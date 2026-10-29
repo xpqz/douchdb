@@ -113,6 +113,7 @@ pub fn new_revid(
     Md5::digest(term.encode()).into()
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leaf {
     pub rev: Rev,
@@ -121,10 +122,11 @@ pub struct Leaf {
 
 /// Pick the winning leaf the way `couch_doc:to_doc_info_path/1` does: sort
 /// descending by `{not Deleted, {Pos, RevId}}` and take the first.
+#[cfg(test)]
 pub fn winner(leaves: &[Leaf]) -> Option<&Leaf> {
-    leaves.iter().max_by(|a, b| {
-        (!a.deleted, a.rev.pos, &a.rev.id).cmp(&(!b.deleted, b.rev.pos, &b.rev.id))
-    })
+    leaves
+        .iter()
+        .max_by(|a, b| (!a.deleted, a.rev.pos, &a.rev.id).cmp(&(!b.deleted, b.rev.pos, &b.rev.id)))
 }
 
 #[cfg(test)]

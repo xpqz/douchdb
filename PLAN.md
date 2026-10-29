@@ -259,5 +259,32 @@ Above ~6k means something was built that nobody asked for.
 
 ## Open questions
 
-* Should `_compact` map to `compact_range`, or be a no-op that returns `ok`?
+* ~~Should `_compact` map to `compact_range`, or be a no-op that returns `ok`?~~
+  **Decided:** map to `compact_range`, return `202 Accepted` immediately. A
+  no-op would make PouchDB's `compact()` lie about reclaiming space, and
+  `compact_range` is what LevelDB is for. The call is synchronous inside the
+  shard actor, so a large compaction delays that shard's next request; that is
+  the same trade-off the write path already makes for `&mut self`. If it becomes
+  a latency problem, move it to a background job with a `compact_running` flag.
 * Attachment chunk size vs read amplification for `pouch.getAttachment`.
+
+## Progress
+
+* **M0 green.** `src/rev.rs` reproduces CouchDB 3.5.3 rev ids byte for byte;
+  ETF is version-byte + Latin-1 atoms. Unit tests cover the corpus.
+* **M1 green.** `src/db.rs` implements CRUD, rev trees, conflict winners,
+  `_bulk_docs`, `_all_docs`, `_local`, `_purge`, `_revs_limit`, attachments
+  (64 KiB chunks, base64). `tests/conformance.rs` starts a real server and
+  asserts CouchDB's status codes, bodies, ETag and digest formats.
+* **M2 green.** `_changes`, `_revs_diff`, `_bulk_get` and `new_edits=false` work.
+  Verified manually: PouchDB ⇄ douchdb round-trips docs, deletions and
+  attachments; CouchDB's own `_replicate` pushes and pulls in both directions
+  with identical revision ids.
+* **Group commit.** The shard actor drains up to 64 queued jobs, merges their
+  `Tx`es into one synced `WriteBatch`, and acknowledges only after the fsync.
+  A write overlay makes later jobs in the same group read their predecessors.
+* **Cluster, partial.** Shard map + rendezvous placement + per-document HTTP
+  proxy work; two nodes with `q=4` split writes 6/2 and converge via
+  anti-entropy. `_bulk_docs`, `_all_docs` and `_changes` still operate on the
+  local node only, and `since` is an integer rather than a version vector.
+

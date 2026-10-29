@@ -191,7 +191,7 @@ mod tests {
                 0x6C, 0, 0, 0, 1, // proplist of 1 pair
                 0x68, 2, // {key, value}
                 0x6D, 0, 0, 0, 1, b'a', // <<"a">>
-                0x61, 1, // 1
+                0x61, 1,    // 1
                 0x6A, // end proplist
                 0x6A, // empty attachments
                 0x6A, // end list
