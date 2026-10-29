@@ -26,6 +26,7 @@ struct Args {
     listen: String,
     data: PathBuf,
     q: u32,
+    n: usize,
     revs_limit: u64,
     admin: Option<(String, String)>,
     nodes: Vec<String>,
@@ -38,6 +39,7 @@ fn parse_args() -> Args {
         listen: "127.0.0.1:5984".into(),
         data: PathBuf::from("data"),
         q: 1,
+        n: 2,
         revs_limit: 1000,
         admin: None,
         nodes: Vec::new(),
@@ -50,6 +52,7 @@ fn parse_args() -> Args {
             "--listen" => args.listen = it.next().unwrap_or_default(),
             "--data" => args.data = PathBuf::from(it.next().unwrap_or_default()),
             "--q" => args.q = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+            "--n" => args.n = it.next().and_then(|v| v.parse().ok()).unwrap_or(2),
             "--revs-limit" => {
                 args.revs_limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(1000)
             }
@@ -73,7 +76,7 @@ fn parse_args() -> Args {
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
             "--help" | "-h" => {
                 println!(
-                    "douchdb [--listen ADDR] [--data DIR] [--q N] [--revs-limit N]\n\
+                    "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]"
                 );
                 std::process::exit(0);
@@ -95,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config {
         q: args.q.max(1),
+        n: args.n.max(1),
         revs_limit: args.revs_limit.max(1),
         admin: args.admin.clone(),
         nodes: args.nodes.clone(),
@@ -112,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         cluster: Cluster {
             nodes: args.nodes.clone(),
             me: args.me,
+            n: args.n.max(1),
         },
         client: reqwest::Client::new(),
     });
@@ -161,7 +166,7 @@ fn spawn_anti_entropy(state: Arc<AppState>) {
                     continue;
                 };
                 for peer in &peers {
-                    match replicate::pull(&db, peer, &state.client).await {
+                    match replicate::pull(&db, peer, &state.client, &state.cluster).await {
                         Ok(0) => {}
                         Ok(n) => tracing::info!("replicated {n} docs of {name} from {peer}"),
                         Err(e) => tracing::warn!("replication {name} from {peer} failed: {e}"),

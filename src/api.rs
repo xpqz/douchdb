@@ -31,6 +31,8 @@ pub struct AppState {
 pub struct Config {
     #[allow(dead_code)]
     pub q: u32,
+    #[allow(dead_code)]
+    pub n: usize,
     pub revs_limit: u64,
     pub admin: Option<(String, String)>,
     #[allow(dead_code)]
@@ -103,6 +105,15 @@ fn flag(q: &HashMap<String, String>, key: &str) -> bool {
 
 fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
     q.get(key).and_then(|v| v.parse().ok())
+}
+
+/// True when a proxied request failed to reach the peer, rather than the peer
+/// answering on behalf of the cluster.
+fn unavailable(response: &Response) -> bool {
+    matches!(
+        response.status(),
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// True for a request a peer already routed. Such requests are served from the
@@ -506,24 +517,51 @@ pub async fn db_root(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            // The id only exists after the body is parsed, so the shard owner
-            // is known here and a generated document can still be routed.
-            if let Some(peer) = st.cluster.owner_url(&id, db.q) {
+            // The id only exists after the body is parsed, so the shard's
+            // replicas are known here and a generated document can still be
+            // routed. Try each replica so a dead primary does not lose it.
+            let replicas = st.cluster.replicas_of_doc(&id, db.q);
+            if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
                 let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
-                return proxy(
-                    &st,
-                    &Method::POST,
-                    &name,
-                    "",
-                    &q,
-                    &headers,
-                    Bytes::from(forwarded),
-                    peer,
-                )
-                .await;
+                let mut last = None;
+                for node in replicas {
+                    let peer = st.cluster.nodes[node].clone();
+                    let response = proxy(
+                        &st,
+                        &Method::POST,
+                        &name,
+                        "",
+                        &q,
+                        &headers,
+                        Bytes::from(forwarded.clone()),
+                        &peer,
+                    )
+                    .await;
+                    if !unavailable(&response) {
+                        return response;
+                    }
+                    last = Some(response);
+                }
+                return last.unwrap_or_else(|| {
+                    fail(ApiError::new(
+                        502,
+                        "bad_gateway",
+                        "no replica in the shard set is reachable",
+                    ))
+                });
             }
-            match db.put_docs(vec![doc], true).await {
-                Ok(mut results) => {
+            match commit_docs(
+                &st,
+                &db,
+                &name,
+                vec![doc],
+                true,
+                num(&q, "w").unwrap_or(0),
+                &headers,
+            )
+            .await
+            {
+                Ok((mut results, quorum)) => {
                     let result = results.pop().unwrap_or(Value::Null);
                     if result.get("error").is_some() {
                         return fail(ApiError::conflict());
@@ -531,7 +569,14 @@ pub async fn db_root(
                     if flag(&q, "batch") {
                         return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
                     }
-                    json(StatusCode::CREATED, result)
+                    json(
+                        if quorum {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::ACCEPTED
+                        },
+                        result,
+                    )
                 }
                 Err(e) => fail(e),
             }
@@ -566,7 +611,7 @@ pub async fn db_rest(
     let q = query(&uri);
 
     match rest.as_str() {
-        "_bulk_docs" => return bulk_docs(&st, &db, &name, &body, &headers).await,
+        "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
         "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers).await,
         "_changes" => return changes(&st, &db, &name, &q, &method, &body, &headers).await,
@@ -672,6 +717,7 @@ async fn bulk_docs(
     st: &AppState,
     db: &Db,
     dbname: &str,
+    q: &HashMap<String, String>,
     body: &[u8],
     headers: &HeaderMap,
 ) -> Response {
@@ -691,58 +737,271 @@ async fn bulk_docs(
         }
     }
 
-    if !st.cluster.is_clustered() || is_forwarded(headers) {
+    if !st.cluster.is_clustered() {
+        return match db.put_docs(docs, new_edits).await {
+            Ok(results) => bulk_response(new_edits, results),
+            Err(e) => fail(e),
+        };
+    }
+    // A forwarded batch has already been placed by its coordinator; write it
+    // to this node's shards and let the coordinator count the replica ack.
+    if is_forwarded(headers) {
         return match db.put_docs(docs, new_edits).await {
             Ok(results) => bulk_response(new_edits, results),
             Err(e) => fail(e),
         };
     }
 
-    // Route each document to the node that owns its shard. Ids are needed
-    // before routing, so generate them here rather than inside put_docs.
-    let mut groups: Vec<Vec<(usize, Value)>> =
-        (0..st.cluster.nodes.len()).map(|_| Vec::new()).collect();
-    for (i, mut doc) in docs.into_iter().enumerate() {
+    let w = num(q, "w").unwrap_or(0);
+    match commit_docs(st, db, dbname, docs, new_edits, w, headers).await {
+        Ok((results, quorum)) => {
+            let mut response = bulk_response(new_edits, results);
+            if !quorum {
+                // CouchDB answers 202 when the write reached fewer than the
+                // requested number of replicas; anti-entropy repairs the rest.
+                *response.status_mut() = StatusCode::ACCEPTED;
+            }
+            response
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Place documents on their replica sets.
+///
+/// `new_edits=true` writes to each document's primary (the coordinating
+/// replica), then copies the resulting full revision to the other replicas with
+/// `new_edits=false`, so every replica ends with byte-identical history.
+/// `new_edits=false` (the replication path) sends the given revision to every
+/// replica directly. The bool is whether the default write quorum was met.
+async fn commit_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    mut docs: Vec<Value>,
+    new_edits: bool,
+    w: usize,
+    headers: &HeaderMap,
+) -> DbResult<(Vec<Value>, bool)> {
+    if !st.cluster.is_clustered() {
+        return Ok((db.put_docs(docs, new_edits).await?, true));
+    }
+
+    // Routing needs ids, so generate them before grouping. `Db::put_docs`
+    // would otherwise assign them per replica and the copies would diverge.
+    for doc in &mut docs {
         if doc.get("_id").is_none() {
             doc["_id"] = json!(crate::db::uuid());
         }
-        let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
-        groups[st.cluster.owner_of_doc(id, db.q)].push((i, doc));
     }
-
-    let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
-    let mut errors = Vec::new();
-    for (owner, group) in groups.into_iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-        let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
-        let results = if owner == st.cluster.me {
-            match db.put_docs(subdocs, new_edits).await {
-                Ok(results) => results,
-                Err(e) => return fail(e),
-            }
-        } else {
-            let peer = st.cluster.nodes[owner].clone();
-            match forward_bulk(st, &peer, dbname, subdocs, new_edits, headers).await {
-                Ok(results) => results,
-                Err(e) => return fail(e),
-            }
-        };
-        if new_edits {
-            for (slot, result) in indices.into_iter().zip(results) {
-                out[slot] = result;
-            }
-        } else {
-            errors.extend(results.into_iter().filter(|r| r.get("error").is_some()));
-        }
-    }
-    if new_edits {
-        json(StatusCode::CREATED, Value::Array(out))
+    let ids: Vec<String> = docs
+        .iter()
+        .map(|doc| {
+            doc.get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let primaries: Vec<usize> = ids
+        .iter()
+        .map(|id| st.cluster.owner_of_doc(id, db.q))
+        .collect();
+    let replicas: Vec<Vec<usize>> = ids
+        .iter()
+        .map(|id| st.cluster.replicas_of_doc(id, db.q))
+        .collect();
+    let replication = st.cluster.replication_factor();
+    // CouchDB defaults to a write quorum and lets `?w=` override it.
+    let quorum = if w == 0 {
+        replication / 2 + 1
     } else {
-        json(StatusCode::CREATED, Value::Array(errors))
+        w.min(replication)
+    };
+    let total = docs.len();
+    let mut out = vec![Value::Null; total];
+    let mut acks = vec![0usize; total];
+
+    if new_edits {
+        // Write each document to the first live replica, then copy the result
+        // to the rest of its replica set. A dead primary falls through to the
+        // next replica instead of failing the request.
+        let mut written_at: Vec<Option<usize>> = vec![None; total];
+        let mut pending: Vec<(usize, Value)> = docs.into_iter().enumerate().collect();
+        let mut attempt = vec![0usize; total];
+        while !pending.is_empty() {
+            let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+            for (slot, doc) in pending.drain(..) {
+                let list = &replicas[slot];
+                let node = list[attempt[slot].min(list.len() - 1)];
+                groups.entry(node).or_default().push((slot, doc));
+            }
+            let mut retry = Vec::new();
+            for (node, group) in groups {
+                let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+                let subdocs: Vec<Value> = group.iter().map(|(_, doc)| doc.clone()).collect();
+                match write_local_or_forward(st, db, dbname, node, subdocs, true, headers).await {
+                    Ok(results) => {
+                        for (slot, result) in slots.into_iter().zip(results) {
+                            if result.get("error").is_none() {
+                                acks[slot] = 1;
+                                written_at[slot] = Some(node);
+                            }
+                            out[slot] = result;
+                        }
+                    }
+                    Err(_) => {
+                        for (slot, doc) in group {
+                            attempt[slot] += 1;
+                            if attempt[slot] < replicas[slot].len() {
+                                retry.push((slot, doc));
+                            } else {
+                                out[slot] = json!({
+                                    "id": ids[slot],
+                                    "error": "replica_unavailable",
+                                    "reason": "no replica in the shard set is reachable",
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            pending = retry;
+        }
+
+        // Copy each successful revision to the rest of its replica set.
+        let mut batches: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        for slot in 0..total {
+            let Some(source) = written_at[slot] else {
+                continue;
+            };
+            let Some(rev) = out[slot].get("rev").and_then(Value::as_str) else {
+                continue;
+            };
+            for node in replicas[slot]
+                .iter()
+                .copied()
+                .filter(|node| *node != source)
+            {
+                let full = fetch_rev(st, db, dbname, source, &ids[slot], rev, headers).await?;
+                batches.entry(node).or_default().push((slot, full));
+            }
+        }
+        for (node, batch) in batches {
+            let slots: Vec<usize> = batch.iter().map(|(slot, _)| *slot).collect();
+            let docs: Vec<Value> = batch.into_iter().map(|(_, doc)| doc).collect();
+            if write_local_or_forward(st, db, dbname, node, docs, false, headers)
+                .await
+                .is_ok()
+            {
+                for slot in slots {
+                    acks[slot] += 1;
+                }
+            }
+        }
+        let met = acks.iter().all(|ack| *ack >= quorum);
+        Ok((out, met))
+    } else {
+        // Replication writes carry their own history and must reach every
+        // replica, including ones that are not the primary. A down replica is
+        // not fatal: anti-entropy will heal it when it returns.
+        let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        for (slot, doc) in docs.into_iter().enumerate() {
+            for node in &replicas[slot] {
+                groups.entry(*node).or_default().push((slot, doc.clone()));
+            }
+        }
+        let mut reached = vec![false; total];
+        for (node, group) in groups {
+            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let subdocs: Vec<Value> = group.iter().map(|(_, doc)| doc.clone()).collect();
+            match write_local_or_forward(st, db, dbname, node, subdocs, false, headers).await {
+                Ok(results) => {
+                    for (slot, result) in slots.into_iter().zip(results) {
+                        reached[slot] = true;
+                        // Prefer the primary's verdict.
+                        if node == primaries[slot] || out[slot].is_null() {
+                            out[slot] = result;
+                        }
+                    }
+                }
+                Err(_) => {
+                    for (slot, _) in group {
+                        if out[slot].is_null() {
+                            out[slot] = json!({
+                                "id": ids[slot],
+                                "error": "replica_unavailable",
+                                "reason": "no replica in the shard set is reachable",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let met = reached.iter().all(|ok| *ok);
+        Ok((out, met))
     }
+}
+
+async fn write_local_or_forward(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    node: usize,
+    docs: Vec<Value>,
+    new_edits: bool,
+    headers: &HeaderMap,
+) -> DbResult<Vec<Value>> {
+    if node == st.cluster.me {
+        return db.put_docs(docs, new_edits).await;
+    }
+    let peer = st.cluster.nodes[node].clone();
+    forward_bulk(st, &peer, dbname, docs, new_edits, headers).await
+}
+
+/// Read one revision with its history and attachment bytes, for copying to
+/// another replica. `attachments=true` matters: a stub would not carry the
+/// chunk data the secondary needs to store the same bytes.
+async fn fetch_rev(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    node: usize,
+    id: &str,
+    rev: &str,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    let opts = DocOpts {
+        rev: Some(rev.to_string()),
+        revs: true,
+        attachments: true,
+        ..Default::default()
+    };
+    if node == st.cluster.me {
+        return db.get_doc(id, &opts).await;
+    }
+    let peer = &st.cluster.nodes[node];
+    let url = format!("{peer}/{dbname}/{}", percent_encode(id));
+    let mut request =
+        st.client
+            .get(url)
+            .query(&[("rev", rev), ("revs", "true"), ("attachments", "true")]);
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "replica_fetch_failed", text));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
 fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
@@ -1385,8 +1644,43 @@ async fn cluster_changes(
         }
     }
 
+    // With N replicas the same revision arrives from more than one node. Keep
+    // one row per document (the one furthest along the version vector) so
+    // clients fed by any coordinator see each change once.
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<Value> = Vec::new();
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            deduped.push(row);
+            continue;
+        };
+        let score = row
+            .get("seq")
+            .and_then(Value::as_str)
+            .and_then(decode_since)
+            .map(|vector| vector.iter().sum())
+            .unwrap_or(0);
+        match by_id.get(&id) {
+            Some(&index) => {
+                let existing = deduped[index]
+                    .get("seq")
+                    .and_then(Value::as_str)
+                    .and_then(decode_since)
+                    .map(|vector| vector.iter().sum())
+                    .unwrap_or(0);
+                if score > existing {
+                    deduped[index] = row;
+                }
+            }
+            None => {
+                by_id.insert(id, deduped.len());
+                deduped.push(row);
+            }
+        }
+    }
+
     Ok(json!({
-        "results": rows,
+        "results": deduped,
         "last_seq": encode_since(&progress),
         "pending": 0,
     }))
@@ -1440,15 +1734,42 @@ async fn doc_request(
         return fail(ApiError::bad_request("invalid document id"));
     }
 
-    if let Some(peer) = st.cluster.owner_url(&docid, db.q) {
-        return proxy(st, &method, dbname, rest, q, headers, body, peer).await;
+    let read_quorum = num(q, "r").unwrap_or(1);
+    if attachment.is_none()
+        && (method == Method::GET || method == Method::HEAD)
+        && st.cluster.is_clustered()
+        && read_quorum > 1
+    {
+        return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
+    }
+
+    // Serve locally if this node holds a replica; otherwise try every replica
+    // in preference order so a dead primary does not break reads or writes.
+    let replicas = st.cluster.replicas_of_doc(&docid, db.q);
+    if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
+        let mut last = None;
+        for node in replicas {
+            let peer = st.cluster.nodes[node].clone();
+            let response = proxy(st, &method, dbname, rest, q, headers, body.clone(), &peer).await;
+            if !unavailable(&response) {
+                return response;
+            }
+            last = Some(response);
+        }
+        return last.unwrap_or_else(|| {
+            fail(ApiError::new(
+                502,
+                "bad_gateway",
+                "no replica in the shard set is reachable",
+            ))
+        });
     }
 
     let Some(attachment) = attachment else {
         return match method {
             Method::GET | Method::HEAD => get_doc(db, &docid, q).await,
-            Method::PUT => put_doc(db, &docid, body, q).await,
-            Method::DELETE => delete_doc(db, &docid, q).await,
+            Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
+            Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers).await,
             _ => fail(ApiError::new(
                 405,
                 "method_not_allowed",
@@ -1509,13 +1830,28 @@ async fn doc_request(
             if let Some(rev) = q.get("rev") {
                 doc["_rev"] = json!(rev);
             }
-            match db.put_docs(vec![doc], true).await {
-                Ok(mut results) => {
+            match commit_docs(
+                st,
+                db,
+                dbname,
+                vec![doc],
+                true,
+                num(q, "w").unwrap_or(0),
+                headers,
+            )
+            .await
+            {
+                Ok((mut results, quorum)) => {
                     let result = results.pop().unwrap_or(Value::Null);
                     if result.get("error").is_some() {
                         return json(StatusCode::CONFLICT, result);
                     }
-                    json(StatusCode::CREATED, result)
+                    let status = if quorum {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::ACCEPTED
+                    };
+                    json(status, result)
                 }
                 Err(e) => fail(e),
             }
@@ -1535,16 +1871,32 @@ async fn doc_request(
                 atts.remove(&attachment);
             }
             doc["_rev"] = json!(rev);
-            match db.put_docs(vec![doc], true).await {
-                Ok(mut results) => {
-                    let result = results.pop().unwrap_or(Value::Null);
-                    if result.get("error").is_some() {
-                        return json(StatusCode::CONFLICT, result);
-                    }
-                    json(StatusCode::OK, result)
-                }
-                Err(e) => fail(e),
+            let result = match commit_docs(
+                st,
+                db,
+                dbname,
+                vec![doc],
+                true,
+                num(q, "w").unwrap_or(0),
+                headers,
+            )
+            .await
+            {
+                Ok((mut results, quorum)) => (results.pop().unwrap_or(Value::Null), quorum),
+                Err(e) => return fail(e),
+            };
+            let (result, quorum) = result;
+            if result.get("error").is_some() {
+                return json(StatusCode::CONFLICT, result);
             }
+            json(
+                if quorum {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                result,
+            )
         }
         _ => fail(ApiError::new(
             405,
@@ -1567,8 +1919,8 @@ fn split_doc_path(rest: &str) -> (String, Option<String>) {
     }
 }
 
-async fn get_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response {
-    let opts = DocOpts {
+fn doc_opts(q: &HashMap<String, String>) -> DocOpts {
+    DocOpts {
         rev: q.get("rev").cloned(),
         revs: flag(q, "revs"),
         revs_info: flag(q, "revs_info"),
@@ -1580,27 +1932,111 @@ async fn get_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response 
             .map(|v| serde_json::from_str::<Vec<String>>(v).unwrap_or_else(|_| vec![v.clone()])),
         latest: flag(q, "latest"),
         ..Default::default()
-    };
-    match db.get_doc(docid, &opts).await {
-        Ok(doc) => {
-            let etag = doc
-                .get("_rev")
-                .and_then(Value::as_str)
-                .map(|r| format!("\"{r}\""))
-                .unwrap_or_default();
-            let mut response = json(StatusCode::OK, doc);
-            if !etag.is_empty() {
-                if let Ok(value) = etag.parse() {
-                    response.headers_mut().insert(header::ETAG, value);
-                }
-            }
-            response
+    }
+}
+
+fn doc_response(doc: Value) -> Response {
+    let etag = doc
+        .get("_rev")
+        .and_then(Value::as_str)
+        .map(|r| format!("\"{r}\""))
+        .unwrap_or_default();
+    let mut response = json(StatusCode::OK, doc);
+    if !etag.is_empty() {
+        if let Ok(value) = etag.parse() {
+            response.headers_mut().insert(header::ETAG, value);
         }
+    }
+    response
+}
+
+async fn get_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response {
+    match db.get_doc(docid, &doc_opts(q)).await {
+        Ok(doc) => doc_response(doc),
         Err(e) => fail(e),
     }
 }
 
-async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>) -> Response {
+/// Compare two document versions with CouchDB's winner rule: live beats
+/// deleted, then higher position, then greater revision id.
+fn better_rev(candidate: &Value, current: &Value) -> bool {
+    let key = |doc: &Value| {
+        let deleted = doc
+            .get("_deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default();
+        let parsed = crate::rev::Rev::parse(rev);
+        let pos = parsed.as_ref().map(|r| r.pos).unwrap_or(0);
+        let id = parsed.map(|r| r.id).unwrap_or_default();
+        (deleted, pos, id)
+    };
+    let a = key(candidate);
+    let b = key(current);
+    (!a.0, a.1, a.2) > (!b.0, b.1, b.2)
+}
+
+/// `?r=N` reads from several replicas and returns the winning revision.
+async fn quorum_read(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+    r: usize,
+) -> Response {
+    let mut best: Option<Value> = None;
+    // Strip `r` from the hop so the replica answers locally instead of
+    // starting another quorum read and bouncing the request back.
+    let mut inner = q.clone();
+    inner.remove("r");
+    for node in st.cluster.replicas_of_doc(docid, db.q).into_iter().take(r) {
+        let doc = if node == st.cluster.me {
+            db.get_doc(docid, &doc_opts(q)).await.ok()
+        } else {
+            let peer = st.cluster.nodes[node].clone();
+            let response = proxy(
+                st,
+                &Method::GET,
+                dbname,
+                docid,
+                &inner,
+                headers,
+                Bytes::new(),
+                &peer,
+            )
+            .await;
+            if response.status().is_success() {
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            } else {
+                None
+            }
+        };
+        if let Some(doc) = doc {
+            if best.as_ref().map(|b| better_rev(&doc, b)).unwrap_or(true) {
+                best = Some(doc);
+            }
+        }
+    }
+    match best {
+        Some(doc) => doc_response(doc),
+        None => fail(ApiError::not_found("missing")),
+    }
+}
+
+async fn put_doc(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    body: Bytes,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Response {
     let mut doc = match serde_json::from_slice::<Value>(&body) {
         Ok(v) => v,
         Err(e) => return fail(ApiError::bad_request(format!("invalid JSON: {e}"))),
@@ -1618,8 +2054,18 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
         .get("_deleted")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    match db.put_docs(vec![doc], new_edits).await {
-        Ok(mut results) => {
+    match commit_docs(
+        st,
+        db,
+        dbname,
+        vec![doc],
+        new_edits,
+        num(q, "w").unwrap_or(0),
+        headers,
+    )
+    .await
+    {
+        Ok((mut results, quorum)) => {
             let mut result = results.pop().unwrap_or(Value::Null);
             if result.get("error").is_some() {
                 // Single-document endpoints, unlike `_bulk_docs`, return no id.
@@ -1636,8 +2082,10 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
             // CouchDB answers 200, not 201, when a PUT lands as a tombstone.
             let status = if tombstone {
                 StatusCode::OK
-            } else {
+            } else if quorum {
                 StatusCode::CREATED
+            } else {
+                StatusCode::ACCEPTED
             };
             json(status, result)
         }
@@ -1645,7 +2093,14 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
     }
 }
 
-async fn delete_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response {
+async fn delete_doc(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Response {
     // A missing document is 404 even without a `rev`; only a live document
     // without a rev is a conflict. A tombstone reports reason "deleted".
     if let Err(e) = db.get_doc(docid, &DocOpts::default()).await {
@@ -1655,8 +2110,18 @@ async fn delete_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Respon
         return fail(ApiError::conflict());
     };
     let doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
-    match db.put_docs(vec![doc], true).await {
-        Ok(mut results) => {
+    match commit_docs(
+        st,
+        db,
+        dbname,
+        vec![doc],
+        true,
+        num(q, "w").unwrap_or(0),
+        headers,
+    )
+    .await
+    {
+        Ok((mut results, quorum)) => {
             let mut result = results.pop().unwrap_or(Value::Null);
             if result.get("error").is_some() {
                 if let Some(obj) = result.as_object_mut() {
@@ -1664,7 +2129,14 @@ async fn delete_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Respon
                 }
                 return json(StatusCode::CONFLICT, result);
             }
-            json(StatusCode::OK, result)
+            json(
+                if quorum {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                result,
+            )
         }
         Err(e) => fail(e),
     }

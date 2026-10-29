@@ -1,11 +1,17 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
+use crate::cluster::Cluster;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-/// Copy everything the peer has that we lack, then checkpoint.
-pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize> {
+/// Copy everything the peer has that this node replicates, then checkpoint.
+pub async fn pull(
+    db: &Db,
+    peer: &str,
+    client: &reqwest::Client,
+    cluster: &Cluster,
+) -> Result<usize> {
     let checkpoint_id = format!("ae:{}", peer);
     let since = db
         .local_get(&checkpoint_id)
@@ -23,6 +29,7 @@ pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize
 
     let resp: Value = client
         .get(format!("{peer}/{}/_changes", db.name))
+        .header("x-douchdb-forwarded", "1")
         .query(&[
             ("since", since_param.as_str()),
             ("style", "all_docs"),
@@ -51,6 +58,7 @@ pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize
 
     let got: Value = client
         .post(format!("{peer}/{}/_bulk_get", db.name))
+        .header("x-douchdb-forwarded", "1")
         .json(&json!({"docs": reqs}))
         .send()
         .await?
@@ -68,6 +76,15 @@ pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize
             }
         }
     }
+
+    // A node only stores the shards it replicates. Without this filter a pull
+    // from any peer would turn every node into a full copy of the database.
+    docs.retain(|doc| {
+        doc.get("_id")
+            .and_then(Value::as_str)
+            .map(|id| cluster.is_replica_of(id, db.q))
+            .unwrap_or(false)
+    });
 
     let count = docs.len();
     if !docs.is_empty() {

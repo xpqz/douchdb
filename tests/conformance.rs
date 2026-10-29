@@ -8,6 +8,7 @@
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,6 +77,16 @@ impl Server {
             std::thread::sleep(Duration::from_millis(20));
         }
         if up {
+            // A colliding process can win the port after `free_port` checked
+            // it; the child then exits while our connect succeeds against the
+            // other listener. Give the bind a moment and confirm the child is
+            // still the one serving.
+            std::thread::sleep(Duration::from_millis(30));
+            if let Ok(Some(_)) = child.try_wait() {
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&dir);
+                return None;
+            }
             return Some(Server {
                 child,
                 base,
@@ -116,6 +127,13 @@ impl Server {
         self.req(Method::DELETE, path, None).await
     }
 
+    /// Stop the process as if the machine had gone away. The HTTP port is
+    /// released; the data directory stays until `Drop`.
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     async fn fresh_db(&self, name: &str) {
         let _ = self.delete(&format!("/{name}")).await;
         let (status, _) = self.put(&format!("/{name}"), json!({})).await;
@@ -150,21 +168,25 @@ fn free_port() -> u16 {
 /// background repair: a document reachable only through its owner proves the
 /// proxy path works.
 fn start_cluster(n: usize) -> Vec<Server> {
-    start_cluster_with_sync(n, "3600")
+    start_cluster_with(n, "3600", 1)
 }
 
-fn start_cluster_with_sync(n: usize, sync_secs: &str) -> Vec<Server> {
-    let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
-    let nodes = ports
-        .iter()
-        .map(|p| format!("http://127.0.0.1:{p}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    (0..n)
-        .map(|i| {
+fn start_cluster_with(n: usize, sync_secs: &str, replication: usize) -> Vec<Server> {
+    for attempt in 0..5 {
+        let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
+        let nodes = ports
+            .iter()
+            .map(|p| format!("http://127.0.0.1:{p}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut servers = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
             let extra = vec![
                 "--q".to_string(),
                 "4".to_string(),
+                "--n".to_string(),
+                replication.to_string(),
                 "--nodes".to_string(),
                 nodes.clone(),
                 "--me".to_string(),
@@ -172,9 +194,20 @@ fn start_cluster_with_sync(n: usize, sync_secs: &str) -> Vec<Server> {
                 "--sync-secs".to_string(),
                 sync_secs.to_string(),
             ];
-            Server::spawn_on(ports[i], &extra, false, 0).expect("start cluster node")
-        })
-        .collect()
+            match Server::spawn_on(ports[i], &extra, false, attempt) {
+                Some(server) => servers.push(server),
+                None => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return servers;
+        }
+        drop(servers);
+    }
+    panic!("douchdb cluster did not start");
 }
 
 #[tokio::test]
@@ -731,7 +764,7 @@ async fn cluster_routes_writes_and_merges_all_docs() {
 
 #[tokio::test]
 async fn cluster_changes_use_an_opaque_version_vector() {
-    let nodes = start_cluster(2);
+    let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("clchanges").await;
     }
@@ -745,6 +778,14 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     let (status, body) = nodes[0].get("/clchanges/_changes").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["results"].as_array().unwrap().len(), 6);
+    // Both replicas report the same documents; the feed must dedupe by id.
+    let ids: std::collections::HashSet<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 6);
     assert!(
         body["last_seq"].is_string(),
         "cluster since is opaque: {:?}",
@@ -843,7 +884,7 @@ async fn cluster_post_creates_the_document_on_its_owner() {
 
 #[tokio::test]
 async fn cluster_anti_entropy_converges_without_client_reads() {
-    let nodes = start_cluster_with_sync(2, "1");
+    let nodes = start_cluster_with(2, "1", 2);
     for node in &nodes {
         node.fresh_db("clsync").await;
     }
@@ -851,10 +892,17 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
     let docs: Vec<Value> = (0..8)
         .map(|i| json!({"_id": format!("s{i}"), "n": i}))
         .collect();
-    let (status, _) = nodes[0]
-        .post("/clsync/_bulk_docs", json!({"docs": docs}))
-        .await;
-    assert_eq!(status, StatusCode::CREATED);
+    // Write with the forwarded marker so only node 0 stores the documents:
+    // node 1 must then pull them through anti-entropy.
+    let response = nodes[0]
+        .client
+        .post(format!("{}/clsync/_bulk_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
 
     // A forwarded `_all_docs` reads only this node's shards, so seeing all
     // eight rows on node 1 means the anti-entropy pull actually copied them
@@ -881,6 +929,177 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test]
+async fn cluster_writes_land_on_the_whole_replica_set() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clrep").await;
+    }
+
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("r{i}"), "n": i}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/clrep/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(12));
+    assert!(body.as_array().unwrap().iter().all(|row| row["ok"] == true));
+
+    // Read each node's shards directly (forwarded requests are not routed), so
+    // the copies counted here are the ones physically stored on that node.
+    let mut copies: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut total = 0usize;
+    for (index, node) in nodes.iter().enumerate() {
+        let body: Value = node
+            .client
+            .post(format!("{}/clrep/_all_docs?include_docs=true", node.base))
+            .header("x-douchdb-forwarded", "1")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        total += body["total_rows"].as_u64().unwrap() as usize;
+        for row in body["rows"].as_array().unwrap() {
+            copies
+                .entry(row["id"].as_str().unwrap().to_string())
+                .or_default()
+                .push((index, row["doc"]["_rev"].as_str().unwrap().to_string()));
+        }
+    }
+    assert_eq!(total, 24, "12 documents x replication factor 2");
+    assert_eq!(copies.len(), 12);
+    for (id, held) in &copies {
+        assert_eq!(held.len(), 2, "{id} replicas {held:?}");
+        assert_eq!(held[0].1, held[1].1, "{id} diverged across replicas");
+    }
+
+    // Routed reads reach a replica from every node.
+    for i in 0..12 {
+        for node in &nodes {
+            let (status, body) = node.get(&format!("/clrep/r{i}")).await;
+            assert_eq!(status, StatusCode::OK, "r{i} via {}", node.base);
+            assert_eq!(body["n"], i);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_survives_killing_a_node_mid_replication() {
+    let mut nodes = start_cluster_with(3, "1", 2);
+    for node in &nodes {
+        node.fresh_db("clkill").await;
+    }
+
+    let first: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("k{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clkill/_bulk_docs", json!({"docs": first}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "initial write: {status}"
+    );
+
+    // Kill a node while anti-entropy is still moving shards around.
+    nodes[2].kill();
+
+    let second: Vec<Value> = (100..106)
+        .map(|i| json!({"_id": format!("k{i}"), "n": i}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/clkill/_bulk_docs", json!({"docs": second}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "write after kill: {status} {body}"
+    );
+    assert!(body.as_array().unwrap().iter().all(|row| row["ok"] == true));
+
+    // Every document remains readable through either survivor: reads fall back
+    // to the next replica when the primary is the dead node.
+    let survivors = &nodes[..2];
+    for i in (0..12).chain(100..106) {
+        for node in survivors {
+            let (status, _) = node.get(&format!("/clkill/k{i}")).await;
+            assert_eq!(status, StatusCode::OK, "k{i} via {}", node.base);
+        }
+    }
+
+    // Anti-entropy converges the survivors to a full copy of every document
+    // that has a replica among them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut seen = std::collections::HashSet::new();
+        for node in survivors {
+            let body: Value = node
+                .client
+                .post(format!("{}/clkill/_all_docs", node.base))
+                .header("x-douchdb-forwarded", "1")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            for row in body["rows"].as_array().unwrap() {
+                seen.insert(row["id"].as_str().unwrap().to_string());
+            }
+        }
+        if seen.len() == 18 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "survivors did not converge: {} of 18 docs",
+            seen.len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn cluster_honours_w_and_r_quorum_parameters() {
+    let mut nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clquorum").await;
+    }
+
+    // Default is a write quorum; ?w=2 asks for both replicas explicitly.
+    let (status, _) = nodes[0]
+        .post("/clquorum/_bulk_docs?w=2", json!({"docs": [{"_id": "q1"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, doc) = nodes[0].get("/clquorum/q1?r=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(doc["_rev"].is_string());
+
+    // With one of two replicas down, w=2 cannot be met and CouchDB answers
+    // 202; w=1 is still satisfiable and answers 201.
+    nodes[1].kill();
+    let (status, body) = nodes[0]
+        .post("/clquorum/_bulk_docs?w=2", json!({"docs": [{"_id": "q2"}]}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "w=2 with one live replica: {body}"
+    );
+    let (status, body) = nodes[0]
+        .post("/clquorum/_bulk_docs?w=1", json!({"docs": [{"_id": "q3"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "w=1: {body}");
+
+    // r=2 tolerates the dead replica as long as one answers.
+    let (status, _) = nodes[0].get("/clquorum/q2?r=2").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
