@@ -883,6 +883,35 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
     }
 }
 
+#[tokio::test]
+async fn cluster_database_creation_and_drop_are_broadcast() {
+    let nodes = start_cluster(2);
+    let _ = nodes[0].delete("/clife").await;
+    let (status, _) = nodes[0].put("/clife", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A database created through one node must exist on every node, and
+    // _all_dbs must show the union.
+    for node in &nodes {
+        let (status, _) = node.get("/clife").await;
+        assert_eq!(status, StatusCode::OK, "missing db via {}", node.base);
+        let (_, dbs) = node.get("/_all_dbs").await;
+        assert!(dbs.as_array().unwrap().contains(&json!("clife")));
+    }
+
+    let (status, _) = nodes[1].delete("/clife").await;
+    assert_eq!(status, StatusCode::OK);
+    for node in &nodes {
+        let (status, _) = node.get("/clife").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "db survived on {}",
+            node.base
+        );
+    }
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
