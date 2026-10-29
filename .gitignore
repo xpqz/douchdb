@@ -1,0 +1,5 @@
+# Rust build output
+/target
+
+# SKIS issue database is local-only, not shared through git
+/.skis/

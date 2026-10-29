@@ -1,0 +1,17 @@
+[package]
+name = "douchdb"
+version = "0.0.1"
+edition = "2021"
+description = "CouchDB wire-compatible document database on LevelDB"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+md-5 = "0.10"
+rusty-leveldb = "4"
+serde = { version = "1", features = ["derive"] }
+# preserve_order is load-bearing: CouchDB's rev hash depends on JSON key order.
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
