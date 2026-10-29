@@ -363,6 +363,26 @@ async fn bulk_docs_and_all_docs() {
 }
 
 #[tokio::test]
+async fn bulk_docs_accepts_requests_larger_than_two_megabytes() {
+    let s = Server::start(false);
+    s.fresh_db("bigbulk").await;
+
+    // Axum's default body limit is 2 MiB; a CouchDB bulk request routinely
+    // exceeds that. Three 1.5 MB documents is ~4.5 MB on the wire.
+    let blob = "x".repeat(1_500_000);
+    let docs: Vec<Value> = (0..3)
+        .map(|i| json!({"_id": format!("big{i}"), "blob": blob}))
+        .collect();
+    let (status, body) = s.post("/bigbulk/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 3);
+
+    let (status, doc) = s.get("/bigbulk/big2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["blob"].as_str().unwrap().len(), 1_500_000);
+}
+
+#[tokio::test]
 async fn changes_revs_diff_and_bulk_get() {
     let s = Server::start(false);
     s.fresh_db("rep").await;

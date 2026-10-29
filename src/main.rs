@@ -137,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/{db}/", any(api::db_root))
         .route("/{db}/{*rest}", any(api::db_rest))
         .fallback(api::not_found)
+        // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
+        // multi-document `_bulk_docs`. CouchDB's limit is far higher.
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .layer(axum::middleware::from_fn(api::log_requests))
         .with_state(state);
 

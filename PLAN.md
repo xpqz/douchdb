@@ -264,8 +264,12 @@ Above ~6k means something was built that nobody asked for.
   no-op would make PouchDB's `compact()` lie about reclaiming space, and
   `compact_range` is what LevelDB is for. The call is synchronous inside the
   shard actor, so a large compaction delays that shard's next request; that is
-  the same trade-off the write path already makes for `&mut self`. If it becomes
-  a latency problem, move it to a background job with a `compact_running` flag.
+  the same trade-off the write path already makes for `&mut self`. Measured at
+  10 GB: compaction blocks the shard for 26.9 s, so a background job that still
+  takes the actor lock would not help latency; the real fix is more shards
+  (`q > 1`) so the stall is divided, or an observable `compact_running` flag
+  plus scheduling compaction off the request path. Left synchronous for now,
+  recorded as a known 27 s p99 per shard at 10 GB.
 * Attachment chunk size vs read amplification for `pouch.getAttachment`.
 
 ## Progress
@@ -287,15 +291,53 @@ Above ~6k means something was built that nobody asked for.
   proxying cover CRUD, `_bulk_docs`, `_bulk_get`, `_revs_diff` and `POST /db`
   (generated ids are routed after parsing). `_all_docs` fans out to every node,
   merges by id preferring the shard owner, then applies `startkey`/`skip`/
-  `limit`; `keys` queries also surface tombstones. `_changes` fans out per node
-  and returns a base64url version-vector `since`/`last_seq`; `GET /db` reports
-  the same vector as `update_seq`. Forwarded subrequests carry
-  `x-douchdb-forwarded` so the receiving peer serves them locally instead of
-  re-fanning out. Anti-entropy checkpoints that opaque vector, so it resumes
-  rather than re-pulling the whole database every tick.
-* **Cluster, remaining.** Placement still has one owner per shard (no N
-  replicas), so anti-entropy converges every node to every document rather than
-  to each shard's replica set. `?w=`/`?r=` are ignored, and `_purge`/`_compact`
-  are local. The v0.1 gate — a three-node cluster surviving a node kill
-  mid-replication — has not been run.
+  `limit`; `keys` queries also surface tombstones. `_changes` fans out per node,
+  dedupes replicated documents and returns a base64url version-vector `since`/
+  `last_seq`; `GET /db` reports the same vector as `update_seq`. Forwarded
+  subrequests carry `x-douchdb-forwarded` so the receiving peer serves them
+  locally instead of re-fanning out.
+* **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
+  rendezvous score. A write goes to the first reachable replica, then the full
+  revision (history plus attachment bytes) is copied to the rest with
+  `new_edits=false`; reads try replicas in preference order and fall back past a
+  dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
+  an unmet write quorum returns `202` and anti-entropy repairs the replica.
+  Database create/drop are broadcast, and anti-entropy pulls only the shards a
+  node replicates. The v0.1 gate — kill a node mid-replication and keep serving
+  from the survivors — is covered by
+  `cluster_survives_killing_a_node_mid_replication`.
+* **Version vectors.** `since`/`update_seq` are keyed by node, not by shard
+  replica: sequence allocation is one counter per database, so a node's changes
+  feed is a single cursor and the coarser key still resumes exactly (no change
+  is skipped). Per-shard-replica keys would require per-shard sequence
+  allocation, which the storage layout does not currently do.
+* **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
+  serialisation) is recorded below.
+
+## Storage spike
+
+`scripts/storage_spike.py` writes incompressible 1 MB documents through the HTTP
+API, keeps concurrent writers running (group commit), probes read latency, then
+compacts the shard and kills the server with `SIGKILL` to check durability.
+Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
+
+| Metric | Result |
+|---|---|
+| Load throughput | 79.9 MB/s (125.2 s for 10 GB) |
+| Write latency p50 / p99 / max | 123 ms / 532 ms / 22.0 s |
+| Disk after load / after compact | 10.04 GB / 10.04 GB |
+| Write amplification | 1.004 |
+| Probe p50 / p99, idle | 2.19 ms / 2.73 ms |
+| `_compact` duration | 26.9 s |
+| Probe latency during compaction | 26.9 s (blocked for the whole compaction) |
+| Docs after kill -9 + restart | 10,001 of 10,001 |
+
+The interesting number is the last one: `compact_range` owns the shard actor
+for its whole duration, so every request behind it waits. At 10 GB that is a
+27-second p99 for that shard. The write path itself is acceptable (80 MB/s,
+~0.5 s p99) with one 22-second outlier where LevelDB compaction stalled the
+writer. Keeping `_compact` synchronous is no longer defensible for large
+databases; the options are a background job that still takes the shard lock
+(same stall, but observable via `compact_running`) or sharding compaction work
+across more shards (`q > 1` divides the stall).
 
