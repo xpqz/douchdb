@@ -12,15 +12,22 @@ pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize
         .await
         .ok()
         .flatten()
-        .and_then(|v| v.get("seq").and_then(Value::as_u64))
-        .unwrap_or(0);
+        .and_then(|v| v.get("seq").cloned())
+        .unwrap_or_else(|| json!(0));
+    // A cluster `_changes` last_seq is an opaque base64 version vector, so
+    // forward whatever the peer gave us rather than parsing it as an integer.
+    let since_param = match &since {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
 
-    let url = format!(
-        "{peer}/{}/_changes?since={since}&style=all_docs&limit=200",
-        db.name
-    );
     let resp: Value = client
-        .get(&url)
+        .get(format!("{peer}/{}/_changes", db.name))
+        .query(&[
+            ("since", since_param.as_str()),
+            ("style", "all_docs"),
+            ("limit", "200"),
+        ])
         .send()
         .await?
         .error_for_status()?
@@ -69,8 +76,8 @@ pub async fn pull(db: &Db, peer: &str, client: &reqwest::Client) -> Result<usize
             .map_err(|e| anyhow!(e.to_string()))?;
     }
 
-    let last = resp["last_seq"].as_u64().unwrap_or(since);
-    if last > since {
+    let last = resp["last_seq"].clone();
+    if !last.is_null() && last != since {
         db.local_put(&checkpoint_id, json!({ "seq": last }))
             .await
             .map_err(|e| anyhow!(e.to_string()))?;

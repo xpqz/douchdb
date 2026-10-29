@@ -10,6 +10,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 struct Server {
@@ -21,12 +22,26 @@ struct Server {
 
 impl Server {
     fn start(admin: bool) -> Server {
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let dir =
-            std::env::temp_dir().join(format!("douchdb-test-{}-{}", std::process::id(), port));
+        Server::start_with(&[], admin)
+    }
+
+    /// Start a node with extra CLI arguments (`--q`, `--nodes`, `--me`, ...).
+    fn start_with(extra: &[String], admin: bool) -> Server {
+        for attempt in 0..20 {
+            if let Some(server) = Server::spawn_on(free_port(), extra, admin, attempt) {
+                return server;
+            }
+        }
+        panic!("douchdb did not start");
+    }
+
+    fn spawn_on(port: u16, extra: &[String], admin: bool, attempt: usize) -> Option<Server> {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-test-{}-{}-{}",
+            std::process::id(),
+            port,
+            attempt
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
         cmd.arg("--listen")
@@ -35,31 +50,43 @@ impl Server {
             .arg(&dir)
             .arg("--sync-secs")
             .arg("3600")
+            .args(extra)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         if admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        let child = cmd.spawn().expect("spawn douchdb");
+        let mut child = cmd.spawn().expect("spawn douchdb");
         let base = format!("http://127.0.0.1:{port}");
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        let server = Server {
-            child,
-            base,
-            dir,
-            client,
-        };
-        // Wait for the listener, not for a fixed amount of time.
+        // Wait for the listener, and notice a child that died (e.g. port
+        // collision) instead of sleeping for the whole budget.
+        let mut up = false;
         for _ in 0..100 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return server;
+                up = true;
+                break;
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("douchdb did not start");
+        if up {
+            return Some(Server {
+                child,
+                base,
+                dir,
+                client,
+            });
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        None
     }
 
     async fn req(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -102,6 +129,52 @@ impl Drop for Server {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+fn free_port() -> u16 {
+    // Tests run in parallel threads. The kernel's ephemeral-port pool can hand
+    // the same released port to two tests, so assign ports from a process-wide
+    // counter and confirm each one is free.
+    static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
+    loop {
+        let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+        let candidate = 31000 + ((std::process::id() as usize + n * 37) % 20000);
+        if std::net::TcpListener::bind(("127.0.0.1", candidate as u16)).is_ok() {
+            return candidate as u16;
+        }
+    }
+}
+
+/// Start `n` nodes in one cluster with `q=4`. Anti-entropy is effectively off
+/// (`--sync-secs 3600`), so tests exercise request routing rather than
+/// background repair: a document reachable only through its owner proves the
+/// proxy path works.
+fn start_cluster(n: usize) -> Vec<Server> {
+    start_cluster_with_sync(n, "3600")
+}
+
+fn start_cluster_with_sync(n: usize, sync_secs: &str) -> Vec<Server> {
+    let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
+    let nodes = ports
+        .iter()
+        .map(|p| format!("http://127.0.0.1:{p}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    (0..n)
+        .map(|i| {
+            let extra = vec![
+                "--q".to_string(),
+                "4".to_string(),
+                "--nodes".to_string(),
+                nodes.clone(),
+                "--me".to_string(),
+                i.to_string(),
+                "--sync-secs".to_string(),
+                sync_secs.to_string(),
+            ];
+            Server::spawn_on(ports[i], &extra, false, 0).expect("start cluster node")
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -572,6 +645,242 @@ async fn auth_basic_session_cookie_and_unauthorized_shape() {
         .post("/_session", json!({"name": "admin", "password": "wrong"}))
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cluster_routes_writes_and_merges_all_docs() {
+    let nodes = start_cluster(2);
+    for node in &nodes {
+        node.fresh_db("cluster").await;
+    }
+
+    let docs: Vec<Value> = (0..8)
+        .map(|i| json!({"_id": format!("d{i}"), "n": i}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/cluster/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body.as_array().map(Vec::len), Some(8));
+    assert!(body.as_array().unwrap().iter().all(|row| row["ok"] == true));
+
+    // A routed write lives on exactly one node until anti-entropy runs, so a
+    // read through either node only succeeds if the proxy reaches the owner.
+    for i in 0..8 {
+        for node in &nodes {
+            let (status, body) = node.get(&format!("/cluster/d{i}")).await;
+            assert_eq!(status, StatusCode::OK, "d{i} via {}", node.base);
+            assert_eq!(body["n"], i);
+        }
+    }
+
+    // _all_docs is fanned out and merged by id, not one node's local view.
+    for node in &nodes {
+        let (status, body) = node.get("/cluster/_all_docs?include_docs=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_rows"], 8);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0]["id"], "d0");
+        assert_eq!(rows[7]["id"], "d7");
+        assert!(
+            rows.iter().all(|row| row["doc"]["_id"] == row["id"]),
+            "include_docs must survive the fan-out"
+        );
+    }
+
+    // startkey/skip/limit are applied after the merge, so the offset counts the
+    // full cluster index and not a single node's slice.
+    let (status, body) = nodes[0]
+        .get("/cluster/_all_docs?startkey=%22d3%22&limit=2&skip=1")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["offset"], 4);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["d4", "d5"]);
+
+    // Delete on the owner, then ask for the key: keys queries must still show
+    // the tombstone even though range scans omit it.
+    let (_, doc) = nodes[0].get("/cluster/d0").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .req(Method::DELETE, &format!("/cluster/d0?rev={rev}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = nodes[1]
+        .post("/cluster/_all_docs", json!({"keys": ["d0", "d1", "zzz"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 7);
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["id"], "d0");
+    assert_eq!(rows[0]["value"]["deleted"], true);
+    assert_eq!(rows[1]["id"], "d1");
+    assert_eq!(rows[2]["key"], "zzz");
+    assert_eq!(rows[2]["error"], "not_found");
+
+    let (_, body) = nodes[0].get("/cluster/_all_docs").await;
+    assert_eq!(body["total_rows"], 7);
+}
+
+#[tokio::test]
+async fn cluster_changes_use_an_opaque_version_vector() {
+    let nodes = start_cluster(2);
+    for node in &nodes {
+        node.fresh_db("clchanges").await;
+    }
+
+    let docs: Vec<Value> = (0..6).map(|i| json!({"_id": format!("v{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/clchanges/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0].get("/clchanges/_changes").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["results"].as_array().unwrap().len(), 6);
+    assert!(
+        body["last_seq"].is_string(),
+        "cluster since is opaque: {:?}",
+        body["last_seq"]
+    );
+    let since = body["last_seq"].as_str().unwrap().to_string();
+
+    // Feeding the vector back resumes exactly where the fan-out stopped.
+    let (_, body) = nodes[0]
+        .get(&format!("/clchanges/_changes?since={since}"))
+        .await;
+    assert!(body["results"].as_array().unwrap().is_empty());
+    assert_eq!(body["last_seq"], since);
+
+    // GET /db reports the same vector, so update_seq works as a since token.
+    let (_, info) = nodes[0].get("/clchanges").await;
+    let update_seq = info["update_seq"].as_str().expect("vector update_seq");
+    let (_, body) = nodes[0]
+        .get(&format!("/clchanges/_changes?since={update_seq}"))
+        .await;
+    assert!(body["results"].as_array().unwrap().is_empty());
+
+    // since=now is an empty feed that still hands back a usable vector.
+    let (_, body) = nodes[0].get("/clchanges/_changes?since=now").await;
+    assert!(body["results"].as_array().unwrap().is_empty());
+    assert!(body["last_seq"].is_string());
+
+    // _revs_diff and _bulk_get route per document as well.
+    let (_, doc) = nodes[0].get("/clchanges/v0").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let missing = "1-00000000000000000000000000000000";
+    let (status, body) = nodes[0]
+        .post(
+            "/clchanges/_revs_diff",
+            json!({"v0": [rev], "v1": [missing]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("v0").is_none());
+    assert_eq!(body["v1"]["missing"][0], missing);
+
+    let reqs: Vec<Value> = (0..6).map(|i| json!({"id": format!("v{i}")})).collect();
+    let (status, body) = nodes[0]
+        .post("/clchanges/_bulk_get", json!({"docs": reqs}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 6);
+    for (i, row) in results.iter().enumerate() {
+        assert_eq!(row["id"], format!("v{i}"));
+        assert!(row["docs"][0]["ok"].is_object());
+    }
+
+    // A deletion after the checkpoint is the only row the next poll sees.
+    let (_, doc) = nodes[0].get("/clchanges/v1").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .req(Method::DELETE, &format!("/clchanges/v1?rev={rev}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = nodes[0]
+        .get(&format!("/clchanges/_changes?since={since}"))
+        .await;
+    let rows = body["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "v1");
+    assert_eq!(rows[0]["deleted"], true);
+}
+
+#[tokio::test]
+async fn cluster_post_creates_the_document_on_its_owner() {
+    let nodes = start_cluster(2);
+    for node in &nodes {
+        node.fresh_db("clpost").await;
+    }
+
+    // POST generates the id after the request arrives, so the handler must
+    // route the resulting document rather than writing it to the local shards.
+    for _ in 0..10 {
+        let (status, body) = nodes[0].post("/clpost", json!({"x": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().unwrap().to_string();
+        for node in &nodes {
+            let (status, doc) = node.get(&format!("/clpost/{id}")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "generated id {id} missing via {}",
+                node.base
+            );
+            assert_eq!(doc["x"], 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_anti_entropy_converges_without_client_reads() {
+    let nodes = start_cluster_with_sync(2, "1");
+    for node in &nodes {
+        node.fresh_db("clsync").await;
+    }
+
+    let docs: Vec<Value> = (0..8)
+        .map(|i| json!({"_id": format!("s{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clsync/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A forwarded `_all_docs` reads only this node's shards, so seeing all
+    // eight rows on node 1 means the anti-entropy pull actually copied them
+    // (a client read would be proxied to the owner and prove nothing).
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let response = nodes[1]
+            .client
+            .post(format!("{}/clsync/_all_docs", nodes[1].base))
+            .header("x-douchdb-forwarded", "1")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if response["total_rows"] == 8 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy did not converge: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn base64_encode(bytes: &[u8]) -> String {

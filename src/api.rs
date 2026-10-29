@@ -12,7 +12,7 @@ use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -103,6 +103,13 @@ fn flag(q: &HashMap<String, String>, key: &str) -> bool {
 
 fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
     q.get(key).and_then(|v| v.parse().ok())
+}
+
+/// True for a request a peer already routed. Such requests are served from the
+/// local node's shards: re-running the fan-out on the receiving side would send
+/// the request straight back and loop.
+fn is_forwarded(headers: &HeaderMap) -> bool {
+    headers.get("x-douchdb-forwarded").is_some()
 }
 
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.
@@ -252,7 +259,35 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
     if !st.authorized(&headers) {
         return unauthorized();
     }
-    json(StatusCode::OK, json!(st.db_names().await))
+    let mut names = st.db_names().await;
+    if st.cluster.is_clustered() && headers.get("x-douchdb-local-db").is_none() {
+        for (i, peer) in st.cluster.nodes.iter().enumerate() {
+            if i == st.cluster.me {
+                continue;
+            }
+            let mut request = st
+                .client
+                .get(format!("{peer}/_all_dbs"))
+                .header("x-douchdb-local-db", "1");
+            if let Some(value) = headers.get(header::AUTHORIZATION) {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            if let Ok(response) = request.send().await {
+                if let Ok(Value::Array(remote)) = response.json::<Value>().await {
+                    for name in remote {
+                        if let Some(name) = name.as_str() {
+                            if !names.iter().any(|n| n == name) {
+                                names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    json(StatusCode::OK, json!(names))
 }
 
 pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
@@ -374,18 +409,79 @@ pub async fn db_root(
     }
     let q = query(&uri);
 
+    let local_only = headers.get("x-douchdb-local-db").is_some();
     match method {
-        Method::PUT => match st.create_db(&name).await {
-            Ok(_) => json(StatusCode::CREATED, json!({"ok": true})),
-            Err(e) => fail(e),
-        },
-        Method::DELETE => match st.drop_db(&name).await {
-            Ok(()) => ok(),
-            Err(e) => fail(e),
-        },
+        Method::PUT => {
+            if let Err(e) = st.create_db(&name).await {
+                return fail(e);
+            }
+            if st.cluster.is_clustered() && !local_only {
+                for peer in st.cluster.nodes.iter() {
+                    if peer == &st.cluster.nodes[st.cluster.me] {
+                        continue;
+                    }
+                    let mut request = st
+                        .client
+                        .put(format!("{peer}/{name}"))
+                        .header("x-douchdb-local-db", "1");
+                    if let Some(value) = headers.get(header::AUTHORIZATION) {
+                        request = request.header(header::AUTHORIZATION, value);
+                    }
+                    let response = match request.send().await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            return fail(ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
+                        }
+                    };
+                    // 412 means another node already had it, which is fine.
+                    if !response.status().is_success()
+                        && response.status() != StatusCode::PRECONDITION_FAILED
+                    {
+                        let status = response.status().as_u16();
+                        let text = response.text().await.unwrap_or_default();
+                        return fail(ApiError::new(status, "db_create_failed", text));
+                    }
+                }
+            }
+            json(StatusCode::CREATED, json!({"ok": true}))
+        }
+        Method::DELETE => {
+            let local = st.drop_db(&name).await;
+            if st.cluster.is_clustered() && !local_only {
+                for (i, peer) in st.cluster.nodes.iter().enumerate() {
+                    if i == st.cluster.me {
+                        continue;
+                    }
+                    let mut request = st
+                        .client
+                        .delete(format!("{peer}/{name}"))
+                        .header("x-douchdb-local-db", "1");
+                    if let Some(value) = headers.get(header::AUTHORIZATION) {
+                        request = request.header(header::AUTHORIZATION, value);
+                    }
+                    let _ = request.send().await;
+                }
+            }
+            match local {
+                Ok(()) => ok(),
+                Err(e) => fail(e),
+            }
+        }
         Method::GET | Method::HEAD => match st.db(&name).await {
             Ok(db) => match db.info().await {
-                Ok(info) => json(StatusCode::OK, info),
+                Ok(mut info) => {
+                    // In a cluster the update_seq is the same version vector
+                    // the changes feed returns, so clients that use it as
+                    // `since` do not skip another node's changes.
+                    if st.cluster.is_clustered() && !is_forwarded(&headers) {
+                        if let Ok(vector) = cluster_update_vector(&st, &db, &name, &headers).await {
+                            let seq = encode_since(&vector);
+                            info["update_seq"] = json!(seq);
+                            info["committed_update_seq"] = json!(seq);
+                        }
+                    }
+                    json(StatusCode::OK, info)
+                }
                 Err(e) => fail(e),
             },
             Err(e) => fail(e),
@@ -410,6 +506,22 @@ pub async fn db_root(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // The id only exists after the body is parsed, so the shard owner
+            // is known here and a generated document can still be routed.
+            if let Some(peer) = st.cluster.owner_url(&id, db.q) {
+                let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
+                return proxy(
+                    &st,
+                    &Method::POST,
+                    &name,
+                    "",
+                    &q,
+                    &headers,
+                    Bytes::from(forwarded),
+                    peer,
+                )
+                .await;
+            }
             match db.put_docs(vec![doc], true).await {
                 Ok(mut results) => {
                     let result = results.pop().unwrap_or(Value::Null);
@@ -454,31 +566,11 @@ pub async fn db_rest(
     let q = query(&uri);
 
     match rest.as_str() {
-        "_bulk_docs" => return bulk_docs(&db, &body).await,
-        "_bulk_get" => {
-            return match serde_json::from_slice::<Value>(&body) {
-                Ok(v) => {
-                    let revs =
-                        flag(&q, "revs") || v.get("revs").and_then(Value::as_bool).unwrap_or(false);
-                    match db.bulk_get(&v, flag(&q, "attachments"), revs).await {
-                        Ok(v) => json(StatusCode::OK, v),
-                        Err(e) => fail(e),
-                    }
-                }
-                Err(_) => fail(ApiError::bad_request("invalid JSON")),
-            }
-        }
-        "_all_docs" => return all_docs(&db, &q, &method, &body).await,
-        "_changes" => return changes(&st, &db, &q, &method, &body).await,
-        "_revs_diff" => {
-            return match serde_json::from_slice::<Value>(&body) {
-                Ok(v) => match db.revs_diff(&v).await {
-                    Ok(diff) => json(StatusCode::OK, diff),
-                    Err(e) => fail(e),
-                },
-                Err(_) => fail(ApiError::bad_request("invalid JSON")),
-            }
-        }
+        "_bulk_docs" => return bulk_docs(&st, &db, &name, &body, &headers).await,
+        "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
+        "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers).await,
+        "_changes" => return changes(&st, &db, &name, &q, &method, &body, &headers).await,
+        "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
         "_purge" => {
             return match serde_json::from_slice::<Value>(&body) {
                 Ok(v) => match db.purge(&v).await {
@@ -576,7 +668,13 @@ async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response 
     }
 }
 
-async fn bulk_docs(db: &Db, body: &[u8]) -> Response {
+async fn bulk_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
@@ -592,23 +690,266 @@ async fn bulk_docs(db: &Db, body: &[u8]) -> Response {
             return fail(e);
         }
     }
-    match db.put_docs(docs, new_edits).await {
-        Ok(results) => {
-            if new_edits {
-                json(StatusCode::CREATED, Value::Array(results))
-            } else {
-                let errors: Vec<Value> = results
-                    .into_iter()
-                    .filter(|r| r.get("error").is_some())
-                    .collect();
-                json(StatusCode::CREATED, Value::Array(errors))
-            }
+
+    if !st.cluster.is_clustered() || is_forwarded(headers) {
+        return match db.put_docs(docs, new_edits).await {
+            Ok(results) => bulk_response(new_edits, results),
+            Err(e) => fail(e),
+        };
+    }
+
+    // Route each document to the node that owns its shard. Ids are needed
+    // before routing, so generate them here rather than inside put_docs.
+    let mut groups: Vec<Vec<(usize, Value)>> =
+        (0..st.cluster.nodes.len()).map(|_| Vec::new()).collect();
+    for (i, mut doc) in docs.into_iter().enumerate() {
+        if doc.get("_id").is_none() {
+            doc["_id"] = json!(crate::db::uuid());
         }
-        Err(e) => fail(e),
+        let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+        groups[st.cluster.owner_of_doc(id, db.q)].push((i, doc));
+    }
+
+    let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
+    let mut errors = Vec::new();
+    for (owner, group) in groups.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+        let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
+        let results = if owner == st.cluster.me {
+            match db.put_docs(subdocs, new_edits).await {
+                Ok(results) => results,
+                Err(e) => return fail(e),
+            }
+        } else {
+            let peer = st.cluster.nodes[owner].clone();
+            match forward_bulk(st, &peer, dbname, subdocs, new_edits, headers).await {
+                Ok(results) => results,
+                Err(e) => return fail(e),
+            }
+        };
+        if new_edits {
+            for (slot, result) in indices.into_iter().zip(results) {
+                out[slot] = result;
+            }
+        } else {
+            errors.extend(results.into_iter().filter(|r| r.get("error").is_some()));
+        }
+    }
+    if new_edits {
+        json(StatusCode::CREATED, Value::Array(out))
+    } else {
+        json(StatusCode::CREATED, Value::Array(errors))
     }
 }
 
-async fn all_docs(db: &Db, q: &HashMap<String, String>, method: &Method, body: &[u8]) -> Response {
+fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
+    if new_edits {
+        json(StatusCode::CREATED, Value::Array(results))
+    } else {
+        let errors: Vec<Value> = results
+            .into_iter()
+            .filter(|r| r.get("error").is_some())
+            .collect();
+        json(StatusCode::CREATED, Value::Array(errors))
+    }
+}
+
+async fn forward_bulk(
+    st: &AppState,
+    peer: &str,
+    dbname: &str,
+    docs: Vec<Value>,
+    new_edits: bool,
+    headers: &HeaderMap,
+) -> DbResult<Vec<Value>> {
+    let mut request = st
+        .client
+        .post(format!("{peer}/{dbname}/_bulk_docs"))
+        .header("x-douchdb-forwarded", "1")
+        .json(&json!({"docs": docs, "new_edits": new_edits}));
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "bulk_docs_failed", text));
+    }
+    match response.json::<Value>().await {
+        Ok(Value::Array(values)) => Ok(values),
+        Ok(_) => Err(ApiError::new(
+            502,
+            "bad_gateway",
+            format!("{peer}: unexpected _bulk_docs response"),
+        )),
+        Err(e) => Err(ApiError::new(502, "bad_gateway", format!("{peer}: {e}"))),
+    }
+}
+
+async fn bulk_get(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return fail(ApiError::bad_request("invalid JSON"));
+    };
+    let attachments = flag(q, "attachments");
+    let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
+    if !st.cluster.is_clustered() || is_forwarded(headers) {
+        return match db.bulk_get(&value, attachments, revs).await {
+            Ok(v) => json(StatusCode::OK, v),
+            Err(e) => fail(e),
+        };
+    }
+    let Some(reqs) = value.get("docs").and_then(Value::as_array).cloned() else {
+        return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
+    };
+    let mut groups: Vec<Vec<(usize, Value)>> =
+        (0..st.cluster.nodes.len()).map(|_| Vec::new()).collect();
+    for (i, req) in reqs.into_iter().enumerate() {
+        let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
+        groups[st.cluster.owner_of_doc(id, db.q)].push((i, req));
+    }
+    let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
+    for (owner, group) in groups.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+        let subdocs: Vec<Value> = group.into_iter().map(|(_, req)| req).collect();
+        let sub = json!({"docs": subdocs});
+        let result = if owner == st.cluster.me {
+            match db.bulk_get(&sub, attachments, revs).await {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            }
+        } else {
+            let peer = st.cluster.nodes[owner].clone();
+            let mut query = format!("revs={revs}");
+            if attachments {
+                query.push_str("&attachments=true");
+            }
+            match forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            }
+        };
+        let rows = result["results"].as_array().cloned().unwrap_or_default();
+        for (slot, row) in indices.into_iter().zip(rows) {
+            out[slot] = row;
+        }
+    }
+    json(StatusCode::OK, json!({"results": out}))
+}
+
+async fn revs_diff(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return fail(ApiError::bad_request("invalid JSON"));
+    };
+    if !st.cluster.is_clustered() || is_forwarded(headers) {
+        return match db.revs_diff(&value).await {
+            Ok(v) => json(StatusCode::OK, v),
+            Err(e) => fail(e),
+        };
+    }
+    let Some(map) = value.as_object() else {
+        return fail(ApiError::bad_request("Request body must be a JSON object"));
+    };
+    let mut groups: Vec<Map<String, Value>> =
+        (0..st.cluster.nodes.len()).map(|_| Map::new()).collect();
+    for (id, revs) in map {
+        groups[st.cluster.owner_of_doc(id, db.q)].insert(id.clone(), revs.clone());
+    }
+    let mut out = Map::new();
+    for (owner, group) in groups.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let sub = Value::Object(group);
+        let result = if owner == st.cluster.me {
+            match db.revs_diff(&sub).await {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            }
+        } else {
+            let peer = st.cluster.nodes[owner].clone();
+            match forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            }
+        };
+        if let Some(obj) = result.as_object() {
+            for (id, entry) in obj {
+                out.insert(id.clone(), entry.clone());
+            }
+        }
+    }
+    json(StatusCode::OK, Value::Object(out))
+}
+
+async fn forward_json(
+    st: &AppState,
+    peer: &str,
+    dbname: &str,
+    endpoint: &str,
+    query: &str,
+    body: &Value,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    let mut url = format!("{peer}/{dbname}/{endpoint}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let mut request = st
+        .client
+        .post(url)
+        .header("x-douchdb-forwarded", "1")
+        .json(body);
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "request_failed", text));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
+}
+
+async fn all_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    method: &Method,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
     let mut opts = AllDocsOpts {
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
@@ -638,59 +979,211 @@ async fn all_docs(db: &Db, q: &HashMap<String, String>, method: &Method, body: &
             }
         }
     }
-    match db.all_docs(&opts).await {
+    let result = if st.cluster.is_clustered() && !is_forwarded(headers) {
+        cluster_all_docs(st, db, dbname, &opts, headers).await
+    } else {
+        db.all_docs(&opts).await
+    };
+    match result {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
     }
 }
 
+async fn cluster_all_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    opts: &AllDocsOpts,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    let mut full = opts.clone();
+    full.skip = 0;
+    full.limit = usize::MAX;
+    full.startkey = None;
+    full.endkey = None;
+    full.descending = false;
+
+    // Count every live doc once. Nodes may hold replicated copies, so union by
+    // id and prefer the row from the shard's owner.
+    let mut count_opts = full.clone();
+    count_opts.keys = None;
+    count_opts.include_docs = false;
+    count_opts.conflicts = false;
+    count_opts.attachments = false;
+    let mut live: HashMap<String, (usize, Value)> = HashMap::new();
+    // Range mode needs the rows themselves (with include_docs/conflicts when
+    // asked for); keys mode only needs the count here and fetches the rows
+    // below.
+    let scan_opts = if opts.keys.is_some() {
+        &count_opts
+    } else {
+        &full
+    };
+    for node in 0..st.cluster.nodes.len() {
+        let response = fetch_all_docs(st, db, dbname, node, scan_opts, headers).await?;
+        for row in response["rows"].as_array().cloned().unwrap_or_default() {
+            merge_all_docs_row(st, db, &mut live, node, row);
+        }
+    }
+    let total_rows = live.len();
+
+    if let Some(keys) = &opts.keys {
+        // A keys query must also surface deleted docs, which a range scan
+        // omits. Ask each node for exactly those keys.
+        let mut key_opts = opts.clone();
+        key_opts.skip = 0;
+        key_opts.limit = usize::MAX;
+        key_opts.startkey = None;
+        key_opts.endkey = None;
+        key_opts.descending = false;
+        let mut found: HashMap<String, (usize, Value)> = HashMap::new();
+        let mut errors: HashMap<String, Value> = HashMap::new();
+        for node in 0..st.cluster.nodes.len() {
+            let response = fetch_all_docs(st, db, dbname, node, &key_opts, headers).await?;
+            for row in response["rows"].as_array().cloned().unwrap_or_default() {
+                match row.get("id").and_then(Value::as_str) {
+                    Some(_) => merge_all_docs_row(st, db, &mut found, node, row),
+                    None => {
+                        if let Some(key) = row.get("key").and_then(Value::as_str) {
+                            errors.entry(key.to_string()).or_insert(row);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for key in keys.iter().skip(opts.skip).take(opts.limit) {
+            if let Some((_, row)) = found.remove(key) {
+                rows.push(row);
+            } else if let Some(row) = errors.remove(key) {
+                rows.push(row);
+            } else {
+                rows.push(json!({"key": key, "error": "not_found"}));
+            }
+        }
+        return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
+    }
+
+    let mut rows: Vec<(String, Value)> = live.into_iter().map(|(id, (_, row))| (id, row)).collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let before_start = match (&opts.startkey, opts.descending) {
+        (Some(start), false) => rows.iter().filter(|(id, _)| id < start).count(),
+        (Some(start), true) => rows.iter().filter(|(id, _)| id > start).count(),
+        (None, _) => 0,
+    };
+    rows.retain(|(id, _)| {
+        let after_start = opts.startkey.as_ref().map(|s| id >= s).unwrap_or(true);
+        let before_end = opts.endkey.as_ref().map(|e| id <= e).unwrap_or(true);
+        after_start && before_end
+    });
+    if opts.descending {
+        rows.reverse();
+    }
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .skip(opts.skip)
+        .take(opts.limit)
+        .map(|(_, row)| row)
+        .collect();
+    Ok(json!({"total_rows": total_rows, "offset": before_start + opts.skip, "rows": rows}))
+}
+
+fn merge_all_docs_row(
+    st: &AppState,
+    db: &Db,
+    rows: &mut HashMap<String, (usize, Value)>,
+    node: usize,
+    row: Value,
+) {
+    let Some(id) = row.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let owner = st.cluster.owner_of_doc(id, db.q);
+    match rows.get(id) {
+        Some((existing, _)) if *existing == owner => {}
+        Some(_) if owner == node => {
+            rows.insert(id.to_string(), (node, row));
+        }
+        None => {
+            rows.insert(id.to_string(), (node, row));
+        }
+        _ => {}
+    }
+}
+
+async fn fetch_all_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    node: usize,
+    opts: &AllDocsOpts,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    if node == st.cluster.me {
+        return db.all_docs(opts).await;
+    }
+    let peer = &st.cluster.nodes[node];
+    let mut query = Vec::new();
+    if opts.include_docs {
+        query.push("include_docs=true");
+    }
+    if opts.conflicts {
+        query.push("conflicts=true");
+    }
+    if opts.attachments {
+        query.push("attachments=true");
+    }
+    let mut url = format!("{peer}/{dbname}/_all_docs");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query.join("&"));
+    }
+    let body = match &opts.keys {
+        Some(keys) => json!({"keys": keys, "include_docs": opts.include_docs}),
+        None => json!({}),
+    };
+    let mut request = st
+        .client
+        .post(url)
+        .header("x-douchdb-forwarded", "1")
+        .json(&body);
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "all_docs_failed", text));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
 async fn changes(
     st: &AppState,
     db: &Db,
+    dbname: &str,
     q: &HashMap<String, String>,
     method: &Method,
     body: &[u8],
+    headers: &HeaderMap,
 ) -> Response {
-    let since = match q.get("since").map(String::as_str) {
-        Some("now") => match db.info().await {
-            Ok(info) => info["update_seq"].as_u64().unwrap_or(0),
-            Err(e) => return fail(e),
-        },
-        Some(raw) => raw.trim_matches('"').parse().unwrap_or(0),
-        None => 0,
-    };
-    let mut opts = ChangesOpts {
-        since,
-        limit: num(q, "limit"),
-        include_docs: flag(q, "include_docs"),
-        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
-        descending: flag(q, "descending"),
-        doc_ids: None,
-    };
-    if q.get("filter").map(String::as_str) == Some("_doc_ids") {
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            opts.doc_ids = value
-                .get("doc_ids")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .or_else(|| {
-                    q.get("doc_ids")
-                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-                });
-        }
-    }
     let _ = method;
-
+    let local_only = is_forwarded(headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
+    let deadline = num(q, "timeout").unwrap_or(30_000) as u64;
+
     if feed == "longpoll" || feed == "continuous" {
-        let timeout = num(q, "timeout").unwrap_or(30_000) as u64;
         let started = std::time::Instant::now();
         loop {
-            match db.changes(&opts).await {
+            match changes_once(st, db, dbname, q, body, headers, local_only).await {
                 Ok(v)
                     if v["results"]
                         .as_array()
@@ -699,20 +1192,237 @@ async fn changes(
                 {
                     return json(StatusCode::OK, v)
                 }
-                Ok(v) if started.elapsed().as_millis() as u64 >= timeout => {
+                Ok(v) if started.elapsed().as_millis() as u64 >= deadline => {
                     return json(StatusCode::OK, v)
                 }
                 Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
                 Err(e) => return fail(e),
             }
-            let _ = st;
         }
     }
 
-    match db.changes(&opts).await {
+    match changes_once(st, db, dbname, q, body, headers, local_only).await {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
     }
+}
+
+async fn changes_once(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    local_only: bool,
+) -> DbResult<Value> {
+    if st.cluster.is_clustered() && !local_only && !flag(q, "descending") {
+        return cluster_changes(st, db, dbname, q, body, headers).await;
+    }
+
+    let since = if q.get("since").map(String::as_str) == Some("now") {
+        db.info().await?["update_seq"].as_u64().unwrap_or(0)
+    } else {
+        since_component(q.get("since").map(String::as_str), st.cluster.me)
+    };
+    let opts = ChangesOpts {
+        since,
+        limit: num(q, "limit"),
+        include_docs: flag(q, "include_docs"),
+        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
+        descending: flag(q, "descending"),
+        doc_ids: doc_ids_from(q, body),
+    };
+    db.changes(&opts).await
+}
+
+fn doc_ids_from(q: &HashMap<String, String>, body: &[u8]) -> Option<Vec<String>> {
+    if q.get("filter").map(String::as_str) != Some("_doc_ids") {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(ids) = value.get("doc_ids").and_then(Value::as_array) {
+            return Some(
+                ids.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+    }
+    q.get("doc_ids")
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+}
+
+/// A cluster `since` is a base64url JSON object of `{node index: update_seq}`.
+/// Clients treat it as opaque and hand it back verbatim, so no version of
+/// PouchDB needs to understand it.
+fn encode_since(vector: &[u64]) -> String {
+    let map: Map<String, Value> = vector
+        .iter()
+        .enumerate()
+        .map(|(i, seq)| (i.to_string(), json!(seq)))
+        .collect();
+    let bytes = serde_json::to_vec(&map).unwrap_or_else(|_| b"{}".to_vec());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_since(raw: &str) -> Option<Vec<u64>> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim_matches('"'))
+        .ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let mut out = Vec::new();
+    for (key, seq) in value.as_object()? {
+        let index: usize = key.parse().ok()?;
+        if out.len() <= index {
+            out.resize(index + 1, 0);
+        }
+        out[index] = seq.as_u64()?;
+    }
+    Some(out)
+}
+
+fn since_component(raw: Option<&str>, index: usize) -> u64 {
+    let Some(raw) = raw else { return 0 };
+    let raw = raw.trim_matches('"');
+    if let Ok(seq) = raw.parse::<u64>() {
+        return seq;
+    }
+    decode_since(raw)
+        .and_then(|vector| vector.get(index).copied())
+        .unwrap_or(0)
+}
+
+async fn cluster_changes(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    let n = st.cluster.nodes.len();
+    let now = q.get("since").map(String::as_str) == Some("now");
+    let mut since = if now {
+        cluster_update_vector(st, db, dbname, headers).await?
+    } else if let Some(raw) = q.get("since").map(String::as_str) {
+        match decode_since(raw) {
+            Some(mut vector) => {
+                vector.resize(n.max(vector.len()), 0);
+                vector
+            }
+            None => vec![since_component(Some(raw), st.cluster.me); n],
+        }
+    } else {
+        vec![0; n]
+    };
+    since.resize(n, 0);
+
+    let include_docs = flag(q, "include_docs");
+    let style_all_docs = q.get("style").map(String::as_str) == Some("all_docs");
+    let doc_ids = doc_ids_from(q, body);
+    let limit = num(q, "limit");
+    let mut progress = since.clone();
+    let mut rows = Vec::new();
+
+    for node in 0..n {
+        let remaining = limit.map(|l| l.saturating_sub(rows.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        let response = if node == st.cluster.me {
+            db.changes(&ChangesOpts {
+                since: since[node],
+                limit: remaining,
+                include_docs,
+                style_all_docs,
+                descending: false,
+                doc_ids: doc_ids.clone(),
+            })
+            .await?
+        } else {
+            let peer = &st.cluster.nodes[node];
+            let mut url = format!("{peer}/{dbname}/_changes?since={}", since[node]);
+            if let Some(limit) = remaining {
+                url.push_str(&format!("&limit={limit}"));
+            }
+            if include_docs {
+                url.push_str("&include_docs=true");
+            }
+            if style_all_docs {
+                url.push_str("&style=all_docs");
+            }
+            let mut request = st.client.get(url).header("x-douchdb-forwarded", "1");
+            if let Some(value) = headers.get(header::AUTHORIZATION) {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let request = if let Some(ids) = &doc_ids {
+                request
+                    .query(&[("filter", "_doc_ids")])
+                    .json(&json!({"doc_ids": ids}))
+            } else {
+                request
+            };
+            let response = request
+                .send()
+                .await
+                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let text = response.text().await.unwrap_or_default();
+                return Err(ApiError::new(status, "changes_failed", text));
+            }
+            response
+                .json::<Value>()
+                .await
+                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?
+        };
+        for mut row in response["results"].as_array().cloned().unwrap_or_default() {
+            let shard_seq = row["seq"].as_u64().unwrap_or(0);
+            progress[node] = shard_seq;
+            row["seq"] = json!(encode_since(&progress));
+            rows.push(row);
+        }
+    }
+
+    Ok(json!({
+        "results": rows,
+        "last_seq": encode_since(&progress),
+        "pending": 0,
+    }))
+}
+
+/// Current per-node update_seq vector. Used for `since=now` and for the
+/// `update_seq` reported in `GET /db`.
+async fn cluster_update_vector(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    headers: &HeaderMap,
+) -> DbResult<Vec<u64>> {
+    let mut out = vec![0; st.cluster.nodes.len()];
+    for (node, slot) in out.iter_mut().enumerate() {
+        if node == st.cluster.me {
+            *slot = db.info().await?["update_seq"].as_u64().unwrap_or(0);
+            continue;
+        }
+        let peer = &st.cluster.nodes[node];
+        let mut request = st
+            .client
+            .get(format!("{peer}/{dbname}"))
+            .header("x-douchdb-forwarded", "1");
+        if let Some(value) = headers.get(header::AUTHORIZATION) {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        if let Ok(response) = request.send().await {
+            if response.status().is_success() {
+                if let Ok(info) = response.json::<Value>().await {
+                    *slot = info["update_seq"].as_u64().unwrap_or(0);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn doc_request(

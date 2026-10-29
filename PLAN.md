@@ -283,8 +283,19 @@ Above ~6k means something was built that nobody asked for.
 * **Group commit.** The shard actor drains up to 64 queued jobs, merges their
   `Tx`es into one synced `WriteBatch`, and acknowledges only after the fsync.
   A write overlay makes later jobs in the same group read their predecessors.
-* **Cluster, partial.** Shard map + rendezvous placement + per-document HTTP
-  proxy work; two nodes with `q=4` split writes 6/2 and converge via
-  anti-entropy. `_bulk_docs`, `_all_docs` and `_changes` still operate on the
-  local node only, and `since` is an integer rather than a version vector.
+* **Cluster routing green.** Shard map, rendezvous placement and per-document
+  proxying cover CRUD, `_bulk_docs`, `_bulk_get`, `_revs_diff` and `POST /db`
+  (generated ids are routed after parsing). `_all_docs` fans out to every node,
+  merges by id preferring the shard owner, then applies `startkey`/`skip`/
+  `limit`; `keys` queries also surface tombstones. `_changes` fans out per node
+  and returns a base64url version-vector `since`/`last_seq`; `GET /db` reports
+  the same vector as `update_seq`. Forwarded subrequests carry
+  `x-douchdb-forwarded` so the receiving peer serves them locally instead of
+  re-fanning out. Anti-entropy checkpoints that opaque vector, so it resumes
+  rather than re-pulling the whole database every tick.
+* **Cluster, remaining.** Placement still has one owner per shard (no N
+  replicas), so anti-entropy converges every node to every document rather than
+  to each shard's replica set. `?w=`/`?r=` are ignored, and `_purge`/`_compact`
+  are local. The v0.1 gate — a three-node cluster surviving a node kill
+  mid-replication — has not been run.
 
