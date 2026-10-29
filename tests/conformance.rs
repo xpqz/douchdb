@@ -241,6 +241,82 @@ async fn welcome_and_database_lifecycle() {
 }
 
 #[tokio::test]
+async fn console_is_served_from_the_couchdb_api_origin() {
+    let s = Server::start(false);
+
+    let response = s
+        .client
+        .get(format!("{}/_utils/", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .starts_with("text/html"));
+    let html = response.text().await.unwrap();
+    assert!(html.contains("id=\"app\""), "Vue mount point missing");
+    assert!(html.contains("vendor/vue.global.prod.js"));
+
+    let response = s
+        .client
+        .get(format!("{}/_utils/app.js", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .starts_with("text/javascript"));
+    let app = response.text().await.unwrap();
+    assert!(app.contains("createApp"), "not a Vue application");
+    // The console may only use the public CouchDB API, never a private route.
+    assert!(!app.contains("/api/"), "console uses a private API path");
+
+    let response = s
+        .client
+        .get(format!("{}/_utils/vendor/vue.global.prod.js", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().len() > 100_000);
+
+    let response = s
+        .client
+        .get(format!("{}/_utils/style.css", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("--accent"));
+
+    let no_redirect = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = no_redirect
+        .get(format!("{}/_utils", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/_utils/")
+    );
+}
+
+#[tokio::test]
 async fn document_crud_matches_couchdb_rev_ids() {
     let s = Server::start(false);
     s.fresh_db("crud").await;
@@ -302,6 +378,28 @@ async fn document_crud_matches_couchdb_rev_ids() {
     let (status, body) = s.put("/crud/tomb", json!({"_deleted": true})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn encoded_slashes_in_document_ids_are_not_path_separators() {
+    let s = Server::start(false);
+    s.fresh_db("slashy").await;
+
+    // CouchDB ids may contain slashes; clients encode them as %2F.
+    let (status, body) = s.put("/slashy/a%2Fb", json!({"x": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "a/b");
+
+    let (status, doc) = s.get("/slashy/a%2Fb").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["_id"], "a/b");
+    assert_eq!(doc["x"], 1);
+
+    let (status, _) = s.put("/slashy/_design%2Ffoo", json!({"views": {}})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, doc) = s.get("/slashy/_design%2Ffoo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["_id"], "_design/foo");
 }
 
 #[tokio::test]

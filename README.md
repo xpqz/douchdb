@@ -49,6 +49,29 @@ curl -X POST http://couch:5984/_replicate \
   -d '{"source":"source","target":"http://douchdb:5984/demo"}'
 ```
 
+## Web console
+
+A Fauxton-style console is embedded at `http://localhost:5984/_utils/`:
+
+![douchdb console](docs/console.png)
+
+It is a single Vue 3 application with a vendored runtime — **no npm and no build
+step**. It provides:
+
+- database list, create and delete;
+- `_all_docs` browser with prefix search and pagination;
+- document viewer/editor with JSON validation, revisions and delete;
+- `_changes` feed with history and live follow;
+- database info and `_compact`;
+- CouchDB `_session` sign-in when the server runs with `--admin`;
+- a toggleable **request log** that records every HTTP call with method, path,
+  status, timing, request JSON and response JSON.
+
+The console uses only the public CouchDB HTTP API. Its assets live in [`ui/`](ui)
+and are compiled into the binary, so `cargo build` after editing them. If you
+serve `ui/` from a different origin, set the server URL in the header; that
+origin needs CORS, which douchdb itself does not implement.
+
 ## Configuration
 
 ```

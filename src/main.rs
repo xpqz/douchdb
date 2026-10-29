@@ -10,6 +10,7 @@ mod replicate;
 mod rev;
 mod revtree;
 mod store;
+mod ui;
 
 use api::{AppState, Config};
 use auth::Auth;
@@ -132,7 +133,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/_all_dbs", get(api::all_dbs))
         .route("/_uuids", get(api::uuids))
         .route("/_membership", get(api::membership))
-        .route("/_session", get(api::session_get).post(api::session_post))
+        .route(
+            "/_session",
+            get(api::session_get)
+                .post(api::session_post)
+                .delete(api::session_delete),
+        )
+        .route("/_utils", get(ui::redirect))
+        .route("/_utils/", get(ui::index))
+        .route("/_utils/{*path}", get(ui::asset))
+        .route("/favicon.ico", get(ui::favicon))
         .route("/{db}", any(api::db_root))
         .route("/{db}/", any(api::db_root))
         .route("/{db}/{*rest}", any(api::db_rest))

@@ -349,6 +349,19 @@ pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) ->
     )
 }
 
+/// CouchDB clears the session cookie with DELETE /_session. The cookie is
+/// stateless, so expiring it on the client is all that is needed.
+pub async fn session_delete() -> Response {
+    let mut response = json(StatusCode::OK, json!({"ok": true}));
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        "AuthSession=; Version=1; Path=/; Max-Age=0; HttpOnly"
+            .parse()
+            .expect("valid cookie"),
+    );
+    response
+}
+
 pub async fn session_post(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
     let text = String::from_utf8_lossy(&body);
     let mut user = String::new();
@@ -675,11 +688,21 @@ pub async fn db_rest(
         _ => {}
     }
 
-    if let Some(id) = rest.strip_prefix("_local/") {
-        return local_doc(&db, id, &method, &body).await;
+    // `Path` percent-decodes the wildcard, which would turn an encoded slash
+    // in a document id (`a%2Fb`) into a path separator (`a`, attachment `b`).
+    // Keep the raw remainder for document routing and decode each segment only
+    // after splitting.
+    let raw_rest = uri
+        .path()
+        .strip_prefix(&format!("/{name}/"))
+        .unwrap_or(rest.as_str())
+        .to_string();
+
+    if let Some(id) = raw_rest.strip_prefix("_local/") {
+        return local_doc(&db, &percent_decode(id), &method, &body).await;
     }
 
-    doc_request(&st, &db, &name, &rest, method, &q, &headers, body).await
+    doc_request(&st, &db, &name, &raw_rest, method, &q, &headers, body).await
 }
 
 async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response {
@@ -1907,16 +1930,16 @@ async fn doc_request(
 }
 
 fn split_doc_path(rest: &str) -> (String, Option<String>) {
-    if let Some(tail) = rest.strip_prefix("_design/") {
-        return match tail.split_once('/') {
-            Some((name, att)) => (format!("_design/{name}"), Some(att.to_string())),
-            None => (format!("_design/{tail}"), None),
-        };
+    // Split on literal slashes first, then decode each segment. That keeps
+    // `a%2Fb` as one document id while `doc/att` is still an attachment path.
+    let segments: Vec<String> = rest.split('/').map(percent_decode).collect();
+    if segments.is_empty() {
+        return (String::new(), None);
     }
-    match rest.split_once('/') {
-        Some((id, att)) => (id.to_string(), Some(att.to_string())),
-        None => (rest.to_string(), None),
+    if segments[0] == "_design" && segments.len() > 1 {
+        return (format!("_design/{}", segments[1]), segments.get(2).cloned());
     }
+    (segments[0].clone(), segments.get(1).cloned())
 }
 
 fn doc_opts(q: &HashMap<String, String>) -> DocOpts {

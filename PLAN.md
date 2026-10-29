@@ -313,6 +313,11 @@ Above ~6k means something was built that nobody asked for.
   allocation, which the storage layout does not currently do.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
+* **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
+  runtime, no build step). It browses databases and documents, edits JSON, tails
+  `_changes`, shows database info, signs in through `_session`, and has a
+  toggleable request log with both directions' JSON. It talks only to the
+  public HTTP API; the static assets are the only addition to the server.
 
 ## Storage spike
 

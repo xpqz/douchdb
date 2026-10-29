@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>douchdb console</title>
+    <link rel="icon" href="favicon.svg">
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <div id="app" v-cloak>
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo">▤</span>
+          <span>douchdb</span>
+          <span class="sub">console</span>
+        </div>
+
+        <div class="server-box">
+          <label for="server-url">server</label>
+          <input
+            id="server-url"
+            v-model="baseUrl"
+            @change="saveBase"
+            spellcheck="false"
+            data-testid="server-url"
+          >
+        </div>
+
+        <div class="spacer"></div>
+
+        <button class="ghost icon" @click="refreshAll" title="Refresh databases">↻</button>
+
+        <template v-if="user">
+          <span class="user" data-testid="current-user">● {{ user }}</span>
+          <button class="ghost" @click="logout">Sign out</button>
+        </template>
+        <button v-else class="primary" @click="openLogin" data-testid="signin">Sign in</button>
+
+        <button class="ghost log-toggle" @click="logOpen = !logOpen" data-testid="toggle-log">
+          Requests <span class="badge">{{ requests.length }}</span>
+        </button>
+      </header>
+
+      <div class="shell">
+        <aside class="sidebar">
+          <div class="side-head">
+            <span>Databases</span>
+            <button class="ghost icon" @click="loadDbs" title="Reload">↻</button>
+          </div>
+
+          <form class="new-db" @submit.prevent="createDb">
+            <input
+              v-model="newDb"
+              placeholder="new database"
+              spellcheck="false"
+              data-testid="new-db-name"
+            >
+            <button class="primary" type="submit" data-testid="create-db">+</button>
+          </form>
+
+          <ul class="db-list" data-testid="db-list">
+            <li
+              v-for="db in databases"
+              :key="db"
+              :class="{ active: db === currentDb }"
+              @click="openDb(db)"
+            >
+              <span class="db-icon">▤</span>
+              <span class="db-name mono">{{ db }}</span>
+            </li>
+          </ul>
+          <p v-if="!databases.length" class="muted side-empty">No databases yet.</p>
+        </aside>
+
+        <main class="main">
+          <!-- home ------------------------------------------------------->
+          <section v-if="view === 'home'" class="page">
+            <h1>Welcome</h1>
+            <p class="muted">
+              A small console for the CouchDB HTTP API. Pick a database on the
+              left, or create one. Every request this page makes is listed in the
+              request log.
+            </p>
+            <div class="cards">
+              <div class="card">
+                <h3>Server</h3>
+                <pre class="json">{{ pretty(serverInfo) }}</pre>
+              </div>
+              <div class="card">
+                <h3>Membership</h3>
+                <pre class="json">{{ pretty(membership) }}</pre>
+              </div>
+            </div>
+          </section>
+
+          <!-- documents -------------------------------------------------->
+          <section v-if="view === 'docs'" class="page">
+            <div class="view-head">
+              <h1 class="mono">{{ currentDb }}</h1>
+              <nav class="tabs">
+                <button class="active">Documents</button>
+                <button @click="openChanges">Changes</button>
+                <button @click="openInfo">Info</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <input
+                v-model="search"
+                @keyup.enter="searchDocs"
+                placeholder="Search document ids…"
+                spellcheck="false"
+                data-testid="doc-search"
+              >
+              <button @click="searchDocs">Search</button>
+              <button v-if="activeSearch" class="ghost" @click="clearSearch">Clear</button>
+              <span class="spacer"></span>
+              <button class="primary" @click="newDoc" data-testid="new-doc">New document</button>
+            </div>
+
+            <table class="grid" data-testid="doc-list">
+              <thead>
+                <tr><th>id</th><th>revision</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in docs" :key="row.id" @click="openDoc(row.id)">
+                  <td class="mono">{{ row.id }}</td>
+                  <td class="mono muted">{{ row.value && row.value.rev }}</td>
+                  <td class="right"><button class="link" @click.stop="openDoc(row.id)">open</button></td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="!docs.length" class="empty">
+              No documents{{ activeSearch ? ' match that prefix' : '' }}.
+            </p>
+
+            <div class="pager" v-if="!activeSearch">
+              <button :disabled="page === 0" @click="prevPage">← Prev</button>
+              <span class="muted">{{ page + 1 }} / {{ pageCount }} · {{ totalRows }} docs</span>
+              <button :disabled="page + 1 >= pageCount" @click="nextPage">Next →</button>
+            </div>
+            <p v-else class="muted">Showing up to 100 ids starting with “{{ activeSearch }}”.</p>
+          </section>
+
+          <!-- document editor -------------------------------------------->
+          <section v-if="view === 'doc'" class="page">
+            <div class="view-head">
+              <h1>Document</h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button class="active">Edit</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <label class="id-field">
+                id
+                <input
+                  v-model="editor.id"
+                  :disabled="!editor.isNew"
+                  class="mono"
+                  spellcheck="false"
+                  data-testid="doc-id"
+                >
+              </label>
+              <span v-if="editor.rev" class="pill mono" data-testid="doc-rev">{{ editor.rev }}</span>
+              <span v-if="editor.deleted" class="pill danger">deleted</span>
+              <span class="spacer"></span>
+              <button @click="formatDoc">Format</button>
+              <button v-if="!editor.isNew" class="danger" @click="deleteDoc" data-testid="delete-doc">Delete</button>
+              <button class="primary" @click="saveDoc" data-testid="save-doc">Save</button>
+            </div>
+
+            <textarea
+              v-model="editor.text"
+              class="editor"
+              spellcheck="false"
+              data-testid="doc-body"
+            ></textarea>
+            <p v-if="editor.error" class="error" data-testid="doc-error">{{ editor.error }}</p>
+            <p v-if="editor.status" class="muted" data-testid="doc-status">{{ editor.status }}</p>
+          </section>
+
+          <!-- changes ---------------------------------------------------->
+          <section v-if="view === 'changes'" class="page">
+            <div class="view-head">
+              <h1 class="mono">{{ currentDb }}</h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button class="active">Changes</button>
+                <button @click="openInfo">Info</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button :class="{ primary: follow }" @click="follow = !follow" data-testid="follow">
+                {{ follow ? 'Following' : 'Follow' }}
+              </button>
+              <button @click="loadNow">From now</button>
+              <button @click="loadHistory">History</button>
+              <button class="ghost" @click="changes = []">Clear</button>
+              <span class="spacer"></span>
+              <span class="muted">{{ changes.length }} changes</span>
+            </div>
+
+            <table class="grid changes" data-testid="change-list">
+              <thead><tr><th>seq</th><th>id</th><th>changes</th></tr></thead>
+              <tbody>
+                <tr v-for="row in changes" :key="row.seq + ':' + row.id" @click="openDoc(row.id)">
+                  <td class="mono muted small">{{ seqLabel(row.seq) }}</td>
+                  <td class="mono">
+                    {{ row.id }}
+                    <span v-if="row.deleted" class="pill danger">deleted</span>
+                  </td>
+                  <td class="mono muted small">
+                    {{ (row.changes || []).map(c => c.rev).join(', ') }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="!changes.length" class="empty">
+              No changes yet. “Follow” polls the feed; “History” starts at 0.
+            </p>
+          </section>
+
+          <!-- database info ---------------------------------------------->
+          <section v-if="view === 'info'" class="page">
+            <div class="view-head">
+              <h1 class="mono">{{ currentDb }}</h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button @click="openChanges">Changes</button>
+                <button class="active">Info</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button @click="loadDbInfo">Refresh</button>
+              <button @click="compactDb">Compact</button>
+              <button class="danger" @click="deleteDb" data-testid="delete-db">Delete database</button>
+            </div>
+            <pre class="json" data-testid="db-info">{{ pretty(dbInfo) }}</pre>
+          </section>
+        </main>
+      </div>
+
+      <!-- request log ---------------------------------------------------->
+      <aside class="request-log" :class="{ open: logOpen }" data-testid="request-log">
+        <div class="log-head">
+          <strong>Request log</strong>
+          <span class="badge">{{ requests.length }}</span>
+          <span class="spacer"></span>
+          <button class="ghost" @click="requests = []" data-testid="clear-log">Clear</button>
+          <button class="ghost" @click="logOpen = false">Close</button>
+        </div>
+        <div v-if="logOpen" class="log-body">
+          <p v-if="!requests.length" class="empty">No requests yet.</p>
+          <div
+            v-for="entry in requests"
+            :key="entry.id"
+            class="log-entry"
+            :class="{ bad: !entry.ok, expanded: selectedLog === entry.id }"
+          >
+            <button class="log-line" @click="toggleLog(entry.id)" data-testid="log-entry">
+              <span class="method">{{ entry.method }}</span>
+              <span class="path mono">{{ entry.path }}</span>
+              <span class="status" :class="statusClass(entry.status)">{{ entry.status }}</span>
+              <span class="muted small">{{ entry.ms }} ms</span>
+            </button>
+            <div v-if="selectedLog === entry.id" class="log-detail">
+              <div class="kv">
+                <span>Request JSON</span>
+                <pre>{{ entry.request || '(no body)' }}</pre>
+              </div>
+              <div class="kv">
+                <span>Response JSON</span>
+                <pre>{{ entry.response }}</pre>
+              </div>
+              <button class="ghost" @click="copyLog(entry)">Copy as text</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- login ---------------------------------------------------------->
+      <div v-if="loginOpen" class="modal-backdrop" @click.self="loginOpen = false">
+        <form class="modal" @submit.prevent="doLogin">
+          <h2>Sign in</h2>
+          <p class="muted">CouchDB session authentication for {{ baseUrl }}</p>
+          <label>Name
+            <input v-model="loginName" autocomplete="username" data-testid="login-name">
+          </label>
+          <label>Password
+            <input
+              v-model="loginPass"
+              type="password"
+              autocomplete="current-password"
+              data-testid="login-password"
+            >
+          </label>
+          <p v-if="loginError" class="error" data-testid="login-error">{{ loginError }}</p>
+          <div class="modal-actions">
+            <button type="button" class="ghost" @click="loginOpen = false">Cancel</button>
+            <button type="submit" class="primary" data-testid="login-submit">Sign in</button>
+          </div>
+        </form>
+      </div>
+
+      <div v-if="toast" class="toast" :class="toastKind" data-testid="toast">{{ toast }}</div>
+    </div>
+
+    <script src="vendor/vue.global.prod.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
