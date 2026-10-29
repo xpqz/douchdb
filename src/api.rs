@@ -3,7 +3,9 @@
 
 use crate::auth::Auth;
 use crate::cluster::Cluster;
-use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts};
+use crate::db::{
+    validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
+};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -397,6 +399,9 @@ pub async fn db_root(
             let Ok(mut doc) = json_body(&body) else {
                 return fail(ApiError::bad_request("Document must be a JSON object"));
             };
+            if let Err(e) = validate_doc(&doc) {
+                return fail(e);
+            }
             if doc.get("_id").is_none() {
                 doc["_id"] = json!(crate::db::uuid());
             }
@@ -548,10 +553,15 @@ async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response 
             Err(e) => fail(e),
         },
         "PUT" => match serde_json::from_slice::<Value>(body) {
-            Ok(doc) => match db.local_put(id, doc).await {
-                Ok(v) => json(StatusCode::CREATED, v),
-                Err(e) => fail(e),
-            },
+            Ok(doc) => {
+                if let Err(e) = validate_doc(&doc) {
+                    return fail(e);
+                }
+                match db.local_put(id, doc).await {
+                    Ok(v) => json(StatusCode::CREATED, v),
+                    Err(e) => fail(e),
+                }
+            }
             Err(_) => fail(ApiError::bad_request("invalid JSON")),
         },
         "DELETE" => match db.local_delete(id).await {
@@ -577,6 +587,11 @@ async fn bulk_docs(db: &Db, body: &[u8]) -> Response {
     let Some(docs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
+    for doc in &docs {
+        if let Err(e) = validate_doc(doc) {
+            return fail(e);
+        }
+    }
     match db.put_docs(docs, new_edits).await {
         Ok(results) => {
             if new_edits {
@@ -880,12 +895,19 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
         Ok(v) => v,
         Err(e) => return fail(ApiError::bad_request(format!("invalid JSON: {e}"))),
     };
+    if let Err(e) = validate_doc(&doc) {
+        return fail(e);
+    }
     // The URL owns the id: CouchDB ignores a conflicting `_id` in the body.
     doc["_id"] = json!(docid);
     let new_edits = !q.contains_key("new_edits") || flag(q, "new_edits");
     if !new_edits && doc.get("_rev").is_none() {
         return fail(ApiError::bad_request("Document is missing _rev"));
     }
+    let tombstone = doc
+        .get("_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     match db.put_docs(vec![doc], new_edits).await {
         Ok(mut results) => {
             let mut result = results.pop().unwrap_or(Value::Null);
@@ -901,7 +923,13 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
                 };
                 return json(status, result);
             }
-            json(StatusCode::CREATED, result)
+            // CouchDB answers 200, not 201, when a PUT lands as a tombstone.
+            let status = if tombstone {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            json(status, result)
         }
         Err(e) => fail(e),
     }
@@ -909,9 +937,9 @@ async fn put_doc(db: &Db, docid: &str, body: Bytes, q: &HashMap<String, String>)
 
 async fn delete_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response {
     // A missing document is 404 even without a `rev`; only a live document
-    // without a rev is a conflict.
-    if db.get_doc(docid, &DocOpts::default()).await.is_err() {
-        return fail(ApiError::not_found("missing"));
+    // without a rev is a conflict. A tombstone reports reason "deleted".
+    if let Err(e) = db.get_doc(docid, &DocOpts::default()).await {
+        return fail(e);
     }
     let Some(rev) = q.get("rev") else {
         return fail(ApiError::conflict());

@@ -188,6 +188,14 @@ async fn document_crud_matches_couchdb_rev_ids() {
     let (status, body) = s.get("/crud/doc1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["reason"], "deleted");
+    let (status, body) = s.delete("/crud/doc1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["reason"], "deleted");
+
+    // A PUT that lands as a tombstone is 200, not 201.
+    let (status, body) = s.put("/crud/tomb", json!({"_deleted": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
 }
 
 #[tokio::test]
@@ -483,6 +491,37 @@ async fn compact_and_ensure_full_commit() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["ok"], true);
     assert!(body["instance_start_time"].is_string());
+}
+
+#[tokio::test]
+async fn rejects_unknown_special_members_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("valid").await;
+    let (status, body) = s.put("/valid/a", json!({"_x": 1})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "doc_validation");
+    assert_eq!(body["reason"], "Bad special document member: _x");
+
+    // `_bulk_docs` rejects the whole request, not just the bad document.
+    let (status, body) = s
+        .post(
+            "/valid/_bulk_docs",
+            json!({"docs": [{"_id": "b"}, {"_id": "c", "_oops": true}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "doc_validation");
+    let (status, _) = s.get("/valid/b").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no partial bulk write");
+
+    // Meta members clients echo back are allowed.
+    let (status, _) = s
+        .put(
+            "/valid/d",
+            json!({"_id": "d", "v": 1, "_conflicts": [], "_revs_info": []}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
 }
 
 #[tokio::test]

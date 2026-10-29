@@ -563,6 +563,24 @@ impl Db {
 // ---------------------------------------------------------------------------
 // document helpers
 
+/// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
+/// whether they arrive through PUT, `_bulk_docs` or `new_edits=false`.
+pub fn validate_doc(doc: &Value) -> DbResult<()> {
+    let Some(obj) = doc.as_object() else {
+        return Err(ApiError::bad_request("Document must be a JSON object"));
+    };
+    for key in obj.keys() {
+        if key.starts_with('_') && !META_FIELDS.contains(&key.as_str()) {
+            return Err(ApiError::new(
+                400,
+                "doc_validation",
+                format!("Bad special document member: {key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn doc_id(doc: &Value) -> DbResult<String> {
     match doc.get("_id") {
         Some(Value::String(id)) if !id.is_empty() => {
@@ -592,6 +610,7 @@ fn split_doc(
     /// friends are read-only decorations a client may echo back.
     const META: [&str; 9] = META_FIELDS;
 
+    validate_doc(&doc)?;
     let Value::Object(obj) = doc else {
         return Err(ApiError::bad_request("Document must be a JSON object"));
     };
@@ -678,7 +697,7 @@ fn put_many(
             shard,
             ops: &mut ops,
             staged: &mut staged,
-            seq: &seq,
+            seq,
         };
         match ctx.stage(doc, new_edits) {
             Ok(value) => results.push((i, Ok(value))),
@@ -832,7 +851,7 @@ impl Stage<'_> {
         let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
 
         let known = meta.tree.edges.contains_key(&rev);
-        if known && meta.atts.get(&rev).is_some() && attachments.is_none() {
+        if known && meta.atts.contains_key(&rev) && attachments.is_none() {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
 
