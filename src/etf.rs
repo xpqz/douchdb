@@ -1,10 +1,11 @@
 //! Minimal Erlang External Term Format encoder.
 //!
 //! CouchDB derives revision ids as
-//! `md5(term_to_binary([Deleted, OldStart, OldRev, Body, Atts]))`, so wire
-//! compatibility requires byte-identical ETF output. We only encode the term
-//! shapes that the rev-hash computation can produce.
+//! `md5(term_to_binary([Deleted, OldStart, OldRev, Body, Atts], [{minor_version, 1}]))`,
+//! so wire compatibility requires byte-identical ETF output, including the
+//! leading version byte.
 
+const VERSION_MAGIC: u8 = 131;
 const SMALL_INTEGER_EXT: u8 = 97;
 const INTEGER_EXT: u8 = 98;
 const SMALL_BIG_EXT: u8 = 110;
@@ -14,8 +15,7 @@ const LARGE_TUPLE_EXT: u8 = 105;
 const NIL_EXT: u8 = 106;
 const LIST_EXT: u8 = 108;
 const BINARY_EXT: u8 = 109;
-const ATOM_UTF8_U16_EXT: u8 = 118;
-const SMALL_ATOM_UTF8_EXT: u8 = 119;
+const ATOM_EXT: u8 = 100;
 
 /// The subset of Erlang terms needed for rev hashing.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,24 +30,21 @@ pub enum Term {
 
 impl Term {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = vec![VERSION_MAGIC];
         self.encode_into(&mut out);
         out
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            // Modern OTP always writes atoms as UTF-8, regardless of minor_version.
+            // CouchDB passes minor_version 1, which predates UTF-8 atoms: this
+            // is Latin-1 ATOM_EXT, not the modern SMALL_ATOM_UTF8_EXT. All the
+            // atoms we encode are ASCII, so bytes and characters coincide.
             Term::Atom(a) => {
-                let b = a.as_bytes();
-                if b.len() < 256 {
-                    out.push(SMALL_ATOM_UTF8_EXT);
-                    out.push(b.len() as u8);
-                } else {
-                    out.push(ATOM_UTF8_U16_EXT);
-                    out.extend((b.len() as u16).to_be_bytes());
-                }
-                out.extend_from_slice(b);
+                debug_assert!(a.is_ascii() && a.len() < 256);
+                out.push(ATOM_EXT);
+                out.extend((a.len() as u16).to_be_bytes());
+                out.extend_from_slice(a.as_bytes());
             }
             Term::Int(i) if (0..=255).contains(i) => {
                 out.push(SMALL_INTEGER_EXT);
@@ -146,29 +143,59 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn atoms_are_utf8_small() {
-        assert_eq!(Term::Atom("true").encode(), b"\x77\x04true");
-        assert_eq!(Term::Atom("false").encode(), b"\x77\x05false");
+    fn atoms_are_latin1_under_minor_version_1() {
+        // Verified against OTP 27: term_to_binary(false, [{minor_version,1}]).
+        assert_eq!(Term::Atom("false").encode(), b"\x83\x64\x00\x05false");
+        assert_eq!(Term::Atom("true").encode(), b"\x83\x64\x00\x04true");
     }
 
     #[test]
     fn integers_pick_the_smallest_form() {
-        assert_eq!(Term::Int(0).encode(), vec![97, 0]);
-        assert_eq!(Term::Int(255).encode(), vec![97, 255]);
-        assert_eq!(Term::Int(256).encode(), vec![98, 0, 0, 1, 0]);
-        assert_eq!(Term::Int(-1).encode(), vec![98, 255, 255, 255, 255]);
+        assert_eq!(Term::Int(0).encode(), vec![131, 97, 0]);
+        assert_eq!(Term::Int(255).encode(), vec![131, 97, 255]);
+        assert_eq!(Term::Int(256).encode(), vec![131, 98, 0, 0, 1, 0]);
+        assert_eq!(Term::Int(-1).encode(), vec![131, 98, 255, 255, 255, 255]);
     }
 
     #[test]
     fn lists_and_tuples() {
-        assert_eq!(Term::List(vec![]).encode(), vec![NIL_EXT]);
+        assert_eq!(Term::List(vec![]).encode(), vec![131, NIL_EXT]);
         assert_eq!(
             Term::List(vec![Term::Int(1)]).encode(),
-            vec![108, 0, 0, 0, 1, 97, 1, 106]
+            vec![131, 108, 0, 0, 0, 1, 97, 1, 106]
         );
         assert_eq!(
             Term::Tuple(vec![Term::Int(1), Term::Int(2)]).encode(),
-            vec![104, 2, 97, 1, 97, 2]
+            vec![131, 104, 2, 97, 1, 97, 2]
+        );
+    }
+
+    /// Byte-for-byte agreement with OTP 27 and with CouchDB 3.5.3's rev ids.
+    #[test]
+    fn matches_erlang_term_to_binary() {
+        let term = Term::List(vec![
+            Term::Atom("false"),
+            Term::Int(0),
+            Term::Int(0),
+            from_json(&json!({"a": 1})),
+            Term::List(vec![]),
+        ]);
+        assert_eq!(
+            term.encode(),
+            vec![
+                0x83, 0x6C, 0, 0, 0, 5, // version, LIST_EXT, 5 elements
+                0x64, 0, 5, b'f', b'a', b'l', b's', b'e', // false
+                0x61, 0, // 0
+                0x61, 0, // 0
+                0x68, 1, // tuple, 1 element
+                0x6C, 0, 0, 0, 1, // proplist of 1 pair
+                0x68, 2, // {key, value}
+                0x6D, 0, 0, 0, 1, b'a', // <<"a">>
+                0x61, 1, // 1
+                0x6A, // end proplist
+                0x6A, // empty attachments
+                0x6A, // end list
+            ]
         );
     }
 
@@ -183,8 +210,8 @@ mod tests {
     #[test]
     fn json_object_is_a_one_tuple_of_proplist() {
         let encoded = from_json(&json!({"a": 1})).encode();
-        assert_eq!(encoded[0], SMALL_TUPLE_EXT);
-        assert_eq!(encoded[1], 1, "object is an arity-1 tuple");
-        assert_eq!(encoded[2], LIST_EXT, "containing a proplist");
+        assert_eq!(encoded[1], SMALL_TUPLE_EXT);
+        assert_eq!(encoded[2], 1, "object is an arity-1 tuple");
+        assert_eq!(encoded[3], LIST_EXT, "containing a proplist");
     }
 }

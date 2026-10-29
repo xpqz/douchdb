@@ -227,4 +227,21 @@ mod tests {
         high.rev.id = vec![2; 16];
         assert_eq!(winner(&[low, high]).unwrap().rev.id, vec![2; 16]);
     }
+
+    /// Revs recorded from a live Apache CouchDB 3.5.3 (`PUT /db/doc`).
+    #[test]
+    fn matches_couchdb_3_5() {
+        let cases = [
+            (json!({"a": 1}), "23202479633c2b380f79507a776743d5"),
+            (
+                json!({"b": {"y": 2, "x": [1, 2.5, null, true]}, "a": "h\u{e9}llo"}),
+                "41692bf1af92c4fee2f4783a50ceb756",
+            ),
+            (json!({"b": 1, "a": 2}), "afc27c384a7b497e8b717857527a0dc7"),
+        ];
+        for (body, expected) in cases {
+            let got = hex16(new_revid(false, None, &body, &[]));
+            assert_eq!(got, expected, "body {body}");
+        }
+    }
 }

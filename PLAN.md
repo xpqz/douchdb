@@ -130,15 +130,23 @@ Three consequences that are easy to miss:
    faithfully.
 2. **We need an ETF encoder.** ~250 lines: `SMALL_INTEGER_EXT`, `INTEGER_EXT`,
    `SMALL_BIG_EXT`, `NEW_FLOAT_EXT`, `BINARY_EXT`, `LIST_EXT`/`NIL_EXT`,
-   `SMALL_TUPLE_EXT`, and atoms as `SMALL_ATOM_UTF8_EXT` (modern OTP always
-   writes UTF-8 atoms; `minor_version 1` selects `NEW_FLOAT_EXT`). This is the
-   single highest-risk item in the project and belongs in milestone zero.
+   `SMALL_TUPLE_EXT`, the leading `131` version byte, and — because
+   `minor_version 1` predates UTF-8 atoms — Latin-1 `ATOM_EXT` rather than
+   `SMALL_ATOM_UTF8_EXT`. That last detail changes every hash, and the version
+   byte changes every hash too.
 3. **Attachment bytes never enter the body hash** — only name, content type and
    md5. That decouples large attachments from revision identity.
 
 Validation is differential, not unit: hash a corpus of documents through both
 CouchDB's `GET /db/doc?rev=` and our encoder and compare rev ids byte for byte.
 This must be green before any storage code is written.
+
+**Status: green.** `src/rev.rs` reproduces revs from a live CouchDB 3.5.3 and
+from OTP 27's `term_to_binary/2` for plain, nested, unicode and reordered-key
+documents. Two bugs surfaced during that check, both invisible to unit tests:
+
+* the message starts with the ETF version byte `131`, which we were omitting;
+* `minor_version 1` encodes atoms as Latin-1 `ATOM_EXT`, not UTF-8.
 
 ## Winner selection
 
@@ -251,8 +259,5 @@ Above ~6k means something was built that nobody asked for.
 
 ## Open questions
 
-* `minor_version: 1` atom encoding — verify empirically against the target
-  CouchDB version rather than trusting the doc (UTF-8 atoms vs Latin-1 changes
-  every hash).
 * Should `_compact` map to `compact_range`, or be a no-op that returns `ok`?
 * Attachment chunk size vs read amplification for `pouch.getAttachment`.
