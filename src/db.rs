@@ -1925,30 +1925,58 @@ fn collect_changes(
     } else {
         usize::MAX
     };
-    let mut entries = Vec::new();
+    let mut entries: Vec<(u64, String)> = Vec::new();
     shard.scan_range_while(
         b"s/",
         Some(&seq_key(opts.since.saturating_add(1))),
         false,
         |key, value| {
-            entries.push((key.to_vec(), value.to_vec()));
+            let Some(seq) = seq_of_key(key) else {
+                return true;
+            };
+            let Ok(id) = std::str::from_utf8(value) else {
+                return true;
+            };
+            entries.push((seq, id.to_string()));
             entries.len() < entry_cap
         },
     )?;
 
     let mut rows = Vec::new();
-    for (key, id_bytes) in entries {
-        let Some(seq) = seq_of_key(&key) else {
-            continue;
-        };
-        let Ok(id) = String::from_utf8(id_bytes) else {
-            continue;
-        };
+    for (seq, id) in entries {
         if let Some(ids) = &opts.doc_ids {
             if !ids.contains(&id) {
                 continue;
             }
         }
+
+        // The live index already has the winning revision for ordinary live
+        // documents. That avoids decoding the whole revision tree from
+        // LevelDB for every row in the common no-conflicts case.
+        if !opts.style_all_docs {
+            let live = shard.live_docs()?.get(&id).cloned();
+            if let Some(live) = live {
+                let doc = if opts.include_docs {
+                    shard.get_body(&id, &live.rev).and_then(|body| {
+                        serde_json::from_str::<Value>(&embed_doc_meta(&id, &live.rev, &body)).ok()
+                    })
+                } else {
+                    None
+                };
+                rows.push(ChangeRow {
+                    id,
+                    seq,
+                    changes: vec![(live.rev, false)],
+                    deleted: false,
+                    doc,
+                });
+                if !opts.descending && rows.len() >= limit {
+                    break;
+                }
+                continue;
+            }
+        }
+
         let Some(meta) = shard.get_meta(&id) else {
             continue;
         };

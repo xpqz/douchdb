@@ -415,6 +415,24 @@ def main():
             changes_all_lat, time.perf_counter() - started
         )
 
+        for name, query in [
+            ("changes_style_all_docs", "style=all_docs"),
+            ("changes_include_docs", "include_docs=true"),
+            ("changes_style_all_docs_include_docs", "style=all_docs&include_docs=true"),
+        ]:
+            latencies = []
+            started = time.perf_counter()
+            for i in range(5):
+                elapsed, _ = request(
+                    conns[i % len(conns)],
+                    "GET",
+                    f"/perf/_changes?since=0&{query}",
+                )
+                latencies.append(elapsed)
+            result["operations"][name] = summary(
+                latencies, time.perf_counter() - started
+            )
+
         info_lat = []
         started = time.perf_counter()
         for i in range(100):
