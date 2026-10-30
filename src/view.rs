@@ -403,7 +403,7 @@ pub async fn local_map(
     owner: Option<&[bool]>,
 ) -> DbResult<(ViewSpec, Arc<Vec<Row>>, HashMap<String, Value>)> {
     let spec = load_spec(db, ddoc_id, view_name).await?;
-    let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits, owner).await?;
+    let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits).await?;
     let docs = if need_docs {
         docs_by_id(db, attachments, owner).await?
     } else {
@@ -427,23 +427,18 @@ async fn ensure_rows(
     view_name: &str,
     spec: &ViewSpec,
     limits: ViewLimits,
-    owner: Option<&[bool]>,
 ) -> DbResult<Arc<Vec<Row>>> {
     let current_seq = db.info().await?["update_seq"].as_u64().unwrap_or(0);
-    let mut design = format!(
+    let design = format!(
         "{}|{}",
         spec.map,
         spec.reduce.as_deref().unwrap_or_default()
     );
-    if let Some(owned) = owner {
-        design.push('|');
-        design.extend(owned.iter().map(|owned| if *owned { '1' } else { '0' }));
-    }
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
     let mut index = handle.lock().await;
 
     if index.design != design || index.last_seq > current_seq {
-        let rows = map_all(db, &spec.map, limits, owner).await?;
+        let rows = map_all(db, &spec.map, limits).await?;
         index
             .rebuild(rows, current_seq, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
@@ -466,11 +461,6 @@ async fn ensure_rows(
             let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
                 continue;
             };
-            if let Some(owned) = owner {
-                if !owned.get(db.shard_index(&id)).copied().unwrap_or(false) {
-                    continue;
-                }
-            }
             changed.push(id.clone());
             if id.starts_with("_design/")
                 || id.starts_with("_local/")
@@ -500,13 +490,8 @@ async fn ensure_rows(
         .map_err(|error| ApiError::new(500, "view_index_error", error))
 }
 
-async fn map_all(
-    db: &Db,
-    map_source: &str,
-    limits: ViewLimits,
-    owner: Option<&[bool]>,
-) -> DbResult<Vec<Row>> {
-    let docs = db.map_docs(owner).await?;
+async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<Row>> {
+    let docs = db.map_docs(None).await?;
     run_map_json(map_source, &docs, limits).map_err(|reason| {
         ApiError::new(500, "view_error", format!("map function failed: {reason}"))
     })

@@ -2291,7 +2291,7 @@ async fn cluster_views_span_shards_with_replication_factor_one() {
 }
 
 #[tokio::test]
-async fn cluster_view_query_fails_loudly_when_a_node_is_down() {
+async fn cluster_view_query_survives_a_node_loss_via_replicas() {
     let mut nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {
         node.fresh_db("clviewfail").await;
@@ -2318,12 +2318,20 @@ async fn cluster_view_query_fails_loudly_when_a_node_is_down() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 2);
 
-    // Do not silently return the rows from the surviving shards: a view
-    // query that cannot read every node is an error.
+    // A dead node is covered by its replicas. The fallback reads all local
+    // replicas from the surviving nodes and deduplicates rows.
     nodes[2].kill();
     let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/by_city").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert!(body["error"].is_string());
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 2);
+    let mut ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["a", "b"]);
 }
 
 #[tokio::test]

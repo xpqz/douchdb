@@ -213,20 +213,16 @@ partials. Grouped custom reducers merge by group key and then rereduce the
 partial values. `_approx_count_distinct` is intentionally excluded because
 per-owner distinct counts cannot be combined exactly.
 
-### Owner-only view indexes (#39)
+### View index locality (#39, revised #45)
 
-Each node now builds its view index only over the primary shards it owns,
-instead of also indexing replicas it will never return in an owner-only cluster
-query. The index design marker includes the ownership bit string, so indexes
-created by older builds rebuild automatically. Incremental `_changes` updates
-and `include_docs` lookups apply the same owner filter.
+Normal cluster queries still return only owner rows, but each node’s view
+index now covers every locally held replica. The owner-only index was faster
+(38.9 ms cold at n=2), but it could not answer for a dead owner’s shards. The
+replica-backed index restores node-loss failover; with n=3 on three nodes every
+local shard is owned anyway, so the n=3 numbers are unchanged.
 
-| Operation | Before (#39) | After (#39) |
-|---|---|---|
-| View cold index build | 67.31 ms | 38.92 ms |
-| View map, warm (reduce default) | p50 2.506 ms | p50 1.584 ms |
-| View map-only, warm | p50 3.251 ms | p50 2.824 ms |
-| View reduce, warm | p50 3.020 ms | p50 1.561 ms |
+At n=2 on three nodes, after replica-backed indexes: cold build ~47.5 ms, warm
+map p50 ~1.91 ms, warm reduce p50 ~1.83 ms.
 
 ### Global limited changes (#40)
 
@@ -270,6 +266,15 @@ The quorum read roughly doubles the per-request work. Use `?r=1` for read-heavy
 workloads that can tolerate a single replica, or keep the default for
 consistency.
 
+### View failover (#45)
+
+If an owner-only view fan-out hits an unavailable node, the coordinator retries
+in degraded mode: it reads all local replicas from every reachable node and
+merges duplicate rows, keeping the maximum emit count. This is slower, but a
+view remains readable as long as each shard has one live replica. The
+node-loss conformance test now expects a successful view with both documents
+after killing one of three nodes.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
@@ -286,8 +291,9 @@ consistency.
   its offset from the in-memory live-document map instead of walking earlier
   metadata.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
-  merge and JSON/HTTP for the selected rows. Cold builds are ~39 ms because
-  each node indexes only its primary shards.
+  merge and JSON/HTTP for the selected rows. Cold builds are ~40–50 ms because
+  each node indexes every locally held replica, which is what enables node-loss
+  failover.
 - **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document
   feed is ~124 ms with nodes queried concurrently. Limited feeds now merge
   every node's prefix round-robin up to the global limit.
