@@ -216,6 +216,9 @@ async fn main() -> anyhow::Result<()> {
         ))
         .layer(axum::middleware::from_fn(api::log_requests))
         .layer(axum::middleware::from_fn(api::security_headers))
+        .layer(axum::middleware::from_fn(api::request_id))
+        .layer(axum::middleware::from_fn(api::head_only))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;

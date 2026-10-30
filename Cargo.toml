@@ -23,3 +23,4 @@ rquickjs = "0.14"
 icu_collator = "2.4"
 icu_locale_core = "2.4"
 async-stream = "0.3"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
