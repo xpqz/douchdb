@@ -382,8 +382,10 @@ Above ~6k means something was built that nobody asked for.
   push the requested window down to owners, and combine global/grouped built-in
   reduces plus custom reducers via `rereduce`. Cluster view indexes cover all
   locally held replicas; normal queries filter to owner shards. When an owner
-  is down, views and `_all_docs` request only the missing shard masks from live
-  replicas instead of rescanning every reachable node. Full `_changes` feeds
+  is down, map views, reduce views and `_all_docs` request only the missing
+  shard masks from live replicas instead of rescanning every reachable node.
+  Reduce partials are recombined after fallback, including grouped and custom
+  `rereduce` reducers. Full `_changes` feeds
   also query peers concurrently; limited
   feeds merge node prefixes round-robin up to the global limit. Unavailable
   change nodes are skipped and covered by replicas, with their vector
