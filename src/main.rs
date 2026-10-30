@@ -133,7 +133,7 @@ fn parse_args() -> Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
-    let telemetry = telemetry::init(args.otel_endpoint.clone())?;
+    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     if args.nodes.len() > 1 {
         if args.me >= args.nodes.len() {
             eprintln!("--me must be smaller than the number of --nodes");

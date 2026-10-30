@@ -340,7 +340,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit per view query |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
-| `--otel-endpoint` | env | OTLP HTTP endpoint for traces and metrics |
+| `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |
 
 Without `--nodes` it runs as a single node (the cluster with one member).
 
@@ -467,7 +467,8 @@ Every HTTP request produces an OTLP trace span (`http.request`) and two metrics:
 `http.server.requests` and `http.server.duration.ms`, labelled by method and
 status. Logs remain on the normal formatting subscriber. Without an endpoint
 the telemetry layer is a no-op, so the single-binary deployment has no collector
-dependency.
+dependency. See [docs/opentelemetry.md](docs/opentelemetry.md) for collector
+configuration, the local capture demo, signal names and cluster notes.
 
 See [docs/process.md](docs/process.md) for the issue/branch workflow used for
 this work.

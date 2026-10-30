@@ -13,7 +13,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use std::sync::OnceLock;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
 pub struct Telemetry {
@@ -21,17 +21,22 @@ pub struct Telemetry {
     meter: SdkMeterProvider,
 }
 
-pub fn init(endpoint: Option<String>) -> anyhow::Result<Option<Telemetry>> {
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+pub fn init(endpoint: Option<String>, node: &str) -> anyhow::Result<Option<Telemetry>> {
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
     let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) else {
         tracing_subscriber::registry().with(fmt_layer).init();
         return Ok(None);
     };
 
-    let resource = Resource::builder().with_service_name("douchdb").build();
+    let resource = Resource::builder()
+        .with_service_name("douchdb")
+        .with_attribute(KeyValue::new("service.instance.id", node.to_string()))
+        .build();
     let span_exporter = SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint.clone())
+        .with_endpoint(signal_endpoint(&endpoint, "traces"))
         .build()?;
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter)
@@ -41,12 +46,14 @@ pub fn init(endpoint: Option<String>) -> anyhow::Result<Option<Telemetry>> {
 
     let metric_exporter = MetricExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(signal_endpoint(&endpoint, "metrics"))
         .build()?;
     let meter_provider = SdkMeterProvider::builder()
         .with_periodic_exporter(metric_exporter)
         .with_resource(resource)
         .build();
+    global::set_tracer_provider(tracer_provider.clone());
+    global::set_meter_provider(meter_provider.clone());
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let metrics_layer = tracing_opentelemetry::MetricsLayer::new(meter_provider.clone());
@@ -60,6 +67,15 @@ pub fn init(endpoint: Option<String>) -> anyhow::Result<Option<Telemetry>> {
         tracer: tracer_provider,
         meter: meter_provider,
     }))
+}
+
+fn signal_endpoint(base: &str, signal: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with(&format!("/v1/{signal}")) {
+        base.to_string()
+    } else {
+        format!("{base}/v1/{signal}")
+    }
 }
 
 impl Telemetry {
