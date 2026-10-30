@@ -1279,22 +1279,34 @@ pub async fn db_root(
             }
         }
         Method::GET | Method::HEAD => match st.db(&name).await {
-            Ok(db) => match db.info().await {
-                Ok(mut info) => {
-                    // In a cluster the update_seq is the same version vector
-                    // the changes feed returns, so clients that use it as
-                    // `since` do not skip another node's changes.
-                    if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
-                        if let Ok(vector) = cluster_update_vector(&st, &db, &name, &headers).await {
-                            let seq = encode_since(&vector);
-                            info["update_seq"] = json!(seq);
-                            info["committed_update_seq"] = json!(seq);
-                        }
-                    }
-                    json(StatusCode::OK, info)
+            Ok(db) => {
+                if is_forwarded(&st, &headers)
+                    && headers
+                        .get("x-douchdb-update-seq")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("1")
+                {
+                    return json(StatusCode::OK, json!({"update_seq": db.update_seq()}));
                 }
-                Err(e) => fail(e),
-            },
+                match db.info().await {
+                    Ok(mut info) => {
+                        // In a cluster the update_seq is the same version vector
+                        // the changes feed returns, so clients that use it as
+                        // `since` do not skip another node's changes.
+                        if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
+                            if let Ok(vector) =
+                                cluster_update_vector(&st, &db, &name, &headers).await
+                            {
+                                let seq = encode_since(&vector);
+                                info["update_seq"] = json!(seq);
+                                info["committed_update_seq"] = json!(seq);
+                            }
+                        }
+                        json(StatusCode::OK, info)
+                    }
+                    Err(e) => fail(e),
+                }
+            }
             Err(e) => fail(e),
         },
         Method::POST => {
@@ -2372,7 +2384,7 @@ async fn changes_options(
             cluster_update_vector(st, db, &db.name, headers).await?
         } else {
             let mut vector = vec![0; n];
-            vector[st.cluster.me] = db.info().await?["update_seq"].as_u64().unwrap_or(0);
+            vector[st.cluster.me] = db.update_seq();
             vector
         }
     } else if let Some(raw) = raw_since {
