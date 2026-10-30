@@ -275,6 +275,14 @@ view remains readable as long as each shard has one live replica. The
 node-loss conformance test now expects a successful view with both documents
 after killing one of three nodes.
 
+### All-docs failover (#46)
+
+`_all_docs` has the same degraded path. If any owner-only response fails, the
+coordinator reads every live replica from every reachable node, deduplicates by
+document id, and answers range/keys queries plus totals/offset from the union.
+A node-loss test kills one of three nodes and still requires all 12 documents,
+correct keys, a range window and a cluster-wide offset.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
@@ -289,7 +297,8 @@ after killing one of three nodes.
   still the fastest way to read many documents through a coordinator.
 - **`_all_docs`** is ~1.3 ms with or without a `startkey`. Each owner answers
   its offset from the in-memory live-document map instead of walking earlier
-  metadata.
+  metadata. If an owner is down, the degraded path reads all reachable replicas
+  and deduplicates by id.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
   merge and JSON/HTTP for the selected rows. Cold builds are ~40–50 ms because
   each node indexes every locally held replica, which is what enables node-loss

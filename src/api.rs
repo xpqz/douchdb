@@ -2357,6 +2357,9 @@ async fn cluster_all_docs(
                 .map(|node| fetch_all_docs(st, db, dbname, node, &key_opts, headers, true)),
         )
         .await;
+        if responses.iter().any(|response| response.is_err()) {
+            return cluster_all_docs_fallback(st, db, dbname, opts, headers).await;
+        }
         let mut total_rows = 0u64;
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut errors: HashMap<String, Value> = HashMap::new();
@@ -2403,6 +2406,9 @@ async fn cluster_all_docs(
         (0..node_count).map(|node| fetch_all_docs(st, db, dbname, node, &window, headers, true)),
     )
     .await;
+    if responses.iter().any(|response| response.is_err()) {
+        return cluster_all_docs_fallback(st, db, dbname, opts, headers).await;
+    }
     let mut total_rows = 0u64;
     let mut before_start = 0usize;
     let mut rows: Vec<(String, Value)> = Vec::new();
@@ -2416,6 +2422,135 @@ async fn cluster_all_docs(
             }
         }
     }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if opts.descending {
+        rows.reverse();
+    }
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .skip(opts.skip)
+        .take(opts.limit)
+        .map(|(_, row)| row)
+        .collect();
+    Ok(json!({"total_rows": total_rows, "offset": before_start + opts.skip, "rows": rows}))
+}
+
+/// A primary/owner was unavailable. Read every live replica from every
+/// reachable node, deduplicate by id, and answer the original query from the
+/// union. This is the degraded path; the owner-only path stays the fast path.
+async fn cluster_all_docs_fallback(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    opts: &AllDocsOpts,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    let node_count = st.cluster.nodes.len();
+    let mut full = opts.clone();
+    full.keys = None;
+    full.skip = 0;
+    full.limit = usize::MAX;
+    full.startkey = None;
+    full.endkey = None;
+    full.descending = false;
+
+    let responses = futures::future::join_all(
+        (0..node_count).map(|node| fetch_all_docs(st, db, dbname, node, &full, headers, false)),
+    )
+    .await;
+    let mut live: HashMap<String, Value> = HashMap::new();
+    let mut succeeded = false;
+    for response in responses {
+        let Ok(response) = response else {
+            continue;
+        };
+        succeeded = true;
+        for row in response["rows"].as_array().cloned().unwrap_or_default() {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                live.entry(id.to_string()).or_insert(row);
+            }
+        }
+    }
+    if !succeeded {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no replica in the cluster is reachable",
+        ));
+    }
+    let total_rows = live.len();
+
+    if let Some(keys) = &opts.keys {
+        let mut key_opts = opts.clone();
+        key_opts.skip = 0;
+        key_opts.limit = usize::MAX;
+        key_opts.startkey = None;
+        key_opts.endkey = None;
+        key_opts.descending = false;
+        let responses = futures::future::join_all(
+            (0..node_count)
+                .map(|node| fetch_all_docs(st, db, dbname, node, &key_opts, headers, false)),
+        )
+        .await;
+        let mut found: HashMap<String, Value> = HashMap::new();
+        let mut errors: HashMap<String, Value> = HashMap::new();
+        for response in responses {
+            let Ok(response) = response else {
+                continue;
+            };
+            for row in response["rows"].as_array().cloned().unwrap_or_default() {
+                match row.get("id").and_then(Value::as_str) {
+                    Some(id) => {
+                        found.insert(id.to_string(), row);
+                    }
+                    None => {
+                        if let Some(key) = row.get("key").and_then(Value::as_str) {
+                            errors.entry(key.to_string()).or_insert(row);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for key in keys.iter().skip(opts.skip).take(opts.limit) {
+            if let Some(row) = found.get(key).cloned() {
+                rows.push(row);
+            } else if let Some(row) = errors.get(key).cloned() {
+                rows.push(row);
+            } else {
+                rows.push(json!({"key": key, "error": "not_found"}));
+            }
+        }
+        return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
+    }
+
+    let before_start = match (&opts.startkey, opts.descending) {
+        (Some(start), false) => live
+            .keys()
+            .filter(|id| id.as_str() < start.as_str())
+            .count(),
+        (Some(start), true) => live
+            .keys()
+            .filter(|id| id.as_str() > start.as_str())
+            .count(),
+        (None, _) => 0,
+    };
+    let mut rows: Vec<(String, Value)> = live
+        .into_iter()
+        .filter(|(id, _)| {
+            let after_start = opts
+                .startkey
+                .as_ref()
+                .map(|start| id.as_str() >= start.as_str())
+                .unwrap_or(true);
+            let before_end = opts
+                .endkey
+                .as_ref()
+                .map(|end| id.as_str() <= end.as_str())
+                .unwrap_or(true);
+            after_start && before_end
+        })
+        .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     if opts.descending {
         rows.reverse();
