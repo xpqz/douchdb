@@ -60,6 +60,17 @@ struct DbFile {
 /// Staged operations for one atomic commit.
 type Ops = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Shard slot for a document id. Kept free so cluster code can map a view row
+/// back to its owning shard without an open database handle.
+pub fn shard_index(docid: &str, q: u32) -> usize {
+    if q <= 1 {
+        return 0;
+    }
+    let digest = Md5::digest(docid.as_bytes());
+    let n = u32::from_be_bytes(digest[..4].try_into().unwrap());
+    (n % q) as usize
+}
+
 pub struct Db {
     pub name: String,
     #[allow(dead_code)]
@@ -136,12 +147,7 @@ impl Db {
     }
 
     pub fn shard_index(&self, docid: &str) -> usize {
-        if self.q <= 1 {
-            return 0;
-        }
-        let digest = Md5::digest(docid.as_bytes());
-        let n = u32::from_be_bytes(digest[..4].try_into().unwrap());
-        (n % self.q) as usize
+        shard_index(docid, self.q)
     }
 
     fn shard(&self, docid: &str) -> &ShardHandle {
@@ -234,8 +240,23 @@ impl Db {
     }
 
     pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+        self.all_docs_filtered(opts, None).await
+    }
+
+    /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
+    /// coordinators use this to fetch each document from exactly one primary
+    /// instead of merging the same replica from every node.
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &[bool]) -> DbResult<Value> {
+        self.all_docs_filtered(opts, Some(owned)).await
+    }
+
+    async fn all_docs_filtered(
+        &self,
+        opts: &AllDocsOpts,
+        owned: Option<&[bool]>,
+    ) -> DbResult<Value> {
         if let Some(keys) = &opts.keys {
-            return self.all_docs_by_keys(opts, keys).await;
+            return self.all_docs_by_keys(opts, keys, owned).await;
         }
 
         // A shard only needs to return enough rows to satisfy the global
@@ -245,7 +266,13 @@ impl Db {
         let mut rows = Vec::new();
         let mut total_rows = 0u64;
         let mut before_start = 0usize;
-        for shard in &self.shards {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if owned
+                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let opts = opts.clone();
             let (mut shard_rows, shard_offset, shard_docs) = shard
                 .call(move |s| {
@@ -328,9 +355,20 @@ impl Db {
         Ok(docs)
     }
 
-    async fn all_docs_by_keys(&self, opts: &AllDocsOpts, keys: &[String]) -> DbResult<Value> {
+    async fn all_docs_by_keys(
+        &self,
+        opts: &AllDocsOpts,
+        keys: &[String],
+        owned: Option<&[bool]>,
+    ) -> DbResult<Value> {
         let mut total_rows = 0u64;
-        for shard in &self.shards {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if owned
+                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             total_rows += shard.call(|s| Ok(s.counts().0)).await?;
         }
 
@@ -341,8 +379,17 @@ impl Db {
             .cloned()
             .collect();
         let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
+        let mut included = vec![false; page.len()];
         for (slot, key) in page.iter().enumerate() {
-            grouped[self.shard_index(key)].push((slot, key.clone()));
+            let shard = self.shard_index(key);
+            if owned
+                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            included[slot] = true;
+            grouped[shard].push((slot, key.clone()));
         }
 
         let mut results: Vec<Option<Value>> = vec![None; page.len()];
@@ -369,7 +416,12 @@ impl Db {
         Ok(json!({
             "total_rows": total_rows,
             "offset": Value::Null,
-            "rows": results.into_iter().map(Option::unwrap).collect::<Vec<_>>(),
+            "rows": results
+                .into_iter()
+                .enumerate()
+                .filter(|(slot, _)| included[*slot])
+                .map(|(_, row)| row.unwrap_or(Value::Null))
+                .collect::<Vec<_>>(),
         }))
     }
 

@@ -2,7 +2,8 @@
 
 A reproducible HTTP benchmark for one douchdb node. This is a baseline, not a
 capacity claim: it measures the current implementation on one machine with a
-warm local filesystem and no authentication.
+warm local filesystem and no authentication. Multi-node numbers are in
+[performance-cluster.md](performance-cluster.md).
 
 ## Environment
 

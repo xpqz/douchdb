@@ -516,6 +516,13 @@ cargo build --release
 python3 scripts/perf_sweep.py --docs 6000
 ```
 
+A three-node (`q=4`, `n=2`) cluster benchmark is in
+[docs/performance-cluster.md](docs/performance-cluster.md):
+
+```sh
+python3 scripts/perf_cluster.py --docs 6000
+```
+
 ## Tests
 
 ```sh

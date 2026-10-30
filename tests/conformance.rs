@@ -1487,6 +1487,13 @@ async fn cluster_routes_writes_and_merges_all_docs() {
     assert_eq!(rows[2]["key"], "zzz");
     assert_eq!(rows[2]["error"], "not_found");
 
+    // Repeated keys preserve request order and repeat the row.
+    let (_, body) = nodes[0]
+        .post("/cluster/_all_docs", json!({"keys": ["d1", "d1"]}))
+        .await;
+    assert_eq!(body["rows"][0]["id"], "d1");
+    assert_eq!(body["rows"][1]["id"], "d1");
+
     let (_, body) = nodes[0].get("/cluster/_all_docs").await;
     assert_eq!(body["total_rows"], 7);
 }
@@ -1979,6 +1986,10 @@ async fn cluster_views_merge_rows_from_every_replica() {
         "count": {
             "map": "function(doc){ emit(doc.city, null); }",
             "reduce": "_count"
+        },
+        "sum": {
+            "map": "function(doc){ emit(doc.city, doc.n); }",
+            "reduce": "_sum"
         }
     }});
     let (status, body) = nodes[0].put("/clview/_design/v", ddoc).await;
@@ -2008,6 +2019,47 @@ async fn cluster_views_merge_rows_from_every_replica() {
             assert_eq!(row["value"], 6);
         }
     }
+
+    // Global built-in reduces are computed per owner and combined.
+    let (_, body) = nodes[0].get("/clview/_design/v/_view/count").await;
+    assert_eq!(body["rows"][0]["value"], 12);
+    let (_, body) = nodes[0].get("/clview/_design/v/_view/sum").await;
+    assert_eq!(body["rows"][0]["value"], 66);
+
+    // Map queries push the window down to the owner nodes but still report the
+    // whole-view total and the correct offset.
+    let (_, body) = nodes[0]
+        .get("/clview/_design/v/_view/by_city?skip=2&limit=5")
+        .await;
+    assert_eq!(body["total_rows"], 12);
+    assert_eq!(body["offset"], 2);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["v2", "v4", "v6", "v8", "v1"]);
+
+    let (_, body) = nodes[0]
+        .get("/clview/_design/v/_view/by_city?descending=true&limit=3")
+        .await;
+    assert_eq!(body["total_rows"], 12);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["v9", "v7", "v5"]);
+
+    // include_docs travels with the pushed-down window.
+    let (_, body) = nodes[0]
+        .get("/clview/_design/v/_view/by_city?include_docs=true&limit=3")
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row["doc"]["_id"] == row["id"]));
 }
 
 #[tokio::test]

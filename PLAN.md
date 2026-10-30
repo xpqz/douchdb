@@ -370,6 +370,11 @@ Above ~6k means something was built that nobody asked for.
   document through `Value`; the rebuilt index seeds a sorted in-memory snapshot
   that warm queries reuse, and built-in reducers skip per-row key/value
   allocation. See the #31 before/after numbers in `docs/performance.md`.
+* **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
+  view queries fetch only shards a node owns, run peer requests concurrently,
+  push the requested window down to owners, and combine global built-in
+  reduces. A reproducible three-node `q=4`/`n=2` benchmark and before/after
+  numbers are in `docs/performance-cluster.md`.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
