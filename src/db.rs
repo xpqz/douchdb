@@ -14,6 +14,7 @@ use base64::Engine;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1458,73 +1459,80 @@ fn collect_all_docs(
     Vec<(String, Option<String>, Option<Value>, Vec<String>, bool)>,
     usize,
 )> {
+    let start = opts.startkey.as_deref();
+    let end = opts.endkey.as_deref();
     let mut rows = Vec::new();
-    let mut before_start = 0usize;
+    let before_start = {
+        let live = shard.live_docs()?;
+        let before_start = match (start, opts.descending) {
+            (Some(start), false) => live
+                .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
+                .count(),
+            (Some(start), true) => live
+                .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
+                .count(),
+            (None, _) => 0,
+        };
 
-    shard.scan_range_while(b"m/", None, opts.descending, |key, bytes| {
-        let Some(id) = std::str::from_utf8(&key[2..]).ok() else {
-            return true;
+        let empty_range = match (start, end) {
+            (Some(start), Some(end)) if opts.descending => start < end,
+            (Some(start), Some(end)) => start > end,
+            _ => false,
         };
-        let Ok(meta) = serde_json::from_slice::<DocMeta>(bytes) else {
-            return true;
-        };
-        let Some(winner) = meta.tree.winner() else {
-            return true;
-        };
-        if meta.tree.is_deleted(&winner) {
-            return true;
+        if !empty_range {
+            if opts.descending {
+                let range = match (start, end) {
+                    (Some(start), Some(end)) => (Bound::Included(end), Bound::Included(start)),
+                    (Some(start), None) => (Bound::Unbounded, Bound::Included(start)),
+                    (None, Some(end)) => (Bound::Included(end), Bound::Unbounded),
+                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
+                };
+                for (id, winner) in live.range::<str, _>(range).rev() {
+                    if rows.len() >= take {
+                        break;
+                    }
+                    rows.push((id.clone(), Some(winner.clone()), None, Vec::new(), false));
+                }
+            } else {
+                let range = match (start, end) {
+                    (Some(start), Some(end)) => (Bound::Included(start), Bound::Included(end)),
+                    (Some(start), None) => (Bound::Included(start), Bound::Unbounded),
+                    (None, Some(end)) => (Bound::Unbounded, Bound::Included(end)),
+                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
+                };
+                for (id, winner) in live.range::<str, _>(range) {
+                    if rows.len() >= take {
+                        break;
+                    }
+                    rows.push((id.clone(), Some(winner.clone()), None, Vec::new(), false));
+                }
+            }
         }
+        before_start
+    };
 
-        if opts.descending {
-            if let Some(start) = &opts.startkey {
-                if id > start.as_str() {
-                    before_start += 1;
-                    return true;
-                }
-            }
-            if let Some(end) = &opts.endkey {
-                if id < end.as_str() {
-                    return false;
-                }
-            }
-        } else {
-            if let Some(start) = &opts.startkey {
-                if id < start.as_str() {
-                    before_start += 1;
-                    return true;
-                }
-            }
-            if let Some(end) = &opts.endkey {
-                if id > end.as_str() {
-                    return false;
-                }
-            }
-        }
-
-        if rows.len() >= take {
-            return false;
-        }
-        let conflicts = if opts.conflicts {
-            meta.tree.conflicts(&winner)
-        } else {
-            Vec::new()
-        };
-        rows.push((id.to_string(), Some(winner), None, conflicts, false));
-        rows.len() < take
-    })?;
-
-    if opts.include_docs {
-        for (id, rev, doc, _, _) in rows.iter_mut() {
+    if opts.include_docs || opts.conflicts {
+        for (id, rev, doc, conflicts, _) in rows.iter_mut() {
             let Some(rev) = rev.as_ref() else {
                 continue;
             };
-            let doc_opts = DocOpts {
-                rev: Some(rev.clone()),
-                conflicts: opts.conflicts,
-                attachments: opts.attachments,
-                ..Default::default()
+            let meta = if opts.conflicts {
+                shard.get_meta(id)
+            } else {
+                None
             };
-            *doc = read_doc(shard, id, &doc_opts).ok();
+            if let Some(meta) = &meta {
+                *conflicts = meta.tree.conflicts(rev);
+            }
+            if opts.include_docs {
+                let doc_opts = DocOpts {
+                    rev: Some(rev.clone()),
+                    conflicts: opts.conflicts,
+                    attachments: opts.attachments,
+                    ..Default::default()
+                };
+                *doc = read_doc(shard, id, &doc_opts).ok();
+            }
         }
     }
 

@@ -740,6 +740,22 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
         .map(|row| row["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["d", "b"]);
+
+    // The live-document map is maintained after it has been built.
+    let (_, doc) = s.get("/ranges/c").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s.delete(&format!("/ranges/c?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/ranges/_all_docs?startkey=%22d%22&limit=2").await;
+    assert_eq!(body["total_rows"], 3);
+    assert_eq!(body["offset"], 1);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["e", "f"]);
 }
 
 #[tokio::test]

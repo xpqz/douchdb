@@ -375,6 +375,11 @@ Above ~6k means something was built that nobody asked for.
   push the requested window down to owners, and combine global built-in
   reduces. A reproducible three-node `q=4`/`n=2` benchmark and before/after
   numbers are in `docs/performance-cluster.md`.
+* **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
+  sorted map of live ids to winning revisions on the first ascending range
+  query, then maintains it on writes. This removes metadata decodes and makes
+  `startkey` offsets a range count without adding an extra LevelDB write per
+  ingested document. Descending ranges still use the metadata scan.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
