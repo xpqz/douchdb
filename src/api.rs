@@ -813,6 +813,7 @@ pub async fn db_rest(
                 )),
             }
         }
+        "_view_cleanup" => return ok(),
         "_local" => return fail(ApiError::bad_request("missing local doc id")),
         _ => {}
     }
@@ -831,7 +832,298 @@ pub async fn db_rest(
         return local_doc(&db, &percent_decode(id), &method, &body).await;
     }
 
+    if let Some((ddoc, view)) = view_path(&rest) {
+        return view_request(&st, &db, &name, &ddoc, &view, &method, &q, &body, &headers).await;
+    }
+
     doc_request(&st, &db, &name, &raw_rest, method, &q, &headers, body).await
+}
+
+/// `_design/{ddoc}/_view/{view}` (the rest has already been percent-decoded).
+fn view_path(rest: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() == 4
+        && parts[0] == "_design"
+        && parts[2] == "_view"
+        && !parts[1].is_empty()
+        && !parts[3].is_empty()
+    {
+        Some((format!("_design/{}", parts[1]), parts[3].to_string()))
+    } else {
+        None
+    }
+}
+
+fn view_json_param(q: &HashMap<String, String>, name: &str) -> DbResult<Option<Value>> {
+    match q.get(name) {
+        Some(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(value) => Ok(Some(value)),
+            // CouchDB wants JSON-encoded keys, but tolerating a bare string is
+            // friendlier to hand-written URLs.
+            Err(_) => Ok(Some(Value::String(raw.clone()))),
+        },
+        None => Ok(None),
+    }
+}
+
+async fn view_request(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    view_name: &str,
+    method: &Method,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Response {
+    if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
+        return fail(ApiError::new(
+            405,
+            "method_not_allowed",
+            "method not allowed",
+        ));
+    }
+
+    let build = || -> DbResult<crate::view::ViewQuery> {
+        let mut keys = match view_json_param(q, "keys")? {
+            Some(Value::Array(keys)) => Some(keys),
+            Some(_) => return Err(ApiError::bad_request("`keys` must be a JSON array")),
+            None => None,
+        };
+        if keys.is_none() && *method == Method::POST {
+            if let Ok(value) = serde_json::from_slice::<Value>(body) {
+                if let Some(array) = value.get("keys").and_then(Value::as_array) {
+                    keys = Some(array.clone());
+                }
+            }
+        }
+        Ok(crate::view::ViewQuery {
+            key: view_json_param(q, "key")?,
+            keys,
+            startkey: view_json_param(q, "startkey")?,
+            endkey: view_json_param(q, "endkey")?,
+            startkey_docid: q.get("startkey_docid").cloned(),
+            endkey_docid: q.get("endkey_docid").cloned(),
+            descending: flag(q, "descending"),
+            inclusive_end: q
+                .get("inclusive_end")
+                .map(|value| value != "false")
+                .unwrap_or(true),
+            skip: num(q, "skip").unwrap_or(0),
+            limit: num(q, "limit").unwrap_or(usize::MAX),
+            reduce: q.get("reduce").map(|_| flag(q, "reduce")),
+            group: flag(q, "group"),
+            group_level: num(q, "group_level").unwrap_or(0),
+            include_docs: flag(q, "include_docs"),
+            attachments: flag(q, "attachments"),
+            update_seq: flag(q, "update_seq"),
+        })
+    };
+
+    let query = match build() {
+        Ok(query) => query,
+        Err(error) => return fail(error),
+    };
+    let result = if st.cluster.is_clustered() && !is_forwarded(headers) {
+        match cluster_view_rows(st, db, dbname, ddoc, view_name, &query, headers).await {
+            Ok((spec, rows, docs)) => crate::view::finish(&spec, rows, docs, &query),
+            Err(error) => Err(error),
+        }
+    } else {
+        crate::view::query(db, ddoc, view_name, &query).await
+    };
+
+    match result {
+        Ok(mut value) => {
+            if query.update_seq {
+                if let Ok(info) = db.info().await {
+                    value["update_seq"] = info["update_seq"].clone();
+                }
+            }
+            json(StatusCode::OK, value)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Views are sharded with the documents: each node maps its local replicas and
+/// the coordinator merges identical rows. The same row exists on N nodes, so
+/// occurrences are counted per node and the maximum count is kept, which
+/// preserves intentional duplicate emits while removing replica copies.
+async fn cluster_view_rows(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    view_name: &str,
+    query: &crate::view::ViewQuery,
+    headers: &HeaderMap,
+) -> DbResult<(
+    crate::view::ViewSpec,
+    Vec<crate::view::Row>,
+    HashMap<String, Value>,
+)> {
+    let ddoc_doc = match db.get_doc(ddoc, &DocOpts::default()).await {
+        Ok(doc) => doc,
+        Err(error) if error.status == 404 => {
+            fetch_ddoc_from_replica(st, db, dbname, ddoc, headers).await?
+        }
+        Err(error) => return Err(error),
+    };
+    let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
+
+    let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+    let mut docs: HashMap<String, Value> = HashMap::new();
+    let mut succeeded = false;
+    let mut last_error = None;
+
+    for node in 0..st.cluster.nodes.len() {
+        let batch = if node == st.cluster.me {
+            match crate::view::local_map(db, ddoc, view_name, query.attachments).await {
+                Ok((_, rows, node_docs)) => Some((rows, node_docs)),
+                Err(error) if error.status == 404 => None,
+                Err(error) => {
+                    last_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            let peer = st.cluster.nodes[node].clone();
+            let url = format!(
+                "{peer}/{dbname}/{}/_view/{}",
+                percent_encode(ddoc),
+                percent_encode(view_name)
+            );
+            let mut request = st
+                .client
+                .get(url)
+                .header("x-douchdb-forwarded", "1")
+                .query(&[
+                    ("reduce", "false"),
+                    (
+                        "include_docs",
+                        if query.include_docs { "true" } else { "false" },
+                    ),
+                    (
+                        "attachments",
+                        if query.attachments { "true" } else { "false" },
+                    ),
+                ]);
+            request = forward_client_auth(request, headers);
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<Value>().await {
+                        Ok(value) => Some(decode_view_batch(value)),
+                        Err(error) => {
+                            last_error = Some(ApiError::new(502, "bad_gateway", error.to_string()));
+                            None
+                        }
+                    }
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Ok(response) => {
+                    last_error = Some(ApiError::new(
+                        response.status().as_u16(),
+                        "view_failed",
+                        response.text().await.unwrap_or_default(),
+                    ));
+                    None
+                }
+                Err(error) => {
+                    last_error = Some(ApiError::new(502, "bad_gateway", error.to_string()));
+                    None
+                }
+            }
+        };
+
+        if let Some((rows, node_docs)) = batch {
+            succeeded = true;
+            docs.extend(node_docs);
+            let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+            for row in rows {
+                let key = row_key(&row);
+                local
+                    .entry(key)
+                    .and_modify(|(count, _)| *count += 1)
+                    .or_insert((1, row));
+            }
+            for (key, (count, row)) in local {
+                match counts.get_mut(&key) {
+                    Some((existing, _)) => *existing = (*existing).max(count),
+                    None => {
+                        counts.insert(key, (count, row));
+                    }
+                }
+            }
+        }
+    }
+
+    if !succeeded {
+        return Err(last_error.unwrap_or_else(|| ApiError::not_found("missing view")));
+    }
+    let mut rows = Vec::new();
+    for (_, (count, row)) in counts {
+        for _ in 0..count {
+            rows.push(row.clone());
+        }
+    }
+    Ok((spec, rows, docs))
+}
+
+fn decode_view_batch(value: Value) -> (Vec<crate::view::Row>, HashMap<String, Value>) {
+    let mut rows = Vec::new();
+    let mut docs = HashMap::new();
+    for row in value["rows"].as_array().cloned().unwrap_or_default() {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if let Some(doc) = row.get("doc").cloned() {
+            docs.insert(id.clone(), doc);
+        }
+        rows.push(crate::view::Row {
+            id,
+            key: row.get("key").cloned().unwrap_or(Value::Null),
+            value: row.get("value").cloned().unwrap_or(Value::Null),
+        });
+    }
+    (rows, docs)
+}
+
+fn row_key(row: &crate::view::Row) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        row.id,
+        serde_json::to_string(&row.key).unwrap_or_default(),
+        serde_json::to_string(&row.value).unwrap_or_default()
+    )
+}
+
+async fn fetch_ddoc_from_replica(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    for node in st.cluster.replicas_of_doc(ddoc, db.q) {
+        if node == st.cluster.me {
+            continue;
+        }
+        let peer = st.cluster.nodes[node].clone();
+        let mut request = st
+            .client
+            .get(format!("{peer}/{dbname}/{}", percent_encode(ddoc)));
+        request = forward_client_auth(request, headers);
+        if let Ok(response) = request.send().await {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    return Ok(value);
+                }
+            }
+        }
+    }
+    Err(ApiError::not_found(format!("missing {ddoc}")))
 }
 
 async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response {

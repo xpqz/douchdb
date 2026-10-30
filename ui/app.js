@@ -87,6 +87,22 @@
       const membership = ref(null);
       const dbInfo = ref(null);
 
+      const viewDefs = ref([]);
+      const selectedView = ref(null);
+      const viewForm = reactive({
+        key: '',
+        startkey: '',
+        endkey: '',
+        limit: 50,
+        include_docs: false,
+        reduce: 'default',
+        group: false,
+        descending: false,
+      });
+      const viewResult = ref(null);
+      const viewError = ref('');
+      const viewLoading = ref(false);
+
       const toast = ref('');
       const toastKind = ref('ok');
 
@@ -273,6 +289,10 @@
           changes.value = [];
           changesLastSeq.value = 0;
           dbInfo.value = null;
+          viewDefs.value = [];
+          selectedView.value = null;
+          viewResult.value = null;
+          viewError.value = '';
         }
         if (parts[2] === 'doc' && parts[3]) {
           loadDocById(decodeURIComponent(parts.slice(3).join('/')));
@@ -281,6 +301,9 @@
         } else if (parts[2] === 'changes') {
           view.value = 'changes';
           if (!changes.value.length) loadNow();
+        } else if (parts[2] === 'views') {
+          view.value = 'views';
+          loadViews();
         } else if (parts[2] === 'info') {
           view.value = 'info';
           loadDbInfo();
@@ -564,6 +587,98 @@
         navigate(dbHash(currentDb.value, 'info'));
       }
 
+      // ----- views -------------------------------------------------------
+
+      async function loadViews() {
+        if (!currentDb.value) return;
+        viewError.value = '';
+        const start = JSON.stringify('_design/');
+        const end = JSON.stringify('_design/\ufff0');
+        try {
+          const data = await call(
+            'GET',
+            `/${enc(currentDb.value)}/_all_docs?startkey=${enc(start)}&endkey=${enc(end)}&include_docs=true`
+          );
+          const defs = [];
+          for (const row of data.rows || []) {
+            const doc = row.doc;
+            if (!doc || !doc.views) continue;
+            const views = Object.entries(doc.views).map(([name, spec]) => ({
+              name,
+              reduce: Boolean(spec && spec.reduce),
+            }));
+            if (views.length) defs.push({ ddoc: doc._id, views });
+          }
+          viewDefs.value = defs;
+          if (
+            selectedView.value &&
+            !defs.some(
+              (group) =>
+                group.ddoc === selectedView.value.ddoc &&
+                group.views.some((item) => item.name === selectedView.value.name)
+            )
+          ) {
+            selectedView.value = null;
+            viewResult.value = null;
+          }
+        } catch (error) {
+          viewError.value = error.data
+            ? pretty(error.data)
+            : error.message || String(error);
+          viewDefs.value = [];
+        }
+      }
+
+      function openViews() {
+        navigate(dbHash(currentDb.value, 'views'));
+      }
+
+      function selectView(ddoc, name, hasReduce) {
+        selectedView.value = { ddoc, name, reduce: hasReduce };
+        viewError.value = '';
+        viewResult.value = null;
+        runView();
+      }
+
+      async function runView() {
+        if (!selectedView.value) return;
+        const params = [];
+        for (const [key, value] of [
+          ['key', viewForm.key],
+          ['startkey', viewForm.startkey],
+          ['endkey', viewForm.endkey],
+        ]) {
+          if (value.trim()) params.push(`${key}=${enc(value.trim())}`);
+        }
+        if (viewForm.limit) params.push(`limit=${enc(String(viewForm.limit))}`);
+        if (viewForm.include_docs) params.push('include_docs=true');
+        if (viewForm.descending) params.push('descending=true');
+        if (viewForm.group) params.push('group=true');
+        if (viewForm.reduce !== 'default') {
+          params.push(`reduce=${enc(viewForm.reduce)}`);
+        }
+        const path =
+          `/${enc(currentDb.value)}/${enc(selectedView.value.ddoc)}/_view/` +
+          `${enc(selectedView.value.name)}` +
+          (params.length ? `?${params.join('&')}` : '');
+        viewLoading.value = true;
+        viewError.value = '';
+        try {
+          viewResult.value = await call('GET', path);
+        } catch (error) {
+          viewResult.value = null;
+          viewError.value = error.data
+            ? pretty(error.data)
+            : error.message || String(error);
+        } finally {
+          viewLoading.value = false;
+        }
+      }
+
+      function compact(value) {
+        return JSON.stringify(value);
+      }
+
       function seqLabel(seq) {
         if (seq === null || seq === undefined) return '';
         const text = String(seq);
@@ -714,7 +829,18 @@
         saveDoc,
         deleteDoc,
         openChanges,
+        openViews,
         openInfo,
+        viewDefs,
+        selectedView,
+        viewForm,
+        viewResult,
+        viewError,
+        viewLoading,
+        loadViews,
+        selectView,
+        runView,
+        compact,
         loadNow,
         loadHistory,
         seqLabel,

@@ -11,6 +11,7 @@ mod rev;
 mod revtree;
 mod store;
 mod ui;
+mod view;
 
 use api::{AppState, Config};
 use auth::Auth;

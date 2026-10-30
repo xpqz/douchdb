@@ -5,8 +5,8 @@ LevelDB, runnable as a Q-shard × N-replica cluster.
 
 The goal is not to reimplement all of CouchDB. It is a server that PouchDB and
 CouchDB can replicate against in both directions, with CouchDB-compatible
-revision ids, HTTP shapes and status codes. No server-side JavaScript, views,
-Mango or `_replicator`.
+revision ids, HTTP shapes and status codes. Map/reduce views run on an embedded
+QuickJS engine; Mango, `_replicator`, lists and shows are not implemented.
 
 See [PLAN.md](PLAN.md) for the design, decisions and known limits.
 
@@ -48,6 +48,53 @@ curl -X POST http://couch:5984/_replicate \
   -H 'Content-Type: application/json' \
   -d '{"source":"source","target":"http://douchdb:5984/demo"}'
 ```
+
+## Views
+
+Views live in design documents and run JavaScript map/reduce functions on the
+embedded QuickJS engine:
+
+```sh
+curl -X PUT localhost:5984/shop/_design/shop \
+  -H 'Content-Type: application/json' \
+  -d '{"views":{
+        "by_city":{"map":"function(doc){ if(doc.city) emit(doc.city, doc.price); }"},
+        "count":{"map":"function(doc){ if(doc.city) emit(doc.city, null); }","reduce":"_count"}
+      }}'
+
+curl 'localhost:5984/shop/_design/shop/_view/by_city?key="Berlin"&include_docs=true'
+curl 'localhost:5984/shop/_design/shop/_view/count?group=true'
+```
+
+Map queries support `key`, `keys` (GET or POST body), `startkey`, `endkey`,
+`startkey_docid`, `endkey_docid`, `descending`, `inclusive_end`, `skip`,
+`limit`, `include_docs` and `attachments`, and return
+`{"total_rows","offset","rows":[{"id","key","value"}]}`. Reduce queries support
+`reduce`, `group` and `group_level`, and return `{"rows":[{"key","value"}]}`.
+Built-in reducers are `_count`, `_sum`, `_stats` and `_approx_count_distinct`;
+custom JavaScript reducers receive `(keys, values, rereduce)`. `_view_cleanup`
+is accepted as a no-op.
+
+The console's **Views** tab lists every view in the database's design documents
+and runs the query with the same options:
+
+![douchdb views](docs/views.png)
+
+View limits:
+
+- Views are built on demand: every query maps all live documents. There is no
+  persistent incremental index yet.
+- Only the winning revision of each document is mapped; `_design/` and
+  `_local/` documents are skipped.
+- String collation uses Unicode code points, not ICU; ASCII ordering matches
+  CouchDB.
+- Map/reduce functions run with a 64 MiB heap, a 512 KiB stack and a 5 s
+  wall-clock limit per query.
+- Custom reduce runs once per group with `rereduce=false`; there is no partial
+  rereduce for very large groups.
+- On a cluster, the coordinator fetches map rows from every node and merges
+  them, so views span all shards. A node that fails is skipped; results can be
+  partial until it returns.
 
 ## Web console
 
@@ -187,7 +234,8 @@ database create/get/delete, document CRUD with `?rev=`, `?revs=`,
 `?open_revs=`, `?new_edits=false`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
 `_changes` (normal/longpoll/continuous, `style=all_docs`, `filter=_doc_ids`),
 `_revs_diff`, `_local/*`, `_purge`, `_compact`, `_revs_limit`,
-`_ensure_full_commit`, and base64 attachments.
+`_design/{ddoc}/_view/{view}`, `_view_cleanup`, `_ensure_full_commit`, and
+base64 attachments.
 
 ## Tests
 
@@ -219,4 +267,5 @@ cluster with anti-entropy are implemented and tested. Known limits:
 - Version vectors are keyed per node, not per shard replica.
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
   shard for ~27 s (measured in [PLAN.md](PLAN.md)).
-- No views, Mango, server-side JS, multipart attachments or metrics.
+- No Mango, lists/shows, multipart attachments or metrics; view indexes are
+  computed on demand rather than incrementally maintained.

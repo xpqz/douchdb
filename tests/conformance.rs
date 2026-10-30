@@ -1348,6 +1348,63 @@ async fn cluster_honours_w_and_r_quorum_parameters() {
 }
 
 #[tokio::test]
+async fn cluster_views_merge_rows_from_every_replica() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clview").await;
+    }
+
+    let docs: Vec<Value> = (0..12)
+        .map(|i| {
+            json!({
+                "_id": format!("v{i}"),
+                "city": if i % 2 == 0 { "Berlin" } else { "Paris" },
+                "n": i,
+            })
+        })
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clview/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let ddoc = json!({"views": {
+        "by_city": {"map": "function(doc){ emit(doc.city, doc.n); }"},
+        "count": {
+            "map": "function(doc){ emit(doc.city, null); }",
+            "reduce": "_count"
+        }
+    }});
+    let (status, body) = nodes[0].put("/clview/_design/v", ddoc).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Each node stores only its replicas; every node's view query must still
+    // see all documents after the coordinator merges the map rows.
+    for node in &nodes {
+        let (status, body) = node.get("/clview/_design/v/_view/by_city").await;
+        assert_eq!(status, StatusCode::OK, "view via {}", node.base);
+        assert_eq!(body["total_rows"], 12, "view via {}", node.base);
+        let mut ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 12, "duplicate rows via {}", node.base);
+
+        let (status, body) = node.get("/clview/_design/v/_view/count?group=true").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["value"], 6);
+        }
+    }
+}
+
+#[tokio::test]
 async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
     let nodes = start_cluster_with_auth(2, "1", 2);
     let basic = format!("Basic {}", base64_encode(b"admin:douchdb"));
@@ -1499,6 +1556,182 @@ async fn cluster_database_creation_and_drop_are_broadcast() {
             node.base
         );
     }
+}
+
+#[tokio::test]
+async fn views_map_reduce_collation_and_query_options() {
+    let s = Server::start(false);
+    s.fresh_db("shop").await;
+
+    let docs = json!({"docs": [
+        {"_id": "a", "city": "Berlin", "type": "book", "price": 10},
+        {"_id": "b", "city": "Berlin", "type": "book", "price": 20},
+        {"_id": "c", "city": "Paris",  "type": "music", "price": 5},
+        {"_id": "d", "city": "Paris",  "type": "book", "price": 15},
+    ]});
+    let (status, _) = s.post("/shop/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let map = "function(doc){ if(doc.city) emit(doc.city, doc.price); }";
+    let ddoc = json!({"language": "javascript", "views": {
+        "by_city": {"map": map},
+        "count": {"map": "function(doc){ if(doc.city) emit(doc.city, null); }", "reduce": "_count"},
+        "sum": {"map": map, "reduce": "_sum"},
+        "stats": {"map": map, "reduce": "_stats"},
+        "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return sum(values) * 2; }"},
+        "by_type_city": {"map": "function(doc){ emit([doc.type, doc.city], 1); }", "reduce": "_count"},
+        "bad": {"map": "function(doc){ emit(; }"}
+    }});
+    let (status, body) = s.put("/shop/_design/shop", ddoc).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ddoc_rev = body["rev"].as_str().unwrap().to_string();
+
+    // Map rows are sorted by key then document id.
+    let (status, body) = s.get("/shop/_design/shop/_view/by_city").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["offset"], 0);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a", "b", "c", "d"]);
+    assert_eq!(body["rows"][0]["key"], "Berlin");
+    assert_eq!(body["rows"][0]["value"], 10);
+
+    // Descending, limits and offsets follow CouchDB.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?descending=true&limit=2")
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["d", "c"]);
+
+    let (_, body) = s.get("/shop/_design/shop/_view/by_city?skip=2").await;
+    assert_eq!(body["offset"], 2);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    // startkey_docid breaks ties within a key.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?startkey=%22Berlin%22&startkey_docid=b")
+        .await;
+    assert_eq!(body["offset"], 1);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["b", "c", "d"]);
+
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?key=%22Paris%22")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?startkey=%22Berlin%22&endkey=%22Paris%22&include_docs=true")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(body["rows"][0]["doc"]["_id"], "a");
+
+    // POST keys preserves the requested key order.
+    let (_, body) = s
+        .post(
+            "/shop/_design/shop/_view/by_city",
+            json!({"keys": ["Paris", "Berlin"]}),
+        )
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c", "d", "a", "b"]);
+
+    // Built-in reduces.
+    let (_, body) = s.get("/shop/_design/shop/_view/count").await;
+    assert_eq!(body["rows"][0]["key"], Value::Null);
+    assert_eq!(body["rows"][0]["value"], 4);
+
+    let (_, body) = s.get("/shop/_design/shop/_view/sum").await;
+    assert_eq!(body["rows"][0]["value"], 50);
+
+    let (_, body) = s.get("/shop/_design/shop/_view/stats").await;
+    assert_eq!(body["rows"][0]["value"]["count"], 4);
+    assert_eq!(body["rows"][0]["value"]["min"], 5);
+    assert_eq!(body["rows"][0]["value"]["max"], 20);
+    assert_eq!(body["rows"][0]["value"]["sum"], 50);
+    assert_eq!(body["rows"][0]["value"]["sumsqr"], 750);
+
+    let (_, body) = s.get("/shop/_design/shop/_view/custom").await;
+    assert_eq!(body["rows"][0]["value"], 100);
+
+    let (_, body) = s.get("/shop/_design/shop/_view/count?group=true").await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(body["rows"][0]["key"], "Berlin");
+    assert_eq!(body["rows"][0]["value"], 2);
+
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_type_city?group_level=1")
+        .await;
+    assert_eq!(body["rows"][0]["key"], json!(["book"]));
+    assert_eq!(body["rows"][0]["value"], 3);
+    assert_eq!(body["rows"][1]["key"], json!(["music"]));
+
+    // reduce=false and update_seq.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/count?reduce=false&limit=1")
+        .await;
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["value"], Value::Null);
+
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?update_seq=true&limit=0")
+        .await;
+    assert!(body["update_seq"].is_number() || body["update_seq"].is_string());
+
+    // A map-only view rejects reduce=true, and a broken map is a view error.
+    let (status, body) = s.get("/shop/_design/shop/_view/by_city?reduce=true").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+
+    let (status, body) = s.get("/shop/_design/shop/_view/bad").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "view_error");
+
+    // Design document changes take effect immediately and deleted documents
+    // leave the view.
+    let ddoc = json!({
+        "_rev": ddoc_rev,
+        "views": {
+            "by_city": {"map": "function(doc){ if(doc.city && doc.price > 10) emit(doc.city, doc.price); }"}
+        }
+    });
+    let (status, _) = s.put("/shop/_design/shop", ddoc).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/shop/_design/shop/_view/by_city").await;
+    assert_eq!(body["total_rows"], 2);
+
+    let (_, doc) = s.get("/shop/d").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .req(Method::DELETE, &format!("/shop/d?rev={rev}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/shop/_design/shop/_view/by_city").await;
+    assert_eq!(body["total_rows"], 1);
+
+    let (status, _) = s.post("/shop/_view_cleanup", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 fn base64_encode(bytes: &[u8]) -> String {

@@ -100,6 +100,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button class="active">Documents</button>
+                <button @click="openViews">Views</button>
                 <button @click="openChanges">Changes</button>
                 <button @click="openInfo">Info</button>
               </nav>
@@ -141,6 +142,102 @@
               <button :disabled="page + 1 >= pageCount" @click="nextPage">Next →</button>
             </div>
             <p v-else class="muted">Showing up to 100 ids starting with “{{ activeSearch }}”.</p>
+          </section>
+
+          <!-- views ------------------------------------------------------>
+          <section v-if="view === 'views'" class="page">
+            <div class="view-head">
+              <h1 class="mono">{{ currentDb }}</h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button class="active">Views</button>
+                <button @click="openChanges">Changes</button>
+                <button @click="openInfo">Info</button>
+              </nav>
+            </div>
+
+            <div class="view-picker">
+              <button class="ghost" @click="loadViews">↻ Reload views</button>
+              <div v-for="group in viewDefs" :key="group.ddoc" class="view-group">
+                <span class="ddoc mono">{{ group.ddoc }}</span>
+                <button
+                  v-for="item in group.views"
+                  :key="item.name"
+                  :class="{ primary: selectedView && selectedView.ddoc === group.ddoc && selectedView.name === item.name }"
+                  @click="selectView(group.ddoc, item.name, item.reduce)"
+                  data-testid="view-button"
+                >
+                  {{ item.name }} <span v-if="item.reduce" class="pill">reduce</span>
+                </button>
+              </div>
+              <p v-if="!viewDefs.length" class="empty">
+                No views yet. Add a design document with a <code>views</code>
+                object from Documents.
+              </p>
+            </div>
+
+            <template v-if="selectedView">
+              <div class="toolbar">
+                <input
+                  v-model="viewForm.key"
+                  placeholder='key JSON, e.g. "Berlin"'
+                  spellcheck="false"
+                  data-testid="view-key"
+                >
+                <input v-model="viewForm.startkey" placeholder="startkey" spellcheck="false">
+                <input v-model="viewForm.endkey" placeholder="endkey" spellcheck="false">
+                <input
+                  v-model.number="viewForm.limit"
+                  type="number"
+                  min="0"
+                  class="limit"
+                  placeholder="limit"
+                >
+                <select v-model="viewForm.reduce">
+                  <option value="default">reduce: default</option>
+                  <option value="true">reduce: true</option>
+                  <option value="false">reduce: false</option>
+                </select>
+                <label class="check">
+                  <input type="checkbox" v-model="viewForm.include_docs"> include docs
+                </label>
+                <label class="check">
+                  <input type="checkbox" v-model="viewForm.group"> group
+                </label>
+                <label class="check">
+                  <input type="checkbox" v-model="viewForm.descending"> descending
+                </label>
+                <button class="primary" @click="runView" data-testid="run-view">Run</button>
+              </div>
+
+              <p v-if="viewError" class="error" data-testid="view-error">{{ viewError }}</p>
+              <p v-if="viewLoading" class="muted">Running view…</p>
+
+              <template v-if="viewResult">
+                <p class="muted">
+                  <template v-if="viewResult.total_rows !== undefined">
+                    {{ viewResult.total_rows }} rows · offset {{ viewResult.offset }}
+                  </template>
+                  <template v-else>{{ viewResult.rows.length }} rows</template>
+                </p>
+                <table class="grid" data-testid="view-rows">
+                  <thead><tr><th>key</th><th>id</th><th>value</th></tr></thead>
+                  <tbody>
+                    <tr v-for="(row, index) in viewResult.rows" :key="index">
+                      <td class="mono">{{ compact(row.key) }}</td>
+                      <td class="mono">
+                        <button v-if="row.id" class="link" @click="openDoc(row.id)">
+                          {{ row.id }}
+                        </button>
+                        <span v-else class="muted">—</span>
+                      </td>
+                      <td class="mono value-cell">{{ compact(row.value) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p v-if="!viewResult.rows.length" class="empty">No rows.</p>
+              </template>
+            </template>
           </section>
 
           <!-- document editor -------------------------------------------->
@@ -188,6 +285,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button @click="backToDocs">Documents</button>
+                <button @click="openViews">Views</button>
                 <button class="active">Changes</button>
                 <button @click="openInfo">Info</button>
               </nav>
@@ -230,6 +328,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button @click="backToDocs">Documents</button>
+                <button @click="openViews">Views</button>
                 <button @click="openChanges">Changes</button>
                 <button class="active">Info</button>
               </nav>

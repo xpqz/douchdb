@@ -10,7 +10,7 @@ compatible document store.
 | Compatibility | CouchDB **wire** compatibility | Revision ids must be byte-identical to CouchDB's. This forces an Erlang External Term Format encoder and order-preserving JSON. See "The rev hash". |
 | Cluster membership | Static node list from config | No gossip, no membership protocol, no Raft. The shard map is a pure function of (node list, q), computed identically at startup on every node. No metadata to distribute. |
 | Storage | `rusty-leveldb` (pure Rust) | One implementation, no C++ toolchain, single static binary. Risk is concentrated here: its API is `&mut self` for *all* operations, including reads. |
-| Not used | Raft, JS engine, Mango, views, `_replicator`, `_users` | Where the code-size win comes from. |
+| Not used | Raft, Mango, `_replicator`, `_users` | Where the code-size win comes from. Views use an embedded QuickJS engine rather than a server-side JS platform. |
 
 ## Goal and non-goals
 
@@ -18,10 +18,10 @@ compatible document store.
 that CouchDB can replicate to and from, storing data in LevelDB, running as a
 Q-shard × N-replica cluster.
 
-**Non-goals, deliberately:** server-side JavaScript, view engine, Mango,
-`_replicator` database, `_users` database machinery beyond auth, per-document
-ETags, multipart `_bulk_docs`. PouchDB runs `query()`/`find()` client-side, so
-none of these are needed for compatibility — only for CouchDB ecosystem parity.
+**Non-goals, deliberately:** Mango, `_replicator` database, `_users` database
+machinery beyond auth, per-document ETags, multipart `_bulk_docs`. Map/reduce
+views are implemented with an embedded QuickJS runtime; lists, shows, update
+handlers and a full server-side JavaScript platform are not.
 
 ## The one architectural idea
 
@@ -329,6 +329,11 @@ Above ~6k means something was built that nobody asked for.
   feed is a single cursor and the coarser key still resumes exactly (no change
   is skipped). Per-shard-replica keys would require per-shard sequence
   allocation, which the storage layout does not currently do.
+* **Views.** Design-document map/reduce views run on embedded QuickJS with
+  CouchDB's `emit`/`sum`/`log` helpers, `key`/`keys`/range/page/include_docs
+  query options, `_count`/`_sum`/`_stats`/`_approx_count_distinct` and custom
+  reducers, grouping and cluster-wide row merging. Indexes are built on demand;
+  there is no incremental view index yet.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
