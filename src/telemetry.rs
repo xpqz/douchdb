@@ -110,3 +110,77 @@ pub fn record_http(method: &str, status: u16, duration_ms: f64) {
     metrics.requests.add(1, &attributes);
     metrics.duration.record(duration_ms, &attributes);
 }
+
+struct FabricMetrics {
+    local_reads: Counter<u64>,
+    remote_reads: Counter<u64>,
+    quorum_failures: Counter<u64>,
+    degraded_reads: Counter<u64>,
+    fanout: Histogram<u64>,
+    shard_map_updates: Counter<u64>,
+    shard_map_pending: Counter<u64>,
+    rebalance_started: Counter<u64>,
+    rebalance_completed: Counter<u64>,
+    rebalance_timeout: Counter<u64>,
+    cleaned_shards: Counter<u64>,
+}
+
+fn fabric_metrics() -> &'static FabricMetrics {
+    static METRICS: OnceLock<FabricMetrics> = OnceLock::new();
+    METRICS.get_or_init(|| {
+        let meter = global::meter("douchdb");
+        FabricMetrics {
+            local_reads: meter.u64_counter("fabric.local_reads").build(),
+            remote_reads: meter.u64_counter("fabric.remote_reads").build(),
+            quorum_failures: meter.u64_counter("fabric.quorum_failures").build(),
+            degraded_reads: meter.u64_counter("fabric.degraded_reads").build(),
+            fanout: meter.u64_histogram("fabric.fanout").build(),
+            shard_map_updates: meter.u64_counter("shard_map.updates").build(),
+            shard_map_pending: meter.u64_counter("shard_map.pending").build(),
+            rebalance_started: meter.u64_counter("rebalance.started").build(),
+            rebalance_completed: meter.u64_counter("rebalance.completed").build(),
+            rebalance_timeout: meter.u64_counter("rebalance.timeout").build(),
+            cleaned_shards: meter.u64_counter("rebalance.cleaned_shards").build(),
+        }
+    })
+}
+
+pub fn record_local_read() {
+    fabric_metrics().local_reads.add(1, &[]);
+}
+
+pub fn record_remote_read() {
+    fabric_metrics().remote_reads.add(1, &[]);
+}
+
+pub fn record_quorum_failure() {
+    fabric_metrics().quorum_failures.add(1, &[]);
+}
+
+pub fn record_degraded_read() {
+    fabric_metrics().degraded_reads.add(1, &[]);
+}
+
+pub fn record_fanout(nodes: u64) {
+    fabric_metrics().fanout.record(nodes, &[]);
+}
+
+pub fn record_shard_map_update(pending: bool) {
+    fabric_metrics().shard_map_updates.add(1, &[]);
+    if pending {
+        fabric_metrics().shard_map_pending.add(1, &[]);
+    }
+}
+
+pub fn record_rebalance_started() {
+    fabric_metrics().rebalance_started.add(1, &[]);
+}
+
+pub fn record_rebalance_completed(cleaned: u64) {
+    fabric_metrics().rebalance_completed.add(1, &[]);
+    fabric_metrics().cleaned_shards.add(cleaned, &[]);
+}
+
+pub fn record_rebalance_timeout() {
+    fabric_metrics().rebalance_timeout.add(1, &[]);
+}

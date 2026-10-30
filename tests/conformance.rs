@@ -2090,6 +2090,86 @@ async fn cluster_all_docs_survives_node_loss_via_replicas() {
 }
 
 #[tokio::test]
+async fn cluster_shard_mask_reads_only_selected_shards() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("shardmask").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/shardmask", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let docs: Vec<Value> = (0..24)
+        .map(|i| json!({"_id": format!("sm{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/shardmask/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(
+            "/shardmask/_design/m",
+            json!({"views": {"all": {"map": "function(doc){ emit(doc.n, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let mut all_docs_ids = std::collections::HashSet::new();
+    let mut view_ids = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for shard in 0..4 {
+        let (status, body) = nodes[0]
+            .req_with(
+                Method::GET,
+                &format!("/shardmask/_all_docs?shards={shard}"),
+                None,
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let selected = body["total_rows"].as_u64().unwrap();
+        total += selected;
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len() as u64, selected, "shard {shard}: {body}");
+        for row in rows {
+            assert!(
+                all_docs_ids.insert(row["id"].as_str().unwrap().to_string()),
+                "document returned by more than one shard mask"
+            );
+        }
+
+        let (status, body) = nodes[0]
+            .req_with(
+                Method::GET,
+                &format!("/shardmask/_design/m/_view/all?reduce=false&shards={shard}"),
+                None,
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["rows"].as_array().unwrap();
+        assert!(rows.len() as u64 <= selected, "view shard {shard}: {body}");
+        for row in rows {
+            assert!(
+                view_ids.insert(row["id"].as_str().unwrap().to_string()),
+                "view row returned by more than one shard mask"
+            );
+        }
+    }
+    assert_eq!(total, 25);
+    assert_eq!(all_docs_ids.len(), 25);
+    // Design documents are excluded from view indexes, so the view union is
+    // every non-design document exactly once.
+    all_docs_ids.remove("_design/m");
+    assert_eq!(view_ids, all_docs_ids);
+}
+
+#[tokio::test]
 async fn cluster_post_creates_the_document_on_its_owner() {
     let nodes = start_cluster(2);
     for node in &nodes {

@@ -316,8 +316,9 @@ node1 and after killing node0.
 ### Fabric extraction (#48)
 
 Cluster routing is now in `src/fabric.rs`: shard-map replica selection, quorum
-reads/writes, cluster `_all_docs`/view/changes fan-out, replica fallback, and
-internal node calls (`proxy`, `forward_bulk`, `forward_json`, replica reads).
+reads/writes, cluster `_all_docs`/view/changes fan-out, shard-mask replica
+fallback, and internal node calls (`proxy`, `forward_bulk`, `forward_json`,
+replica reads).
 HTTP handlers in `src/api.rs` are thin callers. This is a structural change; a
 before/after run on the same three-node n=3 config showed no material
 regression:
@@ -347,6 +348,42 @@ available for controlled/manual runs.
 Two tests cover both shapes: the manual move from node0 to node1 (node0 local
 docs become 0, node1 9), and the automatic planner+cleanup path (sum of local
 shard docs stays 9 and every non-owned shard is empty).
+
+### Shard-mask degraded reads (#54)
+
+Owner reads still use disjoint owner masks. If an owner is unreachable, the
+coordinator computes the shards that owner was responsible for and asks one
+live replica per missing shard for only that shard set. Both `_all_docs` and
+views accept the internal `shards=` mask; local and remote nodes filter to the
+selected shards before returning rows. The full-database fallback scan is gone.
+
+The conformance test pins all shards to node0, writes 24 documents and a design
+document, then queries each shard mask individually. Shard masks are disjoint,
+their `total_rows` sum to the full database, and the union of `_all_docs` rows
+matches the union of view rows (design documents are excluded from views).
+Node-loss tests continue to verify that `_all_docs` and views return complete
+results from replicas.
+
+### Fabric and shard-map metrics (#54)
+
+With `--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) set, douchdb exports:
+
+| Metric | Meaning |
+|---|---|
+| `fabric.local_reads` | point reads served by the local replica |
+| `fabric.remote_reads` | point reads sent to a peer replica |
+| `fabric.quorum_failures` | reads/writes that did not reach `r`/`w` |
+| `fabric.degraded_reads` | fallbacks caused by an unreachable node |
+| `fabric.fanout` | nodes contacted per fan-out operation |
+| `shard_map.updates` | external shard-map updates |
+| `shard_map.pending` | updates that missed a metadata quorum |
+| `rebalance.started` | rebalance requests started |
+| `rebalance.completed` | rebalances that converged and cleaned |
+| `rebalance.timeout` | convergence waits that returned 504 |
+| `rebalance.cleaned_shards` | old shard copies cleared |
+
+Without an endpoint these recorders are no-ops, so the normal build has no
+collector dependency.
 
 ### Changes replica failover (#53)
 
@@ -413,10 +450,11 @@ replicates and the pending file disappears.
   document.
 - **Bulk reads** reach ~36k docs/s; `_bulk_get` is routed per document and is
   still the fastest way to read many documents through a coordinator.
-- **`_all_docs`** is ~1.3 ms with or without a `startkey`. Each owner answers
-  its offset from the in-memory live-document map instead of walking earlier
-  metadata. If an owner is down, the degraded path reads all reachable replicas
-  and deduplicates by id.
+- **`_all_docs`** is ~1.3–1.5 ms with or without a `startkey`. Each owner
+  answers its offset from the in-memory live-document map instead of walking
+  earlier metadata. If an owner is down, the coordinator asks a live replica
+  for exactly the missing shard mask (`?shards=0,2`), so it does not rescan the
+  whole database.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
   merge and JSON/HTTP for the selected rows. Cold builds are ~47–72 ms because
   each node indexes every locally held replica, which is what enables node-loss

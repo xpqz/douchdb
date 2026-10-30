@@ -213,8 +213,10 @@ pub(crate) async fn quorum_read(
         let inner = inner.clone();
         async move {
             if node == st.cluster.me {
+                crate::telemetry::record_local_read();
                 return db.get_doc(docid, &doc_opts(q)).await.ok();
             }
+            crate::telemetry::record_remote_read();
             let peer = st.cluster.nodes[node].clone();
             let response = proxy(
                 st,
@@ -238,10 +240,15 @@ pub(crate) async fn quorum_read(
         }
     }))
     .await;
+    let mut found = 0usize;
     for doc in docs.into_iter().flatten() {
+        found += 1;
         if best.as_ref().map(|b| better_rev(&doc, b)).unwrap_or(true) {
             best = Some(doc);
         }
+    }
+    if found < r {
+        crate::telemetry::record_quorum_failure();
     }
     match best {
         Some(doc) => doc_response(doc),
@@ -323,6 +330,7 @@ pub(crate) async fn commit_docs(
             }
         }
 
+        crate::telemetry::record_fanout(groups.len() as u64);
         let mut successes: Vec<Option<Value>> = vec![None; total];
         let mut failures: Vec<Option<Value>> = vec![None; total];
         let responses =
@@ -376,6 +384,9 @@ pub(crate) async fn commit_docs(
                 });
         }
         let met = acks.iter().all(|ack| *ack >= quorum);
+        if !met {
+            crate::telemetry::record_quorum_failure();
+        }
         if out.iter().any(|result| result.get("ok").is_some()) {
             st.db_updates.record(dbname, "updated");
         }
@@ -390,6 +401,7 @@ pub(crate) async fn commit_docs(
                 groups.entry(*node).or_default().push((slot, doc.clone()));
             }
         }
+        crate::telemetry::record_fanout(groups.len() as u64);
         let mut reached = vec![false; total];
         for (node, group) in groups {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
@@ -418,6 +430,9 @@ pub(crate) async fn commit_docs(
             }
         }
         let met = reached.iter().all(|ok| *ok);
+        if !met {
+            crate::telemetry::record_quorum_failure();
+        }
         if out.iter().any(|result| result.get("ok").is_some()) {
             st.db_updates.record(dbname, "updated");
         }
@@ -512,6 +527,41 @@ pub(crate) async fn forward_json(
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
+pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
+    db.replicas_of_shard(shard)
+}
+
+fn fallback_shard_masks(
+    db: &Db,
+    owned_by_node: &[Vec<bool>],
+    failed: &[usize],
+    alive: &[usize],
+) -> DbResult<Vec<(usize, Vec<bool>)>> {
+    let mut groups: HashMap<usize, Vec<bool>> = HashMap::new();
+    for &node in failed {
+        for shard in 0..db.q {
+            if !owned_by_node
+                .get(node)
+                .and_then(|owned| owned.get(shard as usize))
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let target = replicas_of_shard(db, shard)
+                .into_iter()
+                .find(|candidate| alive.contains(candidate))
+                .ok_or_else(|| {
+                    ApiError::new(502, "no_replica", "no live replica for failed shard")
+                })?;
+            groups
+                .entry(target)
+                .or_insert_with(|| vec![false; db.q as usize])[shard as usize] = true;
+        }
+    }
+    Ok(groups.into_iter().collect())
+}
+
 pub(crate) async fn cluster_all_docs(
     st: &AppState,
     db: &Db,
@@ -520,10 +570,16 @@ pub(crate) async fn cluster_all_docs(
     headers: &HeaderMap,
 ) -> DbResult<Value> {
     let node_count = st.cluster.nodes.len();
+    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
+        .map(|node| {
+            (0..db.q)
+                .map(|shard| owner_of_shard(db, shard) == node)
+                .collect()
+        })
+        .collect();
+    crate::telemetry::record_fanout(node_count as u64);
+
     if let Some(keys) = &opts.keys {
-        // Every document has exactly one primary, so keys are looked up only
-        // on the node that owns their shard. The first phase is no longer a
-        // full scan: each node reports the live count for its owned shards.
         let mut key_opts = opts.clone();
         key_opts.skip = 0;
         key_opts.limit = usize::MAX;
@@ -531,19 +587,53 @@ pub(crate) async fn cluster_all_docs(
         key_opts.endkey = None;
         key_opts.descending = false;
 
-        let responses = futures::future::join_all(
-            (0..node_count)
-                .map(|node| fetch_all_docs(st, db, dbname, node, &key_opts, headers, true)),
-        )
+        let responses = futures::future::join_all((0..node_count).map(|node| {
+            fetch_all_docs(
+                st,
+                db,
+                dbname,
+                node,
+                &key_opts,
+                headers,
+                Some(&owned_by_node[node]),
+            )
+        }))
         .await;
-        if responses.iter().any(|response| response.is_err()) {
-            return cluster_all_docs_fallback(st, db, dbname, opts, headers).await;
+        let mut values = Vec::new();
+        let mut failed = Vec::new();
+        for (node, response) in responses.into_iter().enumerate() {
+            match response {
+                Ok(value) => values.push(value),
+                Err(_) => failed.push(node),
+            }
         }
+        if !failed.is_empty() {
+            crate::telemetry::record_degraded_read();
+            let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
+            let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+            let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
+                let key_opts = key_opts.clone();
+                async move {
+                    fetch_all_docs(st, db, dbname, node, &key_opts, headers, Some(&mask)).await
+                }
+            }))
+            .await;
+            for response in fallbacks {
+                values.push(response?);
+            }
+        }
+        if values.is_empty() {
+            return Err(ApiError::new(
+                502,
+                "bad_gateway",
+                "no all_docs replica is reachable",
+            ));
+        }
+
         let mut total_rows = 0u64;
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut errors: HashMap<String, Value> = HashMap::new();
-        for response in responses {
-            let response = response?;
+        for response in values {
             total_rows += response["total_rows"].as_u64().unwrap_or(0);
             for row in response["rows"].as_array().cloned().unwrap_or_default() {
                 match row.get("id").and_then(Value::as_str) {
@@ -572,27 +662,62 @@ pub(crate) async fn cluster_all_docs(
         return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
     }
 
-    // Range mode: fetch only the requested window from each node's owned
-    // shards, then merge the per-node offsets and totals. A document lives on
-    // one primary, so the union is complete and duplicate-free.
     let mut window = opts.clone();
     window.keys = None;
     let take = opts.skip.saturating_add(opts.limit);
     window.skip = 0;
     window.limit = take;
 
-    let responses = futures::future::join_all(
-        (0..node_count).map(|node| fetch_all_docs(st, db, dbname, node, &window, headers, true)),
-    )
+    let responses = futures::future::join_all((0..node_count).map(|node| {
+        fetch_all_docs(
+            st,
+            db,
+            dbname,
+            node,
+            &window,
+            headers,
+            Some(&owned_by_node[node]),
+        )
+    }))
     .await;
-    if responses.iter().any(|response| response.is_err()) {
-        return cluster_all_docs_fallback(st, db, dbname, opts, headers).await;
+    let mut values = Vec::new();
+    let mut failed = Vec::new();
+    for (node, response) in responses.into_iter().enumerate() {
+        match response {
+            Ok(value) => values.push(value),
+            Err(_) => failed.push(node),
+        }
     }
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
+        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+        let fallbacks =
+            futures::future::join_all(
+                groups.into_iter().map(|(node, mask)| {
+                    let window = window.clone();
+                    async move {
+                        fetch_all_docs(st, db, dbname, node, &window, headers, Some(&mask)).await
+                    }
+                }),
+            )
+            .await;
+        for response in fallbacks {
+            values.push(response?);
+        }
+    }
+    if values.is_empty() {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no all_docs replica is reachable",
+        ));
+    }
+
     let mut total_rows = 0u64;
     let mut before_start = 0usize;
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for response in responses {
-        let response = response?;
+    for response in values {
         total_rows += response["total_rows"].as_u64().unwrap_or(0);
         before_start += response["offset"].as_u64().unwrap_or(0) as usize;
         for row in response["rows"].as_array().cloned().unwrap_or_default() {
@@ -614,132 +739,6 @@ pub(crate) async fn cluster_all_docs(
     Ok(json!({"total_rows": total_rows, "offset": before_start + opts.skip, "rows": rows}))
 }
 
-pub(crate) async fn cluster_all_docs_fallback(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    opts: &AllDocsOpts,
-    headers: &HeaderMap,
-) -> DbResult<Value> {
-    let node_count = st.cluster.nodes.len();
-    let mut full = opts.clone();
-    full.keys = None;
-    full.skip = 0;
-    full.limit = usize::MAX;
-    full.startkey = None;
-    full.endkey = None;
-    full.descending = false;
-
-    let responses = futures::future::join_all(
-        (0..node_count).map(|node| fetch_all_docs(st, db, dbname, node, &full, headers, false)),
-    )
-    .await;
-    let mut live: HashMap<String, Value> = HashMap::new();
-    let mut succeeded = false;
-    for response in responses {
-        let Ok(response) = response else {
-            continue;
-        };
-        succeeded = true;
-        for row in response["rows"].as_array().cloned().unwrap_or_default() {
-            if let Some(id) = row.get("id").and_then(Value::as_str) {
-                live.entry(id.to_string()).or_insert(row);
-            }
-        }
-    }
-    if !succeeded {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no replica in the cluster is reachable",
-        ));
-    }
-    let total_rows = live.len();
-
-    if let Some(keys) = &opts.keys {
-        let mut key_opts = opts.clone();
-        key_opts.skip = 0;
-        key_opts.limit = usize::MAX;
-        key_opts.startkey = None;
-        key_opts.endkey = None;
-        key_opts.descending = false;
-        let responses = futures::future::join_all(
-            (0..node_count)
-                .map(|node| fetch_all_docs(st, db, dbname, node, &key_opts, headers, false)),
-        )
-        .await;
-        let mut found: HashMap<String, Value> = HashMap::new();
-        let mut errors: HashMap<String, Value> = HashMap::new();
-        for response in responses {
-            let Ok(response) = response else {
-                continue;
-            };
-            for row in response["rows"].as_array().cloned().unwrap_or_default() {
-                match row.get("id").and_then(Value::as_str) {
-                    Some(id) => {
-                        found.insert(id.to_string(), row);
-                    }
-                    None => {
-                        if let Some(key) = row.get("key").and_then(Value::as_str) {
-                            errors.entry(key.to_string()).or_insert(row);
-                        }
-                    }
-                }
-            }
-        }
-        let mut rows = Vec::new();
-        for key in keys.iter().skip(opts.skip).take(opts.limit) {
-            if let Some(row) = found.get(key).cloned() {
-                rows.push(row);
-            } else if let Some(row) = errors.get(key).cloned() {
-                rows.push(row);
-            } else {
-                rows.push(json!({"key": key, "error": "not_found"}));
-            }
-        }
-        return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
-    }
-
-    let before_start = match (&opts.startkey, opts.descending) {
-        (Some(start), false) => live
-            .keys()
-            .filter(|id| id.as_str() < start.as_str())
-            .count(),
-        (Some(start), true) => live
-            .keys()
-            .filter(|id| id.as_str() > start.as_str())
-            .count(),
-        (None, _) => 0,
-    };
-    let mut rows: Vec<(String, Value)> = live
-        .into_iter()
-        .filter(|(id, _)| {
-            let after_start = opts
-                .startkey
-                .as_ref()
-                .map(|start| id.as_str() >= start.as_str())
-                .unwrap_or(true);
-            let before_end = opts
-                .endkey
-                .as_ref()
-                .map(|end| id.as_str() <= end.as_str())
-                .unwrap_or(true);
-            after_start && before_end
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    if opts.descending {
-        rows.reverse();
-    }
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .skip(opts.skip)
-        .take(opts.limit)
-        .map(|(_, row)| row)
-        .collect();
-    Ok(json!({"total_rows": total_rows, "offset": before_start + opts.skip, "rows": rows}))
-}
-
 pub(crate) async fn fetch_all_docs(
     st: &AppState,
     db: &Db,
@@ -747,21 +746,24 @@ pub(crate) async fn fetch_all_docs(
     node: usize,
     opts: &AllDocsOpts,
     headers: &HeaderMap,
-    owner_only: bool,
+    shards: Option<&[bool]>,
 ) -> DbResult<Value> {
     if node == st.cluster.me {
-        if owner_only {
-            let owned: Vec<bool> = (0..db.q)
-                .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
-                .collect();
-            return db.all_docs_owned(opts, &owned).await;
+        if let Some(shards) = shards {
+            return db.all_docs_owned(opts, shards).await;
         }
         return db.all_docs(opts).await;
     }
     let peer = &st.cluster.nodes[node];
     let mut query = Vec::new();
-    if owner_only {
-        query.push("owner_only=1".to_string());
+    if let Some(shards) = shards {
+        let selected: Vec<String> = shards
+            .iter()
+            .enumerate()
+            .filter(|(_, owned)| **owned)
+            .map(|(shard, _)| shard.to_string())
+            .collect();
+        query.push(format!("shards={}", selected.join(",")));
     }
     if opts.include_docs {
         query.push("include_docs=true".to_string());
@@ -820,6 +822,110 @@ pub(crate) async fn fetch_all_docs(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
+async fn fetch_view_mask(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    view_name: &str,
+    query: &crate::view::ViewQuery,
+    headers: &HeaderMap,
+    node: usize,
+    mask: &[bool],
+    limit: Option<usize>,
+) -> DbResult<(
+    usize,
+    Arc<Vec<crate::view::Row>>,
+    HashMap<String, Value>,
+    usize,
+)> {
+    if !mask.iter().any(|owned| *owned) {
+        return Ok((node, Arc::new(Vec::new()), HashMap::new(), 0));
+    }
+    if node == st.cluster.me {
+        let (_, rows, node_docs) = crate::view::local_map(
+            db,
+            ddoc,
+            view_name,
+            query.include_docs || query.attachments,
+            query.attachments,
+            query.limits,
+            Some(mask),
+        )
+        .await?;
+        let mut rows: Vec<crate::view::Row> = rows
+            .iter()
+            .filter(|row| mask.get(db.shard_index(&row.id)).copied().unwrap_or(false))
+            .cloned()
+            .collect();
+        let total_rows = rows.len();
+        if let Some(limit) = limit {
+            if query.descending {
+                let skip = rows.len().saturating_sub(limit);
+                rows = rows.split_off(skip);
+            } else {
+                rows.truncate(limit);
+            }
+        }
+        return Ok((node, Arc::new(rows), node_docs, total_rows));
+    }
+
+    let peer = &st.cluster.nodes[node];
+    let url = format!(
+        "{peer}/{dbname}/{}/_view/{}",
+        percent_encode(ddoc),
+        percent_encode(view_name)
+    );
+    let selected: Vec<String> = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, owned)| **owned)
+        .map(|(shard, _)| shard.to_string())
+        .collect();
+    let mut params = vec![
+        ("reduce", "false".to_string()),
+        ("shards", selected.join(",")),
+        (
+            "include_docs",
+            if query.include_docs { "true" } else { "false" }.to_string(),
+        ),
+        (
+            "attachments",
+            if query.attachments { "true" } else { "false" }.to_string(),
+        ),
+    ];
+    if query.descending {
+        params.push(("descending", "true".to_string()));
+    }
+    if let Some(limit) = limit.filter(|limit| *limit != usize::MAX) {
+        params.push(("limit", limit.to_string()));
+    }
+    let mut request = st
+        .client
+        .get(url)
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
+        .query(&params);
+    request = forward_client_auth(request, headers);
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            response.status().as_u16(),
+            "view_failed",
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    let (rows, node_docs, total_rows) = decode_view_batch(value);
+    Ok((node, rows, node_docs, total_rows))
+}
+
 pub(crate) async fn cluster_view_rows(
     st: &AppState,
     db: &Db,
@@ -853,103 +959,63 @@ pub(crate) async fn cluster_view_rows(
     let take = query.skip.saturating_add(query.limit);
 
     let node_count = st.cluster.nodes.len();
-    let owned: Vec<bool> = (0..db.q)
-        .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
+    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
+        .map(|node| {
+            (0..db.q)
+                .map(|shard| owner_of_shard(db, shard) == node)
+                .collect()
+        })
         .collect();
+    crate::telemetry::record_fanout(node_count as u64);
+    let limit = can_limit.then_some(take);
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
-        let owned = owned.clone();
+        let mask = owned_by_node[node].clone();
         async move {
-            if node == st.cluster.me {
-                let (_, rows, node_docs) = crate::view::local_map(
-                    db,
-                    ddoc,
-                    view_name,
-                    query.include_docs || query.attachments,
-                    query.attachments,
-                    query.limits,
-                    Some(&owned),
-                )
-                .await?;
-                let mut rows: Vec<crate::view::Row> = rows
-                    .iter()
-                    .filter(|row| owned.get(db.shard_index(&row.id)).copied().unwrap_or(false))
-                    .cloned()
-                    .collect();
-                let total_rows = rows.len();
-                if can_limit {
-                    if query.descending {
-                        let skip = rows.len().saturating_sub(take);
-                        rows = rows.split_off(skip);
-                    } else {
-                        rows.truncate(take);
-                    }
-                }
-                Ok((node, Arc::new(rows), node_docs, total_rows))
-            } else {
-                let peer = &st.cluster.nodes[node];
-                let url = format!(
-                    "{peer}/{dbname}/{}/_view/{}",
-                    percent_encode(ddoc),
-                    percent_encode(view_name)
-                );
-                let mut params = vec![
-                    ("reduce", "false".to_string()),
-                    ("owner_only", "1".to_string()),
-                    (
-                        "include_docs",
-                        if query.include_docs { "true" } else { "false" }.to_string(),
-                    ),
-                    (
-                        "attachments",
-                        if query.attachments { "true" } else { "false" }.to_string(),
-                    ),
-                ];
-                if query.descending {
-                    params.push(("descending", "true".to_string()));
-                }
-                if can_limit && take != usize::MAX {
-                    params.push(("limit", take.to_string()));
-                }
-                let mut request = st
-                    .client
-                    .get(url)
-                    .header("x-douchdb-forwarded", "1")
-                    .header("x-douchdb-secret", st.cluster.secret.as_str())
-                    .query(&params);
-                request = forward_client_auth(request, headers);
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-                if !response.status().is_success() {
-                    return Err(ApiError::new(
-                        response.status().as_u16(),
-                        "view_failed",
-                        response.text().await.unwrap_or_default(),
-                    ));
-                }
-                let value = response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-                let (rows, node_docs, total_rows) = decode_view_batch(value);
-                Ok((node, rows, node_docs, total_rows))
-            }
+            fetch_view_mask(
+                st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit,
+            )
+            .await
         }
     }))
     .await;
 
-    if batches.iter().any(|batch| batch.is_err()) {
-        return cluster_view_rows_fallback(st, db, dbname, ddoc, view_name, spec, query, headers)
+    let mut values = Vec::new();
+    let mut failed = Vec::new();
+    for (node, batch) in batches.into_iter().enumerate() {
+        match batch {
+            Ok(batch) => values.push(batch),
+            Err(_) => failed.push(node),
+        }
+    }
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
+        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+        let fallbacks =
+            futures::future::join_all(groups.into_iter().map(|(node, mask)| async move {
+                fetch_view_mask(
+                    st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit,
+                )
+                .await
+            }))
             .await;
+        for fallback in fallbacks {
+            values.push(fallback?);
+        }
+    }
+    if values.is_empty() {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no view replica is reachable",
+        ));
     }
 
     let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut total_rows = 0usize;
-    for batch in batches {
-        let (_, rows, node_docs, node_total) = batch?;
+    for (_, rows, node_docs, node_total) in values {
         total_rows += node_total;
         docs.extend(node_docs);
         let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
@@ -994,6 +1060,7 @@ pub(crate) async fn cluster_reduce(
     let owned: Vec<bool> = (0..db.q)
         .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
         .collect();
+    crate::telemetry::record_fanout(node_count as u64);
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
         let owned = owned.clone();
@@ -1162,126 +1229,6 @@ pub(crate) fn combine_reduce_values(
     }
 }
 
-pub(crate) async fn cluster_view_rows_fallback(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
-    spec: crate::view::ViewSpec,
-    query: &crate::view::ViewQuery,
-    headers: &HeaderMap,
-) -> DbResult<(
-    crate::view::ViewSpec,
-    Arc<Vec<crate::view::Row>>,
-    HashMap<String, Value>,
-    Option<usize>,
-)> {
-    let need_docs = query.include_docs || query.attachments;
-    let batches = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
-        if node == st.cluster.me {
-            let (_, rows, node_docs) = crate::view::local_map(
-                db,
-                ddoc,
-                view_name,
-                need_docs,
-                query.attachments,
-                query.limits,
-                None,
-            )
-            .await?;
-            Ok((node, rows, node_docs, 0usize))
-        } else {
-            let peer = &st.cluster.nodes[node];
-            let url = format!(
-                "{peer}/{dbname}/{}/_view/{}",
-                percent_encode(ddoc),
-                percent_encode(view_name)
-            );
-            let params = [
-                ("reduce", "false"),
-                (
-                    "include_docs",
-                    if query.include_docs { "true" } else { "false" },
-                ),
-                (
-                    "attachments",
-                    if query.attachments { "true" } else { "false" },
-                ),
-            ];
-            let mut request = st
-                .client
-                .get(url)
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str())
-                .query(&params);
-            request = forward_client_auth(request, headers);
-            let response = request
-                .send()
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-            if !response.status().is_success() {
-                return Err(ApiError::new(
-                    response.status().as_u16(),
-                    "view_failed",
-                    response.text().await.unwrap_or_default(),
-                ));
-            }
-            let value = response
-                .json::<Value>()
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-            let (rows, node_docs, total_rows) = decode_view_batch(value);
-            Ok((node, rows, node_docs, total_rows))
-        }
-    }))
-    .await;
-
-    let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
-    let mut docs: HashMap<String, Value> = HashMap::new();
-    let mut succeeded = false;
-    for batch in batches {
-        let Ok((_, rows, node_docs, _)) = batch else {
-            continue;
-        };
-        succeeded = true;
-        docs.extend(node_docs);
-        let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
-        for row in rows.iter() {
-            let key = row_key(row);
-            local
-                .entry(key)
-                .and_modify(|(count, _)| *count += 1)
-                .or_insert((1, row.clone()));
-        }
-        for (key, (count, row)) in local {
-            match counts.get_mut(&key) {
-                Some((existing, _)) => *existing = (*existing).max(count),
-                None => {
-                    counts.insert(key, (count, row));
-                }
-            }
-        }
-    }
-    if !succeeded {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no view replica is reachable",
-        ));
-    }
-
-    let mut rows = Vec::new();
-    for (_, (count, row)) in counts {
-        for _ in 0..count {
-            rows.push(row.clone());
-        }
-    }
-    crate::view::sort_rows(&mut rows);
-    let total_rows = rows.len();
-    Ok((spec, Arc::new(rows), docs, Some(total_rows)))
-}
-
 pub(crate) fn decode_view_batch(
     value: Value,
 ) -> (Arc<Vec<crate::view::Row>>, HashMap<String, Value>, usize) {
@@ -1364,6 +1311,7 @@ pub(crate) async fn cluster_changes(
         vec![0; n]
     };
     since.resize(n, 0);
+    crate::telemetry::record_fanout(n as u64);
 
     let include_docs = flag(q, "include_docs");
     let style_all_docs = q.get("style").map(String::as_str) == Some("all_docs");
@@ -1404,6 +1352,9 @@ pub(crate) async fn cluster_changes(
         .into_iter()
         .map(Result::ok)
         .collect();
+        if responses.iter().any(Option::is_none) {
+            crate::telemetry::record_degraded_read();
+        }
         if responses.iter().all(Option::is_none) {
             return Err(ApiError::new(
                 502,
@@ -1471,6 +1422,9 @@ pub(crate) async fn cluster_changes(
             )
         }))
         .await;
+        if responses.iter().any(Result::is_err) {
+            crate::telemetry::record_degraded_read();
+        }
         let mut succeeded = false;
         for (node, response) in responses.into_iter().enumerate() {
             if let Ok(response) = response {

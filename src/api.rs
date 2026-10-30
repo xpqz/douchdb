@@ -162,6 +162,18 @@ pub(crate) fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
     q.get(key).and_then(|v| v.parse().ok())
 }
 
+fn parse_shard_mask(raw: &str, q: u32) -> Option<Vec<bool>> {
+    let mut mask = vec![false; q as usize];
+    for part in raw.split(',').filter(|part| !part.is_empty()) {
+        let shard: usize = part.parse().ok()?;
+        if shard >= mask.len() {
+            return None;
+        }
+        mask[shard] = true;
+    }
+    Some(mask)
+}
+
 /// True when a proxied request failed to reach the peer, rather than the peer
 /// answering on behalf of the cluster.
 
@@ -868,6 +880,7 @@ async fn apply_shard_map(
     } else {
         db.clear_pending_shard_map();
     }
+    crate::telemetry::record_shard_map_update(pending);
     Ok((map, pending))
 }
 
@@ -999,6 +1012,7 @@ pub async fn db_rebalance(
         .unwrap_or(true);
     let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
 
+    crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
     let counts = futures::future::join_all(
         (0..st.cluster.nodes.len()).map(|node| fetch_shard_docs(&st, &db, node, &headers)),
@@ -1042,10 +1056,19 @@ pub async fn db_rebalance(
     }
 
     if let Err(error) = wait_for_rebalance(&st, &db, &map, &required, &headers, timeout_ms).await {
+        if error.status == 504 {
+            crate::telemetry::record_rebalance_timeout();
+        }
         return fail(error);
     }
     match cleanup_all_replicas(&st, &db, &headers).await {
         Ok(cleaned) => {
+            let cleared = cleaned
+                .iter()
+                .filter_map(|response| response["cleared"].as_array())
+                .map(|shards| shards.len() as u64)
+                .sum();
+            crate::telemetry::record_rebalance_completed(cleared);
             value["cleaned"] = json!(cleaned);
             json(StatusCode::OK, value)
         }
@@ -1575,12 +1598,16 @@ async fn view_request(
         Ok(query) => query,
         Err(error) => return fail(error),
     };
-    if flag(q, "owner_only") && is_forwarded(st, headers) {
-        query.owner_shards = Some(
-            (0..db.q)
-                .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
-                .collect(),
-        );
+    if is_forwarded(st, headers) {
+        if let Some(mask) = q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q)) {
+            query.owner_shards = Some(mask);
+        } else if flag(q, "owner_only") {
+            query.owner_shards = Some(
+                (0..db.q)
+                    .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
+                    .collect(),
+            );
+        }
     }
 
     // A global `_count`/`_sum`/`_stats` with no grouping can be reduced
@@ -1904,8 +1931,15 @@ async fn all_docs(
             }
         }
     }
+    let shard_mask = if is_forwarded(st, headers) {
+        q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
+    } else {
+        None
+    };
     let result = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         cluster_all_docs(st, db, dbname, &opts, headers).await
+    } else if let Some(mask) = shard_mask {
+        db.all_docs_owned(&opts, &mask).await
     } else if flag(q, "owner_only") && is_forwarded(st, headers) {
         let owned: Vec<bool> = (0..db.q)
             .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
