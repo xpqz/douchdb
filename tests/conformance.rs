@@ -979,61 +979,41 @@ async fn local_docs_and_revs_limit() {
 }
 
 #[tokio::test]
-async fn attachments_roundtrip_with_couchdb_digests() {
+async fn attachments_are_rejected() {
     let s = Server::start(false);
     s.fresh_db("att").await;
     let data = base64_encode(b"hi there");
-    let (status, _) = s
+
+    let (status, body) = s
         .put(
             "/att/doc",
             json!({"_attachments": {
-                "a.txt": {"content_type": "text/plain", "data": data},
-                "b.bin": {"content_type": "application/octet-stream", "data": base64_encode(b"bee")}
+                "a.txt": {"content_type": "text/plain", "data": data}
             }}),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "attachments_not_supported");
 
-    let (_, body) = s.get("/att/doc").await;
-    let a = &body["_attachments"]["a.txt"];
-    assert_eq!(a["content_type"], "text/plain");
-    assert_eq!(a["length"], 8);
-    assert_eq!(a["stub"], true);
-    let digest = a["digest"].as_str().unwrap();
-    assert!(digest.starts_with("md5-"));
-    // CouchDB's digest is base64 of the raw md5, not hex.
-    assert_eq!(digest.len(), 4 + 24);
-    assert!(!digest[4..].chars().all(|c| c.is_ascii_hexdigit()));
-
-    let (_, body) = s.get("/att/doc?attachments=true").await;
-    assert_eq!(
-        body["_attachments"]["a.txt"]["data"],
-        base64_encode(b"hi there")
-    );
-
-    let response = s
-        .client
-        .get(format!("{}/att/doc/a.txt", s.base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.text().await.unwrap(), "hi there");
-
-    // Replacing one attachment must not drop the other.
-    let rev = body["_rev"].as_str().unwrap();
-    let (_, body) = s.get(&format!("/att/doc?rev={rev}")).await;
-    let rev = body["_rev"].as_str().unwrap();
-    let (status, _) = s
-        .put(
-            &format!("/att/doc/a.txt?rev={rev}"),
-            Value::String(String::new()),
+    let (status, body) = s
+        .post(
+            "/att/_bulk_docs",
+            json!({"docs": [{"_id": "bulk", "_attachments": {"a": {"data": data}}}]}),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (_, body) = s.get("/att/doc").await;
-    assert!(body["_attachments"]["a.txt"].is_object());
-    assert!(body["_attachments"]["b.bin"].is_object());
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "attachments_not_supported");
+
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/att/doc/a.txt",
+            Some(Value::String("ignored".into())),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "attachments_not_supported");
 }
 
 #[tokio::test]

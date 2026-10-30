@@ -193,6 +193,13 @@ impl Db {
     // ----- documents -------------------------------------------------------
 
     pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<Value>> {
+        if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
+            return Err(ApiError::new(
+                400,
+                "attachments_not_supported",
+                "douchdb does not support attachments",
+            ));
+        }
         let mut out: Vec<Option<Value>> = vec![None; docs.len()];
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
@@ -549,44 +556,6 @@ impl Db {
         }
         Ok(())
     }
-
-    pub async fn attachment(
-        &self,
-        docid: &str,
-        rev: Option<&str>,
-        name: &str,
-    ) -> DbResult<(AttMeta, Vec<u8>)> {
-        let docid = docid.to_string();
-        let rev = rev.map(str::to_string);
-        let name = name.to_string();
-        self.shard(&docid)
-            .call(move |s| {
-                let meta = s
-                    .get_meta(&docid)
-                    .ok_or_else(|| ApiError::not_found("missing"))?;
-                let rev = match rev {
-                    Some(r) => r,
-                    None => meta
-                        .tree
-                        .winner()
-                        .ok_or_else(|| ApiError::not_found("missing"))?,
-                };
-                let att = meta
-                    .atts
-                    .get(&rev)
-                    .and_then(|list| list.iter().find(|(n, _)| n.as_str() == name))
-                    .map(|(_, a)| a.clone())
-                    .ok_or_else(|| ApiError::not_found("Document is missing attachment"))?;
-                let mut data = Vec::new();
-                let mut chunk = 0u32;
-                while let Some(part) = s.get(&blob_prefix(&att.digest, chunk)) {
-                    data.extend_from_slice(&part);
-                    chunk += 1;
-                }
-                Ok((att, data))
-            })
-            .await
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +567,13 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
     let Some(obj) = doc.as_object() else {
         return Err(ApiError::bad_request("Document must be a JSON object"));
     };
+    if obj.contains_key("_attachments") {
+        return Err(ApiError::new(
+            400,
+            "attachments_not_supported",
+            "douchdb does not support attachments",
+        ));
+    }
     for key in obj.keys() {
         if key.starts_with('_') && !META_FIELDS.contains(&key.as_str()) {
             return Err(ApiError::new(
