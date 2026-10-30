@@ -6,3 +6,7 @@
 
 # default server data directory
 /data
+
+# Python caches
+__pycache__/
+*.pyc
