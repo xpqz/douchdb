@@ -90,9 +90,11 @@ The cluster pass made fan-out owner-aware and concurrent.
   `total_rows` from the owner row counts.
 - **Map queries push `skip + limit` down.** A map-only view query now asks each
   owner for only the needed window. Reduce queries still need the full range.
-- **Distributed built-in reduces.** Global `_count`, `_sum` and `_stats` without
-  grouping are reduced per owner and combined by the coordinator, instead of
-  shipping every map row to the coordinator.
+- **Distributed reduces.** Global and grouped `_count`, `_sum` and `_stats`
+  are reduced per owner and combined by the coordinator. Custom JavaScript
+  reducers are recombined with `rereduce=true`; `_approx_count_distinct` still
+  falls back to the map-row merge path because per-owner counts cannot be
+  unioned exactly.
 - **Single-replica write fast path.** When every document in a batch has one
   replica, the coordinator returns after the primary write instead of doing an
   unnecessary `_bulk_get` and secondary-copy pass. Design documents still copy
@@ -176,6 +178,14 @@ Grouped `_count`, `_sum` and `_stats` queries are now reduced per owner and
 combined by group key instead of shipping every map row to the coordinator.
 Grouped tests cover both `_count` and `_sum`.
 
+### Custom reducers (#38)
+
+Custom JavaScript reducers are now distributed too. Each owner reduces its own
+rows, and the coordinator calls the reducer again with `rereduce=true` over the
+partials. Grouped custom reducers merge by group key and then rereduce the
+partial values. `_approx_count_distinct` is intentionally excluded because
+per-owner distinct counts cannot be combined exactly.
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -211,8 +221,8 @@ Grouped tests cover both `_count` and `_sum`.
   (or maintain a separate replica index), which would roughly halve the map work
   in this `n=2` configuration.
 - Limited `_changes` feeds still fill from one node at a time; a globally
-  ordered limit across nodes remains. Grouped built-in reduces are combined,
-  but custom reducers still use the map-row merge path.
+  ordered limit across nodes remains. `_approx_count_distinct` still uses the
+  map-row merge path because partial distinct counts cannot be combined.
 - Every node keeps its live `_all_docs` map in memory after the first range
   query. That is what removes the offset scan, but large databases should budget
   for it.

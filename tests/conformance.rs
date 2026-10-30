@@ -2006,6 +2006,10 @@ async fn cluster_views_merge_rows_from_every_replica() {
         "sum": {
             "map": "function(doc){ emit(doc.city, doc.n); }",
             "reduce": "_sum"
+        },
+        "custom_sum": {
+            "map": "function(doc){ emit(doc.city, doc.n); }",
+            "reduce": "function(keys, values, rereduce){ return sum(values); }"
         }
     }});
     let (status, body) = nodes[0].put("/clview/_design/v", ddoc).await;
@@ -2047,6 +2051,16 @@ async fn cluster_views_merge_rows_from_every_replica() {
     assert_eq!(rows[0]["key"], "Berlin");
     assert_eq!(rows[0]["value"], 30);
     assert_eq!(rows[1]["key"], "Paris");
+    assert_eq!(rows[1]["value"], 36);
+
+    // Custom reducers are recombined across owners with rereduce=true.
+    let (_, body) = nodes[0].get("/clview/_design/v/_view/custom_sum").await;
+    assert_eq!(body["rows"][0]["value"], 66);
+    let (_, body) = nodes[0]
+        .get("/clview/_design/v/_view/custom_sum?group=true")
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["value"], 30);
     assert_eq!(rows[1]["value"], 36);
 
     // Map queries push the window down to the owner nodes but still report the

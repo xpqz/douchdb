@@ -961,6 +961,15 @@ fn reduce_value(
     run_reduce(source, keys, values, false, limits)
 }
 
+/// Combine partial custom-reduce values with the reducer's rereduce mode.
+pub(crate) fn recombine(
+    source: &str,
+    values: &[Value],
+    limits: ViewLimits,
+) -> Result<Value, String> {
+    run_reduce(source, &[], values, true, limits)
+}
+
 fn run_reduce(
     source: &str,
     keys: &[Value],
