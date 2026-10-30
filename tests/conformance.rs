@@ -3214,3 +3214,379 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
+
+#[tokio::test]
+async fn partitioned_database_documents_info_and_views() {
+    let node = &start_cluster(1)[0];
+    let (status, _) = node.put("/parted-test?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, info) = node.get("/parted-test").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["props"]["partitioned"], true);
+
+    let (status, _) = node.put("/parted-test/a:1", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = node.put("/parted-test/a:2", json!({"n": 2})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = node.put("/parted-test/b:1", json!({"n": 10})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = node.put("/parted-test/no-colon", json!({"n": 3})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_docid");
+    let (status, body) = node.put("/parted-test/:bad", json!({"n": 3})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_partition");
+    let (status, body) = node.put("/parted-test/_bad:1", json!({"n": 3})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_partition");
+
+    // Design documents are global and exempt from the partition:id rule.
+    let (status, _) = node
+        .put(
+            "/parted-test/_design/p",
+            json!({
+                "views": {
+                    "by_n": {"map": "function(doc){ emit(doc.n, null); }"},
+                    "count": {
+                        "map": "function(doc){ emit(doc.n, null); }",
+                        "reduce": "_count"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // POST cannot generate an id in a partitioned database; an explicit id works.
+    let (status, body) = node.post("/parted-test", json!({"n": 4})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_docid");
+    let (status, _) = node
+        .post("/parted-test", json!({"_id": "c:1", "n": 20}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = node
+        .post(
+            "/parted-test/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a:3", "n": 3},
+                {"_id": "missing-partition", "n": 9}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows = body.as_array().unwrap();
+    assert!(rows[0].get("ok").is_some(), "{body}");
+    assert_eq!(rows[1]["error"], "illegal_docid", "{body}");
+
+    let (status, info) = node.get("/parted-test/_partition/a").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["partition"], "a");
+    assert_eq!(info["doc_count"], 3);
+    assert_eq!(info["doc_del_count"], 0);
+
+    // Delete one document; partition info reports the tombstone separately.
+    let (_, doc) = node.get("/parted-test/a:2").await;
+    let rev = doc["_rev"].as_str().unwrap();
+    let (status, _) = node.delete(&format!("/parted-test/a:2?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, info) = node.get("/parted-test/_partition/a").await;
+    assert_eq!(info["doc_count"], 2);
+    assert_eq!(info["doc_del_count"], 1);
+
+    let (status, body) = node.get("/parted-test/_partition/a/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 2);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a:1", "a:3"]);
+
+    let (status, body) = node
+        .post(
+            "/parted-test/_partition/a/_all_docs",
+            json!({"keys": ["a:1", "b:1", "a:3"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "a:1");
+    assert_eq!(body["rows"][1]["error"], "not_found");
+    assert_eq!(body["rows"][2]["id"], "a:3");
+
+    // A partitioned design doc is queried through the partition path only.
+    let (status, body) = node
+        .get("/parted-test/_partition/a/_design/p/_view/by_n")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 2);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a:1", "a:3"]);
+
+    let (status, body) = node
+        .get("/parted-test/_partition/a/_design/p/_view/count")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 2);
+
+    let (status, body) = node
+        .get("/parted-test/_partition/a/_design/p/_view/by_n?include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["doc"]["n"], 1);
+
+    let (status, body) = node.get("/parted-test/_design/p/_view/by_n").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["reason"].as_str().unwrap().contains("partition"),
+        "{body}"
+    );
+
+    // A global design doc works across partitions and rejects partition paths.
+    let (status, _) = node
+        .put(
+            "/parted-test/_design/g",
+            json!({
+                "options": {"partitioned": false},
+                "views": {"all": {"map": "function(doc){ emit(doc.n, null); }"}}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = node.get("/parted-test/_design/g/_view/all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    let (status, body) = node
+        .get("/parted-test/_partition/a/_design/g/_view/all")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["reason"].as_str().unwrap().contains("partition"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    let (status, _) = nodes[0].put("/clpart?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Creation propagates the partitioned flag to every peer.
+    for node in &nodes {
+        let (status, info) = node.get("/clpart").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        assert_eq!(info["props"]["partitioned"], true, "{info}");
+    }
+
+    let docs: Vec<Value> = (0..24)
+        .map(|i| {
+            let partition = if i % 2 == 0 { "even" } else { "odd" };
+            json!({"_id": format!("{partition}:doc{i}"), "n": i, "partition": partition})
+        })
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clpart/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for node in &nodes {
+        let (status, body) = node.get("/clpart/_partition/even/_all_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 12);
+        assert!(body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"].as_str().unwrap().starts_with("even:")));
+        let (status, info) = node.get("/clpart/_partition/even").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        assert_eq!(info["doc_count"], 12);
+    }
+
+    // All documents in a partition hash to one shard. Query each shard mask
+    // directly and verify partition documents appear in exactly one mask.
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let mut even_shards = std::collections::HashSet::new();
+    for shard in 0..4 {
+        let (status, body) = nodes[0]
+            .req_with(
+                Method::GET,
+                &format!("/clpart/_all_docs?shards={shard}"),
+                None,
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for row in body["rows"].as_array().unwrap() {
+            if row["id"].as_str().unwrap().starts_with("even:") {
+                even_shards.insert(shard);
+            }
+        }
+    }
+    assert_eq!(
+        even_shards.len(),
+        1,
+        "partition spans shards: {even_shards:?}"
+    );
+
+    // Partition views are complete from every coordinator.
+    let (status, _) = nodes[1]
+        .put(
+            "/clpart/_design/p",
+            json!({
+                "views": {
+                    "by_n": {"map": "function(doc){ if (doc.n % 2 === 0) emit(doc.n, null); }"},
+                    "count": {
+                        "map": "function(doc){ if (doc.n % 2 === 0) emit(doc.n, null); }",
+                        "reduce": "_count"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = nodes[2]
+        .get("/clpart/_partition/even/_design/p/_view/by_n")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 12);
+    let (status, body) = nodes[2]
+        .get("/clpart/_partition/even/_design/p/_view/count")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 12);
+    let (status, body) = nodes[2].get("/clpart/_design/p/_view/by_n").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn cluster_partitioned_reads_route_to_the_owner_with_one_replica() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    let (status, _) = nodes[0].put("/clpart1?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("p:doc{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[1]
+        .post("/clpart1/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[1]
+        .put(
+            "/clpart1/_design/p",
+            json!({
+                "views": {"by_n": {"map": "function(doc){ emit(doc.n, null); }"}}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Each coordinator may or may not own p's shard. Partition metadata and
+    // reads must be forwarded to a replica when it does not.
+    for node in &nodes {
+        let (status, body) = node.get("/clpart1/_partition/p").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["doc_count"], 12, "{body}");
+        let (status, body) = node.get("/clpart1/_partition/p/_all_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 12);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 12);
+        let (status, body) = node.get("/clpart1/_partition/p/_design/p/_view/by_n").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 12);
+    }
+}
+
+#[tokio::test]
+async fn partitioned_all_docs_ranges_keys_and_nested_ids() {
+    let node = &start_cluster(1)[0];
+    let (status, _) = node.put("/prange?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = ["p:a", "p:b", "p:c", "p:d:e", "q:x"]
+        .iter()
+        .map(|id| json!({"_id": id}))
+        .collect();
+    let (status, _) = node.post("/prange/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = node.get("/prange/_partition/p/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["p:a", "p:b", "p:c", "p:d:e"]);
+
+    let (status, body) = node
+        .get("/prange/_partition/p/_all_docs?startkey=%22p:b%22")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["offset"], 1);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+
+    let (status, body) = node
+        .get("/prange/_partition/p/_all_docs?endkey=%22p:c%22")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+
+    let (status, body) = node
+        .get("/prange/_partition/p/_all_docs?descending=true&limit=2")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["p:d:e", "p:c"]);
+
+    let (status, body) = node
+        .post(
+            "/prange/_partition/p/_all_docs",
+            json!({"keys": ["p:a", "q:x", "p:d:e"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["rows"][0]["id"], "p:a");
+    assert_eq!(body["rows"][1]["error"], "not_found");
+    assert_eq!(body["rows"][2]["id"], "p:d:e");
+
+    // Global _all_docs remains available in a partitioned database.
+    let (status, body) = node.get("/prange/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 5);
+
+    // Non-partitioned databases reject partition endpoints and omit props.
+    let (status, _) = node.put("/plain", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, info) = node.get("/plain").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(info.get("props").is_none(), "{info}");
+    let (status, body) = node.get("/plain/_partition/p/_all_docs").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["reason"].as_str().unwrap().contains("partition"),
+        "{body}"
+    );
+}

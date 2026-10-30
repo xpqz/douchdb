@@ -385,6 +385,38 @@ With `--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) set, douchdb exports:
 Without an endpoint these recorders are no-ops, so the normal build has no
 collector dependency.
 
+### Partitioned databases (#55)
+
+Databases created with `PUT /{db}?partitioned=true` carry
+`props.partitioned: true` and enforce CouchDB partition ids: everything before
+the first colon is the partition, everything after it is the document id.
+Design documents are exempt. Document ids without a colon, empty partitions and
+underscore-leading partitions return `illegal_docid`/`illegal_partition`.
+
+Placement hashes the partition key rather than the full document id, so every
+document in a partition shares a shard and its replicas. This makes
+`_partition/{partition}/_all_docs` and partitioned views single-shard reads.
+
+Implemented partition API:
+
+- `GET /{db}/_partition/{partition}` — live/deleted counts and sizes.
+- `GET|POST /{db}/_partition/{partition}/_all_docs` — ranges, keys, skip/limit,
+  descending and `include_docs`, all scoped to the partition.
+- `GET|POST /{db}/_partition/{partition}/_design/{ddoc}/_view/{view}` — map and
+  reduce queries scoped to the partition.
+
+Design documents default to partitioned views in a partitioned database.
+`"options": {"partitioned": false}` makes a global design document; global
+queries use the normal view path and partitioned queries reject it. Global
+`_all_docs` across partitions remains available. Cluster coordinators forward
+partition metadata to a replica when they do not own the partition shard, and
+partition reads fan out through the normal owner masks.
+
+Tests cover document validation, bulk per-document errors, partition counts and
+tombstones, range/key/descending `_all_docs`, partitioned and global views,
+reduce views, partition-based shard placement, cluster creation propagation,
+n=1 owner routing, and partition queries from every coordinator.
+
 ### Changes replica failover (#53)
 
 Cluster `_changes` now skips unavailable nodes and continues with reachable

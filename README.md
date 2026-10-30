@@ -67,6 +67,43 @@ The cluster uses `q=4`, `n=3`, three data volumes and OTLP export to Grafana's
 service layout, credentials, verification commands and teardown. The stack is
 for local development: it has no TLS and uses demo credentials.
 
+## Partitioned databases
+
+Create a CouchDB-style partitioned database with:
+
+```sh
+curl -X PUT 'localhost:5984/sensors?partitioned=true'
+```
+
+Every document id, except design documents, must be `partition:docid`. The
+partition is everything before the first colon; the document id may contain
+more colons. Partitioned databases hash by the partition key, so every document
+in a partition lives on the same shard and its replicas.
+
+```sh
+curl -X POST localhost:5984/sensors/_bulk_docs \
+  -H 'Content-Type: application/json' \
+  -d '{"docs":[
+        {"_id":"field-1:reading-1","value":0.15},
+        {"_id":"field-1:reading-2","value":0.14},
+        {"_id":"field-2:reading-1","value":0.22}
+      ]}'
+```
+
+Partition-scoped endpoints:
+
+```sh
+curl localhost:5984/sensors/_partition/field-1
+curl localhost:5984/sensors/_partition/field-1/_all_docs
+curl localhost:5984/sensors/_partition/field-1/_design/readings/_view/by_time
+```
+
+Design documents in a partitioned database are partitioned by default and are
+queried through `_partition/{partition}`. Add `"options": {"partitioned":
+false}` to a design document to make its views global; global views are queried
+through the normal `/{db}/_design/{ddoc}/_view/{view}` path. Global `_all_docs`
+queries across partitions remain available.
+
 ## Views
 
 Views live in design documents and run JavaScript map/reduce functions on the
@@ -556,11 +593,12 @@ with anti-entropy are implemented and tested. Attachments are deliberately not
 supported; documents containing `_attachments` are rejected with
 `attachments_not_supported`. Known limits:
 
-- Static membership and no rebalancing beyond rendezvous hashing.
+- Static cluster membership. Rebalancing is operator-triggered through
+  `POST /_node/_local/_dbs/{db}/rebalance`.
 - Version vectors are keyed per node, not per shard replica.
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
   shard for ~27 s (measured in [PLAN.md](PLAN.md)).
-- No Mango, lists/shows or metrics.
+- No Mango or lists/shows. Attachments are not supported.
 
 ## License
 

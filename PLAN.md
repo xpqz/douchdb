@@ -371,6 +371,12 @@ Above ~6k means something was built that nobody asked for.
   `Value`; the rebuilt index seeds a sorted in-memory snapshot that warm queries
   reuse, and built-in reducers skip per-row key/value allocation. See the #31
   and #35 before/after numbers in `docs/performance.md`.
+* **Partitioned databases.** `PUT /db?partitioned=true` stores a partitioned
+  flag, enforces `partition:docid` ids, and hashes by partition so a partition
+  shares one shard set. `_partition/{p}` exposes counts; partition-scoped
+  `_all_docs` and views filter at the shard, with ranges and keys clamped to the
+  partition prefix. Design docs are partitioned by default and can opt into
+  global views with `options.partitioned=false`.
 * **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in

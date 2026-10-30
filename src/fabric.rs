@@ -765,6 +765,9 @@ pub(crate) async fn fetch_all_docs(
             .collect();
         query.push(format!("shards={}", selected.join(",")));
     }
+    if let Some(partition) = &opts.partition {
+        query.push(format!("partition={}", percent_encode(partition)));
+    }
     if opts.include_docs {
         query.push("include_docs=true".to_string());
     }
@@ -851,6 +854,7 @@ async fn fetch_view_mask(
             query.attachments,
             query.limits,
             Some(mask),
+            query.partition.as_deref(),
         )
         .await?;
         let mut rows: Vec<crate::view::Row> = rows
@@ -896,6 +900,9 @@ async fn fetch_view_mask(
     ];
     if query.descending {
         params.push(("descending", "true".to_string()));
+    }
+    if let Some(partition) = &query.partition {
+        params.push(("partition", partition.clone()));
     }
     if let Some(limit) = limit.filter(|limit| *limit != usize::MAX) {
         params.push(("limit", limit.to_string()));
@@ -948,6 +955,7 @@ pub(crate) async fn cluster_view_rows(
         Err(error) => return Err(error),
     };
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
+    crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
     // A reduce needs the whole range. A map query can take only the global
     // window from each owner because the owner sets are disjoint.
@@ -1056,6 +1064,9 @@ pub(crate) async fn cluster_reduce(
     reducer: &str,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
+    let ddoc_doc = db.get_doc(ddoc, &DocOpts::default()).await?;
+    let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
+    crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let node_count = st.cluster.nodes.len();
     let owned: Vec<bool> = (0..db.q)
         .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
@@ -1087,6 +1098,9 @@ pub(crate) async fn cluster_reduce(
                 }
                 if query.group_level > 0 {
                     params.push(("group_level", query.group_level.to_string()));
+                }
+                if let Some(partition) = &query.partition {
+                    params.push(("partition", partition.clone()));
                 }
                 let request = st
                     .client

@@ -60,6 +60,12 @@ pub struct ViewQuery {
     /// crosses the network once instead of once per replica.
     pub owner_shards: Option<Vec<bool>>,
     pub shard_count: u32,
+    /// Set for a `_partition/{p}/_design/.../_view/...` query. Only rows
+    /// belonging to that partition are returned.
+    pub partition: Option<String>,
+    /// Partitioned databases hash by partition, so owner-shard filtering must
+    /// use the same placement function.
+    pub partitioned: bool,
     /// Set by the cluster coordinator after summing owner-only map row counts.
     pub total_rows_override: Option<usize>,
 }
@@ -68,6 +74,9 @@ pub struct ViewQuery {
 pub struct ViewSpec {
     pub map: String,
     pub reduce: Option<String>,
+    /// Design documents in a partitioned database are partitioned by default.
+    /// `options.partitioned = false` makes the view global.
+    pub partitioned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -379,6 +388,11 @@ impl ViewIndex {
 
 /// Run one view query against the local shards.
 pub async fn query(db: &Db, ddoc_id: &str, view_name: &str, query: &ViewQuery) -> DbResult<Value> {
+    validate_view_partition(
+        db,
+        &load_spec(db, ddoc_id, view_name).await?,
+        query.partition.as_deref(),
+    )?;
     let (spec, rows, docs) = local_map(
         db,
         ddoc_id,
@@ -387,9 +401,33 @@ pub async fn query(db: &Db, ddoc_id: &str, view_name: &str, query: &ViewQuery) -
         query.attachments,
         query.limits,
         query.owner_shards.as_deref(),
+        query.partition.as_deref(),
     )
     .await?;
     finish(&spec, rows, docs, query)
+}
+
+/// Partitioned design docs may only be queried through `_partition`, and
+/// global design docs may only be queried globally.
+pub fn validate_view_partition(db: &Db, spec: &ViewSpec, partition: Option<&str>) -> DbResult<()> {
+    if !db.partitioned {
+        if partition.is_some() {
+            return Err(ApiError::bad_request(
+                "`partition` parameter is not supported on this db",
+            ));
+        }
+        return Ok(());
+    }
+    match (spec.partitioned, partition) {
+        (true, None) => Err(ApiError::bad_request(
+            "`partition` parameter is mandatory for queries to this view.",
+        )),
+        (true, Some(partition)) => crate::db::validate_partition(partition),
+        (false, None) => Ok(()),
+        (false, Some(_)) => Err(ApiError::bad_request(
+            "`partition` parameter is not supported in this design doc",
+        )),
+    }
 }
 
 /// Local map rows plus the documents they came from, for cluster merging.
@@ -401,11 +439,24 @@ pub async fn local_map(
     attachments: bool,
     limits: ViewLimits,
     owner: Option<&[bool]>,
+    partition: Option<&str>,
 ) -> DbResult<(ViewSpec, Arc<Vec<Row>>, HashMap<String, Value>)> {
     let spec = load_spec(db, ddoc_id, view_name).await?;
     let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits).await?;
+    let rows = match partition {
+        Some(partition) => {
+            let prefix = format!("{partition}:");
+            Arc::new(
+                rows.iter()
+                    .filter(|row| row.id.starts_with(&prefix))
+                    .cloned()
+                    .collect(),
+            )
+        }
+        None => rows,
+    };
     let docs = if need_docs {
-        docs_by_id(db, attachments, owner).await?
+        docs_by_id(db, attachments, owner, partition).await?
     } else {
         HashMap::new()
     };
@@ -501,8 +552,10 @@ async fn docs_by_id(
     db: &Db,
     attachments: bool,
     owner: Option<&[bool]>,
+    partition: Option<&str>,
 ) -> DbResult<HashMap<String, Value>> {
     let opts = AllDocsOpts {
+        partition: partition.map(str::to_string),
         include_docs: true,
         attachments,
         limit: usize::MAX,
@@ -613,7 +666,17 @@ pub fn spec_from_doc(ddoc: &Value, view_name: &str) -> DbResult<ViewSpec> {
         .get("reduce")
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(ViewSpec { map, reduce })
+    let partitioned = ddoc
+        .get("options")
+        .and_then(Value::as_object)
+        .and_then(|options| options.get("partitioned"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    Ok(ViewSpec {
+        map,
+        reduce,
+        partitioned,
+    })
 }
 
 fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
@@ -763,9 +826,15 @@ fn render(
         rows.iter().collect()
     };
 
+    if let Some(partition) = &query.partition {
+        let prefix = format!("{partition}:");
+        ordered.retain(|row| row.id.starts_with(&prefix));
+        total_rows = ordered.len();
+    }
+
     if let Some(owned) = &query.owner_shards {
         ordered.retain(|row| {
-            let shard = crate::db::shard_index(&row.id, query.shard_count);
+            let shard = crate::db::shard_index_for(&row.id, query.shard_count, query.partitioned);
             owned.get(shard).copied().unwrap_or(false)
         });
         total_rows = ordered.len();
