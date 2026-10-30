@@ -476,6 +476,28 @@ Before/after against the previous `_changes` path:
 `style=all_docs` still decodes revision trees to find all leaf revisions;
 `include_docs` is now dominated by reading bodies from LevelDB.
 
+### In-memory sequence index (#62)
+
+Each shard now builds a lazy sequence index of `seq -> (id, winning rev,
+deleted, other leaves)` on the first changes request and maintains it on every
+write. Non-conflict documents store no extra leaf entries. The index removes
+the per-request LevelDB scan of `s/` keys, the metadata decode for winning
+revisions, and the revision-tree walk for `style=all_docs`.
+
+The first feed after a restart still builds the index. The benchmark warms one
+request per coordinator before measuring steady state.
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_changes?limit=1000` | 182 req/s | 448 req/s | 5.4 ms | 2.0 ms |
+| Full `_changes` | 78.3 req/s | 186 req/s | 12.6 ms | 5.0 ms |
+| `_changes?style=all_docs` | 38.1 req/s | 226 req/s | 26.0 ms | 4.2 ms |
+| `_changes?include_docs` | 35.9 req/s | 49.0 req/s | 27.2 ms | 19.2 ms |
+| `style=all_docs&include_docs` | 24.9 req/s | 54.9 req/s | 39.3 ms | 17.9 ms |
+
+`include_docs` is now dominated by reading the requested document bodies from
+LevelDB; every other changes mode is mostly JSON serialization and transfer.
+
 ### Partitioned databases (#55)
 
 See [partitioned-databases.md](partitioned-databases.md) for the user-facing
@@ -597,8 +619,9 @@ replicates and the pending file disappears.
   each node indexes every locally held replica, which is what enables node-loss
   failover. Map and reduce queries both fall back to replicas when an owner is
   unreachable.
-- **`_changes`** is ~5.4 ms for a 1,000-row limited feed; a full
-  6,000-document feed is ~12.6 ms. Shard-masked changes use the local replica when available and
+- **`_changes`** is ~2 ms for a 1,000-row limited feed; a full
+  6,000-document feed is ~5 ms. `style=all_docs` is ~4.2 ms; `include_docs`
+  is ~19 ms because it reads every document body. Shard-masked changes use the local replica when available and
   fall back to another replica for missing masks. Limited feeds still merge
   selected nodes round-robin up to the global limit.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence

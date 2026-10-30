@@ -3750,3 +3750,42 @@ async fn partitioned_all_docs_ranges_keys_and_nested_ids() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn changes_style_all_docs_includes_conflict_leaves() {
+    let s = Server::start(false);
+    s.fresh_db("changesconf").await;
+    let root = "00000000000000000000000000000000";
+    let (status, _) = s
+        .post(
+            "/changesconf/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": "2-b", "_revisions": {"start": 2, "ids": ["b", root]}, "v": "b"},
+                {"_id": "x", "_rev": "2-c", "_revisions": {"start": 2, "ids": ["c", root]}, "v": "c"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get("/changesconf/_changes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let default_changes = body["results"][0]["changes"].as_array().unwrap();
+    assert_eq!(default_changes.len(), 1, "default style is main_only");
+    assert_eq!(default_changes[0]["rev"], "2-c");
+
+    let (status, body) = s.get("/changesconf/_changes?style=all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let leaves: Vec<&str> = body["results"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["rev"].as_str().unwrap())
+        .collect();
+    assert_eq!(leaves, ["2-b", "2-c"]);
+
+    let (status, body) = s
+        .get("/changesconf/_changes?style=all_docs&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["doc"]["v"], "c");
+}
