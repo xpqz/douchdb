@@ -385,6 +385,25 @@ With `--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) set, douchdb exports:
 Without an endpoint these recorders are no-ops, so the normal build has no
 collector dependency.
 
+### Native simple-map views (#67)
+
+Map functions matching the narrow `emit(doc.field, field-or-literal)` shape
+skip QuickJS and extract values directly. The index signature includes a
+native-generation marker so an existing JavaScript index is rebuilt once,
+and all other map functions fall back to the JS engine.
+
+On the 6,000-document cluster benchmark, with an equivalent map forced through
+QuickJS (`var v = doc.value; emit(v, 1)`) as the control:
+
+| Operation | QuickJS | Native | Change |
+|---|---:|---:|---:|
+| Cold build | 53.1 ms | 38.2 ms | **28% faster** |
+| Warm map | 463 req/s | 483 req/s | **4% faster** |
+
+Cold builds still read every body and write the index; the saving is the
+QuickJS compile/eval/JSON boundary. Warm queries are dominated by index reads
+and cluster transport.
+
 ### Local-replica reads and cluster fan-out (#58, #59)
 
 Shard-masked reads now prefer the coordinator's local replica for every

@@ -507,6 +507,84 @@ def main():
             reduce_lat, time.perf_counter() - started
         )
 
+        # A deliberately simple map that takes the native field-extraction
+        # path instead of compiling and running QuickJS.
+        native_ddoc = {
+            "views": {
+                "by_value": {
+                    "map": "function(doc){ emit(doc.value, 1); }",
+                    "reduce": "_count",
+                }
+            }
+        }
+        request(conns[0], "PUT", "/perf/_design/native", native_ddoc)
+        native_cold, _ = request(
+            conns[0], "GET", "/perf/_design/native/_view/by_value?limit=100"
+        )
+        for conn in conns:
+            request(conn, "GET", "/perf/_design/native/_view/by_value?limit=100")
+        native_lat = []
+        started = time.perf_counter()
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/native/_view/by_value?limit=100",
+            )
+            native_lat.append(elapsed)
+        result["operations"]["view_native_map_cold"] = {
+            "n": 1,
+            "latency_ms": {"p50": round(native_cold, 3)},
+        }
+        result["operations"]["view_native_map_warm"] = summary(
+            native_lat, time.perf_counter() - started
+        )
+        native_reduce_lat = []
+        started = time.perf_counter()
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/native/_view/by_value?reduce=true",
+            )
+            native_reduce_lat.append(elapsed)
+        result["operations"]["view_native_reduce_warm"] = summary(
+            native_reduce_lat, time.perf_counter() - started
+        )
+
+        # Semantically identical to the native map above, but the extra local
+        # variable forces the QuickJS path.
+        js_ddoc = {
+            "views": {
+                "by_value": {
+                    "map": "function(doc){ var v = doc.value; emit(v, 1); }",
+                    "reduce": "_count",
+                }
+            }
+        }
+        request(conns[0], "PUT", "/perf/_design/jsfx", js_ddoc)
+        js_cold, _ = request(
+            conns[0], "GET", "/perf/_design/jsfx/_view/by_value?limit=100"
+        )
+        for conn in conns:
+            request(conn, "GET", "/perf/_design/jsfx/_view/by_value?limit=100")
+        js_lat = []
+        started = time.perf_counter()
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/jsfx/_view/by_value?limit=100",
+            )
+            js_lat.append(elapsed)
+        result["operations"]["view_js_map_cold"] = {
+            "n": 1,
+            "latency_ms": {"p50": round(js_cold, 3)},
+        }
+        result["operations"]["view_js_map_warm"] = summary(
+            js_lat, time.perf_counter() - started
+        )
+
         request(conns[0], "POST", "/perf/_ensure_full_commit", {})
         for conn in conns:
             conn.close()

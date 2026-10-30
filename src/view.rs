@@ -480,11 +480,19 @@ async fn ensure_rows(
     limits: ViewLimits,
 ) -> DbResult<Arc<Vec<Row>>> {
     let current_seq = db.info().await?["update_seq"].as_u64().unwrap_or(0);
-    let design = format!(
-        "{}|{}",
-        spec.map,
-        spec.reduce.as_deref().unwrap_or_default()
-    );
+    let design = if NativeMap::parse(&spec.map).is_some() {
+        format!(
+            "{}|{}|native={NATIVE_MAP_VERSION}",
+            spec.map,
+            spec.reduce.as_deref().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{}|{}",
+            spec.map,
+            spec.reduce.as_deref().unwrap_or_default()
+        )
+    };
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
     let mut index = handle.lock().await;
 
@@ -679,6 +687,198 @@ pub fn spec_from_doc(ddoc: &Value, view_name: &str) -> DbResult<ViewSpec> {
     })
 }
 
+const NATIVE_MAP_VERSION: u8 = 1;
+
+/// A map function reduced to direct field/literal extraction. Anything that
+/// does not match this deliberately tiny grammar falls back to QuickJS.
+#[derive(Clone, Debug)]
+struct NativeMap {
+    key: EmitExpr,
+    value: EmitExpr,
+}
+
+#[derive(Clone, Debug)]
+enum EmitExpr {
+    Field(String),
+    Literal(Value),
+}
+
+impl NativeMap {
+    fn parse(source: &str) -> Option<NativeMap> {
+        let compact = compact_js(source)?;
+        let body = function_body(&compact)?;
+        let body = body.strip_suffix(';').unwrap_or(body);
+        let inner = body.strip_prefix("emit(")?.strip_suffix(')')?;
+        let args = split_top_level(inner, ',');
+        let (key, value) = match args.as_slice() {
+            [key] => (parse_emit_expr(key)?, EmitExpr::Literal(Value::Null)),
+            [key, value] => (parse_emit_expr(key)?, parse_emit_expr(value)?),
+            _ => return None,
+        };
+        Some(NativeMap { key, value })
+    }
+
+    fn eval(&self, expression: &EmitExpr, doc: &Value) -> Value {
+        match expression {
+            EmitExpr::Field(field) => doc.get(field).cloned().unwrap_or(Value::Null),
+            EmitExpr::Literal(value) => value.clone(),
+        }
+    }
+
+    fn row(&self, id: &str, doc: &Value) -> Row {
+        Row {
+            id: id.to_string(),
+            key: self.eval(&self.key, doc),
+            value: self.eval(&self.value, doc),
+        }
+    }
+
+    fn run_values(&self, docs: &[(String, Value)]) -> Vec<Row> {
+        docs.iter().map(|(id, doc)| self.row(id, doc)).collect()
+    }
+
+    fn run_json(&self, docs: &[(String, String)]) -> Result<Vec<Row>, String> {
+        let mut rows = Vec::with_capacity(docs.len());
+        for (id, raw) in docs {
+            let doc: Value = serde_json::from_str(raw).map_err(|error| format!("{id}: {error}"))?;
+            rows.push(self.row(id, &doc));
+        }
+        Ok(rows)
+    }
+}
+
+/// Remove JavaScript whitespace but leave quoted strings untouched.
+fn compact_js(source: &str) -> Option<String> {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if ch == q {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            out.push(ch);
+        } else if !ch.is_whitespace() {
+            out.push(ch);
+        }
+    }
+    if quote.is_some() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn function_body(compact: &str) -> Option<&str> {
+    if let Some(rest) = compact.strip_prefix("function(") {
+        let (args, tail) = rest.split_once(')')?;
+        if args != "doc" {
+            return None;
+        }
+        let body = tail.strip_prefix('{')?.strip_suffix('}')?;
+        return Some(body);
+    }
+    if let Some(rest) = compact.strip_prefix("(doc)=>") {
+        return Some(
+            rest.strip_prefix('{')
+                .and_then(|body| body.strip_suffix('}'))
+                .unwrap_or(rest),
+        );
+    }
+    if let Some(rest) = compact.strip_prefix("doc=>") {
+        return Some(
+            rest.strip_prefix('{')
+                .and_then(|body| body.strip_suffix('}'))
+                .unwrap_or(rest),
+        );
+    }
+    None
+}
+
+/// Split on a separator at bracket depth zero, respecting strings.
+fn split_top_level(input: &str, separator: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                out.push(&input[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&input[start..]);
+    out
+}
+
+fn parse_emit_expr(raw: &str) -> Option<EmitExpr> {
+    if let Some(field) = raw.strip_prefix("doc.") {
+        if is_js_ident(field) && !is_object_prototype_field(field) {
+            return Some(EmitExpr::Field(field.to_string()));
+        }
+        return None;
+    }
+    if let Some(key) = raw.strip_prefix("doc[") {
+        let key = key.strip_suffix(']')?;
+        let key: String = serde_json::from_str(key).ok()?;
+        return Some(EmitExpr::Field(key));
+    }
+    serde_json::from_str(raw).ok().map(EmitExpr::Literal)
+}
+
+/// `doc.<name>` can resolve through `Object.prototype` when the document has
+/// no such own property. Leave those names to QuickJS so a missing field does
+/// not silently become `null` instead of a function value.
+fn is_object_prototype_field(value: &str) -> bool {
+    matches!(
+        value,
+        "__proto__"
+            | "constructor"
+            | "prototype"
+            | "toString"
+            | "valueOf"
+            | "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toLocaleString"
+    )
+}
+
+fn is_js_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
 fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
     let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(limits.memory);
@@ -691,6 +891,9 @@ fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
 }
 
 fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
+    if let Some(native) = NativeMap::parse(source) {
+        return Ok(native.run_values(docs));
+    }
     let mut serialized = Vec::with_capacity(docs.len());
     for (id, doc) in docs {
         serialized.push((
@@ -711,6 +914,9 @@ fn run_map_json(
 ) -> Result<Vec<Row>, String> {
     if docs.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(native) = NativeMap::parse(source) {
+        return native.run_json(docs);
     }
 
     const MAX_DOCS: usize = 256;
@@ -1251,6 +1457,66 @@ mod tests {
         // Accented letters sort next to their base letter, not after "z".
         assert_eq!(cmp_json(&json!("z"), &json!("ä")), Ordering::Greater);
         assert_eq!(cmp_json(&json!("ä"), &json!("b")), Ordering::Less);
+    }
+
+    #[test]
+    fn native_map_matches_javascript_for_fields_and_literals() {
+        let docs = vec![
+            (
+                "a".to_string(),
+                json!({"_id": "a", "city": "Berlin", "n": 2}),
+            ),
+            ("b".to_string(), json!({"_id": "b", "n": 3})),
+        ];
+        let native = run_map(
+            "function(doc){ emit(doc.city, doc.n); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        let javascript = run_map(
+            "function(doc){ var k = doc.city; var v = doc.n; emit(k, v); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(native.len(), javascript.len());
+        for (left, right) in native.iter().zip(javascript.iter()) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.key, right.key);
+            assert_eq!(left.value, right.value);
+        }
+
+        let constant = run_map(
+            "function(doc){ emit(doc.city, 1); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(constant[0].value, json!(1));
+        assert_eq!(constant[1].key, Value::Null);
+    }
+
+    #[test]
+    fn native_map_supports_brackets_and_arrow_functions() {
+        let docs = vec![("a".to_string(), json!({"strange-key": "v"}))];
+        let rows = run_map(
+            "(doc) => { emit(doc[\"strange-key\"], doc[\"strange-key\"]); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(rows[0].key, json!("v"));
+        assert_eq!(rows[0].value, json!("v"));
+    }
+
+    #[test]
+    fn native_map_rejects_more_complex_functions() {
+        assert!(NativeMap::parse("function(doc){ if (doc.x) emit(doc.x); }").is_none());
+        assert!(NativeMap::parse("function(doc){ emit(doc.x); emit(doc.y); }").is_none());
+        assert!(NativeMap::parse("function(doc){ for (var i=0;i<2;i++) emit(i); }").is_none());
+        assert!(NativeMap::parse("function(other){ emit(other.x); }").is_none());
+        assert!(NativeMap::parse("function(doc){ emit(doc.toString); }").is_none());
     }
 
     #[test]
