@@ -520,8 +520,12 @@ A three-node (`q=4`, `n=3`) cluster benchmark is in
 [docs/performance-cluster.md](docs/performance-cluster.md):
 
 ```sh
-python3 scripts/perf_cluster.py --docs 6000
+cargo build --release --bin loadgen
+python3 scripts/perf_cluster.py --docs 6000 --spread --native
 ```
+
+`loadgen` can also be run directly against any node or load balancer; see
+[docs/performance-cluster.md](docs/performance-cluster.md).
 
 ## Tests
 

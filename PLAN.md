@@ -382,11 +382,12 @@ Above ~6k means something was built that nobody asked for.
   pass. A reproducible three-node `q=4`/`n=3` benchmark and before/after
   numbers are in `docs/performance-cluster.md`.
 * **Load-balanced edge.** The Compose stack puts nginx in front of all three
-  nodes; any node is an equal coordinator. `scripts/perf_cluster.py --spread`
-  measures round-robin client routing and node-count scaling. Point reads and
-  scatter-gather endpoints are not yet linear because non-owner coordinators
-  proxy and every `_all_docs`/view request fans out; owner-aware routing is the
-  next scaling step.
+  nodes; any node is an equal coordinator. Clustered defaults use `n=3`, so a
+  three-node cluster has every document on every node. `scripts/perf_cluster.py
+  --spread --native` measures round-robin routing with the Rust load generator;
+  the remaining single-host ceiling is the load generator sharing CPU with all
+  servers. Owner-aware edge routing was deliberately not added: CouchDB uses
+  cheap internal replica calls and a dumb round-robin LB.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes

@@ -164,6 +164,13 @@ def main():
         action="store_true",
         help="round-robin benchmark clients across every coordinator port",
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="also run the native Rust loadgen against the seeded documents",
+    )
+    parser.add_argument("--loadgen-bin", default="target/release/loadgen")
+    parser.add_argument("--native-count", type=int, default=5000)
     parser.add_argument("--workers", default="8")
     parser.add_argument("--per-level", type=int, default=500)
     parser.add_argument("--json-out", default="target/perf-cluster.json")
@@ -193,6 +200,7 @@ def main():
             "docs": args.docs,
             "sync_secs": args.sync_secs,
             "spread": args.spread,
+            "native": args.native,
             "coordinator_port": ports[0],
         },
         "operations": {},
@@ -251,6 +259,34 @@ def main():
                 for i in range(start, min(start + batch, args.docs))
             ]
             request(conn, "POST", "/perf/_bulk_docs", {"docs": docs})
+
+        if args.native:
+            loadgen = os.path.abspath(args.loadgen_bin)
+            completed = subprocess.run(
+                [
+                    loadgen,
+                    "--base",
+                    ",".join(urls),
+                    "--path",
+                    "/perf/doc-{id}",
+                    "--start",
+                    "0",
+                    "--count",
+                    str(args.native_count),
+                    "--concurrency",
+                    str(max(int(w) for w in args.workers.split(",") if w)),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(f"loadgen failed: {completed.stderr}")
+            native = json.loads(completed.stdout.strip().splitlines()[-1])
+            result["operations"]["get_native"] = native
+            print(
+                f"  native get: {native['per_s']} req/s p50={native['latency_ms']['p50']} ms",
+                file=sys.stderr,
+            )
 
         # Single-document writes, spread across coordinators when requested.
         seq_lat = []

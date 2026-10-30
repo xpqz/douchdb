@@ -33,7 +33,21 @@ existing cluster.
 
 `--spread` round-robins benchmark clients across every coordinator (the same
 shape as the nginx front); `--nodes N --n 1 --spread` runs a scaling
-experiment.
+experiment. `--native` also runs `target/release/loadgen` for GET throughput,
+so build it first:
+
+```sh
+cargo build --release --bin loadgen
+python3 scripts/perf_cluster.py --nodes 3 --spread --native
+```
+
+The load generator can also be run directly:
+
+```sh
+cargo run --release --bin loadgen -- \
+  --base http://127.0.0.1:5984,http://127.0.0.1:5985 \
+  --path '/perf/doc-{id}' --count 10000 --concurrency 64
+```
 
 ## Results
 
@@ -137,8 +151,22 @@ python3 scripts/perf_cluster.py --nodes N --q 4 --n 1 --spread \
 coordinator performs a cluster fan-out, so the view row is not directly
 comparable across that boundary.
 
-**This is not linear scaling yet.** The host and Python client cap absolute
-throughput, but two architectural effects are visible:
+The table above is the historical `n=1` Python-client run. A native Rust client
+on the same host, with `n=3` and 32 concurrent GETs, measured:
+
+| Nodes | GET req/s | p50 |
+|---|---:|---:|
+| 1 | 44,307 | 0.67 ms |
+| 2 | 40,873 | 0.67 ms |
+| 3 | 41,437 | 0.66 ms |
+
+Even the native client flattens around 40k because the client and all server
+processes share the same 16-thread host. This is now a load-generator/host
+ceiling, not a Python client ceiling. A separate load-generator host is required
+to measure true multi-node scaling.
+
+**This is not linear scaling yet.** The host and client cap absolute throughput,
+and two architectural effects remain:
 
 - A client request that lands on a non-owner coordinator proxies to the owner.
   With `n=1`, most requests take that extra hop, so point GET throughput stays
@@ -147,14 +175,14 @@ throughput, but two architectural effects are visible:
   every node and the coordinator merges the result. Adding nodes increases the
   work per request, not the number of independent requests the coordinator can
   serve.
-- Writes still pay batch routing overhead. The `n=1` fast path avoids the
-  unnecessary primary re-fetch/copy, but a four-node batch is split into
-  per-owner requests.
+- Writes are now sent directly to every replica in parallel; batches are still
+  split into per-owner requests, but there is no fetch-and-copy pass.
 
 The nginx front is deliberately simple round-robin/least-connection routing. It
-does not know which node owns a document. Linear read scaling needs owner-aware
-routing (a document-hash-aware proxy or client), or a larger replica factor so
-more coordinators can serve reads locally. Cold view builds do scale: each node
+does not know which node owns a document, matching CouchDB’s deployment model.
+With `n=3` on three nodes every node is a replica, so point reads are local; the
+remaining scaling limit in these runs is the shared client/server host. Cold
+view builds do scale: each node
 maps its own shards in parallel.
 
 ### Parallel update vector (#36)
