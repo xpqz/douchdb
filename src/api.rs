@@ -2,7 +2,7 @@
 //! wire protocol, not by taste.
 
 use crate::auth::Auth;
-use crate::cluster::Cluster;
+use crate::cluster::{Cluster, ShardMap};
 use crate::db::{
     validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
 };
@@ -241,6 +241,7 @@ impl AppState {
             DbConfig {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
+                shard_map: self.cluster.shard_map(self.config.q),
             },
         )?);
         self.dbs.write().await.insert(name.to_string(), db.clone());
@@ -262,6 +263,7 @@ impl AppState {
             DbConfig {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
+                shard_map: self.cluster.shard_map(self.config.q),
             },
         )?);
         self.dbs.write().await.insert(name.to_string(), db.clone());
@@ -724,6 +726,105 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
     )
 }
 
+/// mem3-style shard-map inspection and movement endpoint.
+pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let mut out = Map::new();
+    for name in st.db_names().await {
+        if let Ok(db) = st.db(&name).await {
+            out.insert(name, json!(db.shard_map()));
+        }
+    }
+    json(StatusCode::OK, Value::Object(out))
+}
+
+pub async fn db_metadata(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    match st.db(&name).await {
+        Ok(db) => json(StatusCode::OK, json!(db.shard_map())),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn db_metadata_put(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    let map: ShardMap = match serde_json::from_slice(&body) {
+        Ok(map) => map,
+        Err(_) => return fail(ApiError::bad_request("invalid shard map")),
+    };
+    if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
+        return fail(ApiError::bad_request(
+            "shard map does not match database q or cluster node count",
+        ));
+    }
+    if let Err(error) = db.set_shard_map(map.clone()) {
+        return fail(error);
+    }
+
+    if !is_forwarded(&st, &headers) {
+        let payload = match serde_json::to_vec(&map) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return fail(ApiError::new(
+                    500,
+                    "internal_server_error",
+                    error.to_string(),
+                ))
+            }
+        };
+        for peer in st.cluster.nodes.iter().enumerate() {
+            if peer.0 == st.cluster.me {
+                continue;
+            }
+            let request = st
+                .client
+                .put(format!("{}/_node/_local/_dbs/{}", peer.1, name))
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(payload.clone());
+            let request = forward_client_auth(request, &headers);
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    return fail(ApiError::new(
+                        response.status().as_u16(),
+                        "shard_map_update_failed",
+                        response.text().await.unwrap_or_default(),
+                    ))
+                }
+                Err(error) => {
+                    return fail(ApiError::new(
+                        502,
+                        "bad_gateway",
+                        format!("{}: {error}", peer.1),
+                    ))
+                }
+            }
+        }
+    }
+    json(StatusCode::OK, json!(map))
+}
+
 pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let authenticated = st.authorized(&headers);
     let name = if authenticated {
@@ -936,7 +1037,7 @@ pub async fn db_root(
             // The id only exists after the body is parsed, so the shard's
             // replicas are known here and a generated document can still be
             // routed. Try each replica so a dead primary does not lose it.
-            let replicas = st.cluster.replicas_of_doc(&id, db.q);
+            let replicas = db.replicas_of_doc(&id);
             if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
                 let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
                 let mut last = None;
@@ -1224,7 +1325,7 @@ async fn view_request(
     if flag(q, "owner_only") && is_forwarded(st, headers) {
         query.owner_shards = Some(
             (0..db.q)
-                .map(|shard| st.cluster.owner_of_shard(shard) == st.cluster.me)
+                .map(|shard| db.owner_of_shard(shard) == st.cluster.me)
                 .collect(),
         );
     }
@@ -1326,7 +1427,7 @@ async fn cluster_view_rows(
 
     let node_count = st.cluster.nodes.len();
     let owned: Vec<bool> = (0..db.q)
-        .map(|shard| st.cluster.owner_of_shard(shard) == st.cluster.me)
+        .map(|shard| db.owner_of_shard(shard) == st.cluster.me)
         .collect();
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
@@ -1464,7 +1565,7 @@ async fn cluster_reduce(
 ) -> DbResult<Value> {
     let node_count = st.cluster.nodes.len();
     let owned: Vec<bool> = (0..db.q)
-        .map(|shard| st.cluster.owner_of_shard(shard) == st.cluster.me)
+        .map(|shard| db.owner_of_shard(shard) == st.cluster.me)
         .collect();
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
@@ -1792,7 +1893,7 @@ async fn fetch_ddoc_from_replica(
     ddoc: &str,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
-    for node in st.cluster.replicas_of_doc(ddoc, db.q) {
+    for node in db.replicas_of_doc(ddoc) {
         if node == st.cluster.me {
             continue;
         }
@@ -1949,14 +2050,8 @@ async fn commit_docs(
                 .to_string()
         })
         .collect();
-    let primaries: Vec<usize> = ids
-        .iter()
-        .map(|id| st.cluster.owner_of_doc(id, db.q))
-        .collect();
-    let replicas: Vec<Vec<usize>> = ids
-        .iter()
-        .map(|id| st.cluster.replicas_of_doc(id, db.q))
-        .collect();
+    let primaries: Vec<usize> = ids.iter().map(|id| db.owner_of_doc(id)).collect();
+    let replicas: Vec<Vec<usize>> = ids.iter().map(|id| db.replicas_of_doc(id)).collect();
     let replication = st.cluster.replication_factor();
     // CouchDB defaults to a write quorum and lets `?w=` override it.
     let quorum = if w == 0 {
@@ -2158,7 +2253,7 @@ async fn bulk_get(
         (0..st.cluster.nodes.len()).map(|_| Vec::new()).collect();
     for (i, req) in reqs.into_iter().enumerate() {
         let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
-        groups[st.cluster.owner_of_doc(id, db.q)].push((i, req));
+        groups[db.owner_of_doc(id)].push((i, req));
     }
     let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
     for (owner, group) in groups.into_iter().enumerate() {
@@ -2214,7 +2309,7 @@ async fn revs_diff(
     let mut groups: Vec<Map<String, Value>> =
         (0..st.cluster.nodes.len()).map(|_| Map::new()).collect();
     for (id, revs) in map {
-        groups[st.cluster.owner_of_doc(id, db.q)].insert(id.clone(), revs.clone());
+        groups[db.owner_of_doc(id)].insert(id.clone(), revs.clone());
     }
     let mut out = Map::new();
     for (owner, group) in groups.into_iter().enumerate() {
@@ -2321,7 +2416,7 @@ async fn all_docs(
         cluster_all_docs(st, db, dbname, &opts, headers).await
     } else if flag(q, "owner_only") && is_forwarded(st, headers) {
         let owned: Vec<bool> = (0..db.q)
-            .map(|shard| st.cluster.owner_of_shard(shard) == st.cluster.me)
+            .map(|shard| db.owner_of_shard(shard) == st.cluster.me)
             .collect();
         db.all_docs_owned(&opts, &owned).await
     } else {
@@ -2576,7 +2671,7 @@ async fn fetch_all_docs(
     if node == st.cluster.me {
         if owner_only {
             let owned: Vec<bool> = (0..db.q)
-                .map(|shard| st.cluster.owner_of_shard(shard) == st.cluster.me)
+                .map(|shard| db.owner_of_shard(shard) == st.cluster.me)
                 .collect();
             return db.all_docs_owned(opts, &owned).await;
         }
@@ -3219,7 +3314,7 @@ async fn doc_request(
 
     // Serve locally if this node holds a replica; otherwise try every replica
     // in preference order so a dead primary does not break reads or writes.
-    let replicas = st.cluster.replicas_of_doc(&docid, db.q);
+    let replicas = db.replicas_of_doc(&docid);
     if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
         let mut forward_q = q.clone();
         // The peer is a replica; answer locally instead of starting another
@@ -3423,7 +3518,7 @@ async fn quorum_read(
     // starting another quorum read and bouncing the request back.
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
-    let mut replicas = st.cluster.replicas_of_doc(docid, db.q);
+    let mut replicas = db.replicas_of_doc(docid);
     if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);

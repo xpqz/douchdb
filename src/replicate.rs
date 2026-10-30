@@ -4,6 +4,7 @@ use crate::auth::Auth;
 use crate::cluster::Cluster;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
+use md5::{Digest, Md5};
 use serde_json::{json, Value};
 
 /// Copy everything the peer has that this node replicates, then checkpoint.
@@ -14,7 +15,13 @@ pub async fn pull(
     cluster: &Cluster,
     auth: Option<&Auth>,
 ) -> Result<usize> {
-    let checkpoint_id = format!("ae:{}", peer);
+    // Include the shard map in the checkpoint id. When placement changes, the
+    // new replica starts from zero instead of skipping documents that were
+    // filtered out under the old map.
+    let map_tag = crate::db::hex(&Md5::digest(
+        serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
+    ));
+    let checkpoint_id = format!("ae:{}:{}", peer, map_tag);
     let since = db
         .local_get(&checkpoint_id)
         .await
@@ -84,7 +91,7 @@ pub async fn pull(
     docs.retain(|doc| {
         doc.get("_id")
             .and_then(Value::as_str)
-            .map(|id| cluster.is_replica_of(id, db.q))
+            .map(|id| db.replicas_of_doc(id).contains(&cluster.me))
             .unwrap_or(false)
     });
 

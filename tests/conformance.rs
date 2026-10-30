@@ -1646,6 +1646,63 @@ async fn cluster_changes_limit_covers_all_nodes() {
     );
 }
 
+fn all_shards_on(node: usize) -> Value {
+    json!({
+        "q": 4,
+        "node_count": 3,
+        "replicas": vec![vec![node]; 4],
+    })
+}
+
+#[tokio::test]
+async fn cluster_shard_map_moves_data_between_nodes() {
+    let mut nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("movedb").await;
+    }
+
+    // Pin every shard to node0, write a document, then move every shard to
+    // node1. Anti-entropy must pull the document under the new placement.
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/movedb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, map) = nodes[1].get("/_node/_local/_dbs/movedb").await;
+    assert_eq!(map["replicas"][0][0], 0, "metadata replicated to peers");
+
+    let (status, _) = nodes[0]
+        .put("/movedb/move", json!({"value": "moved"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/movedb", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = nodes[0].get("/movedb/move").await;
+        if status == StatusCode::OK {
+            assert_eq!(body["value"], "moved");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("shard move did not replicate: {status} {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (status, body) = nodes[1].get("/movedb/move").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], "moved");
+
+    // The old replica may still hold bytes, but reads route to the new owner.
+    nodes[0].kill();
+    let (status, body) = nodes[1].get("/movedb/move").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], "moved");
+}
+
 #[tokio::test]
 async fn cluster_all_docs_survives_node_loss_via_replicas() {
     let mut nodes = start_cluster_with(3, "3600", 2);

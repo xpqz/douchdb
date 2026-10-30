@@ -199,6 +199,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
         .route("/_uuids", get(api::uuids))
         .route("/_membership", get(api::membership))
+        .route("/_node/_local/_dbs", get(api::dbs_metadata))
+        .route(
+            "/_node/_local/_dbs/{db}",
+            get(api::db_metadata).put(api::db_metadata_put),
+        )
         .route(
             "/_session",
             get(api::session_get)
