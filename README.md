@@ -266,8 +266,8 @@ douchdb with `--cors-origins` for that origin (see below).
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
-        [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]
-        [--view-memory-mb N]
+        [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
+        [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
 ```
 
 | Flag | Default | Meaning |
@@ -281,9 +281,11 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull interval |
+| `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit per view query |
+| `--max-request-mb` | `64` | Maximum HTTP request body |
 
 Without `--nodes` it runs as a single node (the cluster with one member).
 
@@ -333,18 +335,22 @@ router; there is no coordinator role.
   `update_seq`, so a client that saw a partial fan-out resumes without skipping
   changes.
 
-All nodes must use identical `--nodes`, `--q`, `--n` and `--admin` credentials:
+All nodes must use identical `--nodes`, `--q`, `--n`, `--cluster-secret` and
+`--admin` credentials. The cluster secret authenticates internal routing headers,
+so a client cannot make a request look like a peer's. It is required (at least
+16 characters) when `--nodes` lists more than one node:
 
 ```sh
 BIN=./target/release/douchdb
 NODES=http://127.0.0.1:5984,http://127.0.0.1:5985,http://127.0.0.1:5986
 
+SECRET=change-me-cluster-secret
 $BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 2 \
-  --admin admin:secret --nodes $NODES --me 0
+  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 0
 $BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 2 \
-  --admin admin:secret --nodes $NODES --me 1
+  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 1
 $BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 2 \
-  --admin admin:secret --nodes $NODES --me 2
+  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 2
 ```
 
 Clients can talk to any node. Create the database through any node (it is
@@ -384,6 +390,20 @@ database create/get/delete, document CRUD with `?rev=`, `?revs=`,
 `_revs_diff`, `_local/*`, `_purge`, `_compact`, `_revs_limit`,
 `_design/{ddoc}/_view/{view}`, `_view_cleanup`, `_ensure_full_commit`, and
 base64 attachments.
+
+## Security and operations
+
+- `_all_dbs` and `_membership` require authentication when `--admin` is set;
+  `/_utils/` remains public so the console can render its login page.
+- Session cookies are `HttpOnly; SameSite=Strict`. There is no TLS between
+  nodes; run the cluster on a trusted network or behind a TLS proxy.
+- Internal routing headers are only honoured with `--cluster-secret`.
+- Outbound peer calls use a 2 s connect timeout and a 60 s request timeout, so
+  an unreachable or black-holed node cannot stall anti-entropy forever.
+- Request bodies default to 64 MiB (`--max-request-mb`); view JS is bounded by
+  `--view-memory-mb` and `--view-timeout-ms`.
+- `--cors-origins '*'` allows any website to make credentialed requests against
+  a logged-in session. Prefer an explicit origin list.
 
 ## Tests
 

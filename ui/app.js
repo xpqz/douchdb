@@ -272,7 +272,9 @@
       async function loadServerInfo() {
         try {
           serverInfo.value = await call('GET', '/');
-          membership.value = await call('GET', '/_membership');
+          // _membership needs admin when the server has --admin; do not send a
+          // guaranteed-401 request before the user has signed in.
+          membership.value = user.value ? await call('GET', '/_membership') : null;
         } catch (error) {
           if (error.status !== 401) handleError(error, 'Cannot read server info');
         }

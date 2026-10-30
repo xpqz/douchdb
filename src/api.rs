@@ -124,8 +124,8 @@ fn unavailable(response: &Response) -> bool {
 /// True for a request a peer already routed. Such requests are served from the
 /// local node's shards: re-running the fan-out on the receiving side would send
 /// the request straight back and loop.
-fn is_forwarded(headers: &HeaderMap) -> bool {
-    headers.get("x-douchdb-forwarded").is_some()
+fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
+    st.cluster.is_internal(headers)
 }
 
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
@@ -263,6 +263,26 @@ fn unauthorized() -> Response {
 
 /// Request log, enabled for every node. Cheap, and indispensable when a client
 /// disagrees with us about the protocol.
+/// Baseline response hardening. TLS is an operator concern; these headers still
+/// stop MIME sniffing and framing when the console is served directly.
+pub async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("no-referrer"));
+    response
+}
+
 pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -410,7 +430,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
         return unauthorized();
     }
     let mut names = st.db_names().await;
-    if st.cluster.is_clustered() && headers.get("x-douchdb-local-db").is_none() {
+    if st.cluster.is_clustered() && !st.cluster.is_internal_db(&headers) {
         for (i, peer) in st.cluster.nodes.iter().enumerate() {
             if i == st.cluster.me {
                 continue;
@@ -418,7 +438,8 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
             let request = st
                 .client
                 .get(format!("{peer}/_all_dbs"))
-                .header("x-douchdb-local-db", "1");
+                .header("x-douchdb-local-db", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
             if let Ok(response) = request.send().await {
                 if let Ok(Value::Array(remote)) = response.json::<Value>().await {
@@ -444,7 +465,10 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
     json(StatusCode::OK, json!({ "uuids": ids }))
 }
 
-pub async fn membership(State(st): State<Arc<AppState>>) -> Response {
+pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
     let nodes: Vec<String> = if st.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
@@ -492,7 +516,7 @@ pub async fn session_delete() -> Response {
     let mut response = json(StatusCode::OK, json!({"ok": true}));
     response.headers_mut().insert(
         header::SET_COOKIE,
-        "AuthSession=; Version=1; Path=/; Max-Age=0; HttpOnly"
+        "AuthSession=; Version=1; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
             .parse()
             .expect("valid cookie"),
     );
@@ -570,7 +594,7 @@ pub async fn db_root(
     }
     let q = query(&uri);
 
-    let local_only = headers.get("x-douchdb-local-db").is_some();
+    let local_only = st.cluster.is_internal_db(&headers);
     match method {
         Method::PUT => {
             if let Err(e) = st.create_db(&name).await {
@@ -584,7 +608,8 @@ pub async fn db_root(
                     let request = st
                         .client
                         .put(format!("{peer}/{name}"))
-                        .header("x-douchdb-local-db", "1");
+                        .header("x-douchdb-local-db", "1")
+                        .header("x-douchdb-secret", st.cluster.secret.as_str());
                     let request = forward_client_auth(request, &headers);
                     let response = match request.send().await {
                         Ok(response) => response,
@@ -614,7 +639,8 @@ pub async fn db_root(
                     let request = st
                         .client
                         .delete(format!("{peer}/{name}"))
-                        .header("x-douchdb-local-db", "1");
+                        .header("x-douchdb-local-db", "1")
+                        .header("x-douchdb-secret", st.cluster.secret.as_str());
                     let request = forward_client_auth(request, &headers);
                     let _ = request.send().await;
                 }
@@ -630,7 +656,7 @@ pub async fn db_root(
                     // In a cluster the update_seq is the same version vector
                     // the changes feed returns, so clients that use it as
                     // `since` do not skip another node's changes.
-                    if st.cluster.is_clustered() && !is_forwarded(&headers) {
+                    if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
                         if let Ok(vector) = cluster_update_vector(&st, &db, &name, &headers).await {
                             let seq = encode_since(&vector);
                             info["update_seq"] = json!(seq);
@@ -937,7 +963,7 @@ async fn view_request(
             update_seq: flag(q, "update_seq"),
             limits: crate::view::ViewLimits {
                 timeout: std::time::Duration::from_millis(st.config.view_timeout_ms),
-                memory: st.config.view_memory_mb * 1024 * 1024,
+                memory: st.config.view_memory_mb.saturating_mul(1024 * 1024),
             },
         })
     };
@@ -946,7 +972,7 @@ async fn view_request(
         Ok(query) => query,
         Err(error) => return fail(error),
     };
-    let result = if st.cluster.is_clustered() && !is_forwarded(headers) {
+    let result = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         match cluster_view_rows(st, db, dbname, ddoc, view_name, &query, headers).await {
             Ok((spec, rows, docs)) => crate::view::finish(&spec, rows, docs, &query),
             Err(error) => Err(error),
@@ -1024,6 +1050,7 @@ async fn cluster_view_rows(
                 .client
                 .get(url)
                 .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str())
                 .query(&[
                     ("reduce", "false"),
                     (
@@ -1208,7 +1235,7 @@ async fn bulk_docs(
     }
     // A forwarded batch has already been placed by its coordinator; write it
     // to this node's shards and let the coordinator count the replica ack.
-    if is_forwarded(headers) {
+    if is_forwarded(st, headers) {
         return match db.put_docs(docs, new_edits).await {
             Ok(results) => bulk_response(new_edits, results),
             Err(e) => fail(e),
@@ -1346,8 +1373,14 @@ async fn commit_docs(
                 .copied()
                 .filter(|node| *node != source)
             {
-                let full = fetch_rev(st, db, dbname, source, &ids[slot], rev, headers).await?;
-                batches.entry(node).or_default().push((slot, full));
+                // The primary already has the write. If fetching the revision
+                // fails (for example the node died just after committing), do
+                // not fail the client request; anti-entropy will finish the
+                // copy later.
+                if let Ok(full) = fetch_rev(st, db, dbname, source, &ids[slot], rev, headers).await
+                {
+                    batches.entry(node).or_default().push((slot, full));
+                }
             }
         }
         for (node, batch) in batches {
@@ -1489,6 +1522,7 @@ async fn forward_bulk(
         .client
         .post(format!("{peer}/{dbname}/_bulk_docs"))
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
         .json(&json!({"docs": docs, "new_edits": new_edits}));
     let request = forward_client_auth(request, &headers);
     let response = request
@@ -1524,7 +1558,7 @@ async fn bulk_get(
     };
     let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
-    if !st.cluster.is_clustered() || is_forwarded(headers) {
+    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
         return match db.bulk_get(&value, attachments, revs).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -1581,7 +1615,7 @@ async fn revs_diff(
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    if !st.cluster.is_clustered() || is_forwarded(headers) {
+    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
         return match db.revs_diff(&value).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -1640,6 +1674,7 @@ async fn forward_json(
         .client
         .post(url)
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
         .json(body);
     let request = forward_client_auth(request, &headers);
     let response = request
@@ -1695,7 +1730,7 @@ async fn all_docs(
             }
         }
     }
-    let result = if st.cluster.is_clustered() && !is_forwarded(headers) {
+    let result = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         cluster_all_docs(st, db, dbname, &opts, headers).await
     } else {
         db.all_docs(&opts).await
@@ -1863,6 +1898,7 @@ async fn fetch_all_docs(
         .client
         .post(url)
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
         .json(&body);
     let request = forward_client_auth(request, &headers);
     let response = request
@@ -1890,9 +1926,11 @@ async fn changes(
     headers: &HeaderMap,
 ) -> Response {
     let _ = method;
-    let local_only = is_forwarded(headers);
+    let local_only = is_forwarded(st, headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
-    let deadline = num(q, "timeout").unwrap_or(30_000) as u64;
+    // Cap longpoll/continuous connections so a client cannot pin a worker for
+    // an arbitrary amount of time.
+    let deadline = num(q, "timeout").unwrap_or(30_000).min(300_000) as u64;
 
     if feed == "longpoll" || feed == "continuous" {
         let started = std::time::Instant::now();
@@ -2066,7 +2104,11 @@ async fn cluster_changes(
             if style_all_docs {
                 url.push_str("&style=all_docs");
             }
-            let request = st.client.get(url).header("x-douchdb-forwarded", "1");
+            let request = st
+                .client
+                .get(url)
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
             let request = if let Some(ids) = &doc_ids {
                 request
@@ -2157,7 +2199,8 @@ async fn cluster_update_vector(
         let request = st
             .client
             .get(format!("{peer}/{dbname}"))
-            .header("x-douchdb-forwarded", "1");
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str());
         let request = forward_client_auth(request, &headers);
         if let Ok(response) = request.send().await {
             if response.status().is_success() {
@@ -2365,9 +2408,17 @@ fn split_doc_path(rest: &str) -> (String, Option<String>) {
         return (String::new(), None);
     }
     if segments[0] == "_design" && segments.len() > 1 {
-        return (format!("_design/{}", segments[1]), segments.get(2).cloned());
+        let attachment = segments
+            .get(2..)
+            .map(|parts| parts.join("/"))
+            .filter(|name| !name.is_empty());
+        return (format!("_design/{}", segments[1]), attachment);
     }
-    (segments[0].clone(), segments.get(1).cloned())
+    let attachment = segments
+        .get(1..)
+        .map(|parts| parts.join("/"))
+        .filter(|name| !name.is_empty());
+    (segments[0].clone(), attachment)
 }
 
 fn doc_opts(q: &HashMap<String, String>) -> DocOpts {

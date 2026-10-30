@@ -32,6 +32,7 @@ pub async fn pull(
     let mut changes = client
         .get(format!("{peer}/{}/_changes", db.name))
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", cluster.secret.as_str())
         .query(&[
             ("since", since_param.as_str()),
             ("style", "all_docs"),
@@ -60,6 +61,7 @@ pub async fn pull(
     let mut bulk = client
         .post(format!("{peer}/{}/_bulk_get", db.name))
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", cluster.secret.as_str())
         .json(&json!({"docs": reqs}));
     if let Some(auth) = auth {
         bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));

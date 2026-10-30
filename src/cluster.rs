@@ -1,5 +1,6 @@
 //! Cluster placement: static node list, rendezvous hashing, request routing.
 
+use axum::http::HeaderMap;
 use md5::{Digest, Md5};
 
 #[derive(Clone, Default)]
@@ -10,6 +11,8 @@ pub struct Cluster {
     pub me: usize,
     /// Replication factor: how many distinct nodes hold each shard.
     pub n: usize,
+    /// Shared secret for internal routing headers. Empty on a single node.
+    pub secret: String,
 }
 
 impl Cluster {
@@ -93,6 +96,28 @@ impl Cluster {
             .map(String::as_str)
     }
 
+    /// True only for a peer that presents the shared cluster secret. A client
+    /// cannot make a request look internal just by adding a header.
+    pub fn is_internal(&self, headers: &HeaderMap) -> bool {
+        !self.secret.is_empty()
+            && headers.get("x-douchdb-forwarded").is_some()
+            && self.secret_matches(headers)
+    }
+
+    pub fn is_internal_db(&self, headers: &HeaderMap) -> bool {
+        !self.secret.is_empty()
+            && headers.get("x-douchdb-local-db").is_some()
+            && self.secret_matches(headers)
+    }
+
+    fn secret_matches(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get("x-douchdb-secret")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| constant_time_eq(value.as_bytes(), self.secret.as_bytes()))
+            .unwrap_or(false)
+    }
+
     pub fn peers(&self) -> impl Iterator<Item = &String> {
         self.nodes
             .iter()
@@ -100,6 +125,13 @@ impl Cluster {
             .filter(move |(i, _)| *i != self.me)
             .map(|(_, n)| n)
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn score(node: &str, shard: u32) -> u64 {
@@ -116,6 +148,7 @@ mod tests {
             nodes: vec!["a".into(), "b".into(), "c".into()],
             me: 0,
             n,
+            secret: String::new(),
         }
     }
 
@@ -145,8 +178,14 @@ mod tests {
             nodes: nodes.clone(),
             me: 0,
             n: 2,
+            secret: String::new(),
         };
-        let b = Cluster { nodes, me: 1, n: 2 };
+        let b = Cluster {
+            nodes,
+            me: 1,
+            n: 2,
+            secret: String::new(),
+        };
         for i in 0..50 {
             let id = format!("doc-{i}");
             assert_eq!(a.owner_of_doc(&id, 4), b.owner_of_doc(&id, 4));
@@ -181,6 +220,7 @@ mod tests {
             nodes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
             me: 0,
             n: 1,
+            secret: String::new(),
         };
         let moved = (0..200)
             .filter(|shard| three.owner_of_shard(*shard) != four.owner_of_shard(*shard))

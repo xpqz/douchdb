@@ -98,13 +98,20 @@ fn registry() -> &'static StdMutex<IndexMap> {
     INDEXES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn registry_lock() -> std::sync::MutexGuard<'static, IndexMap> {
+    // A panic in an unrelated request must not poison every later view query.
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
     let digest = Md5::digest(format!("{ddoc_id}\0{view_name}").as_bytes());
     db.path.join("_view_indexes").join(hex(&digest))
 }
 
 fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
-    let mut indexes = registry().lock().unwrap();
+    let mut indexes = registry_lock();
     if let Some(handle) = indexes.get(path) {
         return Ok(handle.clone());
     }
@@ -123,10 +130,7 @@ fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// LevelDB files live under the database directory.
 pub fn forget_db(db_path: &Path) {
     let prefix = db_path.join("_view_indexes");
-    registry()
-        .lock()
-        .unwrap()
-        .retain(|path, _| !path.starts_with(&prefix));
+    registry_lock().retain(|path, _| !path.starts_with(&prefix));
 }
 
 impl ViewIndex {
@@ -444,10 +448,7 @@ async fn docs_by_id(db: &Db, attachments: bool) -> DbResult<HashMap<String, Valu
 /// document without advancing the database sequence.
 pub async fn invalidate(db: &Db) -> DbResult<()> {
     let directory = db.path.join("_view_indexes");
-    registry()
-        .lock()
-        .unwrap()
-        .retain(|path, _| !path.starts_with(&directory));
+    registry_lock().retain(|path, _| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -495,10 +496,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
             }
         }
     }
-    registry()
-        .lock()
-        .unwrap()
-        .retain(|path, _| live.contains(path));
+    registry_lock().retain(|path, _| live.contains(path));
     Ok(())
 }
 
@@ -1041,6 +1039,20 @@ mod tests {
         .unwrap();
         // 1000 + 1000 + 500 in three batches, then rereduce over three partials.
         assert_eq!(value, json!(1003));
+    }
+
+    #[test]
+    fn an_infinite_map_is_interrupted() {
+        let docs = vec![("a".to_string(), json!({}))];
+        let result = run_map(
+            "function (doc) { while (true) {} }",
+            &docs,
+            ViewLimits {
+                timeout: Duration::from_millis(50),
+                memory: 16 * 1024 * 1024,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

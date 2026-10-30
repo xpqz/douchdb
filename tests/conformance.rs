@@ -225,6 +225,8 @@ fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool
                 i.to_string(),
                 "--sync-secs".to_string(),
                 sync_secs.to_string(),
+                "--cluster-secret".to_string(),
+                "test-cluster-secret".to_string(),
             ];
             match Server::spawn_on(ports[i], &extra, admin, attempt) {
                 Some(server) => servers.push(server),
@@ -245,6 +247,21 @@ fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool
 #[tokio::test]
 async fn welcome_and_database_lifecycle() {
     let s = Server::start(false);
+    let response = s.client.get(format!("{}/", s.base)).send().await.unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-frame-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
     let (status, body) = s.get("/").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["couchdb"], "Welcome");
@@ -608,6 +625,20 @@ async fn bulk_docs_and_all_docs() {
 }
 
 #[tokio::test]
+async fn request_body_limit_is_enforced() {
+    let s = Server::start_with(&["--max-request-mb".to_string(), "1".to_string()], false);
+    s.fresh_db("limits").await;
+    let blob = "x".repeat(2 * 1024 * 1024);
+    let (status, _) = s
+        .post(
+            "/limits/_bulk_docs",
+            json!({"docs": [{"_id": "too-big", "blob": blob}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn bulk_docs_accepts_requests_larger_than_two_megabytes() {
     let s = Server::start(false);
     s.fresh_db("bigbulk").await;
@@ -902,9 +933,21 @@ async fn auth_basic_session_cookie_and_unauthorized_shape() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "unauthorized");
 
+    let (status, _) = s.get("/_membership").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
     let response = s
         .client
         .get(format!("{}/_all_dbs", s.base))
+        .basic_auth("admin", Some("douchdb"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = s
+        .client
+        .get(format!("{}/_membership", s.base))
         .basic_auth("admin", Some("douchdb"))
         .send()
         .await
@@ -1163,6 +1206,7 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
         .client
         .post(format!("{}/clsync/_bulk_docs", nodes[0].base))
         .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
         .json(&json!({"docs": docs}))
         .send()
         .await
@@ -1178,6 +1222,7 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
             .client
             .post(format!("{}/clsync/_all_docs", nodes[1].base))
             .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
             .json(&json!({}))
             .send()
             .await
@@ -1222,6 +1267,7 @@ async fn cluster_writes_land_on_the_whole_replica_set() {
             .client
             .post(format!("{}/clrep/_all_docs?include_docs=true", node.base))
             .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
             .json(&json!({}))
             .send()
             .await
@@ -1275,6 +1321,13 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     // Kill a node while anti-entropy is still moving shards around.
     nodes[2].kill();
 
+    // Fan-out endpoints must fail fast rather than silently returning a
+    // partial cluster view.
+    let (status, _) = nodes[0].get("/clkill/_all_docs").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (status, _) = nodes[0].get("/clkill/_changes").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
     let second: Vec<Value> = (100..106)
         .map(|i| json!({"_id": format!("k{i}"), "n": i}))
         .collect();
@@ -1307,6 +1360,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
                 .client
                 .post(format!("{}/clkill/_all_docs", node.base))
                 .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", "test-cluster-secret")
                 .json(&json!({}))
                 .send()
                 .await
@@ -1561,6 +1615,95 @@ async fn purge_invalidates_view_indexes() {
     assert_eq!(body["total_rows"], 0);
 }
 
+#[test]
+fn clustered_startup_requires_a_cluster_secret() {
+    let output = Command::new(env!("CARGO_BIN_EXE_douchdb"))
+        .env_remove("DOUCHDB_CLUSTER_SECRET")
+        .args([
+            "--nodes",
+            "http://127.0.0.1:1,http://127.0.0.1:2",
+            "--me",
+            "0",
+            "--data",
+            "/tmp/douchdb-should-not-be-created",
+        ])
+        .output()
+        .expect("run douchdb");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--cluster-secret"), "{stderr}");
+}
+
+#[tokio::test]
+async fn forged_internal_headers_are_ignored() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("forged").await;
+    }
+    let docs: Vec<Value> = (0..8).map(|i| json!({"_id": format!("f{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/forged/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A client cannot force local-only behaviour by inventing the internal
+    // marker: without the cluster secret this must still fan out.
+    let forged: Value = nodes[0]
+        .client
+        .get(format!("{}/forged/_all_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(forged["total_rows"], 8, "forged header skipped peers");
+
+    // The real header from a peer is honoured and returns only local rows.
+    let local: Value = nodes[0]
+        .client
+        .get(format!("{}/forged/_all_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(local["total_rows"].as_u64().unwrap() < 8);
+
+    // Same rule for the database-lifecycle marker: a forged one must not
+    // suppress the broadcast.
+    let (status, _) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/forged-local",
+            Some(json!({})),
+            &[("x-douchdb-local-db", "1".to_string())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[1].get("/forged-local").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/forged-real",
+            Some(json!({})),
+            &[
+                ("x-douchdb-local-db", "1".to_string()),
+                ("x-douchdb-secret", "test-cluster-secret".to_string()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[1].get("/forged-real").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn cluster_views_span_shards_with_replication_factor_one() {
     let nodes = start_cluster_with(3, "3600", 1);
@@ -1657,6 +1800,7 @@ async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
             &[
                 ("Authorization", basic.clone()),
                 ("x-douchdb-forwarded", "1".to_string()),
+                ("x-douchdb-secret", "test-cluster-secret".to_string()),
             ],
         )
         .await;
@@ -1672,6 +1816,7 @@ async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
                 &[
                     ("Authorization", basic.clone()),
                     ("x-douchdb-forwarded", "1".to_string()),
+                    ("x-douchdb-secret", "test-cluster-secret".to_string()),
                 ],
             )
             .await;

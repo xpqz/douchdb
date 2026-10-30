@@ -37,6 +37,8 @@ struct Args {
     cors_origins: Vec<String>,
     view_timeout_ms: u64,
     view_memory_mb: usize,
+    max_request_mb: usize,
+    cluster_secret: String,
 }
 
 fn parse_args() -> Args {
@@ -53,6 +55,8 @@ fn parse_args() -> Args {
         cors_origins: Vec::new(),
         view_timeout_ms: 5000,
         view_memory_mb: 64,
+        max_request_mb: 64,
+        cluster_secret: std::env::var("DOUCHDB_CLUSTER_SECRET").unwrap_or_default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -88,6 +92,10 @@ fn parse_args() -> Args {
             "--view-memory-mb" => {
                 args.view_memory_mb = it.next().and_then(|v| v.parse().ok()).unwrap_or(64)
             }
+            "--max-request-mb" => {
+                args.max_request_mb = it.next().and_then(|v| v.parse().ok()).unwrap_or(64)
+            }
+            "--cluster-secret" => args.cluster_secret = it.next().unwrap_or_default(),
             "--cors-origins" => {
                 args.cors_origins = it
                     .next()
@@ -103,7 +111,8 @@ fn parse_args() -> Args {
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
-                     \x20       [--view-memory-mb N]"
+                     \x20       [--view-memory-mb N] [--max-request-mb N]\n\
+                     \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)"
                 );
                 std::process::exit(0);
             }
@@ -120,6 +129,23 @@ fn parse_args() -> Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let args = parse_args();
+    if args.nodes.len() > 1 {
+        if args.me >= args.nodes.len() {
+            eprintln!("--me must be smaller than the number of --nodes");
+            std::process::exit(2);
+        }
+        if args.cluster_secret.trim().len() < 16 {
+            eprintln!(
+                "--cluster-secret of at least 16 characters is required with more than one --nodes entry"
+            );
+            std::process::exit(2);
+        }
+    }
+    if args.cors_origins.iter().any(|origin| origin == "*") {
+        tracing::warn!(
+            "CORS allows any origin and sends credentials; any website can act as a logged-in user"
+        );
+    }
     std::fs::create_dir_all(&args.data)?;
 
     let config = Config {
@@ -146,8 +172,12 @@ async fn main() -> anyhow::Result<()> {
             nodes: args.nodes.clone(),
             me: args.me,
             n: args.n.max(1),
+            secret: args.cluster_secret.clone(),
         },
-        client: reqwest::Client::new(),
+        client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(60))
+            .build()?,
     });
 
     if state.cluster.is_clustered() {
@@ -177,12 +207,15 @@ async fn main() -> anyhow::Result<()> {
         .fallback(api::not_found)
         // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
         // multi-document `_bulk_docs`. CouchDB's limit is far higher.
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            args.max_request_mb.max(1).saturating_mul(1024 * 1024),
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::cors,
         ))
         .layer(axum::middleware::from_fn(api::log_requests))
+        .layer(axum::middleware::from_fn(api::security_headers))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;

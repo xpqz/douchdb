@@ -340,6 +340,13 @@ Above ~6k means something was built that nobody asked for.
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
   Design documents replicate to every node; a cluster view query fails with
   `502` if a node is unreachable instead of returning partial rows.
+* **Hardening.** Internal routing headers require a shared
+  `--cluster-secret`, so clients cannot forge peer requests; `_all_dbs` and
+  `_membership` require admin auth; session cookies are `HttpOnly; SameSite=Strict`
+  and HMAC verification is constant-time; peer HTTP calls have connect/request
+  timeouts; request bodies and view execution are bounded; security headers are
+  added to every response; a poisoned view-index mutex no longer takes down
+  future queries; attachment names keep embedded slashes.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored

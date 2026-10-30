@@ -32,7 +32,10 @@ impl Auth {
             return false;
         };
         match text.split_once(':') {
-            Some((user, pass)) => user == self.user && pass == self.pass,
+            Some((user, pass)) => {
+                constant_time_eq(user.as_bytes(), self.user.as_bytes())
+                    && constant_time_eq(pass.as_bytes(), self.pass.as_bytes())
+            }
             None => false,
         }
     }
@@ -55,7 +58,7 @@ impl Auth {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
             self.sign(&payload)
         );
-        format!("{COOKIE}={token}; Version=1; Path=/; HttpOnly")
+        format!("{COOKIE}={token}; Version=1; Path=/; HttpOnly; SameSite=Strict")
     }
 
     pub fn check_cookies(&self, header: Option<&str>) -> bool {
@@ -77,7 +80,12 @@ impl Auth {
             let Ok(payload) = String::from_utf8(payload) else {
                 continue;
             };
-            if self.sign(&payload) != sig {
+            let Ok(signature) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig) else {
+                continue;
+            };
+            let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
+            mac.update(payload.as_bytes());
+            if mac.verify_slice(&signature).is_err() {
                 continue;
             }
             let Some((user, exp)) = payload.rsplit_once(':') else {
@@ -96,6 +104,13 @@ impl Auth {
         }
         false
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -121,6 +136,7 @@ mod tests {
     fn cookie_roundtrip() {
         let auth = Auth::new("admin".into(), "secret".into());
         let header = auth.cookie_header();
+        assert!(header.contains("SameSite=Strict"));
         let value = header.split(';').next().unwrap();
         assert!(auth.check_cookies(Some(value)));
         assert!(!auth.check_cookies(Some("AuthSession=forged")));
