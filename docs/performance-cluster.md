@@ -59,8 +59,8 @@ documents per second.
 |---|---:|---:|---:|---:|
 | Single PUT, sequential | 500 | 1,374 req/s | 0.663 | 1.116 |
 | Single PUT, 8 writers | 500 | 4,002 req/s | 1.727 | 3.684 |
-| Single GET, sequential | 1,000 | 6,070 req/s | 0.150 | 0.278 |
-| Single GET, 8 writers | 500 | 7,922 req/s | 0.534 | 4.328 |
+| Single GET, sequential (default r) | 1,000 | 2,341 req/s | 0.399 | 0.779 |
+| Single GET, 32 writers (default r) | 1,000 | 5,492 req/s | 3.226 | 24.214 |
 | `_bulk_docs`, 250 docs/request | 2,500 | 29,562 docs/s (118 req/s) | 7.828 | 9.192 |
 | `_bulk_get`, 250 docs/request | 2,500 | 36,396 docs/s (146 req/s) | 6.560 | 7.276 |
 | `_all_docs?limit=100` | 50 | 538 req/s | 1.680 | 2.201 |
@@ -152,7 +152,7 @@ coordinator performs a cluster fan-out, so the view row is not directly
 comparable across that boundary.
 
 The table above is the historical `n=1` Python-client run. A native Rust client
-on the same host, with `n=3` and 32 concurrent GETs, measured:
+on the same host, with `n=3`, `?r=1`, and 32 concurrent GETs, measured:
 
 | Nodes | GET req/s | p50 |
 |---|---:|---:|
@@ -254,14 +254,32 @@ go to every replica.
 | `_bulk_docs`, 250 docs/request | 12,177 docs/s | 35,339 | 29,562 |
 | `_bulk_docs` p50 | 19.8 ms | 6.8 ms | 7.8 ms |
 
+### Read quorum (#44)
+
+Clustered point GET/HEAD now defaults to CouchDB’s read quorum,
+`r = (n / 2) + 1`. The coordinator prefers its local replica when it has one,
+then reads the remaining replicas concurrently and returns the winning
+revision. `?r=1` is the local fast path.
+
+| Native GET, 3 nodes, n=3 | Throughput | p50 |
+|---|---:|---:|
+| Default r=2 | 18,522 req/s | 1.47 ms |
+| `?r=1` | 39,296 req/s | 0.68 ms |
+
+The quorum read roughly doubles the per-request work. Use `?r=1` for read-heavy
+workloads that can tolerate a single replica, or keep the default for
+consistency.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
   node; bulk ingestion is ~30k docs/s versus ~37k/s. Documents are written to
   all three replicas in parallel and the request waits for `w`; there is no
   primary fetch-and-copy pass.
-- **Single-document reads** are ~6.1k/s sequentially and ~7.9k/s with eight
-  clients. With n=3 on three nodes every coordinator holds every document.
+- **Single-document reads** use quorum by default: ~2.3k/s sequentially and
+  ~5.5k/s with 32 clients. `?r=1` reads one local replica and reaches ~39k/s
+  with the native client. With n=3 on three nodes every coordinator holds every
+  document.
 - **Bulk reads** reach ~36k docs/s; `_bulk_get` is routed per document and is
   still the fastest way to read many documents through a coordinator.
 - **`_all_docs`** is ~1.3 ms with or without a `startkey`. Each owner answers

@@ -171,6 +171,7 @@ def main():
     )
     parser.add_argument("--loadgen-bin", default="target/release/loadgen")
     parser.add_argument("--native-count", type=int, default=5000)
+    parser.add_argument("--native-path", default="/perf/doc-{id}")
     parser.add_argument("--workers", default="8")
     parser.add_argument("--per-level", type=int, default=500)
     parser.add_argument("--json-out", default="target/perf-cluster.json")
@@ -268,7 +269,7 @@ def main():
                     "--base",
                     ",".join(urls),
                     "--path",
-                    "/perf/doc-{id}",
+                    args.native_path,
                     "--start",
                     "0",
                     "--count",
