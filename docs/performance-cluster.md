@@ -218,8 +218,10 @@ per-owner distinct counts cannot be combined exactly.
 Normal cluster queries still return only owner rows, but each node’s view
 index now covers every locally held replica. The owner-only index was faster
 (38.9 ms cold at n=2), but it could not answer for a dead owner’s shards. The
-replica-backed index restores node-loss failover; with n=3 on three nodes every
-local shard is owned anyway, so the n=3 numbers are unchanged.
+replica-backed index restores node-loss failover. With n=3 on three nodes every
+node holds every replica, but only one node is primary for each shard; indexing
+every local replica makes the index about 3× larger, so cold build is ~71 ms
+instead of ~28 ms. Normal queries still filter to primary rows.
 
 At n=2 on three nodes, after replica-backed indexes: cold build ~47.5 ms, warm
 map p50 ~1.91 ms, warm reduce p50 ~1.83 ms.
@@ -311,6 +313,23 @@ placement. A conformance test pins all shards to node0, writes a document,
 moves all shards to node1, waits for replication, then reads through node0 and
 node1 and after killing node0.
 
+### Fabric extraction (#48)
+
+Cluster routing is now in `src/fabric.rs`: shard-map replica selection, quorum
+reads/writes, cluster `_all_docs`/view/changes fan-out, replica fallback, and
+internal node calls (`proxy`, `forward_bulk`, `forward_json`, replica reads).
+HTTP handlers in `src/api.rs` are thin callers. This is a structural change; a
+before/after run on the same three-node n=3 config showed no material
+regression:
+
+| Operation | Before `fabric.rs` | After `fabric.rs` |
+|---|---:|---:|
+| Sequential PUT | 1,542 req/s | 1,451 req/s |
+| `_bulk_docs` | 30,302 docs/s | 32,747 docs/s |
+| Sequential GET | 2,388 req/s | 2,301 req/s |
+| `_all_docs?limit=100` | 481 req/s | 534 req/s |
+| Cold view build | 71.3 ms | 71.8 ms |
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
@@ -328,7 +347,7 @@ node1 and after killing node0.
   metadata. If an owner is down, the degraded path reads all reachable replicas
   and deduplicates by id.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
-  merge and JSON/HTTP for the selected rows. Cold builds are ~40–50 ms because
+  merge and JSON/HTTP for the selected rows. Cold builds are ~47–72 ms because
   each node indexes every locally held replica, which is what enables node-loss
   failover.
 - **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document

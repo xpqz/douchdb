@@ -91,7 +91,7 @@ pub async fn pull(
     docs.retain(|doc| {
         doc.get("_id")
             .and_then(Value::as_str)
-            .map(|id| db.replicas_of_doc(id).contains(&cluster.me))
+            .map(|id| crate::fabric::is_replica_of(db, id, cluster.me))
             .unwrap_or(false)
     });
 
