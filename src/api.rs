@@ -1340,6 +1340,7 @@ async fn cluster_view_rows(
                     query.include_docs || query.attachments,
                     query.attachments,
                     query.limits,
+                    Some(&owned),
                 )
                 .await?;
                 let mut rows: Vec<crate::view::Row> = rows

@@ -374,8 +374,9 @@ Above ~6k means something was built that nobody asked for.
 * **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in
-  reduces plus custom reducers via `rereduce`. Full `_changes` feeds also
-  query peers concurrently;
+  reduces plus custom reducers via `rereduce`. Cluster view indexes are built
+  over owned shards only, with ownership in the design marker. Full `_changes`
+  feeds also query peers concurrently;
   limited feeds keep resumable one-node-at-a-time progress. A reproducible
   three-node `q=4`/`n=2` benchmark and before/after numbers are in
   `docs/performance-cluster.md`.

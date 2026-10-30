@@ -297,9 +297,17 @@ impl Db {
     /// Documents for a view build, as JSON text with `_id` and `_rev` already
     /// spliced into the stored body. This avoids parsing every body into a
     /// `Value` and serializing it again just to hand it to QuickJS.
-    pub async fn map_docs(&self) -> DbResult<Vec<(String, String)>> {
+    /// View documents from selected shards. Cluster nodes pass their owned
+    /// shards so replicas do not pay to index documents they never serve.
+    pub async fn map_docs(&self, owned: Option<&[bool]>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
-        for shard in &self.shards {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if owned
+                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let mut shard_docs = shard
                 .call(|s| {
                     // Build (or reuse) the live map, then read only bodies.
