@@ -659,6 +659,50 @@ async fn bulk_docs_accepts_requests_larger_than_two_megabytes() {
 }
 
 #[tokio::test]
+async fn continuous_changes_streams_newline_json_and_heartbeats() {
+    let s = Server::start(false);
+    s.fresh_db("stream").await;
+    let (status, _) = s.put("/stream/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = s
+        .client
+        .get(format!(
+            "{}/stream/_changes?feed=continuous&since=0&timeout=250&heartbeat=40",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = response.text().await.unwrap();
+    let changes: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("change line is JSON"))
+        .collect();
+    assert!(changes.iter().any(|row| row["id"] == "doc"), "{text}");
+
+    // With since=now and no new writes, heartbeat newlines keep the stream
+    // alive until the timeout closes it.
+    let response = s
+        .client
+        .get(format!(
+            "{}/stream/_changes?feed=continuous&since=now&timeout=200&heartbeat=30",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let heartbeat = response.text().await.unwrap();
+    assert!(
+        heartbeat.contains('\n'),
+        "no heartbeat bytes: {heartbeat:?}"
+    );
+}
+
+#[tokio::test]
 async fn changes_revs_diff_and_bulk_get() {
     let s = Server::start(false);
     s.fresh_db("rep").await;

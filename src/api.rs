@@ -6,7 +6,7 @@ use crate::cluster::Cluster;
 use crate::db::{
     validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
 };
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -786,7 +786,9 @@ pub async fn db_rest(
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
         "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers).await,
-        "_changes" => return changes(&st, &db, &name, &q, &method, &body, &headers).await,
+        "_changes" => {
+            return changes(st.clone(), db.clone(), &name, &q, &method, &body, &headers).await
+        }
         "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
         "_purge" => {
             return match serde_json::from_slice::<Value>(&body) {
@@ -1917,8 +1919,8 @@ async fn fetch_all_docs(
 }
 
 async fn changes(
-    st: &AppState,
-    db: &Db,
+    st: Arc<AppState>,
+    db: Arc<Db>,
     dbname: &str,
     q: &HashMap<String, String>,
     method: &Method,
@@ -1926,16 +1928,133 @@ async fn changes(
     headers: &HeaderMap,
 ) -> Response {
     let _ = method;
-    let local_only = is_forwarded(st, headers);
+    let local_only = is_forwarded(&st, headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
     // Cap longpoll/continuous connections so a client cannot pin a worker for
     // an arbitrary amount of time.
-    let deadline = num(q, "timeout").unwrap_or(30_000).min(300_000) as u64;
+    let deadline = num(q, "timeout").unwrap_or(60_000).min(300_000) as u64;
+    let heartbeat = num(q, "heartbeat")
+        .filter(|value| *value > 0)
+        .map(|value| std::time::Duration::from_millis(value as u64));
 
-    if feed == "longpoll" || feed == "continuous" {
+    if feed == "continuous" {
+        let dbname = dbname.to_string();
+        let mut query = q.clone();
+        let body = Bytes::copy_from_slice(body);
+        let headers = headers.clone();
+        let limit = num(q, "limit");
+        let stream = async_stream::stream! {
+            let started = std::time::Instant::now();
+            let mut sent = 0usize;
+            let mut last_heartbeat = std::time::Instant::now();
+            loop {
+                if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                    break;
+                }
+                match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
+                    Ok(value) => {
+                        let rows = value["results"].as_array().cloned().unwrap_or_default();
+                        for row in rows {
+                            if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                                break;
+                            }
+                            let mut line = serde_json::to_vec(&row).unwrap_or_default();
+                            line.push(b'\n');
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                            sent += 1;
+                        }
+                        if let Some(seq) = value.get("last_seq") {
+                            let since = seq
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| seq.to_string());
+                            query.insert("since".to_string(), since);
+                        }
+                    }
+                    Err(error) => {
+                        let line = serde_json::to_vec(&json!({
+                            "error": error.error,
+                            "reason": error.reason,
+                        }))
+                        .unwrap_or_default();
+                        let mut line = line;
+                        line.push(b'\n');
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                        break;
+                    }
+                }
+                if started.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
+                if let Some(heartbeat) = heartbeat {
+                    if last_heartbeat.elapsed() >= heartbeat {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    if feed == "longpoll" {
+        if let Some(heartbeat) = heartbeat {
+            let dbname = dbname.to_string();
+            let query = q.clone();
+            let body = Bytes::copy_from_slice(body);
+            let headers = headers.clone();
+            let stream = async_stream::stream! {
+                let started = std::time::Instant::now();
+                let mut last_heartbeat = std::time::Instant::now();
+                loop {
+                    match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
+                        Ok(value)
+                            if value["results"]
+                                .as_array()
+                                .map(|rows| !rows.is_empty())
+                                .unwrap_or(false)
+                                || started.elapsed().as_millis() as u64 >= deadline =>
+                        {
+                            let mut line = serde_json::to_vec(&value).unwrap_or_default();
+                            line.push(b'\n');
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let mut line = serde_json::to_vec(&json!({
+                                "error": error.error,
+                                "reason": error.reason,
+                            }))
+                            .unwrap_or_default();
+                            line.push(b'\n');
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                            break;
+                        }
+                    }
+                    if last_heartbeat.elapsed() >= heartbeat {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
         let started = std::time::Instant::now();
         loop {
-            match changes_once(st, db, dbname, q, body, headers, local_only).await {
+            match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
                 Ok(v)
                     if v["results"]
                         .as_array()
@@ -1953,7 +2072,7 @@ async fn changes(
         }
     }
 
-    match changes_once(st, db, dbname, q, body, headers, local_only).await {
+    match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
     }
