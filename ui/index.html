@@ -158,6 +158,7 @@
 
             <div class="view-picker">
               <button class="ghost" @click="loadViews">↻ Reload views</button>
+              <button class="ghost" @click="newView">+ New view</button>
               <div v-for="group in viewDefs" :key="group.ddoc" class="view-group">
                 <span class="ddoc mono">{{ group.ddoc }}</span>
                 <button
@@ -184,8 +185,6 @@
                   spellcheck="false"
                   data-testid="view-key"
                 >
-                <input v-model="viewForm.startkey" placeholder="startkey" spellcheck="false">
-                <input v-model="viewForm.endkey" placeholder="endkey" spellcheck="false">
                 <input
                   v-model.number="viewForm.limit"
                   type="number"
@@ -193,7 +192,7 @@
                   class="limit"
                   placeholder="limit"
                 >
-                <select v-model="viewForm.reduce">
+                <select v-model="viewForm.reduce" title="reduce">
                   <option value="default">reduce: default</option>
                   <option value="true">reduce: true</option>
                   <option value="false">reduce: false</option>
@@ -204,11 +203,92 @@
                 <label class="check">
                   <input type="checkbox" v-model="viewForm.group"> group
                 </label>
-                <label class="check">
-                  <input type="checkbox" v-model="viewForm.descending"> descending
-                </label>
                 <button class="primary" @click="runView" data-testid="run-view">Run</button>
               </div>
+
+              <details class="query-options">
+                <summary>More query options</summary>
+                <div class="query-grid">
+                  <label class="field">
+                    <span>startkey</span>
+                    <input v-model="viewForm.startkey" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span>endkey</span>
+                    <input v-model="viewForm.endkey" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span>keys (JSON array)</span>
+                    <input
+                      v-model="viewForm.keys"
+                      placeholder='["a","b"]'
+                      spellcheck="false"
+                    >
+                  </label>
+                  <label class="field">
+                    <span>startkey_docid</span>
+                    <input v-model="viewForm.startkey_docid" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span>endkey_docid</span>
+                    <input v-model="viewForm.endkey_docid" spellcheck="false">
+                  </label>
+                  <label class="field">
+                    <span>skip</span>
+                    <input v-model.number="viewForm.skip" type="number" min="0">
+                  </label>
+                  <label class="field">
+                    <span>group_level</span>
+                    <input v-model.number="viewForm.group_level" type="number" min="0">
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" v-model="viewForm.descending"> descending
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" v-model="viewForm.inclusive_end"> inclusive end
+                  </label>
+                  <label class="check">
+                    <input type="checkbox" v-model="viewForm.update_seq"> update_seq
+                  </label>
+                </div>
+              </details>
+
+              <details class="view-source">
+                <summary>
+                  View definition
+                  <span class="muted mono">{{ selectedView.ddoc }} / {{ selectedView.name }}</span>
+                  <button class="link" @click.stop="openDoc(selectedView.ddoc)">
+                    open design doc
+                  </button>
+                </summary>
+                <div class="source-grid">
+                  <label class="field">
+                    <span>map function</span>
+                    <textarea
+                      v-model="viewEditor.map"
+                      class="code"
+                      spellcheck="false"
+                      data-testid="view-map"
+                    ></textarea>
+                  </label>
+                  <label class="field">
+                    <span>reduce function (optional)</span>
+                    <textarea
+                      v-model="viewEditor.reduce"
+                      class="code"
+                      spellcheck="false"
+                      data-testid="view-reduce"
+                    ></textarea>
+                  </label>
+                </div>
+                <div class="toolbar">
+                  <button class="primary" @click="saveView" data-testid="save-view">
+                    Save view
+                  </button>
+                  <span v-if="viewEditor.status" class="muted">{{ viewEditor.status }}</span>
+                  <span v-if="viewEditor.error" class="error">{{ viewEditor.error }}</span>
+                </div>
+              </details>
 
               <p v-if="viewError" class="error" data-testid="view-error">{{ viewError }}</p>
               <p v-if="viewLoading" class="muted">Running view…</p>
@@ -219,19 +299,36 @@
                     {{ viewResult.total_rows }} rows · offset {{ viewResult.offset }}
                   </template>
                   <template v-else>{{ viewResult.rows.length }} rows</template>
+                  <template v-if="viewResult.update_seq !== undefined">
+                    · update_seq {{ viewResult.update_seq }}
+                  </template>
                 </p>
                 <table class="grid" data-testid="view-rows">
-                  <thead><tr><th>key</th><th>id</th><th>value</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th>key</th>
+                      <th>value</th>
+                      <th>id</th>
+                      <th v-if="viewForm.include_docs">document</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     <tr v-for="(row, index) in viewResult.rows" :key="index">
                       <td class="mono">{{ compact(row.key) }}</td>
+                      <td class="mono value-cell">{{ compact(row.value) }}</td>
                       <td class="mono">
                         <button v-if="row.id" class="link" @click="openDoc(row.id)">
                           {{ row.id }}
                         </button>
                         <span v-else class="muted">—</span>
                       </td>
-                      <td class="mono value-cell">{{ compact(row.value) }}</td>
+                      <td v-if="viewForm.include_docs" class="mono">
+                        <details v-if="row.doc">
+                          <summary>show</summary>
+                          <pre class="inline-json">{{ pretty(row.doc) }}</pre>
+                        </details>
+                        <span v-else class="muted">—</span>
+                      </td>
                     </tr>
                   </tbody>
                 </table>

@@ -91,17 +91,32 @@
       const selectedView = ref(null);
       const viewForm = reactive({
         key: '',
+        keys: '',
         startkey: '',
         endkey: '',
+        startkey_docid: '',
+        endkey_docid: '',
         limit: 50,
+        skip: 0,
+        group_level: 0,
         include_docs: false,
         reduce: 'default',
         group: false,
         descending: false,
+        inclusive_end: true,
+        update_seq: false,
       });
       const viewResult = ref(null);
       const viewError = ref('');
       const viewLoading = ref(false);
+      const viewDocs = ref({});
+      const viewEditor = reactive({
+        map: '',
+        reduce: '',
+        rev: null,
+        error: '',
+        status: '',
+      });
 
       const toast = ref('');
       const toastKind = ref('ok');
@@ -290,9 +305,13 @@
           changesLastSeq.value = 0;
           dbInfo.value = null;
           viewDefs.value = [];
+          viewDocs.value = {};
           selectedView.value = null;
           viewResult.value = null;
           viewError.value = '';
+          viewEditor.map = '';
+          viewEditor.reduce = '';
+          viewEditor.rev = null;
         }
         if (parts[2] === 'doc' && parts[3]) {
           loadDocById(decodeURIComponent(parts.slice(3).join('/')));
@@ -303,7 +322,20 @@
           if (!changes.value.length) loadNow();
         } else if (parts[2] === 'views') {
           view.value = 'views';
-          loadViews();
+          if (!parts[3]) {
+            selectedView.value = null;
+            viewResult.value = null;
+            viewError.value = '';
+          }
+          loadViews().then(() => {
+            if (parts[3] && parts[4]) {
+              const ddoc = decodeURIComponent(parts[3]);
+              const name = decodeURIComponent(parts[4]);
+              const group = viewDefs.value.find((item) => item.ddoc === ddoc);
+              const found = group && group.views.find((item) => item.name === name);
+              if (found) selectViewNow(ddoc, name, found.reduce);
+            }
+          });
         } else if (parts[2] === 'info') {
           view.value = 'info';
           loadDbInfo();
@@ -600,9 +632,11 @@
             `/${enc(currentDb.value)}/_all_docs?startkey=${enc(start)}&endkey=${enc(end)}&include_docs=true`
           );
           const defs = [];
+          const docs = {};
           for (const row of data.rows || []) {
             const doc = row.doc;
             if (!doc || !doc.views) continue;
+            docs[doc._id] = doc;
             const views = Object.entries(doc.views).map(([name, spec]) => ({
               name,
               reduce: Boolean(spec && spec.reduce),
@@ -610,6 +644,7 @@
             if (views.length) defs.push({ ddoc: doc._id, views });
           }
           viewDefs.value = defs;
+          viewDocs.value = docs;
           if (
             selectedView.value &&
             !defs.some(
@@ -633,11 +668,88 @@
         navigate(dbHash(currentDb.value, 'views'));
       }
 
+      async function newView() {
+        const ddocName = prompt('Design document name (without _design/):');
+        if (!ddocName) return;
+        const viewName = prompt('View name:');
+        if (!viewName) return;
+        const id = `_design/${ddocName}`;
+        let doc = viewDocs.value[id]
+          ? JSON.parse(JSON.stringify(viewDocs.value[id]))
+          : { _id: id, views: {} };
+        if (!doc.views) doc.views = {};
+        doc.views[viewName] = {
+          map: 'function (doc) {\n  emit(doc._id, null);\n}',
+        };
+        try {
+          await call('PUT', `/${enc(currentDb.value)}/${enc(id)}`, doc);
+          await loadViews();
+          navigate(viewHash(id, viewName));
+        } catch (error) {
+          handleError(error, 'Cannot create view');
+        }
+      }
+
+      function viewHash(ddoc, name) {
+        return dbHash(
+          currentDb.value,
+          `views/${enc(ddoc)}/${enc(name)}`
+        );
+      }
+
       function selectView(ddoc, name, hasReduce) {
+        const hash = viewHash(ddoc, name);
+        if (location.hash !== hash) {
+          location.hash = hash;
+          return;
+        }
+        selectViewNow(ddoc, name, hasReduce);
+      }
+
+      function selectViewNow(ddoc, name, hasReduce) {
         selectedView.value = { ddoc, name, reduce: hasReduce };
+        const doc = viewDocs.value[ddoc];
+        const spec = doc && doc.views ? doc.views[name] : null;
+        viewEditor.map = (spec && spec.map) || '';
+        viewEditor.reduce = (spec && spec.reduce) || '';
+        viewEditor.rev = doc ? doc._rev : null;
+        viewEditor.error = '';
+        viewEditor.status = '';
         viewError.value = '';
         viewResult.value = null;
         runView();
+      }
+
+      async function saveView() {
+        if (!selectedView.value) return;
+        const ddoc = selectedView.value.ddoc;
+        const doc = viewDocs.value[ddoc];
+        if (!doc) return;
+        const updated = JSON.parse(JSON.stringify(doc));
+        const spec = updated.views[selectedView.value.name] || {};
+        spec.map = viewEditor.map;
+        if (viewEditor.reduce.trim()) spec.reduce = viewEditor.reduce.trim();
+        else delete spec.reduce;
+        updated.views[selectedView.value.name] = spec;
+        viewEditor.error = '';
+        viewEditor.status = '';
+        try {
+          const result = await call(
+            'PUT',
+            `/${enc(currentDb.value)}/${enc(ddoc)}`,
+            updated
+          );
+          updated._rev = result.rev;
+          viewDocs.value[ddoc] = updated;
+          viewEditor.rev = result.rev;
+          viewEditor.status = `Saved ${result.rev}`;
+          showToast('View saved');
+          await loadViews();
+          await runView();
+        } catch (error) {
+          viewEditor.error = error.data ? pretty(error.data) : error.message;
+          handleError(error, 'Cannot save view');
+        }
       }
 
       async function runView() {
@@ -645,14 +757,23 @@
         const params = [];
         for (const [key, value] of [
           ['key', viewForm.key],
+          ['keys', viewForm.keys],
           ['startkey', viewForm.startkey],
           ['endkey', viewForm.endkey],
+          ['startkey_docid', viewForm.startkey_docid],
+          ['endkey_docid', viewForm.endkey_docid],
         ]) {
           if (value.trim()) params.push(`${key}=${enc(value.trim())}`);
         }
         if (viewForm.limit) params.push(`limit=${enc(String(viewForm.limit))}`);
+        if (viewForm.skip) params.push(`skip=${enc(String(viewForm.skip))}`);
+        if (viewForm.group_level) {
+          params.push(`group_level=${enc(String(viewForm.group_level))}`);
+        }
         if (viewForm.include_docs) params.push('include_docs=true');
         if (viewForm.descending) params.push('descending=true');
+        if (!viewForm.inclusive_end) params.push('inclusive_end=false');
+        if (viewForm.update_seq) params.push('update_seq=true');
         if (viewForm.group) params.push('group=true');
         if (viewForm.reduce !== 'default') {
           params.push(`reduce=${enc(viewForm.reduce)}`);
@@ -837,9 +958,13 @@
         viewResult,
         viewError,
         viewLoading,
+        viewDocs,
+        viewEditor,
         loadViews,
         selectView,
         runView,
+        saveView,
+        newView,
         compact,
         loadNow,
         loadHistory,
