@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "CouchDB wire-compatible document database on LevelDB"
 license = "Apache-2.0"
+authors = ["Stefan Kruger"]
 
 [dependencies]
 anyhow = "1"
