@@ -396,9 +396,17 @@ def main():
         )
 
         # Local-first feeds maintain one sequence index per coordinator; warm
-        # each node so the measurement is steady-state rather than index build.
+        # each node and each full-feed mode so the measurement is steady-state
+        # rather than index/first-request overhead.
         for conn in conns:
             request(conn, "GET", "/perf/_changes?since=0&limit=1")
+            for query in [
+                "",
+                "&style=all_docs",
+                "&include_docs=true",
+                "&style=all_docs&include_docs=true",
+            ]:
+                request(conn, "GET", f"/perf/_changes?since=0{query}")
 
         changes_lat = []
         started = time.perf_counter()

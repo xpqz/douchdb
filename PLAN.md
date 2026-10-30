@@ -343,8 +343,10 @@ Above ~6k means something was built that nobody asked for.
   partials are combined; custom reducers use QuickJS and `rereduce`. Simple
   single-emit maps that read top-level document fields or JSON literals are
   recognized and evaluated without JavaScript; anything more complex falls back
-  to QuickJS. Warm queries use the atomic update sequence instead of per-shard
-  info calls, and `include_docs` loads bodies only for the selected rows.
+  to QuickJS. Native cold builds extract top-level fields from raw document
+  JSON and parse only the emitted slices. Warm queries use the atomic update
+  sequence instead of per-shard info calls, and `include_docs` loads bodies
+  only for the selected rows.
   Indexes persist under
   `_view_indexes/` and update from `_changes`; design changes rebuild them.
   Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
@@ -403,8 +405,8 @@ Above ~6k means something was built that nobody asked for.
   decodes and duplicate detection. A lazy per-shard sequence index caches
   winning revisions and conflict leaves, so steady-state feeds do not scan the
   LevelDB sequence table or decode metadata. Normal changes responses are
-  serialized directly, with `include_docs` bodies embedded verbatim rather than
-  parsed and rebuilt. Full `_changes` feeds
+  streamed by merging shard pages and serializing bounded chunks, with
+  `include_docs` bodies embedded verbatim rather than parsed and rebuilt. Full `_changes` feeds
   also query peers concurrently; limited
   feeds merge node prefixes round-robin up to the global limit. Unavailable
   change nodes are skipped and covered by replicas, with their vector

@@ -728,7 +728,7 @@ impl Db {
         }))
     }
 
-    async fn changes_rows(&self, opts: &ChangesOpts) -> DbResult<(Vec<ChangeRow>, u64)> {
+    pub(crate) async fn changes_rows(&self, opts: &ChangesOpts) -> DbResult<(Vec<ChangeRow>, u64)> {
         let mut rows = Vec::new();
         for (index, shard) in self.shards.iter().enumerate() {
             if opts
@@ -776,10 +776,89 @@ impl Db {
         Ok(json!({ "results": results, "last_seq": last_seq, "pending": 0 }))
     }
 
-    /// Serialize the normal changes response directly. This is the hot path
-    /// for replication: with `include_docs=true`, the stored body is embedded
-    /// verbatim instead of being parsed into a `Value` and written again.
-    pub async fn changes_json(&self, opts: &ChangesOpts) -> DbResult<ChangesJson> {
+    /// Stream changes rows in global sequence order by merging a page at a
+    /// time from each selected shard. The caller serializes rows as they
+    /// arrive, so a full feed does not materialize the whole response.
+    pub(crate) fn changes_stream_arc(
+        db: Arc<Db>,
+        opts: ChangesOpts,
+    ) -> impl futures::Stream<Item = DbResult<ChangeRow>> + 'static {
+        async_stream::stream! {
+            use std::collections::VecDeque;
+
+            const PAGE: usize = 1024;
+            if opts.descending {
+                yield Err(ApiError::new(
+                    500,
+                    "internal_server_error",
+                    "streaming changes do not support descending order",
+                ));
+                return;
+            }
+            let selected: Vec<usize> = (0..db.shards.len())
+                .filter(|index| {
+                    opts.owned
+                        .as_ref()
+                        .map(|owned| owned.get(*index).copied().unwrap_or(false))
+                        .unwrap_or(true)
+                })
+                .collect();
+            let mut cursors = vec![opts.since; selected.len()];
+            let mut done = vec![false; selected.len()];
+            let mut buffers: Vec<VecDeque<ChangeRow>> =
+                (0..selected.len()).map(|_| VecDeque::new()).collect();
+            let mut emitted = 0usize;
+
+            loop {
+                let mut best: Option<usize> = None;
+                for slot in 0..selected.len() {
+                    if buffers[slot].is_empty() && !done[slot] {
+                        let index = selected[slot];
+                        let mut shard_opts = opts.clone();
+                        shard_opts.since = cursors[slot];
+                        shard_opts.descending = false;
+                        shard_opts.limit = Some(PAGE);
+                        match db.shards[index]
+                            .call(move |shard| collect_changes(shard, &shard_opts))
+                            .await
+                        {
+                            Ok(rows) => {
+                                if rows.is_empty() {
+                                    done[slot] = true;
+                                } else {
+                                    cursors[slot] = rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
+                                    buffers[slot].extend(rows);
+                                }
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(front) = buffers[slot].front() {
+                        if best
+                            .map(|current| front.seq < buffers[current].front().map(|row| row.seq).unwrap_or(u64::MAX))
+                            .unwrap_or(true)
+                        {
+                            best = Some(slot);
+                        }
+                    }
+                }
+                let Some(slot) = best else {
+                    break;
+                };
+                let row = buffers[slot].pop_front().expect("buffered row");
+                emitted += 1;
+                yield Ok(row);
+                if opts.limit.map(|limit| emitted >= limit).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn change_row_json(row: &ChangeRow) -> String {
         use std::fmt::Write as _;
 
         fn push_json_string(out: &mut String, value: &str) {
@@ -795,43 +874,30 @@ impl Db {
             }
         }
 
-        let (rows, last_seq) = self.changes_rows(opts).await?;
-        let mut out = String::with_capacity(rows.len().saturating_mul(128) + 64);
-        out.push_str("{\"results\":[");
-        for (index, row) in rows.into_iter().enumerate() {
-            if index > 0 {
+        let mut out = String::with_capacity(128);
+        out.push_str("{\"seq\":");
+        let _ = write!(out, "{}", row.seq);
+        out.push_str(",\"id\":");
+        push_json_string(&mut out, &row.id);
+        out.push_str(",\"changes\":[");
+        for (change_index, (rev, _)) in row.changes.iter().enumerate() {
+            if change_index > 0 {
                 out.push(',');
             }
-            out.push_str("{\"seq\":");
-            let _ = write!(out, "{}", row.seq);
-            out.push_str(",\"id\":");
-            push_json_string(&mut out, &row.id);
-            out.push_str(",\"changes\":[");
-            for (change_index, (rev, _)) in row.changes.iter().enumerate() {
-                if change_index > 0 {
-                    out.push(',');
-                }
-                out.push_str("{\"rev\":");
-                push_json_string(&mut out, rev);
-                out.push('}');
-            }
-            out.push(']');
-            if row.deleted {
-                out.push_str(",\"deleted\":true");
-            }
-            if let Some(doc) = row.doc {
-                out.push_str(",\"doc\":");
-                out.push_str(&doc);
-            }
+            out.push_str("{\"rev\":");
+            push_json_string(&mut out, rev);
             out.push('}');
         }
-        out.push_str("],\"last_seq\":");
-        let _ = write!(out, "{last_seq}");
-        out.push_str(",\"pending\":0}");
-        Ok(ChangesJson {
-            body: out,
-            last_seq,
-        })
+        out.push(']');
+        if row.deleted {
+            out.push_str(",\"deleted\":true");
+        }
+        if let Some(doc) = &row.doc {
+            out.push_str(",\"doc\":");
+            out.push_str(doc);
+        }
+        out.push('}');
+        out
     }
 
     pub async fn revs_diff(&self, body: &Value) -> DbResult<Value> {
@@ -1671,20 +1737,15 @@ pub struct ChangesOpts {
     pub owned: Option<Vec<bool>>,
 }
 
-struct ChangeRow {
-    id: String,
-    seq: u64,
-    changes: Vec<(String, bool)>,
-    deleted: bool,
+pub(crate) struct ChangeRow {
+    pub(crate) id: String,
+    pub(crate) seq: u64,
+    pub(crate) changes: Vec<(String, bool)>,
+    pub(crate) deleted: bool,
     /// Full document JSON with `_id`/`_rev` already inserted. Keeping this as
     /// text lets the normal changes feed embed the stored body without parsing
     /// and re-serializing it.
-    doc: Option<String>,
-}
-
-pub(crate) struct ChangesJson {
-    pub body: String,
-    pub last_seq: u64,
+    pub(crate) doc: Option<String>,
 }
 
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {

@@ -709,6 +709,103 @@ enum EmitExpr {
     Literal(Value),
 }
 
+fn raw_json_field<'a>(json: &'a str, field: &str) -> Result<Option<&'a str>, ()> {
+    let bytes = json.as_bytes();
+    let mut index = skip_ws(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return Err(());
+    }
+    index += 1;
+    let mut found = None;
+    loop {
+        index = skip_ws(bytes, index);
+        match bytes.get(index) {
+            Some(b'}') => return Ok(found),
+            Some(b'"') => {
+                let key_end = scan_json_string(bytes, index).ok_or(())?;
+                let key: String = serde_json::from_str(&json[index..key_end]).map_err(|_| ())?;
+                index = skip_ws(bytes, key_end);
+                if bytes.get(index) != Some(&b':') {
+                    return Err(());
+                }
+                index = skip_ws(bytes, index + 1);
+                let value_start = index;
+                let value_end = skip_json_value(bytes, index).ok_or(())?;
+                if key == field {
+                    found = Some(json[value_start..value_end].trim());
+                }
+                index = skip_ws(bytes, value_end);
+                match bytes.get(index) {
+                    Some(b',') => index += 1,
+                    Some(b'}') => return Ok(found),
+                    _ => return Err(()),
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    index
+}
+
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => scan_json_string(bytes, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut index = start;
+            while let Some(byte) = bytes.get(index) {
+                match byte {
+                    b'"' => {
+                        index = scan_json_string(bytes, index)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(index + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while let Some(byte) = bytes.get(index) {
+                if matches!(byte, b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t') {
+                    break;
+                }
+                index += 1;
+            }
+            Some(index)
+        }
+    }
+}
+
 impl NativeMap {
     fn parse(source: &str) -> Option<NativeMap> {
         let compact = compact_js(source)?;
@@ -743,11 +840,34 @@ impl NativeMap {
         docs.iter().map(|(id, doc)| self.row(id, doc)).collect()
     }
 
+    fn eval_raw(&self, expression: &EmitExpr, raw: &str) -> Result<Value, ()> {
+        match expression {
+            EmitExpr::Literal(value) => Ok(value.clone()),
+            EmitExpr::Field(field) => match raw_json_field(raw, field)? {
+                Some(value) => serde_json::from_str(value).map_err(|_| ()),
+                None => Ok(Value::Null),
+            },
+        }
+    }
+
     fn run_json(&self, docs: &[(String, String)]) -> Result<Vec<Row>, String> {
         let mut rows = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            let doc: Value = serde_json::from_str(raw).map_err(|error| format!("{id}: {error}"))?;
-            rows.push(self.row(id, &doc));
+            match (
+                self.eval_raw(&self.key, raw),
+                self.eval_raw(&self.value, raw),
+            ) {
+                (Ok(key), Ok(value)) => rows.push(Row {
+                    id: id.clone(),
+                    key,
+                    value,
+                }),
+                _ => {
+                    let doc: Value =
+                        serde_json::from_str(raw).map_err(|error| format!("{id}: {error}"))?;
+                    rows.push(self.row(id, &doc));
+                }
+            }
         }
         Ok(rows)
     }
@@ -1513,6 +1633,41 @@ mod tests {
         .unwrap();
         assert_eq!(constant[0].value, json!(1));
         assert_eq!(constant[1].key, Value::Null);
+    }
+
+    #[test]
+    fn native_raw_json_field_extraction_matches_parsed_documents() {
+        let docs = vec![
+            (
+                "a".to_string(),
+                r#"{"_id":"a","_rev":"1-x","city":"Ber,lin","n":2,"nested":{"x":[1,2]},"escaped":"a\"b"}"#
+                    .to_string(),
+            ),
+            (
+                "b".to_string(),
+                r#"{"_id":"b","_rev":"1-y","n":3,"other":null}"#.to_string(),
+            ),
+        ];
+        let native = NativeMap::parse("function(doc){ emit(doc.city, doc.n); }")
+            .unwrap()
+            .run_json(&docs)
+            .unwrap();
+        let javascript = run_map_json(
+            "function(doc){ var k=doc.city; var v=doc.n; emit(k, v); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(native.len(), javascript.len());
+        for (left, right) in native.iter().zip(javascript.iter()) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.key, right.key);
+            assert_eq!(left.value, right.value);
+        }
+        assert_eq!(native[0].key, json!("Ber,lin"));
+        assert_eq!(native[0].value, json!(2));
+        assert_eq!(native[1].key, Value::Null);
+        assert_eq!(native[1].value, json!(3));
     }
 
     #[test]
