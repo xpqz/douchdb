@@ -424,6 +424,26 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.text().await.unwrap().contains("--accent"));
 
+    let response = s
+        .client
+        .get(format!("{}/_utils/vendor/codemirror/codemirror.js", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().len() > 10_000);
+
+    let response = s
+        .client
+        .get(format!(
+            "{}/_utils/vendor/codemirror/mode/javascript/javascript.js",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
     let no_redirect = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()

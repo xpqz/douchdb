@@ -207,9 +207,11 @@ branch runs. Add more than 1000 rows with the same key to exercise the
 `rereduce=true` branch; the result is the same. Built-in `_stats` is already
 rereduce-safe.
 
-The console's **Views** tab follows Fauxton's view page: it lists every view in
-the database's design documents, deep-links the selected view, edits the map and
-reduce source in place, and runs queries with the same options:
+The console follows Fauxton's design-document workflow: **Design Docs** lists
+design documents, opening one shows its views, and a view page deep-links the
+selected view, edits map/reduce source in a CodeMirror editor, creates or
+deletes views, and runs queries with the same options. New views start from a
+small template (all documents, count by type, sum by type, or blank).
 
 ![douchdb views](docs/views.png)
 

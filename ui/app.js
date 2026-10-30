@@ -88,7 +88,16 @@
       const dbInfo = ref(null);
 
       const viewDefs = ref([]);
+      const selectedDesign = ref(null);
       const selectedView = ref(null);
+      const newViewModal = reactive({
+        open: false,
+        ddoc: '',
+        newDdoc: '',
+        name: '',
+        template: 'all',
+        error: '',
+      });
       const viewForm = reactive({
         key: '',
         keys: '',
@@ -129,6 +138,13 @@
       const pageCount = computed(() =>
         Math.max(1, Math.ceil(totalRows.value / pageSize.value))
       );
+      const selectedDesignViews = computed(() => {
+        if (!selectedDesign.value) return [];
+        const group = viewDefs.value.find(
+          (item) => item.ddoc === selectedDesign.value.ddoc
+        );
+        return group ? group.views : [];
+      });
 
       // ----- plumbing ----------------------------------------------------
 
@@ -306,6 +322,7 @@
           dbInfo.value = null;
           viewDefs.value = [];
           viewDocs.value = {};
+          selectedDesign.value = null;
           selectedView.value = null;
           viewResult.value = null;
           viewError.value = '';
@@ -320,19 +337,29 @@
         } else if (parts[2] === 'changes') {
           view.value = 'changes';
           if (!changes.value.length) loadNow();
-        } else if (parts[2] === 'views') {
-          view.value = 'views';
-          if (!parts[3]) {
-            selectedView.value = null;
-            viewResult.value = null;
-            viewError.value = '';
-          }
+        } else if (parts[2] === 'designs') {
+          view.value = 'designs';
+          selectedDesign.value = null;
+          selectedView.value = null;
+          viewResult.value = null;
+          viewError.value = '';
+          loadViews();
+        } else if (parts[2] === 'design' && parts[3]) {
+          const ddoc = decodeURIComponent(parts[3]);
+          view.value = 'design';
+          selectedView.value = null;
+          viewResult.value = null;
+          viewError.value = '';
           loadViews().then(() => {
-            if (parts[3] && parts[4]) {
-              const ddoc = decodeURIComponent(parts[3]);
-              const name = decodeURIComponent(parts[4]);
-              const group = viewDefs.value.find((item) => item.ddoc === ddoc);
-              const found = group && group.views.find((item) => item.name === name);
+            const group = viewDefs.value.find((item) => item.ddoc === ddoc);
+            if (!group) {
+              openDesigns();
+              return;
+            }
+            selectedDesign.value = { ddoc, doc: viewDocs.value[ddoc] };
+            if (parts[4] === 'view' && parts[5]) {
+              const name = decodeURIComponent(parts[5]);
+              const found = group.views.find((item) => item.name === name);
               if (found) selectViewNow(ddoc, name, found.reduce);
             }
           });
@@ -635,16 +662,22 @@
           const docs = {};
           for (const row of data.rows || []) {
             const doc = row.doc;
-            if (!doc || !doc.views) continue;
+            if (!doc) continue;
             docs[doc._id] = doc;
-            const views = Object.entries(doc.views).map(([name, spec]) => ({
+            const views = Object.entries(doc.views || {}).map(([name, spec]) => ({
               name,
               reduce: Boolean(spec && spec.reduce),
             }));
-            if (views.length) defs.push({ ddoc: doc._id, views });
+            defs.push({ ddoc: doc._id, views });
           }
           viewDefs.value = defs;
           viewDocs.value = docs;
+          if (selectedDesign.value) {
+            selectedDesign.value = {
+              ddoc: selectedDesign.value.ddoc,
+              doc: docs[selectedDesign.value.ddoc],
+            };
+          }
           if (
             selectedView.value &&
             !defs.some(
@@ -664,36 +697,117 @@
         }
       }
 
-      function openViews() {
-        navigate(dbHash(currentDb.value, 'views'));
+      function openDesigns() {
+        navigate(dbHash(currentDb.value, 'designs'));
       }
 
-      async function newView() {
-        const ddocName = prompt('Design document name (without _design/):');
-        if (!ddocName) return;
-        const viewName = prompt('View name:');
-        if (!viewName) return;
-        const id = `_design/${ddocName}`;
-        let doc = viewDocs.value[id]
-          ? JSON.parse(JSON.stringify(viewDocs.value[id]))
-          : { _id: id, views: {} };
+      function designHash(ddoc) {
+        return dbHash(currentDb.value, `design/${enc(ddoc)}`);
+      }
+
+      function openDesign(ddoc) {
+        navigate(designHash(ddoc));
+      }
+
+      function openNewView(ddoc) {
+        newViewModal.open = true;
+        newViewModal.ddoc = ddoc || (viewDefs.value[0] && viewDefs.value[0].ddoc) || '__new__';
+        newViewModal.newDdoc = '';
+        newViewModal.name = '';
+        newViewModal.template = 'all';
+        newViewModal.error = '';
+      }
+
+      function templateSpec(template) {
+        switch (template) {
+          case 'count':
+            return {
+              map: 'function (doc) {\n  emit(doc.type || null, null);\n}',
+              reduce: '_count',
+            };
+          case 'sum':
+            return {
+              map: 'function (doc) {\n  emit(doc.type || null, doc.value || 0);\n}',
+              reduce: '_sum',
+            };
+          case 'blank':
+            return { map: 'function (doc) {\n  \n}' };
+          default:
+            return { map: 'function (doc) {\n  emit(doc._id, null);\n}' };
+        }
+      }
+
+      async function createView() {
+        newViewModal.error = '';
+        const ddoc =
+          newViewModal.ddoc === '__new__'
+            ? `_design/${newViewModal.newDdoc.trim()}`
+            : newViewModal.ddoc;
+        const name = newViewModal.name.trim();
+        if (!ddoc || ddoc === '_design/') {
+          newViewModal.error = 'Design document name is required.';
+          return;
+        }
+        if (!name) {
+          newViewModal.error = 'View name is required.';
+          return;
+        }
+        let doc = viewDocs.value[ddoc]
+          ? JSON.parse(JSON.stringify(viewDocs.value[ddoc]))
+          : { _id: ddoc, views: {} };
         if (!doc.views) doc.views = {};
-        doc.views[viewName] = {
-          map: 'function (doc) {\n  emit(doc._id, null);\n}',
-        };
+        doc.views[name] = templateSpec(newViewModal.template);
         try {
-          await call('PUT', `/${enc(currentDb.value)}/${enc(id)}`, doc);
+          await call('PUT', `/${enc(currentDb.value)}/${enc(ddoc)}`, doc);
+          newViewModal.open = false;
           await loadViews();
-          navigate(viewHash(id, viewName));
+          navigate(viewHash(ddoc, name));
         } catch (error) {
-          handleError(error, 'Cannot create view');
+          newViewModal.error = error.data ? pretty(error.data) : error.message;
+        }
+      }
+
+      async function deleteView() {
+        if (!selectedView.value) return;
+        const { ddoc, name } = selectedView.value;
+        if (!confirm(`Delete view "${name}" from ${ddoc}?`)) return;
+        const doc = viewDocs.value[ddoc];
+        if (!doc) return;
+        const updated = JSON.parse(JSON.stringify(doc));
+        if (updated.views) delete updated.views[name];
+        try {
+          await call('PUT', `/${enc(currentDb.value)}/${enc(ddoc)}`, updated);
+          showToast(`Deleted view ${name}`);
+          await loadViews();
+          navigate(designHash(ddoc));
+        } catch (error) {
+          handleError(error, 'Cannot delete view');
+        }
+      }
+
+      async function deleteDesign() {
+        if (!selectedDesign.value) return;
+        const { ddoc } = selectedDesign.value;
+        if (!confirm(`Delete ${ddoc} and all its views?`)) return;
+        const doc = viewDocs.value[ddoc];
+        if (!doc) return;
+        try {
+          await call(
+            'DELETE',
+            `/${enc(currentDb.value)}/${enc(ddoc)}?rev=${enc(doc._rev)}`
+          );
+          showToast(`Deleted ${ddoc}`);
+          await loadViews();
+          navigate(dbHash(currentDb.value, 'designs'));
+        } catch (error) {
+          handleError(error, 'Cannot delete design document');
         }
       }
 
       function viewHash(ddoc, name) {
         return dbHash(
           currentDb.value,
-          `views/${enc(ddoc)}/${enc(name)}`
+          `design/${enc(ddoc)}/view/${enc(name)}`
         );
       }
 
@@ -708,6 +822,8 @@
 
       function selectViewNow(ddoc, name, hasReduce) {
         selectedView.value = { ddoc, name, reduce: hasReduce };
+        selectedDesign.value = { ddoc, doc: viewDocs.value[ddoc] };
+        view.value = 'view';
         const doc = viewDocs.value[ddoc];
         const spec = doc && doc.views ? doc.views[name] : null;
         viewEditor.map = (spec && spec.map) || '';
@@ -950,7 +1066,8 @@
         saveDoc,
         deleteDoc,
         openChanges,
-        openViews,
+        openDesigns,
+        openDesign,
         openInfo,
         viewDefs,
         selectedView,
@@ -960,11 +1077,17 @@
         viewLoading,
         viewDocs,
         viewEditor,
+        selectedDesign,
+        selectedDesignViews,
+        newViewModal,
         loadViews,
         selectView,
         runView,
         saveView,
-        newView,
+        openNewView,
+        createView,
+        deleteView,
+        deleteDesign,
         compact,
         loadNow,
         loadHistory,
@@ -979,5 +1102,36 @@
     },
   };
 
-  createApp(App).mount('#app');
+  const CodeEditor = {
+    props: { modelValue: { type: String, default: '' } },
+    emits: ['update:modelValue'],
+    template: '<div class="code-editor" ref="host"></div>',
+    mounted() {
+      this.cm = CodeMirror(this.$refs.host, {
+        value: this.modelValue || '',
+        mode: 'javascript',
+        lineNumbers: true,
+        lineWrapping: true,
+        viewportMargin: Infinity,
+        tabSize: 2,
+        indentUnit: 2,
+      });
+      this.cm.on('change', () => {
+        const value = this.cm.getValue();
+        if (value !== this.modelValue) this.$emit('update:modelValue', value);
+      });
+    },
+    watch: {
+      modelValue(value) {
+        if (this.cm && value !== this.cm.getValue()) this.cm.setValue(value || '');
+      },
+    },
+    beforeUnmount() {
+      if (this.cm) this.cm.getWrapperElement().remove();
+    },
+  };
+
+  const app = createApp(App);
+  app.component('code-editor', CodeEditor);
+  app.mount('#app');
 })();

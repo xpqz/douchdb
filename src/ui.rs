@@ -12,6 +12,10 @@ const INDEX: &str = include_str!("../ui/index.html");
 const APP: &str = include_str!("../ui/app.js");
 const CSS: &str = include_str!("../ui/style.css");
 const VUE: &str = include_str!("../ui/vendor/vue.global.prod.js");
+const CODEMIRROR_JS: &str = include_str!("../ui/vendor/codemirror/codemirror.js");
+const CODEMIRROR_CSS: &str = include_str!("../ui/vendor/codemirror/codemirror.css");
+const CODEMIRROR_JS_MODE: &str =
+    include_str!("../ui/vendor/codemirror/mode/javascript/javascript.js");
 const FAVICON: &str = include_str!("../ui/favicon.svg");
 
 pub async fn redirect() -> Redirect {
@@ -48,6 +52,11 @@ pub async fn asset(Path(path): Path<String>) -> Response {
         "style.css" => ("text/css; charset=utf-8", CSS),
         "favicon.svg" => ("image/svg+xml", FAVICON),
         "vendor/vue.global.prod.js" => ("text/javascript; charset=utf-8", VUE),
+        "vendor/codemirror/codemirror.js" => ("text/javascript; charset=utf-8", CODEMIRROR_JS),
+        "vendor/codemirror/codemirror.css" => ("text/css; charset=utf-8", CODEMIRROR_CSS),
+        "vendor/codemirror/mode/javascript/javascript.js" => {
+            ("text/javascript; charset=utf-8", CODEMIRROR_JS_MODE)
+        }
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let cache = if path.starts_with("vendor/") {

@@ -6,6 +6,7 @@
     <title>douchdb console</title>
     <link rel="icon" href="favicon.svg">
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="vendor/codemirror/codemirror.css">
   </head>
   <body>
     <div id="app" v-cloak>
@@ -100,7 +101,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button class="active">Documents</button>
-                <button @click="openViews">Views</button>
+                <button @click="openDesigns">Design Docs</button>
                 <button @click="openChanges">Changes</button>
                 <button @click="openInfo">Info</button>
               </nav>
@@ -144,37 +145,110 @@
             <p v-else class="muted">Showing up to 100 ids starting with “{{ activeSearch }}”.</p>
           </section>
 
-          <!-- views ------------------------------------------------------>
-          <section v-if="view === 'views'" class="page">
+          <!-- design documents ------------------------------------------>
+          <section v-if="view === 'designs'" class="page">
             <div class="view-head">
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button @click="backToDocs">Documents</button>
-                <button class="active">Views</button>
+                <button class="active" @click="openDesigns">Design Docs</button>
                 <button @click="openChanges">Changes</button>
                 <button @click="openInfo">Info</button>
               </nav>
             </div>
 
-            <div class="view-picker">
-              <button class="ghost" @click="loadViews">↻ Reload views</button>
-              <button class="ghost" @click="newView">+ New view</button>
-              <div v-for="group in viewDefs" :key="group.ddoc" class="view-group">
-                <span class="ddoc mono">{{ group.ddoc }}</span>
-                <button
-                  v-for="item in group.views"
+            <div class="toolbar">
+              <button class="ghost" @click="loadViews">↻ Reload</button>
+              <button class="primary" @click="openNewView()">+ New view</button>
+            </div>
+
+            <table class="grid" data-testid="design-list">
+              <thead>
+                <tr><th>design document</th><th>language</th><th>views</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="group in viewDefs" :key="group.ddoc" @click="openDesign(group.ddoc)">
+                  <td class="mono">{{ group.ddoc }}</td>
+                  <td class="muted">
+                    {{ (viewDocs[group.ddoc] && viewDocs[group.ddoc].language) || 'javascript' }}
+                  </td>
+                  <td>{{ group.views.length }}</td>
+                  <td class="right">
+                    <button class="link" @click.stop="openDesign(group.ddoc)">open</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="!viewDefs.length" class="empty">
+              No design documents yet. Use “New view” to create one.
+            </p>
+          </section>
+
+          <!-- design document ------------------------------------------->
+          <section v-if="view === 'design' && selectedDesign" class="page">
+            <div class="view-head">
+              <h1 class="mono">{{ selectedDesign && selectedDesign.ddoc }}</h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button class="active" @click="openDesigns">Design Docs</button>
+                <button @click="openChanges">Changes</button>
+                <button @click="openInfo">Info</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button class="ghost" @click="openDesigns">← All design docs</button>
+              <button @click="openDoc(selectedDesign.ddoc)">Edit design document</button>
+              <button class="primary" @click="openNewView(selectedDesign.ddoc)">+ New view</button>
+              <span class="spacer"></span>
+              <button class="danger" @click="deleteDesign">Delete design document</button>
+            </div>
+
+            <table class="grid" data-testid="design-view-list">
+              <thead><tr><th>view</th><th>reduce</th><th></th></tr></thead>
+              <tbody>
+                <tr
+                  v-for="item in selectedDesignViews"
                   :key="item.name"
-                  :class="{ primary: selectedView && selectedView.ddoc === group.ddoc && selectedView.name === item.name }"
-                  @click="selectView(group.ddoc, item.name, item.reduce)"
-                  data-testid="view-button"
+                  @click="selectView(selectedDesign.ddoc, item.name, item.reduce)"
                 >
-                  {{ item.name }} <span v-if="item.reduce" class="pill">reduce</span>
+                  <td class="mono">{{ item.name }}</td>
+                  <td>
+                    <span v-if="item.reduce" class="pill">reduce</span>
+                    <span v-else class="muted">—</span>
+                  </td>
+                  <td class="right">
+                    <button
+                      class="link"
+                      @click.stop="selectView(selectedDesign.ddoc, item.name, item.reduce)"
+                    >
+                      query
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="selectedDesignViews.length === 0" class="empty">
+              This design document has no views yet.
+            </p>
+          </section>
+
+          <!-- view ------------------------------------------------------->
+          <section v-if="view === 'view' && selectedView" class="page">
+            <div class="view-head">
+              <h1>
+                <button class="link mono" @click="openDesign(selectedView.ddoc)">
+                  {{ selectedView.ddoc }}
                 </button>
-              </div>
-              <p v-if="!viewDefs.length" class="empty">
-                No views yet. Add a design document with a <code>views</code>
-                object from Documents.
-              </p>
+                <span class="muted">/</span>
+                <span class="mono">{{ selectedView.name }}</span>
+              </h1>
+              <nav class="tabs">
+                <button @click="backToDocs">Documents</button>
+                <button class="active" @click="openDesigns">Design Docs</button>
+                <button @click="openChanges">Changes</button>
+                <button @click="openInfo">Info</button>
+              </nav>
             </div>
 
             <template v-if="selectedView">
@@ -204,6 +278,7 @@
                   <input type="checkbox" v-model="viewForm.group"> group
                 </label>
                 <button class="primary" @click="runView" data-testid="run-view">Run</button>
+                <button class="danger" @click="deleteView" data-testid="delete-view">Delete view</button>
               </div>
 
               <details class="query-options">
@@ -264,21 +339,11 @@
                 <div class="source-grid">
                   <label class="field">
                     <span>map function</span>
-                    <textarea
-                      v-model="viewEditor.map"
-                      class="code"
-                      spellcheck="false"
-                      data-testid="view-map"
-                    ></textarea>
+                    <code-editor v-model="viewEditor.map" data-testid="view-map"></code-editor>
                   </label>
                   <label class="field">
                     <span>reduce function (optional)</span>
-                    <textarea
-                      v-model="viewEditor.reduce"
-                      class="code"
-                      spellcheck="false"
-                      data-testid="view-reduce"
-                    ></textarea>
+                    <code-editor v-model="viewEditor.reduce" data-testid="view-reduce"></code-editor>
                   </label>
                 </div>
                 <div class="toolbar">
@@ -382,7 +447,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button @click="backToDocs">Documents</button>
-                <button @click="openViews">Views</button>
+                <button @click="openDesigns">Design Docs</button>
                 <button class="active">Changes</button>
                 <button @click="openInfo">Info</button>
               </nav>
@@ -425,7 +490,7 @@
               <h1 class="mono">{{ currentDb }}</h1>
               <nav class="tabs">
                 <button @click="backToDocs">Documents</button>
-                <button @click="openViews">Views</button>
+                <button @click="openDesigns">Design Docs</button>
                 <button @click="openChanges">Changes</button>
                 <button class="active">Info</button>
               </nav>
@@ -479,6 +544,47 @@
         </div>
       </aside>
 
+      <!-- new view ------------------------------------------------------->
+      <div v-if="newViewModal.open" class="modal-backdrop" @click.self="newViewModal.open = false">
+        <form class="modal" @submit.prevent="createView">
+          <h2>New view</h2>
+          <p class="muted">Create a view in an existing or new design document.</p>
+          <label>Design document
+            <select v-model="newViewModal.ddoc" data-testid="new-view-ddoc-select">
+              <option v-for="group in viewDefs" :key="group.ddoc" :value="group.ddoc">
+                {{ group.ddoc }}
+              </option>
+              <option value="__new__">New design document…</option>
+            </select>
+          </label>
+          <label v-if="newViewModal.ddoc === '__new__'">New design document name
+            <input
+              v-model="newViewModal.newDdoc"
+              placeholder="myviews"
+              data-testid="new-view-ddoc"
+            >
+          </label>
+          <label>View name
+            <input v-model="newViewModal.name" placeholder="by_city" data-testid="new-view-name">
+          </label>
+          <label>Template
+            <select v-model="newViewModal.template" data-testid="new-view-template">
+              <option value="all">All documents — emit(doc._id, null)</option>
+              <option value="count">Count by type — _count</option>
+              <option value="sum">Sum by type — _sum</option>
+              <option value="blank">Blank map</option>
+            </select>
+          </label>
+          <p v-if="newViewModal.error" class="error" data-testid="new-view-error">
+            {{ newViewModal.error }}
+          </p>
+          <div class="modal-actions">
+            <button type="button" class="ghost" @click="newViewModal.open = false">Cancel</button>
+            <button type="submit" class="primary" data-testid="create-view">Create view</button>
+          </div>
+        </form>
+      </div>
+
       <!-- login ---------------------------------------------------------->
       <div v-if="loginOpen" class="modal-backdrop" @click.self="loginOpen = false">
         <form class="modal" @submit.prevent="doLogin">
@@ -507,6 +613,8 @@
     </div>
 
     <script src="vendor/vue.global.prod.js"></script>
+    <script src="vendor/codemirror/codemirror.js"></script>
+    <script src="vendor/codemirror/mode/javascript/javascript.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

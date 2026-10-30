@@ -341,6 +341,12 @@ textarea:focus {
   padding-bottom: 0;
 }
 
+.view-head h1 {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
 .tabs {
   display: flex;
   gap: 2px;
@@ -586,14 +592,17 @@ textarea:focus {
   padding: 6px 0 8px;
 }
 
-textarea.code {
-  width: 100%;
-  min-height: 150px;
-  resize: vertical;
+.code-editor {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.code-editor .CodeMirror {
+  height: 180px;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.5;
-  tab-size: 2;
 }
 
 .inline-json {
