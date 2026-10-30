@@ -2000,6 +2000,55 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
 }
 
 #[tokio::test]
+async fn cluster_changes_survive_node_loss_and_resume() {
+    let mut nodes = start_cluster_with(3, "1", 2);
+    for node in &nodes {
+        node.fresh_db("cfail").await;
+    }
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("cf{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/cfail/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, baseline) = nodes[0].get("/cfail/_changes?since=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: std::collections::HashSet<&str> = baseline["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 9);
+    let since = baseline["last_seq"].as_str().unwrap().to_string();
+
+    nodes[2].kill();
+    let (status, _) = nodes[0].put("/cfail/after", json!({"n": 100})).await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "write after node loss: {status}"
+    );
+
+    let (status, body) = nodes[0]
+        .get(&format!("/cfail/_changes?since={since}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"after"),
+        "resumed feed missed new change: {ids:?}"
+    );
+    assert!(body["last_seq"].is_string());
+}
+
+#[tokio::test]
 async fn cluster_all_docs_survives_node_loss_via_replicas() {
     let mut nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {
@@ -2201,9 +2250,10 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     let (status, body) = nodes[0].get("/clkill/_all_docs").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 12);
-    // The changes feed still requires all nodes.
-    let (status, _) = nodes[0].get("/clkill/_changes").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // The changes feed falls back to the surviving replicas too.
+    let (status, body) = nodes[0].get("/clkill/_changes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["last_seq"].is_string());
 
     let second: Vec<Value> = (100..106)
         .map(|i| json!({"_id": format!("k{i}"), "n": i}))

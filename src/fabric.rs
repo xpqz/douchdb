@@ -1386,7 +1386,7 @@ pub(crate) async fn cluster_changes(
         // the global limit of unique documents, and advance `last_seq` only
         // over rows actually consumed. Replicas may repeat a document; those
         // rows advance the source node's progress but are not emitted twice.
-        let responses = futures::future::join_all((0..n).map(|node| {
+        let responses: Vec<Option<Value>> = futures::future::join_all((0..n).map(|node| {
             fetch_node_changes(
                 st,
                 db,
@@ -1402,7 +1402,15 @@ pub(crate) async fn cluster_changes(
         }))
         .await
         .into_iter()
-        .collect::<DbResult<Vec<Value>>>()?;
+        .map(Result::ok)
+        .collect();
+        if responses.iter().all(Option::is_none) {
+            return Err(ApiError::new(
+                502,
+                "bad_gateway",
+                "no changes replica is reachable",
+            ));
+        }
 
         let mut indices = vec![0usize; n];
         let mut seen = std::collections::HashSet::new();
@@ -1410,8 +1418,9 @@ pub(crate) async fn cluster_changes(
         loop {
             let mut progressed = false;
             for node in 0..n {
-                let row = responses[node]["results"]
-                    .as_array()
+                let row = responses[node]
+                    .as_ref()
+                    .and_then(|response| response["results"].as_array())
                     .and_then(|rows| rows.get(indices[node]))
                     .cloned();
                 let Some(mut row) = row else {
@@ -1462,8 +1471,19 @@ pub(crate) async fn cluster_changes(
             )
         }))
         .await;
+        let mut succeeded = false;
         for (node, response) in responses.into_iter().enumerate() {
-            absorb_node_changes(&response?, node, &mut progress, &mut rows);
+            if let Ok(response) = response {
+                succeeded = true;
+                absorb_node_changes(&response, node, &mut progress, &mut rows);
+            }
+        }
+        if !succeeded {
+            return Err(ApiError::new(
+                502,
+                "bad_gateway",
+                "no changes replica is reachable",
+            ));
         }
     }
 

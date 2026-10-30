@@ -348,6 +348,17 @@ Two tests cover both shapes: the manual move from node0 to node1 (node0 local
 docs become 0, node1 9), and the automatic planner+cleanup path (sum of local
 shard docs stays 9 and every non-owned shard is empty).
 
+### Changes replica failover (#53)
+
+Cluster `_changes` now skips unavailable nodes and continues with reachable
+replicas in both limited and full feeds. The failed node’s version-vector
+component remains at its last checkpoint; when the node returns it resumes from
+there. Surviving replicas can supply the replicated changes meanwhile.
+
+The node-loss test kills one of three nodes, writes a new document, and resumes
+`_changes` from the pre-kill `last_seq`; the new change is present. The existing
+kill-mid-replication test now expects `_changes` to succeed from replicas.
+
 ### Isolated native scaling (#50)
 
 This run pins two CPUs per server and a disjoint client CPU set, removing the
@@ -411,8 +422,10 @@ replicates and the pending file disappears.
   each node indexes every locally held replica, which is what enables node-loss
   failover.
 - **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document
-  feed is ~124 ms with nodes queried concurrently. Limited feeds now merge
-  every node's prefix round-robin up to the global limit.
+  feed is ~124 ms with nodes queried concurrently. Limited feeds merge every
+  node's prefix round-robin up to the global limit. Unavailable nodes are
+  skipped and covered by replicas; their vector component resumes when they
+  return.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
   vector concurrently with small responses.
 
