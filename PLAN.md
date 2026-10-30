@@ -86,6 +86,7 @@ Keys are chosen so LevelDB's own sort order *is* the index.
 | `d/<docid>/<rev>` | JSON body (without `_id`/`_rev`) | one body per revision |
 | `s/<u64 BE seq>/<docid>` | 1 byte | by-seq index for `_changes` |
 | `l/<localid>` | JSON | `_local` docs, replication checkpoints |
+| `z/doc_count`, `z/doc_deleted_count` | u64 BE | live/deleted counters for `GET /db` and `_all_docs` totals |
 | `x/...` | — | reserved |
 
 Doc ids are raw UTF-8 bytes, which sorts identically to CouchDB's binary
@@ -359,6 +360,11 @@ Above ~6k means something was built that nobody asked for.
 * **Single-node baseline.** `scripts/perf_sweep.py` records CRUD, bulk,
   metadata, changes, view, large-document and compaction numbers on release
   builds; results and caveats are in `docs/performance.md`.
+* **Metadata scans removed from read paths.** Per-shard live/deleted counters
+  back `GET /db` and `_all_docs` totals; `_all_docs` range queries stop after
+  `skip + limit` live rows (and keys queries fetch metadata directly);
+  `_changes` stops each shard once `limit` matches are found. The #30
+  before/after numbers are in `docs/performance.md`.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored

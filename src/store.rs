@@ -98,14 +98,83 @@ impl Tx {
     }
 }
 
+/// The first key that sorts after every key beginning with `prefix`.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
+/// Position an iterator on the last key under `prefix`, if any.
+fn seek_last(iter: &mut rusty_leveldb::DBIterator, prefix: &[u8]) -> Result<()> {
+    if let Some(successor) = prefix_successor(prefix) {
+        iter.seek(&successor);
+        if iter.valid() {
+            if iter.prev() {
+                if let Some((key, _)) = iter.current() {
+                    if key.starts_with(prefix) {
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // No key at or after the successor, so walk the prefix to find its last
+    // key. This only happens for a descending scan with no upper bound, and it
+    // visits keys without decoding values.
+    iter.seek(prefix);
+    if !iter.valid() {
+        return Ok(());
+    }
+    let mut last = match iter.current() {
+        Some((key, _)) => key.to_vec(),
+        None => return Ok(()),
+    };
+    while iter.advance() {
+        match iter.current() {
+            Some((key, _)) if key.starts_with(prefix) => last = key.to_vec(),
+            _ => break,
+        }
+    }
+    iter.seek(&last);
+    Ok(())
+}
+
 pub struct Shard {
     db: DB,
     seq: u64,
     revs_limit: u64,
+    /// Number of live documents, maintained on every metadata write so `GET
+    /// /db` and `_all_docs` totals do not scan the whole `m/` namespace.
+    docs: u64,
+    /// Number of documents whose winning revision is deleted.
+    deleted: u64,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+/// `Some(true)` for a live winner, `Some(false)` for a deleted winner, `None`
+/// when the revision tree has no winner.
+fn meta_live(meta: &DocMeta) -> Option<bool> {
+    meta.tree
+        .winner()
+        .map(|winner| !meta.tree.is_deleted(&winner))
+}
+
+fn read_counter(db: &mut DB, key: &[u8]) -> Option<u64> {
+    db.get(key)
+        .filter(|bytes| bytes.len() == 8)
+        .map(|bytes| u64::from_be_bytes(bytes[..].try_into().unwrap()))
 }
 
 impl Shard {
@@ -123,10 +192,47 @@ impl Shard {
             .filter(|b| b.len() == 8)
             .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
             .unwrap_or(revs_limit);
+
+        // Counters are new in this version. Existing databases get them
+        // backfilled once on first open, then every metadata write keeps them
+        // in sync.
+        let stored = read_counter(&mut db, b"z/doc_count")
+            .zip(read_counter(&mut db, b"z/doc_deleted_count"));
+        let (docs, deleted) = match stored {
+            Some(pair) => pair,
+            None => {
+                let mut docs = 0u64;
+                let mut deleted = 0u64;
+                let mut iter = db.new_iter()?;
+                iter.seek(b"m/");
+                while let Some((key, value)) = iter.current() {
+                    if !key.starts_with(b"m/") {
+                        break;
+                    }
+                    if let Ok(meta) = serde_json::from_slice::<DocMeta>(&value) {
+                        match meta_live(&meta) {
+                            Some(true) => docs += 1,
+                            Some(false) => deleted += 1,
+                            None => {}
+                        }
+                    }
+                    if !iter.advance() {
+                        break;
+                    }
+                }
+                db.put(b"z/doc_count", &docs.to_be_bytes())?;
+                db.put(b"z/doc_deleted_count", &deleted.to_be_bytes())?;
+                db.flush()?;
+                (docs, deleted)
+            }
+        };
+
         Ok(Shard {
             db,
             seq,
             revs_limit,
+            docs,
+            deleted,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
         })
@@ -134,6 +240,11 @@ impl Shard {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Live and deleted document counts for this shard.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.docs, self.deleted)
     }
 
     pub fn revs_limit(&self) -> u64 {
@@ -163,38 +274,178 @@ impl Shard {
         self.get(&body_key(docid, rev))
     }
 
-    /// Every key/value pair under `prefix`, in LevelDB order.
-    pub fn scan(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_from(prefix, prefix)
+    /// Every key/value pair under `prefix`, starting at `start`. Only used by
+    /// tests now; production paths use `scan_range_while` so they can stop
+    /// early.
+    #[cfg(test)]
+    pub fn scan_from(&mut self, prefix: &[u8], start: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.scan_range_while(prefix, Some(start), false, |key, value| {
+            out.push((key.to_vec(), value.to_vec()));
+            true
+        })?;
+        Ok(out)
     }
 
-    /// Every key/value pair under `prefix`, starting at `start`. `start` must
-    /// sort within the prefix's range; this is how sequence ranges are read
-    /// without scanning the whole namespace.
-    pub fn scan_from(&mut self, prefix: &[u8], start: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Merge the uncommitted overlay over the on-disk view. Overlay entries
-        // are few (one group commit's worth), so this stays cheap.
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    /// Visit key/value pairs under `prefix` in LevelDB order, merging the
+    /// uncommitted overlay. `start` is an inclusive lower bound when scanning
+    /// forward and an inclusive upper bound when scanning in reverse. Returning
+    /// `false` from the visitor stops the scan early; this is what keeps
+    /// `_all_docs?limit=100` from reading every document metadata record.
+    pub fn scan_range_while<F>(
+        &mut self,
+        prefix: &[u8],
+        start: Option<&[u8]>,
+        reverse: bool,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        // Overlay entries are few (one group commit's worth), so collecting and
+        // merging them in memory stays cheap.
+        let overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = self
+            .overlay
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with(prefix)
+                    && match start {
+                        Some(bound) if reverse => key.as_slice() <= bound,
+                        Some(bound) => key.as_slice() >= bound,
+                        None => true,
+                    }
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
         let mut iter = self.db.new_iter()?;
-        iter.seek(start);
-        while let Some((k, v)) = iter.current() {
-            if !k.starts_with(prefix) {
-                break;
+        if reverse {
+            match start {
+                Some(upper) => {
+                    iter.seek(upper);
+                    if iter.valid() {
+                        let past = iter
+                            .current()
+                            .map(|(key, _)| key.as_ref() > upper)
+                            .unwrap_or(false);
+                        if past {
+                            iter.prev();
+                        }
+                    } else {
+                        seek_last(&mut iter, prefix)?;
+                    }
+                }
+                None => seek_last(&mut iter, prefix)?,
             }
-            merged.insert(k.to_vec(), Some(v.to_vec()));
-            if !iter.advance() {
-                break;
+
+            let mut overlay = overlay.into_iter().rev().peekable();
+            loop {
+                let disk = if iter.valid() {
+                    iter.current()
+                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                } else {
+                    None
+                };
+                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
+                let take_disk = match (&disk, overlay.peek()) {
+                    (Some((disk_key, _)), Some((overlay_key, _))) => {
+                        disk_key.as_slice() >= overlay_key.as_slice()
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if take_disk {
+                    let (key, value) = disk.expect("disk item");
+                    iter.prev();
+                    if let Some((overlay_key, _)) = overlay.peek() {
+                        if overlay_key.as_slice() == key.as_slice() {
+                            let (_, overlay_value) = overlay.next().unwrap();
+                            if let Some(value) = overlay_value {
+                                if !visit(&key, &value) {
+                                    return Ok(());
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if !visit(&key, &value) {
+                        return Ok(());
+                    }
+                } else {
+                    let (key, value) = overlay.next().unwrap();
+                    if let Some(value) = value {
+                        if !visit(&key, &value) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            for (key, value) in overlay {
+                if let Some(value) = value {
+                    if !visit(&key, &value) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            match start {
+                Some(lower) => iter.seek(lower),
+                None => iter.seek(prefix),
+            }
+
+            let mut overlay = overlay.into_iter().peekable();
+            loop {
+                let disk = if iter.valid() {
+                    iter.current()
+                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                } else {
+                    None
+                };
+                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
+                let take_disk = match (&disk, overlay.peek()) {
+                    (Some((disk_key, _)), Some((overlay_key, _))) => {
+                        disk_key.as_slice() <= overlay_key.as_slice()
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if take_disk {
+                    let (key, value) = disk.expect("disk item");
+                    iter.advance();
+                    if let Some((overlay_key, _)) = overlay.peek() {
+                        if overlay_key.as_slice() == key.as_slice() {
+                            let (_, overlay_value) = overlay.next().unwrap();
+                            if let Some(value) = overlay_value {
+                                if !visit(&key, &value) {
+                                    return Ok(());
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if !visit(&key, &value) {
+                        return Ok(());
+                    }
+                } else {
+                    let (key, value) = overlay.next().unwrap();
+                    if let Some(value) = value {
+                        if !visit(&key, &value) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            for (key, value) in overlay {
+                if let Some(value) = value {
+                    if !visit(&key, &value) {
+                        break;
+                    }
+                }
             }
         }
-        for (key, value) in &self.overlay {
-            if key.starts_with(prefix) && key.as_slice() >= start {
-                merged.insert(key.clone(), value.clone());
-            }
-        }
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
-            .collect())
+        Ok(())
     }
 
     pub fn commit(&mut self, tx: Tx) -> Result<()> {
@@ -213,9 +464,46 @@ impl Shard {
         }
         tx.ops
             .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
+
+        let mut docs = self.docs as i64;
+        let mut deleted = self.deleted as i64;
         for (key, value) in tx.ops {
+            if key.starts_with(b"m/") {
+                // `get` includes earlier operations in this same transaction,
+                // so batched updates to one document still produce one final
+                // delta.
+                let old = self
+                    .get(&key)
+                    .and_then(|bytes| serde_json::from_slice::<DocMeta>(&bytes).ok());
+                let new = value
+                    .as_ref()
+                    .and_then(|bytes| serde_json::from_slice::<DocMeta>(bytes).ok());
+                match old.as_ref().and_then(meta_live) {
+                    Some(true) => docs -= 1,
+                    Some(false) => deleted -= 1,
+                    None => {}
+                }
+                match new.as_ref().and_then(meta_live) {
+                    Some(true) => docs += 1,
+                    Some(false) => deleted += 1,
+                    None => {}
+                }
+            }
             self.overlay.insert(key.clone(), value.clone());
             self.pending.push((key, value));
+        }
+
+        if docs != self.docs as i64 || deleted != self.deleted as i64 {
+            self.docs = docs.max(0) as u64;
+            self.deleted = deleted.max(0) as u64;
+            for (key, value) in [
+                (b"z/doc_count".as_slice(), self.docs),
+                (b"z/doc_deleted_count".as_slice(), self.deleted),
+            ] {
+                let value = value.to_be_bytes().to_vec();
+                self.overlay.insert(key.to_vec(), Some(value.clone()));
+                self.pending.push((key.to_vec(), Some(value)));
+            }
         }
         Ok(())
     }
@@ -356,6 +644,115 @@ mod tests {
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+    use crate::rev::Rev;
+
+    fn meta(deleted: bool, seq: u64) -> DocMeta {
+        let rev = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut tree = RevTree::default();
+        tree.merge_path(&[rev], deleted);
+        DocMeta {
+            tree,
+            seq,
+            atts: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn counters_track_live_and_deleted_documents_across_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.counts(), (0, 0));
+
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
+        tx.put_json(&meta_key("c"), &meta(true, 3)).unwrap();
+        shard.commit_at(tx, Some(3)).unwrap();
+        assert_eq!(shard.counts(), (2, 1));
+
+        // Turn a live doc into a deleted one, and purge another entirely.
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(true, 4)).unwrap();
+        tx.delete(&meta_key("b"));
+        shard.commit_at(tx, Some(4)).unwrap();
+        assert_eq!(shard.counts(), (0, 2));
+
+        shard.flush_pending().unwrap();
+        drop(shard);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.counts(), (0, 2), "counters survive reopen");
+
+        // Simulate a database written before counters existed: open must
+        // backfill them from the metadata.
+        shard.db.delete(b"z/doc_count").unwrap();
+        shard.db.delete(b"z/doc_deleted_count").unwrap();
+        shard.db.flush().unwrap();
+        drop(shard);
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.counts(), (0, 2), "missing counters are backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_range_merges_overlay_and_stops_early_in_both_directions() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-range-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        for id in ["a", "b", "c"] {
+            tx.put(&meta_key(id), id.as_bytes());
+        }
+        shard.commit_at(tx, Some(1)).unwrap();
+        // Uncommitted, so this also exercises the overlay merge path.
+        let mut tx = Tx::new();
+        for id in ["d", "e"] {
+            tx.put(&meta_key(id), id.as_bytes());
+        }
+        shard.commit_at(tx, Some(2)).unwrap();
+
+        let mut forward = Vec::new();
+        shard
+            .scan_range_while(b"m/", Some(&meta_key("c")), false, |key, _| {
+                forward.push(String::from_utf8(key[2..].to_vec()).unwrap());
+                forward.len() < 2
+            })
+            .unwrap();
+        assert_eq!(forward, ["c", "d"]);
+
+        let mut reverse = Vec::new();
+        shard
+            .scan_range_while(b"m/", Some(&meta_key("d")), true, |key, _| {
+                reverse.push(String::from_utf8(key[2..].to_vec()).unwrap());
+                reverse.len() < 2
+            })
+            .unwrap();
+        assert_eq!(reverse, ["d", "c"]);
+
+        let mut all_reverse = Vec::new();
+        shard
+            .scan_range_while(b"m/", None, true, |key, _| {
+                all_reverse.push(String::from_utf8(key[2..].to_vec()).unwrap());
+                true
+            })
+            .unwrap();
+        assert_eq!(all_reverse, ["e", "d", "c", "b", "a"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn scan_from_exact_key_includes_it() {
