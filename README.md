@@ -238,6 +238,59 @@ Behaviour and limits:
   missing database or view), the query fails rather than silently returning
   partial rows.
 
+## Changes feeds
+
+`GET /{db}/_changes` has four feed formats. All of them accept `since` (`0`,
+`now`, or an opaque cluster version vector), `limit`, `include_docs`,
+`style=all_docs` and `filter=_doc_ids`. Longpoll, continuous and eventsource
+also accept `heartbeat` and `timeout` in milliseconds, capped at five minutes.
+
+**`feed=normal`** (default) returns one JSON object:
+
+```json
+{"results": [...], "last_seq": 42, "pending": 0}
+```
+
+**`feed=longpoll`** holds the request until changes appear or the timeout
+expires, then returns the same JSON object. With `heartbeat`, newline
+keepalives are sent while waiting.
+
+**`feed=continuous`** returns a chunked `application/json` stream with one
+change object per line. Blank lines are heartbeats.
+
+```sh
+curl -N 'localhost:5984/db/_changes?feed=continuous&since=now&heartbeat=10000'
+```
+
+**`feed=eventsource`** returns a Server-Sent Events stream,
+`Content-Type: text/event-stream`, with each event framed as:
+
+```text
+data: {"seq":42,"id":"doc1","changes":[{"rev":"1-..."}]}
+
+```
+
+Heartbeats are SSE comments (`: heartbeat`). In a browser:
+
+```js
+const changes = new EventSource(
+  'http://localhost:5984/db/_changes?feed=eventsource&since=0&heartbeat=10000'
+);
+changes.onmessage = (event) => {
+  const change = JSON.parse(event.data);
+  console.log(change.id, change.seq);
+};
+```
+
+`EventSource` cannot set an `Authorization` header: use a same-origin
+`_session` cookie, or put a proxy in front. The eventsource feed does not
+implement `Last-Event-ID` resume; reconnect with an explicit `since` value
+(the previous `last_seq` or change `seq`).
+
+`_db_updates` also supports `feed=normal`, `longpoll` and `continuous`, but not
+the eventsource format. On a cluster, `since` and `last_seq` are opaque
+base64url version vectors; do not parse them client-side.
+
 ## Web console
 
 A Fauxton-style console is embedded at `http://localhost:5984/_utils/`:
