@@ -538,3 +538,7 @@ supported; documents containing `_attachments` are rejected with
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
   shard for ~27 s (measured in [PLAN.md](PLAN.md)).
 - No Mango, lists/shows or metrics.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
