@@ -55,6 +55,13 @@ pub struct ViewQuery {
     pub attachments: bool,
     pub update_seq: bool,
     pub limits: ViewLimits,
+    /// Internal cluster filter: return only rows whose shard is owned by this
+    /// node. The coordinator unions the owner-only responses, so each map row
+    /// crosses the network once instead of once per replica.
+    pub owner_shards: Option<Vec<bool>>,
+    pub shard_count: u32,
+    /// Set by the cluster coordinator after summing owner-only map row counts.
+    pub total_rows_override: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -568,7 +575,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     Ok(())
 }
 
-async fn load_spec(db: &Db, ddoc_id: &str, view_name: &str) -> DbResult<ViewSpec> {
+pub async fn load_spec(db: &Db, ddoc_id: &str, view_name: &str) -> DbResult<ViewSpec> {
     let ddoc = db.get_doc(ddoc_id, &DocOpts::default()).await?;
     spec_from_doc(&ddoc, view_name)
 }
@@ -738,7 +745,7 @@ fn render(
     docs: &HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
-    let total_rows = rows.len();
+    let mut total_rows = query.total_rows_override.unwrap_or(rows.len());
 
     // `rows` is cached in CouchDB collation order, so queries never re-sort it.
     let mut ordered: Vec<&Row> = if query.descending {
@@ -746,6 +753,14 @@ fn render(
     } else {
         rows.iter().collect()
     };
+
+    if let Some(owned) = &query.owner_shards {
+        ordered.retain(|row| {
+            let shard = crate::db::shard_index(&row.id, query.shard_count);
+            owned.get(shard).copied().unwrap_or(false)
+        });
+        total_rows = ordered.len();
+    }
 
     if let Some(keys) = &query.keys {
         let mut selected = Vec::new();
@@ -1046,7 +1061,7 @@ fn reduce_approx_count_distinct<'a>(
     Ok(json!(distinct.len()))
 }
 
-fn number_value(value: f64) -> Value {
+pub(crate) fn number_value(value: f64) -> Value {
     if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
         json!(value as i64)
     } else {
