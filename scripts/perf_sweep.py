@@ -314,6 +314,18 @@ def main():
         result["operations"]["view_map_warm"] = summary(
             warm_lat, time.perf_counter() - started
         )
+
+        map_only_lat = []
+        started = time.perf_counter()
+        for _ in range(20):
+            elapsed, _ = request(
+                conn, "GET", "/perf/_design/perf/_view/by_value?reduce=false&limit=100"
+            )
+            map_only_lat.append(elapsed)
+        result["operations"]["view_map_only_warm"] = summary(
+            map_only_lat, time.perf_counter() - started
+        )
+
         reduce_lat = []
         started = time.perf_counter()
         for _ in range(20):

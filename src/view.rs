@@ -15,7 +15,7 @@ use rusty_leveldb::{LdbIterator, Options as LdbOptions, WriteBatch, DB as Ldb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -82,6 +82,12 @@ struct StoredRow {
     value: Value,
 }
 
+#[derive(Serialize)]
+struct StoredRowRef<'a> {
+    key: &'a Value,
+    value: &'a Value,
+}
+
 /// A persistent index for one (database, design document, view) tuple. Rows
 /// are stored per document so a changed document can be re-mapped without
 /// walking the whole database.
@@ -89,6 +95,46 @@ struct ViewIndex {
     db: Ldb,
     last_seq: u64,
     design: String,
+    /// Sorted rows for the current index state. Warm queries reuse this
+    /// instead of scanning and parsing every stored row on each request.
+    cached: Option<Arc<Vec<Row>>>,
+}
+
+/// Rows are ordered by CouchDB key collation, then document id.
+pub fn sort_rows(rows: &mut [Row]) {
+    rows.sort_by(row_cmp);
+}
+
+fn row_cmp(a: &Row, b: &Row) -> Ordering {
+    cmp_json(&a.key, &b.key).then_with(|| a.id.cmp(&b.id))
+}
+
+/// Merge two already-sorted row runs.
+fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
+    let mut out = Vec::with_capacity(base.len() + added.len());
+    let mut base = base.into_iter().peekable();
+    let mut added = added.into_iter().peekable();
+    loop {
+        match (base.peek(), added.peek()) {
+            (Some(left), Some(right)) => {
+                if row_cmp(left, right) == Ordering::Greater {
+                    out.push(added.next().expect("peeked row"));
+                } else {
+                    out.push(base.next().expect("peeked row"));
+                }
+            }
+            (Some(_), None) => {
+                out.extend(base);
+                break;
+            }
+            (None, Some(_)) => {
+                out.extend(added);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    out
 }
 
 type IndexMap = HashMap<PathBuf, Arc<AsyncMutex<ViewIndex>>>;
@@ -148,10 +194,11 @@ impl ViewIndex {
             db,
             last_seq,
             design,
+            cached: None,
         })
     }
 
-    fn rows(&mut self) -> Result<Vec<Row>, String> {
+    fn load_rows(&mut self) -> Result<Vec<Row>, String> {
         // Keys are `r/<base64(docid)>/<ordinal>`; the id is recovered from the
         // key rather than duplicated in every stored row.
         let mut rows = Vec::new();
@@ -177,6 +224,20 @@ impl ViewIndex {
                 value: stored.value,
             });
         }
+        Ok(rows)
+    }
+
+    /// Sorted rows for the current index state. The first query after a
+    /// rebuild or incremental update pays for loading/sorting; later queries
+    /// reuse the same immutable snapshot.
+    fn sorted_rows(&mut self) -> Result<Arc<Vec<Row>>, String> {
+        if let Some(rows) = &self.cached {
+            return Ok(rows.clone());
+        }
+        let mut rows = self.load_rows()?;
+        sort_rows(&mut rows);
+        let rows = Arc::new(rows);
+        self.cached = Some(rows.clone());
         Ok(rows)
     }
 
@@ -209,25 +270,45 @@ impl ViewIndex {
         design: &str,
     ) -> Result<(), String> {
         let mut batch = WriteBatch::default();
-        for id in changed {
-            for (key, _) in self.scan(&Self::doc_prefix(&id))? {
+        for id in &changed {
+            for (key, _) in self.scan(&Self::doc_prefix(id))? {
                 batch.delete(&key);
             }
         }
-        for (id, rows) in by_doc {
-            let prefix = Self::doc_prefix(&id);
-            for (ordinal, row) in rows.into_iter().enumerate() {
+
+        let mut added = Vec::new();
+        for (id, rows) in &by_doc {
+            let prefix = Self::doc_prefix(id);
+            for (ordinal, row) in rows.iter().enumerate() {
                 let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
-                let stored = StoredRow {
-                    key: row.key,
-                    value: row.value,
-                };
                 batch.put(
                     key.as_bytes(),
-                    &serde_json::to_vec(&stored).map_err(|error| error.to_string())?,
+                    &serde_json::to_vec(&StoredRowRef {
+                        key: &row.key,
+                        value: &row.value,
+                    })
+                    .map_err(|error| error.to_string())?,
                 );
+                added.push(row.clone());
             }
         }
+
+        // Update the in-memory snapshot incrementally: drop rows for changed
+        // documents and merge in the new ones. Both runs are sorted, so this is
+        // linear rather than a full reload.
+        let next_cached = match self.cached.take() {
+            Some(cached) => {
+                let changed: HashSet<&str> = changed.iter().map(String::as_str).collect();
+                // Reuse the cached allocation when no in-flight query still
+                // holds the snapshot; otherwise clone it.
+                let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
+                kept.retain(|row| !changed.contains(row.id.as_str()));
+                sort_rows(&mut added);
+                Some(Arc::new(merge_sorted_rows(kept, added)))
+            }
+            None => None,
+        };
+
         self.last_seq = last_seq;
         self.design = design.to_string();
         batch.put(
@@ -241,30 +322,34 @@ impl ViewIndex {
         self.db
             .write(batch, true)
             .map_err(|error| error.to_string())?;
+        self.cached = next_cached;
         Ok(())
     }
 
-    fn rebuild(&mut self, rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), String> {
+    fn rebuild(&mut self, mut rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), String> {
+        sort_rows(&mut rows);
         let mut batch = WriteBatch::default();
         for (key, _) in self.scan(b"r/")? {
             batch.delete(&key);
         }
-        let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
-        for row in rows {
-            by_doc.entry(row.id.clone()).or_default().push(row);
-        }
-        for (id, rows) in by_doc {
-            let prefix = Self::doc_prefix(&id);
-            for (ordinal, row) in rows.into_iter().enumerate() {
-                let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
-                let stored = StoredRow {
-                    key: row.key,
-                    value: row.value,
-                };
-                batch.put(
-                    key.as_bytes(),
-                    &serde_json::to_vec(&stored).map_err(|error| error.to_string())?,
-                );
+        {
+            let mut by_doc: HashMap<&str, Vec<&Row>> = HashMap::new();
+            for row in &rows {
+                by_doc.entry(row.id.as_str()).or_default().push(row);
+            }
+            for (id, doc_rows) in by_doc {
+                let prefix = Self::doc_prefix(id);
+                for (ordinal, row) in doc_rows.into_iter().enumerate() {
+                    let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
+                    batch.put(
+                        key.as_bytes(),
+                        &serde_json::to_vec(&StoredRowRef {
+                            key: &row.key,
+                            value: &row.value,
+                        })
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
             }
         }
         self.last_seq = last_seq;
@@ -280,6 +365,7 @@ impl ViewIndex {
         self.db
             .write(batch, true)
             .map_err(|error| error.to_string())?;
+        self.cached = Some(Arc::new(rows));
         Ok(())
     }
 }
@@ -306,7 +392,7 @@ pub async fn local_map(
     need_docs: bool,
     attachments: bool,
     limits: ViewLimits,
-) -> DbResult<(ViewSpec, Vec<Row>, HashMap<String, Value>)> {
+) -> DbResult<(ViewSpec, Arc<Vec<Row>>, HashMap<String, Value>)> {
     let spec = load_spec(db, ddoc_id, view_name).await?;
     let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits).await?;
     let docs = if need_docs {
@@ -319,11 +405,11 @@ pub async fn local_map(
 
 pub fn finish(
     spec: &ViewSpec,
-    rows: Vec<Row>,
+    rows: Arc<Vec<Row>>,
     docs: HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
-    render(spec, rows, docs, query)
+    render(spec, &rows, &docs, query)
 }
 
 async fn ensure_rows(
@@ -332,7 +418,7 @@ async fn ensure_rows(
     view_name: &str,
     spec: &ViewSpec,
     limits: ViewLimits,
-) -> DbResult<Vec<Row>> {
+) -> DbResult<Arc<Vec<Row>>> {
     let current_seq = db.info().await?["update_seq"].as_u64().unwrap_or(0);
     let design = format!(
         "{}|{}",
@@ -348,7 +434,7 @@ async fn ensure_rows(
             .rebuild(rows, current_seq, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
         return index
-            .rows()
+            .sorted_rows()
             .map_err(|error| ApiError::new(500, "view_index_error", error));
     }
 
@@ -391,31 +477,13 @@ async fn ensure_rows(
     }
 
     index
-        .rows()
+        .sorted_rows()
         .map_err(|error| ApiError::new(500, "view_index_error", error))
 }
 
 async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<Row>> {
-    let all = db
-        .all_docs(&AllDocsOpts {
-            include_docs: true,
-            limit: usize::MAX,
-            ..Default::default()
-        })
-        .await?;
-    let mut docs = Vec::new();
-    for row in all["rows"].as_array().cloned().unwrap_or_default() {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-            continue;
-        };
-        if id.starts_with("_design/") || id.starts_with("_local/") {
-            continue;
-        }
-        if let Some(doc) = row.get("doc").cloned() {
-            docs.push((id, doc));
-        }
-    }
-    run_map(map_source, &docs, limits).map_err(|reason| {
+    let docs = db.map_docs().await?;
+    run_map_json(map_source, &docs, limits).map_err(|reason| {
         ApiError::new(500, "view_error", format!("map function failed: {reason}"))
     })
 }
@@ -544,6 +612,31 @@ fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
 }
 
 fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
+    let mut serialized = Vec::with_capacity(docs.len());
+    for (id, doc) in docs {
+        serialized.push((
+            id.clone(),
+            serde_json::to_string(doc).map_err(|error| format!("{id}: {error}"))?,
+        ));
+    }
+    run_map_json(source, &serialized, limits)
+}
+
+/// Run the map function over batches of already-serialized documents. Batching
+/// amortizes the QuickJS call/JSON boundary; callers that already hold raw
+/// bodies (cold index builds) also avoid a Rust parse/encode round trip.
+fn run_map_json(
+    source: &str,
+    docs: &[(String, String)],
+    limits: ViewLimits,
+) -> Result<Vec<Row>, String> {
+    if docs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const MAX_DOCS: usize = 256;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+
     let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
 
@@ -571,10 +664,14 @@ fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result
                 throw new Error("map must be a function");
               }}
               return function (json) {{
-                var doc = JSON.parse(json);
-                __out = [];
-                __map(doc);
-                return JSON.stringify(__out);
+                var docs = JSON.parse(json);
+                var all = [];
+                for (var i = 0; i < docs.length; i++) {{
+                  __out = [];
+                  __map(docs[i]);
+                  all.push(__out);
+                }}
+                return JSON.stringify(all);
               }};
             }})()
             "#
@@ -582,27 +679,54 @@ fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result
         let func: rquickjs::Function = ctx
             .eval(wrapped)
             .map_err(|error| format!("compile: {error}"))?;
+
         let mut rows = Vec::new();
-        for (id, doc) in docs {
-            let input = serde_json::to_string(doc).map_err(|error| error.to_string())?;
-            let output: String = func
-                .call((input,))
-                .map_err(|error| format!("{id}: {error}"))?;
-            let emitted: Value =
-                serde_json::from_str(&output).map_err(|error| format!("{id}: {error}"))?;
-            for pair in emitted.as_array().cloned().unwrap_or_default() {
-                let mut pair = pair.as_array().cloned().unwrap_or_default();
-                if pair.len() != 2 {
-                    continue;
-                }
-                let value = pair.pop().unwrap_or(Value::Null);
-                let key = pair.pop().unwrap_or(Value::Null);
-                rows.push(Row {
-                    id: id.clone(),
-                    key,
-                    value,
-                });
+        let mut start = 0;
+        while start < docs.len() {
+            let mut end = start;
+            let mut bytes = 2;
+            while end < docs.len()
+                && end - start < MAX_DOCS
+                && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
+            {
+                bytes += docs[end].1.len() + 1;
+                end += 1;
             }
+
+            let mut batch = String::with_capacity(bytes);
+            batch.push('[');
+            for (index, (_, doc)) in docs[start..end].iter().enumerate() {
+                if index > 0 {
+                    batch.push(',');
+                }
+                batch.push_str(doc);
+            }
+            batch.push(']');
+
+            let first_id = &docs[start].0;
+            let output: String = func
+                .call((batch,))
+                .map_err(|error| format!("{first_id}: {error}"))?;
+            let emitted: Vec<Vec<(Value, Value)>> =
+                serde_json::from_str(&output).map_err(|error| format!("{first_id}: {error}"))?;
+            if emitted.len() != end - start {
+                return Err(format!(
+                    "{first_id}: map returned {} results for {} documents",
+                    emitted.len(),
+                    end - start
+                ));
+            }
+            for (offset, pairs) in emitted.into_iter().enumerate() {
+                let id = &docs[start + offset].0;
+                for (key, value) in pairs {
+                    rows.push(Row {
+                        id: id.clone(),
+                        key,
+                        value,
+                    });
+                }
+            }
+            start = end;
         }
         Ok(rows)
     })
@@ -610,33 +734,35 @@ fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result
 
 fn render(
     spec: &ViewSpec,
-    mut rows: Vec<Row>,
-    docs: HashMap<String, Value>,
+    rows: &[Row],
+    docs: &HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
     let total_rows = rows.len();
-    rows.sort_by(|a, b| cmp_json(&a.key, &b.key).then_with(|| a.id.cmp(&b.id)));
-    if query.descending {
-        rows.reverse();
-    }
+
+    // `rows` is cached in CouchDB collation order, so queries never re-sort it.
+    let mut ordered: Vec<&Row> = if query.descending {
+        rows.iter().rev().collect()
+    } else {
+        rows.iter().collect()
+    };
 
     if let Some(keys) = &query.keys {
         let mut selected = Vec::new();
         for key in keys {
-            for row in rows
-                .iter()
-                .filter(|row| cmp_json(&row.key, key) == Ordering::Equal)
-            {
-                selected.push(row.clone());
+            for row in &ordered {
+                if cmp_json(&row.key, key) == Ordering::Equal {
+                    selected.push(*row);
+                }
             }
         }
-        rows = selected;
+        ordered = selected;
     } else if let Some(key) = &query.key {
-        rows.retain(|row| cmp_json(&row.key, key) == Ordering::Equal);
+        ordered.retain(|row| cmp_json(&row.key, key) == Ordering::Equal);
     }
 
-    let before_start = count_before_start(&rows, query);
-    rows.retain(|row| in_range(row, query));
+    let before_start = count_before_start(&ordered, query);
+    ordered.retain(|row| in_range(row, query));
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
 
     if reduce {
@@ -647,12 +773,26 @@ fn render(
                 "Reduce is invalid for map-only views",
             ));
         };
-        let groups = group_rows(rows, query);
+        let groups = group_rows(ordered, query);
         let mut out = Vec::new();
         for (key, members) in groups {
-            let keys: Vec<Value> = members.iter().map(|row| json!([row.id, row.key])).collect();
-            let values: Vec<Value> = members.iter().map(|row| row.value.clone()).collect();
-            let value = match reduce_value(reducer, &keys, &values, query.limits) {
+            // Built-ins only need the values (or, for _count, just the row
+            // count), so avoid allocating a key array for every row.
+            let value = match reducer.as_str() {
+                "_count" => Ok(json!(members.len())),
+                "_sum" => reduce_sum(members.iter().map(|row| &row.value)),
+                "_stats" => reduce_stats(members.iter().map(|row| &row.value)),
+                "_approx_count_distinct" => {
+                    reduce_approx_count_distinct(members.iter().map(|row| &row.value))
+                }
+                _ => {
+                    let keys: Vec<Value> =
+                        members.iter().map(|row| json!([row.id, row.key])).collect();
+                    let values: Vec<Value> = members.iter().map(|row| row.value.clone()).collect();
+                    reduce_value(reducer, &keys, &values, query.limits)
+                }
+            };
+            let value = match value {
                 Ok(value) => value,
                 Err(reason) => {
                     return Err(ApiError::new(
@@ -667,16 +807,15 @@ fn render(
         return Ok(json!({"rows": out}));
     }
 
-    let skip = query.skip.min(rows.len());
+    let skip = query.skip.min(ordered.len());
     let take = query.limit;
-    let selected: Vec<Row> = rows.into_iter().skip(skip).take(take).collect();
+    let selected = ordered.into_iter().skip(skip).take(take);
     let rows: Vec<Value> = selected
-        .into_iter()
         .map(|row| {
             let mut entry = json!({
-                "id": row.id,
-                "key": row.key,
-                "value": row.value,
+                "id": row.id.clone(),
+                "key": row.key.clone(),
+                "value": row.value.clone(),
             });
             if query.include_docs {
                 if let Some(doc) = docs.get(&row.id) {
@@ -693,7 +832,7 @@ fn render(
     }))
 }
 
-fn count_before_start(rows: &[Row], query: &ViewQuery) -> usize {
+fn count_before_start(rows: &[&Row], query: &ViewQuery) -> usize {
     let Some(start) = &query.startkey else {
         return 0;
     };
@@ -750,11 +889,11 @@ fn in_range(row: &Row, query: &ViewQuery) -> bool {
     true
 }
 
-fn group_rows(rows: Vec<Row>, query: &ViewQuery) -> Vec<(Value, Vec<Row>)> {
+fn group_rows<'a>(rows: Vec<&'a Row>, query: &ViewQuery) -> Vec<(Value, Vec<&'a Row>)> {
     if !query.group && query.group_level == 0 {
         return vec![(Value::Null, rows)];
     }
-    let mut groups: Vec<(Value, Vec<Row>)> = Vec::new();
+    let mut groups: Vec<(Value, Vec<&'a Row>)> = Vec::new();
     for row in rows {
         let key = group_key(&row.key, query.group_level);
         match groups.last_mut() {
@@ -785,24 +924,9 @@ fn reduce_value(
 ) -> Result<Value, String> {
     match source {
         "_count" => return Ok(json!(values.len())),
-        "_sum" => {
-            let mut sum = 0.0;
-            for value in values {
-                let number = value
-                    .as_f64()
-                    .ok_or_else(|| format!("_sum requires numbers, got {value}"))?;
-                sum += number;
-            }
-            return Ok(number_value(sum));
-        }
-        "_stats" => return stats(values),
-        "_approx_count_distinct" => {
-            let mut distinct = std::collections::HashSet::new();
-            for value in values {
-                distinct.insert(serde_json::to_string(value).map_err(|error| error.to_string())?);
-            }
-            return Ok(json!(distinct.len()));
-        }
+        "_sum" => return reduce_sum(values.iter()),
+        "_stats" => return reduce_stats(values.iter()),
+        "_approx_count_distinct" => return reduce_approx_count_distinct(values.iter()),
         _ => {}
     }
 
@@ -871,12 +995,19 @@ fn run_reduce(
     })
 }
 
-fn stats(values: &[Value]) -> Result<Value, String> {
-    if values.is_empty() {
-        return Ok(json!({
-            "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
-        }));
+fn reduce_sum<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+    let mut sum = 0.0;
+    for value in values {
+        let number = value
+            .as_f64()
+            .ok_or_else(|| format!("_sum requires numbers, got {value}"))?;
+        sum += number;
     }
+    Ok(number_value(sum))
+}
+
+fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+    let mut count = 0usize;
     let mut sum = 0.0;
     let mut sumsqr = 0.0;
     let mut min = f64::INFINITY;
@@ -885,18 +1016,34 @@ fn stats(values: &[Value]) -> Result<Value, String> {
         let number = value
             .as_f64()
             .ok_or_else(|| format!("_stats requires numbers, got {value}"))?;
+        count += 1;
         sum += number;
         sumsqr += number * number;
         min = min.min(number);
         max = max.max(number);
     }
+    if count == 0 {
+        return Ok(json!({
+            "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
+        }));
+    }
     Ok(json!({
         "sum": number_value(sum),
-        "count": values.len(),
+        "count": count,
         "min": number_value(min),
         "max": number_value(max),
         "sumsqr": number_value(sumsqr),
     }))
+}
+
+fn reduce_approx_count_distinct<'a>(
+    values: impl IntoIterator<Item = &'a Value>,
+) -> Result<Value, String> {
+    let mut distinct = HashSet::new();
+    for value in values {
+        distinct.insert(serde_json::to_string(value).map_err(|error| error.to_string())?);
+    }
+    Ok(json!(distinct.len()))
 }
 
 fn number_value(value: f64) -> Value {
@@ -1028,6 +1175,73 @@ mod tests {
     }
 
     #[test]
+    fn map_batches_large_document_sets() {
+        let docs: Vec<(String, Value)> = (0..600)
+            .map(|i| (format!("d{i}"), json!({"_id": format!("d{i}"), "n": i})))
+            .collect();
+        let rows = run_map(
+            "function(doc){ emit(doc.n, doc.n); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 600);
+        assert_eq!(rows[300].id, "d300");
+        assert_eq!(rows[300].value, json!(300));
+    }
+
+    #[test]
+    fn index_cache_tracks_incremental_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-view-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut index = ViewIndex::open(&dir).unwrap();
+        index
+            .rebuild(
+                vec![
+                    Row {
+                        id: "a".into(),
+                        key: json!("a"),
+                        value: json!(1),
+                    },
+                    Row {
+                        id: "b".into(),
+                        key: json!("b"),
+                        value: json!(2),
+                    },
+                ],
+                1,
+                "map|",
+            )
+            .unwrap();
+        assert_eq!(index.sorted_rows().unwrap().len(), 2);
+
+        // Move a to a later key and delete b; the cached snapshot must follow.
+        let mut by_doc = HashMap::new();
+        by_doc.insert(
+            "a".to_string(),
+            vec![Row {
+                id: "a".into(),
+                key: json!("z"),
+                value: json!(3),
+            }],
+        );
+        index
+            .apply(vec!["a".to_string(), "b".to_string()], by_doc, 2, "map|")
+            .unwrap();
+        let rows = index.sorted_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "a");
+        assert_eq!(rows[0].key, json!("z"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn custom_reduce_rereduces_large_groups() {
         let values: Vec<Value> = (0..2500).map(|i| json!(i)).collect();
         let value = reduce_value(
@@ -1085,7 +1299,7 @@ mod tests {
             let mut index = ViewIndex::open(&dir).unwrap();
             assert_eq!(index.last_seq, 7);
             assert_eq!(index.design, "map|");
-            let mut restored = index.rows().unwrap();
+            let mut restored = index.load_rows().unwrap();
             restored.sort_by(|a, b| a.id.cmp(&b.id));
             assert_eq!(restored.len(), 2);
             assert_eq!(restored[0].id, "a");
@@ -1109,5 +1323,15 @@ mod tests {
         assert_eq!(stats["count"], 2);
         assert_eq!(stats["min"], 1);
         assert_eq!(stats["max"], 3);
+        assert_eq!(
+            reduce_value(
+                "_approx_count_distinct",
+                &[],
+                &[json!(1), json!(2), json!(1)],
+                ViewLimits::default()
+            )
+            .unwrap(),
+            json!(2)
+        );
     }
 }

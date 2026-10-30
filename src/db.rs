@@ -266,6 +266,68 @@ impl Db {
         finish_all_docs(selected, total_rows as usize, before_start + opts.skip)
     }
 
+    /// Documents for a view build, as JSON text with `_id` and `_rev` already
+    /// spliced into the stored body. This avoids parsing every body into a
+    /// `Value` and serializing it again just to hand it to QuickJS.
+    pub async fn map_docs(&self) -> DbResult<Vec<(String, String)>> {
+        let mut docs = Vec::new();
+        for shard in &self.shards {
+            let mut shard_docs = shard
+                .call(|s| {
+                    let mut metas = Vec::new();
+                    s.scan_range_while(b"m/", None, false, |key, bytes| {
+                        let Some(id) = std::str::from_utf8(&key[2..]).ok() else {
+                            return true;
+                        };
+                        if id.starts_with("_design/") || id.starts_with("_local/") {
+                            return true;
+                        }
+                        let Ok(meta) = serde_json::from_slice::<DocMeta>(bytes) else {
+                            return true;
+                        };
+                        let Some(winner) = meta.tree.winner() else {
+                            return true;
+                        };
+                        if meta.tree.is_deleted(&winner) {
+                            return true;
+                        }
+                        let has_attachments = meta
+                            .atts
+                            .get(&winner)
+                            .map(|atts| !atts.is_empty())
+                            .unwrap_or(false);
+                        metas.push((id.to_string(), winner, has_attachments));
+                        true
+                    })?;
+
+                    let mut docs = Vec::with_capacity(metas.len());
+                    for (id, rev, has_attachments) in metas {
+                        if !has_attachments {
+                            if let Some(body) = s.get_body(&id, &rev) {
+                                docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
+                                continue;
+                            }
+                        }
+                        // Attachments are rare; fall back to the full document
+                        // shape so map functions still see `_attachments`.
+                        let doc_opts = DocOpts {
+                            rev: Some(rev),
+                            ..Default::default()
+                        };
+                        if let Ok(doc) = read_doc(s, &id, &doc_opts) {
+                            if let Ok(text) = serde_json::to_string(&doc) {
+                                docs.push((id, text));
+                            }
+                        }
+                    }
+                    Ok(docs)
+                })
+                .await?;
+            docs.append(&mut shard_docs);
+        }
+        Ok(docs)
+    }
+
     async fn all_docs_by_keys(&self, opts: &AllDocsOpts, keys: &[String]) -> DbResult<Value> {
         let mut total_rows = 0u64;
         for shard in &self.shards {
@@ -1415,6 +1477,22 @@ fn collect_all_docs(
     }
 
     Ok((rows, before_start))
+}
+
+/// Put `_id` and `_rev` in front of an already-serialized document body.
+/// Bodies are stored as compact JSON objects, so no parse/encode is needed.
+fn embed_doc_meta(id: &str, rev: &str, body: &[u8]) -> String {
+    let id = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let rev = serde_json::to_string(rev).unwrap_or_else(|_| "\"\"".to_string());
+    let Ok(body) = std::str::from_utf8(body) else {
+        return format!("{{\"_id\":{id},\"_rev\":{rev}}}");
+    };
+    let rest = body.strip_prefix('{').unwrap_or(body);
+    if rest.trim_start().starts_with('}') {
+        format!("{{\"_id\":{id},\"_rev\":{rev}}}")
+    } else {
+        format!("{{\"_id\":{id},\"_rev\":{rev},{rest}")
+    }
 }
 
 fn all_docs_key_row(
