@@ -1647,6 +1647,47 @@ async fn cluster_changes_limit_covers_all_nodes() {
 }
 
 #[tokio::test]
+async fn cluster_all_docs_survives_node_loss_via_replicas() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("alldocsfail").await;
+    }
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("al{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/alldocsfail/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0].get("/alldocsfail/_all_docs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 9);
+
+    nodes[2].kill();
+
+    let (status, body) = nodes[0].get("/alldocsfail/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 9);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 9);
+
+    let (status, body) = nodes[0]
+        .get("/alldocsfail/_all_docs?startkey=%22al3%22&limit=3&skip=1")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 9);
+    assert_eq!(body["offset"], 4);
+
+    let (status, body) = nodes[0]
+        .post("/alldocsfail/_all_docs", json!({"keys": ["al0", "al8"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 9);
+    assert_eq!(body["rows"][0]["id"], "al0");
+    assert_eq!(body["rows"][1]["id"], "al8");
+}
+
+#[tokio::test]
 async fn cluster_post_creates_the_document_on_its_owner() {
     let nodes = start_cluster(2);
     for node in &nodes {
@@ -1803,10 +1844,11 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     // Kill a node while anti-entropy is still moving shards around.
     nodes[2].kill();
 
-    // Fan-out endpoints must fail fast rather than silently returning a
-    // partial cluster view.
-    let (status, _) = nodes[0].get("/clkill/_all_docs").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // _all_docs falls back to the surviving replicas.
+    let (status, body) = nodes[0].get("/clkill/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 12);
+    // The changes feed still requires all nodes.
     let (status, _) = nodes[0].get("/clkill/_changes").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
