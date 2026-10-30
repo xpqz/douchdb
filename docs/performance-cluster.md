@@ -374,6 +374,17 @@ path scales, and the default-r gap is explained by reading two replicas. Keep
 only after an off-host, multi-client run shows transport cost dominating the
 local path.
 
+### Versioned shard maps and reconciliation (#51)
+
+Shard maps now carry a monotonic `version`. External updates increment it,
+peers reject older versions, and the PUT response includes `"pending": true`
+when fewer than a metadata quorum acknowledged. The coordinator persists a
+`pending-shard-map.json`, and anti-entropy reconciles versions with peers:
+newer maps are pulled, older peers are pushed, and the pending marker clears
+once a metadata quorum acknowledges. A test takes two of three nodes down,
+observes a pending version-3 update, restarts one peer, and verifies the map
+replicates and the pending file disappears.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one

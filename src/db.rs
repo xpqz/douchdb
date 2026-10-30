@@ -177,9 +177,19 @@ impl Db {
             .clone()
     }
 
-    pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<()> {
+    pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
+        }
+        let current = self.shard_map();
+        if shard_map.version < current.version {
+            return Ok(false);
+        }
+        if shard_map.version == current.version {
+            if shard_map.replicas != current.replicas {
+                return Ok(false);
+            }
+            return Ok(true);
         }
         std::fs::write(
             self.path.join("shard-map.json"),
@@ -191,7 +201,27 @@ impl Db {
             .shard_map
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = shard_map;
+        Ok(true)
+    }
+
+    pub fn pending_shard_map(&self) -> Option<ShardMap> {
+        std::fs::read(self.path.join("pending-shard-map.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
+        std::fs::write(
+            self.path.join("pending-shard-map.json"),
+            serde_json::to_vec(map)
+                .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?,
+        )
+        .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
         Ok(())
+    }
+
+    pub fn clear_pending_shard_map(&self) {
+        let _ = std::fs::remove_file(self.path.join("pending-shard-map.json"));
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {

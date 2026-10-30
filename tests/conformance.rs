@@ -19,6 +19,9 @@ struct Server {
     base: String,
     dir: PathBuf,
     client: Client,
+    port: u16,
+    extra: Vec<String>,
+    admin: bool,
 }
 
 impl Server {
@@ -92,12 +95,44 @@ impl Server {
                 base,
                 dir,
                 client,
+                port,
+                extra: extra.to_vec(),
+                admin,
             });
         }
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
         None
+    }
+
+    /// Restart this node on the same port and data directory.
+    fn restart(&mut self) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+        cmd.arg("--listen")
+            .arg(format!("127.0.0.1:{}", self.port))
+            .arg("--data")
+            .arg(&self.dir)
+            .arg("--sync-secs")
+            .arg("3600")
+            .args(&self.extra)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if self.admin {
+            cmd.arg("--admin").arg("admin:douchdb");
+        }
+        self.child = cmd.spawn().expect("restart douchdb");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+                return;
+            }
+            if let Ok(Some(_)) = self.child.try_wait() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("douchdb did not restart on port {}", self.port);
     }
 
     async fn req(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -1701,6 +1736,66 @@ async fn cluster_shard_map_moves_data_between_nodes() {
     let (status, body) = nodes[1].get("/movedb/move").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], "moved");
+}
+
+#[tokio::test]
+async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
+    let mut nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("meta").await;
+    }
+
+    let (status, first) = nodes[0]
+        .put("/_node/_local/_dbs/meta", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["version"], 1);
+    assert_eq!(first["pending"], false);
+
+    let (status, second) = nodes[0]
+        .put("/_node/_local/_dbs/meta", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["version"], 2);
+    assert_eq!(second["pending"], false);
+
+    // Lose metadata quorum, then revive one peer. The pending versioned map
+    // must be pushed by anti-entropy and the pending marker cleared.
+    nodes[1].kill();
+    nodes[2].kill();
+    let (status, pending) = nodes[0]
+        .put("/_node/_local/_dbs/meta", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending["version"], 3);
+    assert_eq!(pending["pending"], true);
+    assert!(nodes[0]
+        .dir
+        .join("meta")
+        .join("pending-shard-map.json")
+        .is_file());
+
+    nodes[1].restart();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, map) = nodes[1].get("/_node/_local/_dbs/meta").await;
+        if status == StatusCode::OK && map["version"] == 3 {
+            assert_eq!(map["replicas"][0][0], 0);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("map did not reconcile on restarted peer: {status} {map}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !nodes[0]
+            .dir
+            .join("meta")
+            .join("pending-shard-map.json")
+            .exists(),
+        "pending map was not cleared after quorum acknowledgement"
+    );
 }
 
 #[tokio::test]

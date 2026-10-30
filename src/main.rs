@@ -271,6 +271,7 @@ fn spawn_anti_entropy(state: Arc<AppState>) {
                 let Ok(db) = state.db(&name).await else {
                     continue;
                 };
+                crate::fabric::reconcile_shard_map(&state, &db).await;
                 for peer in &peers {
                     match replicate::pull(
                         &db,

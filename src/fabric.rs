@@ -10,6 +10,7 @@ use axum::body::Bytes;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
+use futures::future::join_all;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +31,92 @@ pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
 
 pub(crate) fn is_replica_of(db: &Db, docid: &str, me: usize) -> bool {
     db.replicas_of_doc(docid).contains(&me)
+}
+
+/// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
+/// older peers receive the local or pending map. This runs from anti-entropy,
+/// so a metadata update that missed a peer is repaired after that peer returns.
+pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
+    if !st.cluster.is_clustered() {
+        return;
+    }
+    let local = db.shard_map();
+    let mut desired = db
+        .pending_shard_map()
+        .filter(|pending| pending.version >= local.version)
+        .unwrap_or_else(|| local.clone());
+
+    let maps = join_all(st.cluster.peers().map(|peer| {
+        let url = format!("{peer}/_node/_local/_dbs/{}", db.name);
+        async move {
+            let request = st
+                .client
+                .get(url)
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str());
+            let request = if let Some(auth) = &st.auth {
+                request.basic_auth(&auth.user, Some(&auth.pass))
+            } else {
+                request
+            };
+            request
+                .send()
+                .await
+                .ok()?
+                .json::<crate::cluster::ShardMap>()
+                .await
+                .ok()
+        }
+    }))
+    .await;
+
+    for map in maps.into_iter().flatten() {
+        if map.version > desired.version {
+            if db.set_shard_map(map.clone()).unwrap_or(false) {
+                desired = map;
+            }
+        }
+    }
+
+    let payload = match serde_json::to_vec(&desired) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let peers: Vec<String> = st
+        .cluster
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != st.cluster.me)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    let responses = join_all(peers.into_iter().map(|peer| {
+        let payload = payload.clone();
+        async move {
+            let request = st
+                .client
+                .put(format!("{peer}/_node/_local/_dbs/{}", db.name))
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str())
+                .header("content-type", "application/json")
+                .body(payload);
+            let request = if let Some(auth) = &st.auth {
+                request.basic_auth(&auth.user, Some(&auth.pass))
+            } else {
+                request
+            };
+            request
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+        }
+    }))
+    .await;
+    let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
+    if acknowledgements >= st.cluster.nodes.len().max(1) / 2 + 1 {
+        db.clear_pending_shard_map();
+    }
 }
 
 pub(crate) async fn proxy(
