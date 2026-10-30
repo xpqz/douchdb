@@ -522,6 +522,7 @@ A three-node (`q=4`, `n=3`) cluster benchmark is in
 ```sh
 cargo build --release --bin loadgen
 python3 scripts/perf_cluster.py --docs 6000 --spread --native
+python3 scripts/perf_isolated.py --nodes 1,2,3
 ```
 
 `loadgen` can also be run directly against any node or load balancer; see

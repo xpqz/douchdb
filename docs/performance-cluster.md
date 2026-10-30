@@ -343,6 +343,37 @@ data. The conformance test moves all shards from node0 to node1, waits for all
 9 documents, runs cleanup on node0, and verifies node0 reports 0 local docs
 while node1 reports 9.
 
+### Isolated native scaling (#50)
+
+This run pins two CPUs per server and a disjoint client CPU set, removing the
+client/server contention from the earlier single-host measurements:
+
+```sh
+cargo build --release --bin douchdb --bin loadgen
+python3 scripts/perf_isolated.py --nodes 1,2,3
+```
+
+Config: `q=4`, `n=3`, 12,000 docs, 64 concurrent GETs, five rounds, medians.
+Server CPUs: `0-1`, `2-3`, `4-5`; client CPUs: `8-15`.
+
+| Nodes | `?r=1` req/s | p50 | default r req/s | p50 |
+|---|---:|---:|---:|---:|
+| 1 | 19,521 | 3.22 ms | 19,040 | 3.25 ms |
+| 2 | 34,971 | 1.62 ms | 11,885 | 5.27 ms |
+| 3 | 45,644 | 0.97 ms | 14,738 | 4.51 ms |
+
+With local reads (`?r=1`), throughput scales from 19.5k to 45.6k req/s at three
+nodes (2.34×), and p50 latency falls from 3.2 to 1.0 ms. Default quorum reads
+do local + remote replica work, so their throughput falls when the second
+replica is reached; that is replicas/quorum work, not evidence that the HTTP
+transport alone is the bottleneck.
+
+**Transport decision:** do not rewrite the internal transport yet. The local
+path scales, and the default-r gap is explained by reading two replicas. Keep
+`?r=1` as the read-heavy fast path and revisit an internal RPC/HTTP-2 transport
+only after an off-host, multi-client run shows transport cost dominating the
+local path.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
