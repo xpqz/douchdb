@@ -73,28 +73,35 @@ Map queries support `key`, `keys` (GET or POST body), `startkey`, `endkey`,
 `reduce`, `group` and `group_level`, and return `{"rows":[{"key","value"}]}`.
 Built-in reducers are `_count`, `_sum`, `_stats` and `_approx_count_distinct`;
 custom JavaScript reducers receive `(keys, values, rereduce)`. `_view_cleanup`
-is accepted as a no-op.
+removes index directories for views that no longer exist on that node.
 
 The console's **Views** tab lists every view in the database's design documents
 and runs the query with the same options:
 
 ![douchdb views](docs/views.png)
 
-View limits:
+Views are indexed persistently and incrementally. Each database keeps its
+indexes under `_view_indexes/`; a query applies `_changes` since the last
+indexed sequence and only re-runs the map function for changed documents. A
+design-document change (or a database reset) rebuilds that view. Deleting a
+database removes its indexes. Design documents are replicated to every node so
+each node can map its local shards.
 
-- Views are built on demand: every query maps all live documents. There is no
-  persistent incremental index yet.
+Behaviour and limits:
+
 - Only the winning revision of each document is mapped; `_design/` and
   `_local/` documents are skipped.
-- String collation uses Unicode code points, not ICU; ASCII ordering matches
-  CouchDB.
-- Map/reduce functions run with a 64 MiB heap, a 512 KiB stack and a 5 s
-  wall-clock limit per query.
-- Custom reduce runs once per group with `rereduce=false`; there is no partial
-  rereduce for very large groups.
+- String keys use ICU's default collation (ICU4X), matching CouchDB's
+  locale-aware ordering; arrays and objects use CouchDB's JSON type order.
+- Map/reduce functions default to a 64 MiB heap, a 512 KiB stack and a 5 s
+  wall-clock limit per query; change the heap and timeout with
+  `--view-memory-mb` and `--view-timeout-ms`.
+- Large groups are reduced in batches of 1000 and the partial results are
+  rereduced with `rereduce=true`.
 - On a cluster, the coordinator fetches map rows from every node and merges
-  them, so views span all shards. A node that fails is skipped; results can be
-  partial until it returns.
+  them, so views span all shards. If any node cannot answer (unreachable,
+  missing database or view), the query fails rather than silently returning
+  partial rows.
 
 ## Web console
 
@@ -124,7 +131,8 @@ douchdb with `--cors-origins` for that origin (see below).
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
-        [--cors-origins ORIGIN,ORIGIN]
+        [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]
+        [--view-memory-mb N]
 ```
 
 | Flag | Default | Meaning |
@@ -139,6 +147,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull interval |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
+| `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
+| `--view-memory-mb` | `64` | QuickJS heap limit per view query |
 
 Without `--nodes` it runs as a single node (the cluster with one member).
 
@@ -180,7 +190,10 @@ router; there is no coordinator role.
   the shards the node replicates. It uses the shared admin credentials when
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
   internal calls.
-- Database creation and deletion are broadcast to all configured nodes.
+- Design documents (`_design/...`) are replicated to every node, because each
+  node needs them to evaluate views over its local shards.
+- Database creation and deletion are broadcast to all configured nodes; design
+  documents are replicated to every node so views can run against any shard.
 - `_changes` and `GET /db` return a base64url version vector for `since` /
   `update_seq`, so a client that saw a partial fan-out resumes without skipping
   changes.
@@ -267,5 +280,4 @@ cluster with anti-entropy are implemented and tested. Known limits:
 - Version vectors are keyed per node, not per shard replica.
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
   shard for ~27 s (measured in [PLAN.md](PLAN.md)).
-- No Mango, lists/shows, multipart attachments or metrics; view indexes are
-  computed on demand rather than incrementally maintained.
+- No Mango, lists/shows, multipart attachments or metrics.

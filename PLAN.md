@@ -222,7 +222,9 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   authenticate with the shared `--admin` credentials; a client's Basic auth or
   `_session` cookie is forwarded when routing/fan-out needs a peer.
 * **Database lifecycle:** create and delete are broadcast to every configured
-  node. A node that is offline during the operation must be repaired manually.
+  node. Design documents are replicated to every node (views need them to map
+  the node's local shards). A node that is offline during the operation must be
+  repaired manually.
 * **Consistency:** implement CouchDB's `?w=`/`?r=`; default quorum write, single
   read. An unmet write quorum returns `202` and anti-entropy heals the replica.
   Do not pretend to offer linearizability.
@@ -332,8 +334,12 @@ Above ~6k means something was built that nobody asked for.
 * **Views.** Design-document map/reduce views run on embedded QuickJS with
   CouchDB's `emit`/`sum`/`log` helpers, `key`/`keys`/range/page/include_docs
   query options, `_count`/`_sum`/`_stats`/`_approx_count_distinct` and custom
-  reducers, grouping and cluster-wide row merging. Indexes are built on demand;
-  there is no incremental view index yet.
+  reducers, grouping and cluster-wide row merging. Indexes persist under
+  `_view_indexes/` and update from `_changes`; design changes rebuild them.
+  Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
+  and time limits are configurable, and `_view_cleanup` removes stale indexes.
+  Design documents replicate to every node; a cluster view query fails with
+  `502` if a node is unreachable instead of returning partial rows.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored

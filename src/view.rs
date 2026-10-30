@@ -1,14 +1,40 @@
 //! CouchDB map/reduce views, evaluated with an embedded QuickJS runtime.
 //!
-//! Views are computed on demand from the winner of every document. There is no
-//! incremental index yet; the JS engine sees the same `doc`/`emit` environment
-//! as CouchDB's JavaScript view server.
+//! Each view has a persistent LevelDB index under `_view_indexes/`. A query
+//! applies `_changes` since the last indexed sequence and only re-runs the map
+//! function for documents that changed; a design-document change rebuilds the
+//! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
+//! JavaScript view server.
 
-use crate::db::{AllDocsOpts, ApiError, Db, DbResult, DocOpts};
+use crate::db::{hex, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use base64::Engine as _;
+use icu_collator::options::CollatorOptions;
+use icu_collator::Collator;
+use md5::{Digest, Md5};
+use rusty_leveldb::{LdbIterator, Options as LdbOptions, WriteBatch, DB as Ldb};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ViewLimits {
+    pub timeout: Duration,
+    pub memory: usize,
+}
+
+impl Default for ViewLimits {
+    fn default() -> Self {
+        ViewLimits {
+            timeout: Duration::from_secs(5),
+            memory: 64 * 1024 * 1024,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewQuery {
@@ -28,6 +54,7 @@ pub struct ViewQuery {
     pub include_docs: bool,
     pub attachments: bool,
     pub update_seq: bool,
+    pub limits: ViewLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -43,9 +70,227 @@ pub struct Row {
     pub value: Value,
 }
 
+#[derive(Serialize, Deserialize)]
+struct IndexMeta {
+    last_seq: u64,
+    design: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredRow {
+    key: Value,
+    value: Value,
+}
+
+/// A persistent index for one (database, design document, view) tuple. Rows
+/// are stored per document so a changed document can be re-mapped without
+/// walking the whole database.
+struct ViewIndex {
+    db: Ldb,
+    last_seq: u64,
+    design: String,
+}
+
+type IndexMap = HashMap<PathBuf, Arc<AsyncMutex<ViewIndex>>>;
+
+fn registry() -> &'static StdMutex<IndexMap> {
+    static INDEXES: OnceLock<StdMutex<IndexMap>> = OnceLock::new();
+    INDEXES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
+    let digest = Md5::digest(format!("{ddoc_id}\0{view_name}").as_bytes());
+    db.path.join("_view_indexes").join(hex(&digest))
+}
+
+fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
+    let mut indexes = registry().lock().unwrap();
+    if let Some(handle) = indexes.get(path) {
+        return Ok(handle.clone());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?;
+    }
+    let index =
+        ViewIndex::open(path).map_err(|error| ApiError::new(500, "view_index_error", error))?;
+    let handle = Arc::new(AsyncMutex::new(index));
+    indexes.insert(path.to_path_buf(), handle.clone());
+    Ok(handle)
+}
+
+/// Drop cached index handles when a database is deleted or recreated. The
+/// LevelDB files live under the database directory.
+pub fn forget_db(db_path: &Path) {
+    let prefix = db_path.join("_view_indexes");
+    registry()
+        .lock()
+        .unwrap()
+        .retain(|path, _| !path.starts_with(&prefix));
+}
+
+impl ViewIndex {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut options = LdbOptions::default();
+        options.create_if_missing = true;
+        let mut db = Ldb::open(path, options).map_err(|error| error.to_string())?;
+        let meta = db
+            .get(b"m")
+            .and_then(|bytes| serde_json::from_slice::<IndexMeta>(&bytes).ok());
+        let (last_seq, design) = meta
+            .map(|meta| (meta.last_seq, meta.design))
+            .unwrap_or((0, String::new()));
+        Ok(ViewIndex {
+            db,
+            last_seq,
+            design,
+        })
+    }
+
+    fn rows(&mut self) -> Result<Vec<Row>, String> {
+        // Keys are `r/<base64(docid)>/<ordinal>`; the id is recovered from the
+        // key rather than duplicated in every stored row.
+        let mut rows = Vec::new();
+        for (key, bytes) in self.scan(b"r/")? {
+            let Some(rest) = key.strip_prefix(b"r/") else {
+                continue;
+            };
+            let Some(encoded) = rest.split(|byte| *byte == b'/').next() else {
+                continue;
+            };
+            let Ok(id) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) else {
+                continue;
+            };
+            let Ok(id) = String::from_utf8(id) else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_slice::<StoredRow>(&bytes) else {
+                continue;
+            };
+            rows.push(Row {
+                id,
+                key: stored.key,
+                value: stored.value,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let mut iterator = self.db.new_iter().map_err(|error| error.to_string())?;
+        iterator.seek(prefix);
+        let mut out = Vec::new();
+        while let Some((key, value)) = iterator.current() {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.to_vec(), value.to_vec()));
+            if !iterator.advance() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn doc_prefix(id: &str) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes());
+        format!("r/{encoded}/").into_bytes()
+    }
+
+    fn apply(
+        &mut self,
+        changed: Vec<String>,
+        by_doc: HashMap<String, Vec<Row>>,
+        last_seq: u64,
+        design: &str,
+    ) -> Result<(), String> {
+        let mut batch = WriteBatch::default();
+        for id in changed {
+            for (key, _) in self.scan(&Self::doc_prefix(&id))? {
+                batch.delete(&key);
+            }
+        }
+        for (id, rows) in by_doc {
+            let prefix = Self::doc_prefix(&id);
+            for (ordinal, row) in rows.into_iter().enumerate() {
+                let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
+                let stored = StoredRow {
+                    key: row.key,
+                    value: row.value,
+                };
+                batch.put(
+                    key.as_bytes(),
+                    &serde_json::to_vec(&stored).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        self.last_seq = last_seq;
+        self.design = design.to_string();
+        batch.put(
+            b"m",
+            &serde_json::to_vec(&IndexMeta {
+                last_seq,
+                design: design.to_string(),
+            })
+            .map_err(|error| error.to_string())?,
+        );
+        self.db
+            .write(batch, true)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn rebuild(&mut self, rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), String> {
+        let mut batch = WriteBatch::default();
+        for (key, _) in self.scan(b"r/")? {
+            batch.delete(&key);
+        }
+        let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+        for row in rows {
+            by_doc.entry(row.id.clone()).or_default().push(row);
+        }
+        for (id, rows) in by_doc {
+            let prefix = Self::doc_prefix(&id);
+            for (ordinal, row) in rows.into_iter().enumerate() {
+                let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
+                let stored = StoredRow {
+                    key: row.key,
+                    value: row.value,
+                };
+                batch.put(
+                    key.as_bytes(),
+                    &serde_json::to_vec(&stored).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        self.last_seq = last_seq;
+        self.design = design.to_string();
+        batch.put(
+            b"m",
+            &serde_json::to_vec(&IndexMeta {
+                last_seq,
+                design: design.to_string(),
+            })
+            .map_err(|error| error.to_string())?,
+        );
+        self.db
+            .write(batch, true)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
 /// Run one view query against the local shards.
 pub async fn query(db: &Db, ddoc_id: &str, view_name: &str, query: &ViewQuery) -> DbResult<Value> {
-    let (spec, rows, docs) = local_map(db, ddoc_id, view_name, query.attachments).await?;
+    let (spec, rows, docs) = local_map(
+        db,
+        ddoc_id,
+        view_name,
+        query.include_docs || query.attachments,
+        query.attachments,
+        query.limits,
+    )
+    .await?;
     finish(&spec, rows, docs, query)
 }
 
@@ -54,10 +299,17 @@ pub async fn local_map(
     db: &Db,
     ddoc_id: &str,
     view_name: &str,
+    need_docs: bool,
     attachments: bool,
+    limits: ViewLimits,
 ) -> DbResult<(ViewSpec, Vec<Row>, HashMap<String, Value>)> {
     let spec = load_spec(db, ddoc_id, view_name).await?;
-    let (rows, docs) = map_local(db, &spec.map, attachments).await?;
+    let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits).await?;
+    let docs = if need_docs {
+        docs_by_id(db, attachments).await?
+    } else {
+        HashMap::new()
+    };
     Ok((spec, rows, docs))
 }
 
@@ -68,6 +320,186 @@ pub fn finish(
     query: &ViewQuery,
 ) -> DbResult<Value> {
     render(spec, rows, docs, query)
+}
+
+async fn ensure_rows(
+    db: &Db,
+    ddoc_id: &str,
+    view_name: &str,
+    spec: &ViewSpec,
+    limits: ViewLimits,
+) -> DbResult<Vec<Row>> {
+    let current_seq = db.info().await?["update_seq"].as_u64().unwrap_or(0);
+    let design = format!(
+        "{}|{}",
+        spec.map,
+        spec.reduce.as_deref().unwrap_or_default()
+    );
+    let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
+    let mut index = handle.lock().await;
+
+    if index.design != design || index.last_seq > current_seq {
+        let rows = map_all(db, &spec.map, limits).await?;
+        index
+            .rebuild(rows, current_seq, &design)
+            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
+        return index
+            .rows()
+            .map_err(|error| ApiError::new(500, "view_index_error", error));
+    }
+
+    if index.last_seq < current_seq {
+        let changes = db
+            .changes(&ChangesOpts {
+                since: index.last_seq,
+                include_docs: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut changed = Vec::new();
+        let mut docs = Vec::new();
+        for row in changes["results"].as_array().cloned().unwrap_or_default() {
+            let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            changed.push(id.clone());
+            if id.starts_with("_design/")
+                || id.starts_with("_local/")
+                || row.get("deleted").and_then(Value::as_bool).unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(doc) = row.get("doc").cloned() {
+                docs.push((id, doc));
+            }
+        }
+        let rows = run_map(&spec.map, &docs, limits).map_err(|reason| {
+            ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+        })?;
+        let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+        for row in rows {
+            by_doc.entry(row.id.clone()).or_default().push(row);
+        }
+        let last_seq = changes["last_seq"].as_u64().unwrap_or(current_seq);
+        index
+            .apply(changed, by_doc, last_seq, &design)
+            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
+    }
+
+    index
+        .rows()
+        .map_err(|error| ApiError::new(500, "view_index_error", error))
+}
+
+async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<Row>> {
+    let all = db
+        .all_docs(&AllDocsOpts {
+            include_docs: true,
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .await?;
+    let mut docs = Vec::new();
+    for row in all["rows"].as_array().cloned().unwrap_or_default() {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if id.starts_with("_design/") || id.starts_with("_local/") {
+            continue;
+        }
+        if let Some(doc) = row.get("doc").cloned() {
+            docs.push((id, doc));
+        }
+    }
+    run_map(map_source, &docs, limits).map_err(|reason| {
+        ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+    })
+}
+
+async fn docs_by_id(db: &Db, attachments: bool) -> DbResult<HashMap<String, Value>> {
+    let all = db
+        .all_docs(&AllDocsOpts {
+            include_docs: true,
+            attachments,
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .await?;
+    let mut docs = HashMap::new();
+    for row in all["rows"].as_array().cloned().unwrap_or_default() {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if id.starts_with("_design/") || id.starts_with("_local/") {
+            continue;
+        }
+        if let Some(doc) = row.get("doc").cloned() {
+            docs.insert(id, doc);
+        }
+    }
+    Ok(docs)
+}
+
+/// Drop every index for a database. Used by `_purge`, which can remove a
+/// document without advancing the database sequence.
+pub async fn invalidate(db: &Db) -> DbResult<()> {
+    let directory = db.path.join("_view_indexes");
+    registry()
+        .lock()
+        .unwrap()
+        .retain(|path, _| !path.starts_with(&directory));
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove index directories whose design document or view no longer exists.
+pub async fn cleanup(db: &Db) -> DbResult<()> {
+    let mut live = std::collections::HashSet::new();
+    let all = db
+        .all_docs(&AllDocsOpts {
+            include_docs: true,
+            startkey: Some("_design/".to_string()),
+            endkey: Some(format!("_design/{}", char::MAX)),
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .await?;
+    for row in all["rows"].as_array().cloned().unwrap_or_default() {
+        let Some(ddoc) = row.get("doc") else {
+            continue;
+        };
+        let Some(id) = ddoc.get("_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(views) = ddoc.get("views").and_then(Value::as_object) {
+            for name in views.keys() {
+                live.insert(index_path(db, id, name));
+            }
+        }
+    }
+
+    let directory = db.path.join("_view_indexes");
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) && !live.contains(&path)
+            {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+    registry()
+        .lock()
+        .unwrap()
+        .retain(|path, _| live.contains(path));
+    Ok(())
 }
 
 async fn load_spec(db: &Db, ddoc_id: &str, view_name: &str) -> DbResult<ViewSpec> {
@@ -102,56 +534,19 @@ pub fn spec_from_doc(ddoc: &Value, view_name: &str) -> DbResult<ViewSpec> {
     Ok(ViewSpec { map, reduce })
 }
 
-/// Build the map index from every live document's winning revision.
-async fn map_local(
-    db: &Db,
-    map_source: &str,
-    attachments: bool,
-) -> DbResult<(Vec<Row>, HashMap<String, Value>)> {
-    let all = db
-        .all_docs(&AllDocsOpts {
-            include_docs: true,
-            attachments,
-            limit: usize::MAX,
-            ..Default::default()
-        })
-        .await?;
-
-    let mut docs = Vec::new();
-    let mut by_id = HashMap::new();
-    for row in all["rows"].as_array().cloned().unwrap_or_default() {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-            continue;
-        };
-        if id.starts_with("_design/") || id.starts_with("_local/") {
-            continue;
-        }
-        let Some(doc) = row.get("doc").cloned() else {
-            continue;
-        };
-        by_id.insert(id.clone(), doc.clone());
-        docs.push((id, doc));
-    }
-
-    let rows = run_map(map_source, &docs).map_err(|reason| {
-        ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-    })?;
-    Ok((rows, by_id))
-}
-
-fn engine() -> Result<rquickjs::Runtime, String> {
+fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
     let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
-    runtime.set_memory_limit(64 * 1024 * 1024);
+    runtime.set_memory_limit(limits.memory);
     runtime.set_max_stack_size(512 * 1024);
     // A view is arbitrary user code. Stop runaway loops instead of hanging the
     // request thread forever.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + limits.timeout;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
     Ok(runtime)
 }
 
-fn run_map(source: &str, docs: &[(String, Value)]) -> Result<Vec<Row>, String> {
-    let runtime = engine()?;
+fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
+    let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
 
     context.with(|ctx| {
@@ -259,7 +654,7 @@ fn render(
         for (key, members) in groups {
             let keys: Vec<Value> = members.iter().map(|row| json!([row.id, row.key])).collect();
             let values: Vec<Value> = members.iter().map(|row| row.value.clone()).collect();
-            let value = match reduce_value(reducer, &keys, &values) {
+            let value = match reduce_value(reducer, &keys, &values, query.limits) {
                 Ok(value) => value,
                 Err(reason) => {
                     return Err(ApiError::new(
@@ -384,7 +779,12 @@ fn group_key(key: &Value, level: usize) -> Value {
     }
 }
 
-fn reduce_value(source: &str, keys: &[Value], values: &[Value]) -> Result<Value, String> {
+fn reduce_value(
+    source: &str,
+    keys: &[Value],
+    values: &[Value],
+    limits: ViewLimits,
+) -> Result<Value, String> {
     match source {
         "_count" => return Ok(json!(values.len())),
         "_sum" => {
@@ -408,7 +808,30 @@ fn reduce_value(source: &str, keys: &[Value], values: &[Value]) -> Result<Value,
         _ => {}
     }
 
-    let runtime = engine()?;
+    // CouchDB reduces in bounded batches and then rereduces the partials.
+    // Do the same for custom JavaScript reducers.
+    const CHUNK: usize = 1000;
+    if values.len() > CHUNK {
+        let mut partials = Vec::new();
+        for (offset, chunk) in values.chunks(CHUNK).enumerate() {
+            let start = offset * CHUNK;
+            let end = (start + chunk.len()).min(keys.len());
+            let chunk_keys = if start < end { &keys[start..end] } else { &[] };
+            partials.push(run_reduce(source, chunk_keys, chunk, false, limits)?);
+        }
+        return run_reduce(source, &[], &partials, true, limits);
+    }
+    run_reduce(source, keys, values, false, limits)
+}
+
+fn run_reduce(
+    source: &str,
+    keys: &[Value],
+    values: &[Value],
+    rereduce: bool,
+    limits: ViewLimits,
+) -> Result<Value, String> {
+    let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     context.with(|ctx| {
         let wrapped = format!(
@@ -426,8 +849,8 @@ fn reduce_value(source: &str, keys: &[Value], values: &[Value]) -> Result<Value,
               if (typeof __reduce !== "function") {{
                 throw new Error("reduce must be a function");
               }}
-              return function (keys, values) {{
-                var result = __reduce(JSON.parse(keys), JSON.parse(values), false);
+              return function (keys, values, rereduce) {{
+                var result = __reduce(JSON.parse(keys), JSON.parse(values), rereduce);
                 return result === undefined ? "null" : JSON.stringify(result);
               }};
             }})()
@@ -436,10 +859,15 @@ fn reduce_value(source: &str, keys: &[Value], values: &[Value]) -> Result<Value,
         let func: rquickjs::Function = ctx
             .eval(wrapped)
             .map_err(|error| format!("compile: {error}"))?;
-        let keys = serde_json::to_string(keys).map_err(|error| error.to_string())?;
+        // CouchDB passes null, not [], for keys during rereduce.
+        let keys = if rereduce {
+            "null".to_string()
+        } else {
+            serde_json::to_string(keys).map_err(|error| error.to_string())?
+        };
         let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
         let output: String = func
-            .call((keys, values))
+            .call((keys, values, rereduce))
             .map_err(|error| error.to_string())?;
         serde_json::from_str(&output).map_err(|error| error.to_string())
     })
@@ -482,8 +910,7 @@ fn number_value(value: f64) -> Value {
 }
 
 /// CouchDB JSON collation: null < false < true < number < string < array <
-/// object. Strings compare by Unicode scalar value rather than ICU collation,
-/// which matches ASCII exactly and is documented as a limitation.
+/// object. Strings use ICU's default (tertiary) collation, as CouchDB does.
 pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
     fn rank(value: &Value) -> u8 {
         match value {
@@ -508,7 +935,7 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
             let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
             a.partial_cmp(&b).unwrap_or(Ordering::Equal)
         }
-        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::String(a), Value::String(b)) => compare_strings(a, b),
         (Value::Array(a), Value::Array(b)) => {
             for (left, right) in a.iter().zip(b.iter()) {
                 let order = cmp_json(left, right);
@@ -530,6 +957,16 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
             a.len().cmp(&b.len())
         }
         _ => Ordering::Equal,
+    }
+}
+
+fn compare_strings(a: &str, b: &str) -> Ordering {
+    static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> = OnceLock::new();
+    let collator = COLLATOR
+        .get_or_init(|| Collator::try_new(Default::default(), CollatorOptions::default()).ok());
+    match collator {
+        Some(collator) => collator.compare(a, b),
+        None => a.cmp(b),
     }
 }
 
@@ -561,6 +998,15 @@ mod tests {
     }
 
     #[test]
+    fn strings_use_icu_collation() {
+        // Codepoint order would put "B" before "a"; ICU puts "a" first.
+        assert_eq!(cmp_json(&json!("a"), &json!("B")), Ordering::Less);
+        // Accented letters sort next to their base letter, not after "z".
+        assert_eq!(cmp_json(&json!("z"), &json!("ä")), Ordering::Greater);
+        assert_eq!(cmp_json(&json!("ä"), &json!("b")), Ordering::Less);
+    }
+
+    #[test]
     fn map_emits_keys_and_values() {
         let docs = vec![
             (
@@ -572,23 +1018,82 @@ mod tests {
                 json!({"_id": "b", "city": "Berlin", "n": 3}),
             ),
         ];
-        let rows = run_map("function(doc){ emit(doc.city, doc.n); }", &docs).unwrap();
+        let rows = run_map(
+            "function(doc){ emit(doc.city, doc.n); }",
+            &docs,
+            ViewLimits::default(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].key, json!("Berlin"));
         assert_eq!(rows[1].value, json!(3));
     }
 
     #[test]
+    fn custom_reduce_rereduces_large_groups() {
+        let values: Vec<Value> = (0..2500).map(|i| json!(i)).collect();
+        let value = reduce_value(
+            "function(keys, values, rereduce){ return (rereduce ? 1000 : 0) + values.length; }",
+            &[],
+            &values,
+            ViewLimits::default(),
+        )
+        .unwrap();
+        // 1000 + 1000 + 500 in three batches, then rereduce over three partials.
+        assert_eq!(value, json!(1003));
+    }
+
+    #[test]
+    fn index_rows_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-view-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rows = vec![
+            Row {
+                id: "a".into(),
+                key: json!("Berlin"),
+                value: json!(1),
+            },
+            Row {
+                id: "b".into(),
+                key: json!("Paris"),
+                value: json!(2),
+            },
+        ];
+        {
+            let mut index = ViewIndex::open(&dir).unwrap();
+            index.rebuild(rows, 7, "map|").unwrap();
+        }
+        {
+            let mut index = ViewIndex::open(&dir).unwrap();
+            assert_eq!(index.last_seq, 7);
+            assert_eq!(index.design, "map|");
+            let mut restored = index.rows().unwrap();
+            restored.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(restored.len(), 2);
+            assert_eq!(restored[0].id, "a");
+            assert_eq!(restored[1].key, json!("Paris"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn builtin_reduces_work() {
         assert_eq!(
-            reduce_value("_count", &[], &[json!(1), json!(2)]).unwrap(),
+            reduce_value("_count", &[], &[json!(1), json!(2)], ViewLimits::default()).unwrap(),
             json!(2)
         );
         assert_eq!(
-            reduce_value("_sum", &[], &[json!(1), json!(2.5)]).unwrap(),
+            reduce_value("_sum", &[], &[json!(1), json!(2.5)], ViewLimits::default()).unwrap(),
             json!(3.5)
         );
-        let stats = reduce_value("_stats", &[], &[json!(1), json!(3)]).unwrap();
+        let stats =
+            reduce_value("_stats", &[], &[json!(1), json!(3)], ViewLimits::default()).unwrap();
         assert_eq!(stats["count"], 2);
         assert_eq!(stats["min"], 1);
         assert_eq!(stats["max"], 3);

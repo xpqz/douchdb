@@ -35,6 +35,8 @@ struct Args {
     me: usize,
     sync_secs: u64,
     cors_origins: Vec<String>,
+    view_timeout_ms: u64,
+    view_memory_mb: usize,
 }
 
 fn parse_args() -> Args {
@@ -49,6 +51,8 @@ fn parse_args() -> Args {
         me: 0,
         sync_secs: 5,
         cors_origins: Vec::new(),
+        view_timeout_ms: 5000,
+        view_memory_mb: 64,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -78,6 +82,12 @@ fn parse_args() -> Args {
             }
             "--me" => args.me = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
+            "--view-timeout-ms" => {
+                args.view_timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(5000)
+            }
+            "--view-memory-mb" => {
+                args.view_memory_mb = it.next().and_then(|v| v.parse().ok()).unwrap_or(64)
+            }
             "--cors-origins" => {
                 args.cors_origins = it
                     .next()
@@ -92,7 +102,8 @@ fn parse_args() -> Args {
                 println!(
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
-                     \x20       [--cors-origins ORIGIN,ORIGIN]"
+                     \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
+                     \x20       [--view-memory-mb N]"
                 );
                 std::process::exit(0);
             }
@@ -120,6 +131,8 @@ async fn main() -> anyhow::Result<()> {
         me: args.me,
         sync_secs: args.sync_secs,
         cors_origins: args.cors_origins.clone(),
+        view_timeout_ms: args.view_timeout_ms.max(1),
+        view_memory_mb: args.view_memory_mb.max(1),
     };
     let state = Arc::new(AppState {
         root: args.data.clone(),

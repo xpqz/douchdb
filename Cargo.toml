@@ -20,3 +20,5 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rquickjs = "0.14"
+icu_collator = "2.4"
+icu_locale_core = "2.4"

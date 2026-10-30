@@ -1348,6 +1348,117 @@ async fn cluster_honours_w_and_r_quorum_parameters() {
 }
 
 #[tokio::test]
+async fn view_index_updates_incrementally_and_persists() {
+    let s = Server::start(false);
+    s.fresh_db("incview").await;
+
+    let (status, _) = s
+        .post(
+            "/incview/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin"},
+                {"_id": "b", "city": "Berlin"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/incview/_design/v",
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Build the index.
+    let (_, body) = s.get("/incview/_design/v/_view/by_city").await;
+    assert_eq!(body["total_rows"], 2);
+    let index_dir = s.dir.join("incview").join("_view_indexes");
+    assert!(index_dir.is_dir(), "view index directory was not created");
+
+    // A new document is picked up through _changes, without a rebuild.
+    let (status, _) = s.put("/incview/c", json!({"city": "Paris"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/incview/_design/v/_view/by_city").await;
+    assert_eq!(body["total_rows"], 3);
+    assert_eq!(body["rows"][2]["id"], "c");
+
+    // Moving a document between keys removes its old row.
+    let (_, doc) = s.get("/incview/b").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    s.put("/incview/b", json!({"_rev": rev, "city": "Paris"}))
+        .await;
+    let (_, body) = s
+        .get("/incview/_design/v/_view/by_city?key=%22Berlin%22")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["id"], "a");
+    let (_, body) = s
+        .get("/incview/_design/v/_view/by_city?key=%22Paris%22")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    // Deleting a document removes its rows.
+    let (_, doc) = s.get("/incview/a").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .req(Method::DELETE, &format!("/incview/a?rev={rev}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/incview/_design/v/_view/by_city").await;
+    assert_eq!(body["total_rows"], 2);
+}
+
+#[tokio::test]
+async fn view_index_is_reused_after_restart() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data = std::env::temp_dir().join(format!(
+        "douchdb-view-persist-{}-{stamp}",
+        std::process::id()
+    ));
+    let extra = vec!["--data".to_string(), data.to_string_lossy().into_owned()];
+
+    let mut first = Server::start_with(&extra, false);
+    first.fresh_db("persist").await;
+    let (status, _) = first
+        .post(
+            "/persist/_bulk_docs",
+            json!({"docs": [{"_id": "a", "city": "Berlin"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = first
+        .put(
+            "/persist/_design/v",
+            json!({"views": {"rnd": {"map": "function(doc){ emit(doc.city, Math.random()); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = first.get("/persist/_design/v/_view/rnd").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = body["rows"][0]["value"].clone();
+    assert!(value.is_number());
+    assert!(data.join("persist").join("_view_indexes").is_dir());
+
+    first.kill();
+    drop(first);
+
+    // A fresh process must load the persisted index rather than re-running the
+    // map function: Math.random would produce a different value on a rebuild.
+    let mut second = Server::start_with(&extra, false);
+    let (status, body) = second.get("/persist/_design/v/_view/rnd").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rows"][0]["value"], value);
+    second.kill();
+    drop(second);
+    let _ = std::fs::remove_dir_all(data);
+}
+
+#[tokio::test]
 async fn cluster_views_merge_rows_from_every_replica() {
     let nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {
@@ -1402,6 +1513,100 @@ async fn cluster_views_merge_rows_from_every_replica() {
             assert_eq!(row["value"], 6);
         }
     }
+}
+
+#[tokio::test]
+async fn purge_invalidates_view_indexes() {
+    let s = Server::start(false);
+    s.fresh_db("purgeview").await;
+
+    let (status, _) = s.put("/purgeview/a", json!({"city": "Berlin"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/purgeview/a").await;
+    let rev = body["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .put(
+            "/purgeview/_design/v",
+            json!({"views": {"cities": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, body) = s.get("/purgeview/_design/v/_view/cities").await;
+    assert_eq!(body["total_rows"], 1);
+
+    let (status, _) = s.post("/purgeview/_purge", json!({"a": [rev]})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/purgeview/_design/v/_view/cities").await;
+    assert_eq!(body["total_rows"], 0);
+}
+
+#[tokio::test]
+async fn cluster_views_span_shards_with_replication_factor_one() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clview1").await;
+    }
+
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("s{i}"), "city": if i % 2 == 0 { "A" } else { "B" }}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clview1/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(
+            "/clview1/_design/v",
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // One replica per document means no single node has every document. The
+    // design doc is on every node so each can map its own shards, and the
+    // coordinator merges all of them.
+    for node in &nodes {
+        let (status, body) = node.get("/clview1/_design/v/_view/by_city").await;
+        assert_eq!(status, StatusCode::OK, "view via {}", node.base);
+        assert_eq!(body["total_rows"], 9, "view via {}", node.base);
+    }
+}
+
+#[tokio::test]
+async fn cluster_view_query_fails_loudly_when_a_node_is_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clviewfail").await;
+    }
+    let (status, _) = nodes[0]
+        .post(
+            "/clviewfail/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin"},
+                {"_id": "b", "city": "Paris"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(
+            "/clviewfail/_design/v",
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/by_city").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 2);
+
+    // Do not silently return the rows from the surviving shards: a view
+    // query that cannot read every node is an error.
+    nodes[2].kill();
+    let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/by_city").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body["error"].is_string());
 }
 
 #[tokio::test]
@@ -1730,8 +1935,19 @@ async fn views_map_reduce_collation_and_query_options() {
     let (_, body) = s.get("/shop/_design/shop/_view/by_city").await;
     assert_eq!(body["total_rows"], 1);
 
+    // Only by_city still exists in the design document; cleanup removes the
+    // index directories for the views that were deleted.
+    let indexes = s.dir.join("shop").join("_view_indexes");
+    let before = std::fs::read_dir(&indexes)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert!(before > 1, "expected several indexes, found {before}");
     let (status, _) = s.post("/shop/_view_cleanup", json!({})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let after = std::fs::read_dir(&indexes)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(after, 1, "stale view indexes were not removed");
 }
 
 fn base64_encode(bytes: &[u8]) -> String {

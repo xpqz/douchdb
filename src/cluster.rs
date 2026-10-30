@@ -62,6 +62,15 @@ impl Cluster {
     }
 
     pub fn replicas_of_doc(&self, docid: &str, q: u32) -> Vec<usize> {
+        // Every node needs design documents to evaluate views over its local
+        // shards, even when its replica set for the document would be smaller.
+        // `_local` documents stay node-local.
+        if docid.starts_with("_design/") {
+            if self.nodes.is_empty() {
+                return vec![0];
+            }
+            return (0..self.nodes.len()).collect();
+        }
         self.replicas_of_shard(self.shard_of(docid, q))
     }
 
@@ -156,6 +165,13 @@ mod tests {
         }
         // A larger factor is clamped to the node count.
         assert_eq!(cluster(9).replicas_of_shard(0).len(), 3);
+    }
+
+    #[test]
+    fn design_documents_replicate_to_every_node() {
+        let c = cluster(1);
+        assert_eq!(c.replicas_of_doc("_design/foo", 4).len(), 3);
+        assert_eq!(c.replicas_of_doc("ordinary", 4).len(), 1);
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub struct Config {
     /// Empty disables CORS. `*` allows any origin (echoed back so credentials
     /// work); entries may be exact origins or `https://*.example.com`.
     pub cors_origins: Vec<String>,
+    pub view_timeout_ms: u64,
+    pub view_memory_mb: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +198,7 @@ impl AppState {
     }
 
     pub async fn create_db(&self, name: &str) -> DbResult<Arc<Db>> {
+        crate::view::forget_db(&self.root.join(name));
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
                 412,
@@ -217,6 +220,7 @@ impl AppState {
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
         self.dbs.write().await.remove(name);
+        crate::view::forget_db(&self.root.join(name));
         Db::destroy(&self.root, name)
     }
 
@@ -761,11 +765,19 @@ pub async fn db_rest(
         "_purge" => {
             return match serde_json::from_slice::<Value>(&body) {
                 Ok(v) => match db.purge(&v).await {
-                    Ok(p) => json(StatusCode::OK, p),
+                    Ok(p) => {
+                        // A fully purged document is removed from `_changes`
+                        // entirely, so the view indexes cannot be updated
+                        // incrementally; rebuild them on the next query.
+                        if let Err(e) = crate::view::invalidate(&db).await {
+                            return fail(e);
+                        }
+                        json(StatusCode::OK, p)
+                    }
                     Err(e) => fail(e),
                 },
                 Err(_) => fail(ApiError::bad_request("invalid JSON")),
-            }
+            };
         }
         "_compact" => {
             if let Err(e) = db.compact().await {
@@ -813,7 +825,12 @@ pub async fn db_rest(
                 )),
             }
         }
-        "_view_cleanup" => return ok(),
+        "_view_cleanup" => {
+            return match crate::view::cleanup(&db).await {
+                Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+                Err(error) => fail(error),
+            }
+        }
         "_local" => return fail(ApiError::bad_request("missing local doc id")),
         _ => {}
     }
@@ -918,6 +935,10 @@ async fn view_request(
             include_docs: flag(q, "include_docs"),
             attachments: flag(q, "attachments"),
             update_seq: flag(q, "update_seq"),
+            limits: crate::view::ViewLimits {
+                timeout: std::time::Duration::from_millis(st.config.view_timeout_ms),
+                memory: st.config.view_memory_mb * 1024 * 1024,
+            },
         })
     };
 
@@ -976,17 +997,21 @@ async fn cluster_view_rows(
     let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut succeeded = false;
-    let mut last_error = None;
 
     for node in 0..st.cluster.nodes.len() {
         let batch = if node == st.cluster.me {
-            match crate::view::local_map(db, ddoc, view_name, query.attachments).await {
+            match crate::view::local_map(
+                db,
+                ddoc,
+                view_name,
+                query.include_docs || query.attachments,
+                query.attachments,
+                query.limits,
+            )
+            .await
+            {
                 Ok((_, rows, node_docs)) => Some((rows, node_docs)),
-                Err(error) if error.status == 404 => None,
-                Err(error) => {
-                    last_error = Some(error);
-                    None
-                }
+                Err(error) => return Err(error),
             }
         } else {
             let peer = st.cluster.nodes[node].clone();
@@ -1016,24 +1041,18 @@ async fn cluster_view_rows(
                     match response.json::<Value>().await {
                         Ok(value) => Some(decode_view_batch(value)),
                         Err(error) => {
-                            last_error = Some(ApiError::new(502, "bad_gateway", error.to_string()));
-                            None
+                            return Err(ApiError::new(502, "bad_gateway", error.to_string()))
                         }
                     }
                 }
-                Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
                 Ok(response) => {
-                    last_error = Some(ApiError::new(
+                    return Err(ApiError::new(
                         response.status().as_u16(),
                         "view_failed",
                         response.text().await.unwrap_or_default(),
-                    ));
-                    None
+                    ))
                 }
-                Err(error) => {
-                    last_error = Some(ApiError::new(502, "bad_gateway", error.to_string()));
-                    None
-                }
+                Err(error) => return Err(ApiError::new(502, "bad_gateway", error.to_string())),
             }
         };
 
@@ -1060,7 +1079,7 @@ async fn cluster_view_rows(
     }
 
     if !succeeded {
-        return Err(last_error.unwrap_or_else(|| ApiError::not_found("missing view")));
+        return Err(ApiError::not_found("missing view"));
     }
     let mut rows = Vec::new();
     for (_, (count, row)) in counts {
