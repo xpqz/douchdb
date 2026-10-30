@@ -15,8 +15,57 @@ use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
+
+#[derive(Default)]
+pub struct DbUpdates {
+    seq: AtomicU64,
+    events: Mutex<Vec<Value>>,
+}
+
+impl DbUpdates {
+    fn record(&self, name: &str, kind: &str) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        events.push(json!({
+            "seq": seq.to_string(),
+            "db_name": name,
+            "type": kind,
+        }));
+        if events.len() > 5000 {
+            let excess = events.len() - 5000;
+            events.drain(0..excess);
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
+    fn since(&self, after: u64) -> (Vec<Value>, u64) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let results = events
+            .iter()
+            .filter(|event| {
+                event["seq"]
+                    .as_str()
+                    .and_then(|seq| seq.parse::<u64>().ok())
+                    .map(|seq| seq > after)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        (results, self.current())
+    }
+}
 
 pub struct AppState {
     pub root: PathBuf,
@@ -25,6 +74,7 @@ pub struct AppState {
     pub auth: Option<Auth>,
     pub cluster: Cluster,
     pub client: reqwest::Client,
+    pub db_updates: DbUpdates,
 }
 
 #[derive(Clone)]
@@ -215,13 +265,16 @@ impl AppState {
             },
         )?);
         self.dbs.write().await.insert(name.to_string(), db.clone());
+        self.db_updates.record(name, "created");
         Ok(db)
     }
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
         self.dbs.write().await.remove(name);
         crate::view::forget_db(&self.root.join(name));
-        Db::destroy(&self.root, name)
+        Db::destroy(&self.root, name)?;
+        self.db_updates.record(name, "deleted");
+        Ok(())
     }
 
     pub async fn db_names(&self) -> Vec<String> {
@@ -443,10 +496,11 @@ pub async fn up() -> Response {
     json(StatusCode::OK, json!({"status": "ok"}))
 }
 
-pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
     if !st.authorized(&headers) {
         return unauthorized();
     }
+    let q = query(&uri);
     let mut names = st.db_names().await;
     if st.cluster.is_clustered() && !st.cluster.is_internal_db(&headers) {
         for (i, peer) in st.cluster.nodes.iter().enumerate() {
@@ -474,6 +528,32 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
     }
     names.sort();
     names.dedup();
+
+    let descending = flag(&q, "descending");
+    if descending {
+        names.reverse();
+    }
+    if let Some(start) = key_param(&q, "startkey") {
+        names.retain(|name| {
+            if descending {
+                name <= &start
+            } else {
+                name >= &start
+            }
+        });
+    }
+    if let Some(end) = key_param(&q, "endkey") {
+        names.retain(|name| {
+            if descending {
+                name >= &end
+            } else {
+                name <= &end
+            }
+        });
+    }
+    let skip = num(&q, "skip").unwrap_or(0);
+    let limit = num(&q, "limit").unwrap_or(usize::MAX);
+    names = names.into_iter().skip(skip).take(limit).collect();
     json(StatusCode::OK, json!(names))
 }
 
@@ -481,6 +561,138 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
     let count = num(&query(&uri), "count").unwrap_or(1).clamp(1, 1000);
     let ids: Vec<String> = (0..count).map(|_| crate::db::uuid()).collect();
     json(StatusCode::OK, json!({ "uuids": ids }))
+}
+
+/// `_db_updates` is an in-memory global feed of database lifecycle and write
+/// events. It is intentionally best-effort: a restart starts a new sequence.
+pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let q = query(&uri);
+    let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
+    let timeout = num(&q, "timeout").unwrap_or(60_000).min(300_000) as u64;
+    let heartbeat = num(&q, "heartbeat")
+        .filter(|value| *value > 0)
+        .map(|value| std::time::Duration::from_millis(value as u64));
+    let limit = num(&q, "limit");
+    let mut since = match q.get("since").map(String::as_str) {
+        Some("now") => st.db_updates.current(),
+        Some(raw) => raw.trim_matches('"').parse::<u64>().unwrap_or(0),
+        None => 0,
+    };
+
+    if feed == "continuous" {
+        let stream = async_stream::stream! {
+            let started = std::time::Instant::now();
+            let mut sent = 0usize;
+            let mut last_heartbeat = std::time::Instant::now();
+            loop {
+                if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                    break;
+                }
+                let (events, _) = st.db_updates.since(since);
+                for event in events {
+                    if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                        break;
+                    }
+                    if let Some(seq) = event["seq"].as_str().and_then(|seq| seq.parse().ok()) {
+                        since = seq;
+                    }
+                    let mut line = serde_json::to_vec(&event).unwrap_or_default();
+                    line.push(b'\n');
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                    sent += 1;
+                }
+                if started.elapsed().as_millis() as u64 >= timeout {
+                    break;
+                }
+                if let Some(heartbeat) = heartbeat {
+                    if last_heartbeat.elapsed() >= heartbeat {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let started = std::time::Instant::now();
+    loop {
+        let (events, current) = st.db_updates.since(since);
+        if !events.is_empty() || feed == "normal" || started.elapsed().as_millis() as u64 >= timeout
+        {
+            let selected: Vec<Value> = events
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+            let last_seq = selected
+                .last()
+                .and_then(|event| event["seq"].as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| current.to_string());
+            return json(
+                StatusCode::OK,
+                json!({"results": selected, "last_seq": last_seq}),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub async fn dbs_info(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let q = query(&uri);
+    let keys = if method == Method::POST {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| value.get("keys").and_then(Value::as_array).cloned())
+    } else {
+        q.get("keys")
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| value.as_array().cloned())
+    };
+    let Some(keys) = keys else {
+        return fail(ApiError::bad_request("`keys` must be a JSON array"));
+    };
+    let mut results = Vec::new();
+    for key in keys {
+        let Some(name) = key.as_str() else {
+            results.push(json!({"key": key, "error": "bad_request"}));
+            continue;
+        };
+        match st.db(name).await {
+            Ok(db) => match db.info().await {
+                Ok(info) => results.push(json!({"key": name, "info": info})),
+                Err(error) => results.push(json!({
+                    "key": name,
+                    "error": error.error,
+                    "reason": error.reason,
+                })),
+            },
+            Err(error) => results.push(json!({
+                "key": name,
+                "error": error.error,
+                "reason": error.reason,
+            })),
+        }
+    }
+    json(StatusCode::OK, Value::Array(results))
 }
 
 pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1306,7 +1518,11 @@ async fn commit_docs(
     headers: &HeaderMap,
 ) -> DbResult<(Vec<Value>, bool)> {
     if !st.cluster.is_clustered() {
-        return Ok((db.put_docs(docs, new_edits).await?, true));
+        let results = db.put_docs(docs, new_edits).await?;
+        if results.iter().any(|result| result.get("ok").is_some()) {
+            st.db_updates.record(dbname, "updated");
+        }
+        return Ok((results, true));
     }
 
     // Routing needs ids, so generate them before grouping. `Db::put_docs`
@@ -1443,6 +1659,9 @@ async fn commit_docs(
             }
         }
         let met = acks.iter().all(|ack| *ack >= quorum);
+        if out.iter().any(|result| result.get("ok").is_some()) {
+            st.db_updates.record(dbname, "updated");
+        }
         Ok((out, met))
     } else {
         // Replication writes carry their own history and must reach every
@@ -1482,6 +1701,9 @@ async fn commit_docs(
             }
         }
         let met = reached.iter().all(|ok| *ok);
+        if out.iter().any(|result| result.get("ok").is_some()) {
+            st.db_updates.record(dbname, "updated");
+        }
         Ok((out, met))
     }
 }
