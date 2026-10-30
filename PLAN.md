@@ -410,8 +410,10 @@ Above ~6k means something was built that nobody asked for.
   change nodes are skipped and covered by replicas, with their vector
   component resuming on return. New edits are written directly to every
   replica in parallel and return once `w` acknowledgements are reached;
-  remaining replica writes continue detached, so slow replicas do not set
-  tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
+  documents are shared as `Arc<Value>` across replica groups and forwarded
+  payloads are serialized directly, avoiding one deep clone and one
+  intermediate JSON tree per peer. Remaining replica writes continue detached,
+  so slow replicas do not set tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
   the remaining replicas concurrently; `?r=1` is the local fast path. Fabric,
   shard-map and rebalance metrics export through the optional OpenTelemetry
   setup and are no-ops without an endpoint. A

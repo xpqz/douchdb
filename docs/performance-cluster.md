@@ -437,6 +437,25 @@ The include-docs result is the important one: that path was doing all the
 document-loading work the old API shape implied, even when the view returned
 only 100 rows.
 
+### Write fan-out copies (#71)
+
+Normal and replication writes now keep each document in one `Arc<Value>` and
+share it across replica groups. The local group materializes a single owned
+copy for `db.put_docs`; remote groups serialize the shared values directly.
+Forwarded `_bulk_docs` bodies are serialized from a `Serialize` struct instead
+of first building a `serde_json::Value` tree and then serializing that tree.
+
+This removes one deep document clone per remote replica and the intermediate
+JSON value for every forwarded bulk request.
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_bulk_docs`, 250 docs | 32,387 docs/s | 37,513 docs/s | 7.11 ms | 6.15 ms |
+| Sequential PUT | 1,406 req/s | 1,451 req/s | 0.66 ms | 0.66 ms |
+
+The single-document path is mostly coordinator and quorum overhead; the gain
+shows up when a batch fans out to the same replica set.
+
 ### Local-first bulk reads (#70)
 
 `_bulk_get` and `_revs_diff` now group each document by the coordinator's local
