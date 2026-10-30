@@ -53,7 +53,7 @@ documents per second.
 | `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
 | `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
 | `_changes?since=0&limit=1000` | 20 | 105 req/s | 9.417 | 10.470 |
-| `GET /db` info | 100 | 1,380 req/s | 0.679 | 1.034 |
+| `GET /db` info | 100 | 1,936 req/s | 0.489 | 0.740 |
 | View map, cold index build | 1 | — | 67.31 | — |
 | View map, warm (reduce default) | 20 | 377 req/s | 2.506 | 3.430 |
 | View map-only, warm | 20 | 284 req/s | 3.251 | 4.625 |
@@ -154,6 +154,16 @@ routing (a document-hash-aware proxy or client), or a larger replica factor so
 more coordinators can serve reads locally. Cold view builds do scale: each node
 maps its own shards in parallel.
 
+### Parallel update vector (#36)
+
+`GET /db` and `since=now` now fetch every node's update sequence concurrently
+instead of one peer at a time. The vector itself is unchanged; only the
+round-trip pattern changed.
+
+| Operation | Before (#36) | After (#36) |
+|---|---|---|
+| `GET /db` info | 1,380 req/s, p50 0.679 ms | 1,936 req/s, p50 0.489 ms |
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -173,8 +183,8 @@ maps its own shards in parallel.
   owner-filtered.
 - **`_changes`** is ~10 ms for a 1,000-row initial feed. The coordinator still
   polls nodes in order and stops when the limit is filled.
-- **`GET /db`** is ~0.66 ms because it fans out the per-node update-sequence
-  vector with small responses.
+- **`GET /db`** is ~0.49 ms because it fetches the per-node update-sequence
+  vector concurrently with small responses.
 
 ## Caveats and next steps
 

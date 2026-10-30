@@ -2150,18 +2150,24 @@ async fn forged_internal_headers_are_ignored() {
     assert_eq!(forged["total_rows"], 8, "forged header skipped peers");
 
     // The real header from a peer is honoured and returns only local rows.
-    let local: Value = nodes[0]
-        .client
-        .get(format!("{}/forged/_all_docs", nodes[0].base))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", "test-cluster-secret")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(local["total_rows"].as_u64().unwrap() < 8);
+    // Sum local totals across nodes: a node that happens to own every shard is
+    // allowed to return all 8, but the two nodes together must not double-count.
+    let mut local_total = 0u64;
+    for node in &nodes {
+        let local: Value = node
+            .client
+            .get(format!("{}/forged/_all_docs", node.base))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        local_total += local["total_rows"].as_u64().unwrap();
+    }
+    assert_eq!(local_total, 8, "local reads must partition the database");
 
     // Same rule for the database-lifecycle marker: a forged one must not
     // suppress the broadcast.
