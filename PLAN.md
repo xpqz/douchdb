@@ -377,9 +377,10 @@ Above ~6k means something was built that nobody asked for.
   reduces plus custom reducers via `rereduce`. Cluster view indexes cover all
   locally held replicas; normal queries filter to owner shards, and degraded
   paths read all reachable replicas when an owner is down for both views and
-  `_all_docs`. Full `_changes`
-  feeds also query peers concurrently; limited feeds merge node prefixes
-  round-robin up to the global limit. New edits are written directly to every
+  `_all_docs`. Full `_changes` feeds also query peers concurrently; limited
+  feeds merge node prefixes round-robin up to the global limit. Unavailable
+  change nodes are skipped and covered by replicas, with their vector
+  component resuming on return. New edits are written directly to every
   replica in parallel and wait for `w`; there is no primary fetch-and-copy
   pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
   the remaining replicas concurrently; `?r=1` is the local fast path. A
