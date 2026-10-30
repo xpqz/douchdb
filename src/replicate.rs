@@ -1,5 +1,6 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
+use crate::auth::Auth;
 use crate::cluster::Cluster;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
@@ -11,6 +12,7 @@ pub async fn pull(
     peer: &str,
     client: &reqwest::Client,
     cluster: &Cluster,
+    auth: Option<&Auth>,
 ) -> Result<usize> {
     let checkpoint_id = format!("ae:{}", peer);
     let since = db
@@ -27,19 +29,18 @@ pub async fn pull(
         other => other.to_string(),
     };
 
-    let resp: Value = client
+    let mut changes = client
         .get(format!("{peer}/{}/_changes", db.name))
         .header("x-douchdb-forwarded", "1")
         .query(&[
             ("since", since_param.as_str()),
             ("style", "all_docs"),
             ("limit", "200"),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        ]);
+    if let Some(auth) = auth {
+        changes = changes.basic_auth(&auth.user, Some(&auth.pass));
+    }
+    let resp: Value = changes.send().await?.error_for_status()?.json().await?;
 
     let results = resp["results"].as_array().cloned().unwrap_or_default();
     if results.is_empty() {
@@ -56,15 +57,14 @@ pub async fn pull(
         }
     }
 
-    let got: Value = client
+    let mut bulk = client
         .post(format!("{peer}/{}/_bulk_get", db.name))
         .header("x-douchdb-forwarded", "1")
-        .json(&json!({"docs": reqs}))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .json(&json!({"docs": reqs}));
+    if let Some(auth) = auth {
+        bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
+    }
+    let got: Value = bulk.send().await?.error_for_status()?.json().await?;
 
     let mut docs = Vec::new();
     if let Some(results) = got["results"].as_array() {

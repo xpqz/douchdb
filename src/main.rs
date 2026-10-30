@@ -197,7 +197,15 @@ fn spawn_anti_entropy(state: Arc<AppState>) {
                     continue;
                 };
                 for peer in &peers {
-                    match replicate::pull(&db, peer, &state.client, &state.cluster).await {
+                    match replicate::pull(
+                        &db,
+                        peer,
+                        &state.client,
+                        &state.cluster,
+                        state.auth.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(0) => {}
                         Ok(n) => tracing::info!("replicated {n} docs of {name} from {peer}"),
                         Err(e) => tracing::warn!("replication {name} from {peer} failed: {e}"),

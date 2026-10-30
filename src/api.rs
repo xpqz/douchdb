@@ -126,6 +126,23 @@ fn is_forwarded(headers: &HeaderMap) -> bool {
     headers.get("x-douchdb-forwarded").is_some()
 }
 
+/// Internal cluster calls must keep the caller's credentials. Basic auth and
+/// the `_session` cookie both arrive as plain headers; the peer is trusted, so
+/// forward whichever one the client used.
+fn forward_client_auth(
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let request = match headers.get(header::AUTHORIZATION) {
+        Some(value) => request.header(header::AUTHORIZATION, value),
+        None => request,
+    };
+    match headers.get(header::COOKIE) {
+        Some(value) => request.header(header::COOKIE, value),
+        None => request,
+    }
+}
+
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.
 fn key_param(q: &HashMap<String, String>, key: &str) -> Option<String> {
     let raw = q.get(key)?;
@@ -394,13 +411,11 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
             if i == st.cluster.me {
                 continue;
             }
-            let mut request = st
+            let request = st
                 .client
                 .get(format!("{peer}/_all_dbs"))
                 .header("x-douchdb-local-db", "1");
-            if let Some(value) = headers.get(header::AUTHORIZATION) {
-                request = request.header(header::AUTHORIZATION, value);
-            }
+            let request = forward_client_auth(request, &headers);
             if let Ok(response) = request.send().await {
                 if let Ok(Value::Array(remote)) = response.json::<Value>().await {
                     for name in remote {
@@ -562,13 +577,11 @@ pub async fn db_root(
                     if peer == &st.cluster.nodes[st.cluster.me] {
                         continue;
                     }
-                    let mut request = st
+                    let request = st
                         .client
                         .put(format!("{peer}/{name}"))
                         .header("x-douchdb-local-db", "1");
-                    if let Some(value) = headers.get(header::AUTHORIZATION) {
-                        request = request.header(header::AUTHORIZATION, value);
-                    }
+                    let request = forward_client_auth(request, &headers);
                     let response = match request.send().await {
                         Ok(response) => response,
                         Err(e) => {
@@ -594,13 +607,11 @@ pub async fn db_root(
                     if i == st.cluster.me {
                         continue;
                     }
-                    let mut request = st
+                    let request = st
                         .client
                         .delete(format!("{peer}/{name}"))
                         .header("x-douchdb-local-db", "1");
-                    if let Some(value) = headers.get(header::AUTHORIZATION) {
-                        request = request.header(header::AUTHORIZATION, value);
-                    }
+                    let request = forward_client_auth(request, &headers);
                     let _ = request.send().await;
                 }
             }
@@ -1123,13 +1134,11 @@ async fn fetch_rev(
     }
     let peer = &st.cluster.nodes[node];
     let url = format!("{peer}/{dbname}/{}", percent_encode(id));
-    let mut request =
+    let request =
         st.client
             .get(url)
             .query(&[("rev", rev), ("revs", "true"), ("attachments", "true")]);
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        request = request.header(header::AUTHORIZATION, value);
-    }
+    let request = forward_client_auth(request, &headers);
     let response = request
         .send()
         .await
@@ -1165,14 +1174,12 @@ async fn forward_bulk(
     new_edits: bool,
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
-    let mut request = st
+    let request = st
         .client
         .post(format!("{peer}/{dbname}/_bulk_docs"))
         .header("x-douchdb-forwarded", "1")
         .json(&json!({"docs": docs, "new_edits": new_edits}));
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        request = request.header(header::AUTHORIZATION, value);
-    }
+    let request = forward_client_auth(request, &headers);
     let response = request
         .send()
         .await
@@ -1318,14 +1325,12 @@ async fn forward_json(
         url.push('?');
         url.push_str(query);
     }
-    let mut request = st
+    let request = st
         .client
         .post(url)
         .header("x-douchdb-forwarded", "1")
         .json(body);
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        request = request.header(header::AUTHORIZATION, value);
-    }
+    let request = forward_client_auth(request, &headers);
     let response = request
         .send()
         .await
@@ -1543,14 +1548,12 @@ async fn fetch_all_docs(
         Some(keys) => json!({"keys": keys, "include_docs": opts.include_docs}),
         None => json!({}),
     };
-    let mut request = st
+    let request = st
         .client
         .post(url)
         .header("x-douchdb-forwarded", "1")
         .json(&body);
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        request = request.header(header::AUTHORIZATION, value);
-    }
+    let request = forward_client_auth(request, &headers);
     let response = request
         .send()
         .await
@@ -1752,10 +1755,8 @@ async fn cluster_changes(
             if style_all_docs {
                 url.push_str("&style=all_docs");
             }
-            let mut request = st.client.get(url).header("x-douchdb-forwarded", "1");
-            if let Some(value) = headers.get(header::AUTHORIZATION) {
-                request = request.header(header::AUTHORIZATION, value);
-            }
+            let request = st.client.get(url).header("x-douchdb-forwarded", "1");
+            let request = forward_client_auth(request, &headers);
             let request = if let Some(ids) = &doc_ids {
                 request
                     .query(&[("filter", "_doc_ids")])
@@ -1842,13 +1843,11 @@ async fn cluster_update_vector(
             continue;
         }
         let peer = &st.cluster.nodes[node];
-        let mut request = st
+        let request = st
             .client
             .get(format!("{peer}/{dbname}"))
             .header("x-douchdb-forwarded", "1");
-        if let Some(value) = headers.get(header::AUTHORIZATION) {
-            request = request.header(header::AUTHORIZATION, value);
-        }
+        let request = forward_client_auth(request, &headers);
         if let Ok(response) = request.send().await {
             if response.status().is_success() {
                 if let Ok(info) = response.json::<Value>().await {
@@ -2305,16 +2304,15 @@ async fn proxy(
         url.push('?');
         url.push_str(&encoded.join("&"));
     }
-    let mut request = st.client.request(
+    let request = st.client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &url,
     );
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        request = request.header("authorization", value);
-    }
-    if let Some(value) = headers.get(header::CONTENT_TYPE) {
-        request = request.header("content-type", value);
-    }
+    let request = forward_client_auth(request, &headers);
+    let mut request = match headers.get(header::CONTENT_TYPE) {
+        Some(value) => request.header("content-type", value),
+        None => request,
+    };
     if !body.is_empty() {
         request = request.body(body.to_vec());
     }

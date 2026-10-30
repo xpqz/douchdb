@@ -302,8 +302,9 @@ Above ~6k means something was built that nobody asked for.
   `new_edits=false`; reads try replicas in preference order and fall back past a
   dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
   an unmet write quorum returns `202` and anti-entropy repairs the replica.
-  Database create/drop are broadcast, and anti-entropy pulls only the shards a
-  node replicates. The v0.1 gate — kill a node mid-replication and keep serving
+  Database create/drop are broadcast, anti-entropy pulls only the shards a node
+  replicates, and internal calls authenticate with the shared admin credentials
+  (client Basic/cookie auth is forwarded to peers). The v0.1 gate — kill a node mid-replication and keep serving
   from the survivors — is covered by
   `cluster_survives_killing_a_node_mid_replication`.
 * **Version vectors.** `since`/`update_seq` are keyed by node, not by shard

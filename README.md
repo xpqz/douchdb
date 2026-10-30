@@ -118,8 +118,10 @@ embedded `/_utils/` console is same-origin and needs no CORS flag.
 
 ## Cluster
 
-Every node needs the same `--nodes`, `--q` and `--n`. Membership is static: to
-change it, restart the cluster with the new list.
+Every node needs the same `--nodes`, `--q`, `--n` and `--admin` credentials.
+Membership is static: to change it, restart the cluster with the new list.
+Internal cluster calls use the shared admin credentials, and a client's Basic
+auth or `_session` cookie is forwarded when a request has to reach a peer.
 
 ```sh
 BIN=./target/release/douchdb

@@ -114,6 +114,30 @@ impl Server {
         (status, value)
     }
 
+    /// Request with extra headers (auth cookies, internal routing markers).
+    async fn req_with(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, String)],
+    ) -> (StatusCode, Value) {
+        let mut request = self
+            .client
+            .request(method, format!("{}{}", self.base, path));
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("request");
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        (status, value)
+    }
+
     async fn put(&self, path: &str, body: Value) -> (StatusCode, Value) {
         self.req(Method::PUT, path, Some(body)).await
     }
@@ -172,6 +196,14 @@ fn start_cluster(n: usize) -> Vec<Server> {
 }
 
 fn start_cluster_with(n: usize, sync_secs: &str, replication: usize) -> Vec<Server> {
+    start_cluster_full(n, sync_secs, replication, false)
+}
+
+fn start_cluster_with_auth(n: usize, sync_secs: &str, replication: usize) -> Vec<Server> {
+    start_cluster_full(n, sync_secs, replication, true)
+}
+
+fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool) -> Vec<Server> {
     for attempt in 0..5 {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let nodes = ports
@@ -194,7 +226,7 @@ fn start_cluster_with(n: usize, sync_secs: &str, replication: usize) -> Vec<Serv
                 "--sync-secs".to_string(),
                 sync_secs.to_string(),
             ];
-            match Server::spawn_on(ports[i], &extra, false, attempt) {
+            match Server::spawn_on(ports[i], &extra, admin, attempt) {
                 Some(server) => servers.push(server),
                 None => {
                     failed = true;
@@ -1313,6 +1345,131 @@ async fn cluster_honours_w_and_r_quorum_parameters() {
     // r=2 tolerates the dead replica as long as one answers.
     let (status, _) = nodes[0].get("/clquorum/q2?r=2").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
+    let nodes = start_cluster_with_auth(2, "1", 2);
+    let basic = format!("Basic {}", base64_encode(b"admin:douchdb"));
+    let auth = [("Authorization", basic.clone())];
+
+    let (status, _) = nodes[0]
+        .req_with(Method::PUT, "/authsync", Some(json!({})), &auth)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[1]
+        .req_with(Method::GET, "/authsync", None, &auth)
+        .await;
+    assert_eq!(status, StatusCode::OK, "database create was authenticated");
+
+    // Write only on node 0; node 1 must pull the documents with the node's
+    // own credentials, not the client's (there is no client here).
+    let docs: Vec<Value> = (0..6)
+        .map(|i| json!({"_id": format!("as{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/authsync/_bulk_docs",
+            Some(json!({"docs": docs})),
+            &[
+                ("Authorization", basic.clone()),
+                ("x-douchdb-forwarded", "1".to_string()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let (status, body) = nodes[1]
+            .req_with(
+                Method::POST,
+                "/authsync/_all_docs",
+                Some(json!({})),
+                &[
+                    ("Authorization", basic.clone()),
+                    ("x-douchdb-forwarded", "1".to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        if body["total_rows"] == 6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "authenticated anti-entropy did not converge: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn cluster_forwards_session_cookies_to_peers() {
+    let nodes = start_cluster_with_auth(2, "3600", 2);
+
+    let response = nodes[0]
+        .client
+        .post(format!("{}/_session", nodes[0].base))
+        .json(&json!({"name": "admin", "password": "douchdb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .expect("session cookie")
+        .to_string();
+    let auth = [("Cookie", cookie)];
+
+    // Database create is broadcast, so the peer must receive the cookie.
+    let (status, _) = nodes[0]
+        .req_with(Method::PUT, "/cookiecl", Some(json!({})), &auth)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[1]
+        .req_with(Method::GET, "/cookiecl", None, &auth)
+        .await;
+    assert_eq!(status, StatusCode::OK, "cookie reached the peer's create");
+
+    let (status, _) = nodes[0]
+        .req_with(Method::PUT, "/cookiecl/cdoc", Some(json!({"v": 1})), &auth)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Both fan-outs call peers: a 401 here would fail the request.
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/cookiecl/_all_docs",
+            Some(json!({"include_docs": true})),
+            &auth,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["doc"]["v"], 1);
+
+    let (status, body) = nodes[0]
+        .req_with(Method::GET, "/cookiecl/_changes", None, &auth)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+
+    // Delete is broadcast as well.
+    let (status, _) = nodes[0]
+        .req_with(Method::DELETE, "/cookiecl", None, &auth)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = nodes[1]
+        .req_with(Method::GET, "/cookiecl", None, &auth)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
