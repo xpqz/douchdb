@@ -268,6 +268,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
+        [--otel-endpoint URL]
 ```
 
 | Flag | Default | Meaning |
@@ -384,13 +385,19 @@ The cluster paths are covered by the integration tests, including
 
 ## API surface
 
-`GET /`, `_up`, `_all_dbs`, `_uuids`, `_membership`, `_session`, `_security`,
-database create/get/delete, document CRUD with `?rev=`, `?revs=`,
-`?open_revs=`, `?new_edits=false`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
-`_changes` (normal/longpoll/continuous, `style=all_docs`, `filter=_doc_ids`),
-`_revs_diff`, `_local/*`, `_purge`, `_compact`, `_revs_limit`,
-`_design/{ddoc}/_view/{view}`, `_view_cleanup` and
+`GET /`, `_up`, `_all_dbs` (with `startkey`/`endkey`/`limit`/`skip`/
+`descending`), `_db_updates` (normal/longpoll/continuous, heartbeat),
+`_dbs_info`, `_uuids`, `_membership`, `_session`, `_security`, database
+create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
+`?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`, `_changes`
+(normal/longpoll/true continuous, heartbeat, `style=all_docs`,
+`filter=_doc_ids`), `_revs_diff`, `_local/*`, `_purge`, `_compact`,
+`_revs_limit`, `_design/{ddoc}/_view/{view}`, `_view_cleanup` and
 `_ensure_full_commit`.
+
+HTTP niceties: `If-Match` on writes, `If-None-Match`/304 on reads, `COPY` with
+`Destination`, `HEAD` without a body, gzip responses, and
+`X-Couch-Request-ID` on every response.
 
 ## Observability
 

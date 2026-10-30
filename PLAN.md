@@ -339,6 +339,12 @@ Above ~6k means something was built that nobody asked for.
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
   Design documents replicate to every node; a cluster view query fails with
   `502` if a node is unreachable instead of returning partial rows.
+* **v0.2 protocol pass.** `_changes` is a true chunked continuous feed with
+  heartbeat; bulk reads/writes batch shard and peer work; COPY, conditional
+  ETags, gzip, request IDs and bodyless HEAD are implemented; attachments were
+  removed and rejected; `_db_updates`, `_dbs_info` and `_all_dbs` pagination
+  are available; optional OTLP tracing/metrics are wired through
+  `--otel-endpoint`.
 * **Hardening.** Internal routing headers require a shared
   `--cluster-secret`, so clients cannot forge peer requests; `_all_dbs` and
   `_membership` require admin auth; session cookies are `HttpOnly; SameSite=Strict`
