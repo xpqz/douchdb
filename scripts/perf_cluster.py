@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local multi-node douchdb HTTP benchmark.
 
-Starts a real cluster (default: 3 nodes, q=4, n=2), loads documents through a
+Starts a real cluster (default: 3 nodes, q=4, n=3), loads documents through a
 coordinator, and measures the paths that fan out across nodes: document CRUD,
 bulk operations, `_all_docs` (range and keys), `_changes`, database info and
 map/reduce views.
@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--docs", type=int, default=6000)
     parser.add_argument("--nodes", type=int, default=3)
     parser.add_argument("--q", type=int, default=4)
-    parser.add_argument("--n", type=int, default=2)
+    parser.add_argument("--n", type=int, default=3)
     parser.add_argument("--sync-secs", default="3600")
     parser.add_argument(
         "--spread",

@@ -62,7 +62,7 @@ docker compose up --build -d
 - Grafana: http://localhost:3000 (anonymous Admin enabled for the demo)
 - OTLP/HTTP: http://localhost:4318
 
-The cluster uses `q=4`, `n=2`, three data volumes and OTLP export to Grafana's
+The cluster uses `q=4`, `n=3`, three data volumes and OTLP export to Grafana's
 `otel-lgtm` all-in-one backend. See [docs/docker.md](docs/docker.md) for the
 service layout, credentials, verification commands and teardown. The stack is
 for local development: it has no TLS and uses demo credentials.
@@ -418,11 +418,11 @@ BIN=./target/release/douchdb
 NODES=http://127.0.0.1:5984,http://127.0.0.1:5985,http://127.0.0.1:5986
 
 SECRET=change-me-cluster-secret
-$BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 2 \
+$BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 3 \
   --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 0
-$BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 2 \
+$BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 3 \
   --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 1
-$BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 2 \
+$BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 3 \
   --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 2
 ```
 
@@ -516,7 +516,7 @@ cargo build --release
 python3 scripts/perf_sweep.py --docs 6000
 ```
 
-A three-node (`q=4`, `n=2`) cluster benchmark is in
+A three-node (`q=4`, `n=3`) cluster benchmark is in
 [docs/performance-cluster.md](docs/performance-cluster.md):
 
 ```sh
