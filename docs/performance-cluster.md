@@ -13,7 +13,7 @@ and views — and records the cost of replication and coordinator merging.
 | Memory | 28 GiB |
 | OS | Linux 7.2.8 / glibc 2.44 |
 | Build | `cargo build --release` |
-| Cluster | 3 nodes, `q=4`, `n=2`, one process per node |
+| Cluster | 3 nodes, `q=4`, `n=3`, one process per node |
 | Client | Python 3.14 `http.client`, keep-alive, local loopback |
 | Coordinator | node 0 |
 | Seed data | 6,000 small documents |
@@ -43,22 +43,22 @@ documents per second.
 
 | Operation | n | Throughput | p50 | p99 |
 |---|---:|---:|---:|---:|
-| Single PUT, sequential | 500 | 1,159 req/s | 0.856 | 1.185 |
-| Single PUT, 8 writers | 500 | 3,676 req/s | 2.012 | 3.680 |
-| Single GET, sequential | 1,000 | 3,558 req/s | 0.283 | 0.623 |
-| Single GET, 8 writers | 500 | 6,738 req/s | 0.805 | 3.650 |
-| `_bulk_docs`, 250 docs/request | 2,500 | 12,177 docs/s (49 req/s) | 19.817 | 21.360 |
-| `_bulk_get`, 250 docs/request | 2,500 | 39,380 docs/s (158 req/s) | 5.897 | 6.968 |
-| `_all_docs?limit=100` | 50 | 481 req/s | 1.868 | 2.410 |
-| `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
-| `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
-| `_changes?since=0&limit=1000` | 20 | 52.5 req/s | 18.996 | 20.856 |
-| `_changes?since=0` (full feed) | 5 | 7.8 req/s | 123.896 | 131.661 |
-| `GET /db` info | 100 | 1,825 req/s | 0.495 | 1.121 |
-| View map, cold index build | 1 | — | 26.38 | — |
-| View map, warm (reduce default) | 20 | 632 req/s | 1.568 | 1.859 |
-| View map-only, warm | 20 | 354 req/s | 3.251 | 3.058 |
-| View reduce, warm | 20 | 628 req/s | 1.561 | 1.706 |
+| Single PUT, sequential | 500 | 1,374 req/s | 0.663 | 1.116 |
+| Single PUT, 8 writers | 500 | 4,002 req/s | 1.727 | 3.684 |
+| Single GET, sequential | 1,000 | 6,070 req/s | 0.150 | 0.278 |
+| Single GET, 8 writers | 500 | 7,922 req/s | 0.534 | 4.328 |
+| `_bulk_docs`, 250 docs/request | 2,500 | 29,562 docs/s (118 req/s) | 7.828 | 9.192 |
+| `_bulk_get`, 250 docs/request | 2,500 | 36,396 docs/s (146 req/s) | 6.560 | 7.276 |
+| `_all_docs?limit=100` | 50 | 538 req/s | 1.680 | 2.201 |
+| `_all_docs?startkey=doc-005000&limit=100` | 50 | 599 req/s | 1.617 | 2.327 |
+| `_all_docs` with 100 keys | 20 | 646 req/s | 1.447 | 1.842 |
+| `_changes?since=0&limit=1000` | 20 | 47 req/s | 20.505 | 24.723 |
+| `_changes?since=0` (full feed) | 5 | 6.6 req/s | 144.239 | 158.575 |
+| `GET /db` info | 100 | 1,749 req/s | 0.505 | 1.742 |
+| View map, cold index build | 1 | — | 27.98 | — |
+| View map, warm (reduce default) | 20 | 550 req/s | 1.905 | 2.079 |
+| View map-only, warm | 20 | 355 req/s | 2.626 | 4.495 |
+| View reduce, warm | 20 | 548 req/s | 1.833 | 2.272 |
 
 ## Before and after
 
@@ -212,15 +212,29 @@ The cost is more work per limited poll: a 1,000-row feed fetches up to 1,000
 changes from each node. It moved from ~12 ms to ~19 ms, but it now covers the
 whole cluster fairly instead of filling the window from one node at a time.
 
+### Direct replica writes (#42)
+
+New edits are now sent to every replica in the document's shard set in
+parallel; the coordinator waits for `w` acknowledgements and returns 201/202.
+This removes the old primary-write → `_bulk_get` → secondary-copy cycle. Design
+documents still go to every node, and `new_edits=false` replication writes still
+go to every replica.
+
+| Operation | Before (#42), n=2 | After, n=2 | After, n=3 |
+|---|---:|---:|---:|
+| Single PUT, sequential | 1,159 req/s | 1,685 | 1,374 |
+| `_bulk_docs`, 250 docs/request | 12,177 docs/s | 35,339 | 29,562 |
+| `_bulk_docs` p50 | 19.8 ms | 6.8 ms | 7.8 ms |
+
 ## Reading the numbers
 
-- **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
-  node; bulk ingestion is ~12k docs/s versus ~37k/s. The coordinator writes the
-  primary, fetches the revision, and copies it to the other replica. That is
-  the cost of synchronous replication, not a regression in the storage path.
-- **Single-document reads** are ~3.3k/s sequentially and ~7.1k/s with eight
-  clients. Some requests are served locally and some proxy to the owner.
-- **Bulk reads** reach ~38k docs/s; `_bulk_get` is routed per document and is
+- **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
+  node; bulk ingestion is ~30k docs/s versus ~37k/s. Documents are written to
+  all three replicas in parallel and the request waits for `w`; there is no
+  primary fetch-and-copy pass.
+- **Single-document reads** are ~6.1k/s sequentially and ~7.9k/s with eight
+  clients. With n=3 on three nodes every coordinator holds every document.
+- **Bulk reads** reach ~36k docs/s; `_bulk_get` is routed per document and is
   still the fastest way to read many documents through a coordinator.
 - **`_all_docs`** is ~1.3 ms with or without a `startkey`. Each owner answers
   its offset from the in-memory live-document map instead of walking earlier

@@ -25,7 +25,7 @@ Console login: `admin` / `secret`.
 All three nodes use:
 
 ```text
---q 4 --n 2
+--q 4 --n 3
 --nodes http://node0:5984,http://node1:5984,http://node2:5984
 --me 0|1|2
 --sync-secs 3
@@ -33,6 +33,11 @@ All three nodes use:
 --cluster-secret <DOUCHDB_CLUSTER_SECRET>
 --otel-endpoint http://otel-lgtm:4318
 ```
+
+With `n=3` on three nodes every document lives on every node, so any
+coordinator can serve point reads locally. That is the CouchDB-recommended
+cluster shape for a three-node deployment; the trade-off is 3× storage and
+three replica writes per document.
 
 Data lives in the `node0-data`, `node1-data` and `node2-data` volumes. The
 default cluster secret is `dev-cluster-secret-please-change`; override it for

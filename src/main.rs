@@ -48,7 +48,7 @@ fn parse_args() -> Args {
         listen: "127.0.0.1:5984".into(),
         data: PathBuf::from("data"),
         q: 1,
-        n: 2,
+        n: 3,
         revs_limit: 1000,
         admin: None,
         nodes: Vec::new(),

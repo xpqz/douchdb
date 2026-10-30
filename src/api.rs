@@ -1842,113 +1842,67 @@ async fn commit_docs(
     let mut acks = vec![0usize; total];
 
     if new_edits {
-        // Write each document to the first live replica, then copy the result
-        // to the rest of its replica set. A dead primary falls through to the
-        // next replica instead of failing the request.
-        let mut written_at: Vec<Option<usize>> = vec![None; total];
-        let mut pending: Vec<(usize, Value)> = docs.into_iter().enumerate().collect();
-        let mut attempt = vec![0usize; total];
-        while !pending.is_empty() {
-            let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
-            for (slot, doc) in pending.drain(..) {
-                let list = &replicas[slot];
-                let node = list[attempt[slot].min(list.len() - 1)];
-                groups.entry(node).or_default().push((slot, doc));
+        // CouchDB-style: send the original document to every replica in its
+        // shard set and wait for `w` acknowledgements. Revision ids are
+        // deterministic, so no primary re-fetch/copy pass is needed.
+        let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        for (slot, doc) in docs.into_iter().enumerate() {
+            for node in &replicas[slot] {
+                groups.entry(*node).or_default().push((slot, doc.clone()));
             }
-            let mut retry = Vec::new();
-            for (node, group) in groups {
+        }
+
+        let mut successes: Vec<Option<Value>> = vec![None; total];
+        let mut failures: Vec<Option<Value>> = vec![None; total];
+        let responses =
+            futures::future::join_all(groups.into_iter().map(|(node, group)| async move {
                 let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-                let subdocs: Vec<Value> = group.iter().map(|(_, doc)| doc.clone()).collect();
-                match write_local_or_forward(st, db, dbname, node, subdocs, true, headers).await {
-                    Ok(results) => {
-                        for (slot, result) in slots.into_iter().zip(results) {
-                            if result.get("error").is_none() {
-                                acks[slot] = 1;
-                                written_at[slot] = Some(node);
+                let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
+                let result =
+                    write_local_or_forward(st, db, dbname, node, subdocs, true, headers).await;
+                (node, slots, result)
+            }))
+            .await;
+
+        for (node, slots, response) in responses {
+            match response {
+                Ok(results) => {
+                    for (slot, result) in slots.into_iter().zip(results) {
+                        if result.get("error").is_none() {
+                            acks[slot] += 1;
+                            if successes[slot].is_none() || node == primaries[slot] {
+                                successes[slot] = Some(result);
                             }
-                            out[slot] = result;
+                        } else if failures[slot].is_none() || node == primaries[slot] {
+                            failures[slot] = Some(result);
                         }
                     }
-                    Err(_) => {
-                        for (slot, doc) in group {
-                            attempt[slot] += 1;
-                            if attempt[slot] < replicas[slot].len() {
-                                retry.push((slot, doc));
-                            } else {
-                                out[slot] = json!({
-                                    "id": ids[slot],
-                                    "error": "replica_unavailable",
-                                    "reason": "no replica in the shard set is reachable",
-                                });
-                            }
+                }
+                Err(_) => {
+                    for slot in slots {
+                        if failures[slot].is_none() {
+                            failures[slot] = Some(json!({
+                                "id": ids[slot],
+                                "error": "replica_unavailable",
+                                "reason": "no replica in the shard set is reachable",
+                            }));
                         }
                     }
                 }
             }
-            pending = retry;
         }
 
-        // With one replica per document the primary write is the whole story:
-        // there is nothing to fetch or copy. Design documents are an exception:
-        // they deliberately live on every node even when `n=1`.
-        if replicas.iter().all(|list| list.len() <= 1) {
-            let met = acks.iter().all(|ack| *ack >= quorum);
-            if out.iter().any(|result| result.get("ok").is_some()) {
-                st.db_updates.record(dbname, "updated");
-            }
-            return Ok((out, met));
-        }
-
-        // Fetch the successful revisions in one `_bulk_get` per primary
-        // instead of one GET per document. Then copy each primary's batch to
-        // the remaining replicas in one `_bulk_docs` per peer.
-        let mut fetch_groups: HashMap<usize, Vec<(usize, String, String)>> = HashMap::new();
         for slot in 0..total {
-            let Some(source) = written_at[slot] else {
-                continue;
-            };
-            let Some(rev) = out[slot].get("rev").and_then(Value::as_str) else {
-                continue;
-            };
-            fetch_groups.entry(source).or_default().push((
-                slot,
-                ids[slot].clone(),
-                rev.to_string(),
-            ));
-        }
-        let mut full_docs: HashMap<usize, Value> = HashMap::new();
-        for (source, requests) in fetch_groups {
-            // The primary already has the write. If the batch fetch fails
-            // (for example the node died just after committing), do not fail
-            // the client request; anti-entropy will finish the copy later.
-            if let Ok(docs) = fetch_revs(st, db, dbname, source, requests, headers).await {
-                full_docs.extend(docs);
-            }
-        }
-        let mut batches: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
-        for (slot, full) in full_docs {
-            let Some(source) = written_at[slot] else {
-                continue;
-            };
-            for node in replicas[slot]
-                .iter()
-                .copied()
-                .filter(|node| *node != source)
-            {
-                batches.entry(node).or_default().push((slot, full.clone()));
-            }
-        }
-        for (node, batch) in batches {
-            let slots: Vec<usize> = batch.iter().map(|(slot, _)| *slot).collect();
-            let docs: Vec<Value> = batch.into_iter().map(|(_, doc)| doc).collect();
-            if write_local_or_forward(st, db, dbname, node, docs, false, headers)
-                .await
-                .is_ok()
-            {
-                for slot in slots {
-                    acks[slot] += 1;
-                }
-            }
+            out[slot] = successes[slot]
+                .take()
+                .or_else(|| failures[slot].take())
+                .unwrap_or_else(|| {
+                    json!({
+                        "id": ids[slot],
+                        "error": "replica_unavailable",
+                        "reason": "no replica in the shard set is reachable",
+                    })
+                });
         }
         let met = acks.iter().all(|ack| *ack >= quorum);
         if out.iter().any(|result| result.get("ok").is_some()) {
@@ -2014,61 +1968,6 @@ async fn write_local_or_forward(
     }
     let peer = st.cluster.nodes[node].clone();
     forward_bulk(st, &peer, dbname, docs, new_edits, headers).await
-}
-
-/// Read one revision with its history and attachment bytes, for copying to
-/// another replica. `attachments=true` matters: a stub would not carry the
-/// chunk data the secondary needs to store the same bytes.
-async fn fetch_revs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    node: usize,
-    requests: Vec<(usize, String, String)>,
-    headers: &HeaderMap,
-) -> DbResult<Vec<(usize, Value)>> {
-    let docs: Vec<Value> = requests
-        .iter()
-        .map(|(_, id, rev)| json!({"id": id, "rev": rev}))
-        .collect();
-    let body = json!({"docs": docs});
-    let value = if node == st.cluster.me {
-        db.bulk_get(&body, true, true).await?
-    } else {
-        let peer = st.cluster.nodes[node].clone();
-        forward_json(
-            st,
-            &peer,
-            dbname,
-            "_bulk_get",
-            "revs=true&attachments=true",
-            &body,
-            headers,
-        )
-        .await?
-    };
-    let mut out = Vec::new();
-    for (index, row) in value["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
-        let Some((slot, _, _)) = requests.get(index) else {
-            continue;
-        };
-        let Some(doc) = row
-            .get("docs")
-            .and_then(Value::as_array)
-            .and_then(|docs| docs.first())
-            .and_then(|entry| entry.get("ok"))
-        else {
-            continue;
-        };
-        out.push((*slot, doc.clone()));
-    }
-    Ok(out)
 }
 
 async fn forward_bulk(
