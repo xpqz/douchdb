@@ -57,8 +57,8 @@ A three-node cluster, console and Grafana OpenTelemetry stack are provided:
 docker compose up --build -d
 ```
 
-- Console: http://localhost:8080/_utils/ — login `admin` / `secret`
-- API: nodes on ports 5984, 5985 and 5986
+- API + console: http://localhost:8080 — nginx round-robins across all nodes; login `admin` / `secret`
+- Direct nodes: ports 5984, 5985 and 5986
 - Grafana: http://localhost:3000 (anonymous Admin enabled for the demo)
 - OTLP/HTTP: http://localhost:4318
 

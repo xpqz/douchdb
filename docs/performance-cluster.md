@@ -31,6 +31,10 @@ loads documents through node 0, runs the measurements, writes
 `target/perf-cluster.json`, and shuts the processes down. It does not reuse an
 existing cluster.
 
+`--spread` round-robins benchmark clients across every coordinator (the same
+shape as the nginx front); `--nodes N --n 1 --spread` runs a scaling
+experiment.
+
 ## Results
 
 These are the numbers after the cluster fan-out (#32) and live-document index
@@ -88,6 +92,10 @@ The cluster pass made fan-out owner-aware and concurrent.
 - **Distributed built-in reduces.** Global `_count`, `_sum` and `_stats` without
   grouping are reduced per owner and combined by the coordinator, instead of
   shipping every map row to the coordinator.
+- **Single-replica write fast path.** When every document in a batch has one
+  replica, the coordinator returns after the primary write instead of doing an
+  unnecessary `_bulk_get` and secondary-copy pass. Design documents still copy
+  to all nodes.
 
 ### Live-document index (#33)
 
@@ -100,6 +108,51 @@ metadata to compute their local offsets, including with a far-away `startkey`.
 | `_all_docs?limit=100` | p50 2.23 ms | p50 1.83 ms |
 | `_all_docs?startkey=doc-005000&limit=100` | 118 req/s, p50 8.27 ms | 524 req/s, p50 1.86 ms |
 | `_bulk_docs`, 250 docs/request | 11,956 docs/s | 12,177 docs/s |
+
+## Scaling with node count
+
+This run keeps one replica per document (`q=4`, `n=1`) and spreads clients
+across all coordinators, so it measures the effect of adding nodes rather than
+replica fan-out:
+
+```sh
+python3 scripts/perf_cluster.py --nodes N --q 4 --n 1 --spread \
+  --workers 32 --per-level 5000
+```
+
+| Operation | 1 node | 2 nodes | 3 nodes | 4 nodes |
+|---|---:|---:|---:|---:|
+| Single PUT, 32 writers | 5,595 req/s | 5,135 | 4,918 | 4,919 |
+| Single GET, 32 writers | 7,783 req/s | 7,086 | 6,781 | 6,690 |
+| `_bulk_docs`, 250 docs/request | 44,045 docs/s | 32,510 | 29,640 | 26,680 |
+| `_all_docs?limit=100` | 963 req/s | 558 | 482 | 463 |
+| Warm map view | 2,764 req/s* | 366 | 528 | 652 |
+| `GET /db` info | 5,322 req/s | 2,005 | 1,356 | 1,021 |
+| `_changes?since=0&limit=1000` | 77 req/s | 84 | 112 | 101 |
+
+\* The one-node row uses the single-node view path; at two or more nodes the
+coordinator performs a cluster fan-out, so the view row is not directly
+comparable across that boundary.
+
+**This is not linear scaling yet.** The host and Python client cap absolute
+throughput, but two architectural effects are visible:
+
+- A client request that lands on a non-owner coordinator proxies to the owner.
+  With `n=1`, most requests take that extra hop, so point GET throughput stays
+  roughly flat instead of rising with nodes.
+- `_all_docs` and views are scatter-gather operations: every request touches
+  every node and the coordinator merges the result. Adding nodes increases the
+  work per request, not the number of independent requests the coordinator can
+  serve.
+- Writes still pay batch routing overhead. The `n=1` fast path avoids the
+  unnecessary primary re-fetch/copy, but a four-node batch is split into
+  per-owner requests.
+
+The nginx front is deliberately simple round-robin/least-connection routing. It
+does not know which node owns a document. Linear read scaling needs owner-aware
+routing (a document-hash-aware proxy or client), or a larger replica factor so
+more coordinators can serve reads locally. Cold view builds do scale: each node
+maps its own shards in parallel.
 
 ## Reading the numbers
 
