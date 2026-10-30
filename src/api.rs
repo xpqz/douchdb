@@ -265,6 +265,24 @@ fn unauthorized() -> Response {
 /// disagrees with us about the protocol.
 /// Baseline response hardening. TLS is an operator concern; these headers still
 /// stop MIME sniffing and framing when the console is served directly.
+pub async fn request_id(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let id = crate::db::uuid();
+    let mut response = next.run(req).await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-couch-request-id", value);
+    }
+    response
+}
+
+pub async fn head_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let head = req.method() == Method::HEAD;
+    let mut response = next.run(req).await;
+    if head {
+        *response.body_mut() = Body::empty();
+    }
+    response
+}
+
 pub async fn security_headers(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -2407,9 +2425,10 @@ async fn doc_request(
 
     let Some(attachment) = attachment else {
         return match method {
-            Method::GET | Method::HEAD => get_doc(db, &docid, q).await,
+            Method::GET | Method::HEAD => get_doc(db, &docid, q, headers).await,
             Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
             Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers).await,
+            _ if method.as_str() == "COPY" => copy_doc(st, db, dbname, &docid, q, headers).await,
             _ => fail(ApiError::new(
                 405,
                 "method_not_allowed",
@@ -2598,10 +2617,66 @@ fn doc_response(doc: Value) -> Response {
     response
 }
 
-async fn get_doc(db: &Db, docid: &str, q: &HashMap<String, String>) -> Response {
+async fn get_doc(
+    db: &Db,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Response {
     match db.get_doc(docid, &doc_opts(q)).await {
-        Ok(doc) => doc_response(doc),
+        Ok(doc) => {
+            let etag = doc
+                .get("_rev")
+                .and_then(Value::as_str)
+                .map(|rev| format!("\"{rev}\""))
+                .unwrap_or_default();
+            if !etag.is_empty() && etag_matches(headers, header::IF_NONE_MATCH, &etag) {
+                let mut response = StatusCode::NOT_MODIFIED.into_response();
+                if let Ok(value) = etag.parse() {
+                    response.headers_mut().insert(header::ETAG, value);
+                }
+                return response;
+            }
+            doc_response(doc)
+        }
         Err(e) => fail(e),
+    }
+}
+
+fn etag_matches(headers: &HeaderMap, name: header::HeaderName, etag: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .unwrap_or_default()
+            .split(',')
+            .any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+            })
+    })
+}
+
+async fn check_if_match(db: &Db, docid: &str, headers: &HeaderMap) -> Option<Response> {
+    if headers.get(header::IF_MATCH).is_none() {
+        return None;
+    }
+    let current = db
+        .get_doc(docid, &DocOpts::default())
+        .await
+        .ok()
+        .and_then(|doc| {
+            doc.get("_rev")
+                .and_then(Value::as_str)
+                .map(|rev| format!("\"{rev}\""))
+        });
+    match current {
+        Some(etag) if etag_matches(headers, header::IF_MATCH, &etag) => None,
+        _ => Some(fail(ApiError::new(
+            412,
+            "precondition_failed",
+            "If-Match does not match the current revision",
+        ))),
     }
 }
 
@@ -2676,6 +2751,88 @@ async fn quorum_read(
     }
 }
 
+async fn copy_doc(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(raw) = headers
+        .get("destination")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return fail(ApiError::bad_request("Destination header is required"));
+    };
+    let (raw, destination_rev) = match raw.split_once('?') {
+        Some((destination, query)) => {
+            let rev = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("rev=").map(percent_decode));
+            (destination, rev)
+        }
+        None => (raw, None),
+    };
+    let destination = percent_decode(raw);
+    if destination.is_empty() {
+        return fail(ApiError::bad_request("Destination must not be empty"));
+    }
+
+    let source = match db
+        .get_doc(
+            docid,
+            &DocOpts {
+                rev: q.get("rev").cloned(),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(doc) => doc,
+        Err(error) => return fail(error),
+    };
+    if source.get("_attachments").is_some() {
+        return fail(ApiError::bad_request(
+            "Attachments are not supported by douchdb",
+        ));
+    }
+    let mut copy = source;
+    if let Some(object) = copy.as_object_mut() {
+        object.remove("_id");
+        object.remove("_rev");
+        object.remove("_revisions");
+        object.remove("_conflicts");
+        object.remove("_deleted_conflicts");
+        object.remove("_deleted");
+    }
+    copy["_id"] = json!(destination);
+    if let Some(rev) = destination_rev {
+        copy["_rev"] = json!(rev);
+    }
+    match commit_docs(
+        st,
+        db,
+        dbname,
+        vec![copy],
+        true,
+        num(q, "w").unwrap_or(0),
+        headers,
+    )
+    .await
+    {
+        Ok((mut results, _)) => {
+            let result = results.pop().unwrap_or(Value::Null);
+            if result.get("error").is_some() {
+                json(StatusCode::CONFLICT, result)
+            } else {
+                json(StatusCode::CREATED, result)
+            }
+        }
+        Err(error) => fail(error),
+    }
+}
+
 async fn put_doc(
     st: &AppState,
     db: &Db,
@@ -2697,6 +2854,9 @@ async fn put_doc(
     let new_edits = !q.contains_key("new_edits") || flag(q, "new_edits");
     if !new_edits && doc.get("_rev").is_none() {
         return fail(ApiError::bad_request("Document is missing _rev"));
+    }
+    if let Some(response) = check_if_match(db, docid, headers).await {
+        return response;
     }
     let tombstone = doc
         .get("_deleted")
@@ -2753,6 +2913,9 @@ async fn delete_doc(
     // without a rev is a conflict. A tombstone reports reason "deleted".
     if let Err(e) = db.get_doc(docid, &DocOpts::default()).await {
         return fail(e);
+    }
+    if let Some(response) = check_if_match(db, docid, headers).await {
+        return response;
     }
     let Some(rev) = q.get("rev") else {
         return fail(ApiError::conflict());
@@ -2821,6 +2984,11 @@ async fn proxy(
         Some(value) => request.header("content-type", value),
         None => request,
     };
+    for name in ["destination", "if-match", "if-none-match"] {
+        if let Some(value) = headers.get(name) {
+            request = request.header(name, value);
+        }
+    }
     if !body.is_empty() {
         request = request.body(body.to_vec());
     }
@@ -2834,8 +3002,18 @@ async fn proxy(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
+            let etag = resp.headers().get(header::ETAG).cloned();
+            let location = resp.headers().get(header::LOCATION).cloned();
             let bytes = resp.bytes().await.unwrap_or_default().to_vec();
-            (status, [(header::CONTENT_TYPE, content_type)], bytes).into_response()
+            let mut response =
+                (status, [(header::CONTENT_TYPE, content_type)], bytes).into_response();
+            if let Some(value) = etag {
+                response.headers_mut().insert(header::ETAG, value);
+            }
+            if let Some(value) = location {
+                response.headers_mut().insert(header::LOCATION, value);
+            }
+            response
         }
         Err(e) => fail(ApiError::new(502, "bad_gateway", e.to_string())),
     }

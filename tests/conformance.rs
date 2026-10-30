@@ -769,6 +769,118 @@ async fn changes_revs_diff_and_bulk_get() {
 }
 
 #[tokio::test]
+async fn http_conditional_copy_head_and_request_id() {
+    let s = Server::start(false);
+    s.fresh_db("http").await;
+    let (status, body) = s.put("/http/src", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rev = body["rev"].as_str().unwrap().to_string();
+
+    // If-None-Match returns 304 with the ETag and no body.
+    let response = s
+        .client
+        .get(format!("{}/http/src", s.base))
+        .header("if-none-match", format!("\"{rev}\""))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("\"{rev}\"").as_str())
+    );
+    assert!(response.text().await.unwrap().is_empty());
+
+    // A stale If-Match is a precondition failure.
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/http/src",
+            Some(json!({"v": 2, "_rev": &rev})),
+            &[(
+                "if-match",
+                "\"1-deadbeefdeadbeefdeadbeefdeadbeef\"".to_string(),
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    // The matching If-Match succeeds.
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/http/src",
+            Some(json!({"v": 2, "_rev": &rev})),
+            &[("if-match", format!("\"{rev}\""))],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // COPY uses Destination and creates a new document.
+    let response = s
+        .client
+        .request(
+            Method::from_bytes(b"COPY").unwrap(),
+            format!("{}/http/src", s.base),
+        )
+        .header("destination", "dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let (status, doc) = s.get("/http/dst").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["v"], 2);
+
+    // HEAD has the normal status/headers but no body.
+    let response = s
+        .client
+        .head(format!("{}/http/src", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().is_empty());
+
+    assert!(s
+        .client
+        .get(format!("{}/", s.base))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-couch-request-id")
+        .is_some());
+}
+
+#[tokio::test]
+async fn responses_are_gzipped_when_requested() {
+    let s = Server::start(false);
+    s.fresh_db("gzip").await;
+    let blob = "x".repeat(8 * 1024);
+    let (status, _) = s.put("/gzip/doc", json!({"blob": blob})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = s
+        .client
+        .get(format!("{}/gzip/doc", s.base))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
+}
+
+#[tokio::test]
 async fn bulk_get_preserves_order_for_a_large_batch() {
     let s = Server::start(false);
     s.fresh_db("bulkbig").await;
