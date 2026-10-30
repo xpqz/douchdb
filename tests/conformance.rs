@@ -625,6 +625,124 @@ async fn bulk_docs_and_all_docs() {
 }
 
 #[tokio::test]
+async fn all_docs_ranges_and_changes_limits_after_deletes() {
+    let s = Server::start(false);
+    s.fresh_db("ranges").await;
+    let (status, _) = s
+        .post(
+            "/ranges/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a"}, {"_id": "b"}, {"_id": "c"},
+                {"_id": "d"}, {"_id": "e"}, {"_id": "f"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for id in ["b", "d"] {
+        let (_, doc) = s.get(&format!("/ranges/{id}")).await;
+        let rev = doc["_rev"].as_str().unwrap();
+        let (status, _) = s.delete(&format!("/ranges/{id}?rev={rev}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // Live docs are a, c, e, f. Deleted docs do not count or appear in ranges.
+    let (_, body) = s.get("/ranges/_all_docs").await;
+    assert_eq!(body["total_rows"], 4);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a", "c", "e", "f"]);
+
+    let (_, body) = s.get("/ranges/_all_docs?limit=2&skip=1").await;
+    assert_eq!(body["offset"], 1, "offset includes the skipped row");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c", "e"]);
+
+    let (_, body) = s
+        .get("/ranges/_all_docs?startkey=%22c%22&limit=1&skip=1")
+        .await;
+    assert_eq!(body["offset"], 2, "one live doc precedes c, plus skip");
+    assert_eq!(body["rows"][0]["id"], "e");
+
+    let (_, body) = s
+        .get("/ranges/_all_docs?descending=true&startkey=%22e%22&limit=1")
+        .await;
+    assert_eq!(body["offset"], 1, "descending counts docs after startkey");
+    assert_eq!(body["rows"][0]["id"], "e");
+
+    let (_, body) = s
+        .get("/ranges/_all_docs?descending=true&skip=1&limit=2")
+        .await;
+    assert_eq!(body["offset"], 1);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["e", "c"]);
+
+    let (_, body) = s
+        .get("/ranges/_all_docs?startkey=%22c%22&endkey=%22e%22")
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c", "e"]);
+
+    // Keys queries still surface deleted docs but keep total_rows live-only.
+    let (_, body) = s
+        .post("/ranges/_all_docs", json!({"keys": ["b", "e"]}))
+        .await;
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["offset"], Value::Null);
+    assert_eq!(body["rows"][0]["value"]["deleted"], true);
+    assert_eq!(body["rows"][1]["id"], "e");
+
+    // A limited changes feed returns only the requested window, and its
+    // last_seq resumes exactly where it stopped.
+    let (_, first) = s.get("/ranges/_changes?since=0&limit=3").await;
+    let first_rows = first["results"].as_array().unwrap();
+    assert_eq!(first_rows.len(), 3);
+    let last_seq = first["last_seq"].as_u64().unwrap();
+    assert_eq!(first_rows[2]["seq"].as_u64().unwrap(), last_seq);
+
+    let (_, second) = s
+        .get(&format!("/ranges/_changes?since={last_seq}&limit=3"))
+        .await;
+    let second_rows = second["results"].as_array().unwrap();
+    assert_eq!(second_rows.len(), 3);
+    assert!(
+        second_rows
+            .iter()
+            .all(|row| row["seq"].as_u64().unwrap() > last_seq),
+        "resumed feed starts after last_seq"
+    );
+
+    // Descending still returns the newest rows, not the first ones scanned.
+    let (_, body) = s.get("/ranges/_changes?descending=true&limit=2").await;
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["d", "b"]);
+}
+
+#[tokio::test]
 async fn request_body_limit_is_enforced() {
     let s = Server::start_with(&["--max-request-mb".to_string(), "1".to_string()], false);
     s.fresh_db("limits").await;
