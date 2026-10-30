@@ -711,7 +711,7 @@ impl Db {
         }))
     }
 
-    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
+    async fn changes_rows(&self, opts: &ChangesOpts) -> DbResult<(Vec<ChangeRow>, u64)> {
         let mut rows = Vec::new();
         for (index, shard) in self.shards.iter().enumerate() {
             if opts
@@ -734,8 +734,12 @@ impl Db {
             rows.truncate(limit);
         }
         let last_seq = rows.last().map(|r| r.seq).unwrap_or(opts.since);
+        Ok((rows, last_seq))
+    }
 
-        let mut results = Vec::new();
+    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
+        let (rows, last_seq) = self.changes_rows(opts).await?;
+        let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             let mut entry = json!({
                 "seq": row.seq,
@@ -746,11 +750,71 @@ impl Db {
                 entry["deleted"] = json!(true);
             }
             if let Some(doc) = row.doc {
-                entry["doc"] = doc;
+                if let Ok(doc) = serde_json::from_str::<Value>(&doc) {
+                    entry["doc"] = doc;
+                }
             }
             results.push(entry);
         }
         Ok(json!({ "results": results, "last_seq": last_seq, "pending": 0 }))
+    }
+
+    /// Serialize the normal changes response directly. This is the hot path
+    /// for replication: with `include_docs=true`, the stored body is embedded
+    /// verbatim instead of being parsed into a `Value` and written again.
+    pub async fn changes_json(&self, opts: &ChangesOpts) -> DbResult<ChangesJson> {
+        use std::fmt::Write as _;
+
+        fn push_json_string(out: &mut String, value: &str) {
+            if value
+                .bytes()
+                .all(|byte| byte >= 0x20 && byte != b'"' && byte != b'\\')
+            {
+                out.push('"');
+                out.push_str(value);
+                out.push('"');
+            } else {
+                out.push_str(&serde_json::to_string(value).unwrap_or_default());
+            }
+        }
+
+        let (rows, last_seq) = self.changes_rows(opts).await?;
+        let mut out = String::with_capacity(rows.len().saturating_mul(128) + 64);
+        out.push_str("{\"results\":[");
+        for (index, row) in rows.into_iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"seq\":");
+            let _ = write!(out, "{}", row.seq);
+            out.push_str(",\"id\":");
+            push_json_string(&mut out, &row.id);
+            out.push_str(",\"changes\":[");
+            for (change_index, (rev, _)) in row.changes.iter().enumerate() {
+                if change_index > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"rev\":");
+                push_json_string(&mut out, rev);
+                out.push('}');
+            }
+            out.push(']');
+            if row.deleted {
+                out.push_str(",\"deleted\":true");
+            }
+            if let Some(doc) = row.doc {
+                out.push_str(",\"doc\":");
+                out.push_str(&doc);
+            }
+            out.push('}');
+        }
+        out.push_str("],\"last_seq\":");
+        let _ = write!(out, "{last_seq}");
+        out.push_str(",\"pending\":0}");
+        Ok(ChangesJson {
+            body: out,
+            last_seq,
+        })
     }
 
     pub async fn revs_diff(&self, body: &Value) -> DbResult<Value> {
@@ -1595,7 +1659,15 @@ struct ChangeRow {
     seq: u64,
     changes: Vec<(String, bool)>,
     deleted: bool,
-    doc: Option<Value>,
+    /// Full document JSON with `_id`/`_rev` already inserted. Keeping this as
+    /// text lets the normal changes feed embed the stored body without parsing
+    /// and re-serializing it.
+    doc: Option<String>,
+}
+
+pub(crate) struct ChangesJson {
+    pub body: String,
+    pub last_seq: u64,
 }
 
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
@@ -1957,9 +2029,9 @@ fn collect_changes(
             let live = shard.live_docs()?.get(&id).cloned();
             if let Some(live) = live {
                 let doc = if opts.include_docs {
-                    shard.get_body(&id, &live.rev).and_then(|body| {
-                        serde_json::from_str::<Value>(&embed_doc_meta(&id, &live.rev, &body)).ok()
-                    })
+                    shard
+                        .get_body(&id, &live.rev)
+                        .map(|body| embed_doc_meta(&id, &live.rev, &body))
                 } else {
                     None
                 };
@@ -2000,17 +2072,24 @@ fn collect_changes(
             vec![(winner.clone(), deleted)]
         };
         let doc = if opts.include_docs {
-            read_doc_rev(
-                shard,
-                &id,
-                &meta,
-                &winner,
-                &DocOpts {
-                    rev: Some(winner.clone()),
-                    ..Default::default()
-                },
-            )
-            .ok()
+            if deleted {
+                read_doc_rev(
+                    shard,
+                    &id,
+                    &meta,
+                    &winner,
+                    &DocOpts {
+                        rev: Some(winner.clone()),
+                        ..Default::default()
+                    },
+                )
+                .ok()
+                .and_then(|doc| serde_json::to_string(&doc).ok())
+            } else {
+                shard
+                    .get_body(&id, &winner)
+                    .map(|body| embed_doc_meta(&id, &winner, &body))
+            }
         } else {
             None
         };

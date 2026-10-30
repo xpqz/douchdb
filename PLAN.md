@@ -388,7 +388,9 @@ Above ~6k means something was built that nobody asked for.
   reachable node. Reduce partials are recombined after fallback, including
   grouped and custom `rereduce` reducers. Changes use the live-document index
   for winning revisions and compact sequence tokens, avoiding per-row metadata
-  decodes and duplicate detection. Full `_changes` feeds
+  decodes and duplicate detection. Normal changes responses are serialized
+  directly, with `include_docs` bodies embedded verbatim rather than parsed and
+  rebuilt. Full `_changes` feeds
   also query peers concurrently; limited
   feeds merge node prefixes round-robin up to the global limit. Unavailable
   change nodes are skipped and covered by replicas, with their vector

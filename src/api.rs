@@ -2281,10 +2281,128 @@ async fn changes(
         }
     }
 
+    if feed == "normal" {
+        if let Some(response) = changes_normal_raw(&st, &db, q, body, headers, local_only).await {
+            return response;
+        }
+    }
+
     match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
     }
+}
+
+/// Rewrite the trailing numeric `last_seq` in a locally built changes body
+/// with the cluster version vector, without parsing the rows again.
+fn rewrite_last_seq(body: &mut Vec<u8>, vector: &[u64]) {
+    let marker = b"\"last_seq\":";
+    let Some(position) = body
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+    else {
+        return;
+    };
+    let start = position + marker.len();
+    let Some(relative) = body[start..].iter().position(|byte| *byte == b',') else {
+        return;
+    };
+    let end = start + relative;
+    let encoded = serde_json::to_vec(&crate::fabric::encode_since(vector)).unwrap_or_default();
+    body.splice(start..end, encoded);
+}
+
+async fn changes_normal_raw(
+    st: &AppState,
+    db: &Db,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    local_only: bool,
+) -> Option<Response> {
+    if flag(q, "descending") {
+        return None;
+    }
+    let mut local_mask = None;
+    if st.cluster.is_clustered() && !local_only {
+        let masks = crate::fabric::preferred_shard_masks(st, db);
+        let active: Vec<usize> = masks
+            .iter()
+            .enumerate()
+            .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+            .map(|(node, _)| node)
+            .collect();
+        if active.len() != 1 || active[0] != st.cluster.me {
+            return None;
+        }
+        local_mask = Some(masks[st.cluster.me].clone());
+    }
+    let (mut opts, mut progress) = changes_options(st, db, q, body, headers, local_only)
+        .await
+        .ok()?;
+    let rewrite = local_mask.is_some();
+    if let Some(mask) = local_mask {
+        opts.owned = Some(mask);
+    }
+    let changes = db.changes_json(&opts).await.ok()?;
+    let mut body = changes.body.into_bytes();
+    if rewrite {
+        progress[st.cluster.me] = changes.last_seq;
+        rewrite_last_seq(&mut body, &progress);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .ok()
+}
+
+async fn changes_options(
+    st: &AppState,
+    db: &Db,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    local_only: bool,
+) -> DbResult<(ChangesOpts, Vec<u64>)> {
+    let n = st.cluster.nodes.len().max(1);
+    let raw_since = q.get("since").map(String::as_str);
+    let mut progress = if raw_since == Some("now") {
+        if st.cluster.is_clustered() && !local_only {
+            cluster_update_vector(st, db, &db.name, headers).await?
+        } else {
+            let mut vector = vec![0; n];
+            vector[st.cluster.me] = db.info().await?["update_seq"].as_u64().unwrap_or(0);
+            vector
+        }
+    } else if let Some(raw) = raw_since {
+        match decode_since(raw) {
+            Some(mut vector) => {
+                vector.resize(n.max(vector.len()), 0);
+                vector
+            }
+            None => vec![since_component(Some(raw), st.cluster.me); n],
+        }
+    } else {
+        vec![0; n]
+    };
+    progress.resize(n, 0);
+    let since = progress.get(st.cluster.me).copied().unwrap_or(0);
+    let owned = if is_forwarded(st, headers) {
+        q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
+    } else {
+        None
+    };
+    let opts = ChangesOpts {
+        since,
+        limit: num(q, "limit"),
+        include_docs: flag(q, "include_docs"),
+        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
+        descending: flag(q, "descending"),
+        doc_ids: doc_ids_from(q, body),
+        owned,
+    };
+    Ok((opts, progress))
 }
 
 async fn changes_once(
@@ -2300,25 +2418,7 @@ async fn changes_once(
         return cluster_changes(st, db, dbname, q, body, headers).await;
     }
 
-    let since = if q.get("since").map(String::as_str) == Some("now") {
-        db.info().await?["update_seq"].as_u64().unwrap_or(0)
-    } else {
-        since_component(q.get("since").map(String::as_str), st.cluster.me)
-    };
-    let owned = if is_forwarded(st, headers) {
-        q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
-    } else {
-        None
-    };
-    let opts = ChangesOpts {
-        since,
-        limit: num(q, "limit"),
-        include_docs: flag(q, "include_docs"),
-        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
-        descending: flag(q, "descending"),
-        doc_ids: doc_ids_from(q, body),
-        owned,
-    };
+    let (opts, _) = changes_options(st, db, q, body, headers, local_only).await?;
     db.changes(&opts).await
 }
 

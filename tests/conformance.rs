@@ -2224,6 +2224,16 @@ async fn cluster_full_replica_reads_survive_two_node_loss() {
     let (status, body) = nodes[0].get("/clfull/_changes?limit=5").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["results"].as_array().unwrap().len(), 5);
+    let (status, body) = nodes[0]
+        .get("/clfull/_changes?include_docs=true&limit=3")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 3);
+    assert!(body["last_seq"].is_string(), "{body}");
+    for row in body["results"].as_array().unwrap() {
+        assert_eq!(row["doc"]["_id"], row["id"]);
+        assert!(row["doc"]["_rev"].is_string());
+    }
 }
 
 #[tokio::test]
