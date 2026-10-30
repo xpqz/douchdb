@@ -302,31 +302,15 @@ impl Db {
         for shard in &self.shards {
             let mut shard_docs = shard
                 .call(|s| {
-                    let mut metas = Vec::new();
-                    s.scan_range_while(b"m/", None, false, |key, bytes| {
-                        let Some(id) = std::str::from_utf8(&key[2..]).ok() else {
-                            return true;
-                        };
-                        if id.starts_with("_design/") || id.starts_with("_local/") {
-                            return true;
-                        }
-                        let Ok(meta) = serde_json::from_slice::<DocMeta>(bytes) else {
-                            return true;
-                        };
-                        let Some(winner) = meta.tree.winner() else {
-                            return true;
-                        };
-                        if meta.tree.is_deleted(&winner) {
-                            return true;
-                        }
-                        let has_attachments = meta
-                            .atts
-                            .get(&winner)
-                            .map(|atts| !atts.is_empty())
-                            .unwrap_or(false);
-                        metas.push((id.to_string(), winner, has_attachments));
-                        true
-                    })?;
+                    // Build (or reuse) the live map, then read only bodies.
+                    // This avoids decoding every full DocMeta record again for
+                    // each cold view build.
+                    let metas: Vec<(String, String, bool)> = s
+                        .live_docs()?
+                        .iter()
+                        .filter(|(id, _)| !id.starts_with("_design/") && !id.starts_with("_local/"))
+                        .map(|(id, doc)| (id.clone(), doc.rev.clone(), doc.has_attachments))
+                        .collect();
 
                     let mut docs = Vec::with_capacity(metas.len());
                     for (id, rev, has_attachments) in metas {
@@ -1487,11 +1471,11 @@ fn collect_all_docs(
                     (None, Some(end)) => (Bound::Included(end), Bound::Unbounded),
                     (None, None) => (Bound::Unbounded, Bound::Unbounded),
                 };
-                for (id, winner) in live.range::<str, _>(range).rev() {
+                for (id, doc) in live.range::<str, _>(range).rev() {
                     if rows.len() >= take {
                         break;
                     }
-                    rows.push((id.clone(), Some(winner.clone()), None, Vec::new(), false));
+                    rows.push((id.clone(), Some(doc.rev.clone()), None, Vec::new(), false));
                 }
             } else {
                 let range = match (start, end) {
@@ -1500,11 +1484,11 @@ fn collect_all_docs(
                     (None, Some(end)) => (Bound::Unbounded, Bound::Included(end)),
                     (None, None) => (Bound::Unbounded, Bound::Unbounded),
                 };
-                for (id, winner) in live.range::<str, _>(range) {
+                for (id, doc) in live.range::<str, _>(range) {
                     if rows.len() >= take {
                         break;
                     }
-                    rows.push((id.clone(), Some(winner.clone()), None, Vec::new(), false));
+                    rows.push((id.clone(), Some(doc.rev.clone()), None, Vec::new(), false));
                 }
             }
         }
