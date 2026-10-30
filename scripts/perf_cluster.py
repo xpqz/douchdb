@@ -585,6 +585,19 @@ def main():
             js_lat, time.perf_counter() - started
         )
 
+        include_lat = []
+        started = time.perf_counter()
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/native/_view/by_value?reduce=false&include_docs=true&limit=100",
+            )
+            include_lat.append(elapsed)
+        result["operations"]["view_include_docs_limit_100"] = summary(
+            include_lat, time.perf_counter() - started
+        )
+
         request(conns[0], "POST", "/perf/_ensure_full_commit", {})
         for conn in conns:
             conn.close()

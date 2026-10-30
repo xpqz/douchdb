@@ -405,6 +405,38 @@ Cold builds still read every body and write the index; the saving is the
 QuickJS compile/eval/JSON boundary. Warm queries are dominated by index reads
 and cluster transport.
 
+### Hot-path cleanup (#69)
+
+Several repeated operations were removed without adding caches:
+
+- View queries read the shared atomic update counter instead of calling
+  `db.info()` and round-tripping every shard actor just to learn the current
+  sequence. The incremental-index path also advances its checkpoint to the
+  observed sequence if the counter is ahead of the returned changes.
+- A view query loads its design document once. The coordinator and local
+  execution path no longer reload it through `load_spec` a second time.
+- `include_docs` view queries load documents only for the rows selected after
+  key/range/skip/limit filtering. Previously every document in the owned shards
+  was loaded and attached before filtering.
+- Write routing computes a document's owner and replica list with one shard
+  hash and one shard-map read instead of calling `owner_of_doc` and
+  `replicas_of_doc` separately.
+- Cluster update-vector reads use an internal update-sequence response instead
+  of fetching full database info from every peer.
+
+Measured against the previous build:
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| View `include_docs`, limit 100 | 10.0 req/s | 216.1 req/s | 91.6 ms | 4.4 ms |
+| `GET /db` (cluster update vector) | 1,655 req/s | 1,944 req/s | 0.55 ms | 0.47 ms |
+| Warm native map | 463 req/s | 469 req/s | 2.15 ms | 2.07 ms |
+| `_changes?limit=1000` | 429 req/s | 456 req/s | 2.27 ms | 2.13 ms |
+
+The include-docs result is the important one: that path was doing all the
+document-loading work the old API shape implied, even when the view returned
+only 100 rows.
+
 ### Local-replica reads and cluster fan-out (#58, #59)
 
 Shard-masked reads now prefer the coordinator's local replica for every

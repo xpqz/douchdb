@@ -343,7 +343,9 @@ Above ~6k means something was built that nobody asked for.
   partials are combined; custom reducers use QuickJS and `rereduce`. Simple
   single-emit maps that read top-level document fields or JSON literals are
   recognized and evaluated without JavaScript; anything more complex falls back
-  to QuickJS. Indexes persist under
+  to QuickJS. Warm queries use the atomic update sequence instead of per-shard
+  info calls, and `include_docs` loads bodies only for the selected rows.
+  Indexes persist under
   `_view_indexes/` and update from `_changes`; design changes rebuild them.
   Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
   and time limits are configurable, and `_view_cleanup` removes stale indexes.

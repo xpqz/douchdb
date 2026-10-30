@@ -330,8 +330,8 @@ pub(crate) async fn commit_docs(
                 .to_string()
         })
         .collect();
-    let primaries: Vec<usize> = ids.iter().map(|id| owner_of_doc(db, id)).collect();
-    let replicas: Vec<Vec<usize>> = ids.iter().map(|id| replicas_of_doc(db, id)).collect();
+    let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
+        ids.iter().map(|id| db.placement_of_doc(id)).unzip();
     let replication = st.cluster.replication_factor();
     // CouchDB defaults to a write quorum and lets `?w=` override it.
     let quorum = if w == 0 {
@@ -916,6 +916,7 @@ async fn fetch_view_mask(
     node: usize,
     mask: &[bool],
     limit: Option<usize>,
+    spec: &crate::view::ViewSpec,
 ) -> DbResult<(
     usize,
     Arc<Vec<crate::view::Row>>,
@@ -926,14 +927,12 @@ async fn fetch_view_mask(
         return Ok((node, Arc::new(Vec::new()), HashMap::new(), 0));
     }
     if node == st.cluster.me {
-        let (_, rows, node_docs) = crate::view::local_map(
+        let rows = crate::view::local_rows(
             db,
             ddoc,
             view_name,
-            query.include_docs || query.attachments,
-            query.attachments,
+            spec,
             query.limits,
-            Some(mask),
             query.partition.as_deref(),
         )
         .await?;
@@ -951,6 +950,12 @@ async fn fetch_view_mask(
                 rows.truncate(limit);
             }
         }
+        let node_docs = if query.include_docs || query.attachments {
+            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+            crate::view::docs_by_ids(db, query.attachments, &ids).await?
+        } else {
+            HashMap::new()
+        };
         return Ok((node, Arc::new(rows), node_docs, total_rows));
     }
 
@@ -1057,9 +1062,10 @@ pub(crate) async fn cluster_view_rows(
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
         let mask = owned_by_node[node].clone();
+        let spec = spec.clone();
         async move {
             fetch_view_mask(
-                st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit,
+                st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit, &spec,
             )
             .await
         }
@@ -1078,14 +1084,16 @@ pub(crate) async fn cluster_view_rows(
         crate::telemetry::record_degraded_read();
         let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
         let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-        let fallbacks =
-            futures::future::join_all(groups.into_iter().map(|(node, mask)| async move {
+        let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
+            let spec = spec.clone();
+            async move {
                 fetch_view_mask(
-                    st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit,
+                    st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit, &spec,
                 )
                 .await
-            }))
-            .await;
+            }
+        }))
+        .await;
         for fallback in fallbacks {
             values.push(fallback?);
         }
@@ -1798,13 +1806,14 @@ pub(crate) async fn cluster_update_vector(
 ) -> DbResult<Vec<u64>> {
     let out = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
         if node == st.cluster.me {
-            return Ok(db.info().await?["update_seq"].as_u64().unwrap_or(0));
+            return Ok(db.update_seq());
         }
         let peer = &st.cluster.nodes[node];
         let request = st
             .client
             .get(format!("{peer}/{dbname}"))
             .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-update-seq", "1")
             .header("x-douchdb-secret", st.cluster.secret.as_str());
         let request = forward_client_auth(request, headers);
         let seq = match request.send().await {

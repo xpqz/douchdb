@@ -372,6 +372,27 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
+    /// Current committed sequence counter. This is the same database-wide
+    /// counter used for `update_seq`, without asking every shard actor.
+    pub fn update_seq(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
+    /// Owner and replica list for a document, computed with one shard-map
+    /// read and one shard hash. Write routing needs both for every document.
+    pub fn placement_of_doc(&self, docid: &str) -> (usize, Vec<usize>) {
+        let shard = self.shard_index(docid) as u32;
+        let map = self
+            .shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let owner = map.owner_of(shard);
+        if docid.starts_with("_design/") {
+            return (owner, (0..map.node_count).collect());
+        }
+        (owner, map.replicas_of(shard).to_vec())
+    }
+
     pub async fn info(&self) -> DbResult<Value> {
         let mut doc_count = 0;
         let mut deleted_count = 0;

@@ -388,23 +388,36 @@ impl ViewIndex {
 
 /// Run one view query against the local shards.
 pub async fn query(db: &Db, ddoc_id: &str, view_name: &str, query: &ViewQuery) -> DbResult<Value> {
-    validate_view_partition(
-        db,
-        &load_spec(db, ddoc_id, view_name).await?,
-        query.partition.as_deref(),
-    )?;
-    let (spec, rows, docs) = local_map(
+    let spec = load_spec(db, ddoc_id, view_name).await?;
+    query_with_spec(db, ddoc_id, view_name, &spec, query).await
+}
+
+/// Same as `query`, for callers that already loaded the design document.
+pub async fn query_with_spec(
+    db: &Db,
+    ddoc_id: &str,
+    view_name: &str,
+    spec: &ViewSpec,
+    query: &ViewQuery,
+) -> DbResult<Value> {
+    validate_view_partition(db, spec, query.partition.as_deref())?;
+    let rows = local_rows(
         db,
         ddoc_id,
         view_name,
-        query.include_docs || query.attachments,
-        query.attachments,
+        spec,
         query.limits,
-        query.owner_shards.as_deref(),
         query.partition.as_deref(),
     )
     .await?;
-    finish(&spec, rows, docs, query)
+    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    let docs = if !reduce && (query.include_docs || query.attachments) {
+        let ids = selected_row_ids(&rows, query);
+        docs_by_ids(db, query.attachments, &ids).await?
+    } else {
+        HashMap::new()
+    };
+    finish(spec, rows, docs, query)
 }
 
 /// Partitioned design docs may only be queried through `_partition`, and
@@ -430,19 +443,16 @@ pub fn validate_view_partition(db: &Db, spec: &ViewSpec, partition: Option<&str>
     }
 }
 
-/// Local map rows plus the documents they came from, for cluster merging.
-pub async fn local_map(
+/// Local map rows, filtered to a partition when requested.
+pub async fn local_rows(
     db: &Db,
     ddoc_id: &str,
     view_name: &str,
-    need_docs: bool,
-    attachments: bool,
+    spec: &ViewSpec,
     limits: ViewLimits,
-    owner: Option<&[bool]>,
     partition: Option<&str>,
-) -> DbResult<(ViewSpec, Arc<Vec<Row>>, HashMap<String, Value>)> {
-    let spec = load_spec(db, ddoc_id, view_name).await?;
-    let rows = ensure_rows(db, ddoc_id, view_name, &spec, limits).await?;
+) -> DbResult<Arc<Vec<Row>>> {
+    let rows = ensure_rows(db, ddoc_id, view_name, spec, limits).await?;
     let rows = match partition {
         Some(partition) => {
             let prefix = format!("{partition}:");
@@ -455,12 +465,7 @@ pub async fn local_map(
         }
         None => rows,
     };
-    let docs = if need_docs {
-        docs_by_id(db, attachments, owner, partition).await?
-    } else {
-        HashMap::new()
-    };
-    Ok((spec, rows, docs))
+    Ok(rows)
 }
 
 pub fn finish(
@@ -479,7 +484,7 @@ async fn ensure_rows(
     spec: &ViewSpec,
     limits: ViewLimits,
 ) -> DbResult<Arc<Vec<Row>>> {
-    let current_seq = db.info().await?["update_seq"].as_u64().unwrap_or(0);
+    let current_seq = db.update_seq();
     let design = if NativeMap::parse(&spec.map).is_some() {
         format!(
             "{}|{}|native={NATIVE_MAP_VERSION}",
@@ -538,7 +543,10 @@ async fn ensure_rows(
         for row in rows {
             by_doc.entry(row.id.clone()).or_default().push(row);
         }
-        let last_seq = changes["last_seq"].as_u64().unwrap_or(current_seq);
+        let last_seq = changes["last_seq"]
+            .as_u64()
+            .unwrap_or(current_seq)
+            .max(current_seq);
         index
             .apply(changed, by_doc, last_seq, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
@@ -556,24 +564,22 @@ async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<
     })
 }
 
-async fn docs_by_id(
+pub(crate) async fn docs_by_ids(
     db: &Db,
     attachments: bool,
-    owner: Option<&[bool]>,
-    partition: Option<&str>,
+    ids: &[String],
 ) -> DbResult<HashMap<String, Value>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let opts = AllDocsOpts {
-        partition: partition.map(str::to_string),
+        keys: Some(ids.to_vec()),
         include_docs: true,
         attachments,
         limit: usize::MAX,
         ..Default::default()
     };
-    let all = if let Some(owned) = owner {
-        db.all_docs_owned(&opts, owned).await?
-    } else {
-        db.all_docs(&opts).await?
-    };
+    let all = db.all_docs(&opts).await?;
     let mut docs = HashMap::new();
     for row in all["rows"].as_array().cloned().unwrap_or_default() {
         let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
@@ -1017,15 +1023,8 @@ fn run_map_json(
     })
 }
 
-fn render(
-    spec: &ViewSpec,
-    rows: &[Row],
-    docs: &HashMap<String, Value>,
-    query: &ViewQuery,
-) -> DbResult<Value> {
+fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize) {
     let mut total_rows = query.total_rows_override.unwrap_or(rows.len());
-
-    // `rows` is cached in CouchDB collation order, so queries never re-sort it.
     let mut ordered: Vec<&Row> = if query.descending {
         rows.iter().rev().collect()
     } else {
@@ -1059,7 +1058,28 @@ fn render(
     } else if let Some(key) = &query.key {
         ordered.retain(|row| cmp_json(&row.key, key) == Ordering::Equal);
     }
+    (ordered, total_rows)
+}
 
+fn selected_row_ids(rows: &[Row], query: &ViewQuery) -> Vec<String> {
+    let (mut ordered, _) = ordered_rows(rows, query);
+    ordered.retain(|row| in_range(row, query));
+    let skip = query.skip.min(ordered.len());
+    ordered
+        .into_iter()
+        .skip(skip)
+        .take(query.limit)
+        .map(|row| row.id.clone())
+        .collect()
+}
+
+fn render(
+    spec: &ViewSpec,
+    rows: &[Row],
+    docs: &HashMap<String, Value>,
+    query: &ViewQuery,
+) -> DbResult<Value> {
+    let (mut ordered, total_rows) = ordered_rows(rows, query);
     let before_start = count_before_start(&ordered, query);
     ordered.retain(|row| in_range(row, query));
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
@@ -1075,8 +1095,6 @@ fn render(
         let groups = group_rows(ordered, query);
         let mut out = Vec::new();
         for (key, members) in groups {
-            // Built-ins only need the values (or, for _count, just the row
-            // count), so avoid allocating a key array for every row.
             let value = match reducer.as_str() {
                 "_count" => Ok(json!(members.len())),
                 "_sum" => reduce_sum(members.iter().map(|row| &row.value)),
