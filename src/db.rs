@@ -336,36 +336,65 @@ impl Db {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
-        let mut results = Vec::new();
-        for req in reqs {
+
+        // One shard-actor round trip per shard instead of one per document.
+        // `_bulk_get` is on the hot replication path, so the channel hops are
+        // the difference between a batch and a request storm.
+        let mut grouped: Vec<Vec<(usize, String, DocOpts)>> =
+            (0..self.q).map(|_| Vec::new()).collect();
+        for (slot, req) in reqs.iter().enumerate() {
             let id = req
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let rev = req.get("rev").and_then(Value::as_str).map(str::to_string);
-            let revs = req.get("revs").and_then(Value::as_bool).unwrap_or(revs);
             let opts = DocOpts {
-                rev: rev.clone(),
-                revs,
+                rev,
+                revs: req.get("revs").and_then(Value::as_bool).unwrap_or(revs),
                 attachments: req
                     .get("attachments")
                     .and_then(Value::as_bool)
                     .unwrap_or(attachments),
                 ..Default::default()
             };
-            let docs = match self.get_doc(&id, &opts).await {
-                Ok(doc) => vec![json!({"ok": doc})],
-                Err(e) => vec![json!({"error": {
-                    "id": id,
-                    "rev": rev.unwrap_or_else(|| "undefined".into()),
-                    "error": e.error,
-                    "reason": e.reason
-                }})],
-            };
-            results.push(json!({ "id": id, "docs": docs }));
+            grouped[self.shard_index(&id)].push((slot, id, opts));
         }
-        Ok(json!({ "results": results }))
+
+        let mut out: Vec<Option<Value>> = vec![None; reqs.len()];
+        for (index, batch) in grouped.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            let results = self.shards[index]
+                .call(move |shard| {
+                    let mut out = Vec::with_capacity(batch.len());
+                    for (slot, id, opts) in batch {
+                        let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
+                        let result = read_doc(shard, &id, &opts);
+                        out.push((slot, id, rev, result));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            for (slot, id, rev, result) in results {
+                out[slot] = Some(match result {
+                    Ok(doc) => json!({ "id": id, "docs": [{"ok": doc}] }),
+                    Err(error) => json!({
+                        "id": id,
+                        "docs": [{"error": {
+                            "id": id,
+                            "rev": rev,
+                            "error": error.error,
+                            "reason": error.reason,
+                        }}]
+                    }),
+                });
+            }
+        }
+        Ok(json!({
+            "results": out.into_iter().map(|value| value.unwrap_or(Value::Null)).collect::<Vec<_>>()
+        }))
     }
 
     // ----- local documents -------------------------------------------------

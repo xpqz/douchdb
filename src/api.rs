@@ -1259,6 +1259,18 @@ async fn bulk_docs(
     }
 }
 
+fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
+    if new_edits {
+        json(StatusCode::CREATED, Value::Array(results))
+    } else {
+        let errors: Vec<Value> = results
+            .into_iter()
+            .filter(|result| result.get("error").is_some())
+            .collect();
+        json(StatusCode::CREATED, Value::Array(errors))
+    }
+}
+
 /// Place documents on their replica sets.
 ///
 /// `new_edits=true` writes to each document's primary (the coordinating
@@ -1361,8 +1373,10 @@ async fn commit_docs(
             pending = retry;
         }
 
-        // Copy each successful revision to the rest of its replica set.
-        let mut batches: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        // Fetch the successful revisions in one `_bulk_get` per primary
+        // instead of one GET per document. Then copy each primary's batch to
+        // the remaining replicas in one `_bulk_docs` per peer.
+        let mut fetch_groups: HashMap<usize, Vec<(usize, String, String)>> = HashMap::new();
         for slot in 0..total {
             let Some(source) = written_at[slot] else {
                 continue;
@@ -1370,19 +1384,32 @@ async fn commit_docs(
             let Some(rev) = out[slot].get("rev").and_then(Value::as_str) else {
                 continue;
             };
+            fetch_groups.entry(source).or_default().push((
+                slot,
+                ids[slot].clone(),
+                rev.to_string(),
+            ));
+        }
+        let mut full_docs: HashMap<usize, Value> = HashMap::new();
+        for (source, requests) in fetch_groups {
+            // The primary already has the write. If the batch fetch fails
+            // (for example the node died just after committing), do not fail
+            // the client request; anti-entropy will finish the copy later.
+            if let Ok(docs) = fetch_revs(st, db, dbname, source, requests, headers).await {
+                full_docs.extend(docs);
+            }
+        }
+        let mut batches: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        for (slot, full) in full_docs {
+            let Some(source) = written_at[slot] else {
+                continue;
+            };
             for node in replicas[slot]
                 .iter()
                 .copied()
                 .filter(|node| *node != source)
             {
-                // The primary already has the write. If fetching the revision
-                // fails (for example the node died just after committing), do
-                // not fail the client request; anti-entropy will finish the
-                // copy later.
-                if let Ok(full) = fetch_rev(st, db, dbname, source, &ids[slot], rev, headers).await
-                {
-                    batches.entry(node).or_default().push((slot, full));
-                }
+                batches.entry(node).or_default().push((slot, full.clone()));
             }
         }
         for (node, batch) in batches {
@@ -1460,56 +1487,56 @@ async fn write_local_or_forward(
 /// Read one revision with its history and attachment bytes, for copying to
 /// another replica. `attachments=true` matters: a stub would not carry the
 /// chunk data the secondary needs to store the same bytes.
-async fn fetch_rev(
+async fn fetch_revs(
     st: &AppState,
     db: &Db,
     dbname: &str,
     node: usize,
-    id: &str,
-    rev: &str,
+    requests: Vec<(usize, String, String)>,
     headers: &HeaderMap,
-) -> DbResult<Value> {
-    let opts = DocOpts {
-        rev: Some(rev.to_string()),
-        revs: true,
-        attachments: true,
-        ..Default::default()
-    };
-    if node == st.cluster.me {
-        return db.get_doc(id, &opts).await;
-    }
-    let peer = &st.cluster.nodes[node];
-    let url = format!("{peer}/{dbname}/{}", percent_encode(id));
-    let request =
-        st.client
-            .get(url)
-            .query(&[("rev", rev), ("revs", "true"), ("attachments", "true")]);
-    let request = forward_client_auth(request, &headers);
-    let response = request
-        .send()
-        .await
-        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        return Err(ApiError::new(status, "replica_fetch_failed", text));
-    }
-    response
-        .json::<Value>()
-        .await
-        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
-}
-
-fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
-    if new_edits {
-        json(StatusCode::CREATED, Value::Array(results))
+) -> DbResult<Vec<(usize, Value)>> {
+    let docs: Vec<Value> = requests
+        .iter()
+        .map(|(_, id, rev)| json!({"id": id, "rev": rev}))
+        .collect();
+    let body = json!({"docs": docs});
+    let value = if node == st.cluster.me {
+        db.bulk_get(&body, true, true).await?
     } else {
-        let errors: Vec<Value> = results
-            .into_iter()
-            .filter(|r| r.get("error").is_some())
-            .collect();
-        json(StatusCode::CREATED, Value::Array(errors))
+        let peer = st.cluster.nodes[node].clone();
+        forward_json(
+            st,
+            &peer,
+            dbname,
+            "_bulk_get",
+            "revs=true&attachments=true",
+            &body,
+            headers,
+        )
+        .await?
+    };
+    let mut out = Vec::new();
+    for (index, row) in value["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        let Some((slot, _, _)) = requests.get(index) else {
+            continue;
+        };
+        let Some(doc) = row
+            .get("docs")
+            .and_then(Value::as_array)
+            .and_then(|docs| docs.first())
+            .and_then(|entry| entry.get("ok"))
+        else {
+            continue;
+        };
+        out.push((*slot, doc.clone()));
     }
+    Ok(out)
 }
 
 async fn forward_bulk(

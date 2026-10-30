@@ -769,6 +769,31 @@ async fn changes_revs_diff_and_bulk_get() {
 }
 
 #[tokio::test]
+async fn bulk_get_preserves_order_for_a_large_batch() {
+    let s = Server::start(false);
+    s.fresh_db("bulkbig").await;
+    let docs: Vec<Value> = (0..250)
+        .map(|i| json!({"_id": format!("b{i:03}"), "n": i}))
+        .collect();
+    let (status, _) = s.post("/bulkbig/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let reqs: Vec<Value> = (0..250)
+        .rev()
+        .map(|i| json!({"id": format!("b{i:03}")}))
+        .collect();
+    let (status, body) = s.post("/bulkbig/_bulk_get", json!({"docs": reqs})).await;
+    assert_eq!(status, StatusCode::OK);
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 250);
+    for (index, row) in results.iter().enumerate() {
+        let expected = 249 - index;
+        assert_eq!(row["id"], format!("b{expected:03}"));
+        assert_eq!(row["docs"][0]["ok"]["n"], expected);
+    }
+}
+
+#[tokio::test]
 async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     let s = Server::start(false);
     s.fresh_db("revs").await;
