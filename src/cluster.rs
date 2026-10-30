@@ -36,6 +36,25 @@ impl ShardMap {
         }
     }
 
+    /// Evenly spread shard replicas across nodes. This is intentionally
+    /// simple: for shard `s`, replica `k` goes to `(s + k) % node_count`.
+    pub fn balanced(q: u32, node_count: usize, n: usize) -> ShardMap {
+        let q = q.max(1);
+        let node_count = node_count.max(1);
+        let n = n.max(1).min(node_count);
+        ShardMap {
+            q,
+            node_count,
+            replicas: (0..q)
+                .map(|shard| {
+                    (0..n)
+                        .map(|replica| (shard as usize + replica) % node_count)
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
     pub fn replicas_of(&self, shard: u32) -> &[usize] {
         self.replicas
             .get(shard as usize)
@@ -225,6 +244,23 @@ mod tests {
         assert!(cluster.is_local("anything", 8));
         assert_eq!(cluster.owner_url("anything", 8), None);
         assert_eq!(cluster.replicas_of_doc("anything", 8), vec![0]);
+    }
+
+    #[test]
+    fn balanced_map_spreads_shards_evenly() {
+        let map = ShardMap::balanced(6, 3, 2);
+        assert_eq!(map.replicas.len(), 6);
+        for replicas in &map.replicas {
+            assert_eq!(replicas.len(), 2);
+            assert_ne!(replicas[0], replicas[1]);
+        }
+        let mut counts = [0usize; 3];
+        for shard in 0..6 {
+            for node in map.replicas_of(shard) {
+                counts[*node] += 1;
+            }
+        }
+        assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1);
     }
 
     #[test]

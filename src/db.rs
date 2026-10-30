@@ -225,6 +225,16 @@ impl Db {
         self.owner_of_shard(self.shard_index(docid) as u32)
     }
 
+    pub async fn clear_shards(&self, shards: &[usize]) -> DbResult<()> {
+        for &index in shards {
+            let Some(shard) = self.shards.get(index) else {
+                continue;
+            };
+            shard.call(|s| s.clear().map_err(ApiError::from)).await?;
+        }
+        Ok(())
+    }
+
     fn shard(&self, docid: &str) -> &ShardHandle {
         &self.shards[self.shard_index(docid)]
     }

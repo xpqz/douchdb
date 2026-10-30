@@ -1704,6 +1704,92 @@ async fn cluster_shard_map_moves_data_between_nodes() {
 }
 
 #[tokio::test]
+async fn cluster_rebalance_converges_and_cleans_old_replicas() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("reb").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/reb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("reb{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/reb/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The planner spreads the four shards across the three nodes.
+    let (status, map) = nodes[0]
+        .post("/_node/_local/_dbs/reb/rebalance", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    let owners: std::collections::HashSet<u64> = map["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|replicas| replicas[0].as_u64().unwrap())
+        .collect();
+    assert!(owners.len() > 1, "planner must use multiple nodes: {map}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = nodes[0].get("/reb/_all_docs").await;
+        if status == StatusCode::OK && body["total_rows"] == 9 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("rebalance did not converge: {status} {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Move everything to node1, wait for convergence, then clean node0's
+    // non-owned local shards.
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/reb", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = nodes[1].get("/reb/_all_docs").await;
+        if status == StatusCode::OK && body["total_rows"] == 9 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("shard move did not converge on node1: {status} {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (status, cleared) = nodes[0]
+        .post("/_node/_local/_dbs/reb/cleanup", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["cleared"].as_array().unwrap().len(), 4);
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (_, info) = nodes[0]
+        .req_with(Method::GET, "/reb", None, &internal)
+        .await;
+    assert_eq!(info["doc_count"], 0, "old replica was not cleared");
+    let (_, info) = nodes[1]
+        .req_with(Method::GET, "/reb", None, &internal)
+        .await;
+    assert_eq!(info["doc_count"], 9, "new replica lost data");
+
+    let (status, body) = nodes[0].get("/reb/_all_docs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 9);
+}
+
+#[tokio::test]
 async fn cluster_all_docs_survives_node_loss_via_replicas() {
     let mut nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {

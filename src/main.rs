@@ -206,6 +206,14 @@ async fn main() -> anyhow::Result<()> {
             get(api::db_metadata).put(api::db_metadata_put),
         )
         .route(
+            "/_node/_local/_dbs/{db}/rebalance",
+            axum::routing::post(api::db_rebalance),
+        )
+        .route(
+            "/_node/_local/_dbs/{db}/cleanup",
+            axum::routing::post(api::db_cleanup),
+        )
+        .route(
             "/_session",
             get(api::session_get)
                 .post(api::session_post)
