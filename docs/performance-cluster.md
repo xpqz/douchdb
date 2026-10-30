@@ -428,6 +428,31 @@ Before/after on the same three-node, `q=4`, `n=3`, 6,000-document benchmark
 The view index benchmark now warms every coordinator before measuring, because
 local-first reads mean each node serves views from its own index.
 
+### Changes feed per-row cost (#60)
+
+After local-first shard selection, the remaining `_changes` cost is per-row
+work. Three changes target it:
+
+- Shard masks are disjoint, so the cluster feed no longer builds a HashSet or
+  runs a dedup/sequence-score pass for every row.
+- The live-document index supplies the winning revision for ordinary live
+  documents, avoiding a LevelDB metadata read and revision-tree decode per
+  row. Tombstones and `style=all_docs` still use the full metadata path.
+- Cluster sequence tokens use a compact `v1:<node seqs>` form instead of
+  base64(JSON) encoded per row. `decode_since` still accepts old tokens.
+
+Before/after on the 6,000-document cluster benchmark:
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_changes?limit=1000` | 65.6 req/s | 128.6 req/s | 15.0 ms | 7.8 ms |
+| Full `_changes` | 13.3 req/s | 22.9 req/s | 74.2 ms | 43.2 ms |
+| `_changes?style=all_docs` | — | 20.0 req/s | — | 47.8 ms |
+| `_changes?include_docs` | — | 10.6 req/s | — | 93.9 ms |
+
+`style=all_docs` is close to the default path. `include_docs` remains the
+slowest mode because every row reads and parses a document body from LevelDB.
+
 ### Partitioned databases (#55)
 
 See [partitioned-databases.md](partitioned-databases.md) for the user-facing
@@ -549,8 +574,8 @@ replicates and the pending file disappears.
   each node indexes every locally held replica, which is what enables node-loss
   failover. Map and reduce queries both fall back to replicas when an owner is
   unreachable.
-- **`_changes`** is ~15 ms for a 1,000-row limited feed; a full 6,000-document
-  feed is ~73 ms. Shard-masked changes use the local replica when available and
+- **`_changes`** is ~7.8 ms for a 1,000-row limited feed; a full
+  6,000-document feed is ~43 ms. Shard-masked changes use the local replica when available and
   fall back to another replica for missing masks. Limited feeds still merge
   selected nodes round-robin up to the global limit.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence

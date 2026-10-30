@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1515,15 +1515,17 @@ pub(crate) async fn cluster_changes(
             }
         }))
         .await;
-        let mut node_rows: Vec<Vec<Value>> = (0..n).map(|_| Vec::new()).collect();
+        let mut node_rows: Vec<std::collections::VecDeque<Value>> =
+            (0..n).map(|_| std::collections::VecDeque::new()).collect();
         let mut failed = Vec::new();
         let mut succeeded = false;
         for (node, response) in responses {
             match response {
-                Ok(value) => {
+                Ok(mut value) => {
                     succeeded = true;
-                    node_rows[node]
-                        .extend(value["results"].as_array().cloned().unwrap_or_default());
+                    if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
+                        node_rows[node].extend(rows);
+                    }
                 }
                 Err(_) => failed.push(node),
             }
@@ -1557,9 +1559,11 @@ pub(crate) async fn cluster_changes(
             }))
             .await;
             for (node, response) in fallbacks {
-                let value = response?;
+                let mut value = response?;
                 succeeded = true;
-                node_rows[node].extend(value["results"].as_array().cloned().unwrap_or_default());
+                if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
+                    node_rows[node].extend(rows);
+                }
             }
         }
         if !succeeded {
@@ -1571,34 +1575,24 @@ pub(crate) async fn cluster_changes(
         }
 
         for rows in &mut node_rows {
-            rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
+            rows.make_contiguous()
+                .sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
         }
-        let mut indices = vec![0usize; n];
         let mut progress = since.clone();
-        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         loop {
             let mut progressed = false;
             for node in 0..n {
-                let row = node_rows[node].get(indices[node]).cloned();
-                let Some(mut row) = row else {
+                let Some(mut row) = node_rows[node].pop_front() else {
                     continue;
                 };
-                indices[node] += 1;
                 progressed = true;
                 let shard_seq = row["seq"].as_u64().unwrap_or(0);
                 progress[node] = progress[node].max(shard_seq);
                 row["seq"] = json!(encode_since(&progress));
-                let duplicate = row
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| !seen.insert(id.to_string()))
-                    .unwrap_or(false);
-                if !duplicate {
-                    out.push(row);
-                    if out.len() >= limit {
-                        break;
-                    }
+                out.push(row);
+                if out.len() >= limit {
+                    break;
                 }
             }
             if out.len() >= limit || !progressed {
@@ -1647,7 +1641,7 @@ pub(crate) async fn cluster_changes(
         match response {
             Ok(value) => {
                 succeeded = true;
-                absorb_node_changes(&value, node, &mut progress, &mut rows);
+                absorb_node_changes(value, node, &mut progress, &mut rows);
             }
             Err(_) => failed.push(node),
         }
@@ -1683,7 +1677,7 @@ pub(crate) async fn cluster_changes(
         for (node, response) in fallbacks {
             let value = response?;
             succeeded = true;
-            absorb_node_changes(&value, node, &mut progress, &mut rows);
+            absorb_node_changes(value, node, &mut progress, &mut rows);
         }
     }
     if !succeeded {
@@ -1694,43 +1688,11 @@ pub(crate) async fn cluster_changes(
         ));
     }
 
-    // Shard masks are disjoint, so the same revision should no longer arrive
-    // from multiple nodes. Keep the dedup pass for map transitions and legacy
-    // clients that replay a `since` vector from before local-first reads.
-    let mut by_id: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<Value> = Vec::new();
-    for row in rows {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-            deduped.push(row);
-            continue;
-        };
-        let score = row
-            .get("seq")
-            .and_then(Value::as_str)
-            .and_then(decode_since)
-            .map(|vector| vector.iter().sum())
-            .unwrap_or(0);
-        match by_id.get(&id) {
-            Some(&index) => {
-                let existing = deduped[index]
-                    .get("seq")
-                    .and_then(Value::as_str)
-                    .and_then(decode_since)
-                    .map(|vector| vector.iter().sum())
-                    .unwrap_or(0);
-                if score > existing {
-                    deduped[index] = row;
-                }
-            }
-            None => {
-                by_id.insert(id, deduped.len());
-                deduped.push(row);
-            }
-        }
-    }
-
+    // Shard masks are disjoint, so each document's change is produced by
+    // exactly one node. The old all-node fan-out needed a per-row dedup pass;
+    // local-first masks make that redundant.
     Ok(json!({
-        "results": deduped,
+        "results": rows,
         "last_seq": encode_since(&progress),
         "pending": 0,
     }))
@@ -1812,12 +1774,15 @@ pub(crate) async fn fetch_node_changes(
 }
 
 pub(crate) fn absorb_node_changes(
-    response: &Value,
+    mut response: Value,
     node: usize,
     progress: &mut [u64],
     rows: &mut Vec<Value>,
 ) {
-    for mut row in response["results"].as_array().cloned().unwrap_or_default() {
+    let Some(Value::Array(values)) = response.get_mut("results").map(std::mem::take) else {
+        return;
+    };
+    for mut row in values {
         let shard_seq = row["seq"].as_u64().unwrap_or(0);
         progress[node] = progress[node].max(shard_seq);
         row["seq"] = json!(encode_since(progress));
@@ -1860,18 +1825,33 @@ pub(crate) async fn cluster_update_vector(
 }
 
 pub(crate) fn encode_since(vector: &[u64]) -> String {
-    let map: Map<String, Value> = vector
-        .iter()
-        .enumerate()
-        .map(|(i, seq)| (i.to_string(), json!(seq)))
-        .collect();
-    let bytes = serde_json::to_vec(&map).unwrap_or_else(|_| b"{}".to_vec());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    use std::fmt::Write as _;
+
+    // This runs once per change row in a cluster feed. The old form was
+    // base64(JSON) and allocated a map plus a base64 buffer for every row.
+    // `v1:` is still an opaque token to clients; `decode_since` accepts both.
+    let mut out = String::with_capacity(3 + vector.len() * 12);
+    out.push_str("v1:");
+    for (index, seq) in vector.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{seq}");
+    }
+    out
 }
 
 pub(crate) fn decode_since(raw: &str) -> Option<Vec<u64>> {
+    let raw = raw.trim_matches('"');
+    if let Some(rest) = raw.strip_prefix("v1:") {
+        let mut out = Vec::new();
+        for part in rest.split(',') {
+            out.push(part.parse().ok()?);
+        }
+        return Some(out);
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw.trim_matches('"'))
+        .decode(raw)
         .ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     let mut out = Vec::new();

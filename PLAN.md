@@ -386,7 +386,9 @@ Above ~6k means something was built that nobody asked for.
   owner is down, map views, reduce views, `_all_docs` and `_changes` request
   only the missing shard masks from live replicas instead of rescanning every
   reachable node. Reduce partials are recombined after fallback, including
-  grouped and custom `rereduce` reducers. Full `_changes` feeds
+  grouped and custom `rereduce` reducers. Changes use the live-document index
+  for winning revisions and compact sequence tokens, avoiding per-row metadata
+  decodes and duplicate detection. Full `_changes` feeds
   also query peers concurrently; limited
   feeds merge node prefixes round-robin up to the global limit. Unavailable
   change nodes are skipped and covered by replicas, with their vector
