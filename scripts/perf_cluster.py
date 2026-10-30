@@ -94,7 +94,7 @@ def wait_ready(port, proc):
     raise RuntimeError(f"server on {port} did not start")
 
 
-def run_workers(port, workers, total, fn):
+def run_workers(ports, workers, total, fn):
     workers = max(1, min(workers, total))
     bounds = []
     base = total // workers
@@ -110,7 +110,7 @@ def run_workers(port, workers, total, fn):
     latencies = []
     errors = []
 
-    def worker(lo, hi):
+    def worker(lo, hi, port):
         conn = connect(port)
         barrier.wait()
         local = []
@@ -126,7 +126,11 @@ def run_workers(port, workers, total, fn):
         with lock:
             latencies.extend(local)
 
-    threads = [threading.Thread(target=worker, args=bound) for bound in bounds]
+    ports_for_workers = [ports[i % len(ports)] for i in range(workers)]
+    threads = [
+        threading.Thread(target=worker, args=(*bound, ports_for_workers[i]))
+        for i, bound in enumerate(bounds)
+    ]
     started = time.perf_counter()
     for thread in threads:
         thread.start()
@@ -155,6 +159,11 @@ def main():
     parser.add_argument("--q", type=int, default=4)
     parser.add_argument("--n", type=int, default=2)
     parser.add_argument("--sync-secs", default="3600")
+    parser.add_argument(
+        "--spread",
+        action="store_true",
+        help="round-robin benchmark clients across every coordinator port",
+    )
     parser.add_argument("--workers", default="8")
     parser.add_argument("--per-level", type=int, default=500)
     parser.add_argument("--json-out", default="target/perf-cluster.json")
@@ -183,6 +192,7 @@ def main():
             "n": args.n,
             "docs": args.docs,
             "sync_secs": args.sync_secs,
+            "spread": args.spread,
             "coordinator_port": ports[0],
         },
         "operations": {},
@@ -219,10 +229,12 @@ def main():
             processes.append(proc)
             wait_ready(port, proc)
 
-        conn = connect(ports[0])
+        bench_ports = ports if args.spread else [ports[0]]
+        conns = [connect(port) for port in bench_ports]
+        conn = conns[0]
         request(conn, "PUT", "/perf", {})
         print(
-            f"{nodes}-node cluster ready (q={args.q}, n={args.n}); "
+            f"{nodes}-node cluster ready (q={args.q}, n={args.n}, spread={args.spread}); "
             f"loading {args.docs} docs...",
             file=sys.stderr,
         )
@@ -240,22 +252,21 @@ def main():
             ]
             request(conn, "POST", "/perf/_bulk_docs", {"docs": docs})
 
-        # Single-document writes through the coordinator.
+        # Single-document writes, spread across coordinators when requested.
         seq_lat = []
         started = time.perf_counter()
         for i in range(500):
-            elapsed, _ = put_doc(conn, f"seq-{i:06d}", i, "x" * 100)
+            elapsed, _ = put_doc(conns[i % len(conns)], f"seq-{i:06d}", i, "x" * 100)
             seq_lat.append(elapsed)
         result["operations"]["put_single_sequential"] = summary(
             seq_lat, time.perf_counter() - started
         )
-        conn.close()
 
         for workers in [int(w) for w in args.workers.split(",") if w]:
             def write(conn, i, workers=workers):
                 return put_doc(conn, f"w{workers}-{i:06d}", i, "x" * 100)
 
-            latency, wall = run_workers(ports[0], workers, args.per_level, write)
+            latency, wall = run_workers(bench_ports, workers, args.per_level, write)
             result["operations"][f"put_single_concurrent_w{workers}"] = summary(
                 latency, wall
             )
@@ -264,17 +275,16 @@ def main():
         def read(conn, i):
             return get_doc(conn, i)
 
-        latency, wall = run_workers(ports[0], 1, 1000, read)
+        latency, wall = run_workers(bench_ports, 1, 1000, read)
         result["operations"]["get_single_sequential"] = summary(latency, wall)
         for workers in [int(w) for w in args.workers.split(",") if w]:
-            latency, wall = run_workers(ports[0], workers, args.per_level, read)
+            latency, wall = run_workers(bench_ports, workers, args.per_level, read)
             result["operations"][f"get_single_concurrent_w{workers}"] = summary(
                 latency, wall
             )
             print(f"  get w={workers}: {summary(latency, wall)['per_s']} req/s", file=sys.stderr)
 
         # Bulk operations.
-        conn = connect(ports[0])
         bulk_lat = []
         started = time.perf_counter()
         for batch_no in range(10):
@@ -282,7 +292,9 @@ def main():
                 {"_id": f"bulk-{batch_no}-{i:04d}", "value": i, "text": "x" * 100}
                 for i in range(250)
             ]
-            elapsed, _ = request(conn, "POST", "/perf/_bulk_docs", {"docs": docs})
+            elapsed, _ = request(
+                conns[batch_no % len(conns)], "POST", "/perf/_bulk_docs", {"docs": docs}
+            )
             bulk_lat.append(elapsed)
         bulk_wall = time.perf_counter() - started
         result["operations"]["bulk_docs_250"] = summary(
@@ -297,7 +309,9 @@ def main():
                 {"id": f"doc-{i:06d}"}
                 for i in range(batch_no * 250, (batch_no + 1) * 250)
             ]
-            elapsed, _ = request(conn, "POST", "/perf/_bulk_get", {"docs": docs})
+            elapsed, _ = request(
+                conns[batch_no % len(conns)], "POST", "/perf/_bulk_get", {"docs": docs}
+            )
             bulk_get_lat.append(elapsed)
         bulk_get_wall = time.perf_counter() - started
         result["operations"]["bulk_get_250"] = summary(
@@ -310,8 +324,10 @@ def main():
         # Cluster metadata endpoints.
         all_docs_lat = []
         started = time.perf_counter()
-        for _ in range(50):
-            elapsed, _ = request(conn, "GET", "/perf/_all_docs?limit=100")
+        for i in range(50):
+            elapsed, _ = request(
+                conns[i % len(conns)], "GET", "/perf/_all_docs?limit=100"
+            )
             all_docs_lat.append(elapsed)
         result["operations"]["all_docs_limit_100"] = summary(
             all_docs_lat, time.perf_counter() - started
@@ -319,9 +335,9 @@ def main():
 
         startkey_lat = []
         started = time.perf_counter()
-        for _ in range(50):
+        for i in range(50):
             elapsed, _ = request(
-                conn,
+                conns[i % len(conns)],
                 "GET",
                 "/perf/_all_docs?startkey=%22doc-005000%22&limit=100",
             )
@@ -333,8 +349,10 @@ def main():
         keys = [f"doc-{i:06d}" for i in range(0, 100)]
         keys_lat = []
         started = time.perf_counter()
-        for _ in range(20):
-            elapsed, _ = request(conn, "POST", "/perf/_all_docs", {"keys": keys})
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)], "POST", "/perf/_all_docs", {"keys": keys}
+            )
             keys_lat.append(elapsed)
         result["operations"]["all_docs_keys_100"] = summary(
             keys_lat, time.perf_counter() - started
@@ -342,8 +360,10 @@ def main():
 
         changes_lat = []
         started = time.perf_counter()
-        for _ in range(20):
-            elapsed, _ = request(conn, "GET", "/perf/_changes?since=0&limit=1000")
+        for i in range(20):
+            elapsed, _ = request(
+                conns[i % len(conns)], "GET", "/perf/_changes?since=0&limit=1000"
+            )
             changes_lat.append(elapsed)
         result["operations"]["changes_since_0_limit_1000"] = summary(
             changes_lat, time.perf_counter() - started
@@ -351,8 +371,8 @@ def main():
 
         info_lat = []
         started = time.perf_counter()
-        for _ in range(100):
-            elapsed, _ = request(conn, "GET", "/perf")
+        for i in range(100):
+            elapsed, _ = request(conns[i % len(conns)], "GET", "/perf")
             info_lat.append(elapsed)
         result["operations"]["db_info_cluster"] = summary(
             info_lat, time.perf_counter() - started
@@ -367,15 +387,17 @@ def main():
                 }
             }
         }
-        request(conn, "PUT", "/perf/_design/perf", ddoc)
+        request(conns[0], "PUT", "/perf/_design/perf", ddoc)
         cold_elapsed, _ = request(
-            conn, "GET", "/perf/_design/perf/_view/by_value?limit=100"
+            conns[0], "GET", "/perf/_design/perf/_view/by_value?limit=100"
         )
         warm_lat = []
         started = time.perf_counter()
-        for _ in range(20):
+        for i in range(20):
             elapsed, _ = request(
-                conn, "GET", "/perf/_design/perf/_view/by_value?limit=100"
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/perf/_view/by_value?limit=100",
             )
             warm_lat.append(elapsed)
         result["operations"]["view_map_cold"] = {
@@ -388,9 +410,9 @@ def main():
 
         map_only_lat = []
         started = time.perf_counter()
-        for _ in range(20):
+        for i in range(20):
             elapsed, _ = request(
-                conn,
+                conns[i % len(conns)],
                 "GET",
                 "/perf/_design/perf/_view/by_value?reduce=false&limit=100",
             )
@@ -401,17 +423,20 @@ def main():
 
         reduce_lat = []
         started = time.perf_counter()
-        for _ in range(20):
+        for i in range(20):
             elapsed, _ = request(
-                conn, "GET", "/perf/_design/perf/_view/by_value?reduce=true"
+                conns[i % len(conns)],
+                "GET",
+                "/perf/_design/perf/_view/by_value?reduce=true",
             )
             reduce_lat.append(elapsed)
         result["operations"]["view_reduce_warm"] = summary(
             reduce_lat, time.perf_counter() - started
         )
 
-        request(conn, "POST", "/perf/_ensure_full_commit", {})
-        conn.close()
+        request(conns[0], "POST", "/perf/_ensure_full_commit", {})
+        for conn in conns:
+            conn.close()
     finally:
         for proc in processes:
             if proc.poll() is None:

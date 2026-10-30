@@ -1834,6 +1834,17 @@ async fn commit_docs(
             pending = retry;
         }
 
+        // With one replica per document the primary write is the whole story:
+        // there is nothing to fetch or copy. Design documents are an exception:
+        // they deliberately live on every node even when `n=1`.
+        if replicas.iter().all(|list| list.len() <= 1) {
+            let met = acks.iter().all(|ack| *ack >= quorum);
+            if out.iter().any(|result| result.get("ok").is_some()) {
+                st.db_updates.record(dbname, "updated");
+            }
+            return Ok((out, met));
+        }
+
         // Fetch the successful revisions in one `_bulk_get` per primary
         // instead of one GET per document. Then copy each primary's batch to
         // the remaining replicas in one `_bulk_docs` per peer.

@@ -375,6 +375,12 @@ Above ~6k means something was built that nobody asked for.
   push the requested window down to owners, and combine global built-in
   reduces. A reproducible three-node `q=4`/`n=2` benchmark and before/after
   numbers are in `docs/performance-cluster.md`.
+* **Load-balanced edge.** The Compose stack puts nginx in front of all three
+  nodes; any node is an equal coordinator. `scripts/perf_cluster.py --spread`
+  measures round-robin client routing and node-count scaling. Point reads and
+  scatter-gather endpoints are not yet linear because non-owner coordinators
+  proxy and every `_all_docs`/view request fans out; owner-aware routing is the
+  next scaling step.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes

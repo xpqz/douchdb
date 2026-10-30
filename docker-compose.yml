@@ -91,11 +91,13 @@ services:
     volumes:
       - node2-data:/data
 
-  console:
+  proxy:
     image: nginx:1.29-alpine
     restart: unless-stopped
     depends_on:
       - node0
+      - node1
+      - node2
     ports:
       - "8080:80"
     volumes:
