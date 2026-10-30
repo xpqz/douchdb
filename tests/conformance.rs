@@ -1885,6 +1885,121 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
 }
 
 #[tokio::test]
+async fn cluster_rebalance_auto_cleans_old_replicas() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("autoreb").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/autoreb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("auto{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/autoreb/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/autoreb/rebalance?timeout_ms=20000",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pending"], false);
+    assert_eq!(body["cleaned"].as_array().unwrap().len(), 3);
+    let map = body.as_object().unwrap();
+    let replicas = map["replicas"].as_array().unwrap();
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let mut total = 0u64;
+    for (index, node) in nodes.iter().enumerate() {
+        let (status, counts) = node
+            .req_with(
+                Method::GET,
+                "/_node/_local/_dbs/autoreb/shards",
+                None,
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{counts}");
+        let shards = counts["shards"].as_array().unwrap();
+        for (shard, row) in shards.iter().enumerate() {
+            let docs = row["docs"].as_u64().unwrap();
+            total += docs;
+            let owned = replicas[shard]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner.as_u64().unwrap() as usize == index);
+            if !owned {
+                assert_eq!(docs, 0, "node {index} kept shard {shard} after cleanup");
+            }
+        }
+    }
+    assert_eq!(total, 9, "cleanup must not duplicate or lose documents");
+
+    let (status, body) = nodes[0].get("/autoreb/_all_docs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 9);
+}
+
+#[tokio::test]
+async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("timeoutreb").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/timeoutreb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("to{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/timeoutreb/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/timeoutreb/rebalance?timeout_ms=500",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, counts) = nodes[0]
+        .req_with(
+            Method::GET,
+            "/_node/_local/_dbs/timeoutreb/shards",
+            None,
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{counts}");
+    let total: u64 = counts["shards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["docs"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 9, "timeout must not clean the old replica");
+}
+
+#[tokio::test]
 async fn cluster_all_docs_survives_node_loss_via_replicas() {
     let mut nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {
