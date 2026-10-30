@@ -293,6 +293,12 @@ pub(crate) fn better_rev(candidate: &Value, current: &Value) -> bool {
     (!a.0, a.1, a.2) > (!b.0, b.1, b.2)
 }
 
+#[derive(serde::Serialize)]
+struct BulkBody<'a, T: serde::Serialize> {
+    docs: &'a [T],
+    new_edits: bool,
+}
+
 pub(crate) async fn commit_docs(
     st: &AppState,
     db: &Db,
@@ -336,6 +342,7 @@ pub(crate) async fn commit_docs(
         w.min(replication)
     };
     let total = docs.len();
+    let docs: Vec<Arc<Value>> = docs.into_iter().map(Arc::new).collect();
     let mut out = vec![Value::Null; total];
     let mut acks = vec![0usize; total];
 
@@ -344,7 +351,7 @@ pub(crate) async fn commit_docs(
         // shard set and wait for `w` acknowledgements. Revision ids are
         // deterministic, so no primary re-fetch/copy pass is needed.
         let db_handle = st.db(dbname).await?;
-        let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
         for (slot, doc) in docs.into_iter().enumerate() {
             for node in &replicas[slot] {
                 groups.entry(*node).or_default().push((slot, doc.clone()));
@@ -357,13 +364,15 @@ pub(crate) async fn commit_docs(
         let mut pending = FuturesUnordered::new();
         for (node, group) in groups {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
             if node == st.cluster.me {
+                let subdocs: Vec<Value> =
+                    group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
                 let db = db_handle.clone();
                 pending.push(tokio::spawn(async move {
                     (node, slots, db.put_docs(subdocs, true).await)
                 }));
             } else {
+                let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
                 let client = st.client.clone();
                 let secret = st.cluster.secret.clone();
                 let peer = st.cluster.nodes[node].clone();
@@ -441,7 +450,7 @@ pub(crate) async fn commit_docs(
         // Replication writes carry their own history and must reach every
         // replica, including ones that are not the primary. A down replica is
         // not fatal: anti-entropy will heal it when it returns.
-        let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
+        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
         for (slot, doc) in docs.into_iter().enumerate() {
             for node in &replicas[slot] {
                 groups.entry(*node).or_default().push((slot, doc.clone()));
@@ -449,18 +458,30 @@ pub(crate) async fn commit_docs(
         }
         crate::telemetry::record_fanout(groups.len() as u64);
         let mut reached = vec![false; total];
-        let responses = futures::future::join_all(groups.into_iter().map(|(node, group)| {
+        let mut responses = Vec::new();
+        if let Some(group) = groups.remove(&st.cluster.me) {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
+            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
+            responses.push((st.cluster.me, slots, db.put_docs(subdocs, false).await));
+        }
+        let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
+            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+            let client = st.client.clone();
+            let secret = st.cluster.secret.clone();
+            let peer = st.cluster.nodes[node].clone();
+            let dbname = dbname.to_string();
+            let headers = headers.clone();
             async move {
                 (
                     node,
                     slots,
-                    write_local_or_forward(st, db, dbname, node, subdocs, false, headers).await,
+                    forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
                 )
             }
         }))
         .await;
+        responses.extend(remote);
         for (node, slots, response) in responses {
             match response {
                 Ok(results) => {
@@ -496,56 +517,26 @@ pub(crate) async fn commit_docs(
     }
 }
 
-pub(crate) async fn write_local_or_forward(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    node: usize,
-    docs: Vec<Value>,
-    new_edits: bool,
-    headers: &HeaderMap,
-) -> DbResult<Vec<Value>> {
-    if node == st.cluster.me {
-        return db.put_docs(docs, new_edits).await;
-    }
-    let peer = st.cluster.nodes[node].clone();
-    forward_bulk(st, &peer, dbname, docs, new_edits, headers).await
-}
-
-pub(crate) async fn forward_bulk(
-    st: &AppState,
-    peer: &str,
-    dbname: &str,
-    docs: Vec<Value>,
-    new_edits: bool,
-    headers: &HeaderMap,
-) -> DbResult<Vec<Value>> {
-    forward_bulk_owned(
-        st.client.clone(),
-        st.cluster.secret.clone(),
-        peer.to_string(),
-        dbname.to_string(),
-        docs,
-        new_edits,
-        headers.clone(),
-    )
-    .await
-}
-
-async fn forward_bulk_owned(
+async fn forward_bulk_owned<T>(
     client: reqwest::Client,
     secret: String,
     peer: String,
     dbname: String,
-    docs: Vec<Value>,
+    docs: Vec<T>,
     new_edits: bool,
     headers: HeaderMap,
-) -> DbResult<Vec<Value>> {
+) -> DbResult<Vec<Value>>
+where
+    T: serde::Serialize,
+{
     let request = client
         .post(format!("{peer}/{dbname}/_bulk_docs"))
         .header("x-douchdb-forwarded", "1")
         .header("x-douchdb-secret", secret)
-        .json(&json!({"docs": docs, "new_edits": new_edits}));
+        .json(&BulkBody {
+            docs: &docs,
+            new_edits,
+        });
     let request = forward_client_auth(request, &headers);
     let response = request
         .send()
