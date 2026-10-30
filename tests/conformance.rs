@@ -769,6 +769,99 @@ async fn changes_revs_diff_and_bulk_get() {
 }
 
 #[tokio::test]
+async fn all_dbs_pagination_and_dbs_info() {
+    let s = Server::start(false);
+    for name in ["aaa", "bbb", "ccc"] {
+        s.fresh_db(name).await;
+    }
+    let (status, body) = s.get("/_all_dbs?startkey=%22bbb%22&endkey=%22ccc%22").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!(["bbb", "ccc"]));
+
+    let (_, body) = s.get("/_all_dbs?descending=true&limit=2").await;
+    assert_eq!(body, json!(["ccc", "bbb"]));
+    let (_, body) = s.get("/_all_dbs?skip=1&limit=1").await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    let (status, body) = s
+        .get("/_dbs_info?keys=%5B%22aaa%22%2C%22missing%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows[0]["key"], "aaa");
+    assert_eq!(rows[0]["info"]["db_name"], "aaa");
+    assert_eq!(rows[1]["key"], "missing");
+    assert_eq!(rows[1]["error"], "not_found");
+
+    let (status, body) = s.post("/_dbs_info", json!({"keys": ["ccc"]})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["info"]["db_name"], "ccc");
+}
+
+#[tokio::test]
+async fn db_updates_reports_lifecycle_and_write_events() {
+    let s = Server::start(false);
+    let (_, baseline) = s.get("/_db_updates?since=0").await;
+    let mut since = baseline["last_seq"].as_str().unwrap().to_string();
+
+    let (status, _) = s.put("/events", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get(&format!("/_db_updates?since={since}")).await;
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["db_name"] == "events" && event["type"] == "created"));
+    since = body["last_seq"].as_str().unwrap().to_string();
+
+    let (status, _) = s.put("/events/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get(&format!("/_db_updates?since={since}")).await;
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["db_name"] == "events" && event["type"] == "updated"));
+    since = body["last_seq"].as_str().unwrap().to_string();
+
+    let (status, _) = s.delete("/events").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get(&format!("/_db_updates?since={since}")).await;
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["db_name"] == "events" && event["type"] == "deleted"));
+
+    // Longpoll waits for the next event.
+    let (_, baseline) = s.get("/_db_updates?since=0").await;
+    let since = baseline["last_seq"].as_str().unwrap().to_string();
+    let base = s.base.clone();
+    let client = s.client.clone();
+    let waiting = tokio::spawn(async move {
+        client
+            .get(format!(
+                "{base}/_db_updates?feed=longpoll&since={since}&timeout=2000"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _) = s.put("/lpdb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let body = waiting.await.unwrap();
+    assert!(body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["db_name"] == "lpdb"));
+}
+
+#[tokio::test]
 async fn http_conditional_copy_head_and_request_id() {
     let s = Server::start(false);
     s.fresh_db("http").await;

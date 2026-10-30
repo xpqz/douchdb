@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(60))
             .build()?,
+        db_updates: api::DbUpdates::default(),
     });
 
     if state.cluster.is_clustered() {
@@ -189,6 +190,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(api::welcome))
         .route("/_up", get(api::up))
         .route("/_all_dbs", get(api::all_dbs))
+        .route("/_db_updates", get(api::db_updates))
+        .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
         .route("/_uuids", get(api::uuids))
         .route("/_membership", get(api::membership))
         .route(
