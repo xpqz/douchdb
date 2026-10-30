@@ -2781,29 +2781,77 @@ async fn cluster_changes(
     let mut rows = Vec::new();
 
     if let Some(limit) = limit {
-        // Limited feeds keep the existing resumable behaviour: fill the
-        // window from one node at a time so last_seq only advances over rows
-        // that were actually returned.
-        for node in 0..n {
-            let remaining = limit.saturating_sub(rows.len());
-            if remaining == 0 {
-                break;
-            }
-            let response = fetch_node_changes(
+        if limit == 0 {
+            return Ok(json!({
+                "results": [],
+                "last_seq": encode_since(&since),
+                "pending": 0,
+            }));
+        }
+
+        // Query every node for its next `limit` changes. Walk the responses
+        // round-robin so each node's rows are consumed as a prefix, stop at
+        // the global limit of unique documents, and advance `last_seq` only
+        // over rows actually consumed. Replicas may repeat a document; those
+        // rows advance the source node's progress but are not emitted twice.
+        let responses = futures::future::join_all((0..n).map(|node| {
+            fetch_node_changes(
                 st,
                 db,
                 dbname,
                 node,
                 since[node],
-                Some(remaining),
+                Some(limit),
                 include_docs,
                 style_all_docs,
                 doc_ids.as_deref(),
                 headers,
             )
-            .await?;
-            absorb_node_changes(&response, node, &mut progress, &mut rows);
+        }))
+        .await
+        .into_iter()
+        .collect::<DbResult<Vec<Value>>>()?;
+
+        let mut indices = vec![0usize; n];
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        loop {
+            let mut progressed = false;
+            for node in 0..n {
+                let row = responses[node]["results"]
+                    .as_array()
+                    .and_then(|rows| rows.get(indices[node]))
+                    .cloned();
+                let Some(mut row) = row else {
+                    continue;
+                };
+                indices[node] += 1;
+                progressed = true;
+                let shard_seq = row["seq"].as_u64().unwrap_or(0);
+                progress[node] = shard_seq;
+                row["seq"] = json!(encode_since(&progress));
+                let duplicate = row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| !seen.insert(id.to_string()))
+                    .unwrap_or(false);
+                if !duplicate {
+                    out.push(row);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            if out.len() >= limit || !progressed {
+                break;
+            }
         }
+
+        return Ok(json!({
+            "results": out,
+            "last_seq": encode_since(&progress),
+            "pending": 0,
+        }));
     } else {
         // A full feed (replication, initial sync) can ask every node at once;
         // the responses are then merged in node order for a stable vector.

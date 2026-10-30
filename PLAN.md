@@ -376,10 +376,9 @@ Above ~6k means something was built that nobody asked for.
   push the requested window down to owners, and combine global/grouped built-in
   reduces plus custom reducers via `rereduce`. Cluster view indexes are built
   over owned shards only, with ownership in the design marker. Full `_changes`
-  feeds also query peers concurrently;
-  limited feeds keep resumable one-node-at-a-time progress. A reproducible
-  three-node `q=4`/`n=2` benchmark and before/after numbers are in
-  `docs/performance-cluster.md`.
+  feeds also query peers concurrently; limited feeds merge node prefixes
+  round-robin up to the global limit. A reproducible three-node `q=4`/`n=2`
+  benchmark and before/after numbers are in `docs/performance-cluster.md`.
 * **Load-balanced edge.** The Compose stack puts nginx in front of all three
   nodes; any node is an equal coordinator. `scripts/perf_cluster.py --spread`
   measures round-robin client routing and node-count scaling. Point reads and
