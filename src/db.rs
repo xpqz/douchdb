@@ -8,8 +8,8 @@ use crate::cluster::ShardMap;
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, seq_key, seq_of_key, AttMeta, DocMeta, ShardHandle,
-    Tx, ATTEST_CHUNK,
+    blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
+    ATTEST_CHUNK,
 };
 use base64::Engine;
 use md5::{Digest, Md5};
@@ -1988,123 +1988,78 @@ fn collect_changes(
         return Ok(Vec::new());
     }
 
-    // Each sequence key maps to one document's current change. When there is
-    // no filter and no descending merge, the shard only needs `limit`
-    // sequence entries; `_doc_ids` filters may skip entries, so those still
-    // scan the range before processing.
-    let entry_cap = if opts.doc_ids.is_none() && !opts.descending {
-        limit
-    } else {
-        usize::MAX
-    };
-    let mut entries: Vec<(u64, String)> = Vec::new();
-    shard.scan_range_while(
-        b"s/",
-        Some(&seq_key(opts.since.saturating_add(1))),
-        false,
-        |key, value| {
-            let Some(seq) = seq_of_key(key) else {
-                return true;
-            };
-            let Ok(id) = std::str::from_utf8(value) else {
-                return true;
-            };
-            entries.push((seq, id.to_string()));
-            entries.len() < entry_cap
-        },
-    )?;
-
-    let mut rows = Vec::new();
-    for (seq, id) in entries {
-        if let Some(ids) = &opts.doc_ids {
-            if !ids.contains(&id) {
-                continue;
-            }
-        }
-
-        // The live index already has the winning revision for ordinary live
-        // documents. That avoids decoding the whole revision tree from
-        // LevelDB for every row in the common no-conflicts case.
-        if !opts.style_all_docs {
-            let live = shard.live_docs()?.get(&id).cloned();
-            if let Some(live) = live {
-                let doc = if opts.include_docs {
-                    shard
-                        .get_body(&id, &live.rev)
-                        .map(|body| embed_doc_meta(&id, &live.rev, &body))
-                } else {
-                    None
-                };
-                rows.push(ChangeRow {
-                    id,
-                    seq,
-                    changes: vec![(live.rev, false)],
-                    deleted: false,
-                    doc,
-                });
-                if !opts.descending && rows.len() >= limit {
-                    break;
+    let mut selected = Vec::new();
+    {
+        let by_seq = shard.seq_entries()?;
+        for (seq, entry) in by_seq.range(opts.since.saturating_add(1)..) {
+            if let Some(ids) = &opts.doc_ids {
+                if !ids.iter().any(|id| id.as_str() == &*entry.id) {
+                    continue;
                 }
-                continue;
+            }
+            selected.push((*seq, entry.clone()));
+            if !opts.descending && selected.len() >= limit {
+                break;
             }
         }
+    }
 
-        let Some(meta) = shard.get_meta(&id) else {
-            continue;
-        };
-        if meta.seq != seq {
-            continue;
-        }
-        let Some(winner) = meta.tree.winner() else {
-            continue;
-        };
-        let deleted = meta.tree.is_deleted(&winner);
+    let mut rows = Vec::with_capacity(selected.len());
+    for (seq, entry) in selected {
         let changes = if opts.style_all_docs {
-            meta.tree
-                .leaves()
-                .into_iter()
-                .map(|leaf| {
-                    let deleted = meta.tree.is_deleted(&leaf);
-                    (leaf, deleted)
-                })
-                .collect()
+            // Rebuild revision-tree leaf order without touching LevelDB. The
+            // winner is merged back into the cached non-winning leaves.
+            let mut leaves = Vec::with_capacity(1 + entry.other_leaves.len());
+            let mut winner_inserted = false;
+            for (rev, deleted) in &entry.other_leaves {
+                if !winner_inserted && rev.as_ref() > entry.rev.as_ref() {
+                    leaves.push((entry.rev.to_string(), entry.deleted));
+                    winner_inserted = true;
+                }
+                leaves.push((rev.to_string(), *deleted));
+            }
+            if !winner_inserted {
+                leaves.push((entry.rev.to_string(), entry.deleted));
+            }
+            leaves
         } else {
-            vec![(winner.clone(), deleted)]
+            vec![(entry.rev.to_string(), entry.deleted)]
         };
+
         let doc = if opts.include_docs {
-            if deleted {
-                read_doc_rev(
-                    shard,
-                    &id,
-                    &meta,
-                    &winner,
-                    &DocOpts {
-                        rev: Some(winner.clone()),
-                        ..Default::default()
-                    },
-                )
-                .ok()
-                .and_then(|doc| serde_json::to_string(&doc).ok())
+            if entry.deleted {
+                shard
+                    .get_meta(&entry.id)
+                    .and_then(|meta| {
+                        let winner = meta.tree.winner()?;
+                        read_doc_rev(
+                            shard,
+                            &entry.id,
+                            &meta,
+                            &winner,
+                            &DocOpts {
+                                rev: Some(winner.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .ok()
+                    })
+                    .and_then(|doc| serde_json::to_string(&doc).ok())
             } else {
                 shard
-                    .get_body(&id, &winner)
-                    .map(|body| embed_doc_meta(&id, &winner, &body))
+                    .get_body(&entry.id, &entry.rev)
+                    .map(|body| embed_doc_meta(&entry.id, &entry.rev, &body))
             }
         } else {
             None
         };
         rows.push(ChangeRow {
-            id,
+            id: entry.id.to_string(),
             seq,
             changes,
-            deleted,
+            deleted: entry.deleted,
             doc,
         });
-        // Descending feeds are reversed after the merge, so the first `limit`
-        // rows collected here are not the ones the response keeps.
-        if !opts.descending && rows.len() >= limit {
-            break;
-        }
     }
     Ok(rows)
 }

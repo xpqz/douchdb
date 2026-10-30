@@ -395,6 +395,11 @@ def main():
             keys_lat, time.perf_counter() - started
         )
 
+        # Local-first feeds maintain one sequence index per coordinator; warm
+        # each node so the measurement is steady-state rather than index build.
+        for conn in conns:
+            request(conn, "GET", "/perf/_changes?since=0&limit=1")
+
         changes_lat = []
         started = time.perf_counter()
         for i in range(20):

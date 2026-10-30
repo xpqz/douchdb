@@ -10,6 +10,7 @@ use rusty_leveldb::{LdbIterator, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub const ATTEST_CHUNK: usize = 64 * 1024;
@@ -154,6 +155,16 @@ fn seek_last(iter: &mut rusty_leveldb::DBIterator, prefix: &[u8]) -> Result<()> 
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct SeqEntry {
+    pub id: Arc<str>,
+    pub rev: Arc<str>,
+    pub deleted: bool,
+    /// Non-winning leaves in revision-tree order, with their deleted flags.
+    /// Empty for the overwhelmingly common conflict-free document.
+    pub other_leaves: Vec<(Arc<str>, bool)>,
+}
+
 pub struct Shard {
     db: DB,
     seq: u64,
@@ -167,6 +178,10 @@ pub struct Shard {
     /// `_all_docs` range query and then maintained in memory. Keeping this out
     /// of LevelDB avoids an extra write per ingested document.
     live: Option<BTreeMap<String, LiveDoc>>,
+    /// Sequence -> winning revision, built lazily for `_changes` and then
+    /// maintained on writes. Avoids scanning LevelDB's `s/` index and decoding
+    /// document metadata on every feed poll.
+    by_seq: Option<BTreeMap<u64, Arc<SeqEntry>>>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -175,6 +190,26 @@ pub struct Shard {
 
 /// Winner revision, whether it is live, and whether that revision has
 /// attachments. `None` when the revision tree has no winner.
+fn seq_entry(id: &str, meta: &DocMeta) -> Option<SeqEntry> {
+    let (rev, live, _) = meta_state(meta)?;
+    let other_leaves = meta
+        .tree
+        .leaves()
+        .into_iter()
+        .filter(|leaf| leaf != &rev)
+        .map(|leaf| {
+            let deleted = meta.tree.is_deleted(&leaf);
+            (Arc::from(leaf.as_str()), deleted)
+        })
+        .collect();
+    Some(SeqEntry {
+        id: Arc::from(id),
+        rev: Arc::from(rev.as_str()),
+        deleted: !live,
+        other_leaves,
+    })
+}
+
 fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
@@ -250,6 +285,7 @@ impl Shard {
             docs,
             deleted,
             live: None,
+            by_seq: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
         })
@@ -257,6 +293,36 @@ impl Shard {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Sequence index for `_changes`, built on first use and maintained by
+    /// subsequent commits.
+    pub fn seq_entries(&mut self) -> Result<&BTreeMap<u64, Arc<SeqEntry>>> {
+        if self.by_seq.is_none() {
+            let mut pairs = Vec::new();
+            self.scan_range_while(b"s/", None, false, |key, value| {
+                if let Some(seq) = seq_of_key(key) {
+                    if let Ok(id) = std::str::from_utf8(value) {
+                        pairs.push((seq, id.to_string()));
+                    }
+                }
+                true
+            })?;
+            let mut entries = BTreeMap::new();
+            for (seq, id) in pairs {
+                let Some(meta) = self.get_meta(&id) else {
+                    continue;
+                };
+                if meta.seq != seq {
+                    continue;
+                }
+                if let Some(entry) = seq_entry(&id, &meta) {
+                    entries.insert(seq, Arc::new(entry));
+                }
+            }
+            self.by_seq = Some(entries);
+        }
+        Ok(self.by_seq.as_ref().expect("sequence index initialized"))
     }
 
     /// Live and deleted document counts for this shard.
@@ -569,6 +635,18 @@ impl Shard {
                     Some(false) => deleted += 1,
                     None => {}
                 }
+                if let Some(by_seq) = self.by_seq.as_mut() {
+                    if let Some(old) = &old {
+                        by_seq.remove(&old.seq);
+                    }
+                    if let Ok(id) = std::str::from_utf8(&key[2..]) {
+                        if let Some(new) = &new {
+                            if let Some(entry) = seq_entry(id, new) {
+                                by_seq.insert(new.seq, Arc::new(entry));
+                            }
+                        }
+                    }
+                }
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = std::str::from_utf8(&key[2..]) {
                         match new_state {
@@ -657,6 +735,7 @@ impl Shard {
         self.docs = 0;
         self.deleted = 0;
         self.live = None;
+        self.by_seq = None;
         self.pending.clear();
         self.overlay.clear();
         self.db
