@@ -183,6 +183,30 @@ curl 'localhost:5984/shop/_design/shop/_view/by_city'
 ```
 
 The `tags` view emits once per tag, so one document can produce several rows.
+
+### Native fast path for simple maps
+
+A deliberately narrow map shape bypasses JavaScript entirely:
+
+```js
+function(doc){ emit(doc.field); }
+function(doc){ emit(doc.field, doc.other); }
+function(doc){ emit(doc.field, 1); }
+function(doc){ emit(doc["field"], "constant"); }
+```
+
+Arrow forms such as `(doc) => { emit(doc.city, 1); }` are also recognized.
+Everything else - conditions, multiple emits, loops, local variables, custom
+objects - falls back to QuickJS.
+
+This is an intentional departure from CouchDB's "always run JavaScript"
+model for these simple views. The emitted JSON is the same for normal
+document fields: missing fields become `null`, and the second argument
+defaults to `null`. Native extraction does not perform JavaScript number
+coercion and does not expose `Object.prototype` properties.
+
+The view index records that the native path was used, so an already-built
+JavaScript index is rebuilt once when a view becomes eligible.
 Map queries support `key`, `keys` (GET or POST body), `startkey`, `endkey`,
 `startkey_docid`, `endkey_docid`, `descending`, `inclusive_end`, `skip`,
 `limit` and `include_docs`.
