@@ -12,6 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -2357,28 +2358,9 @@ async fn changes(
     }
 }
 
-/// Rewrite the trailing numeric `last_seq` in a locally built changes body
-/// with the cluster version vector, without parsing the rows again.
-fn rewrite_last_seq(body: &mut Vec<u8>, vector: &[u64]) {
-    let marker = b"\"last_seq\":";
-    let Some(position) = body
-        .windows(marker.len())
-        .rposition(|window| window == marker)
-    else {
-        return;
-    };
-    let start = position + marker.len();
-    let Some(relative) = body[start..].iter().position(|byte| *byte == b',') else {
-        return;
-    };
-    let end = start + relative;
-    let encoded = serde_json::to_vec(&crate::fabric::encode_since(vector)).unwrap_or_default();
-    body.splice(start..end, encoded);
-}
-
 async fn changes_normal_raw(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     q: &HashMap<String, String>,
     body: &[u8],
     headers: &HeaderMap,
@@ -2408,16 +2390,57 @@ async fn changes_normal_raw(
     if let Some(mask) = local_mask {
         opts.owned = Some(mask);
     }
-    let changes = db.changes_json(&opts).await.ok()?;
-    let mut body = changes.body.into_bytes();
-    if rewrite {
-        progress[st.cluster.me] = changes.last_seq;
-        rewrite_last_seq(&mut body, &progress);
-    }
+    let me = st.cluster.me;
+    let initial_seq = progress.get(me).copied().unwrap_or(0);
+    let mut rows = Box::pin(Db::changes_stream_arc(db.clone(), opts));
+    let stream = async_stream::stream! {
+        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"results\":["));
+        let mut buffer = String::with_capacity(64 * 1024);
+        let mut first = true;
+        let mut last_seq = initial_seq;
+        while let Some(item) = rows.next().await {
+            let row = match item {
+                Ok(row) => row,
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!("{}: {}", error.error, error.reason)));
+                    return;
+                }
+            };
+            last_seq = row.seq;
+            if rewrite {
+                progress[me] = row.seq;
+            }
+            if !first {
+                buffer.push(',');
+            }
+            first = false;
+            buffer.push_str(&Db::change_row_json(&row));
+            if buffer.len() >= 64 * 1024 {
+                yield Ok(Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        let last_seq_json = if rewrite {
+            crate::fabric::encode_since(&progress)
+        } else {
+            last_seq.to_string()
+        };
+        buffer.push_str("],\"last_seq\":");
+        if rewrite {
+            buffer.push('"');
+            buffer.push_str(&last_seq_json);
+            buffer.push('"');
+        } else {
+            buffer.push_str(&last_seq_json);
+        }
+        buffer.push_str(",\"pending\":0}");
+        if !buffer.is_empty() {
+            yield Ok(Bytes::from(buffer));
+        }
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
+        .body(Body::from_stream(stream))
         .ok()
 }
 

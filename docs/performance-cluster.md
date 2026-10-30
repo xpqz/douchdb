@@ -437,6 +437,28 @@ The include-docs result is the important one: that path was doing all the
 document-loading work the old API shape implied, even when the view returned
 only 100 rows.
 
+### Streaming changes and raw native maps (#72)
+
+Normal `_changes` responses now stream. The database merges 1,024-row pages
+from each selected shard in sequence order, and the HTTP layer serializes rows
+into 64 KiB chunks. A full feed no longer builds the complete row vector or the
+complete response string in memory; `last_seq` is written when the stream ends.
+
+Native map cold builds now read top-level emitted fields directly from the raw
+document JSON. Only the key/value field slices are parsed into JSON values;
+anything the scanner cannot handle falls back to a full document parse.
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_changes?limit=1000` | 521 req/s | 629 req/s | 1.92 ms | 1.47 ms |
+| Full `_changes` | 200 req/s | 243 req/s | 4.93 ms | 3.84 ms |
+| `style=all_docs` | 224 req/s | 239 req/s | 4.10 ms | 4.06 ms |
+| Native map cold build | 38.2 ms | 35.2 ms | — | — |
+
+`include_docs` remains dominated by reading document bodies from LevelDB.
+The benchmark now warms each full-feed mode on every coordinator before
+measuring steady state.
+
 ### Write fan-out copies (#71)
 
 Normal and replication writes now keep each document in one `Arc<Value>` and
