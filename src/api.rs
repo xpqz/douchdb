@@ -766,7 +766,11 @@ pub async fn db_metadata_put(
         Err(_) => return fail(ApiError::bad_request("invalid shard map")),
     };
     match apply_shard_map(&st, &db, &name, map, &headers).await {
-        Ok(map) => json(StatusCode::OK, json!(map)),
+        Ok((map, pending)) => {
+            let mut value = json!(map);
+            value["pending"] = json!(pending);
+            json(StatusCode::OK, value)
+        }
         Err(error) => fail(error),
     }
 }
@@ -775,44 +779,67 @@ async fn apply_shard_map(
     st: &AppState,
     db: &Arc<Db>,
     name: &str,
-    map: ShardMap,
+    mut map: ShardMap,
     headers: &HeaderMap,
-) -> DbResult<ShardMap> {
+) -> DbResult<(ShardMap, bool)> {
     if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
         return Err(ApiError::bad_request(
             "shard map does not match database q or cluster node count",
         ));
     }
+    let internal = is_forwarded(st, headers);
+    if !internal {
+        map.version = db.shard_map().version.saturating_add(1);
+    }
     db.set_shard_map(map.clone())?;
-    if !is_forwarded(st, headers) {
-        let payload = serde_json::to_vec(&map)
-            .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-        for (index, peer) in st.cluster.nodes.iter().enumerate() {
-            if index == st.cluster.me {
-                continue;
-            }
+    if internal {
+        db.clear_pending_shard_map();
+        return Ok((map, false));
+    }
+
+    let payload = serde_json::to_vec(&map)
+        .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
+    let peers: Vec<String> = st
+        .cluster
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != st.cluster.me)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    let responses = futures::future::join_all(peers.into_iter().map(|peer| {
+        let payload = payload.clone();
+        async move {
             let request = st
                 .client
                 .put(format!("{peer}/_node/_local/_dbs/{name}"))
                 .header("x-douchdb-forwarded", "1")
                 .header("x-douchdb-secret", st.cluster.secret.as_str())
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(payload.clone());
+                .body(payload);
             let request = forward_client_auth(request, headers);
-            let response = request
+            request
                 .send()
                 .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
-            if !response.status().is_success() {
-                return Err(ApiError::new(
-                    response.status().as_u16(),
-                    "shard_map_update_failed",
-                    response.text().await.unwrap_or_default(),
-                ));
-            }
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+        }
+    }))
+    .await;
+    let mut acknowledgements = 1usize; // local write
+    for acknowledged in responses {
+        if acknowledged {
+            acknowledgements += 1;
         }
     }
-    Ok(map)
+    let quorum = st.cluster.nodes.len().max(1) / 2 + 1;
+    let pending = acknowledgements < quorum;
+    if pending {
+        db.set_pending_shard_map(&map)?;
+    } else {
+        db.clear_pending_shard_map();
+    }
+    Ok((map, pending))
 }
 
 pub async fn db_rebalance(
@@ -833,7 +860,11 @@ pub async fn db_rebalance(
         st.cluster.replication_factor(),
     );
     match apply_shard_map(&st, &db, &name, map, &headers).await {
-        Ok(map) => json(StatusCode::OK, json!(map)),
+        Ok((map, pending)) => {
+            let mut value = json!(map);
+            value["pending"] = json!(pending);
+            json(StatusCode::OK, value)
+        }
         Err(error) => fail(error),
     }
 }

@@ -396,8 +396,11 @@ Above ~6k means something was built that nobody asked for.
   added: CouchDB uses cheap internal replica calls and a dumb round-robin LB.
 * **Shard-map metadata and movement.** Each database has a persisted, cached
   mem3-style shard map, exposed at `/_node/_local/_dbs/{db}` and broadcast to
-  peers. Routing and anti-entropy read the map; anti-entropy checkpoints are
-  tagged by map hash so new replicas backfill after a move. A balanced planner
+  peers. Maps carry monotonic versions; updates track metadata quorum and a
+  pending map file, and anti-entropy reconciles newer/older peers after a
+  missed update. Routing and anti-entropy read the map; anti-entropy
+  checkpoints are tagged by map hash so new replicas backfill after a move. A
+  balanced planner
   endpoint and an explicit post-convergence cleanup endpoint move and then
   remove old replicas. Cluster routing, replica selection, quorum reads/writes
   and internal node calls live in `src/fabric.rs`; HTTP handlers only call that

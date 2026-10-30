@@ -24,6 +24,10 @@ pub struct ShardMap {
     pub q: u32,
     pub node_count: usize,
     pub replicas: Vec<Vec<usize>>,
+    /// Monotonically increasing metadata generation. Higher versions win
+    /// when peers reconcile after a missed update.
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl ShardMap {
@@ -33,6 +37,7 @@ impl ShardMap {
             q,
             node_count: 1,
             replicas: vec![vec![0]; q as usize],
+            version: 0,
         }
     }
 
@@ -52,6 +57,7 @@ impl ShardMap {
                         .collect()
                 })
                 .collect(),
+            version: 0,
         }
     }
 
@@ -86,6 +92,7 @@ impl Cluster {
             q,
             node_count: self.nodes.len(),
             replicas: (0..q).map(|shard| self.replicas_of_shard(shard)).collect(),
+            version: 0,
         }
     }
 
