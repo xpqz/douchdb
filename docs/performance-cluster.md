@@ -437,6 +437,20 @@ The include-docs result is the important one: that path was doing all the
 document-loading work the old API shape implied, even when the view returned
 only 100 rows.
 
+### Local-first bulk reads (#70)
+
+`_bulk_get` and `_revs_diff` now group each document by the coordinator's local
+replica when it holds one, instead of always going to the primary owner. A
+failed group retries the affected documents on the next replica in the shard
+map, so bulk reads no longer fail just because the primary is down.
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_bulk_get`, 250 docs | 53,774 docs/s | 60,921 docs/s | 4.22 ms | 3.76 ms |
+
+The two-node-loss test also exercises `_bulk_get` and `_revs_diff` through the
+surviving coordinator with no peers available.
+
 ### Local-replica reads and cluster fan-out (#58, #59)
 
 Shard-masked reads now prefer the coordinator's local replica for every

@@ -346,10 +346,6 @@ impl Db {
         self.replicas_of_shard(self.shard_index(docid) as u32)
     }
 
-    pub fn owner_of_doc(&self, docid: &str) -> usize {
-        self.owner_of_shard(self.shard_index(docid) as u32)
-    }
-
     pub async fn clear_shards(&self, shards: &[usize]) -> DbResult<()> {
         for &index in shards {
             let Some(shard) = self.shards.get(index) else {
