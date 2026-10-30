@@ -1254,7 +1254,7 @@ async fn cluster_view_rows(
     headers: &HeaderMap,
 ) -> DbResult<(
     crate::view::ViewSpec,
-    Vec<crate::view::Row>,
+    Arc<Vec<crate::view::Row>>,
     HashMap<String, Value>,
 )> {
     let ddoc_doc = match db.get_doc(ddoc, &DocOpts::default()).await {
@@ -1333,12 +1333,12 @@ async fn cluster_view_rows(
             succeeded = true;
             docs.extend(node_docs);
             let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
-            for row in rows {
-                let key = row_key(&row);
+            for row in rows.iter() {
+                let key = row_key(row);
                 local
                     .entry(key)
                     .and_modify(|(count, _)| *count += 1)
-                    .or_insert((1, row));
+                    .or_insert((1, row.clone()));
             }
             for (key, (count, row)) in local {
                 match counts.get_mut(&key) {
@@ -1360,10 +1360,11 @@ async fn cluster_view_rows(
             rows.push(row.clone());
         }
     }
-    Ok((spec, rows, docs))
+    crate::view::sort_rows(&mut rows);
+    Ok((spec, Arc::new(rows), docs))
 }
 
-fn decode_view_batch(value: Value) -> (Vec<crate::view::Row>, HashMap<String, Value>) {
+fn decode_view_batch(value: Value) -> (Arc<Vec<crate::view::Row>>, HashMap<String, Value>) {
     let mut rows = Vec::new();
     let mut docs = HashMap::new();
     for row in value["rows"].as_array().cloned().unwrap_or_default() {
@@ -1379,7 +1380,7 @@ fn decode_view_batch(value: Value) -> (Vec<crate::view::Row>, HashMap<String, Va
             value: row.get("value").cloned().unwrap_or(Value::Null),
         });
     }
-    (rows, docs)
+    (Arc::new(rows), docs)
 }
 
 fn row_key(row: &crate::view::Row) -> String {

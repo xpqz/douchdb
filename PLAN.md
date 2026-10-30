@@ -365,6 +365,11 @@ Above ~6k means something was built that nobody asked for.
   `skip + limit` live rows (and keys queries fetch metadata directly);
   `_changes` stops each shard once `limit` matches are found. The #30
   before/after numbers are in `docs/performance.md`.
+* **View map builds and warm queries.** Cold builds splice `_id`/`_rev` onto
+  raw bodies and batch QuickJS calls instead of parsing and re-encoding every
+  document through `Value`; the rebuilt index seeds a sorted in-memory snapshot
+  that warm queries reuse, and built-in reducers skip per-row key/value
+  allocation. See the #31 before/after numbers in `docs/performance.md`.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored

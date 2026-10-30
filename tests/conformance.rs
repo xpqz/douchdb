@@ -2371,6 +2371,7 @@ async fn views_map_reduce_collation_and_query_options() {
         "stats": {"map": map, "reduce": "_stats"},
         "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return sum(values) * 2; }"},
         "by_type_city": {"map": "function(doc){ emit([doc.type, doc.city], 1); }", "reduce": "_count"},
+        "meta": {"map": "function(doc){ emit(doc._id, doc._rev); }"},
         "bad": {"map": "function(doc){ emit(; }"}
     }});
     let (status, body) = s.put("/shop/_design/shop", ddoc).await;
@@ -2391,6 +2392,13 @@ async fn views_map_reduce_collation_and_query_options() {
     assert_eq!(ids, ["a", "b", "c", "d"]);
     assert_eq!(body["rows"][0]["key"], "Berlin");
     assert_eq!(body["rows"][0]["value"], 10);
+
+    // Map functions see `_id` and `_rev` even though bodies are stored without
+    // them; the index build injects them without a JSON parse/encode round trip.
+    let (_, body) = s.get("/shop/_design/shop/_view/meta?reduce=false").await;
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["rows"][0]["key"], "a");
+    assert!(body["rows"][0]["value"].as_str().unwrap().starts_with("1-"));
 
     // Descending, limits and offsets follow CouchDB.
     let (_, body) = s
