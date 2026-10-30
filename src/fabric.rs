@@ -22,10 +22,6 @@ pub(crate) fn replicas_of_doc(db: &Db, docid: &str) -> Vec<usize> {
     db.replicas_of_doc(docid)
 }
 
-pub(crate) fn owner_of_doc(db: &Db, docid: &str) -> usize {
-    db.owner_of_doc(docid)
-}
-
 pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
     db.owner_of_shard(shard)
 }

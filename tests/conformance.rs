@@ -2234,6 +2234,25 @@ async fn cluster_full_replica_reads_survive_two_node_loss() {
         assert_eq!(row["doc"]["_id"], row["id"]);
         assert!(row["doc"]["_rev"].is_string());
     }
+
+    // Bulk reads also prefer the local replica, so no peer is required.
+    let (status, body) = nodes[0]
+        .post(
+            "/clfull/_bulk_get",
+            json!({"docs": [{"id": "f00"}, {"id": "f11"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|row| row["docs"][0]["ok"].is_object()));
+
+    let missing = "1-00000000000000000000000000000000";
+    let (status, body) = nodes[0]
+        .post("/clfull/_revs_diff", json!({"f00": [missing]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["f00"]["missing"][0], missing);
 }
 
 #[tokio::test]

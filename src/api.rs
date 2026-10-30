@@ -1926,6 +1926,21 @@ fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
 /// `new_edits=false` (the replication path) sends the given revision to every
 /// replica directly. The bool is whether the default write quorum was met.
 
+/// Replica candidates for a bulk read, with the coordinator's local replica
+/// first when it holds one. The remaining replicas are ordered by the shard
+/// map so a failed request can retry elsewhere.
+fn bulk_read_candidates(db: &Db, id: &str, me: usize) -> Vec<usize> {
+    let (owner, mut replicas) = db.placement_of_doc(id);
+    if replicas.is_empty() {
+        return vec![owner];
+    }
+    if replicas.contains(&me) {
+        replicas.retain(|node| *node != me);
+        replicas.insert(0, me);
+    }
+    replicas
+}
+
 async fn bulk_get(
     st: &AppState,
     db: &Db,
@@ -1948,42 +1963,56 @@ async fn bulk_get(
     let Some(reqs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
-    let mut groups: Vec<Vec<(usize, Value)>> =
-        (0..st.cluster.nodes.len()).map(|_| Vec::new()).collect();
-    for (i, req) in reqs.into_iter().enumerate() {
-        let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
-        groups[owner_of_doc(db, id)].push((i, req));
-    }
-    let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
-    let requests = groups.into_iter().enumerate().filter_map(|(owner, group)| {
-        if group.is_empty() {
-            return None;
-        }
-        let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
-        let subdocs: Vec<Value> = group.into_iter().map(|(_, req)| req).collect();
-        Some(async move {
-            let sub = json!({"docs": subdocs});
-            let result = if owner == st.cluster.me {
-                db.bulk_get(&sub, attachments, revs).await
-            } else {
-                let peer = st.cluster.nodes[owner].clone();
-                let mut query = format!("revs={revs}");
-                if attachments {
-                    query.push_str("&attachments=true");
-                }
-                forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
-            };
-            (indices, result)
+    let mut candidates: Vec<Vec<usize>> = reqs
+        .iter()
+        .map(|req| {
+            let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
+            bulk_read_candidates(db, id, st.cluster.me)
         })
-    });
-    for (indices, result) in futures::future::join_all(requests).await {
-        let result = match result {
-            Ok(value) => value,
-            Err(error) => return fail(error),
-        };
-        let rows = result["results"].as_array().cloned().unwrap_or_default();
-        for (slot, row) in indices.into_iter().zip(rows) {
-            out[slot] = row;
+        .collect();
+    let mut out = vec![Value::Null; reqs.len()];
+    let mut pending: Vec<usize> = (0..reqs.len()).collect();
+    while !pending.is_empty() {
+        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for slot in pending.drain(..) {
+            groups.entry(candidates[slot][0]).or_default().push(slot);
+        }
+        let requests = groups.into_iter().map(|(node, slots)| {
+            let subdocs: Vec<Value> = slots.iter().map(|slot| reqs[*slot].clone()).collect();
+            async move {
+                let sub = json!({"docs": subdocs});
+                let result = if node == st.cluster.me {
+                    db.bulk_get(&sub, attachments, revs).await
+                } else {
+                    let peer = st.cluster.nodes[node].clone();
+                    let mut query = format!("revs={revs}");
+                    if attachments {
+                        query.push_str("&attachments=true");
+                    }
+                    forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+                };
+                (slots, result)
+            }
+        });
+        for (slots, result) in futures::future::join_all(requests).await {
+            match result {
+                Ok(value) => {
+                    let rows = value["results"].as_array().cloned().unwrap_or_default();
+                    for (slot, row) in slots.into_iter().zip(rows) {
+                        out[slot] = row;
+                    }
+                }
+                Err(error) => {
+                    for slot in slots {
+                        if candidates[slot].len() > 1 {
+                            candidates[slot].remove(0);
+                            pending.push(slot);
+                        } else {
+                            return fail(error);
+                        }
+                    }
+                }
+            }
         }
     }
     json(StatusCode::OK, json!({"results": out}))
@@ -2008,34 +2037,57 @@ async fn revs_diff(
     let Some(map) = value.as_object() else {
         return fail(ApiError::bad_request("Request body must be a JSON object"));
     };
-    let mut groups: Vec<Map<String, Value>> =
-        (0..st.cluster.nodes.len()).map(|_| Map::new()).collect();
-    for (id, revs) in map {
-        groups[owner_of_doc(db, id)].insert(id.clone(), revs.clone());
-    }
-    let requests = groups.into_iter().enumerate().filter_map(|(owner, group)| {
-        if group.is_empty() {
-            return None;
-        }
-        Some(async move {
-            let sub = Value::Object(group);
-            if owner == st.cluster.me {
-                db.revs_diff(&sub).await
-            } else {
-                let peer = st.cluster.nodes[owner].clone();
-                forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await
-            }
-        })
-    });
+    let entries: Vec<(String, Value)> = map
+        .iter()
+        .map(|(id, revs)| (id.clone(), revs.clone()))
+        .collect();
+    let mut candidates: Vec<Vec<usize>> = entries
+        .iter()
+        .map(|(id, _)| bulk_read_candidates(db, id, st.cluster.me))
+        .collect();
     let mut out = Map::new();
-    for result in futures::future::join_all(requests).await {
-        let result = match result {
-            Ok(value) => value,
-            Err(error) => return fail(error),
-        };
-        if let Some(obj) = result.as_object() {
-            for (id, entry) in obj {
-                out.insert(id.clone(), entry.clone());
+    let mut pending: Vec<usize> = (0..entries.len()).collect();
+    while !pending.is_empty() {
+        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for slot in pending.drain(..) {
+            groups.entry(candidates[slot][0]).or_default().push(slot);
+        }
+        let requests = groups.into_iter().map(|(node, slots)| {
+            let sub = Value::Object(
+                slots
+                    .iter()
+                    .map(|slot| (entries[*slot].0.clone(), entries[*slot].1.clone()))
+                    .collect(),
+            );
+            async move {
+                let result = if node == st.cluster.me {
+                    db.revs_diff(&sub).await
+                } else {
+                    let peer = st.cluster.nodes[node].clone();
+                    forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await
+                };
+                (slots, result)
+            }
+        });
+        for (slots, result) in futures::future::join_all(requests).await {
+            match result {
+                Ok(value) => {
+                    if let Some(obj) = value.as_object() {
+                        for (id, entry) in obj {
+                            out.insert(id.clone(), entry.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    for slot in slots {
+                        if candidates[slot].len() > 1 {
+                            candidates[slot].remove(0);
+                            pending.push(slot);
+                        } else {
+                            return fail(error);
+                        }
+                    }
+                }
             }
         }
     }

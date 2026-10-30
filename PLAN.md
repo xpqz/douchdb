@@ -392,11 +392,12 @@ Above ~6k means something was built that nobody asked for.
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in
   reduces plus custom reducers via `rereduce`. Cluster view indexes cover all
-  locally held replicas; normal queries and `_changes` use the coordinator's
-  local replica when it holds the shard, otherwise the primary owner. When an
-  owner is down, map views, reduce views, `_all_docs` and `_changes` request
-  only the missing shard masks from live replicas instead of rescanning every
-  reachable node. Reduce partials are recombined after fallback, including
+  locally held replicas; normal queries, `_changes`, `_bulk_get` and
+  `_revs_diff` use the coordinator's local replica when it holds the shard,
+  otherwise the primary owner, with replica retry on failure. When an owner is
+  down, map views, reduce views, `_all_docs` and `_changes` request only the
+  missing shard masks from live replicas instead of rescanning every reachable
+  node. Reduce partials are recombined after fallback, including
   grouped and custom `rereduce` reducers. Changes use the live-document index
   for winning revisions and compact sequence tokens, avoiding per-row metadata
   decodes and duplicate detection. A lazy per-shard sequence index caches
