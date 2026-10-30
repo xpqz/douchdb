@@ -11,6 +11,7 @@ use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,29 @@ pub(crate) fn owner_of_doc(db: &Db, docid: &str) -> usize {
 
 pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
     db.owner_of_shard(shard)
+}
+
+/// Assign each shard to exactly one node for a fan-out read. Prefer the
+/// coordinator's local replica when it holds one: for n=3 on three nodes every
+/// node holds every shard, so the whole query can be answered locally instead
+/// of issuing one HTTP request per owner. Shards without a local replica stay
+/// with their primary owner and can still fall back to other replicas.
+pub(crate) fn preferred_shard_masks(st: &AppState, db: &Db) -> Vec<Vec<bool>> {
+    let node_count = st.cluster.nodes.len().max(1);
+    let mut masks = vec![vec![false; db.q as usize]; node_count];
+    let map = db.shard_map();
+    for shard in 0..db.q {
+        let replicas = map.replicas_of(shard);
+        let target = if replicas.contains(&st.cluster.me) {
+            st.cluster.me
+        } else {
+            replicas.first().copied().unwrap_or(0)
+        };
+        if let Some(mask) = masks.get_mut(target) {
+            mask[shard as usize] = true;
+        }
+    }
+    masks
 }
 
 pub(crate) fn is_replica_of(db: &Db, docid: &str, me: usize) -> bool {
@@ -323,6 +347,7 @@ pub(crate) async fn commit_docs(
         // CouchDB-style: send the original document to every replica in its
         // shard set and wait for `w` acknowledgements. Revision ids are
         // deterministic, so no primary re-fetch/copy pass is needed.
+        let db_handle = st.db(dbname).await?;
         let mut groups: HashMap<usize, Vec<(usize, Value)>> = HashMap::new();
         for (slot, doc) in docs.into_iter().enumerate() {
             for node in &replicas[slot] {
@@ -333,17 +358,39 @@ pub(crate) async fn commit_docs(
         crate::telemetry::record_fanout(groups.len() as u64);
         let mut successes: Vec<Option<Value>> = vec![None; total];
         let mut failures: Vec<Option<Value>> = vec![None; total];
-        let responses =
-            futures::future::join_all(groups.into_iter().map(|(node, group)| async move {
-                let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-                let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
-                let result =
-                    write_local_or_forward(st, db, dbname, node, subdocs, true, headers).await;
-                (node, slots, result)
-            }))
-            .await;
+        let mut pending = FuturesUnordered::new();
+        for (node, group) in groups {
+            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
+            if node == st.cluster.me {
+                let db = db_handle.clone();
+                pending.push(tokio::spawn(async move {
+                    (node, slots, db.put_docs(subdocs, true).await)
+                }));
+            } else {
+                let client = st.client.clone();
+                let secret = st.cluster.secret.clone();
+                let peer = st.cluster.nodes[node].clone();
+                let dbname = dbname.to_string();
+                let headers = headers.clone();
+                pending.push(tokio::spawn(async move {
+                    (
+                        node,
+                        slots,
+                        forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers)
+                            .await,
+                    )
+                }));
+            }
+        }
 
-        for (node, slots, response) in responses {
+        // Return as soon as every document has `w` acknowledgements. The
+        // remaining replica writes keep running as detached tasks, so a slow
+        // or unreachable replica no longer sets write tail latency.
+        while let Some(joined) = pending.next().await {
+            let Ok((node, slots, response)) = joined else {
+                continue;
+            };
             match response {
                 Ok(results) => {
                     for (slot, result) in slots.into_iter().zip(results) {
@@ -368,6 +415,9 @@ pub(crate) async fn commit_docs(
                         }
                     }
                 }
+            }
+            if acks.iter().all(|ack| *ack >= quorum) {
+                break;
             }
         }
 
@@ -403,10 +453,20 @@ pub(crate) async fn commit_docs(
         }
         crate::telemetry::record_fanout(groups.len() as u64);
         let mut reached = vec![false; total];
-        for (node, group) in groups {
+        let responses = futures::future::join_all(groups.into_iter().map(|(node, group)| {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            let subdocs: Vec<Value> = group.iter().map(|(_, doc)| doc.clone()).collect();
-            match write_local_or_forward(st, db, dbname, node, subdocs, false, headers).await {
+            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| doc).collect();
+            async move {
+                (
+                    node,
+                    slots,
+                    write_local_or_forward(st, db, dbname, node, subdocs, false, headers).await,
+                )
+            }
+        }))
+        .await;
+        for (node, slots, response) in responses {
+            match response {
                 Ok(results) => {
                     for (slot, result) in slots.into_iter().zip(results) {
                         reached[slot] = true;
@@ -417,7 +477,7 @@ pub(crate) async fn commit_docs(
                     }
                 }
                 Err(_) => {
-                    for (slot, _) in group {
+                    for slot in slots {
                         if out[slot].is_null() {
                             out[slot] = json!({
                                 "id": ids[slot],
@@ -464,11 +524,31 @@ pub(crate) async fn forward_bulk(
     new_edits: bool,
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
-    let request = st
-        .client
+    forward_bulk_owned(
+        st.client.clone(),
+        st.cluster.secret.clone(),
+        peer.to_string(),
+        dbname.to_string(),
+        docs,
+        new_edits,
+        headers.clone(),
+    )
+    .await
+}
+
+async fn forward_bulk_owned(
+    client: reqwest::Client,
+    secret: String,
+    peer: String,
+    dbname: String,
+    docs: Vec<Value>,
+    new_edits: bool,
+    headers: HeaderMap,
+) -> DbResult<Vec<Value>> {
+    let request = client
         .post(format!("{peer}/{dbname}/_bulk_docs"))
         .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
+        .header("x-douchdb-secret", secret)
         .json(&json!({"docs": docs, "new_edits": new_edits}));
     let request = forward_client_auth(request, &headers);
     let response = request
@@ -570,14 +650,14 @@ pub(crate) async fn cluster_all_docs(
     headers: &HeaderMap,
 ) -> DbResult<Value> {
     let node_count = st.cluster.nodes.len();
-    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
-        .map(|node| {
-            (0..db.q)
-                .map(|shard| owner_of_shard(db, shard) == node)
-                .collect()
-        })
+    let owned_by_node = preferred_shard_masks(st, db);
+    let requests: Vec<(usize, Vec<bool>)> = owned_by_node
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, mask)| mask.iter().any(|owned| *owned))
         .collect();
-    crate::telemetry::record_fanout(node_count as u64);
+    crate::telemetry::record_fanout(requests.len() as u64);
 
     if let Some(keys) = &opts.keys {
         let mut key_opts = opts.clone();
@@ -587,21 +667,21 @@ pub(crate) async fn cluster_all_docs(
         key_opts.endkey = None;
         key_opts.descending = false;
 
-        let responses = futures::future::join_all((0..node_count).map(|node| {
-            fetch_all_docs(
-                st,
-                db,
-                dbname,
-                node,
-                &key_opts,
-                headers,
-                Some(&owned_by_node[node]),
-            )
+        let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
+            let node = *node;
+            let mask = mask.clone();
+            let key_opts = key_opts.clone();
+            async move {
+                (
+                    node,
+                    fetch_all_docs(st, db, dbname, node, &key_opts, headers, Some(&mask)).await,
+                )
+            }
         }))
         .await;
         let mut values = Vec::new();
         let mut failed = Vec::new();
-        for (node, response) in responses.into_iter().enumerate() {
+        for (node, response) in responses {
             match response {
                 Ok(value) => values.push(value),
                 Err(_) => failed.push(node),
@@ -668,21 +748,21 @@ pub(crate) async fn cluster_all_docs(
     window.skip = 0;
     window.limit = take;
 
-    let responses = futures::future::join_all((0..node_count).map(|node| {
-        fetch_all_docs(
-            st,
-            db,
-            dbname,
-            node,
-            &window,
-            headers,
-            Some(&owned_by_node[node]),
-        )
+    let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
+        let node = *node;
+        let mask = mask.clone();
+        let window = window.clone();
+        async move {
+            (
+                node,
+                fetch_all_docs(st, db, dbname, node, &window, headers, Some(&mask)).await,
+            )
+        }
     }))
     .await;
     let mut values = Vec::new();
     let mut failed = Vec::new();
-    for (node, response) in responses.into_iter().enumerate() {
+    for (node, response) in responses {
         match response {
             Ok(value) => values.push(value),
             Err(_) => failed.push(node),
@@ -967,14 +1047,12 @@ pub(crate) async fn cluster_view_rows(
     let take = query.skip.saturating_add(query.limit);
 
     let node_count = st.cluster.nodes.len();
-    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
-        .map(|node| {
-            (0..db.q)
-                .map(|shard| owner_of_shard(db, shard) == node)
-                .collect()
-        })
-        .collect();
-    crate::telemetry::record_fanout(node_count as u64);
+    let owned_by_node = preferred_shard_masks(st, db);
+    let active = owned_by_node
+        .iter()
+        .filter(|mask| mask.iter().any(|owned| *owned))
+        .count();
+    crate::telemetry::record_fanout(active as u64);
     let limit = can_limit.then_some(take);
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
@@ -1137,14 +1215,12 @@ pub(crate) async fn cluster_reduce(
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let node_count = st.cluster.nodes.len();
-    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
-        .map(|node| {
-            (0..db.q)
-                .map(|shard| owner_of_shard(db, shard) == node)
-                .collect()
-        })
-        .collect();
-    crate::telemetry::record_fanout(node_count as u64);
+    let owned_by_node = preferred_shard_masks(st, db);
+    let active = owned_by_node
+        .iter()
+        .filter(|mask| mask.iter().any(|owned| *owned))
+        .count();
+    crate::telemetry::record_fanout(active as u64);
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
         let mask = owned_by_node[node].clone();
@@ -1390,14 +1466,19 @@ pub(crate) async fn cluster_changes(
         vec![0; n]
     };
     since.resize(n, 0);
-    crate::telemetry::record_fanout(n as u64);
+    let owned_by_node = preferred_shard_masks(st, db);
+    let requests: Vec<(usize, Vec<bool>)> = owned_by_node
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+        .collect();
+    crate::telemetry::record_fanout(requests.len() as u64);
 
     let include_docs = flag(q, "include_docs");
     let style_all_docs = q.get("style").map(String::as_str) == Some("all_docs");
     let doc_ids = doc_ids_from(q, body);
     let limit = num(q, "limit");
-    let mut progress = since.clone();
-    let mut rows = Vec::new();
 
     if let Some(limit) = limit {
         if limit == 0 {
@@ -1408,33 +1489,80 @@ pub(crate) async fn cluster_changes(
             }));
         }
 
-        // Query every node for its next `limit` changes. Walk the responses
-        // round-robin so each node's rows are consumed as a prefix, stop at
-        // the global limit of unique documents, and advance `last_seq` only
-        // over rows actually consumed. Replicas may repeat a document; those
-        // rows advance the source node's progress but are not emitted twice.
-        let responses: Vec<Option<Value>> = futures::future::join_all((0..n).map(|node| {
-            fetch_node_changes(
-                st,
-                db,
-                dbname,
-                node,
-                since[node],
-                Some(limit),
-                include_docs,
-                style_all_docs,
-                doc_ids.as_deref(),
-                headers,
-            )
+        let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
+            let node = *node;
+            let mask = mask.clone();
+            let since = since[node];
+            let doc_ids = doc_ids.clone();
+            async move {
+                (
+                    node,
+                    fetch_node_changes(
+                        st,
+                        db,
+                        dbname,
+                        node,
+                        since,
+                        Some(limit),
+                        include_docs,
+                        style_all_docs,
+                        doc_ids.as_deref(),
+                        headers,
+                        &mask,
+                    )
+                    .await,
+                )
+            }
         }))
-        .await
-        .into_iter()
-        .map(Result::ok)
-        .collect();
-        if responses.iter().any(Option::is_none) {
-            crate::telemetry::record_degraded_read();
+        .await;
+        let mut node_rows: Vec<Vec<Value>> = (0..n).map(|_| Vec::new()).collect();
+        let mut failed = Vec::new();
+        let mut succeeded = false;
+        for (node, response) in responses {
+            match response {
+                Ok(value) => {
+                    succeeded = true;
+                    node_rows[node]
+                        .extend(value["results"].as_array().cloned().unwrap_or_default());
+                }
+                Err(_) => failed.push(node),
+            }
         }
-        if responses.iter().all(Option::is_none) {
+        if !failed.is_empty() {
+            crate::telemetry::record_degraded_read();
+            let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
+            let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+            let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
+                let since = since[node];
+                let doc_ids = doc_ids.clone();
+                async move {
+                    (
+                        node,
+                        fetch_node_changes(
+                            st,
+                            db,
+                            dbname,
+                            node,
+                            since,
+                            Some(limit),
+                            include_docs,
+                            style_all_docs,
+                            doc_ids.as_deref(),
+                            headers,
+                            &mask,
+                        )
+                        .await,
+                    )
+                }
+            }))
+            .await;
+            for (node, response) in fallbacks {
+                let value = response?;
+                succeeded = true;
+                node_rows[node].extend(value["results"].as_array().cloned().unwrap_or_default());
+            }
+        }
+        if !succeeded {
             return Err(ApiError::new(
                 502,
                 "bad_gateway",
@@ -1442,24 +1570,24 @@ pub(crate) async fn cluster_changes(
             ));
         }
 
+        for rows in &mut node_rows {
+            rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
+        }
         let mut indices = vec![0usize; n];
+        let mut progress = since.clone();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         loop {
             let mut progressed = false;
             for node in 0..n {
-                let row = responses[node]
-                    .as_ref()
-                    .and_then(|response| response["results"].as_array())
-                    .and_then(|rows| rows.get(indices[node]))
-                    .cloned();
+                let row = node_rows[node].get(indices[node]).cloned();
                 let Some(mut row) = row else {
                     continue;
                 };
                 indices[node] += 1;
                 progressed = true;
                 let shard_seq = row["seq"].as_u64().unwrap_or(0);
-                progress[node] = shard_seq;
+                progress[node] = progress[node].max(shard_seq);
                 row["seq"] = json!(encode_since(&progress));
                 let duplicate = row
                     .get("id")
@@ -1483,46 +1611,92 @@ pub(crate) async fn cluster_changes(
             "last_seq": encode_since(&progress),
             "pending": 0,
         }));
-    } else {
-        // A full feed (replication, initial sync) can ask every node at once;
-        // the responses are then merged in node order for a stable vector.
-        let responses = futures::future::join_all((0..n).map(|node| {
-            fetch_node_changes(
-                st,
-                db,
-                dbname,
-                node,
-                since[node],
-                None,
-                include_docs,
-                style_all_docs,
-                doc_ids.as_deref(),
-                headers,
-            )
-        }))
-        .await;
-        if responses.iter().any(Result::is_err) {
-            crate::telemetry::record_degraded_read();
-        }
-        let mut succeeded = false;
-        for (node, response) in responses.into_iter().enumerate() {
-            if let Ok(response) = response {
-                succeeded = true;
-                absorb_node_changes(&response, node, &mut progress, &mut rows);
-            }
-        }
-        if !succeeded {
-            return Err(ApiError::new(
-                502,
-                "bad_gateway",
-                "no changes replica is reachable",
-            ));
-        }
     }
 
-    // With N replicas the same revision arrives from more than one node. Keep
-    // one row per document (the one furthest along the version vector) so
-    // clients fed by any coordinator see each change once.
+    let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
+        let node = *node;
+        let mask = mask.clone();
+        let since = since[node];
+        let doc_ids = doc_ids.clone();
+        async move {
+            (
+                node,
+                fetch_node_changes(
+                    st,
+                    db,
+                    dbname,
+                    node,
+                    since,
+                    None,
+                    include_docs,
+                    style_all_docs,
+                    doc_ids.as_deref(),
+                    headers,
+                    &mask,
+                )
+                .await,
+            )
+        }
+    }))
+    .await;
+    let mut succeeded = false;
+    let mut failed = Vec::new();
+    let mut rows = Vec::new();
+    let mut progress = since.clone();
+    for (node, response) in responses {
+        match response {
+            Ok(value) => {
+                succeeded = true;
+                absorb_node_changes(&value, node, &mut progress, &mut rows);
+            }
+            Err(_) => failed.push(node),
+        }
+    }
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
+        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+        let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
+            let since = since[node];
+            let doc_ids = doc_ids.clone();
+            async move {
+                (
+                    node,
+                    fetch_node_changes(
+                        st,
+                        db,
+                        dbname,
+                        node,
+                        since,
+                        None,
+                        include_docs,
+                        style_all_docs,
+                        doc_ids.as_deref(),
+                        headers,
+                        &mask,
+                    )
+                    .await,
+                )
+            }
+        }))
+        .await;
+        for (node, response) in fallbacks {
+            let value = response?;
+            succeeded = true;
+            absorb_node_changes(&value, node, &mut progress, &mut rows);
+        }
+    }
+    if !succeeded {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no changes replica is reachable",
+        ));
+    }
+
+    // Shard masks are disjoint, so the same revision should no longer arrive
+    // from multiple nodes. Keep the dedup pass for map transitions and legacy
+    // clients that replay a `since` vector from before local-first reads.
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut deduped: Vec<Value> = Vec::new();
     for row in rows {
@@ -1573,6 +1747,7 @@ pub(crate) async fn fetch_node_changes(
     style_all_docs: bool,
     doc_ids: Option<&[String]>,
     headers: &HeaderMap,
+    mask: &[bool],
 ) -> DbResult<Value> {
     if node == st.cluster.me {
         return db
@@ -1583,12 +1758,22 @@ pub(crate) async fn fetch_node_changes(
                 style_all_docs,
                 descending: false,
                 doc_ids: doc_ids.map(|ids| ids.to_vec()),
+                owned: Some(mask.to_vec()),
             })
             .await;
     }
 
     let peer = &st.cluster.nodes[node];
-    let mut url = format!("{peer}/{dbname}/_changes?since={since}");
+    let selected: Vec<String> = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, owned)| **owned)
+        .map(|(shard, _)| shard.to_string())
+        .collect();
+    let mut url = format!(
+        "{peer}/{dbname}/_changes?since={since}&shards={}",
+        selected.join(",")
+    );
     if let Some(limit) = limit {
         url.push_str(&format!("&limit={limit}"));
     }
@@ -1634,7 +1819,7 @@ pub(crate) fn absorb_node_changes(
 ) {
     for mut row in response["results"].as_array().cloned().unwrap_or_default() {
         let shard_seq = row["seq"].as_u64().unwrap_or(0);
-        progress[node] = shard_seq;
+        progress[node] = progress[node].max(shard_seq);
         row["seq"] = json!(encode_since(progress));
         rows.push(row);
     }

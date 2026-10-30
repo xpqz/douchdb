@@ -381,17 +381,19 @@ Above ~6k means something was built that nobody asked for.
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in
   reduces plus custom reducers via `rereduce`. Cluster view indexes cover all
-  locally held replicas; normal queries filter to owner shards. When an owner
-  is down, map views, reduce views and `_all_docs` request only the missing
-  shard masks from live replicas instead of rescanning every reachable node.
-  Reduce partials are recombined after fallback, including grouped and custom
-  `rereduce` reducers. Full `_changes` feeds
+  locally held replicas; normal queries and `_changes` use the coordinator's
+  local replica when it holds the shard, otherwise the primary owner. When an
+  owner is down, map views, reduce views, `_all_docs` and `_changes` request
+  only the missing shard masks from live replicas instead of rescanning every
+  reachable node. Reduce partials are recombined after fallback, including
+  grouped and custom `rereduce` reducers. Full `_changes` feeds
   also query peers concurrently; limited
   feeds merge node prefixes round-robin up to the global limit. Unavailable
   change nodes are skipped and covered by replicas, with their vector
   component resuming on return. New edits are written directly to every
-  replica in parallel and wait for `w`; there is no primary fetch-and-copy
-  pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
+  replica in parallel and return once `w` acknowledgements are reached;
+  remaining replica writes continue detached, so slow replicas do not set
+  tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
   the remaining replicas concurrently; `?r=1` is the local fast path. Fabric,
   shard-map and rebalance metrics export through the optional OpenTelemetry
   setup and are no-ops without an endpoint. A
