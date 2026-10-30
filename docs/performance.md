@@ -74,7 +74,8 @@ Warm views also improved as a side effect: every view query calls `GET /db` for
 the current update sequence, and that now reads counters instead of scanning all
 metadata. Single-document write throughput is within run-to-run variance; the
 counters add one metadata read and JSON decode per written document, which is
-small relative to the group-commit fsync.
+small relative to the group-commit flush. rusty-leveldb does not fsync; the
+write numbers are OS-buffered, not power-loss durable.
 
 ### View map pass (#31)
 
@@ -144,7 +145,9 @@ Storage at the end of the run:
 
 ## Reading the numbers
 
-- **Single-document writes** are dominated by the group-commit fsync path. With
+- **Single-document writes** are dominated by the group-commit flush path.
+  rusty-leveldb does not fsync by default, so these are OS-buffered writes, not
+  power-loss durable. With
   one client they reach ~3.6k/s; eight concurrent clients get ~5.9k/s. More than
   eight writers mostly increases queueing latency (p99 3 ms → 41 ms) rather than
   throughput. Live/deleted counters are updated in the same batch as the

@@ -597,7 +597,8 @@ python3 scripts/storage_spike.py --target-gb 10
 ```
 
 It reports throughput, write/read latencies, compaction latency and
-amplification, and checks durability across `kill -9`.
+amplification, and checks process-crash durability across `kill -9`. It does
+not test power-loss durability: rusty-leveldb does not fsync.
 
 ## Status and limits
 
