@@ -217,6 +217,12 @@ Add `reduce` to a view to collapse its rows. Built-ins are `_count`, `_sum`,
 `_stats` and `_approx_count_distinct`; `group=true` reduces per key and
 `group_level=N` groups array keys by their first N elements.
 
+The built-in reducers run entirely in Rust. `_count`, `_sum` and `_stats` are
+also combined natively on the coordinator in a cluster; custom JavaScript
+reducers are the only reduce path that uses QuickJS, including their
+`rereduce=true` pass. `_approx_count_distinct` is currently exact: it uses a
+Rust `HashSet` of serialized values and is not partially combined across nodes.
+
 ```sh
 curl 'localhost:5984/shop/_design/shop/_view/totals?group=true'
 ```
