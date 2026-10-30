@@ -57,6 +57,8 @@ struct DbFile {
     q: u32,
     uuid: String,
     instance_start_time: String,
+    #[serde(default)]
+    partitioned: bool,
 }
 
 /// Staged operations for one atomic commit.
@@ -73,11 +75,59 @@ pub fn shard_index(docid: &str, q: u32) -> usize {
     (n % q) as usize
 }
 
+/// Split a partitioned document id into `(partition, docid)`.
+pub fn partition_of(docid: &str) -> Option<(&str, &str)> {
+    let (partition, rest) = docid.split_once(':')?;
+    if partition.is_empty() || rest.is_empty() || partition.starts_with('_') {
+        return None;
+    }
+    Some((partition, rest))
+}
+
+/// Document ids in a partitioned database hash by their partition, so every
+/// document in a partition lands on the same shard. Design/local documents are
+/// global and keep hashing by their full id.
+pub fn shard_index_for(docid: &str, q: u32, partitioned: bool) -> usize {
+    if partitioned && !docid.starts_with('_') {
+        if let Some((partition, _)) = partition_of(docid) {
+            return shard_index(&format!("{partition}:foo"), q);
+        }
+    }
+    shard_index(docid, q)
+}
+
+/// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
+pub fn validate_partition(partition: &str) -> DbResult<()> {
+    if partition.is_empty() {
+        return Err(ApiError::new(
+            400,
+            "illegal_partition",
+            "Partition must not be empty",
+        ));
+    }
+    if partition.starts_with('_') {
+        return Err(ApiError::new(
+            400,
+            "illegal_partition",
+            "Partition must not start with an underscore",
+        ));
+    }
+    if partition.contains(':') {
+        return Err(ApiError::new(
+            400,
+            "illegal_partition",
+            "Partition must not contain a colon",
+        ));
+    }
+    Ok(())
+}
+
 pub struct Db {
     pub name: String,
     #[allow(dead_code)]
     pub path: PathBuf,
     pub q: u32,
+    pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
     shard_map: Arc<std::sync::RwLock<ShardMap>>,
@@ -92,6 +142,7 @@ pub struct DbConfig {
     pub q: u32,
     pub revs_limit: u64,
     pub shard_map: ShardMap,
+    pub partitioned: bool,
 }
 
 impl Db {
@@ -111,6 +162,7 @@ impl Db {
                     .unwrap_or_default()
                     .as_micros()
                     .to_string(),
+                partitioned: config.partitioned,
             };
             std::fs::write(&db_file, serde_json::to_vec(&file).unwrap()).ok();
             file
@@ -149,6 +201,7 @@ impl Db {
             name: name.to_string(),
             path,
             q: file.q.max(1),
+            partitioned: file.partitioned,
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
             shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
@@ -167,7 +220,49 @@ impl Db {
     }
 
     pub fn shard_index(&self, docid: &str) -> usize {
-        shard_index(docid, self.q)
+        shard_index_for(docid, self.q, self.partitioned)
+    }
+
+    pub fn validate_doc_id(&self, id: &str) -> DbResult<()> {
+        if !self.partitioned || id.starts_with("_design/") || id.starts_with("_local/") {
+            return Ok(());
+        }
+        let Some((partition, rest)) = id.split_once(':') else {
+            return Err(ApiError::new(
+                400,
+                "illegal_docid",
+                "Doc id must be of form partition:id",
+            ));
+        };
+        validate_partition(partition)?;
+        if rest.is_empty() {
+            return Err(ApiError::new(
+                400,
+                "illegal_docid",
+                "Document id must not be empty",
+            ));
+        }
+        if rest.starts_with('_') {
+            return Err(ApiError::new(
+                400,
+                "illegal_docid",
+                "Only reserved document ids may start with underscore.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shard holding a partition. Used for partition metadata and scoped reads.
+    pub fn partition_shard(&self, partition: &str) -> usize {
+        shard_index(&format!("{partition}:foo"), self.q)
+    }
+
+    pub async fn partition_counts(&self, partition: &str) -> DbResult<(u64, u64)> {
+        let shard = &self.shards[self.partition_shard(partition)];
+        let partition = partition.to_string();
+        shard
+            .call(move |s| s.partition_counts(&partition).map_err(ApiError::from))
+            .await
     }
 
     pub fn shard_map(&self) -> ShardMap {
@@ -292,7 +387,7 @@ impl Db {
             deleted_count += deleted;
             update_seq = update_seq.max(seq);
         }
-        Ok(json!({
+        let mut info = json!({
             "db_name": self.name,
             "doc_count": doc_count,
             "doc_del_count": deleted_count,
@@ -306,7 +401,11 @@ impl Db {
             "disk_format_version": 8,
             "committed_update_seq": update_seq,
             "uuid": self.uuid,
-        }))
+        });
+        if self.partitioned {
+            info["props"] = json!({"partitioned": true});
+        }
+        Ok(info)
     }
 
     // ----- documents -------------------------------------------------------
@@ -325,10 +424,17 @@ impl Db {
 
         for (i, doc) in docs.into_iter().enumerate() {
             match doc_id(&doc) {
-                Ok(id) => {
-                    ids[i] = Some(id.clone());
-                    grouped[self.shard_index(&id)].push((i, doc));
-                }
+                Ok(id) => match self.validate_doc_id(&id) {
+                    Ok(()) => {
+                        ids[i] = Some(id.clone());
+                        grouped[self.shard_index(&id)].push((i, doc));
+                    }
+                    Err(e) => {
+                        out[i] = Some(json!({
+                            "id": id, "error": e.error, "reason": e.reason
+                        }))
+                    }
+                },
                 Err(e) => out[i] = Some(json!({"error": e.error, "reason": e.reason})),
             }
         }
@@ -386,10 +492,47 @@ impl Db {
         // `skip + limit`: any row in the global window is also in its shard's
         // first `skip + limit` rows.
         let take = opts.skip.saturating_add(opts.limit);
+        let mut opts = opts.clone();
+        let partition_shard = opts
+            .partition
+            .as_ref()
+            .map(|partition| self.partition_shard(partition));
+        if let Some(partition) = &opts.partition {
+            // CouchDB intersects the requested range with the partition's
+            // [partition:, partition;) key range.
+            let first = format!("{partition}:");
+            let last = format!("{partition};");
+            if opts.descending {
+                opts.startkey = Some(match &opts.startkey {
+                    Some(start) => start.min(&last).clone(),
+                    None => last.clone(),
+                });
+                opts.endkey = Some(match &opts.endkey {
+                    Some(end) => end.max(&first).clone(),
+                    None => first.clone(),
+                });
+            } else {
+                opts.startkey = Some(match &opts.startkey {
+                    Some(start) => start.max(&first).clone(),
+                    None => first.clone(),
+                });
+                opts.endkey = Some(match &opts.endkey {
+                    Some(end) => end.min(&last).clone(),
+                    None => last.clone(),
+                });
+            }
+        }
+
         let mut rows = Vec::new();
         let mut total_rows = 0u64;
         let mut before_start = 0usize;
         for (index, shard) in self.shards.iter().enumerate() {
+            if partition_shard
+                .map(|partition| partition != index)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if owned
                 .map(|owned| !owned.get(index).copied().unwrap_or(false))
                 .unwrap_or(false)
@@ -399,7 +542,10 @@ impl Db {
             let opts = opts.clone();
             let (mut shard_rows, shard_offset, shard_docs) = shard
                 .call(move |s| {
-                    let (docs, _) = s.counts();
+                    let docs = match &opts.partition {
+                        Some(partition) => s.partition_live_count(partition)?,
+                        None => s.counts().0,
+                    };
                     let (rows, offset) = collect_all_docs(s, &opts, take)?;
                     Ok((rows, offset, docs))
                 })
@@ -477,14 +623,29 @@ impl Db {
         owned: Option<&[bool]>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
-        for (index, shard) in self.shards.iter().enumerate() {
+        if let Some(partition) = &opts.partition {
+            let shard = self.partition_shard(partition);
             if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
                 .unwrap_or(false)
             {
-                continue;
+                total_rows = 0;
+            } else {
+                let partition = partition.clone();
+                total_rows = self.shards[shard]
+                    .call(move |s| s.partition_live_count(&partition).map_err(ApiError::from))
+                    .await?;
             }
-            total_rows += shard.call(|s| Ok(s.counts().0)).await?;
+        } else {
+            for (index, shard) in self.shards.iter().enumerate() {
+                if owned
+                    .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                total_rows += shard.call(|s| Ok(s.counts().0)).await?;
+            }
         }
 
         let page: Vec<String> = keys
@@ -495,7 +656,15 @@ impl Db {
             .collect();
         let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut included = vec![false; page.len()];
+        if opts.partition.is_some() {
+            included.fill(true);
+        }
         for (slot, key) in page.iter().enumerate() {
+            if let Some(partition) = &opts.partition {
+                if !key.starts_with(&format!("{partition}:")) {
+                    continue;
+                }
+            }
             let shard = self.shard_index(key);
             if owned
                 .map(|owned| !owned.get(shard).copied().unwrap_or(false))
@@ -535,7 +704,9 @@ impl Db {
                 .into_iter()
                 .enumerate()
                 .filter(|(slot, _)| included[*slot])
-                .map(|(_, row)| row.unwrap_or(Value::Null))
+                .map(|(slot, row)| {
+                    row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"}))
+                })
                 .collect::<Vec<_>>(),
         }))
     }
@@ -1370,6 +1541,7 @@ pub struct DocOpts {
 
 #[derive(Clone, Debug)]
 pub struct AllDocsOpts {
+    pub partition: Option<String>,
     pub include_docs: bool,
     pub conflicts: bool,
     pub attachments: bool,
@@ -1384,6 +1556,7 @@ pub struct AllDocsOpts {
 impl Default for AllDocsOpts {
     fn default() -> Self {
         AllDocsOpts {
+            partition: None,
             include_docs: false,
             conflicts: false,
             attachments: false,
@@ -1578,12 +1751,16 @@ fn collect_all_docs(
     let mut rows = Vec::new();
     let before_start = {
         let live = shard.live_docs()?;
+        let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
+        let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
         let before_start = match (start, opts.descending) {
             (Some(start), false) => live
                 .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
+                .filter(|(id, _)| in_partition(id))
                 .count(),
             (Some(start), true) => live
                 .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
+                .filter(|(id, _)| in_partition(id))
                 .count(),
             (None, _) => 0,
         };

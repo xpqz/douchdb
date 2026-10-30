@@ -264,6 +264,40 @@ impl Shard {
         (self.docs, self.deleted)
     }
 
+    /// Live document count for one partition, using the in-memory live map.
+    pub fn partition_live_count(&mut self, partition: &str) -> Result<u64> {
+        let first = format!("{partition}:");
+        let last = format!("{partition};");
+        let live = self.live_docs()?;
+        Ok(live
+            .range::<str, _>((
+                std::ops::Bound::Included(first.as_str()),
+                std::ops::Bound::Excluded(last.as_str()),
+            ))
+            .count() as u64)
+    }
+
+    /// Live and deleted document counts for one partition. The partition
+    /// prefix keeps the scan inside that partition's key range.
+    pub fn partition_counts(&mut self, partition: &str) -> Result<(u64, u64)> {
+        let prefix = format!("m/{partition}:");
+        let mut docs = 0u64;
+        let mut deleted = 0u64;
+        self.scan_range_while(prefix.as_bytes(), None, false, |_, value| {
+            if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
+                if let Some((_, live, _)) = meta_state(&meta) {
+                    if live {
+                        docs += 1;
+                    } else {
+                        deleted += 1;
+                    }
+                }
+            }
+            true
+        })?;
+        Ok((docs, deleted))
+    }
+
     /// Sorted live document ids and their winning revisions. The index is
     /// built on first use and maintained in memory from then on.
     pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {

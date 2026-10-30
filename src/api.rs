@@ -248,13 +248,14 @@ impl AppState {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
                 shard_map: self.cluster.shard_map(self.config.q),
+                partitioned: false,
             },
         )?);
         self.dbs.write().await.insert(name.to_string(), db.clone());
         Ok(db)
     }
 
-    pub async fn create_db(&self, name: &str) -> DbResult<Arc<Db>> {
+    pub async fn create_db(&self, name: &str, partitioned: bool) -> DbResult<Arc<Db>> {
         crate::view::forget_db(&self.root.join(name));
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
@@ -270,6 +271,7 @@ impl AppState {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
                 shard_map: self.cluster.shard_map(self.config.q),
+                partitioned,
             },
         )?);
         self.dbs.write().await.insert(name.to_string(), db.clone());
@@ -1218,7 +1220,8 @@ pub async fn db_root(
     let local_only = st.cluster.is_internal_db(&headers);
     match method {
         Method::PUT => {
-            if let Err(e) = st.create_db(&name).await {
+            let partitioned = flag(&q, "partitioned");
+            if let Err(e) = st.create_db(&name, partitioned).await {
                 return fail(e);
             }
             if st.cluster.is_clustered() && !local_only {
@@ -1226,9 +1229,13 @@ pub async fn db_root(
                     if peer == &st.cluster.nodes[st.cluster.me] {
                         continue;
                     }
+                    let mut url = format!("{peer}/{name}");
+                    if partitioned {
+                        url.push_str("?partitioned=true");
+                    }
                     let request = st
                         .client
-                        .put(format!("{peer}/{name}"))
+                        .put(url)
                         .header("x-douchdb-local-db", "1")
                         .header("x-douchdb-secret", st.cluster.secret.as_str());
                     let request = forward_client_auth(request, &headers);
@@ -1310,6 +1317,9 @@ pub async fn db_root(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            if let Err(e) = db.validate_doc_id(&id) {
+                return fail(e);
+            }
             // The id only exists after the body is parsed, so the shard's
             // replicas are known here and a generated document can still be
             // routed. Try each replica so a dead primary does not lose it.
@@ -1382,6 +1392,68 @@ pub async fn db_root(
     }
 }
 
+async fn partition_info(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    partition: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    if *method != Method::GET && *method != Method::HEAD {
+        return fail(ApiError::new(
+            405,
+            "method_not_allowed",
+            "method not allowed",
+        ));
+    }
+    if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+        let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
+        if !replicas.contains(&st.cluster.me) {
+            if let Some(node) = replicas.first() {
+                let url = format!(
+                    "{}/{name}/_partition/{}",
+                    st.cluster.nodes[*node],
+                    percent_encode(partition)
+                );
+                let request = st
+                    .client
+                    .get(url)
+                    .header("x-douchdb-forwarded", "1")
+                    .header("x-douchdb-secret", st.cluster.secret.as_str());
+                let request = forward_client_auth(request, headers);
+                return match request.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        let value = response.json::<Value>().await.unwrap_or_else(
+                            |error| json!({"error": "bad_gateway", "reason": error.to_string()}),
+                        );
+                        json(status, value)
+                    }
+                    Err(error) => fail(ApiError::new(
+                        502,
+                        "bad_gateway",
+                        format!("{}: {error}", st.cluster.nodes[*node]),
+                    )),
+                };
+            }
+        }
+    }
+    match db.partition_counts(partition).await {
+        Ok((docs, deleted)) => json(
+            StatusCode::OK,
+            json!({
+                "db_name": name,
+                "doc_count": docs,
+                "doc_del_count": deleted,
+                "partition": partition,
+                "sizes": { "active": 0, "external": 0 },
+            }),
+        ),
+        Err(error) => fail(error),
+    }
+}
+
 pub async fn db_rest(
     State(st): State<Arc<AppState>>,
     Path((name, rest)): Path<(String, String)>,
@@ -1406,7 +1478,7 @@ pub async fn db_rest(
     match rest.as_str() {
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
-        "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers).await,
+        "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers, None).await,
         "_changes" => {
             return changes(st.clone(), db.clone(), &name, &q, &method, &body, &headers).await
         }
@@ -1498,8 +1570,65 @@ pub async fn db_rest(
         return local_doc(&db, &percent_decode(id), &method, &body).await;
     }
 
+    if let Some(tail) = rest.strip_prefix("_partition/") {
+        let (partition, suffix) = match tail.find("/_") {
+            Some(index) => (&tail[..index], &tail[index + 1..]),
+            None => (tail, ""),
+        };
+        if !db.partitioned {
+            return fail(ApiError::bad_request("database is not partitioned"));
+        }
+        if let Err(error) = crate::db::validate_partition(partition) {
+            return fail(error);
+        }
+        if let Some(requested) = q.get("partition") {
+            if requested != partition {
+                return fail(ApiError::bad_request(
+                    "Conflicting value for `partition` in query string",
+                ));
+            }
+        }
+        return match suffix {
+            "" => partition_info(&st, &db, &name, partition, &method, &headers).await,
+            "_all_docs" => {
+                all_docs(
+                    &st,
+                    &db,
+                    &name,
+                    &q,
+                    &method,
+                    &body,
+                    &headers,
+                    Some(partition.to_string()),
+                )
+                .await
+            }
+            _ => match view_path(suffix) {
+                Some((ddoc, view)) => {
+                    view_request(
+                        &st,
+                        &db,
+                        &name,
+                        &ddoc,
+                        &view,
+                        &method,
+                        &q,
+                        &body,
+                        &headers,
+                        Some(partition.to_string()),
+                    )
+                    .await
+                }
+                None => fail(ApiError::not_found("missing partition endpoint")),
+            },
+        };
+    }
+
     if let Some((ddoc, view)) = view_path(&rest) {
-        return view_request(&st, &db, &name, &ddoc, &view, &method, &q, &body, &headers).await;
+        return view_request(
+            &st, &db, &name, &ddoc, &view, &method, &q, &body, &headers, None,
+        )
+        .await;
     }
 
     doc_request(&st, &db, &name, &raw_rest, method, &q, &headers, body).await
@@ -1542,6 +1671,7 @@ async fn view_request(
     q: &HashMap<String, String>,
     body: &[u8],
     headers: &HeaderMap,
+    partition: Option<String>,
 ) -> Response {
     if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
         return fail(ApiError::new(
@@ -1590,6 +1720,8 @@ async fn view_request(
             },
             owner_shards: None,
             shard_count: db.q,
+            partition: partition.clone().or_else(|| q.get("partition").cloned()),
+            partitioned: db.partitioned,
             total_rows_override: None,
         })
     };
@@ -1901,8 +2033,21 @@ async fn all_docs(
     method: &Method,
     body: &[u8],
     headers: &HeaderMap,
+    partition: Option<String>,
 ) -> Response {
+    let partition = partition.or_else(|| q.get("partition").cloned());
+    if let Some(partition) = &partition {
+        if !db.partitioned {
+            return fail(ApiError::bad_request(
+                "`partition` parameter is not supported on this db",
+            ));
+        }
+        if let Err(error) = crate::db::validate_partition(partition) {
+            return fail(error);
+        }
+    }
     let mut opts = AllDocsOpts {
+        partition: partition.clone(),
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
         attachments: flag(q, "attachments"),
@@ -2497,6 +2642,9 @@ async fn put_doc(
     }
     // The URL owns the id: CouchDB ignores a conflicting `_id` in the body.
     doc["_id"] = json!(docid);
+    if let Err(error) = db.validate_doc_id(docid) {
+        return fail(error);
+    }
     let new_edits = !q.contains_key("new_edits") || flag(q, "new_edits");
     if !new_edits && doc.get("_rev").is_none() {
         return fail(ApiError::bad_request("Document is missing _rev"));
@@ -2555,6 +2703,9 @@ async fn delete_doc(
     q: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Response {
+    if let Err(error) = db.validate_doc_id(docid) {
+        return fail(error);
+    }
     // A missing document is 404 even without a `rev`; only a live document
     // without a rev is a conflict. A tombstone reports reason "deleted".
     if let Err(e) = db.get_doc(docid, &DocOpts::default()).await {
