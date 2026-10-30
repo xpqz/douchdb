@@ -453,6 +453,29 @@ Before/after on the 6,000-document cluster benchmark:
 `style=all_docs` is close to the default path. `include_docs` remains the
 slowest mode because every row reads and parses a document body from LevelDB.
 
+### Raw changes serialization (#61)
+
+The normal changes feed now builds its JSON response directly instead of
+constructing a `serde_json::Value` tree and serializing it again.
+`include_docs` embeds the stored document body verbatim, with `_id`/`_rev`
+inserted, so document bodies are never parsed and rebuilt. Single-node feeds
+use this path directly; a clustered feed uses it when the coordinator holds
+every selected shard and rewrites only the trailing `last_seq` to the cluster
+vector.
+
+Before/after against the previous `_changes` path:
+
+| Operation | Before | After | p50 before | p50 after |
+|---|---:|---:|---:|---:|
+| `_changes?limit=1000` | 128.6 req/s | 182 req/s | 7.8 ms | 5.4 ms |
+| Full `_changes` | 22.9 req/s | 78.3 req/s | 43.2 ms | 12.6 ms |
+| `_changes?style=all_docs` | 20.0 req/s | 38.1 req/s | 47.8 ms | 26.0 ms |
+| `_changes?include_docs` | 10.6 req/s | 35.9 req/s | 93.9 ms | 27.2 ms |
+| `style=all_docs&include_docs` | 10.1 req/s | 24.9 req/s | 96.4 ms | 39.3 ms |
+
+`style=all_docs` still decodes revision trees to find all leaf revisions;
+`include_docs` is now dominated by reading bodies from LevelDB.
+
 ### Partitioned databases (#55)
 
 See [partitioned-databases.md](partitioned-databases.md) for the user-facing
@@ -574,8 +597,8 @@ replicates and the pending file disappears.
   each node indexes every locally held replica, which is what enables node-loss
   failover. Map and reduce queries both fall back to replicas when an owner is
   unreachable.
-- **`_changes`** is ~7.8 ms for a 1,000-row limited feed; a full
-  6,000-document feed is ~43 ms. Shard-masked changes use the local replica when available and
+- **`_changes`** is ~5.4 ms for a 1,000-row limited feed; a full
+  6,000-document feed is ~12.6 ms. Shard-masked changes use the local replica when available and
   fall back to another replica for missing masks. Limited feeds still merge
   selected nodes round-robin up to the global limit.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
