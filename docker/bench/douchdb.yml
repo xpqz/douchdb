@@ -1,0 +1,33 @@
+name: douch-bench
+x-douchdb: &douchdb
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: douchdb:bench
+  cpus: 2.0
+  mem_limit: 2g
+  environment:
+    DOUCHDB_CLUSTER_SECRET: bench-cluster-secret-123456
+services:
+  node0:
+    <<: *douchdb
+    container_name: douch-bench-1
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","0","--sync-secs","3600"]
+    ports: ["25984:5984"]
+    volumes: ["douch0-data:/data"]
+  node1:
+    <<: *douchdb
+    container_name: douch-bench-2
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","1","--sync-secs","3600"]
+    ports: ["25985:5984"]
+    volumes: ["douch1-data:/data"]
+  node2:
+    <<: *douchdb
+    container_name: douch-bench-3
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","2","--sync-secs","3600"]
+    ports: ["25986:5984"]
+    volumes: ["douch2-data:/data"]
+volumes:
+  douch0-data:
+  douch1-data:
+  douch2-data:

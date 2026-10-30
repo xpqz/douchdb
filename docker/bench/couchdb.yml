@@ -1,0 +1,63 @@
+name: couch-bench
+services:
+  couch1:
+    image: couchdb:3.5
+    container_name: couch-bench-1
+    hostname: couch1
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: password
+      COUCHDB_SECRET: benchsecret
+      COUCHDB_ERLANG_COOKIE: benchcookie
+      NODENAME: 10.99.0.11
+    ports: ["15984:5984"]
+    cpus: 2.0
+    mem_limit: 2g
+    networks:
+      couchnet:
+        ipv4_address: 10.99.0.11
+    volumes: ["couch1-data:/opt/couchdb/data"]
+  couch2:
+    image: couchdb:3.5
+    container_name: couch-bench-2
+    hostname: couch2
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: password
+      COUCHDB_SECRET: benchsecret
+      COUCHDB_ERLANG_COOKIE: benchcookie
+      NODENAME: 10.99.0.12
+    ports: ["15985:5984"]
+    cpus: 2.0
+    mem_limit: 2g
+    networks:
+      couchnet:
+        ipv4_address: 10.99.0.12
+    volumes: ["couch2-data:/opt/couchdb/data"]
+  couch3:
+    image: couchdb:3.5
+    container_name: couch-bench-3
+    hostname: couch3
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: password
+      COUCHDB_SECRET: benchsecret
+      COUCHDB_ERLANG_COOKIE: benchcookie
+      NODENAME: 10.99.0.13
+    ports: ["15986:5984"]
+    cpus: 2.0
+    mem_limit: 2g
+    networks:
+      couchnet:
+        ipv4_address: 10.99.0.13
+    volumes: ["couch3-data:/opt/couchdb/data"]
+networks:
+  couchnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.99.0.0/24
+volumes:
+  couch1-data:
+  couch2-data:
+  couch3-data:

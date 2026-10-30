@@ -568,6 +568,16 @@ python3 scripts/perf_isolated.py --nodes 1,2,3
 `loadgen` can also be run directly against any node or load balancer; see
 [docs/performance-cluster.md](docs/performance-cluster.md).
 
+A direct Docker comparison against a three-node Apache CouchDB 3.5 cluster is
+in [docs/couchdb-comparison.md](docs/couchdb-comparison.md):
+
+```sh
+docker compose -f docker/bench/couchdb.yml up -d
+docker compose -f docker/bench/douchdb.yml up -d --build
+python3 scripts/docker_compare.py --engine couchdb --json-out couch.json
+python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
+```
+
 ## Tests
 
 ```sh
