@@ -379,8 +379,10 @@ Above ~6k means something was built that nobody asked for.
   feeds also query peers concurrently; limited feeds merge node prefixes
   round-robin up to the global limit. New edits are written directly to every
   replica in parallel and wait for `w`; there is no primary fetch-and-copy
-  pass. A reproducible three-node `q=4`/`n=3` benchmark and before/after
-  numbers are in `docs/performance-cluster.md`.
+  pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
+  the remaining replicas concurrently; `?r=1` is the local fast path. A
+  reproducible three-node `q=4`/`n=3` benchmark and before/after numbers are in
+  `docs/performance-cluster.md`.
 * **Load-balanced edge.** The Compose stack puts nginx in front of all three
   nodes; any node is an equal coordinator. Clustered defaults use `n=3`, so a
   three-node cluster has every document on every node. `scripts/perf_cluster.py

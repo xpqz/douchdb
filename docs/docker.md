@@ -37,7 +37,8 @@ All three nodes use:
 With `n=3` on three nodes every document lives on every node, so any
 coordinator can serve point reads locally. That is the CouchDB-recommended
 cluster shape for a three-node deployment; the trade-off is 3× storage and
-three replica writes per document.
+three replica writes per document. Point reads default to a quorum (`r=2`);
+use `?r=1` for the local-replica fast path.
 
 Data lives in the `node0-data`, `node1-data` and `node2-data` volumes. The
 default cluster secret is `dev-cluster-secret-please-change`; override it for

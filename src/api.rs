@@ -2940,11 +2940,17 @@ async fn doc_request(
         return fail(ApiError::bad_request("invalid document id"));
     }
 
-    let read_quorum = num(q, "r").unwrap_or(1);
+    let default_read_quorum = if st.cluster.is_clustered() {
+        st.cluster.replication_factor() / 2 + 1
+    } else {
+        1
+    };
+    let read_quorum = num(q, "r").unwrap_or(default_read_quorum);
     if attachment.is_none()
         && (method == Method::GET || method == Method::HEAD)
         && st.cluster.is_clustered()
         && read_quorum > 1
+        && !is_forwarded(st, headers)
     {
         return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
     }
@@ -2953,10 +2959,24 @@ async fn doc_request(
     // in preference order so a dead primary does not break reads or writes.
     let replicas = st.cluster.replicas_of_doc(&docid, db.q);
     if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
+        let mut forward_q = q.clone();
+        // The peer is a replica; answer locally instead of starting another
+        // quorum read and bouncing the request back.
+        forward_q.insert("r".to_string(), "1".to_string());
         let mut last = None;
         for node in replicas {
             let peer = st.cluster.nodes[node].clone();
-            let response = proxy(st, &method, dbname, rest, q, headers, body.clone(), &peer).await;
+            let response = proxy(
+                st,
+                &method,
+                dbname,
+                rest,
+                &forward_q,
+                headers,
+                body.clone(),
+                &peer,
+            )
+            .await;
             if !unavailable(&response) {
                 return response;
             }
@@ -3140,11 +3160,19 @@ async fn quorum_read(
     // Strip `r` from the hop so the replica answers locally instead of
     // starting another quorum read and bouncing the request back.
     let mut inner = q.clone();
-    inner.remove("r");
-    for node in st.cluster.replicas_of_doc(docid, db.q).into_iter().take(r) {
-        let doc = if node == st.cluster.me {
-            db.get_doc(docid, &doc_opts(q)).await.ok()
-        } else {
+    inner.insert("r".to_string(), "1".to_string());
+    let mut replicas = st.cluster.replicas_of_doc(docid, db.q);
+    if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
+        let local = replicas.remove(index);
+        replicas.insert(0, local);
+    }
+    let targets: Vec<usize> = replicas.into_iter().take(r).collect();
+    let docs = futures::future::join_all(targets.into_iter().map(|node| {
+        let inner = inner.clone();
+        async move {
+            if node == st.cluster.me {
+                return db.get_doc(docid, &doc_opts(q)).await.ok();
+            }
             let peer = st.cluster.nodes[node].clone();
             let response = proxy(
                 st,
@@ -3165,11 +3193,12 @@ async fn quorum_read(
             } else {
                 None
             }
-        };
-        if let Some(doc) = doc {
-            if best.as_ref().map(|b| better_rev(&doc, b)).unwrap_or(true) {
-                best = Some(doc);
-            }
+        }
+    }))
+    .await;
+    for doc in docs.into_iter().flatten() {
+        if best.as_ref().map(|b| better_rev(&doc, b)).unwrap_or(true) {
+            best = Some(doc);
         }
     }
     match best {
