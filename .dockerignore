@@ -1,0 +1,7 @@
+target
+data
+.git
+.skis
+docs
+*.log
+mise.toml
