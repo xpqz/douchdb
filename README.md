@@ -69,14 +69,15 @@ step**. It provides:
 
 The console uses only the public CouchDB HTTP API. Its assets live in [`ui/`](ui)
 and are compiled into the binary, so `cargo build` after editing them. If you
-serve `ui/` from a different origin, set the server URL in the header; that
-origin needs CORS, which douchdb itself does not implement.
+serve `ui/` from a different origin, set the server URL in the header and start
+douchdb with `--cors-origins` for that origin (see below).
 
 ## Configuration
 
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
+        [--cors-origins ORIGIN,ORIGIN]
 ```
 
 | Flag | Default | Meaning |
@@ -90,8 +91,30 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull interval |
+| `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 
 Without `--nodes` it runs as a single node (the cluster with one member).
+
+## CORS
+
+Cross-origin access is **off by default**. Enable it for browser clients
+(PouchDB in a web app, a separately hosted console) with an explicit list:
+
+```sh
+./target/release/douchdb --cors-origins 'http://localhost:5173,https://*.example.com'
+```
+
+`*` allows any origin. Origins are echoed back in
+`Access-Control-Allow-Origin` rather than literally sending `*`, so
+`Access-Control-Allow-Credentials: true` works with `_session` cookies. `OPTIONS`
+preflights return `204` with the requested headers and a one-hour max-age;
+preflights from origins not on the list return `403` and get no CORS headers.
+Wildcards match subdomains (`https://*.example.com`), and ports must match
+exactly.
+
+`--cors-origins '*'` lets any website make credentialed requests against a
+logged-in session, so prefer an explicit list outside local development. The
+embedded `/_utils/` console is same-origin and needs no CORS flag.
 
 ## Cluster
 

@@ -318,6 +318,9 @@ Above ~6k means something was built that nobody asked for.
   `_changes`, shows database info, signs in through `_session`, and has a
   toggleable request log with both directions' JSON. It talks only to the
   public HTTP API; the static assets are the only addition to the server.
+  CORS is opt-in via `--cors-origins` (exact origins or `https://*.example.com`,
+  or `*`), with echoed origins, credentials, preflight and CORS headers on
+  errors, mirroring CouchDB's `[cors]` behaviour.
 
 ## Storage spike
 

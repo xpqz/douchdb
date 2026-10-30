@@ -33,6 +33,7 @@ struct Args {
     nodes: Vec<String>,
     me: usize,
     sync_secs: u64,
+    cors_origins: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +47,7 @@ fn parse_args() -> Args {
         nodes: Vec::new(),
         me: 0,
         sync_secs: 5,
+        cors_origins: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -75,10 +77,21 @@ fn parse_args() -> Args {
             }
             "--me" => args.me = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
+            "--cors-origins" => {
+                args.cors_origins = it
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
             "--help" | "-h" => {
                 println!(
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
-                     \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]"
+                     \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
+                     \x20       [--cors-origins ORIGIN,ORIGIN]"
                 );
                 std::process::exit(0);
             }
@@ -105,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         nodes: args.nodes.clone(),
         me: args.me,
         sync_secs: args.sync_secs,
+        cors_origins: args.cors_origins.clone(),
     };
     let state = Arc::new(AppState {
         root: args.data.clone(),
@@ -150,6 +164,10 @@ async fn main() -> anyhow::Result<()> {
         // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
         // multi-document `_bulk_docs`. CouchDB's limit is far higher.
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::cors,
+        ))
         .layer(axum::middleware::from_fn(api::log_requests))
         .with_state(state);
 

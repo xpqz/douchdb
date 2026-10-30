@@ -8,7 +8,7 @@ use crate::db::{
 };
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
@@ -40,6 +40,9 @@ pub struct Config {
     #[allow(dead_code)]
     pub me: usize,
     pub sync_secs: u64,
+    /// Empty disables CORS. `*` allows any origin (echoed back so credentials
+    /// work); entries may be exact origins or `https://*.example.com`.
+    pub cors_origins: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +248,121 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     let response = next.run(req).await;
     tracing::info!("{} {} -> {}", method, uri, response.status().as_u16());
     response
+}
+
+/// Opt-in CORS, matching CouchDB's `[cors]` configuration. The embedded
+/// console is served from the same origin and needs none of this; it exists for
+/// browser apps (PouchDB, Fauxton, a separate frontend) on another origin.
+pub async fn cors(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if st.config.cors_origins.is_empty() {
+        return next.run(req).await;
+    }
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let allowed = origin
+        .as_deref()
+        .map(|origin| cors_origin_allowed(&st.config.cors_origins, origin))
+        .unwrap_or(false);
+
+    if req.method() == Method::OPTIONS {
+        if !allowed {
+            return fail(ApiError::new(
+                403,
+                "forbidden",
+                "CORS origin is not allowed",
+            ));
+        }
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        add_cors_headers(
+            response.headers_mut(),
+            origin.as_deref().unwrap_or_default(),
+            Some(req.headers()),
+        );
+        return response;
+    }
+
+    let mut response = next.run(req).await;
+    if allowed {
+        add_cors_headers(
+            response.headers_mut(),
+            origin.as_deref().unwrap_or_default(),
+            None,
+        );
+    }
+    response
+}
+
+fn cors_origin_allowed(rules: &[String], origin: &str) -> bool {
+    rules.iter().any(|rule| {
+        if rule == "*" {
+            return true;
+        }
+        let Some((rule_scheme, rule_host)) = rule.split_once("://") else {
+            return false;
+        };
+        let Some((origin_scheme, origin_host)) = origin.split_once("://") else {
+            return false;
+        };
+        if !rule_scheme.eq_ignore_ascii_case(origin_scheme) {
+            return false;
+        }
+        match rule_host.strip_prefix("*.") {
+            // CouchDB-style subdomain wildcard: https://*.example.com
+            Some(suffix) => {
+                let host = origin_host.to_ascii_lowercase();
+                let suffix = suffix.to_ascii_lowercase();
+                host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}"))
+            }
+            None => rule_host.eq_ignore_ascii_case(origin_host),
+        }
+    })
+}
+
+fn add_cors_headers(headers: &mut HeaderMap, origin: &str, preflight: Option<&HeaderMap>) {
+    let put = |headers: &mut HeaderMap, name, value: &str| {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(name, value);
+        }
+    };
+    // Echo the origin rather than using `*`, so cookie credentials work even
+    // when the rule is `*`.
+    put(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    put(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+    put(
+        headers,
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        "ETag, Location, Server, X-Couch-Request-ID, Content-Type, Content-Length",
+    );
+    headers.append(header::VARY, HeaderValue::from_static("Origin"));
+
+    if let Some(request_headers) = preflight {
+        put(
+            headers,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, PUT, POST, HEAD, DELETE, OPTIONS",
+        );
+        let requested = request_headers
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("accept, authorization, content-type, origin, referer, x-csrf-token");
+        put(headers, header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
+        put(headers, header::ACCESS_CONTROL_MAX_AGE, "3600");
+        headers.append(
+            header::VARY,
+            HeaderValue::from_static("Access-Control-Request-Method"),
+        );
+        headers.append(
+            header::VARY,
+            HeaderValue::from_static("Access-Control-Request-Headers"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

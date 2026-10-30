@@ -642,6 +642,14 @@
 
       onMounted(async () => {
         window.addEventListener('hashchange', applyRoute);
+        // When the console is hosted away from douchdb there is no way to
+        // guess the API origin. Wait for the user to enter one in the header
+        // instead of firing requests at the default and logging CORS errors.
+        const servedByApi =
+          location.protocol.startsWith('http') && location.pathname.startsWith('/_utils');
+        const hasSavedServer = Boolean(localStorage.getItem('douchdb.ui.base'));
+        if (!servedByApi && !hasSavedServer) return;
+
         await refreshSession();
         // Avoid a guaranteed 401 (and an error in the browser console) when
         // the server requires authentication and no session exists yet.

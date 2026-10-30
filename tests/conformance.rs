@@ -241,6 +241,101 @@ async fn welcome_and_database_lifecycle() {
 }
 
 #[tokio::test]
+async fn cors_is_opt_in_and_answers_preflight() {
+    let options = |server: &Server, origin: &str| {
+        server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "PUT")
+            .header(
+                "Access-Control-Request-Headers",
+                "content-type, authorization",
+            )
+            .send()
+    };
+
+    let plain = Server::start(false);
+    let response = options(&plain, "http://example.test").await.unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test,https://*.trusted.test".to_string(),
+        ],
+        false,
+    );
+
+    let response = options(&s, "http://example.test").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://example.test")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-credentials")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    let methods = response
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(methods.contains("PUT") && methods.contains("DELETE"));
+    let allowed_headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(allowed_headers.contains("authorization"));
+
+    // Wildcard subdomains match and are echoed for credential support.
+    let response = options(&s, "https://app.trusted.test").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.trusted.test")
+    );
+
+    // Actual responses, including errors, get the header too.
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://example.test")
+    );
+
+    let response = options(&s, "http://evil.test").await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+}
+
+#[tokio::test]
 async fn console_is_served_from_the_couchdb_api_origin() {
     let s = Server::start(false);
 
