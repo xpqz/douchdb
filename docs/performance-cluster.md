@@ -49,16 +49,16 @@ documents per second.
 | Single GET, 8 writers | 500 | 6,738 req/s | 0.805 | 3.650 |
 | `_bulk_docs`, 250 docs/request | 2,500 | 12,177 docs/s (49 req/s) | 19.817 | 21.360 |
 | `_bulk_get`, 250 docs/request | 2,500 | 39,380 docs/s (158 req/s) | 5.897 | 6.968 |
-| `_all_docs?limit=100` | 50 | 489 req/s | 1.832 | 2.506 |
+| `_all_docs?limit=100` | 50 | 613 req/s | 1.350 | 2.002 |
 | `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
 | `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
 | `_changes?since=0&limit=1000` | 20 | 83 req/s | 12.026 | 12.690 |
-| `_changes?since=0` (full feed) | 5 | 8.7 req/s | 115.588 | 121.579 |
-| `GET /db` info | 100 | 1,782 req/s | 0.507 | 1.171 |
-| View map, cold index build | 1 | — | 67.31 | — |
-| View map, warm (reduce default) | 20 | 377 req/s | 2.506 | 3.430 |
-| View map-only, warm | 20 | 284 req/s | 3.251 | 4.625 |
-| View reduce, warm | 20 | 329 req/s | 3.020 | 3.468 |
+| `_changes?since=0` (full feed) | 5 | 8.7 req/s | 109.212 | 123.427 |
+| `GET /db` info | 100 | 1,780 req/s | 0.519 | 1.297 |
+| View map, cold index build | 1 | — | 38.92 | — |
+| View map, warm (reduce default) | 20 | 612 req/s | 1.584 | 1.786 |
+| View map-only, warm | 20 | 354 req/s | 2.824 | 3.058 |
+| View reduce, warm | 20 | 628 req/s | 1.561 | 1.706 |
 
 ## Before and after
 
@@ -186,6 +186,21 @@ partials. Grouped custom reducers merge by group key and then rereduce the
 partial values. `_approx_count_distinct` is intentionally excluded because
 per-owner distinct counts cannot be combined exactly.
 
+### Owner-only view indexes (#39)
+
+Each node now builds its view index only over the primary shards it owns,
+instead of also indexing replicas it will never return in an owner-only cluster
+query. The index design marker includes the ownership bit string, so indexes
+created by older builds rebuild automatically. Incremental `_changes` updates
+and `include_docs` lookups apply the same owner filter.
+
+| Operation | Before (#39) | After (#39) |
+|---|---|---|
+| View cold index build | 67.31 ms | 38.92 ms |
+| View map, warm (reduce default) | p50 2.506 ms | p50 1.584 ms |
+| View map-only, warm | p50 3.251 ms | p50 2.824 ms |
+| View reduce, warm | p50 3.020 ms | p50 1.561 ms |
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -196,15 +211,14 @@ per-owner distinct counts cannot be combined exactly.
   clients. Some requests are served locally and some proxy to the owner.
 - **Bulk reads** reach ~38k docs/s; `_bulk_get` is routed per document and is
   still the fastest way to read many documents through a coordinator.
-- **`_all_docs`** is ~1.8 ms with or without a `startkey`. Each owner answers
+- **`_all_docs`** is ~1.3 ms with or without a `startkey`. Each owner answers
   its offset from the in-memory live-document map instead of walking earlier
   metadata.
-- **Warm views** are ~2.5–3.3 ms. The remaining cost is mostly coordinator
-  merge and JSON/HTTP for the selected rows. Cold builds are ~67 ms because
-  every node still indexes its local replicas; only the output rows are
-  owner-filtered.
+- **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
+  merge and JSON/HTTP for the selected rows. Cold builds are ~39 ms because
+  each node indexes only its primary shards.
 - **`_changes`** is ~12 ms for a 1,000-row limited feed; a full 6,000-document
-  feed is ~116 ms with nodes queried concurrently. Limited feeds still fill
+  feed is ~109 ms with nodes queried concurrently. Limited feeds still fill
   from one node at a time so `last_seq` remains resumable.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
   vector concurrently with small responses.
@@ -217,9 +231,6 @@ per-owner distinct counts cannot be combined exactly.
   mid-write is healed by the background replicator when it returns.
 - The coordinator and all peers run on the same host, so loopback and shared CPU
   are part of the measurement.
-- The next cold-build win is to build each node's view over owned shards only
-  (or maintain a separate replica index), which would roughly halve the map work
-  in this `n=2` configuration.
 - Limited `_changes` feeds still fill from one node at a time; a globally
   ordered limit across nodes remains. `_approx_count_distinct` still uses the
   map-row merge path because partial distinct counts cannot be combined.
