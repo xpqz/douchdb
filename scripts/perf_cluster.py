@@ -369,6 +369,15 @@ def main():
             changes_lat, time.perf_counter() - started
         )
 
+        changes_all_lat = []
+        started = time.perf_counter()
+        for i in range(5):
+            elapsed, _ = request(conns[i % len(conns)], "GET", "/perf/_changes?since=0")
+            changes_all_lat.append(elapsed)
+        result["operations"]["changes_since_0_all"] = summary(
+            changes_all_lat, time.perf_counter() - started
+        )
+
         info_lat = []
         started = time.perf_counter()
         for i in range(100):

@@ -52,8 +52,9 @@ documents per second.
 | `_all_docs?limit=100` | 50 | 489 req/s | 1.832 | 2.506 |
 | `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
 | `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
-| `_changes?since=0&limit=1000` | 20 | 105 req/s | 9.417 | 10.470 |
-| `GET /db` info | 100 | 1,936 req/s | 0.489 | 0.740 |
+| `_changes?since=0&limit=1000` | 20 | 83 req/s | 12.026 | 12.690 |
+| `_changes?since=0` (full feed) | 5 | 8.7 req/s | 115.588 | 121.579 |
+| `GET /db` info | 100 | 1,782 req/s | 0.507 | 1.171 |
 | View map, cold index build | 1 | — | 67.31 | — |
 | View map, warm (reduce default) | 20 | 377 req/s | 2.506 | 3.430 |
 | View map-only, warm | 20 | 284 req/s | 3.251 | 4.625 |
@@ -164,6 +165,17 @@ round-trip pattern changed.
 |---|---|---|
 | `GET /db` info | 1,380 req/s, p50 0.679 ms | 1,936 req/s, p50 0.489 ms |
 
+### Parallel full changes and grouped reduces (#37)
+
+An unlimited `_changes` feed (initial sync or replication) now requests every
+node concurrently and merges the responses in node order. Limited feeds keep
+the resumable one-node-at-a-time behavior, so `last_seq` only advances over rows
+actually returned. A full 6,000-document seed feed is ~116 ms p50.
+
+Grouped `_count`, `_sum` and `_stats` queries are now reduced per owner and
+combined by group key instead of shipping every map row to the coordinator.
+Grouped tests cover both `_count` and `_sum`.
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -181,9 +193,10 @@ round-trip pattern changed.
   merge and JSON/HTTP for the selected rows. Cold builds are ~67 ms because
   every node still indexes its local replicas; only the output rows are
   owner-filtered.
-- **`_changes`** is ~10 ms for a 1,000-row initial feed. The coordinator still
-  polls nodes in order and stops when the limit is filled.
-- **`GET /db`** is ~0.49 ms because it fetches the per-node update-sequence
+- **`_changes`** is ~12 ms for a 1,000-row limited feed; a full 6,000-document
+  feed is ~116 ms with nodes queried concurrently. Limited feeds still fill
+  from one node at a time so `last_seq` remains resumable.
+- **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
   vector concurrently with small responses.
 
 ## Caveats and next steps
@@ -197,9 +210,9 @@ round-trip pattern changed.
 - The next cold-build win is to build each node's view over owned shards only
   (or maintain a separate replica index), which would roughly halve the map work
   in this `n=2` configuration.
-- `_changes` fan-out could be made concurrent and its `limit` global across all
-  nodes. Grouped/custom reduces still use the map-row merge path; only global
-  built-in reduces are combined today.
+- Limited `_changes` feeds still fill from one node at a time; a globally
+  ordered limit across nodes remains. Grouped built-in reduces are combined,
+  but custom reducers still use the map-row merge path.
 - Every node keeps its live `_all_docs` map in memory after the first range
   query. That is what removes the offset scan, but large databases should budget
   for it.

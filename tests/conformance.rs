@@ -2041,6 +2041,13 @@ async fn cluster_views_merge_rows_from_every_replica() {
     assert_eq!(body["rows"][0]["value"], 12);
     let (_, body) = nodes[0].get("/clview/_design/v/_view/sum").await;
     assert_eq!(body["rows"][0]["value"], 66);
+    let (_, body) = nodes[0].get("/clview/_design/v/_view/sum?group=true").await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["key"], "Berlin");
+    assert_eq!(rows[0]["value"], 30);
+    assert_eq!(rows[1]["key"], "Paris");
+    assert_eq!(rows[1]["value"], 36);
 
     // Map queries push the window down to the owner nodes but still report the
     // whole-view total and the correct offset.

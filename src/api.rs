@@ -1237,8 +1237,6 @@ async fn view_request(
             Ok(spec) => {
                 let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
                 if reduce
-                    && !query.group
-                    && query.group_level == 0
                     && query.key.is_none()
                     && query.keys.is_none()
                     && query.startkey.is_none()
@@ -1475,12 +1473,22 @@ async fn cluster_reduce(
                     percent_encode(ddoc),
                     percent_encode(view_name)
                 );
+                let mut params = vec![
+                    ("reduce", "true".to_string()),
+                    ("owner_only", "1".to_string()),
+                ];
+                if query.group {
+                    params.push(("group", "true".to_string()));
+                }
+                if query.group_level > 0 {
+                    params.push(("group_level", query.group_level.to_string()));
+                }
                 let request = st
                     .client
                     .get(url)
                     .header("x-douchdb-forwarded", "1")
                     .header("x-douchdb-secret", st.cluster.secret.as_str())
-                    .query(&[("reduce", "true"), ("owner_only", "1")]);
+                    .query(&params);
                 let request = forward_client_auth(request, headers);
                 let response = request
                     .send()
@@ -1503,17 +1511,48 @@ async fn cluster_reduce(
     }))
     .await;
 
+    let grouped = query.group || query.group_level > 0;
     let mut partials = Vec::new();
+    let mut groups: HashMap<String, (Value, Value)> = HashMap::new();
     for batch in batches {
         let (_, value) = batch?;
-        partials.push(
-            value["rows"]
-                .get(0)
-                .and_then(|row| row.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
+        if grouped {
+            for row in value["rows"].as_array().cloned().unwrap_or_default() {
+                let key = row.get("key").cloned().unwrap_or(Value::Null);
+                let value = row.get("value").cloned().unwrap_or(Value::Null);
+                let hash = serde_json::to_string(&key).unwrap_or_default();
+                match groups.get_mut(&hash) {
+                    Some((_, existing)) => {
+                        let combined = combine_reduce_values(reducer, &[existing.clone(), value])?;
+                        *existing = combined;
+                    }
+                    None => {
+                        groups.insert(hash, (key, value));
+                    }
+                }
+            }
+        } else {
+            partials.push(
+                value["rows"]
+                    .get(0)
+                    .and_then(|row| row.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
     }
+
+    if grouped {
+        let mut rows: Vec<(Value, Value)> = groups.into_values().collect();
+        rows.sort_by(|a, b| crate::view::cmp_json(&a.0, &b.0));
+        return Ok(json!({
+            "rows": rows
+                .into_iter()
+                .map(|(key, value)| json!({"key": key, "value": value}))
+                .collect::<Vec<_>>()
+        }));
+    }
+
     let value = combine_reduce_values(reducer, &partials)?;
     Ok(json!({"rows": [{"key": Value::Null, "value": value}]}))
 }
@@ -2726,65 +2765,50 @@ async fn cluster_changes(
     let mut progress = since.clone();
     let mut rows = Vec::new();
 
-    for node in 0..n {
-        let remaining = limit.map(|l| l.saturating_sub(rows.len()));
-        if remaining == Some(0) {
-            break;
-        }
-        let response = if node == st.cluster.me {
-            db.changes(&ChangesOpts {
-                since: since[node],
-                limit: remaining,
+    if let Some(limit) = limit {
+        // Limited feeds keep the existing resumable behaviour: fill the
+        // window from one node at a time so last_seq only advances over rows
+        // that were actually returned.
+        for node in 0..n {
+            let remaining = limit.saturating_sub(rows.len());
+            if remaining == 0 {
+                break;
+            }
+            let response = fetch_node_changes(
+                st,
+                db,
+                dbname,
+                node,
+                since[node],
+                Some(remaining),
                 include_docs,
                 style_all_docs,
-                descending: false,
-                doc_ids: doc_ids.clone(),
-            })
-            .await?
-        } else {
-            let peer = &st.cluster.nodes[node];
-            let mut url = format!("{peer}/{dbname}/_changes?since={}", since[node]);
-            if let Some(limit) = remaining {
-                url.push_str(&format!("&limit={limit}"));
-            }
-            if include_docs {
-                url.push_str("&include_docs=true");
-            }
-            if style_all_docs {
-                url.push_str("&style=all_docs");
-            }
-            let request = st
-                .client
-                .get(url)
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str());
-            let request = forward_client_auth(request, &headers);
-            let request = if let Some(ids) = &doc_ids {
-                request
-                    .query(&[("filter", "_doc_ids")])
-                    .json(&json!({"doc_ids": ids}))
-            } else {
-                request
-            };
-            let response = request
-                .send()
-                .await
-                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let text = response.text().await.unwrap_or_default();
-                return Err(ApiError::new(status, "changes_failed", text));
-            }
-            response
-                .json::<Value>()
-                .await
-                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?
-        };
-        for mut row in response["results"].as_array().cloned().unwrap_or_default() {
-            let shard_seq = row["seq"].as_u64().unwrap_or(0);
-            progress[node] = shard_seq;
-            row["seq"] = json!(encode_since(&progress));
-            rows.push(row);
+                doc_ids.as_deref(),
+                headers,
+            )
+            .await?;
+            absorb_node_changes(&response, node, &mut progress, &mut rows);
+        }
+    } else {
+        // A full feed (replication, initial sync) can ask every node at once;
+        // the responses are then merged in node order for a stable vector.
+        let responses = futures::future::join_all((0..n).map(|node| {
+            fetch_node_changes(
+                st,
+                db,
+                dbname,
+                node,
+                since[node],
+                None,
+                include_docs,
+                style_all_docs,
+                doc_ids.as_deref(),
+                headers,
+            )
+        }))
+        .await;
+        for (node, response) in responses.into_iter().enumerate() {
+            absorb_node_changes(&response?, node, &mut progress, &mut rows);
         }
     }
 
@@ -2828,6 +2852,79 @@ async fn cluster_changes(
         "last_seq": encode_since(&progress),
         "pending": 0,
     }))
+}
+
+async fn fetch_node_changes(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    node: usize,
+    since: u64,
+    limit: Option<usize>,
+    include_docs: bool,
+    style_all_docs: bool,
+    doc_ids: Option<&[String]>,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    if node == st.cluster.me {
+        return db
+            .changes(&ChangesOpts {
+                since,
+                limit,
+                include_docs,
+                style_all_docs,
+                descending: false,
+                doc_ids: doc_ids.map(|ids| ids.to_vec()),
+            })
+            .await;
+    }
+
+    let peer = &st.cluster.nodes[node];
+    let mut url = format!("{peer}/{dbname}/_changes?since={since}");
+    if let Some(limit) = limit {
+        url.push_str(&format!("&limit={limit}"));
+    }
+    if include_docs {
+        url.push_str("&include_docs=true");
+    }
+    if style_all_docs {
+        url.push_str("&style=all_docs");
+    }
+    let request = st
+        .client
+        .get(url)
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str());
+    let request = forward_client_auth(request, headers);
+    let request = if let Some(ids) = doc_ids {
+        request
+            .query(&[("filter", "_doc_ids")])
+            .json(&json!({"doc_ids": ids}))
+    } else {
+        request
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "changes_failed", text));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
+fn absorb_node_changes(response: &Value, node: usize, progress: &mut [u64], rows: &mut Vec<Value>) {
+    for mut row in response["results"].as_array().cloned().unwrap_or_default() {
+        let shard_seq = row["seq"].as_u64().unwrap_or(0);
+        progress[node] = shard_seq;
+        row["seq"] = json!(encode_since(progress));
+        rows.push(row);
+    }
 }
 
 /// Current per-node update_seq vector. Used for `since=now` and for the
