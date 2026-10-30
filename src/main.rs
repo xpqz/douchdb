@@ -205,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
             "/_node/_local/_dbs/{db}",
             get(api::db_metadata).put(api::db_metadata_put),
         )
+        .route("/_node/_local/_dbs/{db}/shards", get(api::db_shard_counts))
         .route(
             "/_node/_local/_dbs/{db}/rebalance",
             axum::routing::post(api::db_rebalance),

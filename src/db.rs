@@ -265,6 +265,14 @@ impl Db {
         Ok(())
     }
 
+    pub async fn shard_counts(&self) -> DbResult<Vec<(u64, u64)>> {
+        let mut out = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            out.push(shard.call(|s| Ok(s.counts())).await?);
+        }
+        Ok(out)
+    }
+
     fn shard(&self, docid: &str) -> &ShardHandle {
         &self.shards[self.shard_index(docid)]
     }

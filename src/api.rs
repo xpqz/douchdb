@@ -748,6 +748,35 @@ pub async fn db_metadata(
     }
 }
 
+pub async fn db_shard_counts(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    match db.shard_counts().await {
+        Ok(counts) => json(
+            StatusCode::OK,
+            json!({
+                "shards": counts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(shard, (docs, deleted))| {
+                        json!({"shard": shard, "docs": docs, "deleted": deleted})
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        ),
+        Err(error) => fail(error),
+    }
+}
+
 pub async fn db_metadata_put(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -842,10 +871,119 @@ async fn apply_shard_map(
     Ok((map, pending))
 }
 
+async fn fetch_shard_docs(
+    st: &AppState,
+    db: &Arc<Db>,
+    node: usize,
+    headers: &HeaderMap,
+) -> Option<Vec<u64>> {
+    if node == st.cluster.me {
+        return db
+            .shard_counts()
+            .await
+            .ok()
+            .map(|counts| counts.into_iter().map(|(docs, _)| docs).collect());
+    }
+    let request = st
+        .client
+        .get(format!(
+            "{}/_node/_local/_dbs/{}/shards",
+            st.cluster.nodes[node], db.name
+        ))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str());
+    let request = forward_client_auth(request, headers);
+    let value = request.send().await.ok()?.json::<Value>().await.ok()?;
+    let mut out = Vec::new();
+    for row in value["shards"].as_array()? {
+        out.push(row.get("docs").and_then(Value::as_u64).unwrap_or(0));
+    }
+    Some(out)
+}
+
+async fn wait_for_rebalance(
+    st: &AppState,
+    db: &Arc<Db>,
+    map: &ShardMap,
+    required: &[u64],
+    headers: &HeaderMap,
+    timeout_ms: u64,
+) -> DbResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let counts = futures::future::join_all(
+            (0..st.cluster.nodes.len()).map(|node| fetch_shard_docs(st, db, node, headers)),
+        )
+        .await;
+        let ready = (0..db.q).all(|shard| {
+            let required = required.get(shard as usize).copied().unwrap_or(0);
+            map.replicas_of(shard).iter().all(|node| {
+                counts
+                    .get(*node)
+                    .and_then(|count| count.as_ref())
+                    .and_then(|count| count.get(shard as usize))
+                    .copied()
+                    .map(|docs| docs >= required)
+                    .unwrap_or(false)
+            })
+        });
+        if ready {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::new(
+                504,
+                "rebalance_timeout",
+                "new replicas did not report the shard data before the timeout",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn cleanup_all_replicas(
+    st: &AppState,
+    db: &Arc<Db>,
+    headers: &HeaderMap,
+) -> DbResult<Vec<Value>> {
+    let responses = futures::future::join_all(st.cluster.nodes.iter().map(|peer| {
+        let request = st
+            .client
+            .post(format!("{peer}/_node/_local/_dbs/{}/cleanup", db.name))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str());
+        let request = forward_client_auth(request, headers);
+        async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
+            if !response.status().is_success() {
+                return Err(ApiError::new(
+                    response.status().as_u16(),
+                    "cleanup_failed",
+                    response.text().await.unwrap_or_default(),
+                ));
+            }
+            response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
+        }
+    }))
+    .await;
+    let mut out = Vec::new();
+    for response in responses {
+        out.push(response?);
+    }
+    Ok(out)
+}
+
 pub async fn db_rebalance(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     if !st.authorized(&headers) {
         return unauthorized();
@@ -854,15 +992,61 @@ pub async fn db_rebalance(
         Ok(db) => db,
         Err(error) => return fail(error),
     };
+    let q = query(&uri);
+    let cleanup = q
+        .get("cleanup")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+    let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
+
+    let old_map = db.shard_map();
+    let counts = futures::future::join_all(
+        (0..st.cluster.nodes.len()).map(|node| fetch_shard_docs(&st, &db, node, &headers)),
+    )
+    .await;
+    let mut required = Vec::new();
+    for shard in 0..db.q {
+        let mut best = None;
+        for node in old_map.replicas_of(shard) {
+            if let Some(docs) = counts
+                .get(*node)
+                .and_then(|count| count.as_ref())
+                .and_then(|count| count.get(shard as usize))
+            {
+                best = Some(best.map_or(*docs, |current: u64| current.max(*docs)));
+            }
+        }
+        let Some(best) = best else {
+            return fail(ApiError::new(
+                502,
+                "rebalance_failed",
+                "no reachable old replica for shard",
+            ));
+        };
+        required.push(best);
+    }
+
     let map = ShardMap::balanced(
         db.q,
         st.cluster.nodes.len().max(1),
         st.cluster.replication_factor(),
     );
-    match apply_shard_map(&st, &db, &name, map, &headers).await {
-        Ok((map, pending)) => {
-            let mut value = json!(map);
-            value["pending"] = json!(pending);
+    let (map, pending) = match apply_shard_map(&st, &db, &name, map, &headers).await {
+        Ok(result) => result,
+        Err(error) => return fail(error),
+    };
+    let mut value = json!(map.clone());
+    value["pending"] = json!(pending);
+    if !cleanup || pending {
+        return json(StatusCode::OK, value);
+    }
+
+    if let Err(error) = wait_for_rebalance(&st, &db, &map, &required, &headers, timeout_ms).await {
+        return fail(error);
+    }
+    match cleanup_all_replicas(&st, &db, &headers).await {
+        Ok(cleaned) => {
+            value["cleaned"] = json!(cleaned);
             json(StatusCode::OK, value)
         }
         Err(error) => fail(error),

@@ -330,18 +330,23 @@ regression:
 | `_all_docs?limit=100` | 481 req/s | 534 req/s |
 | Cold view build | 71.3 ms | 71.8 ms |
 
-### Automatic rebalance and cleanup (#49)
+### Automatic rebalance and cleanup (#49, #52)
 
 `POST /_node/_local/_dbs/{db}/rebalance` computes a balanced shard map
-(`(shard + replica) % node_count`) and applies/broadcasts it. Anti-entropy then
-copies data to the new replicas.
+(`(shard + replica) % node_count`), applies/broadcasts it, then:
 
-After convergence, `POST /_node/_local/_dbs/{db}/cleanup` clears local shard
-data for shards this node no longer owns. Cleanup is deliberately a separate
-step: deleting an old replica before the new one has backfilled would lose
-data. The conformance test moves all shards from node0 to node1, waits for all
-9 documents, runs cleanup on node0, and verifies node0 reports 0 local docs
-while node1 reports 9.
+1. reads per-shard live counts from every node,
+2. waits until every new replica reports at least the old shard’s count,
+3. invokes cleanup on every node, clearing local shard data it no longer owns.
+
+`?cleanup=false` skips the wait/cleanup phase. `?timeout_ms=` bounds the
+convergence wait (default 30 s); timeout returns 504 and does not delete old
+data. The lower-level `POST /_node/_local/_dbs/{db}/cleanup` endpoint remains
+available for controlled/manual runs.
+
+Two tests cover both shapes: the manual move from node0 to node1 (node0 local
+docs become 0, node1 9), and the automatic planner+cleanup path (sum of local
+shard docs stays 9 and every non-owned shard is empty).
 
 ### Isolated native scaling (#50)
 

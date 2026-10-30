@@ -400,10 +400,10 @@ Above ~6k means something was built that nobody asked for.
   pending map file, and anti-entropy reconciles newer/older peers after a
   missed update. Routing and anti-entropy read the map; anti-entropy
   checkpoints are tagged by map hash so new replicas backfill after a move. A
-  balanced planner
-  endpoint and an explicit post-convergence cleanup endpoint move and then
-  remove old replicas. Cluster routing, replica selection, quorum reads/writes
-  and internal node calls live in `src/fabric.rs`; HTTP handlers only call that
+  balanced planner endpoint waits for per-shard replica counts and then
+  automatically cleans old replicas; a manual cleanup endpoint remains for
+  controlled runs. Cluster routing, replica selection, quorum reads/writes and
+  internal node calls live in `src/fabric.rs`; HTTP handlers only call that
   layer.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
