@@ -149,6 +149,40 @@ impl Server {
         (status, value)
     }
 
+    /// Request returning response headers as well as status and JSON.
+    async fn req_headers(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, String)],
+    ) -> (StatusCode, HashMap<String, String>, Value) {
+        let mut request = self
+            .client
+            .request(method, format!("{}{}", self.base, path));
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("request");
+        let status = response.status();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let text = response.text().await.unwrap_or_default();
+        let value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        (status, headers, value)
+    }
+
     /// Request with extra headers (auth cookies, internal routing markers).
     async fn req_with(
         &self,
@@ -3807,4 +3841,517 @@ async fn changes_style_all_docs_includes_conflict_leaves() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["results"][0]["doc"]["v"], "c");
+}
+
+// ---------------------------------------------------------------------------
+// Ports from Apache CouchDB's Elixir integration suite.
+
+#[tokio::test]
+async fn couchdb_basics_ports() {
+    let s = Server::start(false);
+    let (status, body) = s.get("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["couchdb"], "Welcome");
+
+    let name = "couchbasics";
+    let (status, headers, _) = s
+        .req_headers(Method::PUT, &format!("/{name}"), Some(json!({})), &[])
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(headers
+        .get("location")
+        .is_some_and(|value| value.ends_with(name)));
+    let (status, _) = s.put(&format!("/{name}"), json!({})).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    let (status, info) = s.get(&format!("/{name}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["db_name"], name);
+    assert_eq!(info["doc_count"], 0);
+
+    let (status, headers, body) = s
+        .req_headers(
+            Method::PUT,
+            &format!("/{name}/doc0"),
+            Some(json!({"a": 1})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let etag = headers.get("etag").cloned().expect("etag on creation");
+    assert_eq!(etag, format!("\"{}\"", body["rev"].as_str().unwrap()));
+
+    let (status, headers, _) = s
+        .req_headers(
+            Method::GET,
+            &format!("/{name}/doc0"),
+            None,
+            &[("if-none-match", etag.clone())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(headers.get("etag"), Some(&etag));
+
+    let (status, _, body) = s
+        .req_headers(Method::HEAD, &format!("/{name}/doc0"), None, &[])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("etag"), Some(&etag));
+    assert_eq!(body, Value::Null);
+
+    let (status, body) = s
+        .get(&format!("/{name}/doc0?revs_info=true&local_seq=true"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_revs_info"][0]["status"], "available");
+    assert_eq!(body["_local_seq"], 1);
+
+    let (_, dbs) = s.get("/_all_dbs?start_key=%22couchbasics%22&limit=1").await;
+    assert!(dbs.as_array().unwrap().iter().any(|db| db == name));
+    let (_, dbs) = s.get("/_all_dbs?limit=0").await;
+    assert_eq!(dbs, json!([]));
+}
+
+#[tokio::test]
+async fn couchdb_all_docs_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchalldocs").await;
+    let docs: Vec<Value> = (0..4)
+        .map(|i| json!({"_id": i.to_string(), "a": i + 1, "b": (i + 1) * (i + 1)}))
+        .collect();
+    let (status, _) = s
+        .post("/couchalldocs/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get("/couchalldocs/_all_docs?key=%221%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["id"], "1");
+
+    let (status, body) = s
+        .get("/couchalldocs/_all_docs?keys=%5B%220%22,%222%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    let (status, body) = s.post("/couchalldocs/_all_docs", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+
+    let (status, body) = s
+        .post(
+            "/couchalldocs/_all_docs",
+            json!({"keys": ["1", "2"], "limit": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+    let (status, body) = s
+        .post(
+            "/couchalldocs/_all_docs?limit=1",
+            json!({"keys": ["1", "2"], "limit": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+    let (status, body) = s
+        .post(
+            "/couchalldocs/_all_docs?include_docs=true",
+            json!({"keys": ["1"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["doc"]["a"], 2);
+
+    let (status, body) = s.get("/couchalldocs/_all_docs?start_key=%221%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["offset"], 1);
+}
+
+#[tokio::test]
+async fn couchdb_invalid_docid_and_bulk_error_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchinvalid").await;
+
+    for path in ["/_other", "/_tmp_view"] {
+        let (status, body) = s.put(&format!("/couchinvalid{path}"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "illegal_docid");
+    }
+
+    let (status, body) = s.post("/couchinvalid", json!({"_id": 1})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_docid");
+    assert_eq!(body["reason"], "Document id must be a string");
+
+    let (status, body) = s.post("/couchinvalid", json!({"_id": "_invalid"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_docid");
+
+    let (status, body) = s
+        .post(
+            "/couchinvalid/_bulk_docs",
+            json!({"docs": [{"_id": "_invalid"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "illegal_docid");
+
+    let (status, body) = s
+        .post(
+            "/couchinvalid/_bulk_docs",
+            json!({"docs": [], "new_edits": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+
+    let (status, body) = s
+        .post(
+            "/couchinvalid/_bulk_docs",
+            json!({"docs": [{"_id": "ok"}], "all_or_nothing": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::EXPECTATION_FAILED, "{body}");
+    assert_eq!(body[0]["error"], "not_implemented");
+    assert_eq!(body[0]["reason"], "all_or_nothing is not supported");
+}
+
+#[tokio::test]
+async fn couchdb_bulk_docs_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchbulk").await;
+    let docs: Vec<Value> = (1..=5)
+        .map(|i| json!({"_id": i.to_string(), "string": format!("doc{i}")}))
+        .collect();
+    let (status, rows) = s.post("/couchbulk/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows = rows.as_array().unwrap();
+    assert!(rows
+        .iter()
+        .all(|row| row["rev"].as_str().unwrap().starts_with("1-")));
+
+    let mut updated = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let id = (index + 1).to_string();
+        let (_, doc) = s.get(&format!("/couchbulk/{id}")).await;
+        doc.as_object()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .for_each(|_| {});
+        updated.push(json!({
+            "_id": id,
+            "_rev": row["rev"],
+            "string": format!("doc{}.00", index + 1)
+        }));
+    }
+    let (status, rows) = s
+        .post("/couchbulk/_bulk_docs", json!({"docs": updated}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["rev"].as_str().unwrap().starts_with("2-")));
+
+    let (_, one) = s.get("/couchbulk/1").await;
+    assert_eq!(one["string"], "doc1.00");
+
+    // Create a conflict on doc 1, then bulk-delete everything using old revs.
+    let (status, _) = s
+        .put(
+            "/couchbulk/1",
+            json!({"_id": "1", "_rev": one["_rev"], "string": "newer"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut deletes = Vec::new();
+    for row in rows.as_array().unwrap() {
+        deletes.push(json!({
+            "_id": row["id"],
+            "_rev": row["rev"],
+            "_deleted": true
+        }));
+    }
+    let (status, rows) = s
+        .post("/couchbulk/_bulk_docs", json!({"docs": deletes}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows = rows.as_array().unwrap();
+    assert!(rows.iter().any(|row| row["error"] == "conflict"));
+    assert!(rows.iter().any(|row| row["ok"] == true));
+
+    let (status, body) = s.get("/couchbulk/2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["reason"], "deleted");
+}
+
+#[tokio::test]
+async fn couchdb_changes_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchchanges").await;
+    let (status, _) = s
+        .post(
+            "/couchchanges/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "n": 1},
+                {"_id": "b", "n": 2},
+                {"_id": "c", "n": 3}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .post(
+            "/couchchanges/_changes?filter=_doc_ids",
+            json!({"doc_ids": ["a", "c"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"a"));
+    assert!(ids.contains(&"c"));
+
+    let (status, body) = s.get("/couchchanges/_changes?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+
+    let (status, body) = s
+        .get("/couchchanges/_changes?since=0&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row["doc"].is_object()));
+}
+
+#[tokio::test]
+async fn couchdb_view_pagination_and_alias_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchviewpage").await;
+    let docs: Vec<Value> = (0..100)
+        .map(|i| json!({"_id": i.to_string(), "integer": i}))
+        .collect();
+    let (status, _) = s
+        .post("/couchviewpage/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/couchviewpage/_design/test",
+            json!({"views": {"by_int": {"map": "function(doc){ emit(doc.integer, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/couchviewpage/_design/test/_view/by_int?startkey=30&startkey_docid=30&limit=10")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 100);
+    assert_eq!(body["offset"], 30);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 10);
+    assert_eq!(body["rows"][0]["key"], 30);
+
+    let (status, body) = s
+        .get("/couchviewpage/_design/test/_view/by_int?start_key=30&start_key_docid=30&limit=10")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["offset"], 30);
+    assert_eq!(body["rows"][0]["key"], 30);
+
+    let (status, body) = s
+        .get("/couchviewpage/_design/test/_view/by_int?startkey=70&startkey_docid=70&limit=10&descending=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["offset"], 29);
+    assert_eq!(body["rows"][0]["key"], 70);
+}
+
+#[tokio::test]
+async fn couchdb_builtin_reduce_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchreduce").await;
+    let docs: Vec<Value> = (1..=4)
+        .map(|i| json!({"_id": i.to_string(), "value": i}))
+        .collect();
+    let (status, _) = s
+        .post("/couchreduce/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/couchreduce/_design/r",
+            json!({"views": {
+                "count": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_count"},
+                "sum": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_sum"},
+                "stats": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_stats"},
+                "distinct": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_approx_count_distinct"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, body) = s.get("/couchreduce/_design/r/_view/count").await;
+    assert_eq!(body["rows"][0]["value"], 4);
+    let (_, body) = s.get("/couchreduce/_design/r/_view/sum").await;
+    assert_eq!(body["rows"][0]["value"], 10);
+    let (_, body) = s.get("/couchreduce/_design/r/_view/stats").await;
+    assert_eq!(body["rows"][0]["value"]["count"], 4);
+    assert_eq!(body["rows"][0]["value"]["sum"], 10);
+    let (_, body) = s.get("/couchreduce/_design/r/_view/distinct").await;
+    assert_eq!(body["rows"][0]["value"], 4);
+}
+
+#[tokio::test]
+async fn couchdb_view_include_docs_and_utf8_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchviewdocs").await;
+    let (status, _) = s
+        .post(
+            "/couchviewdocs/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Zürich", "price": 10},
+                {"_id": "b", "city": "Paris", "price": 20}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/couchviewdocs/_design/v",
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, doc.price); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/couchviewdocs/_design/v/_view/by_city?include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["doc"]["city"], "Paris");
+    assert_eq!(rows[1]["doc"]["city"], "Zürich");
+
+    let (status, body) = s
+        .get("/couchviewdocs/_design/v/_view/by_city?reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn couchdb_view_collation_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchcollation").await;
+    let values = vec![
+        Value::Null,
+        json!(false),
+        json!(true),
+        json!(1),
+        json!(2),
+        json!(3.0),
+        json!(4),
+        json!("a"),
+        json!("A"),
+        json!("aa"),
+        json!("b"),
+        json!("B"),
+        json!("ba"),
+        json!("bb"),
+        json!(["a"]),
+        json!(["b"]),
+        json!(["b", "c"]),
+        json!(["b", "c", "a"]),
+        json!(["b", "d"]),
+        json!(["b", "d", "e"]),
+        json!({"a": 1}),
+        json!({"a": 2}),
+        json!({"b": 1}),
+        json!({"b": 2}),
+        json!({"b": 2, "a": 1}),
+        json!({"b": 2, "c": 2}),
+    ];
+    let docs: Vec<Value> = values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| json!({"_id": i.to_string(), "foo": value}))
+        .collect();
+    let (status, _) = s
+        .post("/couchcollation/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/couchcollation/_design/foo",
+            json!({"views": {"foo": {"map": "function(doc){ emit(doc.foo, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get("/couchcollation/_design/foo/_view/foo").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keys: Vec<Value> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["key"].clone())
+        .collect();
+    assert_eq!(keys, values);
+
+    let (status, body) = s
+        .get("/couchcollation/_design/foo/_view/foo?descending=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut reversed = values.clone();
+    reversed.reverse();
+    let keys: Vec<Value> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["key"].clone())
+        .collect();
+    assert_eq!(keys, reversed);
+
+    for (query, expected) in [
+        ("key=null", Value::Null),
+        ("key=%22b%22", json!("b")),
+        ("key=%5B%22b%22,%22c%22%5D", json!(["b", "c"])),
+    ] {
+        let (status, body) = s
+            .get(&format!("/couchcollation/_design/foo/_view/foo?{query}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"].as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(body["rows"][0]["key"], expected);
+    }
+
+    let (status, body) = s
+        .get("/couchcollation/_design/foo/_view/foo?endkey=%22b%22&inclusive_end=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"].as_array().unwrap().last().unwrap()["key"],
+        "aa"
+    );
+
+    let (status, body) = s
+        .get("/couchcollation/_design/foo/_view/foo?endkey=%22b%22&inclusive_end=false&descending=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().last().unwrap()["key"], "B");
 }

@@ -224,25 +224,42 @@ impl Db {
     }
 
     pub fn validate_doc_id(&self, id: &str) -> DbResult<()> {
-        if !self.partitioned || id.starts_with("_design/") || id.starts_with("_local/") {
+        if id.starts_with("_design/") || id.starts_with("_local/") {
             return Ok(());
         }
-        let Some((partition, rest)) = id.split_once(':') else {
-            return Err(ApiError::new(
-                400,
-                "illegal_docid",
-                "Doc id must be of form partition:id",
-            ));
-        };
-        validate_partition(partition)?;
-        if rest.is_empty() {
+        if self.partitioned {
+            let Some((partition, rest)) = id.split_once(':') else {
+                return Err(ApiError::new(
+                    400,
+                    "illegal_docid",
+                    "Doc id must be of form partition:id",
+                ));
+            };
+            validate_partition(partition)?;
+            if rest.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "illegal_docid",
+                    "Document id must not be empty",
+                ));
+            }
+            if rest.starts_with('_') {
+                return Err(ApiError::new(
+                    400,
+                    "illegal_docid",
+                    "Only reserved document ids may start with underscore.",
+                ));
+            }
+            return Ok(());
+        }
+        if id.is_empty() {
             return Err(ApiError::new(
                 400,
                 "illegal_docid",
                 "Document id must not be empty",
             ));
         }
-        if rest.starts_with('_') {
+        if id.starts_with('_') {
             return Err(ApiError::new(
                 400,
                 "illegal_docid",
@@ -1202,13 +1219,19 @@ fn doc_id(doc: &Value) -> DbResult<String> {
     match doc.get("_id") {
         Some(Value::String(id)) if !id.is_empty() => {
             if id.starts_with('_') && !id.starts_with("_design/") {
-                return Err(ApiError::bad_request(
+                return Err(ApiError::new(
+                    400,
+                    "illegal_docid",
                     "Only reserved document ids may start with underscore.",
                 ));
             }
             Ok(id.clone())
         }
-        Some(_) => Err(ApiError::bad_request("Document id must be a string")),
+        Some(_) => Err(ApiError::new(
+            400,
+            "illegal_docid",
+            "Document id must be a string",
+        )),
         None => Ok(uuid()),
     }
 }
@@ -1245,7 +1268,13 @@ fn split_doc(
         match key.as_str() {
             "_id" => match value {
                 Value::String(s) => id = Some(s),
-                _ => return Err(ApiError::bad_request("Document id must be a string")),
+                _ => {
+                    return Err(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must be a string",
+                    ))
+                }
             },
             "_rev" => match value {
                 Value::String(s) => rev = Some(s),
@@ -1263,7 +1292,11 @@ fn split_doc(
 
     let id = id.unwrap_or_else(uuid);
     if id.is_empty() {
-        return Err(ApiError::bad_request("Document id must not be empty"));
+        return Err(ApiError::new(
+            400,
+            "illegal_docid",
+            "Document id must not be empty",
+        ));
     }
     Ok((id, rev, deleted, attachments, revisions, body))
 }
@@ -1684,6 +1717,7 @@ pub struct DocOpts {
     pub rev: Option<String>,
     pub revs: bool,
     pub revs_info: bool,
+    pub local_seq: bool,
     pub conflicts: bool,
     pub deleted_conflicts: bool,
     pub attachments: bool,
@@ -1835,6 +1869,9 @@ fn read_doc_rev(
             .filter_map(|r| Rev::parse(r).map(|p| hex(&p.id)))
             .collect();
         map.insert("_revisions".into(), json!({ "start": start, "ids": ids }));
+    }
+    if opts.local_seq {
+        map.insert("_local_seq".into(), json!(meta.seq));
     }
     if opts.revs_info {
         let info: Vec<Value> = meta
