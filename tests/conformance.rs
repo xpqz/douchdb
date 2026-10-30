@@ -1609,6 +1609,44 @@ async fn cluster_changes_use_an_opaque_version_vector() {
 }
 
 #[tokio::test]
+async fn cluster_changes_limit_covers_all_nodes() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clchlimit").await;
+    }
+    let docs: Vec<Value> = (0..9).map(|i| json!({"_id": format!("lim{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/clchlimit/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut since = "0".to_string();
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let (status, body) = nodes[0]
+            .get(&format!("/clchlimit/_changes?since={since}&limit=4"))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().unwrap();
+        assert!(results.len() <= 4);
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            ids.push(row["id"].as_str().unwrap().to_string());
+        }
+        since = body["last_seq"].as_str().unwrap().to_string();
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        9,
+        "limited feed must eventually cover every node"
+    );
+}
+
+#[tokio::test]
 async fn cluster_post_creates_the_document_on_its_owner() {
     let nodes = start_cluster(2);
     for node in &nodes {

@@ -49,15 +49,15 @@ documents per second.
 | Single GET, 8 writers | 500 | 6,738 req/s | 0.805 | 3.650 |
 | `_bulk_docs`, 250 docs/request | 2,500 | 12,177 docs/s (49 req/s) | 19.817 | 21.360 |
 | `_bulk_get`, 250 docs/request | 2,500 | 39,380 docs/s (158 req/s) | 5.897 | 6.968 |
-| `_all_docs?limit=100` | 50 | 613 req/s | 1.350 | 2.002 |
+| `_all_docs?limit=100` | 50 | 481 req/s | 1.868 | 2.410 |
 | `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
 | `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
-| `_changes?since=0&limit=1000` | 20 | 83 req/s | 12.026 | 12.690 |
-| `_changes?since=0` (full feed) | 5 | 8.7 req/s | 109.212 | 123.427 |
-| `GET /db` info | 100 | 1,780 req/s | 0.519 | 1.297 |
-| View map, cold index build | 1 | — | 38.92 | — |
-| View map, warm (reduce default) | 20 | 612 req/s | 1.584 | 1.786 |
-| View map-only, warm | 20 | 354 req/s | 2.824 | 3.058 |
+| `_changes?since=0&limit=1000` | 20 | 52.5 req/s | 18.996 | 20.856 |
+| `_changes?since=0` (full feed) | 5 | 7.8 req/s | 123.896 | 131.661 |
+| `GET /db` info | 100 | 1,825 req/s | 0.495 | 1.121 |
+| View map, cold index build | 1 | — | 26.38 | — |
+| View map, warm (reduce default) | 20 | 632 req/s | 1.568 | 1.859 |
+| View map-only, warm | 20 | 354 req/s | 3.251 | 3.058 |
 | View reduce, warm | 20 | 628 req/s | 1.561 | 1.706 |
 
 ## Before and after
@@ -170,9 +170,8 @@ round-trip pattern changed.
 ### Parallel full changes and grouped reduces (#37)
 
 An unlimited `_changes` feed (initial sync or replication) now requests every
-node concurrently and merges the responses in node order. Limited feeds keep
-the resumable one-node-at-a-time behavior, so `last_seq` only advances over rows
-actually returned. A full 6,000-document seed feed is ~116 ms p50.
+node concurrently and merges the responses in node order. Limited feeds were
+later made global in #40. A full 6,000-document seed feed is ~124 ms p50.
 
 Grouped `_count`, `_sum` and `_stats` queries are now reduced per owner and
 combined by group key instead of shipping every map row to the coordinator.
@@ -201,6 +200,18 @@ and `include_docs` lookups apply the same owner filter.
 | View map-only, warm | p50 3.251 ms | p50 2.824 ms |
 | View reduce, warm | p50 3.020 ms | p50 1.561 ms |
 
+### Global limited changes (#40)
+
+A limited `_changes` feed now queries every node with the requested limit and
+walks the responses round-robin, consuming each node's changes as a prefix and
+stopping at the global limit of unique documents. `last_seq` advances only over
+rows actually consumed, so the next poll resumes safely. Replica duplicates
+advance the source node's progress but are emitted once.
+
+The cost is more work per limited poll: a 1,000-row feed fetches up to 1,000
+changes from each node. It moved from ~12 ms to ~19 ms, but it now covers the
+whole cluster fairly instead of filling the window from one node at a time.
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -217,9 +228,9 @@ and `include_docs` lookups apply the same owner filter.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
   merge and JSON/HTTP for the selected rows. Cold builds are ~39 ms because
   each node indexes only its primary shards.
-- **`_changes`** is ~12 ms for a 1,000-row limited feed; a full 6,000-document
-  feed is ~109 ms with nodes queried concurrently. Limited feeds still fill
-  from one node at a time so `last_seq` remains resumable.
+- **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document
+  feed is ~124 ms with nodes queried concurrently. Limited feeds now merge
+  every node's prefix round-robin up to the global limit.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
   vector concurrently with small responses.
 
@@ -231,9 +242,8 @@ and `include_docs` lookups apply the same owner filter.
   mid-write is healed by the background replicator when it returns.
 - The coordinator and all peers run on the same host, so loopback and shared CPU
   are part of the measurement.
-- Limited `_changes` feeds still fill from one node at a time; a globally
-  ordered limit across nodes remains. `_approx_count_distinct` still uses the
-  map-row merge path because partial distinct counts cannot be combined.
+- `_approx_count_distinct` still uses the map-row merge path because partial
+  distinct counts cannot be combined.
 - Every node keeps its live `_all_docs` map in memory after the first range
   query. That is what removes the offset scan, but large databases should budget
   for it.
