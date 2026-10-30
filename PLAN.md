@@ -365,11 +365,12 @@ Above ~6k means something was built that nobody asked for.
   `skip + limit` live rows (and keys queries fetch metadata directly);
   `_changes` stops each shard once `limit` matches are found. The #30
   before/after numbers are in `docs/performance.md`.
-* **View map builds and warm queries.** Cold builds splice `_id`/`_rev` onto
-  raw bodies and batch QuickJS calls instead of parsing and re-encoding every
-  document through `Value`; the rebuilt index seeds a sorted in-memory snapshot
-  that warm queries reuse, and built-in reducers skip per-row key/value
-  allocation. See the #31 before/after numbers in `docs/performance.md`.
+* **View map builds and warm queries.** Cold builds take ids/winner revisions
+  from the live-document map, splice `_id`/`_rev` onto raw bodies, and batch
+  QuickJS calls instead of parsing and re-encoding every document through
+  `Value`; the rebuilt index seeds a sorted in-memory snapshot that warm queries
+  reuse, and built-in reducers skip per-row key/value allocation. See the #31
+  and #35 before/after numbers in `docs/performance.md`.
 * **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global built-in

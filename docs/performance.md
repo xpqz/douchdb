@@ -38,26 +38,26 @@ second; the request rate is shown separately.
 
 | Operation | n | Throughput | p50 | p99 |
 |---|---:|---:|---:|---:|
-| Single PUT, sequential | 500 | 3,468 req/s | 0.234 | 0.353 |
-| Single PUT, 8 writers | 1,000 | 5,884 req/s | 1.193 | 2.983 |
-| Single PUT, 32 writers | 1,000 | 5,420 req/s | 4.694 | 14.578 |
-| Single PUT, 64 writers | 1,000 | 4,814 req/s | 9.671 | 40.902 |
-| Single GET, sequential | 1,000 | 6,032 req/s | 0.154 | 0.251 |
-| Single GET, 8 writers | 1,000 | 8,003 req/s | 0.532 | 4.564 |
-| Single GET, 32 writers | 1,000 | 7,235 req/s | 2.628 | 17.482 |
-| Single GET, 64 writers | 1,000 | 6,810 req/s | 5.176 | 38.908 |
-| `_bulk_docs`, 250 docs/request | 2,500 | 37,457 docs/s (150 req/s) | 6.017 | 6.470 |
-| `_bulk_get`, 250 docs/request | 2,500 | 50,853 docs/s (203 req/s) | 4.499 | 5.098 |
-| `_all_docs?limit=100` | 50 | 1,220 req/s | 0.366 | 0.573 |
-| `_all_docs?startkey=doc-005000&limit=100` | 50 | 2,317 req/s | 0.376 | 1.122 |
-| `_changes?since=0&limit=1000` | 20 | 117.6 req/s | 8.453 | 8.686 |
-| `GET /db` info | 200 | 6,581 req/s | 0.134 | 0.360 |
-| View map, cold index build | 1 | — | 115.13 | — |
-| View map, warm (reduce default) | 20 | 2,992 req/s | 0.301 | 0.470 |
-| View map-only, warm | 20 | 2,472 req/s | 0.399 | 0.435 |
-| View reduce, warm | 20 | 4,076 req/s | 0.245 | 0.269 |
-| 1 MiB document PUT | 10 | — | 6.314 | 12.341 |
-| 1 MiB document GET | 10 | — | 2.962 | 3.243 |
+| Single PUT, sequential | 500 | 3,782 req/s | 0.211 | 0.362 |
+| Single PUT, 8 writers | 1,000 | 5,867 req/s | 1.226 | 3.046 |
+| Single PUT, 32 writers | 1,000 | 5,378 req/s | 4.749 | 17.202 |
+| Single PUT, 64 writers | 1,000 | 4,754 req/s | 9.773 | 40.251 |
+| Single GET, sequential | 1,000 | 5,943 req/s | 0.158 | 0.263 |
+| Single GET, 8 writers | 1,000 | 7,893 req/s | 0.601 | 4.585 |
+| Single GET, 32 writers | 1,000 | 7,246 req/s | 2.254 | 18.250 |
+| Single GET, 64 writers | 1,000 | 6,819 req/s | 4.344 | 36.596 |
+| `_bulk_docs`, 250 docs/request | 2,500 | 37,040 docs/s (148 req/s) | 6.047 | 6.873 |
+| `_bulk_get`, 250 docs/request | 2,500 | 51,179 docs/s (205 req/s) | 4.466 | 4.757 |
+| `_all_docs?limit=100` | 50 | 1,204 req/s | 0.394 | 0.613 |
+| `_all_docs?startkey=doc-005000&limit=100` | 50 | 2,987 req/s | 0.325 | 0.424 |
+| `_changes?since=0&limit=1000` | 20 | 117.3 req/s | 8.512 | 8.638 |
+| `GET /db` info | 200 | 6,264 req/s | 0.138 | 0.369 |
+| View map, cold index build | 1 | — | 99.54 | — |
+| View map, warm (reduce default) | 20 | 2,753 req/s | 0.324 | 0.584 |
+| View map-only, warm | 20 | 2,331 req/s | 0.428 | 0.445 |
+| View reduce, warm | 20 | 3,910 req/s | 0.256 | 0.281 |
+| 1 MiB document PUT | 10 | — | 6.491 | 13.110 |
+| 1 MiB document GET | 10 | — | 3.200 | 3.857 |
 
 ### Metadata scan pass (#30)
 
@@ -117,11 +117,26 @@ metadata scan to build the map; the numbers above include it. The index adds no
 LevelDB writes; after it is built, writes pay an in-memory BTreeMap update
 (bulk ingestion measured within ~2% of the previous throughput).
 
+### View builds from the live map (#35)
+
+Cold view builds now take their document ids and winning revisions from the
+live-document map instead of scanning and decoding every `DocMeta` again. They
+still read one body per document and fall back to the full document shape only
+for revisions with attachments.
+
+| Operation | Before (#35) | After (#35) |
+|---|---|---|
+| View cold index build | 115.1 ms | 99.5 ms |
+
+The remaining cold cost is body reads, QuickJS mapping, and index writes. In
+the cluster the change was within run-to-run variance; body reads and parallel
+index builds dominate there.
+
 Storage at the end of the run:
 
 ```json
 {
-  "data_dir_bytes_before_compact": 15984682,
+  "data_dir_bytes_before_compact": 15984667,
   "data_dir_bytes_after_compact": 15996605,
   "compact_seconds": 0.093
 }
@@ -148,8 +163,8 @@ Storage at the end of the run:
 - **`_changes` with `since=0`** now reads sequence entries only until `limit`
   matches and returns 1,000 rows in ~8.8 ms instead of scanning the whole
   sequence index (~63 ms). Incremental `since` values avoid most of that work.
-- **Views** build the persistent index on the first query (~116 ms for ~13k
-  documents), then warm map queries are ~0.4 ms and reduce queries ~0.2 ms.
+- **Views** build the persistent index on the first query (~100 ms for ~13k
+  documents), then warm map queries are ~0.4 ms and reduce queries ~0.3 ms.
   Cold builds read bodies directly and batch QuickJS calls; warm queries reuse a
   sorted in-memory row snapshot instead of scanning, parsing and sorting the
   index on every request. The snapshot is invalidated and updated incrementally

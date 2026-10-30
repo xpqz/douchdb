@@ -70,6 +70,12 @@ pub struct DocMeta {
     pub atts: BTreeMap<String, Vec<(String, AttMeta)>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LiveDoc {
+    pub rev: String,
+    pub has_attachments: bool,
+}
+
 /// A batch of changes plus the sequence counter, committed atomically.
 ///
 /// Staged as plain operations rather than a `WriteBatch` so the shard actor can
@@ -160,19 +166,24 @@ pub struct Shard {
     /// Live document id -> winning revision, built lazily on the first
     /// `_all_docs` range query and then maintained in memory. Keeping this out
     /// of LevelDB avoids an extra write per ingested document.
-    live: Option<BTreeMap<String, String>>,
+    live: Option<BTreeMap<String, LiveDoc>>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
-/// Winner revision and whether it is live. `None` when the revision tree has
-/// no winner.
-fn meta_state(meta: &DocMeta) -> Option<(String, bool)> {
+/// Winner revision, whether it is live, and whether that revision has
+/// attachments. `None` when the revision tree has no winner.
+fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
-        (winner, live)
+        let has_attachments = meta
+            .atts
+            .get(&winner)
+            .map(|atts| !atts.is_empty())
+            .unwrap_or(false);
+        (winner, live, has_attachments)
     })
 }
 
@@ -216,8 +227,8 @@ impl Shard {
                     }
                     if let Ok(meta) = serde_json::from_slice::<DocMeta>(&value) {
                         match meta_state(&meta) {
-                            Some((_, true)) => docs += 1,
-                            Some((_, false)) => deleted += 1,
+                            Some((_, true, _)) => docs += 1,
+                            Some((_, false, _)) => deleted += 1,
                             None => {}
                         }
                     }
@@ -255,7 +266,7 @@ impl Shard {
 
     /// Sorted live document ids and their winning revisions. The index is
     /// built on first use and maintained in memory from then on.
-    pub fn live_docs(&mut self) -> Result<&BTreeMap<String, String>> {
+    pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {
         if self.live.is_none() {
             let mut live = BTreeMap::new();
             // `scan_range_while` merges the uncommitted overlay, so a read in
@@ -263,8 +274,14 @@ impl Shard {
             self.scan_range_while(b"m/", None, false, |key, value| {
                 if let Ok(id) = std::str::from_utf8(&key[2..]) {
                     if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
-                        if let Some((rev, true)) = meta_state(&meta) {
-                            live.insert(id.to_string(), rev);
+                        if let Some((rev, true, has_attachments)) = meta_state(&meta) {
+                            live.insert(
+                                id.to_string(),
+                                LiveDoc {
+                                    rev,
+                                    has_attachments,
+                                },
+                            );
                         }
                     }
                 }
@@ -508,12 +525,12 @@ impl Shard {
                     .and_then(|bytes| serde_json::from_slice::<DocMeta>(bytes).ok());
                 let old_state = old.as_ref().and_then(meta_state);
                 let new_state = new.as_ref().and_then(meta_state);
-                match old_state.as_ref().map(|(_, live)| *live) {
+                match old_state.as_ref().map(|(_, live, _)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
                     None => {}
                 }
-                match new_state.as_ref().map(|(_, live)| *live) {
+                match new_state.as_ref().map(|(_, live, _)| *live) {
                     Some(true) => docs += 1,
                     Some(false) => deleted += 1,
                     None => {}
@@ -521,8 +538,14 @@ impl Shard {
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = std::str::from_utf8(&key[2..]) {
                         match new_state {
-                            Some((rev, true)) => {
-                                live.insert(id.to_string(), rev);
+                            Some((rev, true, has_attachments)) => {
+                                live.insert(
+                                    id.to_string(),
+                                    LiveDoc {
+                                        rev,
+                                        has_attachments,
+                                    },
+                                );
                             }
                             _ => {
                                 live.remove(id);
