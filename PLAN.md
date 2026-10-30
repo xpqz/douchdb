@@ -338,9 +338,12 @@ Above ~6k means something was built that nobody asked for.
 * **Views.** Design-document map/reduce views run on embedded QuickJS with
   CouchDB's `emit`/`sum`/`log` helpers, `key`/`keys`/range/page/include_docs
   query options, `_count`/`_sum`/`_stats`/`_approx_count_distinct` and custom
-  reducers, grouping and cluster-wide row merging. Simple single-emit maps that
-  read top-level document fields or JSON literals are recognized and evaluated
-  without JavaScript; anything more complex falls back to QuickJS. Indexes persist under
+  reducers, grouping and cluster-wide row merging. `_count`, `_sum`, `_stats`
+  and `_approx_count_distinct` are evaluated in Rust, locally and when cluster
+  partials are combined; custom reducers use QuickJS and `rereduce`. Simple
+  single-emit maps that read top-level document fields or JSON literals are
+  recognized and evaluated without JavaScript; anything more complex falls back
+  to QuickJS. Indexes persist under
   `_view_indexes/` and update from `_changes`; design changes rebuild them.
   Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
