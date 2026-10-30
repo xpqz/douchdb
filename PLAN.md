@@ -356,6 +356,9 @@ Above ~6k means something was built that nobody asked for.
   `OTEL_EXPORTER_OTLP_ENDPOINT`: `http.request` spans plus request count and
   latency metrics, with a no-op default. The issue/branch/merge workflow is
   documented in `docs/process.md`.
+* **Single-node baseline.** `scripts/perf_sweep.py` records CRUD, bulk,
+  metadata, changes, view, large-document and compaction numbers on release
+  builds; results and caveats are in `docs/performance.md`.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
