@@ -346,6 +346,10 @@ Above ~6k means something was built that nobody asked for.
   timeouts; request bodies and view execution are bounded; security headers are
   added to every response; a poisoned view-index mutex no longer takes down
   future queries.
+* **Observability.** Optional OTLP traces and metrics via `--otel-endpoint` /
+  `OTEL_EXPORTER_OTLP_ENDPOINT`: `http.request` spans plus request count and
+  latency metrics, with a no-op default. The issue/branch/merge workflow is
+  documented in `docs/process.md`.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored

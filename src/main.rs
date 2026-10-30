@@ -10,6 +10,7 @@ mod replicate;
 mod rev;
 mod revtree;
 mod store;
+mod telemetry;
 mod ui;
 mod view;
 
@@ -39,6 +40,7 @@ struct Args {
     view_memory_mb: usize,
     max_request_mb: usize,
     cluster_secret: String,
+    otel_endpoint: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -57,6 +59,7 @@ fn parse_args() -> Args {
         view_memory_mb: 64,
         max_request_mb: 64,
         cluster_secret: std::env::var("DOUCHDB_CLUSTER_SECRET").unwrap_or_default(),
+        otel_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -96,6 +99,7 @@ fn parse_args() -> Args {
                 args.max_request_mb = it.next().and_then(|v| v.parse().ok()).unwrap_or(64)
             }
             "--cluster-secret" => args.cluster_secret = it.next().unwrap_or_default(),
+            "--otel-endpoint" => args.otel_endpoint = it.next(),
             "--cors-origins" => {
                 args.cors_origins = it
                     .next()
@@ -112,7 +116,8 @@ fn parse_args() -> Args {
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
-                     \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)"
+                     \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
+                     \x20       [--otel-endpoint URL]       (or OTEL_EXPORTER_OTLP_ENDPOINT)"
                 );
                 std::process::exit(0);
             }
@@ -127,8 +132,8 @@ fn parse_args() -> Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
     let args = parse_args();
+    let telemetry = telemetry::init(args.otel_endpoint.clone())?;
     if args.nodes.len() > 1 {
         if args.me >= args.nodes.len() {
             eprintln!("--me must be smaller than the number of --nodes");
@@ -231,6 +236,9 @@ async fn main() -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
     Ok(())
 }
 

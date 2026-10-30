@@ -769,6 +769,20 @@ async fn changes_revs_diff_and_bulk_get() {
 }
 
 #[tokio::test]
+async fn otel_endpoint_is_optional_and_does_not_block_startup() {
+    let s = Server::start_with(
+        &[
+            "--otel-endpoint".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        ],
+        false,
+    );
+    let (status, body) = s.get("/_up").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
 async fn all_dbs_pagination_and_dbs_info() {
     let s = Server::start(false);
     for name in ["aaa", "bbb", "ccc"] {

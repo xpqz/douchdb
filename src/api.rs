@@ -355,10 +355,24 @@ pub async fn security_headers(
 }
 
 pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use tracing::Instrument;
+
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let response = next.run(req).await;
-    tracing::info!("{} {} -> {}", method, uri, response.status().as_u16());
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!(
+        "http.request",
+        "http.method" = %method,
+        "http.url" = %uri
+    );
+    let response = next.run(req).instrument(span).await;
+    let status = response.status().as_u16();
+    crate::telemetry::record_http(
+        method.as_str(),
+        status,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    tracing::info!("{} {} -> {}", method, uri, status);
     response
 }
 
