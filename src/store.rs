@@ -157,18 +157,23 @@ pub struct Shard {
     docs: u64,
     /// Number of documents whose winning revision is deleted.
     deleted: u64,
+    /// Live document id -> winning revision, built lazily on the first
+    /// `_all_docs` range query and then maintained in memory. Keeping this out
+    /// of LevelDB avoids an extra write per ingested document.
+    live: Option<BTreeMap<String, String>>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
-/// `Some(true)` for a live winner, `Some(false)` for a deleted winner, `None`
-/// when the revision tree has no winner.
-fn meta_live(meta: &DocMeta) -> Option<bool> {
-    meta.tree
-        .winner()
-        .map(|winner| !meta.tree.is_deleted(&winner))
+/// Winner revision and whether it is live. `None` when the revision tree has
+/// no winner.
+fn meta_state(meta: &DocMeta) -> Option<(String, bool)> {
+    meta.tree.winner().map(|winner| {
+        let live = !meta.tree.is_deleted(&winner);
+        (winner, live)
+    })
 }
 
 fn read_counter(db: &mut DB, key: &[u8]) -> Option<u64> {
@@ -210,9 +215,9 @@ impl Shard {
                         break;
                     }
                     if let Ok(meta) = serde_json::from_slice::<DocMeta>(&value) {
-                        match meta_live(&meta) {
-                            Some(true) => docs += 1,
-                            Some(false) => deleted += 1,
+                        match meta_state(&meta) {
+                            Some((_, true)) => docs += 1,
+                            Some((_, false)) => deleted += 1,
                             None => {}
                         }
                     }
@@ -233,6 +238,7 @@ impl Shard {
             revs_limit,
             docs,
             deleted,
+            live: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
         })
@@ -245,6 +251,28 @@ impl Shard {
     /// Live and deleted document counts for this shard.
     pub fn counts(&self) -> (u64, u64) {
         (self.docs, self.deleted)
+    }
+
+    /// Sorted live document ids and their winning revisions. The index is
+    /// built on first use and maintained in memory from then on.
+    pub fn live_docs(&mut self) -> Result<&BTreeMap<String, String>> {
+        if self.live.is_none() {
+            let mut live = BTreeMap::new();
+            // `scan_range_while` merges the uncommitted overlay, so a read in
+            // the same group commit sees writes queued before it.
+            self.scan_range_while(b"m/", None, false, |key, value| {
+                if let Ok(id) = std::str::from_utf8(&key[2..]) {
+                    if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
+                        if let Some((rev, true)) = meta_state(&meta) {
+                            live.insert(id.to_string(), rev);
+                        }
+                    }
+                }
+                true
+            })?;
+            self.live = Some(live);
+        }
+        Ok(self.live.as_ref().expect("live index initialized"))
     }
 
     pub fn revs_limit(&self) -> u64 {
@@ -478,15 +506,29 @@ impl Shard {
                 let new = value
                     .as_ref()
                     .and_then(|bytes| serde_json::from_slice::<DocMeta>(bytes).ok());
-                match old.as_ref().and_then(meta_live) {
+                let old_state = old.as_ref().and_then(meta_state);
+                let new_state = new.as_ref().and_then(meta_state);
+                match old_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
                     None => {}
                 }
-                match new.as_ref().and_then(meta_live) {
+                match new_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs += 1,
                     Some(false) => deleted += 1,
                     None => {}
+                }
+                if let Some(live) = self.live.as_mut() {
+                    if let Ok(id) = std::str::from_utf8(&key[2..]) {
+                        match new_state {
+                            Some((rev, true)) => {
+                                live.insert(id.to_string(), rev);
+                            }
+                            _ => {
+                                live.remove(id);
+                            }
+                        }
+                    }
                 }
             }
             self.overlay.insert(key.clone(), value.clone());
@@ -698,6 +740,49 @@ mod scan_tests {
         drop(shard);
         let shard = Shard::open(&dir, 1000).unwrap();
         assert_eq!(shard.counts(), (0, 2), "missing counters are backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn live_ids(shard: &mut Shard) -> Vec<String> {
+        shard.live_docs().unwrap().keys().cloned().collect()
+    }
+
+    #[test]
+    fn live_index_tracks_documents_and_rebuilds_on_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
+        shard.commit_at(tx, Some(2)).unwrap();
+        assert_eq!(live_ids(&mut shard), ["a"]);
+
+        // Once built, the index follows deletions and new writes.
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(true, 3)).unwrap();
+        tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
+        shard.commit_at(tx, Some(4)).unwrap();
+        assert_eq!(live_ids(&mut shard), ["c"]);
+        shard.flush_pending().unwrap();
+        drop(shard);
+
+        // A fresh process rebuilds the index from metadata on first use.
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(live_ids(&mut shard), ["c"]);
+        assert_eq!(shard.counts(), (1, 2));
+
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("d"), &meta(false, 5)).unwrap();
+        shard.commit_at(tx, Some(5)).unwrap();
+        assert_eq!(live_ids(&mut shard), ["c", "d"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

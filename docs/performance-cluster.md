@@ -33,26 +33,27 @@ existing cluster.
 
 ## Results
 
-These are the numbers after the cluster fan-out pass (#32). Latency is in
-milliseconds. Throughput for bulk operations is documents per second.
+These are the numbers after the cluster fan-out (#32) and live-document index
+(#33) passes. Latency is in milliseconds. Throughput for bulk operations is
+documents per second.
 
 | Operation | n | Throughput | p50 | p99 |
 |---|---:|---:|---:|---:|
-| Single PUT, sequential | 500 | 1,217 req/s | 0.824 | 1.115 |
-| Single PUT, 8 writers | 500 | 3,671 req/s | 1.891 | 3.782 |
-| Single GET, sequential | 1,000 | 3,309 req/s | 0.294 | 0.741 |
-| Single GET, 8 writers | 500 | 7,091 req/s | 0.850 | 2.962 |
-| `_bulk_docs`, 250 docs/request | 2,500 | 11,956 docs/s (48 req/s) | 20.523 | 21.240 |
-| `_bulk_get`, 250 docs/request | 2,500 | 38,223 docs/s (153 req/s) | 6.159 | 6.999 |
-| `_all_docs?limit=100` | 50 | 431 req/s | 2.225 | 2.865 |
-| `_all_docs?startkey=doc-005000&limit=100` | 50 | 118 req/s | 8.271 | 9.945 |
-| `_all_docs` with 100 keys | 20 | 606 req/s | 1.574 | 1.818 |
-| `_changes?since=0&limit=1000` | 20 | 100 req/s | 9.819 | 10.450 |
-| `GET /db` info | 100 | 1,444 req/s | 0.661 | 0.957 |
-| View map, cold index build | 1 | — | 77.77 | — |
-| View map, warm (reduce default) | 20 | 399 req/s | 2.341 | 3.158 |
-| View map-only, warm | 20 | 299 req/s | 3.346 | 3.543 |
-| View reduce, warm | 20 | 425 req/s | 2.222 | 2.829 |
+| Single PUT, sequential | 500 | 1,159 req/s | 0.856 | 1.185 |
+| Single PUT, 8 writers | 500 | 3,676 req/s | 2.012 | 3.680 |
+| Single GET, sequential | 1,000 | 3,558 req/s | 0.283 | 0.623 |
+| Single GET, 8 writers | 500 | 6,738 req/s | 0.805 | 3.650 |
+| `_bulk_docs`, 250 docs/request | 2,500 | 12,177 docs/s (49 req/s) | 19.817 | 21.360 |
+| `_bulk_get`, 250 docs/request | 2,500 | 39,380 docs/s (158 req/s) | 5.897 | 6.968 |
+| `_all_docs?limit=100` | 50 | 489 req/s | 1.832 | 2.506 |
+| `_all_docs?startkey=doc-005000&limit=100` | 50 | 524 req/s | 1.861 | 2.572 |
+| `_all_docs` with 100 keys | 20 | 586 req/s | 1.647 | 1.934 |
+| `_changes?since=0&limit=1000` | 20 | 105 req/s | 9.417 | 10.470 |
+| `GET /db` info | 100 | 1,380 req/s | 0.679 | 1.034 |
+| View map, cold index build | 1 | — | 67.31 | — |
+| View map, warm (reduce default) | 20 | 377 req/s | 2.506 | 3.430 |
+| View map-only, warm | 20 | 284 req/s | 3.251 | 4.625 |
+| View reduce, warm | 20 | 329 req/s | 3.020 | 3.468 |
 
 ## Before and after
 
@@ -88,6 +89,18 @@ The cluster pass made fan-out owner-aware and concurrent.
   grouping are reduced per owner and combined by the coordinator, instead of
   shipping every map row to the coordinator.
 
+### Live-document index (#33)
+
+Each node builds its ascending `_all_docs` live-document map lazily on the first
+range query and maintains it in memory. Owner-only range queries no longer walk
+metadata to compute their local offsets, including with a far-away `startkey`.
+
+| Operation | Before (#33) | After (#33) |
+|---|---|---|
+| `_all_docs?limit=100` | p50 2.23 ms | p50 1.83 ms |
+| `_all_docs?startkey=doc-005000&limit=100` | 118 req/s, p50 8.27 ms | 524 req/s, p50 1.86 ms |
+| `_bulk_docs`, 250 docs/request | 11,956 docs/s | 12,177 docs/s |
+
 ## Reading the numbers
 
 - **Writes pay for `n=2`.** A sequential PUT is ~1.2k/s versus ~3.5k/s on one
@@ -98,12 +111,13 @@ The cluster pass made fan-out owner-aware and concurrent.
   clients. Some requests are served locally and some proxy to the owner.
 - **Bulk reads** reach ~38k docs/s; `_bulk_get` is routed per document and is
   still the fastest way to read many documents through a coordinator.
-- **`_all_docs` without a start key** is now a few milliseconds. A start key
-  still costs ~8 ms because each owner must count live rows before the key to
-  produce the exact cluster-wide `offset`.
-- **Warm views** are ~2–3 ms. The remaining cost is mostly coordinator merge
-  and JSON/HTTP for the selected rows. Cold builds are ~78 ms because every
-  node still indexes its local replicas; only the output rows are owner-filtered.
+- **`_all_docs`** is ~1.8 ms with or without a `startkey`. Each owner answers
+  its offset from the in-memory live-document map instead of walking earlier
+  metadata.
+- **Warm views** are ~2.5–3.3 ms. The remaining cost is mostly coordinator
+  merge and JSON/HTTP for the selected rows. Cold builds are ~67 ms because
+  every node still indexes its local replicas; only the output rows are
+  owner-filtered.
 - **`_changes`** is ~10 ms for a 1,000-row initial feed. The coordinator still
   polls nodes in order and stops when the limit is filled.
 - **`GET /db`** is ~0.66 ms because it fans out the per-node update-sequence
@@ -123,5 +137,6 @@ The cluster pass made fan-out owner-aware and concurrent.
 - `_changes` fan-out could be made concurrent and its `limit` global across all
   nodes. Grouped/custom reduces still use the map-row merge path; only global
   built-in reduces are combined today.
-- `_all_docs` with a far-away `startkey` still walks earlier metadata to compute
-  `offset`; a live-document key index would remove that scan.
+- Every node keeps its live `_all_docs` map in memory after the first range
+  query. That is what removes the offset scan, but large databases should budget
+  for it.

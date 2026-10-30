@@ -278,6 +278,19 @@ def main():
             all_docs_lat, time.perf_counter() - started
         )
 
+        startkey_lat = []
+        started = time.perf_counter()
+        for _ in range(50):
+            elapsed, _ = request(
+                conn,
+                "GET",
+                "/perf/_all_docs?startkey=%22doc-005000%22&limit=100",
+            )
+            startkey_lat.append(elapsed)
+        result["operations"]["all_docs_startkey_limit_100"] = summary(
+            startkey_lat, time.perf_counter() - started
+        )
+
         changes_lat = []
         started = time.perf_counter()
         for _ in range(20):
