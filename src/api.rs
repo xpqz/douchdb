@@ -1412,6 +1412,11 @@ async fn cluster_view_rows(
     }))
     .await;
 
+    if batches.iter().any(|batch| batch.is_err()) {
+        return cluster_view_rows_fallback(st, db, dbname, ddoc, view_name, spec, query, headers)
+            .await;
+    }
+
     let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut total_rows = 0usize;
@@ -1627,6 +1632,128 @@ fn combine_reduce_values(
             )
         }),
     }
+}
+
+/// Degraded-mode view read: an owner-only fetch failed, so query every
+/// reachable node for all local replicas and merge duplicates by row identity.
+async fn cluster_view_rows_fallback(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    view_name: &str,
+    spec: crate::view::ViewSpec,
+    query: &crate::view::ViewQuery,
+    headers: &HeaderMap,
+) -> DbResult<(
+    crate::view::ViewSpec,
+    Arc<Vec<crate::view::Row>>,
+    HashMap<String, Value>,
+    Option<usize>,
+)> {
+    let need_docs = query.include_docs || query.attachments;
+    let batches = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
+        if node == st.cluster.me {
+            let (_, rows, node_docs) = crate::view::local_map(
+                db,
+                ddoc,
+                view_name,
+                need_docs,
+                query.attachments,
+                query.limits,
+                None,
+            )
+            .await?;
+            Ok((node, rows, node_docs, 0usize))
+        } else {
+            let peer = &st.cluster.nodes[node];
+            let url = format!(
+                "{peer}/{dbname}/{}/_view/{}",
+                percent_encode(ddoc),
+                percent_encode(view_name)
+            );
+            let params = [
+                ("reduce", "false"),
+                (
+                    "include_docs",
+                    if query.include_docs { "true" } else { "false" },
+                ),
+                (
+                    "attachments",
+                    if query.attachments { "true" } else { "false" },
+                ),
+            ];
+            let mut request = st
+                .client
+                .get(url)
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str())
+                .query(&params);
+            request = forward_client_auth(request, headers);
+            let response = request
+                .send()
+                .await
+                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(ApiError::new(
+                    response.status().as_u16(),
+                    "view_failed",
+                    response.text().await.unwrap_or_default(),
+                ));
+            }
+            let value = response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+            let (rows, node_docs, total_rows) = decode_view_batch(value);
+            Ok((node, rows, node_docs, total_rows))
+        }
+    }))
+    .await;
+
+    let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+    let mut docs: HashMap<String, Value> = HashMap::new();
+    let mut succeeded = false;
+    for batch in batches {
+        let Ok((_, rows, node_docs, _)) = batch else {
+            continue;
+        };
+        succeeded = true;
+        docs.extend(node_docs);
+        let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+        for row in rows.iter() {
+            let key = row_key(row);
+            local
+                .entry(key)
+                .and_modify(|(count, _)| *count += 1)
+                .or_insert((1, row.clone()));
+        }
+        for (key, (count, row)) in local {
+            match counts.get_mut(&key) {
+                Some((existing, _)) => *existing = (*existing).max(count),
+                None => {
+                    counts.insert(key, (count, row));
+                }
+            }
+        }
+    }
+    if !succeeded {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no view replica is reachable",
+        ));
+    }
+
+    let mut rows = Vec::new();
+    for (_, (count, row)) in counts {
+        for _ in 0..count {
+            rows.push(row.clone());
+        }
+    }
+    crate::view::sort_rows(&mut rows);
+    let total_rows = rows.len();
+    Ok((spec, Arc::new(rows), docs, Some(total_rows)))
 }
 
 fn decode_view_batch(value: Value) -> (Arc<Vec<crate::view::Row>>, HashMap<String, Value>, usize) {
