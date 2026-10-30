@@ -2218,7 +2218,8 @@ async fn changes(
         .filter(|value| *value > 0)
         .map(|value| std::time::Duration::from_millis(value as u64));
 
-    if feed == "continuous" {
+    let eventsource = feed == "eventsource";
+    if feed == "continuous" || eventsource {
         let dbname = dbname.to_string();
         let mut query = q.clone();
         let body = Bytes::copy_from_slice(body);
@@ -2239,8 +2240,12 @@ async fn changes(
                             if limit.map(|limit| sent >= limit).unwrap_or(false) {
                                 break;
                             }
-                            let mut line = serde_json::to_vec(&row).unwrap_or_default();
-                            line.push(b'\n');
+                            let json = serde_json::to_vec(&row).unwrap_or_default();
+                            let line = if eventsource {
+                                [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
+                            } else {
+                                [json.as_slice(), b"\n"].concat()
+                            };
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                             sent += 1;
                         }
@@ -2253,13 +2258,16 @@ async fn changes(
                         }
                     }
                     Err(error) => {
-                        let line = serde_json::to_vec(&json!({
+                        let json = serde_json::to_vec(&json!({
                             "error": error.error,
                             "reason": error.reason,
                         }))
                         .unwrap_or_default();
-                        let mut line = line;
-                        line.push(b'\n');
+                        let line = if eventsource {
+                            [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
+                        } else {
+                            [json.as_slice(), b"\n"].concat()
+                        };
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                         break;
                     }
@@ -2269,7 +2277,11 @@ async fn changes(
                 }
                 if let Some(heartbeat) = heartbeat {
                     if last_heartbeat.elapsed() >= heartbeat {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
+                            b": heartbeat\n\n"
+                        } else {
+                            b"\n"
+                        }));
                         last_heartbeat = std::time::Instant::now();
                     }
                 }
@@ -2278,7 +2290,14 @@ async fn changes(
         };
         return Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::CONTENT_TYPE,
+                if eventsource {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::from_stream(stream))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());

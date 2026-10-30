@@ -703,6 +703,41 @@ async fn continuous_changes_streams_newline_json_and_heartbeats() {
 }
 
 #[tokio::test]
+async fn changes_supports_sse_eventsource_feed() {
+    let s = Server::start(false);
+    s.fresh_db("sse").await;
+    let (status, _) = s.put("/sse/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = s
+        .client
+        .get(format!(
+            "{}/sse/_changes?feed=eventsource&since=0&timeout=250&heartbeat=40",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = response.text().await.unwrap();
+    let data: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect();
+    assert!(!data.is_empty(), "{body:?}");
+    let event: Value = serde_json::from_str(data[0]).unwrap();
+    assert_eq!(event["id"], "doc");
+    assert!(body.contains(": heartbeat"), "{body:?}");
+}
+
+#[tokio::test]
 async fn changes_revs_diff_and_bulk_get() {
     let s = Server::start(false);
     s.fresh_db("rep").await;

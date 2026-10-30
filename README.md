@@ -390,8 +390,9 @@ The cluster paths are covered by the integration tests, including
 `_dbs_info`, `_uuids`, `_membership`, `_session`, `_security`, database
 create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
 `?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`, `_changes`
-(normal/longpoll/true continuous, heartbeat, `style=all_docs`,
-`filter=_doc_ids`), `_revs_diff`, `_local/*`, `_purge`, `_compact`,
+(normal/longpoll/true continuous, `feed=eventsource` SSE, heartbeat,
+`style=all_docs`, `filter=_doc_ids`), `_revs_diff`, `_local/*`, `_purge`,
+`_compact`,
 `_revs_limit`, `_design/{ddoc}/_view/{view}`, `_view_cleanup` and
 `_ensure_full_commit`.
 
