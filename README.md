@@ -49,6 +49,24 @@ curl -X POST http://couch:5984/_replicate \
   -d '{"source":"source","target":"http://douchdb:5984/demo"}'
 ```
 
+## Docker Compose
+
+A three-node cluster, console and Grafana OpenTelemetry stack are provided:
+
+```sh
+docker compose up --build -d
+```
+
+- Console: http://localhost:8080/_utils/ — login `admin` / `secret`
+- API: nodes on ports 5984, 5985 and 5986
+- Grafana: http://localhost:3000 (anonymous Admin enabled for the demo)
+- OTLP/HTTP: http://localhost:4318
+
+The cluster uses `q=4`, `n=2`, three data volumes and OTLP export to Grafana's
+`otel-lgtm` all-in-one backend. See [docs/docker.md](docs/docker.md) for the
+service layout, credentials, verification commands and teardown. The stack is
+for local development: it has no TLS and uses demo credentials.
+
 ## Views
 
 Views live in design documents and run JavaScript map/reduce functions on the
