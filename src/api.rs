@@ -1242,7 +1242,11 @@ async fn view_request(
                     && query.startkey.is_none()
                     && query.endkey.is_none()
                     && !query.descending
-                    && matches!(spec.reduce.as_deref(), Some("_count" | "_sum" | "_stats"))
+                    && spec
+                        .reduce
+                        .as_deref()
+                        .map(|reducer| reducer != "_approx_count_distinct")
+                        .unwrap_or(false)
                 {
                     spec.reduce
                 } else {
@@ -1523,7 +1527,11 @@ async fn cluster_reduce(
                 let hash = serde_json::to_string(&key).unwrap_or_default();
                 match groups.get_mut(&hash) {
                     Some((_, existing)) => {
-                        let combined = combine_reduce_values(reducer, &[existing.clone(), value])?;
+                        let combined = combine_reduce_values(
+                            reducer,
+                            &[existing.clone(), value],
+                            query.limits,
+                        )?;
                         *existing = combined;
                     }
                     None => {
@@ -1553,11 +1561,15 @@ async fn cluster_reduce(
         }));
     }
 
-    let value = combine_reduce_values(reducer, &partials)?;
+    let value = combine_reduce_values(reducer, &partials, query.limits)?;
     Ok(json!({"rows": [{"key": Value::Null, "value": value}]}))
 }
 
-fn combine_reduce_values(reducer: &str, partials: &[Value]) -> DbResult<Value> {
+fn combine_reduce_values(
+    reducer: &str,
+    partials: &[Value],
+    limits: crate::view::ViewLimits,
+) -> DbResult<Value> {
     match reducer {
         "_count" => Ok(json!(partials
             .iter()
@@ -1606,11 +1618,13 @@ fn combine_reduce_values(reducer: &str, partials: &[Value]) -> DbResult<Value> {
                 "sumsqr": crate::view::number_value(sumsqr),
             }))
         }
-        _ => Err(ApiError::new(
-            500,
-            "view_error",
-            format!("distributed reduce is not supported for {reducer}"),
-        )),
+        _ => crate::view::recombine(reducer, partials, limits).map_err(|reason| {
+            ApiError::new(
+                500,
+                "view_error",
+                format!("reduce function failed: {reason}"),
+            )
+        }),
     }
 }
 
