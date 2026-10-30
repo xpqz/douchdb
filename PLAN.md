@@ -388,10 +388,12 @@ Above ~6k means something was built that nobody asked for.
 * **Load-balanced edge.** The Compose stack puts nginx in front of all three
   nodes; any node is an equal coordinator. Clustered defaults use `n=3`, so a
   three-node cluster has every document on every node. `scripts/perf_cluster.py
-  --spread --native` measures round-robin routing with the Rust load generator;
-  the remaining single-host ceiling is the load generator sharing CPU with all
-  servers. Owner-aware edge routing was deliberately not added: CouchDB uses
-  cheap internal replica calls and a dumb round-robin LB.
+  --spread --native` measures round-robin routing with the Rust load generator.
+  `scripts/perf_isolated.py` pins servers and client to disjoint CPUs and shows
+  `?r=1` GET scaling from 19.5k to 45.6k req/s across 1-3 nodes; default quorum
+  reads remain flat because they read two replicas. Internal transport was not
+  rewritten based on that result. Owner-aware edge routing was deliberately not
+  added: CouchDB uses cheap internal replica calls and a dumb round-robin LB.
 * **Shard-map metadata and movement.** Each database has a persisted, cached
   mem3-style shard map, exposed at `/_node/_local/_dbs/{db}` and broadcast to
   peers. Routing and anti-entropy read the map; anti-entropy checkpoints are
