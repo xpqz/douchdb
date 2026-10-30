@@ -91,9 +91,10 @@ Therefore:
 - **Read, view, `_all_docs` and `_changes` comparisons are meaningful.**
 - **Write throughput comparisons are not equal-durability.** They compare
   CouchDB full commits against douchdb OS-buffered writes.
-- To make writes comparable we need to fsync the LevelDB log before
-  acknowledging the write (or add a separate durable WAL), then rerun the
-  write benchmarks. CouchDB 3.x cannot be switched back to delayed commits.
+- douchdb intentionally follows rusty-leveldb's default no-fsync behaviour.
+  That is a valid deployment choice, but it means these write numbers are a
+  different durability class. A durable-mode benchmark would need an fsynced
+  LevelDB log or WAL; CouchDB 3.x cannot be switched back to delayed commits.
 
 The table below keeps the measured numbers, but write rows should be read with
 that caveat.
@@ -143,8 +144,7 @@ Latency at p50:
   douchdb currently acknowledges after writing to the OS page cache.
 
 - douchdb's replica-write fan-out is faster in this container setup, but part
-  of the write gap is the missing fsync. The durable comparison requires the
-  fsync fix above.
+  of the write gap is its default no-fsync LevelDB behaviour.
 - With that caveat, the read-only and index paths show douchdb ahead by roughly
   2–3× for point/range reads, 9–10× for limited changes and much more for full
   changes. Write ratios must not be quoted as an apples-to-apples durability
@@ -174,5 +174,5 @@ Latency at p50:
 - Basic auth was used. Session cookies changed CouchDB point-read latency by
   only a few percent, so auth is not the explanation for the large read and
   changes differences.
-- douchdb's current LevelDB path does not fsync. The write numbers are
-  throughput measurements of OS-buffered commits, not durable commits.
+- douchdb follows rusty-leveldb's default and does not fsync. The write numbers
+  are throughput measurements of OS-buffered commits, not durable commits.

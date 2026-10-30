@@ -97,8 +97,10 @@ collation layer. `_local` lives in its own prefix and is excluded from
 **Write path.** Sequence numbers are allocated in memory and persisted *in the
 same WriteBatch* as the document, so a crash can never leave a gap or a document
 without a seq. The actor drains its mailbox and commits everything as one
-`WriteBatch` with `sync=true` — group commit turns fsync-per-write into
-something usable, and is ~60 lines.
+`WriteBatch` with `sync=true`. rusty-leveldb's sync flag flushes its
+`BufWriter` to the OS but does not call `fsync`, so this gives process-crash
+durability, not power-loss durability. Group commit still turns many small
+writes into one flushed batch and is ~60 lines.
 
 ## The rev hash
 
@@ -304,8 +306,10 @@ Above ~6k means something was built that nobody asked for.
   and CouchDB's own `_replicate` pushes and pulls in both directions with
   identical revision ids.
 * **Group commit.** The shard actor drains up to 64 queued jobs, merges their
-  `Tx`es into one synced `WriteBatch`, and acknowledges only after the fsync.
-  A write overlay makes later jobs in the same group read their predecessors.
+  `Tx`es into one `WriteBatch`, and acknowledges after the batch is flushed to
+  the OS. rusty-leveldb does not fsync by default, so acknowledged writes are
+  not power-loss durable; comparisons must state this. A write overlay makes
+  later jobs in the same group read their predecessors.
 * **Cluster routing green.** Shard map, rendezvous placement and per-document
   proxying cover CRUD, `_bulk_docs`, `_bulk_get`, `_revs_diff` and `POST /db`
   (generated ids are routed after parsing). `_all_docs` fans out to every node,
@@ -445,7 +449,8 @@ Above ~6k means something was built that nobody asked for.
 
 `scripts/storage_spike.py` writes incompressible 1 MB documents through the HTTP
 API, keeps concurrent writers running (group commit), probes read latency, then
-compacts the shard and kills the server with `SIGKILL` to check durability.
+compacts the shard and kills the server with `SIGKILL` to check process-crash
+durability. This does not cover power loss: rusty-leveldb does not fsync.
 Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
 
 | Metric | Result |
