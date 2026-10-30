@@ -1943,28 +1943,31 @@ async fn bulk_get(
         groups[owner_of_doc(db, id)].push((i, req));
     }
     let mut out = vec![Value::Null; groups.iter().map(Vec::len).sum()];
-    for (owner, group) in groups.into_iter().enumerate() {
+    let requests = groups.into_iter().enumerate().filter_map(|(owner, group)| {
         if group.is_empty() {
-            continue;
+            return None;
         }
         let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
         let subdocs: Vec<Value> = group.into_iter().map(|(_, req)| req).collect();
-        let sub = json!({"docs": subdocs});
-        let result = if owner == st.cluster.me {
-            match db.bulk_get(&sub, attachments, revs).await {
-                Ok(v) => v,
-                Err(e) => return fail(e),
-            }
-        } else {
-            let peer = st.cluster.nodes[owner].clone();
-            let mut query = format!("revs={revs}");
-            if attachments {
-                query.push_str("&attachments=true");
-            }
-            match forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await {
-                Ok(v) => v,
-                Err(e) => return fail(e),
-            }
+        Some(async move {
+            let sub = json!({"docs": subdocs});
+            let result = if owner == st.cluster.me {
+                db.bulk_get(&sub, attachments, revs).await
+            } else {
+                let peer = st.cluster.nodes[owner].clone();
+                let mut query = format!("revs={revs}");
+                if attachments {
+                    query.push_str("&attachments=true");
+                }
+                forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+            };
+            (indices, result)
+        })
+    });
+    for (indices, result) in futures::future::join_all(requests).await {
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => return fail(error),
         };
         let rows = result["results"].as_array().cloned().unwrap_or_default();
         for (slot, row) in indices.into_iter().zip(rows) {
@@ -1998,23 +2001,25 @@ async fn revs_diff(
     for (id, revs) in map {
         groups[owner_of_doc(db, id)].insert(id.clone(), revs.clone());
     }
-    let mut out = Map::new();
-    for (owner, group) in groups.into_iter().enumerate() {
+    let requests = groups.into_iter().enumerate().filter_map(|(owner, group)| {
         if group.is_empty() {
-            continue;
+            return None;
         }
-        let sub = Value::Object(group);
-        let result = if owner == st.cluster.me {
-            match db.revs_diff(&sub).await {
-                Ok(v) => v,
-                Err(e) => return fail(e),
+        Some(async move {
+            let sub = Value::Object(group);
+            if owner == st.cluster.me {
+                db.revs_diff(&sub).await
+            } else {
+                let peer = st.cluster.nodes[owner].clone();
+                forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await
             }
-        } else {
-            let peer = st.cluster.nodes[owner].clone();
-            match forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await {
-                Ok(v) => v,
-                Err(e) => return fail(e),
-            }
+        })
+    });
+    let mut out = Map::new();
+    for result in futures::future::join_all(requests).await {
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => return fail(error),
         };
         if let Some(obj) = result.as_object() {
             for (id, entry) in obj {
@@ -2300,6 +2305,11 @@ async fn changes_once(
     } else {
         since_component(q.get("since").map(String::as_str), st.cluster.me)
     };
+    let owned = if is_forwarded(st, headers) {
+        q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
+    } else {
+        None
+    };
     let opts = ChangesOpts {
         since,
         limit: num(q, "limit"),
@@ -2307,6 +2317,7 @@ async fn changes_once(
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
         descending: flag(q, "descending"),
         doc_ids: doc_ids_from(q, body),
+        owned,
     };
     db.changes(&opts).await
 }

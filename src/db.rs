@@ -713,7 +713,15 @@ impl Db {
 
     pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
         let mut rows = Vec::new();
-        for shard in &self.shards {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if opts
+                .owned
+                .as_ref()
+                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let shard_opts = opts.clone();
             let mut shard_rows = shard.call(move |s| collect_changes(s, &shard_opts)).await?;
             rows.append(&mut shard_rows);
@@ -1578,6 +1586,8 @@ pub struct ChangesOpts {
     pub style_all_docs: bool,
     pub descending: bool,
     pub doc_ids: Option<Vec<String>>,
+    /// Internal cluster filter: only scan shards selected by this mask.
+    pub owned: Option<Vec<bool>>,
 }
 
 struct ChangeRow {

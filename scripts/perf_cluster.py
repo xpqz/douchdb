@@ -437,6 +437,10 @@ def main():
         cold_elapsed, _ = request(
             conns[0], "GET", "/perf/_design/perf/_view/by_value?limit=100"
         )
+        # Shard-masked reads prefer the local replica, so every coordinator
+        # needs its own warm view index before measuring steady-state latency.
+        for conn in conns:
+            request(conn, "GET", "/perf/_design/perf/_view/by_value?limit=100")
         warm_lat = []
         started = time.perf_counter()
         for i in range(20):

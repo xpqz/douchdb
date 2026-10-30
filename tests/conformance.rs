@@ -2170,6 +2170,63 @@ async fn cluster_shard_mask_reads_only_selected_shards() {
 }
 
 #[tokio::test]
+async fn cluster_full_replica_reads_survive_two_node_loss() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clfull").await;
+    }
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("f{i:02}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clfull/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(
+            "/clfull/_design/v",
+            json!({
+                "views": {
+                    "all": {"map": "function(doc){ emit(doc.n, null); }"},
+                    "count": {
+                        "map": "function(doc){ emit(doc.n, null); }",
+                        "reduce": "_count"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    nodes[1].kill();
+    nodes[2].kill();
+
+    // With n=3 on three nodes, node0 holds every shard. Shard-masked reads
+    // must use those local replicas and not require any surviving peer.
+    let (status, body) = nodes[0].get("/clfull/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 13);
+    let (status, body) = nodes[0]
+        .post("/clfull/_all_docs", json!({"keys": ["f00", "f11"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "f00");
+    assert_eq!(body["rows"][1]["id"], "f11");
+    let (status, body) = nodes[0].get("/clfull/_design/v/_view/all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 12);
+    let (status, body) = nodes[0].get("/clfull/_design/v/_view/count").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 12);
+    let (status, body) = nodes[0].get("/clfull/_changes").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 13);
+    let (status, body) = nodes[0].get("/clfull/_changes?limit=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
 async fn cluster_post_creates_the_document_on_its_owner() {
     let nodes = start_cluster(2);
     for node in &nodes {
@@ -2241,6 +2298,55 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
         assert!(
             std::time::Instant::now() < deadline,
             "anti-entropy did not converge: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn cluster_anti_entropy_drains_a_large_backlog_in_one_pass() {
+    let nodes = start_cluster_with(2, "1", 2);
+    for node in &nodes {
+        node.fresh_db("cldrain").await;
+    }
+
+    let total = 1000usize;
+    let docs: Vec<Value> = (0..total)
+        .map(|i| json!({"_id": format!("b{i:04}"), "n": i}))
+        .collect();
+    let response = nodes[0]
+        .client
+        .post(format!("{}/cldrain/_bulk_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // More than the old 200-document-per-interval cap. One anti-entropy pass
+    // must drain every page rather than stopping after a single batch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let response = nodes[1]
+            .client
+            .post(format!("{}/cldrain/_all_docs", nodes[1].base))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if response["total_rows"] == total {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy did not drain the backlog: {response}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

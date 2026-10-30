@@ -273,16 +273,24 @@ fn spawn_anti_entropy(state: Arc<AppState>) {
                     continue;
                 };
                 crate::fabric::reconcile_shard_map(&state, &db).await;
-                for peer in &peers {
-                    match replicate::pull(
-                        &db,
-                        peer,
-                        &state.client,
-                        &state.cluster,
-                        state.auth.as_ref(),
-                    )
-                    .await
-                    {
+                let pulls = peers.iter().map(|peer| {
+                    let db = db.clone();
+                    let peer = peer.clone();
+                    let state = state.clone();
+                    async move {
+                        let result = replicate::pull(
+                            &db,
+                            &peer,
+                            &state.client,
+                            &state.cluster,
+                            state.auth.as_ref(),
+                        )
+                        .await;
+                        (peer, result)
+                    }
+                });
+                for (peer, result) in futures::future::join_all(pulls).await {
+                    match result {
                         Ok(0) => {}
                         Ok(n) => tracing::info!("replicated {n} docs of {name} from {peer}"),
                         Err(e) => tracing::warn!("replication {name} from {peer} failed: {e}"),

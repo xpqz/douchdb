@@ -385,6 +385,49 @@ With `--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) set, douchdb exports:
 Without an endpoint these recorders are no-ops, so the normal build has no
 collector dependency.
 
+### Local-replica reads and cluster fan-out (#58, #59)
+
+Shard-masked reads now prefer the coordinator's local replica for every
+shard it holds. With `n=3` on three nodes every node holds every shard, so
+`_all_docs`, views, reduces and `_changes` no longer fan out to the other
+nodes. Shards without a local replica stay with their primary, and failed
+requests still fall back to another live replica. Empty shard masks are
+skipped instead of issuing empty HTTP requests.
+
+`_changes` accepts the same internal shard mask as `_all_docs` and views.
+The coordinator merges only the selected shards and falls back to replicas for
+missing masks.
+
+Anti-entropy now drains the peer in one pass: it requests 1,000-document
+`_changes` pages until the feed is empty, checkpoints after every page, and
+pulls peers concurrently. Previously it copied one 200-document page per peer
+per sync interval, so repair throughput was capped at `200 / sync-secs`
+documents per second.
+
+Internal owner fan-out for `_bulk_get`, `_revs_diff` and `new_edits=false`
+bulk writes is now concurrent. Normal `new_edits=true` writes return once every
+document has `w` acknowledgements; remaining replica writes continue as
+detached tasks, so a slow or unreachable replica does not set write tail
+latency. Default quorum reads still require `r` replicas and therefore retain
+their consistency guarantee.
+
+Before/after on the same three-node, `q=4`, `n=3`, 6,000-document benchmark
+(with a warm view index on every coordinator):
+
+| Operation | Before | After | Change |
+|---|---:|---:|---:|
+| `_all_docs?startkey&limit=100` | 554 req/s | 914 req/s | +65% |
+| `_all_docs?keys=100` | 547 req/s | 801 req/s | +46% |
+| `_changes?limit=1000` | 44.3 req/s | 67.0 req/s | +51% |
+| Full `_changes` | 6.4 req/s | 13.6 req/s | +112% |
+| `_bulk_get` 250 docs | 42,219 docs/s | 50,540 docs/s | +20% |
+| `_bulk_docs` 250 docs | 29,440 docs/s | 34,175 docs/s | +16% |
+| Warm view map | 346 req/s | 427 req/s | +23% |
+| Warm view reduce | 394 req/s | 425 req/s | +8% |
+
+The view index benchmark now warms every coordinator before measuring, because
+local-first reads mean each node serves views from its own index.
+
 ### Partitioned databases (#55)
 
 See [partitioned-databases.md](partitioned-databases.md) for the user-facing
@@ -506,11 +549,10 @@ replicates and the pending file disappears.
   each node indexes every locally held replica, which is what enables node-loss
   failover. Map and reduce queries both fall back to replicas when an owner is
   unreachable.
-- **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document
-  feed is ~124 ms with nodes queried concurrently. Limited feeds merge every
-  node's prefix round-robin up to the global limit. Unavailable nodes are
-  skipped and covered by replicas; their vector component resumes when they
-  return.
+- **`_changes`** is ~15 ms for a 1,000-row limited feed; a full 6,000-document
+  feed is ~73 ms. Shard-masked changes use the local replica when available and
+  fall back to another replica for missing masks. Limited feeds still merge
+  selected nodes round-robin up to the global limit.
 - **`GET /db`** is ~0.5 ms because it fetches the per-node update-sequence
   vector concurrently with small responses.
 
