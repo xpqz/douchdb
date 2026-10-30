@@ -118,29 +118,67 @@ embedded `/_utils/` console is same-origin and needs no CORS flag.
 
 ## Cluster
 
-Every node needs the same `--nodes`, `--q`, `--n` and `--admin` credentials.
-Membership is static: to change it, restart the cluster with the new list.
-Internal cluster calls use the shared admin credentials, and a client's Basic
-auth or `_session` cookie is forwarded when a request has to reach a peer.
+douchdb runs as a static **Q-shard × N-replica** cluster. Every node is a
+router; there is no coordinator role.
+
+- `--q` fixes the shard count when a database is created.
+- `md5(docid)` selects the shard; rendezvous hashing over the node list selects
+  `--n` distinct replicas, in preference order. The first is the primary.
+- A write goes to the first reachable replica and is copied to the rest of the
+  set. A read tries replicas in order and falls back if the primary is down.
+- `?w=` / `?r=` select write and read quorum (default: write quorum, single
+  read). An unmet write quorum returns `202`; anti-entropy repairs the replica
+  later.
+- Anti-entropy runs every `--sync-secs`, pulling from every peer but only for
+  the shards the node replicates. It uses the shared admin credentials when
+  `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
+  internal calls.
+- Database creation and deletion are broadcast to all configured nodes.
+- `_changes` and `GET /db` return a base64url version vector for `since` /
+  `update_seq`, so a client that saw a partial fan-out resumes without skipping
+  changes.
+
+All nodes must use identical `--nodes`, `--q`, `--n` and `--admin` credentials:
 
 ```sh
 BIN=./target/release/douchdb
 NODES=http://127.0.0.1:5984,http://127.0.0.1:5985,http://127.0.0.1:5986
 
-$BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 2 --nodes $NODES --me 0
-$BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 2 --nodes $NODES --me 1
-$BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 2 --nodes $NODES --me 2
+$BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 2 \
+  --admin admin:secret --nodes $NODES --me 0
+$BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 2 \
+  --admin admin:secret --nodes $NODES --me 1
+$BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 2 \
+  --admin admin:secret --nodes $NODES --me 2
 ```
 
-Any node routes a request for a document to one of its replicas, so clients can
-talk to any node. Database creation and deletion are broadcast. A document's
-primary is the first replica; writes are copied to the rest of the set, and
-`?w=` / `?r=` select write and read quorum (default: write quorum, single read).
-An unmet write quorum returns `202` and anti-entropy repairs the replica.
+Clients can talk to any node. Create the database through any node (it is
+broadcast) and then write normally.
 
-`_changes` and `GET /db` use a base64url version vector for `since` /
-`update_seq`, so a client that saw a partial fan-out resumes without skipping
-changes.
+### Cluster limits
+
+- **Static membership.** There is no gossip or automatic join. To change the
+  node list, restart every node with the new list. Rendezvous hashing and
+  anti-entropy copy data to new replicas, but old copies on nodes that lost a
+  shard are not deleted.
+- **AP, not linearizable.** Concurrent writes converge through CouchDB revision
+  trees; there is no Raft and no global ordering beyond version vectors.
+- **Best-effort database lifecycle.** A node that is offline during a database
+  create or drop is not repaired automatically.
+- **Node-local operations.** `_purge`, `_compact` and `_revs_limit` act only on
+  the node that receives them.
+- **Per-node version vectors.** `since` is keyed by node, not by shard replica;
+  resumption is still exact, but the vector is coarser than CouchDB's.
+- **No inter-node TLS or service accounts.** Nodes trust each other on the
+  network; use a private network or a proxy if that matters.
+- **No rebalancing tool.** Membership changes are a restart plus anti-entropy,
+  not an online shard move.
+
+The cluster paths are covered by the integration tests, including
+`cluster_writes_land_on_the_whole_replica_set`,
+`cluster_survives_killing_a_node_mid_replication`,
+`authenticated_cluster_anti_entropy_uses_node_credentials` and
+`cluster_forwards_session_cookies_to_peers`.
 
 ## API surface
 

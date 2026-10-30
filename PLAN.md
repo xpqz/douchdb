@@ -193,25 +193,42 @@ resolution — is already a join-semilattice, so concurrent writes on different
 replicas converge without consensus. Raft would buy linearizable `_changes`
 ordering; a version vector buys the same resumption correctness for ~60 lines.
 
-* **Sharding:** `md5(docid)` → the top `log2(q)` bits of a 2³² ring → shard
-  index. `q` is fixed at database creation, as in CouchDB.
-* **Placement:** rendezvous hashing of `(shard, replica_index)` over the sorted
-  node list. ~20 lines, no rebalance table, adding a node moves ~1/N of shards.
-* **Routing:** every node is a router; there is no coordinator role.
-  Local replica → shard actor. Remote → HTTP proxy of the same shard-level API.
-* **Membership:** `--nodes a:5984,b:5984,c:5984` in config, served verbatim by
-  `GET /_membership`. Changing membership is an operator action: restart with a
-  new list, then let anti-entropy move shards.
-* **Sequence numbers:** per-shard-replica monotonic counters; `since` and
-  `update_seq` are base64url **version vectors** `{replica → seq}`. Clients treat
+* **Sharding:** `md5(docid)` → first four bytes `% q` → shard index. `q` is
+  fixed at database creation, as in CouchDB.
+* **Placement:** rendezvous score of `(node, shard)`; the top `n` distinct nodes
+  form the replica set in preference order, and the first is the primary. This
+  is a pure function of `(nodes, q, n)`, so every node computes it identically
+  with no metadata to distribute. `n` is clamped to the node count.
+* **Routing:** every node is a router; there is no coordinator role. A local
+  replica calls the shard actor, a remote replica gets the same HTTP request
+  proxied. Writes go to the first reachable replica, then the resulting full
+  revision is copied to the other replicas with `new_edits=false`. Reads try
+  replicas in order and fall back past a dead primary.
+* **Membership:** `--nodes a:5984,b:5984,c:5984` is static and served verbatim
+  by `GET /_membership`. Changing membership is an operator action: restart
+  every node with the new list. Rendezvous hashing and anti-entropy move data
+  to new replicas; stale copies are not deleted and there is no online
+  rebalancing tool.
+* **Sequence numbers:** one counter per database; `since` and `update_seq` are
+  base64url **version vectors** keyed by node `{node → seq}`. Clients treat
   `since` as opaque (CouchDB 2 already returns strings like `"12-g1AAA…"`), and
-  `0`/`now` still work. A single hybrid-logical-clock integer would be smaller
-  but silently drops changes under clock skew.
-* **Anti-entropy:** a background task runs the replication protocol node to node,
-  per shard, so the internal sync path is exercised constantly by the same code
-  clients use.
+  `0`/`now` still work. Node keys are coarser than per-shard-replica keys, but
+  resumption remains exact because a node's changes feed is one cursor. A
+  single hybrid-logical-clock integer would be smaller but silently drops
+  changes under clock skew.
+* **Anti-entropy:** one pull per peer per database every `--sync-secs`, using
+  the same `_changes` + `_bulk_get` + `new_edits=false` protocol clients use,
+  with documents filtered to the shards this node replicates. Internal calls
+  authenticate with the shared `--admin` credentials; a client's Basic auth or
+  `_session` cookie is forwarded when routing/fan-out needs a peer.
+* **Database lifecycle:** create and delete are broadcast to every configured
+  node. A node that is offline during the operation must be repaired manually.
 * **Consistency:** implement CouchDB's `?w=`/`?r=`; default quorum write, single
-  read. Do not pretend to offer linearizability.
+  read. An unmet write quorum returns `202` and anti-entropy heals the replica.
+  Do not pretend to offer linearizability.
+* **Operational limits:** `_purge`, `_compact` and `_revs_limit` are local to the
+  receiving node; there is no inter-node TLS or separate service account, so
+  cluster nodes must sit on a trusted network.
 
 ## Code size budget
 
