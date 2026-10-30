@@ -505,6 +505,17 @@ this work.
 - `--cors-origins '*'` allows any website to make credentialed requests against
   a logged-in session. Prefer an explicit origin list.
 
+## Performance
+
+A reproducible single-node HTTP baseline (CRUD, bulk, `_all_docs`, `_changes`,
+views, large documents and compaction) is recorded in
+[docs/performance.md](docs/performance.md):
+
+```sh
+cargo build --release
+python3 scripts/perf_sweep.py --docs 6000
+```
+
 ## Tests
 
 ```sh
