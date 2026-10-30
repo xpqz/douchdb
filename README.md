@@ -52,28 +52,160 @@ curl -X POST http://couch:5984/_replicate \
 ## Views
 
 Views live in design documents and run JavaScript map/reduce functions on the
-embedded QuickJS engine:
+embedded QuickJS engine. Start with a small database:
+
+```sh
+curl -X PUT localhost:5984/shop
+curl -X POST localhost:5984/shop/_bulk_docs \
+  -H 'Content-Type: application/json' \
+  -d '{"docs":[
+        {"_id":"a","city":"Berlin","tags":["book"],"price":10},
+        {"_id":"b","city":"Berlin","tags":["book","sale"],"price":20},
+        {"_id":"c","city":"Paris","tags":["music"],"price":5},
+        {"_id":"d","city":"Paris","tags":["book"],"price":15}
+      ]}'
+```
+
+### Map
+
+A map function receives each document and calls `emit(key, value)` zero or
+more times. The index is sorted by key, then by document id:
+
+```js
+function (doc) {
+  if (doc.city) emit(doc.city, doc.price);
+}
+```
+
+The same function embedded in a design document:
 
 ```sh
 curl -X PUT localhost:5984/shop/_design/shop \
   -H 'Content-Type: application/json' \
-  -d '{"views":{
-        "by_city":{"map":"function(doc){ if(doc.city) emit(doc.city, doc.price); }"},
-        "count":{"map":"function(doc){ if(doc.city) emit(doc.city, null); }","reduce":"_count"}
-      }}'
+  -d @- <<'JSON'
+{
+  "views": {
+    "by_city": {
+      "map": "function (doc) { if (doc.city) emit(doc.city, doc.price); }"
+    },
+    "totals": {
+      "map": "function (doc) { if (doc.city) emit(doc.city, doc.price); }",
+      "reduce": "_sum"
+    },
+    "count": {
+      "map": "function (doc) { if (doc.city) emit(doc.city, null); }",
+      "reduce": "_count"
+    },
+    "average": {
+      "map": "function (doc) { if (doc.city) emit(doc.city, doc.price); }",
+      "reduce": "function (keys, values, rereduce) { if (rereduce) { var sum = 0; var count = 0; for (var i = 0; i < values.length; i++) { sum += values[i].sum; count += values[i].count; } return { sum: sum, count: count, mean: count ? sum / count : 0 }; } var sum = 0; for (var i = 0; i < values.length; i++) sum += values[i]; return { sum: sum, count: values.length, mean: values.length ? sum / values.length : 0 }; }"
+    },
+    "tags": {
+      "map": "function (doc) { (doc.tags || []).forEach(function (tag) { emit([doc.city, tag], 1); }); }",
+      "reduce": "_count"
+    }
+  }
+}
+JSON
 
-curl 'localhost:5984/shop/_design/shop/_view/by_city?key="Berlin"&include_docs=true'
-curl 'localhost:5984/shop/_design/shop/_view/count?group=true'
+curl 'localhost:5984/shop/_design/shop/_view/by_city'
 ```
 
+```json
+{
+  "total_rows": 4,
+  "offset": 0,
+  "rows": [
+    {"id": "a", "key": "Berlin", "value": 10},
+    {"id": "b", "key": "Berlin", "value": 20},
+    {"id": "c", "key": "Paris",  "value": 5},
+    {"id": "d", "key": "Paris",  "value": 15}
+  ]
+}
+```
+
+The `tags` view emits once per tag, so one document can produce several rows.
 Map queries support `key`, `keys` (GET or POST body), `startkey`, `endkey`,
 `startkey_docid`, `endkey_docid`, `descending`, `inclusive_end`, `skip`,
-`limit`, `include_docs` and `attachments`, and return
-`{"total_rows","offset","rows":[{"id","key","value"}]}`. Reduce queries support
-`reduce`, `group` and `group_level`, and return `{"rows":[{"key","value"}]}`.
-Built-in reducers are `_count`, `_sum`, `_stats` and `_approx_count_distinct`;
-custom JavaScript reducers receive `(keys, values, rereduce)`. `_view_cleanup`
-removes index directories for views that no longer exist on that node.
+`limit`, `include_docs` and `attachments`.
+
+### Reduce
+
+Add `reduce` to a view to collapse its rows. Built-ins are `_count`, `_sum`,
+`_stats` and `_approx_count_distinct`; `group=true` reduces per key and
+`group_level=N` groups array keys by their first N elements.
+
+```sh
+curl 'localhost:5984/shop/_design/shop/_view/totals?group=true'
+```
+
+```json
+{
+  "rows": [
+    {"key": "Berlin", "value": 30},
+    {"key": "Paris",  "value": 20}
+  ]
+}
+```
+
+Use `reduce=false` to see the underlying map rows even on a reduce view, and
+`group_level=1` on `tags` to count tags per city:
+
+```sh
+curl 'localhost:5984/shop/_design/shop/_view/tags?group_level=1'
+# {"rows":[{"key":["Berlin"],"value":3},{"key":["Paris"],"value":2}]}
+```
+
+The response shape for map queries is
+`{"total_rows","offset","rows":[{"id","key","value"}]}`; reduce queries return
+`{"rows":[{"key","value"}]}`.
+
+### Re-reduce
+
+A group can be much larger than the 1000 rows the runtime reduces at a time.
+The reduce function is first called for each batch with `rereduce=false` and
+`values` holding the emitted values. The partial results are then passed to the
+same function with `rereduce=true`, `keys=null`, and `values` holding the
+partial results. The `average` view above handles both calls:
+
+```js
+function (keys, values, rereduce) {
+  var sum = 0;
+  var count = 0;
+  if (rereduce) {
+    // values are results from earlier reduce calls
+    for (var i = 0; i < values.length; i++) {
+      sum += values[i].sum;
+      count += values[i].count;
+    }
+  } else {
+    // values are the numbers emitted by the map function
+    for (var i = 0; i < values.length; i++) {
+      sum += values[i];
+      count += 1;
+    }
+  }
+  return { sum: sum, count: count, mean: count ? sum / count : 0 };
+}
+```
+
+```sh
+curl 'localhost:5984/shop/_design/shop/_view/average?group=true'
+```
+
+```json
+{
+  "rows": [
+    {"key": "Berlin", "value": {"sum": 30, "count": 2, "mean": 15}},
+    {"key": "Paris",  "value": {"sum": 20, "count": 2, "mean": 10}}
+  ]
+}
+```
+
+With these four documents the group is small, so only the `rereduce=false`
+branch runs. Add more than 1000 rows with the same key to exercise the
+`rereduce=true` branch; the result is the same. Built-in `_stats` is already
+rereduce-safe.
 
 The console's **Views** tab lists every view in the database's design documents
 and runs the query with the same options:
