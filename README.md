@@ -127,7 +127,7 @@ curl 'localhost:5984/shop/_design/shop/_view/by_city'
 The `tags` view emits once per tag, so one document can produce several rows.
 Map queries support `key`, `keys` (GET or POST body), `startkey`, `endkey`,
 `startkey_docid`, `endkey_docid`, `descending`, `inclusive_end`, `skip`,
-`limit`, `include_docs` and `attachments`.
+`limit` and `include_docs`.
 
 ### Reduce
 
@@ -388,8 +388,8 @@ database create/get/delete, document CRUD with `?rev=`, `?revs=`,
 `?open_revs=`, `?new_edits=false`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
 `_changes` (normal/longpoll/continuous, `style=all_docs`, `filter=_doc_ids`),
 `_revs_diff`, `_local/*`, `_purge`, `_compact`, `_revs_limit`,
-`_design/{ddoc}/_view/{view}`, `_view_cleanup`, `_ensure_full_commit`, and
-base64 attachments.
+`_design/{ddoc}/_view/{view}`, `_view_cleanup` and
+`_ensure_full_commit`.
 
 ## Security and operations
 
@@ -428,11 +428,13 @@ amplification, and checks durability across `kill -9`.
 
 ## Status and limits
 
-v0.1: the replication protocol, attachments, auth, and a Q-shard × N-replica
-cluster with anti-entropy are implemented and tested. Known limits:
+v0.1: the replication protocol, auth, views and a Q-shard × N-replica cluster
+with anti-entropy are implemented and tested. Attachments are deliberately not
+supported; documents containing `_attachments` are rejected with
+`attachments_not_supported`. Known limits:
 
 - Static membership and no rebalancing beyond rendezvous hashing.
 - Version vectors are keyed per node, not per shard replica.
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
   shard for ~27 s (measured in [PLAN.md](PLAN.md)).
-- No Mango, lists/shows, multipart attachments or metrics.
+- No Mango, lists/shows or metrics.

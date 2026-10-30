@@ -2423,140 +2423,19 @@ async fn doc_request(
         });
     }
 
-    let Some(attachment) = attachment else {
-        return match method {
-            Method::GET | Method::HEAD => get_doc(db, &docid, q, headers).await,
-            Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
-            Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers).await,
-            _ if method.as_str() == "COPY" => copy_doc(st, db, dbname, &docid, q, headers).await,
-            _ => fail(ApiError::new(
-                405,
-                "method_not_allowed",
-                "method not allowed",
-            )),
-        };
-    };
+    if attachment.is_some() {
+        return fail(ApiError::new(
+            400,
+            "attachments_not_supported",
+            "douchdb does not support attachments",
+        ));
+    }
 
     match method {
-        Method::GET => match db
-            .attachment(&docid, q.get("rev").map(String::as_str), &attachment)
-            .await
-        {
-            Ok((att, bytes)) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, att.content_type)],
-                bytes,
-            )
-                .into_response(),
-            Err(e) => fail(e),
-        },
-        Method::PUT => {
-            let content_type = headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&body);
-            // `PUT /db/doc/att` updates the document: the existing body and the
-            // other attachments must be preserved, only this attachment changes.
-            let mut doc = match q.get("rev") {
-                Some(rev) => match db
-                    .get_doc(
-                        &docid,
-                        &DocOpts {
-                            rev: Some(rev.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(doc) => doc,
-                    Err(e) => return fail(e),
-                },
-                None => json!({"_id": docid}),
-            };
-            let mut atts = doc
-                .get("_attachments")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            atts.insert(
-                attachment.clone(),
-                json!({ "content_type": content_type, "data": encoded }),
-            );
-            doc["_attachments"] = Value::Object(atts);
-            doc["_id"] = json!(docid);
-            if let Some(rev) = q.get("rev") {
-                doc["_rev"] = json!(rev);
-            }
-            match commit_docs(
-                st,
-                db,
-                dbname,
-                vec![doc],
-                true,
-                num(q, "w").unwrap_or(0),
-                headers,
-            )
-            .await
-            {
-                Ok((mut results, quorum)) => {
-                    let result = results.pop().unwrap_or(Value::Null);
-                    if result.get("error").is_some() {
-                        return json(StatusCode::CONFLICT, result);
-                    }
-                    let status = if quorum {
-                        StatusCode::CREATED
-                    } else {
-                        StatusCode::ACCEPTED
-                    };
-                    json(status, result)
-                }
-                Err(e) => fail(e),
-            }
-        }
-        Method::DELETE => {
-            let Some(rev) = q.get("rev") else {
-                return fail(ApiError::conflict());
-            };
-            let opts = DocOpts {
-                rev: Some(rev.clone()),
-                ..Default::default()
-            };
-            let Ok(mut doc) = db.get_doc(&docid, &opts).await else {
-                return fail(ApiError::not_found("missing"));
-            };
-            if let Some(atts) = doc.get_mut("_attachments").and_then(Value::as_object_mut) {
-                atts.remove(&attachment);
-            }
-            doc["_rev"] = json!(rev);
-            let result = match commit_docs(
-                st,
-                db,
-                dbname,
-                vec![doc],
-                true,
-                num(q, "w").unwrap_or(0),
-                headers,
-            )
-            .await
-            {
-                Ok((mut results, quorum)) => (results.pop().unwrap_or(Value::Null), quorum),
-                Err(e) => return fail(e),
-            };
-            let (result, quorum) = result;
-            if result.get("error").is_some() {
-                return json(StatusCode::CONFLICT, result);
-            }
-            json(
-                if quorum {
-                    StatusCode::OK
-                } else {
-                    StatusCode::ACCEPTED
-                },
-                result,
-            )
-        }
+        Method::GET | Method::HEAD => get_doc(db, &docid, q, headers).await,
+        Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
+        Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers).await,
+        _ if method.as_str() == "COPY" => copy_doc(st, db, dbname, &docid, q, headers).await,
         _ => fail(ApiError::new(
             405,
             "method_not_allowed",

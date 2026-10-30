@@ -18,8 +18,9 @@ compatible document store.
 that CouchDB can replicate to and from, storing data in LevelDB, running as a
 Q-shard × N-replica cluster.
 
-**Non-goals, deliberately:** Mango, `_replicator` database, `_users` database
-machinery beyond auth, per-document ETags, multipart `_bulk_docs`. Map/reduce
+**Non-goals, deliberately:** attachments, Mango, `_replicator` database,
+`_users` database machinery beyond auth, per-document ETags, multipart
+`_bulk_docs`. Attachments are rejected rather than stored. Map/reduce
 views are implemented with an embedded QuickJS runtime; lists, shows, update
 handlers and a full server-side JavaScript platform are not.
 
@@ -83,7 +84,6 @@ Keys are chosen so LevelDB's own sort order *is* the index.
 |---|---|---|
 | `m/<docid>` | revtree + winner + deleted flag + update seq | doc metadata; sorted = `_all_docs` order |
 | `d/<docid>/<rev>` | JSON body (without `_id`/`_rev`) | one body per revision |
-| `a/<docid>/<rev>/<attname>` | attachment chunk, 64 KiB | streaming attachments |
 | `s/<u64 BE seq>/<docid>` | 1 byte | by-seq index for `_changes` |
 | `l/<localid>` | JSON | `_local` docs, replication checkpoints |
 | `x/...` | — | reserved |
@@ -119,7 +119,8 @@ couch_hash:md5_hash(
   appeared in the JSON document** — `couch_doc:from_json_obj` builds a proplist
   and never sorts it.
 * `Atts2` — list of `{Name, Type, Md5}` triples, **reversed**, for attachments
-  that carry an md5 (CouchDB falls back to a random id for legacy attachments).
+  that carry an md5. The API rejects attachments now, but the hash code keeps
+  this path for legacy documents and CouchDB rev compatibility.
 
 Three consequences that are easy to miss:
 
@@ -241,10 +242,9 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
 | Store: key codec, shard actor, group commit | 700 |
 | HTTP handlers, params, error/shape compatibility | 1400 |
 | Cluster: shard map, rendezvous, proxy, anti-entropy, version vector | 700 |
-| Attachments | 350 |
 | Auth (JWT issued by `_session`, cluster-friendly) | 250 |
 | Config, main, misc | 300 |
-| **Total** | **~4600** |
+| **Total** | **~4250** |
 
 Above ~6k means something was built that nobody asked for.
 
@@ -256,7 +256,7 @@ Above ~6k means something was built that nobody asked for.
 2. **Replication round-trips.** `_changes`, `_revs_diff`, `_bulk_get`, `_local`,
    `new_edits=false`. CI gate: `pouch.replicate()` both directions, and
    CouchDB→douchdb, douchdb→CouchDB.
-3. **Attachments.** Chunked; base64 first, multipart second.
+3. ~~**Attachments.**~~ Removed in v0.2; the API rejects `_attachments`.
 4. **Cluster.** Shard map, routing, quorum, anti-entropy. Ship v0.1 only when a
    three-node cluster survives killing a node mid-replication.
 5. **Ersatz CouchDB.** `_purge`, `_compact`, `_session`, `_security`,
@@ -270,8 +270,7 @@ Above ~6k means something was built that nobody asked for.
    serialises all access per shard — that is the design, but compaction stalls
    and write amplification are unproven. Spike: 10 GB, group-commit throughput,
    p99 latency during compaction.
-3. **Attachment bloat.** Large values wreck LevelDB compaction. Chunk at 64 KiB
-   from the start, never "add chunking later".
+3. ~~**Attachment bloat.**~~ No longer applicable: attachments are not stored.
 4. **Wire-compat surface creep.** Every quirk discovered (`ETag` format,
    `_changes` line framing, `open_revs` shape) is small but there are many.
    Keep a conformance test file per endpoint; refuse features by default.
@@ -289,20 +288,20 @@ Above ~6k means something was built that nobody asked for.
   (`q > 1`) so the stall is divided, or an observable `compact_running` flag
   plus scheduling compaction off the request path. Left synchronous for now,
   recorded as a known 27 s p99 per shard at 10 GB.
-* Attachment chunk size vs read amplification for `pouch.getAttachment`.
+* ~~Attachment chunk size vs read amplification for `pouch.getAttachment`.~~
 
 ## Progress
 
 * **M0 green.** `src/rev.rs` reproduces CouchDB 3.5.3 rev ids byte for byte;
   ETF is version-byte + Latin-1 atoms. Unit tests cover the corpus.
 * **M1 green.** `src/db.rs` implements CRUD, rev trees, conflict winners,
-  `_bulk_docs`, `_all_docs`, `_local`, `_purge`, `_revs_limit`, attachments
-  (64 KiB chunks, base64). `tests/conformance.rs` starts a real server and
+  `_bulk_docs`, `_all_docs`, `_local`, `_purge` and `_revs_limit`. Attachments
+  were removed in v0.2. `tests/conformance.rs` starts a real server and
   asserts CouchDB's status codes, bodies, ETag and digest formats.
 * **M2 green.** `_changes`, `_revs_diff`, `_bulk_get` and `new_edits=false` work.
   Verified manually: PouchDB ⇄ douchdb round-trips docs, deletions and
-  attachments; CouchDB's own `_replicate` pushes and pulls in both directions
-  with identical revision ids.
+  and CouchDB's own `_replicate` pushes and pulls in both directions with
+  identical revision ids.
 * **Group commit.** The shard actor drains up to 64 queued jobs, merges their
   `Tx`es into one synced `WriteBatch`, and acknowledges only after the fsync.
   A write overlay makes later jobs in the same group read their predecessors.
@@ -317,7 +316,7 @@ Above ~6k means something was built that nobody asked for.
   locally instead of re-fanning out.
 * **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
   rendezvous score. A write goes to the first reachable replica, then the full
-  revision (history plus attachment bytes) is copied to the rest with
+  revision (history plus body) is copied to the rest with
   `new_edits=false`; reads try replicas in preference order and fall back past a
   dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
   an unmet write quorum returns `202` and anti-entropy repairs the replica.
@@ -346,7 +345,7 @@ Above ~6k means something was built that nobody asked for.
   and HMAC verification is constant-time; peer HTTP calls have connect/request
   timeouts; request bodies and view execution are bounded; security headers are
   added to every response; a poisoned view-index mutex no longer takes down
-  future queries; attachment names keep embedded slashes.
+  future queries.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
