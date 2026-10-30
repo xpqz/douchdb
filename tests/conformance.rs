@@ -2834,7 +2834,13 @@ async fn cluster_view_query_survives_a_node_loss_via_replicas() {
     let (status, _) = nodes[0]
         .put(
             "/clviewfail/_design/v",
-            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+            json!({"views": {
+                "by_city": {"map": "function(doc){ emit(doc.city, 1); }"},
+                "count": {
+                    "map": "function(doc){ emit(doc.city, null); }",
+                    "reduce": "_count"
+                }
+            }}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -2857,6 +2863,31 @@ async fn cluster_view_query_survives_a_node_loss_via_replicas() {
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, ["a", "b"]);
+
+    // Reduce partials fall back to the dead owner's replicas too.
+    let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/count").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 2);
+    let (status, body) = nodes[0]
+        .get("/clviewfail/_design/v/_view/count?group=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut groups: Vec<(String, u64)> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["key"].as_str().unwrap().to_string(),
+                row["value"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    groups.sort();
+    assert_eq!(
+        groups,
+        [("Berlin".to_string(), 1), ("Paris".to_string(), 1)]
+    );
 }
 
 #[tokio::test]
@@ -3378,7 +3409,7 @@ async fn partitioned_database_documents_info_and_views() {
 
 #[tokio::test]
 async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
-    let nodes = start_cluster_with(3, "3600", 3);
+    let mut nodes = start_cluster_with(3, "3600", 3);
     let (status, _) = nodes[0].put("/clpart?partitioned=true", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
 
@@ -3471,6 +3502,19 @@ async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
     assert_eq!(body["rows"][0]["value"], 12);
     let (status, body) = nodes[2].get("/clpart/_design/p/_view/by_n").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Partitioned reduce and map queries fall back to replicas after node loss.
+    nodes[2].kill();
+    let (status, body) = nodes[0]
+        .get("/clpart/_partition/even/_design/p/_view/count")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 12);
+    let (status, body) = nodes[0]
+        .get("/clpart/_partition/even/_design/p/_view/by_n")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 12);
 }
 
 #[tokio::test]

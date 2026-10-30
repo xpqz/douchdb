@@ -418,6 +418,19 @@ tombstones, range/key/descending `_all_docs`, partitioned and global views,
 reduce views, partition-based shard placement, cluster creation propagation,
 n=1 owner routing, and partition queries from every coordinator.
 
+### View reduce replica failover (#57)
+
+Cluster reduce queries now use the same shard-mask fan-out as map views. Each
+owner reduces only its shards; if an owner is unreachable, the coordinator asks
+a live replica for exactly the missing shard masks and recombines those
+partials. Global and grouped built-in reducers and custom `rereduce` reducers
+all take this path, including partition-scoped reduces.
+
+The node-loss view test now kills one of three nodes and verifies both the map
+query and `_count`/grouped `_count` results. The partitioned cluster test kills
+a node and verifies partitioned map and reduce queries still return the full
+partition.
+
 ### Changes replica failover (#53)
 
 Cluster `_changes` now skips unavailable nodes and continues with reachable
@@ -491,7 +504,8 @@ replicates and the pending file disappears.
 - **Warm views** are ~1.6–2.8 ms. The remaining cost is mostly coordinator
   merge and JSON/HTTP for the selected rows. Cold builds are ~47–72 ms because
   each node indexes every locally held replica, which is what enables node-loss
-  failover.
+  failover. Map and reduce queries both fall back to replicas when an owner is
+  unreachable.
 - **`_changes`** is ~19 ms for a 1,000-row limited feed; a full 6,000-document
   feed is ~124 ms with nodes queried concurrently. Limited feeds merge every
   node's prefix round-robin up to the global limit. Unavailable nodes are

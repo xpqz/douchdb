@@ -1054,6 +1054,75 @@ pub(crate) async fn cluster_view_rows(
     Ok((spec, Arc::new(rows), docs, Some(total_rows)))
 }
 
+async fn fetch_reduce_mask(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    view_name: &str,
+    query: &crate::view::ViewQuery,
+    headers: &HeaderMap,
+    node: usize,
+    mask: &[bool],
+) -> DbResult<(usize, Value)> {
+    if node == st.cluster.me {
+        let mut local = query.clone();
+        local.owner_shards = Some(mask.to_vec());
+        local.reduce = Some(true);
+        let value = crate::view::query(db, ddoc, view_name, &local).await?;
+        return Ok((node, value));
+    }
+
+    let peer = &st.cluster.nodes[node];
+    let url = format!(
+        "{peer}/{dbname}/{}/_view/{}",
+        percent_encode(ddoc),
+        percent_encode(view_name)
+    );
+    let selected: Vec<String> = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, owned)| **owned)
+        .map(|(shard, _)| shard.to_string())
+        .collect();
+    let mut params = vec![
+        ("reduce", "true".to_string()),
+        ("shards", selected.join(",")),
+    ];
+    if query.group {
+        params.push(("group", "true".to_string()));
+    }
+    if query.group_level > 0 {
+        params.push(("group_level", query.group_level.to_string()));
+    }
+    if let Some(partition) = &query.partition {
+        params.push(("partition", partition.clone()));
+    }
+    let request = st
+        .client
+        .get(url)
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
+        .query(&params);
+    let request = forward_client_auth(request, headers);
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            response.status().as_u16(),
+            "view_failed",
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    Ok((node, value))
+}
+
 pub(crate) async fn cluster_reduce(
     st: &AppState,
     db: &Db,
@@ -1068,73 +1137,65 @@ pub(crate) async fn cluster_reduce(
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let node_count = st.cluster.nodes.len();
-    let owned: Vec<bool> = (0..db.q)
-        .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
+    let owned_by_node: Vec<Vec<bool>> = (0..node_count)
+        .map(|node| {
+            (0..db.q)
+                .map(|shard| owner_of_shard(db, shard) == node)
+                .collect()
+        })
         .collect();
     crate::telemetry::record_fanout(node_count as u64);
 
     let batches = futures::future::join_all((0..node_count).map(|node| {
-        let owned = owned.clone();
+        let mask = owned_by_node[node].clone();
         async move {
-            if node == st.cluster.me {
-                let mut local = query.clone();
-                local.owner_shards = Some(owned);
-                local.reduce = Some(true);
-                let value = crate::view::query(db, ddoc, view_name, &local).await?;
-                Ok((node, value))
-            } else {
-                let peer = &st.cluster.nodes[node];
-                let url = format!(
-                    "{peer}/{dbname}/{}/_view/{}",
-                    percent_encode(ddoc),
-                    percent_encode(view_name)
-                );
-                let mut params = vec![
-                    ("reduce", "true".to_string()),
-                    ("owner_only", "1".to_string()),
-                ];
-                if query.group {
-                    params.push(("group", "true".to_string()));
-                }
-                if query.group_level > 0 {
-                    params.push(("group_level", query.group_level.to_string()));
-                }
-                if let Some(partition) = &query.partition {
-                    params.push(("partition", partition.clone()));
-                }
-                let request = st
-                    .client
-                    .get(url)
-                    .header("x-douchdb-forwarded", "1")
-                    .header("x-douchdb-secret", st.cluster.secret.as_str())
-                    .query(&params);
-                let request = forward_client_auth(request, headers);
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-                if !response.status().is_success() {
-                    return Err(ApiError::new(
-                        response.status().as_u16(),
-                        "view_failed",
-                        response.text().await.unwrap_or_default(),
-                    ));
-                }
-                let value = response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-                Ok((node, value))
+            if !mask.iter().any(|owned| *owned) {
+                return Ok(None);
             }
+            fetch_reduce_mask(st, db, dbname, ddoc, view_name, query, headers, node, &mask)
+                .await
+                .map(Some)
         }
     }))
     .await;
 
+    let mut values = Vec::new();
+    let mut failed = Vec::new();
+    for (node, batch) in batches.into_iter().enumerate() {
+        match batch {
+            Ok(Some(value)) => values.push(value),
+            Ok(None) => {}
+            Err(_) => failed.push(node),
+        }
+    }
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..node_count)
+            .filter(|node| !failed.contains(node))
+            .collect();
+        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
+        let fallbacks =
+            futures::future::join_all(groups.into_iter().map(|(node, mask)| async move {
+                fetch_reduce_mask(st, db, dbname, ddoc, view_name, query, headers, node, &mask)
+                    .await
+            }))
+            .await;
+        for fallback in fallbacks {
+            values.push(fallback?);
+        }
+    }
+    if values.is_empty() {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            "no view replica is reachable",
+        ));
+    }
+
     let grouped = query.group || query.group_level > 0;
     let mut partials = Vec::new();
     let mut groups: HashMap<String, (Value, Value)> = HashMap::new();
-    for batch in batches {
-        let (_, value) = batch?;
+    for (_, value) in values {
         if grouped {
             for row in value["rows"].as_array().cloned().unwrap_or_default() {
                 let key = row.get("key").cloned().unwrap_or(Value::Null);
@@ -1176,7 +1237,11 @@ pub(crate) async fn cluster_reduce(
         }));
     }
 
-    let value = combine_reduce_values(reducer, &partials, query.limits)?;
+    let value = if partials.len() == 1 {
+        partials.pop().unwrap_or(Value::Null)
+    } else {
+        combine_reduce_values(reducer, &partials, query.limits)?
+    };
     Ok(json!({"rows": [{"key": Value::Null, "value": value}]}))
 }
 
