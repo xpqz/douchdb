@@ -67,13 +67,44 @@ python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
 Host: 16 CPUs, 30 GiB RAM, Docker 29.9.2, Linux. Client runs on the host and
 talks to the published node ports through the Docker bridge.
 
+## Durability caveat
+
+**The write comparison is not durability-equivalent.** CouchDB 3.x removed
+`delayed_commits`; every write is a full commit (CouchDB 3.0 upgrade note
+`#2208`). douchdb uses rusty-leveldb 4.0.2, whose `DB::write(batch, true)`
+only flushes a `BufWriter` to the operating-system page cache. The crate has no
+`fsync`, `fdatasync`, `sync_all` or `sync_data` call at all.
+
+Measured directly with:
+
+```sh
+strace -f -e trace=fsync,fdatasync target/release/douchdb ...
+curl -X PUT .../db/doc1
+```
+
+the successful PUT produced **zero** `fsync`/`fdatasync` syscalls. A process
+crash preserves the data because it is in the page cache, but a host crash or
+power loss can lose acknowledged writes.
+
+Therefore:
+
+- **Read, view, `_all_docs` and `_changes` comparisons are meaningful.**
+- **Write throughput comparisons are not equal-durability.** They compare
+  CouchDB full commits against douchdb OS-buffered writes.
+- To make writes comparable we need to fsync the LevelDB log before
+  acknowledging the write (or add a separate durable WAL), then rerun the
+  write benchmarks. CouchDB 3.x cannot be switched back to delayed commits.
+
+The table below keeps the measured numbers, but write rows should be read with
+that caveat.
+
 ## Results
 
 | Operation | CouchDB | douchdb | douchdb / CouchDB |
 |---|---:|---:|---:|
-| Sequential PUT | 96 req/s | 1,198 req/s | **12.5×** |
-| Concurrent PUT, 8 clients | 238 req/s | 3,547 req/s | **14.9×** |
-| `_bulk_docs`, 250 docs | 6,255 docs/s | 29,984 docs/s | **4.8×** |
+| Sequential PUT * | 96 req/s | 1,198 req/s | **12.5×** |
+| Concurrent PUT, 8 clients * | 238 req/s | 3,547 req/s | **14.9×** |
+| `_bulk_docs`, 250 docs * | 6,255 docs/s | 29,984 docs/s | **4.8×** |
 | Sequential GET | 743 req/s | 1,774 req/s | **2.4×** |
 | Concurrent GET, 8 clients | 2,572 req/s | 4,997 req/s | **1.9×** |
 | `_bulk_get`, 250 docs | 20,917 docs/s | 64,155 docs/s | **3.1×** |
@@ -108,8 +139,16 @@ Latency at p50:
 
 ## Reading the results
 
-- douchdb's synchronous replica writes are much faster in this container
-  setup. CouchDB pays more per-document coordinator, auth and durability work.
+* Write rows are not durability-equivalent: CouchDB fsyncs every commit while
+  douchdb currently acknowledges after writing to the OS page cache.
+
+- douchdb's replica-write fan-out is faster in this container setup, but part
+  of the write gap is the missing fsync. The durable comparison requires the
+  fsync fix above.
+- With that caveat, the read-only and index paths show douchdb ahead by roughly
+  2–3× for point/range reads, 9–10× for limited changes and much more for full
+  changes. Write ratios must not be quoted as an apples-to-apples durability
+  result.
 - Bulk operations narrow the gap: CouchDB reaches ~6.3k docs/s versus ~30k
   docs/s for douchdb.
 - Point reads are the closest path: CouchDB is within ~2×.
@@ -133,5 +172,7 @@ Latency at p50:
   benchmark. CouchDB `_all_docs?limit=100` and `_bulk_get` showed the largest
   run-to-run variance (roughly ±30%).
 - Basic auth was used. Session cookies changed CouchDB point-read latency by
-  only a few percent, so auth is not the explanation for the large write and
+  only a few percent, so auth is not the explanation for the large read and
   changes differences.
+- douchdb's current LevelDB path does not fsync. The write numbers are
+  throughput measurements of OS-buffered commits, not durable commits.
