@@ -392,6 +392,10 @@ Above ~6k means something was built that nobody asked for.
   the remaining single-host ceiling is the load generator sharing CPU with all
   servers. Owner-aware edge routing was deliberately not added: CouchDB uses
   cheap internal replica calls and a dumb round-robin LB.
+* **Shard-map metadata and movement.** Each database has a persisted, cached
+  mem3-style shard map, exposed at `/_node/_local/_dbs/{db}` and broadcast to
+  peers. Routing and anti-entropy read the map; anti-entropy checkpoints are
+  tagged by map hash so new replicas backfill after a move.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes

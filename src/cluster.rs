@@ -2,6 +2,7 @@
 
 use axum::http::HeaderMap;
 use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default)]
 pub struct Cluster {
@@ -15,7 +16,60 @@ pub struct Cluster {
     pub secret: String,
 }
 
+/// Per-database placement metadata, modelled on CouchDB's `_dbs`/mem3 shard
+/// map: one ordered replica list per shard. The first entry is the preferred
+/// primary; all entries are full replicas.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ShardMap {
+    pub q: u32,
+    pub node_count: usize,
+    pub replicas: Vec<Vec<usize>>,
+}
+
+impl ShardMap {
+    pub fn single(q: u32) -> ShardMap {
+        let q = q.max(1);
+        ShardMap {
+            q,
+            node_count: 1,
+            replicas: vec![vec![0]; q as usize],
+        }
+    }
+
+    pub fn replicas_of(&self, shard: u32) -> &[usize] {
+        self.replicas
+            .get(shard as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn owner_of(&self, shard: u32) -> usize {
+        self.replicas_of(shard).first().copied().unwrap_or(0)
+    }
+
+    pub fn is_valid(&self, q: u32, node_count: usize) -> bool {
+        self.q == q.max(1)
+            && self.node_count == node_count
+            && self.replicas.len() == self.q as usize
+            && self.replicas.iter().all(|replicas| {
+                !replicas.is_empty() && replicas.iter().all(|node| *node < node_count)
+            })
+    }
+}
+
 impl Cluster {
+    pub fn shard_map(&self, q: u32) -> ShardMap {
+        let q = q.max(1);
+        if self.nodes.is_empty() {
+            return ShardMap::single(q);
+        }
+        ShardMap {
+            q,
+            node_count: self.nodes.len(),
+            replicas: (0..q).map(|shard| self.replicas_of_shard(shard)).collect(),
+        }
+    }
+
     pub fn is_clustered(&self) -> bool {
         self.nodes.len() > 1
     }
@@ -64,6 +118,7 @@ impl Cluster {
         self.owner_of_shard(self.shard_of(docid, q))
     }
 
+    #[allow(dead_code)]
     pub fn replicas_of_doc(&self, docid: &str, q: u32) -> Vec<usize> {
         // Every node needs design documents to evaluate views over its local
         // shards, even when its replica set for the document would be smaller.
@@ -77,6 +132,7 @@ impl Cluster {
         self.replicas_of_shard(self.shard_of(docid, q))
     }
 
+    #[allow(dead_code)]
     pub fn is_replica_of(&self, docid: &str, q: u32) -> bool {
         !self.is_clustered() || self.replicas_of_doc(docid, q).contains(&self.me)
     }

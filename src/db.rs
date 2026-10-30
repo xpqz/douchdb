@@ -4,6 +4,7 @@
 //! operations and applied as a single LevelDB `WriteBatch`, so a `_bulk_docs`
 //! of a thousand documents costs one fsync, not a thousand.
 
+use crate::cluster::ShardMap;
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
@@ -79,16 +80,18 @@ pub struct Db {
     pub q: u32,
     pub uuid: String,
     pub instance_start_time: String,
+    shard_map: Arc<std::sync::RwLock<ShardMap>>,
     shards: Vec<ShardHandle>,
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
     seq: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DbConfig {
     pub q: u32,
     pub revs_limit: u64,
+    pub shard_map: ShardMap,
 }
 
 impl Db {
@@ -113,6 +116,21 @@ impl Db {
             file
         };
 
+        let map_path = path.join("shard-map.json");
+        let shard_map = std::fs::read(&map_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ShardMap>(&bytes).ok())
+            .filter(|map| map.is_valid(file.q, config.shard_map.node_count))
+            .unwrap_or_else(|| {
+                let map = if config.shard_map.q == file.q {
+                    config.shard_map.clone()
+                } else {
+                    ShardMap::single(file.q)
+                };
+                let _ = std::fs::write(&map_path, serde_json::to_vec(&map).unwrap());
+                map
+            });
+
         let mut shards = Vec::new();
         for i in 0..file.q {
             shards.push(ShardHandle::spawn(
@@ -133,6 +151,7 @@ impl Db {
             q: file.q.max(1),
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
+            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
             shards,
             seq: Arc::new(AtomicU64::new(seq)),
         })
@@ -149,6 +168,61 @@ impl Db {
 
     pub fn shard_index(&self, docid: &str) -> usize {
         shard_index(docid, self.q)
+    }
+
+    pub fn shard_map(&self) -> ShardMap {
+        self.shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<()> {
+        if !shard_map.is_valid(self.q, shard_map.node_count) {
+            return Err(ApiError::bad_request("invalid shard map"));
+        }
+        std::fs::write(
+            self.path.join("shard-map.json"),
+            serde_json::to_vec(&shard_map)
+                .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?,
+        )
+        .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
+        *self
+            .shard_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = shard_map;
+        Ok(())
+    }
+
+    pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
+        self.shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .replicas_of(shard)
+            .to_vec()
+    }
+
+    pub fn owner_of_shard(&self, shard: u32) -> usize {
+        self.shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .owner_of(shard)
+    }
+
+    pub fn replicas_of_doc(&self, docid: &str) -> Vec<usize> {
+        if docid.starts_with("_design/") {
+            let node_count = self
+                .shard_map
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .node_count;
+            return (0..node_count).collect();
+        }
+        self.replicas_of_shard(self.shard_index(docid) as u32)
+    }
+
+    pub fn owner_of_doc(&self, docid: &str) -> usize {
+        self.owner_of_shard(self.shard_index(docid) as u32)
     }
 
     fn shard(&self, docid: &str) -> &ShardHandle {

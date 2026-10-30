@@ -283,6 +283,34 @@ document id, and answers range/keys queries plus totals/offset from the union.
 A node-loss test kills one of three nodes and still requires all 12 documents,
 correct keys, a range window and a cluster-wide offset.
 
+### Shard-map metadata and movement (#47)
+
+Each database now carries a mem3-style shard map: one ordered replica list per
+shard, persisted as `shard-map.json` and cached in memory. It defaults to the
+rendezvous placement, and all routing, anti-entropy filters and owner filters
+read it.
+
+Inspect it on any node:
+
+```sh
+curl localhost:5984/_node/_local/_dbs/mydb
+```
+
+Move shards by writing a map through any node; it is persisted and broadcast to
+peers:
+
+```sh
+curl -X PUT localhost:5984/_node/_local/_dbs/mydb \
+  -H 'Content-Type: application/json' \
+  -d '{"q":4,"node_count":3,"replicas":[[1],[1],[1],[1]]}'
+```
+
+Anti-entropy checkpoints include a hash of the shard map, so a new replica
+starts from zero and pulls documents that were filtered out under the previous
+placement. A conformance test pins all shards to node0, writes a document,
+moves all shards to node1, waits for replication, then reads through node0 and
+node1 and after killing node0.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one
