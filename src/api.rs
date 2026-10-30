@@ -2838,11 +2838,9 @@ async fn cluster_update_vector(
     dbname: &str,
     headers: &HeaderMap,
 ) -> DbResult<Vec<u64>> {
-    let mut out = vec![0; st.cluster.nodes.len()];
-    for (node, slot) in out.iter_mut().enumerate() {
+    let out = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
         if node == st.cluster.me {
-            *slot = db.info().await?["update_seq"].as_u64().unwrap_or(0);
-            continue;
+            return Ok(db.info().await?["update_seq"].as_u64().unwrap_or(0));
         }
         let peer = &st.cluster.nodes[node];
         let request = st
@@ -2850,15 +2848,21 @@ async fn cluster_update_vector(
             .get(format!("{peer}/{dbname}"))
             .header("x-douchdb-forwarded", "1")
             .header("x-douchdb-secret", st.cluster.secret.as_str());
-        let request = forward_client_auth(request, &headers);
-        if let Ok(response) = request.send().await {
-            if response.status().is_success() {
-                if let Ok(info) = response.json::<Value>().await {
-                    *slot = info["update_seq"].as_u64().unwrap_or(0);
-                }
-            }
-        }
-    }
+        let request = forward_client_auth(request, headers);
+        let seq = match request.send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|info| info["update_seq"].as_u64())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        Ok(seq)
+    }))
+    .await
+    .into_iter()
+    .collect::<DbResult<Vec<u64>>>()?;
     Ok(out)
 }
 
