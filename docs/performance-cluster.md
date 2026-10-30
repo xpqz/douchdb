@@ -330,6 +330,19 @@ regression:
 | `_all_docs?limit=100` | 481 req/s | 534 req/s |
 | Cold view build | 71.3 ms | 71.8 ms |
 
+### Automatic rebalance and cleanup (#49)
+
+`POST /_node/_local/_dbs/{db}/rebalance` computes a balanced shard map
+(`(shard + replica) % node_count`) and applies/broadcasts it. Anti-entropy then
+copies data to the new replicas.
+
+After convergence, `POST /_node/_local/_dbs/{db}/cleanup` clears local shard
+data for shards this node no longer owns. Cleanup is deliberately a separate
+step: deleting an old replica before the new one has backfilled would lose
+data. The conformance test moves all shards from node0 to node1, waits for all
+9 documents, runs cleanup on node0, and verifies node0 reports 0 local docs
+while node1 reports 9.
+
 ## Reading the numbers
 
 - **Writes pay for `n=3`.** A sequential PUT is ~1.4k/s versus ~3.8k/s on one

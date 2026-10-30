@@ -765,58 +765,102 @@ pub async fn db_metadata_put(
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid shard map")),
     };
+    match apply_shard_map(&st, &db, &name, map, &headers).await {
+        Ok(map) => json(StatusCode::OK, json!(map)),
+        Err(error) => fail(error),
+    }
+}
+
+async fn apply_shard_map(
+    st: &AppState,
+    db: &Arc<Db>,
+    name: &str,
+    map: ShardMap,
+    headers: &HeaderMap,
+) -> DbResult<ShardMap> {
     if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
-        return fail(ApiError::bad_request(
+        return Err(ApiError::bad_request(
             "shard map does not match database q or cluster node count",
         ));
     }
-    if let Err(error) = db.set_shard_map(map.clone()) {
-        return fail(error);
-    }
-
-    if !is_forwarded(&st, &headers) {
-        let payload = match serde_json::to_vec(&map) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return fail(ApiError::new(
-                    500,
-                    "internal_server_error",
-                    error.to_string(),
-                ))
-            }
-        };
-        for peer in st.cluster.nodes.iter().enumerate() {
-            if peer.0 == st.cluster.me {
+    db.set_shard_map(map.clone())?;
+    if !is_forwarded(st, headers) {
+        let payload = serde_json::to_vec(&map)
+            .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
+        for (index, peer) in st.cluster.nodes.iter().enumerate() {
+            if index == st.cluster.me {
                 continue;
             }
             let request = st
                 .client
-                .put(format!("{}/_node/_local/_dbs/{}", peer.1, name))
+                .put(format!("{peer}/_node/_local/_dbs/{name}"))
                 .header("x-douchdb-forwarded", "1")
                 .header("x-douchdb-secret", st.cluster.secret.as_str())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload.clone());
-            let request = forward_client_auth(request, &headers);
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => {
-                    return fail(ApiError::new(
-                        response.status().as_u16(),
-                        "shard_map_update_failed",
-                        response.text().await.unwrap_or_default(),
-                    ))
-                }
-                Err(error) => {
-                    return fail(ApiError::new(
-                        502,
-                        "bad_gateway",
-                        format!("{}: {error}", peer.1),
-                    ))
-                }
+            let request = forward_client_auth(request, headers);
+            let response = request
+                .send()
+                .await
+                .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
+            if !response.status().is_success() {
+                return Err(ApiError::new(
+                    response.status().as_u16(),
+                    "shard_map_update_failed",
+                    response.text().await.unwrap_or_default(),
+                ));
             }
         }
     }
-    json(StatusCode::OK, json!(map))
+    Ok(map)
+}
+
+pub async fn db_rebalance(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    let map = ShardMap::balanced(
+        db.q,
+        st.cluster.nodes.len().max(1),
+        st.cluster.replication_factor(),
+    );
+    match apply_shard_map(&st, &db, &name, map, &headers).await {
+        Ok(map) => json(StatusCode::OK, json!(map)),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn db_cleanup(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    let map = db.shard_map();
+    let mut cleared = Vec::new();
+    for shard in 0..db.q {
+        if !map.replicas_of(shard).contains(&st.cluster.me) {
+            cleared.push(shard as usize);
+        }
+    }
+    match db.clear_shards(&cleared).await {
+        Ok(()) => json(StatusCode::OK, json!({"cleared": cleared})),
+        Err(error) => fail(error),
+    }
 }
 
 pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {

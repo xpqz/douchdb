@@ -596,6 +596,41 @@ impl Shard {
         Ok(())
     }
 
+    /// Drop all document data from this local shard, preserving only the
+    /// shard's revs-limit setting. Used after a shard has moved elsewhere and
+    /// anti-entropy has seeded the new replicas.
+    pub fn clear(&mut self) -> Result<()> {
+        let mut keys = Vec::new();
+        {
+            let mut iter = self.db.new_iter()?;
+            iter.reset();
+            iter.advance();
+            while let Some((key, _)) = iter.current() {
+                if key.as_ref() != b"z/revs_limit" {
+                    keys.push(key.to_vec());
+                }
+                if !iter.advance() {
+                    break;
+                }
+            }
+        }
+        let mut batch = WriteBatch::default();
+        for key in keys {
+            batch.delete(&key);
+        }
+        self.db.write(batch, true)?;
+        self.seq = 0;
+        self.docs = 0;
+        self.deleted = 0;
+        self.live = None;
+        self.pending.clear();
+        self.overlay.clear();
+        self.db
+            .put(b"z/revs_limit", &self.revs_limit.to_be_bytes())?;
+        self.db.flush()?;
+        Ok(())
+    }
+
     pub fn compact(&mut self) -> Result<()> {
         self.flush_pending()?;
         self.db.compact_range(&[], &[])?;
