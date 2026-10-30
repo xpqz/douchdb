@@ -558,7 +558,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
     if descending {
         names.reverse();
     }
-    if let Some(start) = key_param(&q, "startkey") {
+    if let Some(start) = key_param(&q, "startkey").or_else(|| key_param(&q, "start_key")) {
         names.retain(|name| {
             if descending {
                 name <= &start
@@ -567,7 +567,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
             }
         });
     }
-    if let Some(end) = key_param(&q, "endkey") {
+    if let Some(end) = key_param(&q, "endkey").or_else(|| key_param(&q, "end_key")) {
         names.retain(|name| {
             if descending {
                 name >= &end
@@ -1256,7 +1256,11 @@ pub async fn db_root(
                     }
                 }
             }
-            json(StatusCode::CREATED, json!({"ok": true}))
+            let mut response = json(StatusCode::CREATED, json!({"ok": true}));
+            if let Ok(value) = format!("/{name}").parse() {
+                response.headers_mut().insert(header::LOCATION, value);
+            }
+            response
         }
         Method::DELETE => {
             let local = st.drop_db(&name).await;
@@ -1325,11 +1329,24 @@ pub async fn db_root(
             if doc.get("_id").is_none() {
                 doc["_id"] = json!(crate::db::uuid());
             }
-            let id = doc
-                .get("_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let id = match doc.get("_id") {
+                Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                Some(Value::String(_)) => {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must not be empty",
+                    ))
+                }
+                Some(_) => {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must be a string",
+                    ))
+                }
+                None => unreachable!("id generated above"),
+            };
             if let Err(e) = db.validate_doc_id(&id) {
                 return fail(e);
             }
@@ -1710,10 +1727,16 @@ async fn view_request(
         Ok(crate::view::ViewQuery {
             key: view_json_param(q, "key")?,
             keys,
-            startkey: view_json_param(q, "startkey")?,
-            endkey: view_json_param(q, "endkey")?,
-            startkey_docid: q.get("startkey_docid").cloned(),
-            endkey_docid: q.get("endkey_docid").cloned(),
+            startkey: view_json_param(q, "startkey")?.or(view_json_param(q, "start_key")?),
+            endkey: view_json_param(q, "endkey")?.or(view_json_param(q, "end_key")?),
+            startkey_docid: q
+                .get("startkey_docid")
+                .or_else(|| q.get("start_key_docid"))
+                .cloned(),
+            endkey_docid: q
+                .get("endkey_docid")
+                .or_else(|| q.get("end_key_doc_id"))
+                .cloned(),
             descending: flag(q, "descending"),
             inclusive_end: q
                 .get("inclusive_end")
@@ -1864,10 +1887,15 @@ async fn bulk_docs(
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    let new_edits = value
-        .get("new_edits")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let new_edits = match value.get("new_edits") {
+        Some(Value::Bool(new_edits)) => *new_edits,
+        Some(_) => {
+            return fail(ApiError::bad_request(
+                "`new_edits` parameter must be a boolean.",
+            ))
+        }
+        None => true,
+    };
     let Some(docs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
@@ -1875,6 +1903,45 @@ async fn bulk_docs(
         if let Err(e) = validate_doc(doc) {
             return fail(e);
         }
+        if !db.partitioned {
+            match doc.get("_id") {
+                Some(Value::String(id))
+                    if id.starts_with('_')
+                        && !id.starts_with("_design/")
+                        && !id.starts_with("_local/") =>
+                {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Only reserved document ids may start with underscore.",
+                    ))
+                }
+                Some(Value::String(_)) | None => {}
+                Some(_) => {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must be a string",
+                    ))
+                }
+            }
+        }
+    }
+    if value
+        .get("all_or_nothing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let results: Vec<Value> = docs
+            .iter()
+            .map(|_| {
+                json!({
+                    "error": "not_implemented",
+                    "reason": "all_or_nothing is not supported"
+                })
+            })
+            .collect();
+        return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
     }
 
     if !st.cluster.is_clustered() {
@@ -2116,18 +2183,31 @@ async fn all_docs(
             return fail(error);
         }
     }
+    let query_limit = q.contains_key("limit");
+    let query_skip = q.contains_key("skip");
     let mut opts = AllDocsOpts {
         partition: partition.clone(),
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
         attachments: flag(q, "attachments"),
-        startkey: key_param(q, "startkey"),
-        endkey: key_param(q, "endkey"),
+        startkey: key_param(q, "startkey").or_else(|| key_param(q, "start_key")),
+        endkey: key_param(q, "endkey").or_else(|| key_param(q, "end_key")),
         descending: flag(q, "descending"),
         limit: num(q, "limit").unwrap_or(usize::MAX),
         skip: num(q, "skip").unwrap_or(0),
         ..Default::default()
     };
+    if let Some(key) = key_param(q, "key") {
+        opts.keys = Some(vec![key]);
+    } else if let Some(raw) = q.get("keys") {
+        if let Ok(Value::Array(keys)) = serde_json::from_str::<Value>(raw) {
+            opts.keys = Some(
+                keys.into_iter()
+                    .filter_map(|key| key.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+    }
     if *method == Method::POST {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
             if let Some(keys) = value.get("keys").and_then(Value::as_array) {
@@ -2143,6 +2223,16 @@ async fn all_docs(
                 .unwrap_or(false)
             {
                 opts.include_docs = true;
+            }
+            if !query_limit {
+                if let Some(limit) = value.get("limit").and_then(Value::as_u64) {
+                    opts.limit = limit as usize;
+                }
+            }
+            if !query_skip {
+                if let Some(skip) = value.get("skip").and_then(Value::as_u64) {
+                    opts.skip = skip as usize;
+                }
             }
         }
     }
@@ -2646,6 +2736,7 @@ pub(crate) fn doc_opts(q: &HashMap<String, String>) -> DocOpts {
         rev: q.get("rev").cloned(),
         revs: flag(q, "revs"),
         revs_info: flag(q, "revs_info"),
+        local_seq: flag(q, "local_seq"),
         conflicts: flag(q, "conflicts"),
         deleted_conflicts: flag(q, "deleted_conflicts"),
         attachments: flag(q, "attachments"),
@@ -2887,7 +2978,18 @@ async fn put_doc(
             } else {
                 StatusCode::ACCEPTED
             };
-            json(status, result)
+            let etag = result
+                .get("rev")
+                .or_else(|| result.get("_rev"))
+                .and_then(Value::as_str)
+                .map(|rev| format!("\"{rev}\""));
+            let mut response = json(status, result);
+            if let Some(etag) = etag {
+                if let Ok(value) = etag.parse() {
+                    response.headers_mut().insert(header::ETAG, value);
+                }
+            }
+            response
         }
         Err(e) => fail(e),
     }

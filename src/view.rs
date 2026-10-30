@@ -13,7 +13,7 @@ use icu_collator::Collator;
 use md5::{Digest, Md5};
 use rusty_leveldb::{LdbIterator, Options as LdbOptions, WriteBatch, DB as Ldb};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1288,39 +1288,42 @@ fn count_before_start(rows: &[&Row], query: &ViewQuery) -> usize {
 
 fn in_range(row: &Row, query: &ViewQuery) -> bool {
     if let Some(start) = &query.startkey {
-        let order = cmp_json(&row.key, start);
-        let after = match order {
-            Ordering::Greater => true,
-            Ordering::Less => false,
-            Ordering::Equal => match &query.startkey_docid {
-                Some(id) if query.descending => row.id <= *id,
-                Some(id) => row.id >= *id,
-                None => true,
-            },
-        };
-        if after == query.descending {
-            return false;
-        }
-    }
-    if let Some(end) = &query.endkey {
-        let order = cmp_json(&row.key, end);
-        let before = match order {
-            Ordering::Less => true,
-            Ordering::Greater => false,
+        match cmp_json(&row.key, start) {
+            Ordering::Less if !query.descending => return false,
+            Ordering::Greater if query.descending => return false,
             Ordering::Equal => {
-                if !query.inclusive_end {
-                    false
-                } else {
-                    match &query.endkey_docid {
-                        Some(id) if query.descending => row.id >= *id,
-                        Some(id) => row.id <= *id,
-                        None => true,
+                if let Some(id) = &query.startkey_docid {
+                    if query.descending {
+                        if row.id > *id {
+                            return false;
+                        }
+                    } else if row.id < *id {
+                        return false;
                     }
                 }
             }
-        };
-        if before == query.descending {
-            return false;
+            _ => {}
+        }
+    }
+    if let Some(end) = &query.endkey {
+        match cmp_json(&row.key, end) {
+            Ordering::Greater if !query.descending => return false,
+            Ordering::Less if query.descending => return false,
+            Ordering::Equal => {
+                if !query.inclusive_end {
+                    return false;
+                }
+                if let Some(id) = &query.endkey_docid {
+                    if query.descending {
+                        if row.id < *id {
+                            return false;
+                        }
+                    } else if row.id > *id {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     true
@@ -1537,8 +1540,10 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
             a.len().cmp(&b.len())
         }
         (Value::Object(a), Value::Object(b)) => {
-            let a = sorted_entries(a);
-            let b = sorted_entries(b);
+            // CouchDB object collation follows the stored member order, not
+            // lexicographic key order.
+            let a: Vec<_> = a.iter().collect();
+            let b: Vec<_> = b.iter().collect();
             for (left, right) in a.iter().zip(b.iter()) {
                 let order = left.0.cmp(right.0).then_with(|| cmp_json(left.1, right.1));
                 if order != Ordering::Equal {
@@ -1559,12 +1564,6 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
         Some(collator) => collator.compare(a, b),
         None => a.cmp(b),
     }
-}
-
-fn sorted_entries(map: &Map<String, Value>) -> Vec<(&String, &Value)> {
-    let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    entries
 }
 
 #[cfg(test)]

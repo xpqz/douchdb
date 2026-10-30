@@ -618,6 +618,14 @@ This runs unit tests plus integration tests that start real server processes
 and assert CouchDB wire shapes, revision ids, replication and cluster behaviour
 (including killing a node mid-replication).
 
+A focused set of Apache CouchDB's Elixir integration tests has been ported;
+see [docs/couchdb-test-ports.md](docs/couchdb-test-ports.md). Run just those
+with:
+
+```sh
+cargo test --test conformance couchdb_
+```
+
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:
 
