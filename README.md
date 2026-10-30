@@ -69,6 +69,9 @@ for local development: it has no TLS and uses demo credentials.
 
 ## Partitioned databases
 
+See [docs/partitioned-databases.md](docs/partitioned-databases.md) for the full
+guide, including cluster behavior, view rules and limits.
+
 Create a CouchDB-style partitioned database with:
 
 ```sh

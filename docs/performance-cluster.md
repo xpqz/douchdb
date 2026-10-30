@@ -387,7 +387,8 @@ collector dependency.
 
 ### Partitioned databases (#55)
 
-Databases created with `PUT /{db}?partitioned=true` carry
+See [partitioned-databases.md](partitioned-databases.md) for the user-facing
+guide. Databases created with `PUT /{db}?partitioned=true` carry
 `props.partitioned: true` and enforce CouchDB partition ids: everything before
 the first colon is the partition, everything after it is the document id.
 Design documents are exempt. Document ids without a colon, empty partitions and
