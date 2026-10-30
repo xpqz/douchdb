@@ -6,6 +6,7 @@ mod cluster;
 mod db;
 mod error;
 mod etf;
+mod fabric;
 mod replicate;
 mod rev;
 mod revtree;
