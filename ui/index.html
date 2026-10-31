@@ -31,6 +31,7 @@
         <div class="spacer"></div>
 
         <button class="ghost icon" @click="refreshAll" title="Refresh databases">↻</button>
+        <button class="ghost" @click="openCluster" data-testid="open-cluster">Cluster</button>
 
         <template v-if="user">
           <span class="user" data-testid="current-user">● {{ user }}</span>
@@ -93,6 +94,189 @@
                 <pre class="json">{{ pretty(membership) }}</pre>
               </div>
             </div>
+          </section>
+
+          <!-- cluster ---------------------------------------------------->
+          <section v-if="view === 'cluster'" class="page">
+            <div class="view-head">
+              <h1>Cluster</h1>
+              <nav class="tabs">
+                <button class="active">Overview</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button @click="loadCluster" data-testid="cluster-refresh">Refresh</button>
+              <button @click="discoverNow" data-testid="cluster-discover">Discover now</button>
+              <button class="primary" @click="syncNow" data-testid="cluster-sync">Sync now</button>
+              <button @click="toggleReplication" data-testid="cluster-pause">
+                {{ cluster && cluster.replication.paused ? 'Resume background' : 'Pause background' }}
+              </button>
+              <span class="spacer"></span>
+              <span class="muted" v-if="cluster">
+                {{ cluster.local.clustered ? 'clustered' : 'single node' }} ·
+                {{ cluster.membership.cluster_nodes.length }} nodes
+              </span>
+            </div>
+
+            <p v-if="clusterError" class="error" data-testid="cluster-error">{{ clusterError }}</p>
+            <p v-if="!cluster && !clusterError" class="muted">Loading cluster state…</p>
+
+            <template v-if="cluster">
+              <div class="cards">
+                <div class="card">
+                  <h3>Local node</h3>
+                  <p class="mono">{{ cluster.local.url }}</p>
+                  <p class="muted">
+                    index {{ cluster.local.index }} · q={{ cluster.local.q }} ·
+                    n={{ cluster.local.n }} · sync {{ cluster.local.sync_secs }}s
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Discovery</h3>
+                  <p>
+                    <span :class="['pill', cluster.discovery.running ? 'warn' : 'ok']">
+                      {{ cluster.discovery.running ? 'probing' : 'idle' }}
+                    </span>
+                    <span class="muted"> · last run {{ age(cluster.discovery.last_finished) }}</span>
+                  </p>
+                  <p class="muted" v-if="cluster.discovery.seeds.length">
+                    seeds: <span class="mono">{{ cluster.discovery.seeds.join(', ') }}</span>
+                  </p>
+                  <p class="error" v-if="cluster.discovery.error">{{ cluster.discovery.error }}</p>
+                </div>
+                <div class="card">
+                  <h3>Replication</h3>
+                  <p>
+                    <span :class="['pill', cluster.replication.running ? 'warn' : 'ok']">
+                      {{ cluster.replication.running ? 'running' : 'idle' }}
+                    </span>
+                    <span v-if="cluster.replication.paused" class="pill warn">paused</span>
+                    <span class="muted">
+                      · {{ cluster.replication.runs }} runs · {{ cluster.replication.docs }} docs
+                    </span>
+                  </p>
+                  <p class="muted">last run {{ age(cluster.replication.last_finished) }}</p>
+                  <p class="error" v-if="cluster.replication.error">{{ cluster.replication.error }}</p>
+                </div>
+              </div>
+
+              <h2>Nodes</h2>
+              <table class="grid" data-testid="cluster-nodes">
+                <thead>
+                  <tr>
+                    <th>node</th>
+                    <th>role</th>
+                    <th>membership</th>
+                    <th>reachable</th>
+                    <th>latency</th>
+                    <th>last seen</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="node in cluster.discovery.nodes" :key="node.url">
+                    <td class="mono">
+                      {{ node.url }}
+                      <span v-if="node.url === cluster.local.url" class="pill ok">local</span>
+                    </td>
+                    <td>
+                      <span v-if="node.seed" class="pill">seed</span>
+                      <span v-if="node.discovered" class="pill warn">discovered</span>
+                      <span v-if="!node.seed && !node.discovered" class="muted">member</span>
+                    </td>
+                    <td>{{ node.in_membership ? 'placement' : 'external' }}</td>
+                    <td>
+                      <span :class="['pill', node.reachable ? 'ok' : 'danger']">
+                        {{ node.reachable ? 'up' : 'down' }}
+                      </span>
+                    </td>
+                    <td class="muted">{{ node.reachable ? node.latency_ms + ' ms' : '—' }}</td>
+                    <td class="muted">{{ age(node.last_seen) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!cluster.discovery.nodes.length" class="empty">
+                No nodes probed yet. Use “Discover now”.
+              </p>
+
+              <h2>Replication</h2>
+              <table class="grid" data-testid="cluster-replication">
+                <thead>
+                  <tr>
+                    <th>database</th>
+                    <th>peer</th>
+                    <th>state</th>
+                    <th>docs</th>
+                    <th>last finished</th>
+                    <th>checkpoint</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="entry in cluster.replication.entries" :key="entry.db + entry.peer">
+                    <td class="mono">{{ entry.db }}</td>
+                    <td class="mono">{{ entry.peer }}</td>
+                    <td>
+                      <span :class="['pill', entry.state === 'ok' ? 'ok' : (entry.state === 'error' ? 'danger' : 'warn')]">
+                        {{ entry.state }}
+                      </span>
+                    </td>
+                    <td>{{ entry.docs }}</td>
+                    <td class="muted">{{ age(entry.finished) }}</td>
+                    <td class="mono muted small">{{ compact(entry.checkpoint) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!cluster.replication.entries.length" class="empty">
+                No replication passes yet. Background replication runs every
+                {{ cluster.local.sync_secs }}s; “Sync now” forces a pass.
+              </p>
+
+              <h2>Databases</h2>
+              <table class="grid" data-testid="cluster-databases">
+                <thead>
+                  <tr>
+                    <th>database</th>
+                    <th>q</th>
+                    <th>map version</th>
+                    <th>local shards</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="db in cluster.databases" :key="db.name">
+                    <td class="mono">{{ db.name }}</td>
+                    <td>{{ db.q }}</td>
+                    <td>{{ db.version }}</td>
+                    <td>{{ localShards(db) }} / {{ db.q }}</td>
+                    <td class="right">
+                      <button class="link" @click="rebalanceDb(db.name)">rebalance</button>
+                      <button class="link" @click="cleanupDb(db.name)">cleanup</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!cluster.databases.length" class="empty">No databases yet.</p>
+
+              <details v-for="db in cluster.databases" :key="'map-' + db.name" class="query-options">
+                <summary class="mono">{{ db.name }} shard map</summary>
+                <table class="grid">
+                  <thead><tr><th>shard</th><th>replicas</th><th>owner</th><th>docs</th><th>local</th></tr></thead>
+                  <tbody>
+                    <tr v-for="shard in db.shards" :key="shard.shard">
+                      <td>{{ shard.shard }}</td>
+                      <td class="mono">{{ shard.replicas.join(', ') }}</td>
+                      <td>{{ shard.owner }}</td>
+                      <td>{{ shard.docs }}</td>
+                      <td>
+                        <span :class="['pill', shard.local ? 'ok' : '']">
+                          {{ shard.local ? 'local' : 'remote' }}
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </details>
+            </template>
           </section>
 
           <!-- documents -------------------------------------------------->

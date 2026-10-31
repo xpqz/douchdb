@@ -393,6 +393,8 @@ step**. It provides:
 - document viewer/editor with JSON validation, revisions and delete;
 - `_changes` feed with history and live follow;
 - database info and `_compact`;
+- a cluster page with node discovery, shard maps, background replication
+  status, and controls to discover, sync, pause/resume and rebalance;
 - CouchDB `_session` sign-in when the server runs with `--admin`;
 - a toggleable **request log** that records every HTTP call with method, path,
   status, timing, request JSON and response JSON.
@@ -407,6 +409,7 @@ douchdb with `--cors-origins` for that origin (see below).
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
+        [--advertise URL] [--seed-nodes URL,URL]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--otel-endpoint URL]
@@ -422,7 +425,9 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--admin` | none | `user:pass` for Basic auth and `_session` |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
-| `--sync-secs` | `5` | Anti-entropy pull interval |
+| `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
+| `--advertise` | matching `--nodes` entry | URL shown for this node in cluster views |
+| `--seed-nodes` | empty | Extra peers probed for membership discovery |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
@@ -469,7 +474,13 @@ router; there is no coordinator role.
 - Anti-entropy runs every `--sync-secs`, pulling from every peer but only for
   the shards the node replicates. It uses the shared admin credentials when
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
-  internal calls.
+  internal calls. This is non-client-induced replication: it catches up after
+  missed writes, restarts and offline periods without a client request.
+- Cluster management is exposed at `/_node/_local/_cluster`,
+  `/_node/_local/_replication` and in the console. Discovery probes configured
+  nodes, `--seed-nodes` and the memberships they report, marking reachable
+  peers that are not in the placement list. Placement itself is still static.
+  See [docs/cluster-management.md](docs/cluster-management.md).
 - Design documents (`_design/...`) are replicated to every node, because each
   node needs them to evaluate views over its local shards.
 - Database creation and deletion are broadcast to all configured nodes; design
@@ -501,10 +512,11 @@ broadcast) and then write normally.
 
 ### Cluster limits
 
-- **Static membership.** There is no gossip or automatic join. To change the
+- **Static membership.** There is no gossip or automatic join. Discovery
+  reports peers and drift, but it does not change placement. To change the
   node list, restart every node with the new list. Rendezvous hashing and
-  anti-entropy copy data to new replicas, but old copies on nodes that lost a
-  shard are not deleted.
+  anti-entropy copy data to new replicas; use `rebalance`/`cleanup` to remove
+  old copies.
 - **AP, not linearizable.** Concurrent writes converge through CouchDB revision
   trees; there is no Raft and no global ordering beyond version vectors.
 - **Best-effort database lifecycle.** A node that is offline during a database
@@ -515,14 +527,18 @@ broadcast) and then write normally.
   resumption is still exact, but the vector is coarser than CouchDB's.
 - **No inter-node TLS or service accounts.** Nodes trust each other on the
   network; use a private network or a proxy if that matters.
-- **No rebalancing tool.** Membership changes are a restart plus anti-entropy,
-  not an online shard move.
+- **Rebalance is not consensus.** `POST /_node/_local/_dbs/{db}/rebalance`
+  computes and broadcasts a balanced map and waits for replica catch-up, but
+  it is still an operator action built on static membership, not an online
+  membership protocol.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,
 `cluster_survives_killing_a_node_mid_replication`,
-`authenticated_cluster_anti_entropy_uses_node_credentials` and
-`cluster_forwards_session_cookies_to_peers`.
+`authenticated_cluster_anti_entropy_uses_node_credentials`,
+`cluster_forwards_session_cookies_to_peers`,
+`cluster_management_reports_discovery_and_runs_replication` and
+`discovery_follows_seed_membership`.
 
 ## API surface
 

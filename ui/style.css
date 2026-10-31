@@ -418,6 +418,16 @@ textarea:focus {
   color: var(--bad);
 }
 
+.pill.ok {
+  background: var(--line-soft);
+  color: var(--ok);
+}
+
+.pill.warn {
+  background: var(--line-soft);
+  color: var(--warn);
+}
+
 /* ---------------------------------------------------------------- grid */
 
 .grid {
