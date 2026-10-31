@@ -1144,7 +1144,7 @@ async fn http_conditional_copy_head_and_request_id() {
         .req_with(
             Method::PUT,
             "/http/src",
-            Some(json!({"v": 2, "_rev": &rev})),
+            Some(json!({"v": 2})),
             &[(
                 "if-match",
                 "\"1-deadbeefdeadbeefdeadbeefdeadbeef\"".to_string(),
@@ -4778,4 +4778,128 @@ async fn pouchdb_mapreduce_conflicts_and_uuids_ports() {
     let unique: std::collections::HashSet<&str> =
         uuids.iter().map(|uuid| uuid.as_str().unwrap()).collect();
     assert_eq!(unique.len(), 4);
+}
+
+#[tokio::test]
+async fn pouchdb_reserved_ids_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchreserved").await;
+    let (status, _) = s
+        .post(
+            "/pouchreserved/_bulk_docs",
+            json!({"docs": [
+                {"_id": "constructor"},
+                {"_id": "toString"},
+                {"_id": "valueOf"},
+                {"_id": "_design/all", "views": {"all": {
+                    "map": "function(doc) { emit(doc._id); }"
+                }}}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/pouchreserved/_all_docs?key=%22constructor%22")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    let (status, body) = s
+        .get("/pouchreserved/_all_docs?keys=%5B%22constructor%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    let (status, body) = s.get("/pouchreserved/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+
+    let (status, body) = s
+        .get("/pouchreserved/_design/all/_view/all?key=%22constructor%22")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    let (status, body) = s
+        .get("/pouchreserved/_design/all/_view/all?keys=%5B%22constructor%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pouchdb_get_and_error_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchget").await;
+    let (status, created) = s.put("/pouchget/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/pouchget/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
+    assert_eq!(body["reason"], "missing");
+
+    let rev = created["rev"].as_str().unwrap().to_string();
+    let (status, _) = s.delete(&format!("/pouchget/doc?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s.get("/pouchget/doc").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["reason"], "deleted");
+    let (status, body) = s.get(&format!("/pouchget/doc?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], rev);
+
+    let (status, created) = s.put("/pouchget/doc2", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let bad_rev = format!("{}broken", created["rev"].as_str().unwrap());
+    let (status, _) = s
+        .put("/pouchget/doc2", json!({"_rev": bad_rev, "v": 2}))
+        .await;
+    assert!(
+        status == StatusCode::CONFLICT || status == StatusCode::BAD_REQUEST,
+        "invalid revision must be rejected: {status}"
+    );
+}
+
+#[tokio::test]
+async fn couchdb_conflict_request_ports() {
+    let s = Server::start(false);
+    s.fresh_db("couchconflict").await;
+    let (status, created) = s.put("/couchconflict/doc-1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rev = created["rev"].as_str().unwrap().to_string();
+
+    let (status, body) = s
+        .put(
+            &format!("/couchconflict/doc-1?rev=1-foobar"),
+            json!({"_rev": rev, "a": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["reason"]
+        .as_str()
+        .unwrap()
+        .contains("body and query string"));
+
+    let (status, _, body) = s
+        .req_headers(
+            Method::PUT,
+            "/couchconflict/doc-1",
+            Some(json!({"_rev": rev, "a": 2})),
+            &[("if-match", "1-foobar".to_string())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Document rev and etag"));
+
+    // Same revision twice: the second write conflicts.
+    let (status, _) = s
+        .put("/couchconflict/doc-1", json!({"_rev": rev, "a": 2}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s
+        .put("/couchconflict/doc-1", json!({"_rev": rev, "a": 3}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "conflict");
 }

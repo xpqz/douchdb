@@ -3136,6 +3136,28 @@ async fn put_doc(
     if let Err(error) = db.validate_doc_id(docid) {
         return fail(error);
     }
+    let body_rev = doc.get("_rev").and_then(Value::as_str).map(str::to_string);
+    if let Some(query_rev) = q.get("rev") {
+        match &body_rev {
+            Some(body_rev) if body_rev != query_rev => {
+                return fail(ApiError::bad_request(
+                    "Document rev from request body and query string have different values",
+                ))
+            }
+            None => doc["_rev"] = json!(query_rev),
+            _ => {}
+        }
+    }
+    if headers.get(header::IF_MATCH).is_some() {
+        if let Some(body_rev) = &body_rev {
+            let etag = format!("\"{body_rev}\"");
+            if !etag_matches(headers, header::IF_MATCH, &etag) {
+                return fail(ApiError::bad_request(
+                    "Document rev and etag have different values",
+                ));
+            }
+        }
+    }
     let new_edits = !q.contains_key("new_edits") || flag(q, "new_edits");
     if !new_edits && doc.get("_rev").is_none() {
         return fail(ApiError::bad_request("Document is missing _rev"));

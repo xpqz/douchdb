@@ -24,6 +24,9 @@ one-for-one.
 | PouchDB `test.local_docs.js`, `test.revs_diff.js`, `test.bulk_get.js` | `pouchdb_local_docs_revs_diff_and_bulk_get_ports` |
 | PouchDB `test.changes.js`, `test.all_docs.js` | `pouchdb_changes_and_all_docs_ports` |
 | PouchDB `test.mapreduce.js`, `test.conflicts.js`, `test.uuids.js` | `pouchdb_mapreduce_conflicts_and_uuids_ports` |
+| PouchDB `test.reserved.js` | `pouchdb_reserved_ids_ports` |
+| PouchDB `test.basics.js`, `test.get.js` error cases | `pouchdb_get_and_error_ports` |
+| CouchDB `conflicts_test.exs` header/rev cases | `couchdb_conflict_request_ports` |
 
 The set covers:
 
@@ -57,6 +60,8 @@ These ports exposed and fixed:
 - `_bulk_docs` accepted invalid `new_edits`, reserved IDs and `all_or_nothing`.
 - Descending view ranges dropped rows whose start key equalled a supplied
   `startkey_docid`.
+- `?rev=` was not applied to the document body, and a body/`If-Match`
+  revision mismatch was not rejected.
 - Object view keys were collated by sorted member names rather than CouchDB's
   stored member order.
 
