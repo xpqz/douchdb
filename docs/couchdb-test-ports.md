@@ -19,6 +19,11 @@ one-for-one.
 | `reduce_builtin_test.exs` | `couchdb_builtin_reduce_ports` |
 | `view_include_docs_test.exs`, `utf8_test.exs` | `couchdb_view_include_docs_and_utf8_ports` |
 | `view_collation_test.exs` | `couchdb_view_collation_ports` |
+| `search_test.exs` | `couchdb_search_ports` |
+| `partition_search_test.exs` | `couchdb_partition_search_ports` |
+| PouchDB `test.local_docs.js`, `test.revs_diff.js`, `test.bulk_get.js` | `pouchdb_local_docs_revs_diff_and_bulk_get_ports` |
+| PouchDB `test.changes.js`, `test.all_docs.js` | `pouchdb_changes_and_all_docs_ports` |
+| PouchDB `test.mapreduce.js`, `test.conflicts.js`, `test.uuids.js` | `pouchdb_mapreduce_conflicts_and_uuids_ports` |
 
 The set covers:
 
@@ -33,6 +38,9 @@ The set covers:
 - built-in `_count`, `_sum`, `_stats`, `_approx_count_distinct`
 - view `include_docs`, UTF-8 keys, full CouchDB collation order
 - object collation by stored member order
+- Tantivy search indexes, field queries, drilldown, counts, ranges, groups,
+  bookmarks and partitioned search
+- PouchDB local-document, revs-diff, bulk-get, changes and all-docs semantics
 
 ## Gaps found and fixed
 
@@ -60,6 +68,8 @@ These ports exposed and fixed:
 - JWT, proxy auth, users DB and security-object administration.
 - Resharding, cluster setup/config, compaction/disk-monitor internals.
 - JavaScript changes filters and view sandboxing limits.
+- Search highlighting, custom sorting, `_index_info`, search timeouts and
+  cluster-wide search fan-out.
 - CouchDB's attachment, local-doc and replication suites; douchdb has separate
   conformance coverage for replication and local documents.
 

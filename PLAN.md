@@ -390,6 +390,12 @@ Above ~6k means something was built that nobody asked for.
   `_all_docs` and views filter at the shard, with ranges and keys clamped to the
   partition prefix. Design docs are partitioned by default and can opt into
   global views with `options.partitioned=false`.
+* **Search.** Design-document `indexes` run through QuickJS and build
+  Tantivy-backed indexes under `_search_indexes/`. The API supports field
+  queries, `include_docs`, drilldown, counts, ranges, grouping, bookmarks and
+  partitioned search. Indexes rebuild when the update sequence or definition
+  changes. Highlighting, custom sorting, `_index_info` and cluster-wide search
+  fan-out remain future work.
 * **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in

@@ -10,6 +10,7 @@ mod fabric;
 mod replicate;
 mod rev;
 mod revtree;
+mod search;
 mod store;
 mod telemetry;
 mod ui;
