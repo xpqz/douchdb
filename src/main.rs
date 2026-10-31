@@ -3,7 +3,9 @@
 mod api;
 mod auth;
 mod cluster;
+mod cluster_state;
 mod db;
+mod discovery;
 mod error;
 mod etf;
 mod fabric;
@@ -36,6 +38,8 @@ struct Args {
     admin: Option<(String, String)>,
     nodes: Vec<String>,
     me: usize,
+    advertise: String,
+    seed_nodes: Vec<String>,
     sync_secs: u64,
     cors_origins: Vec<String>,
     view_timeout_ms: u64,
@@ -55,6 +59,8 @@ fn parse_args() -> Args {
         admin: None,
         nodes: Vec::new(),
         me: 0,
+        advertise: String::new(),
+        seed_nodes: Vec::new(),
         sync_secs: 5,
         cors_origins: Vec::new(),
         view_timeout_ms: 5000,
@@ -90,6 +96,17 @@ fn parse_args() -> Args {
                     .collect()
             }
             "--me" => args.me = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--advertise" => args.advertise = it.next().unwrap_or_default(),
+            "--seed-nodes" => {
+                args.seed_nodes = it
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|node| !node.is_empty())
+                    .map(|node| node.trim_end_matches('/').to_string())
+                    .collect()
+            }
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
             "--view-timeout-ms" => {
                 args.view_timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(5000)
@@ -116,6 +133,7 @@ fn parse_args() -> Args {
                 println!(
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
+                     \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -155,6 +173,13 @@ async fn main() -> anyhow::Result<()> {
     }
     std::fs::create_dir_all(&args.data)?;
 
+    let advertise = if !args.advertise.trim().is_empty() {
+        args.advertise.trim().trim_end_matches('/').to_string()
+    } else if let Some(url) = args.nodes.get(args.me) {
+        url.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", args.listen)
+    };
     let config = Config {
         q: args.q.max(1),
         n: args.n.max(1),
@@ -163,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
         nodes: args.nodes.clone(),
         me: args.me,
         sync_secs: args.sync_secs,
+        seeds: args.seed_nodes.clone(),
+        advertise: advertise.clone(),
         cors_origins: args.cors_origins.clone(),
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
@@ -186,11 +213,15 @@ async fn main() -> anyhow::Result<()> {
             .timeout(Duration::from_secs(60))
             .build()?,
         db_updates: api::DbUpdates::default(),
+        cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
     });
 
     if state.cluster.is_clustered() {
-        spawn_anti_entropy(state.clone());
+        replicate::spawn_anti_entropy(state.clone());
         tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
+    }
+    if state.cluster.is_clustered() || !state.config.seeds.is_empty() {
+        discovery::spawn(state.clone());
     }
 
     let app = Router::new()
@@ -202,6 +233,24 @@ async fn main() -> anyhow::Result<()> {
         .route("/_uuids", get(api::uuids))
         .route("/_membership", get(api::membership))
         .route("/_node/_local/_dbs", get(api::dbs_metadata))
+        .route("/_node/_local/_cluster", get(api::cluster_status))
+        .route(
+            "/_node/_local/_cluster/discover",
+            axum::routing::post(api::cluster_discover),
+        )
+        .route("/_node/_local/_replication", get(api::replication_status))
+        .route(
+            "/_node/_local/_replication/run",
+            axum::routing::post(api::replication_run),
+        )
+        .route(
+            "/_node/_local/_replication/pause",
+            axum::routing::post(api::replication_pause),
+        )
+        .route(
+            "/_node/_local/_replication/resume",
+            axum::routing::post(api::replication_resume),
+        )
         .route(
             "/_node/_local/_dbs/{db}",
             get(api::db_metadata).put(api::db_metadata_put),
@@ -256,48 +305,4 @@ async fn main() -> anyhow::Result<()> {
         telemetry.shutdown();
     }
     Ok(())
-}
-
-/// Pull from every peer on a timer. The same `_changes`/`_bulk_get` protocol
-/// clients use, so the replication path is exercised constantly.
-fn spawn_anti_entropy(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(state.config.sync_secs.max(1));
-        loop {
-            tokio::time::sleep(interval).await;
-            let peers: Vec<String> = state.cluster.peers().cloned().collect();
-            if peers.is_empty() {
-                continue;
-            }
-            for name in state.db_names().await {
-                let Ok(db) = state.db(&name).await else {
-                    continue;
-                };
-                crate::fabric::reconcile_shard_map(&state, &db).await;
-                let pulls = peers.iter().map(|peer| {
-                    let db = db.clone();
-                    let peer = peer.clone();
-                    let state = state.clone();
-                    async move {
-                        let result = replicate::pull(
-                            &db,
-                            &peer,
-                            &state.client,
-                            &state.cluster,
-                            state.auth.as_ref(),
-                        )
-                        .await;
-                        (peer, result)
-                    }
-                });
-                for (peer, result) in futures::future::join_all(pulls).await {
-                    match result {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!("replicated {n} docs of {name} from {peer}"),
-                        Err(e) => tracing::warn!("replication {name} from {peer} failed: {e}"),
-                    }
-                }
-            }
-        }
-    });
 }

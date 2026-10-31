@@ -1,11 +1,21 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
+use crate::api::AppState;
 use crate::auth::Auth;
 use crate::cluster::Cluster;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
+use futures::future::join_all;
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone, Debug, Default)]
+pub struct PullOutcome {
+    pub docs: usize,
+    pub checkpoint: Option<Value>,
+}
 
 /// Copy everything the peer has that this node replicates, then checkpoint.
 ///
@@ -19,7 +29,7 @@ pub async fn pull(
     client: &reqwest::Client,
     cluster: &Cluster,
     auth: Option<&Auth>,
-) -> Result<usize> {
+) -> Result<PullOutcome> {
     const BATCH: usize = 1000;
 
     // Include the shard map in the checkpoint id. When placement changes, the
@@ -123,5 +133,92 @@ pub async fn pull(
             .map_err(|e| anyhow!(e.to_string()))?;
         since = last;
     }
-    Ok(total)
+    Ok(PullOutcome {
+        docs: total,
+        checkpoint: Some(since),
+    })
+}
+
+/// Run one anti-entropy pass over every database and peer. Returns false when a
+/// pass is already in flight.
+pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
+    if !state.cluster_state.begin_replication() {
+        return false;
+    }
+    let peers: Vec<String> = state.cluster.peers().cloned().collect();
+    let mut names = state.db_names().await;
+    names.sort();
+    if let Some(only) = only_db {
+        names.retain(|name| name == &only);
+    }
+
+    let mut error: Option<String> = None;
+    for name in names {
+        let Ok(db) = state.db(&name).await else {
+            continue;
+        };
+        crate::fabric::reconcile_shard_map(&state, &db).await;
+        let pulls = peers.iter().map(|peer| {
+            let db = db.clone();
+            let peer = peer.clone();
+            let state = state.clone();
+            let name = name.clone();
+            async move {
+                state.cluster_state.replication_started(&name, &peer);
+                let result = pull(
+                    &db,
+                    &peer,
+                    &state.client,
+                    &state.cluster,
+                    state.auth.as_ref(),
+                )
+                .await;
+                match result {
+                    Ok(outcome) => {
+                        state.cluster_state.replication_finished(
+                            &name,
+                            &peer,
+                            outcome.docs as u64,
+                            outcome.checkpoint,
+                        );
+                        Ok(outcome.docs)
+                    }
+                    Err(cause) => {
+                        state
+                            .cluster_state
+                            .replication_failed(&name, &peer, cause.to_string());
+                        Err((peer, cause.to_string()))
+                    }
+                }
+            }
+        });
+        for result in join_all(pulls).await {
+            match result {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("replicated {n} docs of {name}"),
+                Err((peer, cause)) => {
+                    tracing::warn!("replication {name} from {peer} failed: {cause}");
+                    if error.is_none() {
+                        error = Some(cause);
+                    }
+                }
+            }
+        }
+    }
+    state.cluster_state.finish_replication(error);
+    true
+}
+
+/// Pull from every peer on a timer. This is the non-client-induced replication
+/// path: a node catches up from its peers even when no client reads or writes.
+pub fn spawn_anti_entropy(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(state.config.sync_secs.max(1));
+        loop {
+            if !state.cluster_state.replication_paused() {
+                sync_once(state.clone(), None).await;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 }

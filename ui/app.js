@@ -86,6 +86,8 @@
       const serverInfo = ref(null);
       const membership = ref(null);
       const dbInfo = ref(null);
+      const cluster = ref(null);
+      const clusterError = ref('');
 
       const viewDefs = ref([]);
       const selectedDesign = ref(null);
@@ -245,6 +247,8 @@
         currentDb.value = null;
         serverInfo.value = null;
         membership.value = null;
+        cluster.value = null;
+        clusterError.value = '';
         view.value = 'home';
         refreshAll();
       }
@@ -284,7 +288,100 @@
         await refreshSession();
         if (user.value) await loadDbs();
         await loadServerInfo();
-        if (currentDb.value && view.value !== 'doc') applyRoute();
+        if (view.value === 'cluster') await loadCluster();
+        else if (currentDb.value && view.value !== 'doc') applyRoute();
+      }
+
+      // ----- cluster management -----------------------------------------
+
+      function age(ms) {
+        if (!ms) return '—';
+        const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+        if (seconds < 60) return `${seconds}s ago`;
+        const minutes = Math.round(seconds / 60);
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.round(minutes / 60);
+        if (hours < 48) return `${hours}h ago`;
+        return `${Math.round(hours / 24)}d ago`;
+      }
+
+      async function loadCluster() {
+        try {
+          cluster.value = await call('GET', '/_node/_local/_cluster');
+          clusterError.value = '';
+        } catch (error) {
+          clusterError.value = error.data
+            ? pretty(error.data)
+            : error.message || String(error);
+          if (error.status !== 401) handleError(error, 'Cannot read cluster state');
+        }
+      }
+
+      function openCluster() {
+        if (location.hash === '#/cluster') applyRoute();
+        else location.hash = '#/cluster';
+      }
+
+      async function discoverNow() {
+        try {
+          await call('POST', '/_node/_local/_cluster/discover');
+          showToast('Discovery started');
+          setTimeout(loadCluster, 900);
+        } catch (error) {
+          handleError(error, 'Cannot start discovery');
+        }
+      }
+
+      async function syncNow() {
+        try {
+          await call('POST', '/_node/_local/_replication/run');
+          showToast('Replication started');
+          setTimeout(loadCluster, 1500);
+        } catch (error) {
+          handleError(error, 'Cannot start replication');
+        }
+      }
+
+      async function toggleReplication() {
+        const paused = Boolean(cluster.value && cluster.value.replication.paused);
+        try {
+          await call(
+            'POST',
+            paused
+              ? '/_node/_local/_replication/resume'
+              : '/_node/_local/_replication/pause'
+          );
+          showToast(paused ? 'Background replication resumed' : 'Background replication paused');
+          await loadCluster();
+        } catch (error) {
+          handleError(error, 'Cannot change replication state');
+        }
+      }
+
+      async function rebalanceDb(name) {
+        if (!confirm(`Rebalance ${name} to the balanced shard map?`)) return;
+        try {
+          await call('POST', `/_node/_local/_dbs/${enc(name)}/rebalance`);
+          showToast(`Rebalance started for ${name}`);
+          setTimeout(loadCluster, 1500);
+        } catch (error) {
+          handleError(error, 'Cannot rebalance database');
+        }
+      }
+
+      async function cleanupDb(name) {
+        if (!confirm(`Remove shards of ${name} this node no longer replicates?`)) return;
+        try {
+          await call('POST', `/_node/_local/_dbs/${enc(name)}/cleanup`);
+          showToast(`Cleaned up ${name}`);
+          setTimeout(loadCluster, 600);
+        } catch (error) {
+          handleError(error, 'Cannot clean up database');
+        }
+      }
+
+      function localShards(db) {
+        return (db.shards || []).filter((shard) => shard.local).length;
       }
 
       function dbHash(name, sub) {
@@ -304,6 +401,11 @@
         const raw = location.hash.replace(/^#\/?/, '');
         if (!raw) {
           view.value = 'home';
+          return;
+        }
+        if (raw === 'cluster') {
+          view.value = 'cluster';
+          loadCluster();
           return;
         }
         const parts = raw.split('/');
@@ -1015,6 +1117,9 @@
             loadChanges(changesLastSeq.value, 100);
           }
         }, 2000);
+        setInterval(() => {
+          if (view.value === 'cluster') loadCluster();
+        }, 5000);
       });
 
       return {
@@ -1044,6 +1149,8 @@
         serverInfo,
         membership,
         dbInfo,
+        cluster,
+        clusterError,
         toast,
         toastKind,
         pretty,
@@ -1051,6 +1158,15 @@
         refreshAll,
         loadDbs,
         loadServerInfo,
+        openCluster,
+        loadCluster,
+        discoverNow,
+        syncNow,
+        toggleReplication,
+        rebalanceDb,
+        cleanupDb,
+        localShards,
+        age,
         openDb,
         createDb,
         deleteDb,

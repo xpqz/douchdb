@@ -76,6 +76,7 @@ pub struct AppState {
     pub cluster: Cluster,
     pub client: reqwest::Client,
     pub db_updates: DbUpdates,
+    pub cluster_state: Arc<crate::cluster_state::ClusterState>,
 }
 
 #[derive(Clone)]
@@ -91,6 +92,10 @@ pub struct Config {
     #[allow(dead_code)]
     pub me: usize,
     pub sync_secs: u64,
+    /// Additional peers probed for membership discovery.
+    pub seeds: Vec<String>,
+    /// The URL this node advertises in cluster management views.
+    pub advertise: String,
     /// Empty disables CORS. `*` allows any origin (echoed back so credentials
     /// work); entries may be exact origins or `https://*.example.com`.
     pub cors_origins: Vec<String>,
@@ -721,7 +726,7 @@ pub async fn dbs_info(
 }
 
 pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
+    if !st.authorized(&headers) && !st.cluster.is_internal(&headers) {
         return unauthorized();
     }
     let nodes: Vec<String> = if st.cluster.nodes.is_empty() {
@@ -732,6 +737,136 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
     json(
         StatusCode::OK,
         json!({ "all_nodes": nodes, "cluster_nodes": nodes }),
+    )
+}
+
+/// Cluster overview for the management console: membership, discovery probes,
+/// per-database shard maps and the background replicator snapshot.
+pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let membership: Vec<String> = if st.cluster.nodes.is_empty() {
+        vec!["nonode@localhost".to_string()]
+    } else {
+        st.cluster.nodes.clone()
+    };
+    let mut databases = Vec::new();
+    for name in st.db_names().await {
+        let Ok(db) = st.db(&name).await else {
+            continue;
+        };
+        let map = db.shard_map();
+        let counts = db.shard_counts().await.unwrap_or_default();
+        let shards: Vec<Value> = (0..map.q)
+            .map(|shard| {
+                let replicas = map.replicas_of(shard).to_vec();
+                let (docs, deleted) = counts.get(shard as usize).copied().unwrap_or((0, 0));
+                json!({
+                    "shard": shard,
+                    "replicas": replicas,
+                    "owner": map.owner_of(shard),
+                    "local": replicas.contains(&st.cluster.me),
+                    "docs": docs,
+                    "deleted": deleted,
+                })
+            })
+            .collect();
+        databases.push(json!({
+            "name": name,
+            "q": map.q,
+            "node_count": map.node_count,
+            "version": map.version,
+            "shards": shards,
+        }));
+    }
+    json(
+        StatusCode::OK,
+        json!({
+            "local": {
+                "url": st.config.advertise,
+                "index": st.cluster.me,
+                "clustered": st.cluster.is_clustered(),
+                "q": st.config.q,
+                "n": st.cluster.replication_factor(),
+                "sync_secs": st.config.sync_secs,
+            },
+            "membership": {
+                "all_nodes": membership.clone(),
+                "cluster_nodes": membership,
+            },
+            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+            "replication": st.cluster_state.replication_json(),
+            "databases": databases,
+        }),
+    )
+}
+
+/// Probe peers and reported memberships now. Returns the previous snapshot and
+/// starts the pass in the background so a dead seed cannot block the request.
+pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    if !st.cluster_state.discovery_running() {
+        tokio::spawn(crate::discovery::discover_once(st.clone()));
+    }
+    json(
+        StatusCode::ACCEPTED,
+        json!({
+            "ok": true,
+            "running": st.cluster_state.discovery_running(),
+            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+        }),
+    )
+}
+
+pub async fn replication_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    json(StatusCode::OK, st.cluster_state.replication_json())
+}
+
+/// Trigger one anti-entropy pass. Background replication already runs on its
+/// timer; this is the "sync now" control for operators.
+pub async fn replication_run(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    let db = query(&uri).get("db").cloned();
+    if !st.cluster_state.replication_running() {
+        tokio::spawn(crate::replicate::sync_once(st.clone(), db));
+    }
+    json(
+        StatusCode::ACCEPTED,
+        json!({"ok": true, "running": true, "replication": st.cluster_state.replication_json()}),
+    )
+}
+
+pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    st.cluster_state.set_replication_paused(true);
+    json(
+        StatusCode::OK,
+        json!({"ok": true, "replication": st.cluster_state.replication_json()}),
+    )
+}
+
+pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !st.authorized(&headers) {
+        return unauthorized();
+    }
+    st.cluster_state.set_replication_paused(false);
+    json(
+        StatusCode::OK,
+        json!({"ok": true, "replication": st.cluster_state.replication_json()}),
     )
 }
 

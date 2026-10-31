@@ -473,6 +473,7 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     let html = response.text().await.unwrap();
     assert!(html.contains("id=\"app\""), "Vue mount point missing");
     assert!(html.contains("vendor/vue.global.prod.js"));
+    assert!(html.contains("data-testid=\"open-cluster\""));
 
     let response = s
         .client
@@ -489,6 +490,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
         .starts_with("text/javascript"));
     let app = response.text().await.unwrap();
     assert!(app.contains("createApp"), "not a Vue application");
+    assert!(app.contains("/_node/_local/_cluster"));
+    assert!(app.contains("/_node/_local/_replication"));
     // The console may only use the public CouchDB API, never a private route.
     assert!(!app.contains("/api/"), "console uses a private API path");
 
@@ -5309,4 +5312,247 @@ async fn search_fans_out_across_cluster_shards() {
         .map(|row| row["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["fruit2", "fruit3"]);
+}
+
+#[tokio::test]
+async fn cluster_management_reports_discovery_and_runs_replication() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("cadmin").await;
+    }
+    let docs: Vec<Value> = (0..8)
+        .map(|i| json!({"_id": format!("m{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/cadmin/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Discovery probes the configured peers and follows their membership
+    // lists. Wait for the startup passes to see both nodes.
+    for node in &nodes {
+        let mut snapshot = Value::Null;
+        for _ in 0..80 {
+            let (status, body) = node.get("/_node/_local/_cluster").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let reachable = body["discovery"]["nodes"]
+                .as_array()
+                .map(|nodes| {
+                    nodes.len() >= 2
+                        && nodes.iter().all(|node| node["reachable"] == true)
+                        && nodes
+                            .iter()
+                            .all(|node| node["membership"]["all_nodes"].as_array().is_some())
+                })
+                .unwrap_or(false);
+            if reachable {
+                snapshot = body;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!snapshot.is_null(), "discovery via {}", node.base);
+        assert_eq!(
+            snapshot["membership"]["cluster_nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(snapshot["local"]["clustered"], true);
+        assert!(snapshot["databases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|db| db["name"] == "cadmin"));
+    }
+
+    // Let the startup pass settle before testing the explicit controls.
+    for _ in 0..100 {
+        let (status, body) = nodes[1].get("/_node/_local/_replication").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["running"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Background replication can be paused and resumed from the interface.
+    let (status, body) = nodes[1]
+        .post("/_node/_local/_replication/pause", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replication"]["paused"], true);
+    let (status, body) = nodes[1]
+        .post("/_node/_local/_replication/resume", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replication"]["paused"], false);
+
+    // "Sync now" runs the same background anti-entropy pass on demand.
+    let (status, body) = nodes[1]
+        .post("/_node/_local/_replication/run", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let mut entry = Value::Null;
+    for _ in 0..100 {
+        let (status, body) = nodes[1].get("/_node/_local/_replication").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["running"] == false {
+            if let Some(found) = body["entries"]
+                .as_array()
+                .and_then(|entries| entries.iter().find(|entry| entry["db"] == "cadmin"))
+            {
+                entry = found.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!entry.is_null(), "replication did not run");
+    assert_eq!(entry["state"], "ok", "{entry}");
+    assert!(!entry["checkpoint"].is_null(), "{entry}");
+
+    let (status, body) = nodes[0].get("/_node/_local/_cluster").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["replication"]["runs"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test]
+async fn discovery_follows_seed_membership() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    let seed = nodes[0].base.clone();
+    let other = nodes[1].base.clone();
+
+    let port = free_port();
+    let self_url = format!("http://127.0.0.1:{port}");
+    let extra = vec![
+        "--nodes".to_string(),
+        self_url.clone(),
+        "--me".to_string(),
+        "0".to_string(),
+        "--seed-nodes".to_string(),
+        seed.clone(),
+        "--cluster-secret".to_string(),
+        "test-cluster-secret".to_string(),
+    ];
+    let probe = Server::spawn_on(port, &extra, false, 0).expect("probe server");
+
+    let mut body = Value::Null;
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let (status, current) = probe.get("/_node/_local/_cluster").await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        last = current.clone();
+        let found = current["discovery"]["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes.len() >= 3
+                    && nodes
+                        .iter()
+                        .any(|node| node["url"] == seed && node["seed"] == true)
+                    && nodes
+                        .iter()
+                        .any(|node| node["url"] == other && node["discovered"] == true)
+            })
+            .unwrap_or(false);
+        if found {
+            body = current;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!body.is_null(), "seed discovery did not complete: {last}");
+    assert_eq!(body["local"]["clustered"], false);
+    let nodes = body["discovery"]["nodes"].as_array().unwrap();
+    assert!(nodes
+        .iter()
+        .any(|node| node["url"] == self_url && node["in_membership"] == true));
+    assert!(nodes
+        .iter()
+        .any(|node| node["url"] == seed && node["seed"] == true && node["in_membership"] == false));
+    assert!(nodes.iter().any(|node| node["url"] == other
+        && node["discovered"] == true
+        && node["membership"]["all_nodes"].as_array().unwrap().len() == 2));
+}
+
+async fn local_shard_docs(node: &Server, db: &str, shard: u32) -> u64 {
+    let (_, body) = node.get(&format!("/_node/_local/_dbs/{db}/shards")).await;
+    body["shards"]
+        .as_array()
+        .and_then(|shards| shards.iter().find(|row| row["shard"] == shard))
+        .and_then(|row| row["docs"].as_u64())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn background_replication_repairs_a_missed_shard_without_a_client() {
+    use md5::{Digest, Md5};
+
+    let nodes = start_cluster_with(2, "1", 1);
+    for node in &nodes {
+        node.fresh_db("rfan").await;
+    }
+    let q = 4u32;
+    let (_, map) = nodes[0].get("/_node/_local/_dbs/rfan").await;
+    let target = (0..q)
+        .find(|shard| map["replicas"][*shard as usize] == json!([1]))
+        .expect("node 1 owns a shard");
+    let mut id = String::new();
+    for n in 0..10_000 {
+        let candidate = format!("miss{n}");
+        let digest = Md5::digest(candidate.as_bytes());
+        let shard = u32::from_be_bytes(digest[..4].try_into().unwrap()) % q;
+        if shard == target {
+            id = candidate;
+            break;
+        }
+    }
+    assert!(!id.is_empty());
+    let before = local_shard_docs(&nodes[1], "rfan", target).await;
+
+    // Write directly to node 0, which does not own this shard. A normal write
+    // would be routed to node 1; the internal forwarded form leaves the copy
+    // only on node 0, exactly like a write whose replica fan-out failed.
+    let rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (status, _, body) = nodes[0]
+        .req_headers(
+            Method::POST,
+            "/rfan/_bulk_docs",
+            Some(json!({
+                "new_edits": false,
+                "docs": [{
+                    "_id": id,
+                    "_rev": format!("1-{rev}"),
+                    "_revisions": {"start": 1, "ids": [rev]},
+                    "v": 1
+                }]
+            })),
+            &[
+                ("x-douchdb-forwarded", "1".to_string()),
+                ("x-douchdb-secret", "test-cluster-secret".to_string()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // No client request touches node 1 for this document. The one-second
+    // anti-entropy timer must pull it into node 1's copy of the shard.
+    let mut after = before;
+    for _ in 0..150 {
+        after = local_shard_docs(&nodes[1], "rfan", target).await;
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        after > before,
+        "anti-entropy did not repair shard {target}: {before} -> {after}"
+    );
+
+    let (status, body) = nodes[1].get(&format!("/rfan/{id}?r=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 1);
 }

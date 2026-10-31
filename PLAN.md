@@ -210,9 +210,12 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   replicas in order and fall back past a dead primary.
 * **Membership:** `--nodes a:5984,b:5984,c:5984` is static and served verbatim
   by `GET /_membership`. Changing membership is an operator action: restart
-  every node with the new list. Rendezvous hashing and anti-entropy move data
-  to new replicas; stale copies are not deleted and there is no online
-  rebalancing tool.
+  every node with the new list. Discovery probes configured nodes,
+  `--seed-nodes` and reported memberships for the management console without
+  changing placement. Rendezvous hashing and anti-entropy move data to new
+  replicas; the rebalance endpoint broadcasts a balanced map and waits for
+  replica catch-up, then `cleanup` removes copies on nodes that no longer own
+  the shard.
 * **Sequence numbers:** one counter per database; `since` and `update_seq` are
   base64url **version vectors** keyed by node `{node → seq}`. Clients treat
   `since` as opaque (CouchDB 2 already returns strings like `"12-g1AAA…"`), and
@@ -222,7 +225,10 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   changes under clock skew.
 * **Anti-entropy:** one pull per peer per database every `--sync-secs`, using
   the same `_changes` + `_bulk_get` + `new_edits=false` protocol clients use,
-  with documents filtered to the shards this node replicates. Internal calls
+  with documents filtered to the shards this node replicates. Runs without a
+  client request; observable and controllable through
+  `/_node/_local/_replication` and the console. Discovery probes configured
+  nodes, `--seed-nodes` and reported memberships without changing placement. Internal calls
   authenticate with the shared `--admin` credentials; a client's Basic auth or
   `_session` cookie is forwarded when routing/fan-out needs a peer.
 * **Database lifecycle:** create and delete are broadcast to every configured
