@@ -1588,6 +1588,20 @@ pub async fn db_rest(
                 Err(error) => fail(error),
             }
         }
+        "_index_info" => {
+            let search = crate::search::all_indexes(&db);
+            let total_rows = search.len();
+            return json(
+                StatusCode::OK,
+                json!({
+                    "total_rows": total_rows,
+                    "bookmark": Value::Null,
+                    "view_indexes": [],
+                    "search_indexes": search,
+                    "nouveau_indexes": [],
+                }),
+            );
+        }
         "_local" => return fail(ApiError::bad_request("missing local doc id")),
         _ => {}
     }
@@ -1762,6 +1776,22 @@ fn drilldown_clause(value: &Value) -> Option<(String, Vec<Value>)> {
     Some((field, values.get(1..).unwrap_or_default().to_vec()))
 }
 
+fn string_list(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn parse_drilldown_value(value: &Value) -> Vec<Vec<(String, Vec<Value>)>> {
     let Some(values) = value.as_array() else {
         return Vec::new();
@@ -1852,6 +1882,27 @@ async fn search_request(
                 if let Some(drilldown) = object.get("drilldown") {
                     request.drilldown = parse_drilldown_value(drilldown);
                 }
+                if let Some(sort) = object.get("sort") {
+                    request.sort = crate::search::parse_sort(sort);
+                }
+                if let Some(fields) = object.get("highlight_fields") {
+                    request.highlight_fields = string_list(fields);
+                }
+                if let Some(value) = object.get("highlight_pre_tag").and_then(Value::as_str) {
+                    request.highlight_pre = value.to_string();
+                }
+                if let Some(value) = object.get("highlight_post_tag").and_then(Value::as_str) {
+                    request.highlight_post = value.to_string();
+                }
+                if let Some(value) = object.get("highlight_size").and_then(Value::as_u64) {
+                    request.highlight_size = value as usize;
+                }
+                if let Some(value) = object.get("highlight_number").and_then(Value::as_u64) {
+                    request.highlight_number = value as usize;
+                }
+                if let Some(value) = object.get("timeout").and_then(Value::as_u64) {
+                    request.timeout_ms = value;
+                }
             }
         }
     }
@@ -1885,6 +1936,49 @@ async fn search_request(
                 request.drilldown.extend(parse_drilldown_value(&value));
             }
         }
+        if let Some(raw) = q.get("sort") {
+            let value = serde_json::from_str::<Value>(raw).unwrap_or(Value::String(raw.clone()));
+            request.sort = crate::search::parse_sort(&value);
+        }
+        if let Some(raw) = q.get("highlight_fields") {
+            let value =
+                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()));
+            request.highlight_fields = string_list(&value);
+        }
+        if let Some(value) = q
+            .get("highlight_pre_tag")
+            .or_else(|| q.get("highlight_pre"))
+        {
+            request.highlight_pre = value.clone();
+        }
+        if let Some(value) = q
+            .get("highlight_post_tag")
+            .or_else(|| q.get("highlight_post"))
+        {
+            request.highlight_post = value.clone();
+        }
+        if let Some(value) = num(q, "highlight_size") {
+            request.highlight_size = value;
+        }
+        if let Some(value) = num(q, "highlight_number") {
+            request.highlight_number = value;
+        }
+        if let Some(value) = num(q, "timeout") {
+            request.timeout_ms = value as u64;
+        }
+    }
+
+    if is_forwarded(st, headers) {
+        if let Some(mask) = q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q)) {
+            request.owner_shards = Some(mask);
+        }
+    } else if st.cluster.is_clustered() {
+        return match cluster_search(st, db, dbname, ddoc, index_name, &request, limits, headers)
+            .await
+        {
+            Ok(value) => json(StatusCode::OK, value),
+            Err(error) => fail(error),
+        };
     }
 
     match crate::search::query(db, ddoc, index_name, &request, limits).await {

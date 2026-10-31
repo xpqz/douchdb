@@ -598,7 +598,7 @@ pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
     db.replicas_of_shard(shard)
 }
 
-fn fallback_shard_masks(
+pub(crate) fn fallback_shard_masks(
     db: &Db,
     owned_by_node: &[Vec<bool>],
     failed: &[usize],
@@ -1870,4 +1870,347 @@ pub(crate) fn since_component(raw: Option<&str>, index: usize) -> u64 {
     decode_since(raw)
         .and_then(|vector| vector.get(index).copied())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Search fan-out
+
+fn search_row_compare(left: &Value, right: &Value, sort: &[(String, bool)]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if !sort.is_empty() {
+        let left_order = left.get("order").and_then(Value::as_array);
+        let right_order = right.get("order").and_then(Value::as_array);
+        for (index, (_, descending)) in sort.iter().enumerate() {
+            let null = Value::Null;
+            let left_value = left_order
+                .and_then(|values| values.get(index))
+                .unwrap_or(&null);
+            let right_value = right_order
+                .and_then(|values| values.get(index))
+                .unwrap_or(&null);
+            let order = crate::view::cmp_json(left_value, right_value);
+            if order != Ordering::Equal {
+                return if *descending { order.reverse() } else { order };
+            }
+        }
+    }
+    left.get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+}
+
+fn merge_search_batch(
+    batch: &mut (
+        usize,
+        usize,
+        HashMap<String, Value>,
+        HashMap<String, HashMap<String, u64>>,
+        HashMap<String, HashMap<String, u64>>,
+        std::collections::BTreeMap<String, (usize, Vec<Value>)>,
+    ),
+    value: Value,
+) {
+    batch.1 += value.get("total_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if let Some(rows) = value.get("rows").and_then(Value::as_array) {
+        for row in rows {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                batch.2.entry(id.to_string()).or_insert_with(|| row.clone());
+            }
+        }
+    }
+    if let Some(counts) = value.get("counts").and_then(Value::as_object) {
+        for (field, values) in counts {
+            let entry = batch.3.entry(field.clone()).or_default();
+            if let Some(values) = values.as_object() {
+                for (key, count) in values {
+                    *entry.entry(key.clone()).or_default() += count.as_u64().unwrap_or(0);
+                }
+            }
+        }
+    }
+    if let Some(ranges) = value.get("ranges").and_then(Value::as_object) {
+        for (field, values) in ranges {
+            let entry = batch.4.entry(field.clone()).or_default();
+            if let Some(values) = values.as_object() {
+                for (key, count) in values {
+                    *entry.entry(key.clone()).or_default() += count.as_u64().unwrap_or(0);
+                }
+            }
+        }
+    }
+    if let Some(groups) = value.get("groups").and_then(Value::as_array) {
+        for group in groups {
+            let by = group
+                .get("by")
+                .and_then(Value::as_str)
+                .unwrap_or("null")
+                .to_string();
+            let entry = batch.5.entry(by).or_insert_with(|| (0, Vec::new()));
+            entry.0 += group.get("total_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if let Some(rows) = group.get("rows").and_then(Value::as_array) {
+                entry.1.extend(rows.iter().cloned());
+            }
+        }
+    }
+}
+
+/// Union per-node search results. Each node answers for a disjoint set of
+/// shards, so total counts add up while rows are deduplicated by document id.
+pub(crate) async fn cluster_search(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    index_name: &str,
+    request: &crate::search::SearchRequest,
+    limits: crate::view::ViewLimits,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    use futures::future::join_all;
+
+    let node_count = st.cluster.nodes.len();
+    let built = preferred_shard_masks(st, db);
+    let offset = crate::search::parse_bookmark(request.bookmark.as_deref());
+    let window = offset.saturating_add(request.limit);
+    let active = built
+        .iter()
+        .filter(|mask| mask.iter().any(|owned| *owned))
+        .count();
+    crate::telemetry::record_fanout(active as u64);
+
+    let mut masks = built.clone();
+    let mut failed: Vec<usize> = Vec::new();
+    let mut batch = (
+        0usize,
+        0usize,
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        std::collections::BTreeMap::new(),
+    );
+
+    let batches = join_all((0..node_count).map(|node| {
+        let mask = masks[node].clone();
+        async move {
+            fetch_search_mask(
+                st, db, dbname, ddoc, index_name, request, limits, headers, node, &mask, window,
+            )
+            .await
+        }
+    }))
+    .await;
+
+    for (node, result) in batches.into_iter().enumerate() {
+        match result {
+            Ok(value) => merge_search_batch(&mut batch, value),
+            Err(_) => failed.push(node),
+        }
+    }
+
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..node_count)
+            .filter(|node| !failed.contains(node))
+            .collect();
+        if alive.is_empty() {
+            return Err(ApiError::new(
+                502,
+                "bad_gateway",
+                "no search replica is reachable",
+            ));
+        }
+        let groups = fallback_shard_masks(db, &built, &failed, &alive)?;
+        for node in &failed {
+            masks[*node] = vec![false; db.q as usize];
+        }
+        for (node, extra) in groups {
+            for shard in 0..extra.len() {
+                masks[node][shard] |= extra[shard];
+            }
+        }
+
+        batch = (
+            0,
+            0,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let batches = join_all((0..node_count).map(|node| {
+            let mask = masks[node].clone();
+            async move {
+                fetch_search_mask(
+                    st, db, dbname, ddoc, index_name, request, limits, headers, node, &mask, window,
+                )
+                .await
+            }
+        }))
+        .await;
+        let mut any = false;
+        for result in batches {
+            if let Ok(value) = result {
+                any = true;
+                merge_search_batch(&mut batch, value);
+            }
+        }
+        if !any {
+            return Err(ApiError::new(
+                502,
+                "bad_gateway",
+                "no search replica is reachable",
+            ));
+        }
+    }
+
+    let (_, total_rows, rows, counts, ranges, groups) = batch;
+    let mut rows: Vec<Value> = rows.into_values().collect();
+    rows.sort_by(|left, right| search_row_compare(left, right, &request.sort));
+    let page: Vec<Value> = rows.into_iter().skip(offset).take(request.limit).collect();
+
+    let mut response = json!({
+        "total_rows": total_rows,
+        "bookmark": format!("search:{}", offset.saturating_add(page.len())),
+        "rows": page,
+    });
+    if !request.counts.is_empty() {
+        response["counts"] = json!(counts);
+    }
+    if !request.ranges.is_empty() {
+        response["ranges"] = json!(ranges);
+    }
+    if request.group_field.is_some() {
+        let groups: Vec<Value> = groups
+            .into_iter()
+            .map(|(by, (total_rows, rows))| {
+                json!({"by": by, "total_rows": total_rows, "rows": rows})
+            })
+            .collect();
+        response["groups"] = json!(groups);
+    }
+    Ok(response)
+}
+
+async fn fetch_search_mask(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    ddoc: &str,
+    index_name: &str,
+    request: &crate::search::SearchRequest,
+    limits: crate::view::ViewLimits,
+    headers: &HeaderMap,
+    node: usize,
+    mask: &[bool],
+    window: usize,
+) -> DbResult<Value> {
+    if !mask.iter().any(|owned| *owned) {
+        return Ok(json!({"total_rows": 0, "rows": [], "bookmark": "search:0"}));
+    }
+    let mut local = request.clone();
+    local.owner_shards = Some(mask.to_vec());
+    local.bookmark = None;
+    local.limit = window;
+    if node == st.cluster.me {
+        return crate::search::query(db, ddoc, index_name, &local, limits).await;
+    }
+
+    let peer = &st.cluster.nodes[node];
+    let url = format!(
+        "{peer}/{dbname}/{}/_search/{}",
+        percent_encode(ddoc),
+        percent_encode(index_name)
+    );
+    let selected: Vec<String> = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, owned)| **owned)
+        .map(|(shard, _)| shard.to_string())
+        .collect();
+    let mut params: Vec<(&str, String)> = vec![
+        ("q", request.query.clone()),
+        ("limit", window.to_string()),
+        ("timeout", request.timeout_ms.to_string()),
+        ("shards", selected.join(",")),
+    ];
+    if request.include_docs {
+        params.push(("include_docs", "true".to_string()));
+    }
+    if let Some(partition) = &request.partition {
+        params.push(("partition", partition.clone()));
+    }
+    if !request.counts.is_empty() {
+        params.push((
+            "counts",
+            serde_json::to_string(&request.counts).unwrap_or_default(),
+        ));
+    }
+    if !request.ranges.is_empty() {
+        params.push((
+            "ranges",
+            serde_json::to_string(&request.ranges).unwrap_or_default(),
+        ));
+    }
+    if let Some(group_field) = &request.group_field {
+        params.push(("group_field", group_field.clone()));
+    }
+    for clause in &request.drilldown {
+        let mut flat = Vec::with_capacity(clause.len() + 1);
+        for (field, values) in clause {
+            flat.push(Value::String(field.clone()));
+            flat.extend(values.iter().cloned());
+        }
+        params.push((
+            "drilldown",
+            serde_json::to_string(&flat).unwrap_or_default(),
+        ));
+    }
+    if !request.sort.is_empty() {
+        let sort: Vec<String> = request
+            .sort
+            .iter()
+            .map(|(field, descending)| {
+                if *descending {
+                    format!("-{field}")
+                } else {
+                    field.clone()
+                }
+            })
+            .collect();
+        params.push(("sort", serde_json::to_string(&sort).unwrap_or_default()));
+    }
+    if !request.highlight_fields.is_empty() {
+        params.push((
+            "highlight_fields",
+            serde_json::to_string(&request.highlight_fields).unwrap_or_default(),
+        ));
+        params.push(("highlight_pre_tag", request.highlight_pre.clone()));
+        params.push(("highlight_post_tag", request.highlight_post.clone()));
+        params.push(("highlight_size", request.highlight_size.to_string()));
+        params.push(("highlight_number", request.highlight_number.to_string()));
+    }
+
+    let mut outgoing = st
+        .client
+        .get(url)
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
+        .query(&params);
+    outgoing = forward_client_auth(outgoing, headers);
+    let response = outgoing
+        .send()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            response.status().as_u16(),
+            "search_failed",
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
 }

@@ -394,8 +394,9 @@ Above ~6k means something was built that nobody asked for.
   Tantivy-backed indexes under `_search_indexes/`. The API supports field
   queries, `include_docs`, drilldown, counts, ranges, grouping, bookmarks and
   partitioned search. Indexes rebuild when the update sequence or definition
-  changes. Highlighting, custom sorting, `_index_info` and cluster-wide search
-  fan-out remain future work.
+  changes. Custom sorting, highlighting, request timeouts,
+  `_index_info?type=search` and owner-aware cluster fan-out with merge/dedup
+  are implemented.
 * **Cluster fan-out is owner-aware and concurrent.** Cluster `_all_docs` and
   view queries fetch only shards a node owns, run peer requests concurrently,
   push the requested window down to owners, and combine global/grouped built-in
