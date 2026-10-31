@@ -5146,3 +5146,167 @@ async fn pouchdb_bulk_docs_and_design_docs_ports() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn couchdb_search_sort_highlight_timeout_and_index_info_ports() {
+    let s = Server::start(false);
+    seed_search_docs(&s, "couchsearchopts").await;
+
+    let (status, body) = s
+        .get("/couchsearchopts/_design/inventory/_search/fruits?q=*:*&sort=%5B%22price%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["carrot", "apple", "date", "banana"]);
+    assert_eq!(body["rows"][0]["order"], json!([0.75]));
+
+    let (status, body) = s
+        .get("/couchsearchopts/_design/inventory/_search/fruits?q=*:*&sort=%5B%22-price%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["banana", "date", "apple", "carrot"]);
+
+    let (status, body) = s
+        .post(
+            "/couchsearchopts/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "sort": ["-price"], "limit": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "banana");
+    assert_eq!(body["rows"][1]["id"], "date");
+
+    let (status, body) = s
+        .get("/couchsearchopts/_design/inventory/_search/fruits?q=item:apple&highlight_fields=%5B%22item%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["highlights"]["item"],
+        json!(["<em>apple</em>"])
+    );
+
+    let (status, body) = s
+        .post(
+            "/couchsearchopts/_design/inventory/_search/fruits",
+            json!({
+                "q": "item:apple",
+                "highlight_fields": ["item"],
+                "highlight_pre_tag": "[",
+                "highlight_post_tag": "]"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["highlights"]["item"], json!(["[apple]"]));
+
+    let (status, body) = s
+        .get("/couchsearchopts/_design/inventory/_search/fruits?q=*:*&timeout=0")
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(
+        body["reason"],
+        "The request could not be processed in a reasonable amount of time."
+    );
+
+    let (status, body) = s.get("/couchsearchopts/_index_info?type=search").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["view_indexes"], json!([]));
+    assert_eq!(body["nouveau_indexes"], json!([]));
+    let search = body["search_indexes"].as_array().unwrap();
+    assert_eq!(search.len(), 1);
+    assert_eq!(search[0]["ddoc"], "_design/inventory");
+    assert_eq!(search[0]["name"], "fruits");
+    assert_eq!(search[0]["ok"], true);
+    let mut keys: Vec<&str> = search[0]["info"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["doc_count", "signature", "updates_pending"]);
+
+    let (status, info) = s
+        .get("/couchsearchopts/_design/inventory/_search_info/fruits")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(search[0]["info"], info["search_index"]);
+}
+
+#[tokio::test]
+async fn search_fans_out_across_cluster_shards() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("csearchfan").await;
+    }
+    let docs: Vec<Value> = (0..9)
+        .map(|i| {
+            json!({
+                "_id": format!("fruit{i}"),
+                "item": format!("item{i}"),
+                "place": "kitchen",
+                "state": if i % 2 == 0 { "new" } else { "old" },
+                "price": i
+            })
+        })
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/csearchfan/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put("/csearchfan/_design/inventory", search_ddoc())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for node in &nodes {
+        let (status, body) = node
+            .get("/csearchfan/_design/inventory/_search/fruits?q=*:*")
+            .await;
+        assert_eq!(status, StatusCode::OK, "search via {}", node.base);
+        assert_eq!(body["total_rows"], 9, "search via {}", node.base);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 9);
+    }
+
+    // Sorting and faceting are applied after the per-shard merge.
+    let (status, body) = nodes[1]
+        .post(
+            "/csearchfan/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "sort": ["-price"], "limit": 3, "counts": ["state"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["fruit8", "fruit7", "fruit6"]);
+    assert_eq!(body["counts"]["state"]["new"], 5);
+    assert_eq!(body["counts"]["state"]["old"], 4);
+
+    let (status, body) = nodes[2]
+        .get("/csearchfan/_design/inventory/_search/fruits?q=*:*&limit=2&bookmark=search%3A2&sort=%5B%22price%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["fruit2", "fruit3"]);
+}

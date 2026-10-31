@@ -21,6 +21,8 @@ one-for-one.
 | `view_collation_test.exs` | `couchdb_view_collation_ports` |
 | `search_test.exs` | `couchdb_search_ports` |
 | `partition_search_test.exs` | `couchdb_partition_search_ports` |
+| `index_info_test.exs` (search entries) | `couchdb_search_sort_highlight_timeout_and_index_info_ports` |
+| cluster search fan-out | `search_fans_out_across_cluster_shards` |
 | PouchDB `test.local_docs.js`, `test.revs_diff.js`, `test.bulk_get.js` | `pouchdb_local_docs_revs_diff_and_bulk_get_ports` |
 | PouchDB `test.changes.js`, `test.all_docs.js` | `pouchdb_changes_and_all_docs_ports` |
 | PouchDB `test.mapreduce.js`, `test.conflicts.js`, `test.uuids.js` | `pouchdb_mapreduce_conflicts_and_uuids_ports` |
@@ -70,13 +72,11 @@ These ports exposed and fixed:
 ## Deliberately not ported
 
 - Attachments and multipart requests.
-- Mango, Search, Nouveau.
+- Mango and Nouveau (search itself is implemented and its tests are ported).
 - Show/list/rewrite/update handlers and `validate_doc_update`.
 - JWT, proxy auth, users DB and security-object administration.
 - Resharding, cluster setup/config, compaction/disk-monitor internals.
 - JavaScript changes filters and view sandboxing limits.
-- Search highlighting, custom sorting, `_index_info`, search timeouts and
-  cluster-wide search fan-out.
 - CouchDB's attachment, local-doc and replication suites; douchdb has separate
   conformance coverage for replication and local documents.
 

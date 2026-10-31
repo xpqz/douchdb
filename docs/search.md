@@ -45,6 +45,15 @@ Supported parameters:
 - `ranges` — JSON object of field name to label/range pairs. Numeric ranges use
   `[lower TO upper]` with `Infinity` available.
 - `group_field` — returns `groups` grouped by a field value.
+- `sort` — a field name, `-field` for descending, or a JSON array such as
+  `["-price", "item"]`. CouchDB's optional `<type>` suffix is accepted and
+  ignored because field types are inferred when the index is built.
+- `highlight_fields` — JSON array (or comma-separated list) of fields to
+  highlight. Matching query terms are wrapped in `highlight_pre_tag` /
+  `highlight_post_tag`, with `highlight_size` and `highlight_number`
+  controlling fragment length and count.
+- `timeout` — request timeout in milliseconds. `0` makes the request fail
+  immediately with CouchDB's `timeout` error shape.
 
 Partitioned form:
 
@@ -53,19 +62,23 @@ GET /{db}/_partition/{partition}/_design/{ddoc}/_search/{index}
 ```
 
 Search responses contain `total_rows`, `bookmark`, and `rows` entries with
-`id`, `fields`, `order`, and optionally `doc`. Facet counts, ranges and groups
-are added when requested.
+`id`, `fields`, `order`, and optionally `doc` and `highlights`. Facet counts,
+ranges and groups are added when requested. `order` contains the values used
+for each requested sort field.
 
 ## Index information and cleanup
 
 ```text
 GET  /{db}/_design/{ddoc}/_search_info/{index}
+GET  /{db}/_index_info?type=search
 POST /{db}/_search_cleanup
 ```
 
 The info endpoint reports the indexed document count, the definition
-signature and the expected `updates_pending` shape. Cleanup removes all search
-index directories for the database.
+signature and the expected `updates_pending` shape. `_index_info?type=search`
+returns the same object under `search_indexes`, with empty `view_indexes` and
+`nouveau_indexes` lists. Cleanup removes all search index directories for the
+database.
 
 ## Implementation and limits
 
@@ -74,11 +87,18 @@ index directories for the database.
 - Index values used for counts/ranges/groups are kept in a sidecar JSON file;
   Tantivy handles query matching.
 - The `analyzer` name is accepted but currently all string fields use Tantivy's
-  default tokenizer.
-- Highlighting, custom sorting, `_index_info`, search timeouts and cluster-wide
-  search fan-out are not implemented yet.
-- Search currently indexes local documents only; for n<3, a coordinator without
-  every shard does not have a complete search index.
+  default tokenizer. Analyzer tuning is intentionally out of scope.
+- Cluster search assigns each shard to one preferred owner, queries those
+  owners concurrently and merges/deduplicates rows, counts, ranges and groups.
+  If an owner is unreachable the coordinator falls back to another live
+  replica. In the common three-node, full-replication case the coordinator can
+  answer locally without any fan-out.
+- Search builds against the documents stored on the local node. In a cluster
+  with fewer replicas than nodes, a non-owner does not index the documents it
+  does not hold; the coordinator fan-out supplies those rows from the owners.
+- A search bookmark is an offset into the merged result window. Cluster
+  pagination beyond the 2,000-row page limit is therefore not supported, the
+  same as a single-node limit of 2,000 rows per request.
 
 ## Tests
 
@@ -89,6 +109,9 @@ index directories for the database.
 - drilldown (single, multiple, nested, repeated GET)
 - counts and numeric ranges
 - grouping
+- custom sorting and highlighting
+- request timeouts and `_index_info?type=search`
 - update/rebuild after a document change
 - search info and cleanup
 - partitioned search with bookmarks and the partition limit
+- cluster-wide fan-out across shards with merged counts and sorting

@@ -14,7 +14,7 @@ use tantivy::schema::{
 };
 use tantivy::Index;
 
-const SEARCH_VERSION: u8 = 1;
+const SEARCH_VERSION: u8 = 2;
 const PAGE_LIMIT: usize = 2000;
 
 #[derive(Clone, Debug)]
@@ -34,6 +34,10 @@ struct SearchMeta {
     version: u8,
     last_seq: u64,
     design: String,
+    #[serde(default)]
+    ddoc: String,
+    #[serde(default)]
+    name: String,
     docs: Vec<SearchDoc>,
 }
 
@@ -43,6 +47,7 @@ struct IndexedDoc {
     fields: Map<String, Value>,
 }
 
+#[derive(Clone, Debug)]
 pub struct SearchRequest {
     pub query: String,
     pub limit: usize,
@@ -53,6 +58,16 @@ pub struct SearchRequest {
     pub group_field: Option<String>,
     pub drilldown: Vec<Vec<(String, Vec<Value>)>>,
     pub partition: Option<String>,
+    /// Internal: only return documents whose shard is marked here. Cluster
+    /// coordinators use this to split a search into disjoint owner sets.
+    pub owner_shards: Option<Vec<bool>>,
+    pub sort: Vec<(String, bool)>,
+    pub highlight_fields: Vec<String>,
+    pub highlight_pre: String,
+    pub highlight_post: String,
+    pub highlight_size: usize,
+    pub highlight_number: usize,
+    pub timeout_ms: u64,
 }
 
 impl Default for SearchRequest {
@@ -67,6 +82,14 @@ impl Default for SearchRequest {
             group_field: None,
             drilldown: Vec::new(),
             partition: None,
+            owner_shards: None,
+            sort: Vec::new(),
+            highlight_fields: Vec::new(),
+            highlight_pre: "<em>".to_string(),
+            highlight_post: "</em>".to_string(),
+            highlight_size: 100,
+            highlight_number: 1,
+            timeout_ms: 30_000,
         }
     }
 }
@@ -317,6 +340,8 @@ async fn build_index(
         version: SEARCH_VERSION,
         last_seq: db.update_seq(),
         design: design_signature(spec),
+        ddoc: ddoc.to_string(),
+        name: index_name.to_string(),
         docs: indexed
             .into_iter()
             .map(|doc| SearchDoc {
@@ -452,11 +477,121 @@ fn value_in_range(value: &Value, range: &str) -> bool {
     within_lower && within_upper
 }
 
-fn parse_bookmark(bookmark: Option<&str>) -> usize {
+pub(crate) fn parse_bookmark(bookmark: Option<&str>) -> usize {
     bookmark
         .and_then(|bookmark| bookmark.strip_prefix("search:").or(Some(bookmark)))
         .and_then(|bookmark| bookmark.parse().ok())
         .unwrap_or(0)
+}
+
+pub(crate) fn parse_sort(value: &Value) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let items: Vec<&str> = match value {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => return out,
+    };
+    for item in items {
+        let mut item = item.trim();
+        let descending = item.starts_with('-');
+        if descending {
+            item = &item[1..];
+        }
+        let name = item.split('<').next().unwrap_or(item).trim();
+        if !name.is_empty() && name != "<score>" && name != "score" {
+            out.push((name.to_string(), descending));
+        }
+    }
+    out
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .flat_map(|token| token.split(['(', ')']))
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '+' | '-' | '"' | '~' | '*' | '?' | '[' | ']' | '{' | '}' | ':' | '^'
+                )
+            });
+            if token.is_empty()
+                || token == "TO"
+                || token == "AND"
+                || token == "OR"
+                || token == "NOT"
+            {
+                return None;
+            }
+            let token = token.rsplit(':').next().unwrap_or(token);
+            Some(token.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn highlight_fragment(
+    text: &str,
+    terms: &[String],
+    pre: &str,
+    post: &str,
+    size: usize,
+    number: usize,
+) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut fragments = Vec::new();
+    for term in terms {
+        if term.is_empty() || fragments.len() >= number {
+            continue;
+        }
+        let Some(index) = lower.find(term) else {
+            continue;
+        };
+        if !text.is_char_boundary(index) || !text.is_char_boundary(index + term.len()) {
+            continue;
+        }
+        let start = index.saturating_sub(size / 2);
+        let end = (index + term.len() + size / 2).min(text.len());
+        let start = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|i| *i >= start)
+            .unwrap_or(0);
+        let end = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|i| *i >= end)
+            .unwrap_or(text.len());
+        let mut fragment = String::new();
+        fragment.push_str(&text[start..index]);
+        fragment.push_str(pre);
+        fragment.push_str(&text[index..index + term.len()]);
+        fragment.push_str(post);
+        fragment.push_str(&text[index + term.len()..end]);
+        fragments.push(fragment);
+    }
+    fragments
+}
+
+fn sort_compare(
+    left: &SearchDoc,
+    right: &SearchDoc,
+    sort: &[(String, bool)],
+) -> std::cmp::Ordering {
+    for (field, descending) in sort {
+        let left_value = left.fields.get(field);
+        let right_value = right.fields.get(field);
+        let order = match (left_value, right_value) {
+            (Some(left_value), Some(right_value)) => crate::view::cmp_json(left_value, right_value),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        if order != std::cmp::Ordering::Equal {
+            return if *descending { order.reverse() } else { order };
+        }
+    }
+    left.id.cmp(&right.id)
 }
 
 pub async fn query(
@@ -466,6 +601,14 @@ pub async fn query(
     request: &SearchRequest,
     limits: crate::view::ViewLimits,
 ) -> DbResult<Value> {
+    let started = Instant::now();
+    if request.timeout_ms == 0 || started.elapsed().as_millis() as u64 > request.timeout_ms {
+        return Err(ApiError::new(
+            500,
+            "timeout",
+            "The request could not be processed in a reasonable amount of time.",
+        ));
+    }
     if request.partition.is_some() && request.limit > PAGE_LIMIT {
         return Err(ApiError::bad_request(
             "Limit is too large for a partitioned search.",
@@ -473,6 +616,13 @@ pub async fn query(
     }
     let spec = load_spec(db, ddoc, index_name).await?;
     let (path, meta) = ensure_index(db, ddoc, index_name, &spec, limits).await?;
+    if started.elapsed().as_millis() as u64 > request.timeout_ms {
+        return Err(ApiError::new(
+            500,
+            "timeout",
+            "The request could not be processed in a reasonable amount of time.",
+        ));
+    }
     let tantivy_index = Index::open_in_dir(&path)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     let schema = tantivy_index.schema();
@@ -524,12 +674,25 @@ pub async fn query(
                 continue;
             }
         }
+        if let Some(owner_shards) = &request.owner_shards {
+            if !owner_shards
+                .get(db.shard_index(&doc.id))
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
         if !matches_drilldown(doc, &request.drilldown) {
             continue;
         }
         matched.push((*doc).clone());
     }
-    matched.sort_by(|a, b| a.id.cmp(&b.id));
+    if request.sort.is_empty() {
+        matched.sort_by(|a, b| a.id.cmp(&b.id));
+    } else {
+        matched.sort_by(|a, b| sort_compare(a, b, &request.sort));
+    }
 
     let total_rows = matched.len();
     let offset = parse_bookmark(request.bookmark.as_deref());
@@ -546,15 +709,42 @@ pub async fn query(
         HashMap::new()
     };
 
+    let terms = query_terms(&request.query);
     let mut rows = Vec::with_capacity(page.len());
     for doc in &page {
+        let order: Vec<Value> = request
+            .sort
+            .iter()
+            .map(|(field, _)| doc.fields.get(field).cloned().unwrap_or(Value::Null))
+            .collect();
         let mut row = json!({
             "id": doc.id,
             "fields": doc.fields,
-            "order": [],
+            "order": order,
         });
         if let Some(document) = docs.get(&doc.id) {
             row["doc"] = document.clone();
+        }
+        if !request.highlight_fields.is_empty() {
+            let mut highlights = Map::new();
+            for field in &request.highlight_fields {
+                if let Some(Value::String(text)) = doc.fields.get(field) {
+                    let fragments = highlight_fragment(
+                        text,
+                        &terms,
+                        &request.highlight_pre,
+                        &request.highlight_post,
+                        request.highlight_size,
+                        request.highlight_number,
+                    );
+                    if !fragments.is_empty() {
+                        highlights.insert(field.clone(), json!(fragments));
+                    }
+                }
+            }
+            if !highlights.is_empty() {
+                row["highlights"] = Value::Object(highlights);
+            }
         }
         rows.push(row);
     }
@@ -666,4 +856,39 @@ pub fn cleanup(db: &Db) -> DbResult<()> {
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     }
     Ok(())
+}
+
+/// Entries for the `_index_info` endpoint.
+pub fn all_indexes(db: &Db) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(db.path.join("_search_indexes")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(meta) = read_meta(&path) else {
+            continue;
+        };
+        if meta.ddoc.is_empty() || meta.name.is_empty() {
+            continue;
+        }
+        out.push(json!({
+            "ddoc": meta.ddoc,
+            "name": meta.name,
+            "ok": true,
+            "info": {
+                "doc_count": meta.docs.len(),
+                "signature": meta.design,
+                "updates_pending": {
+                    "copies": db.replicas_of_shard(0).len().max(1),
+                    "copies_expected": db.replicas_of_shard(0).len().max(1),
+                    "maximum": 0,
+                    "minimum": 0,
+                    "preferred": db.replicas_of_shard(0).len().max(1),
+                    "total": 0,
+                }
+            }
+        }));
+    }
+    out
 }

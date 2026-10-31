@@ -598,8 +598,9 @@ curl -X POST localhost:5984/inventory/_design/inventory/_search/fruits \
   -d '{"q":"*:*","drilldown":["place","kitchen"],"counts":["place"]}'
 ```
 
-See [docs/search.md](docs/search.md) for the full API, partition search,
-counts, ranges, grouping, bookmarks and current limitations.
+See [docs/search.md](docs/search.md) for the full API: sorting, highlighting,
+timeouts, partition search, counts, ranges, grouping, bookmarks,
+`_index_info` and cluster fan-out.
 
 ## Performance
 
