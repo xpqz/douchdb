@@ -265,6 +265,11 @@ async fn build_index(
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
 ) -> DbResult<(PathBuf, SearchMeta)> {
+    // Capture the sequence before reading the snapshot. A write that lands
+    // while the index is being built then leaves the database ahead of the
+    // recorded sequence, so the next query rebuilds instead of trusting a
+    // snapshot that may have missed it.
+    let last_seq = db.update_seq();
     let docs = db.map_docs(None).await?;
     let indexed = run_index_json(&spec.source, &docs, limits).map_err(|reason| {
         ApiError::new(
@@ -338,7 +343,7 @@ async fn build_index(
 
     let meta = SearchMeta {
         version: SEARCH_VERSION,
-        last_seq: db.update_seq(),
+        last_seq,
         design: design_signature(spec),
         ddoc: ddoc.to_string(),
         name: index_name.to_string(),
