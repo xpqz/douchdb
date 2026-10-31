@@ -4518,6 +4518,60 @@ async fn couchdb_search_ports() {
     assert_eq!(body["total_rows"], 1);
     assert_eq!(body["rows"][0]["doc"]["item"], "apple2");
 
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "item:tomato", "limit": 0, "counts": ["place"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counts"]["place"], json!({}));
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "limit": 0, "ranges": {"price": {}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ranges"]["price"], json!({}));
+
+    // Duplicate JSON members: the last drilldown wins, matching PouchDB.
+    let raw = r#"{"include_docs":true,"q":"*:*","drilldown":["state","old"],"drilldown":["item","banana"]}"#;
+    let response = s
+        .client
+        .post(format!(
+            "{}/couchsearch/_design/inventory/_search/fruits",
+            s.base
+        ))
+        .header("content-type", "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["rows"][0]["doc"]["item"], "banana");
+
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search_info/fruits")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pending = body["search_index"]["updates_pending"].as_object().unwrap();
+    let mut keys: Vec<&str> = pending.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "copies",
+            "copies_expected",
+            "maximum",
+            "minimum",
+            "preferred",
+            "total"
+        ]
+    );
+
     let (status, _) = s.post("/couchsearch/_search_cleanup", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 }
@@ -4829,6 +4883,9 @@ async fn pouchdb_reserved_ids_ports() {
 async fn pouchdb_get_and_error_ports() {
     let s = Server::start(false);
     s.fresh_db("pouchget").await;
+    let (status, info) = s.get("/pouchget").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(info["uuid"].as_str().is_some());
     let (status, created) = s.put("/pouchget/doc", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = s.get("/pouchget/missing").await;
@@ -4902,4 +4959,80 @@ async fn couchdb_conflict_request_ports() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "conflict");
+}
+
+#[tokio::test]
+async fn pouchdb_all_docs_keys_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchkeys").await;
+    let docs = json!({"docs": [
+        {"_id": "0", "a": 1, "b": 1},
+        {"_id": "3", "a": 4, "b": 16},
+        {"_id": "1", "a": 2, "b": 4},
+        {"_id": "2", "a": 3, "b": 9}
+    ]});
+    let (status, _) = s.post("/pouchkeys/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .post(
+            "/pouchkeys/_all_docs",
+            json!({"keys": ["2", "0", "1000"], "descending": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["key"], "1000");
+    assert_eq!(rows[0]["error"], "not_found");
+    assert_eq!(rows[1]["key"], "0");
+    assert_eq!(rows[2]["key"], "2");
+
+    let (status, body) = s
+        .post(
+            "/pouchkeys/_all_docs",
+            json!({"keys": ["3", "1"], "skip": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["id"], "1");
+
+    let (status, body) = s
+        .post(
+            "/pouchkeys/_all_docs",
+            json!({"keys": ["0", "2"], "limit": 3}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    let (status, body) = s.post("/pouchkeys/_all_docs", json!({"keys": 1234})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = s
+        .post(
+            "/pouchkeys/_all_docs?startkey=%22a%22",
+            json!({"keys": ["0"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_, doc) = s.get("/pouchkeys/2").await;
+    let (status, _) = s
+        .delete(&format!(
+            "/pouchkeys/2?rev={}",
+            doc["_rev"].as_str().unwrap()
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s
+        .post(
+            "/pouchkeys/_all_docs?include_docs=true",
+            json!({"keys": ["2"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"]["deleted"], true);
+    assert_eq!(body["rows"][0]["doc"], Value::Null);
 }

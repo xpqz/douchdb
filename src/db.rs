@@ -682,7 +682,12 @@ impl Db {
             }
         }
 
-        let page: Vec<String> = keys
+        let ordered_keys: Vec<String> = if opts.descending {
+            keys.iter().rev().cloned().collect()
+        } else {
+            keys.to_vec()
+        };
+        let page: Vec<String> = ordered_keys
             .iter()
             .skip(opts.skip)
             .take(opts.limit)
@@ -2065,14 +2070,18 @@ fn all_docs_key_row(
         }
     }
     if opts.include_docs {
-        let doc_opts = DocOpts {
-            rev: Some(winner),
-            conflicts: opts.conflicts,
-            attachments: opts.attachments,
-            ..Default::default()
-        };
-        if let Ok(doc) = read_doc(shard, key, &doc_opts) {
-            row["doc"] = doc;
+        if deleted {
+            row["doc"] = Value::Null;
+        } else {
+            let doc_opts = DocOpts {
+                rev: Some(winner),
+                conflicts: opts.conflicts,
+                attachments: opts.attachments,
+                ..Default::default()
+            };
+            if let Ok(doc) = read_doc(shard, key, &doc_opts) {
+                row["doc"] = doc;
+            }
         }
     }
     Some(row)

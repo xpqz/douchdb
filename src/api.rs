@@ -2412,12 +2412,17 @@ async fn all_docs(
     }
     if *method == Method::POST {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            if let Some(keys) = value.get("keys").and_then(Value::as_array) {
-                opts.keys = Some(
-                    keys.iter()
-                        .filter_map(|k| k.as_str().map(str::to_string))
-                        .collect(),
-                );
+            if opts.keys.is_none() {
+                if let Some(keys_value) = value.get("keys") {
+                    let Some(keys) = keys_value.as_array() else {
+                        return fail(ApiError::bad_request("`keys` must be an array."));
+                    };
+                    opts.keys = Some(
+                        keys.iter()
+                            .filter_map(|k| k.as_str().map(str::to_string))
+                            .collect(),
+                    );
+                }
             }
             if value
                 .get("include_docs")
@@ -2425,6 +2430,13 @@ async fn all_docs(
                 .unwrap_or(false)
             {
                 opts.include_docs = true;
+            }
+            if value
+                .get("descending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                opts.descending = true;
             }
             if !query_limit {
                 if let Some(limit) = value.get("limit").and_then(Value::as_u64) {
@@ -2437,6 +2449,11 @@ async fn all_docs(
                 }
             }
         }
+    }
+    if opts.keys.is_some() && (opts.startkey.is_some() || opts.endkey.is_some()) {
+        return fail(ApiError::bad_request(
+            "`keys` is incompatible with `startkey` and `endkey`",
+        ));
     }
     let shard_mask = if is_forwarded(st, headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
