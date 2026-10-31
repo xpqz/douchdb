@@ -575,6 +575,32 @@ this work.
 - `--cors-origins '*'` allows any website to make credentialed requests against
   a logged-in session. Prefer an explicit origin list.
 
+## Search
+
+Design documents can define Tantivy-backed search indexes:
+
+```json
+{
+  "_id": "_design/inventory",
+  "indexes": {
+    "fruits": {
+      "analyzer": {"name": "standard"},
+      "index": "function (doc) { index(\"item\", doc.item, {facet: true}); index(\"place\", doc.place, {facet: true}); }"
+    }
+  }
+}
+```
+
+```sh
+curl 'localhost:5984/inventory/_design/inventory/_search/fruits?q=*:*&include_docs=true'
+curl -X POST localhost:5984/inventory/_design/inventory/_search/fruits \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"*:*","drilldown":["place","kitchen"],"counts":["place"]}'
+```
+
+See [docs/search.md](docs/search.md) for the full API, partition search,
+counts, ranges, grouping, bookmarks and current limitations.
+
 ## Performance
 
 A reproducible single-node HTTP baseline (CRUD, bulk, `_all_docs`, `_changes`,

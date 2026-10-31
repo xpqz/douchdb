@@ -804,6 +804,9 @@ impl Db {
             use std::collections::VecDeque;
 
             const PAGE: usize = 1024;
+            if opts.limit == Some(0) {
+                return;
+            }
             if opts.descending {
                 yield Err(ApiError::new(
                     500,
@@ -1080,7 +1083,7 @@ impl Db {
                 let mut tx = Tx::new();
                 tx.delete(&local_key(&id));
                 s.commit(tx)?;
-                Ok(json!({"ok": true, "id": format!("_local/{id}")}))
+                Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
             })
             .await
     }

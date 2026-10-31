@@ -4355,3 +4355,427 @@ async fn couchdb_view_collation_ports() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"].as_array().unwrap().last().unwrap()["key"], "B");
 }
+
+fn search_ddoc() -> Value {
+    json!({
+        "indexes": {
+            "fruits": {
+                "analyzer": {"name": "standard"},
+                "index": "function(doc) {\n  index(\"item\", doc.item, {facet: true});\n  index(\"place\", doc.place, {facet: true});\n  index(\"state\", doc.state, {facet: true});\n  index(\"price\", doc.price, {facet: true});\n}"
+            }
+        }
+    })
+}
+
+async fn seed_search_docs(s: &Server, db: &str) {
+    s.fresh_db(db).await;
+    let (status, _) = s
+        .post(
+            &format!("/{db}/_bulk_docs"),
+            json!({"docs": [
+                {"_id": "apple", "item": "apple", "place": "kitchen", "state": "new", "price": 0.99},
+                {"_id": "banana", "item": "banana", "place": "kitchen", "state": "new", "price": 1.49},
+                {"_id": "carrot", "item": "carrot", "place": "kitchen", "state": "old", "price": 0.75},
+                {"_id": "date", "item": "date", "place": "lobby", "state": "unknown", "price": 1.25}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(&format!("/{db}/_design/inventory"), search_ddoc())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn couchdb_search_ports() {
+    let s = Server::start(false);
+    seed_search_docs(&s, "couchsearch").await;
+
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search/fruits?q=*:*&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut items: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["doc"]["item"].as_str().unwrap())
+        .collect();
+    items.sort_unstable();
+    assert_eq!(items, ["apple", "banana", "carrot", "date"]);
+
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search/fruits?q=item:apple&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["doc"]["item"], "apple");
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "drilldown": ["place", "kitchen"], "include_docs": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut items: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["doc"]["item"].as_str().unwrap())
+        .collect();
+    items.sort_unstable();
+    assert_eq!(items, ["apple", "banana", "carrot"]);
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "limit": 0, "counts": ["place"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counts"]["place"]["kitchen"], 3);
+    assert_eq!(body["counts"]["place"]["lobby"], 1);
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "limit": 0, "ranges": {"price": {
+                "cheap": "[0 TO 0.99]",
+                "expensive": "[1.00 TO Infinity]"
+            }}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ranges"]["price"]["cheap"], 2);
+    assert_eq!(body["ranges"]["price"]["expensive"], 2);
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "group_field": "state"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let groups = body["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 3);
+    for group in groups {
+        let expected = match group["by"].as_str().unwrap() {
+            "new" => 2,
+            "old" | "unknown" => 1,
+            other => panic!("unexpected group {other}"),
+        };
+        assert_eq!(group["total_rows"], expected);
+    }
+
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search_info/fruits")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["search_index"]["doc_count"], 4);
+    assert!(!body["search_index"]["signature"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "drilldown": [["state", "old"], ["item", "apple"]], "include_docs": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["rows"].as_array().unwrap().is_empty());
+
+    let (status, body) = s
+        .post(
+            "/couchsearch/_design/inventory/_search/fruits",
+            json!({"q": "*:*", "drilldown": [["state", "old", "new"], ["item", "apple"]], "include_docs": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["doc"]["item"], "apple");
+
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search/fruits?q=*:*&drilldown=%5B%22state%22,%22old%22%5D&drilldown=%5B%22item%22,%22apple%22%5D&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["rows"].as_array().unwrap().is_empty());
+
+    let (_, apple) = s.get("/couchsearch/apple").await;
+    let (status, _) = s
+        .post(
+            "/couchsearch/_bulk_docs",
+            json!({"docs": [{"_id": "apple", "_rev": apple["_rev"], "item": "apple2", "place": "kitchen", "state": "new", "price": 0.99}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s
+        .get("/couchsearch/_design/inventory/_search/fruits?q=item:apple2&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["doc"]["item"], "apple2");
+
+    let (status, _) = s.post("/couchsearch/_search_cleanup", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn couchdb_partition_search_ports() {
+    let s = Server::start(false);
+    let (status, _) = s.put("/couchpsearch?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (1..=10)
+        .map(|i| {
+            let partition = if i % 2 == 0 { "foo" } else { "bar" };
+            json!({"_id": format!("{partition}:{i}"), "some": "field", "value": i})
+        })
+        .collect();
+    let (status, _) = s
+        .post("/couchpsearch/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/couchpsearch/_design/library",
+            json!({"indexes": {"books": {
+                "analyzer": {"name": "standard"},
+                "index": "function(doc) { if (doc.some) { index('some', doc.some); } }"
+            }}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/couchpsearch/_partition/foo/_design/library/_search/books?q=some:field")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["foo:10", "foo:2", "foo:4", "foo:6", "foo:8"]);
+
+    let (status, body) = s
+        .get("/couchpsearch/_partition/foo/_design/library/_search/books?q=some:field&limit=3")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let bookmark = body["bookmark"].as_str().unwrap().to_string();
+    let (status, body) = s
+        .get(&format!(
+            "/couchpsearch/_partition/foo/_design/library/_search/books?q=some:field&limit=3&bookmark={bookmark}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["foo:6", "foo:8"]);
+
+    let (status, _) = s
+        .get("/couchpsearch/_partition/foo/_design/library/_search/books?q=some:field&limit=2001")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pouchdb_local_docs_revs_diff_and_bulk_get_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchports").await;
+
+    let (status, body) = s.put("/pouchports/_local/foo", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "0-1");
+    let (status, body) = s.get("/pouchports/_local/foo").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_id"], "_local/foo");
+    assert_eq!(body["_rev"], "0-1");
+    assert!(body.get("_revisions").is_none());
+
+    let (_, body) = s.get("/pouchports/_all_docs").await;
+    assert_eq!(body["total_rows"], 0);
+    let (_, body) = s.get("/pouchports/_changes").await;
+    assert!(body["results"].as_array().unwrap().is_empty());
+
+    let (status, body) = s.delete("/pouchports/_local/foo?rev=0-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rev"], "0-0");
+    let (status, _) = s.get("/pouchports/_local/foo").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = s.put("/pouchports/_local/foo", json!({"v": 2})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "0-1");
+
+    // revs_diff: known leaves are not missing; unknown revisions are.
+    let (status, first) = s.put("/pouchports/somestuff", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rev1 = first["rev"].as_str().unwrap().to_string();
+    let (status, second) = s
+        .put("/pouchports/somestuff", json!({"_rev": rev1, "v": 2}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rev2 = second["rev"].as_str().unwrap().to_string();
+    let (status, body) = s
+        .post("/pouchports/_revs_diff", json!({"somestuff": [rev1, rev2]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("somestuff").is_none());
+    let missing = "2-00000000000000000000000000000000";
+    let (status, body) = s
+        .post(
+            "/pouchports/_revs_diff",
+            json!({"somestuff": [rev1, rev2, missing], "ghost": ["1-a", "2-a"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["somestuff"]["missing"][0], missing);
+    assert_eq!(body["ghost"]["missing"], json!(["1-a", "2-a"]));
+
+    // bulk_get: revisions are opt-in.
+    let (status, body) = s
+        .post(
+            "/pouchports/_bulk_get",
+            json!({"docs": [{"id": "somestuff"}, {"id": "ghost"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["docs"][0]["ok"]["_id"], "somestuff");
+    assert!(body["results"][0]["docs"][0]["ok"]
+        .get("_revisions")
+        .is_none());
+    assert!(body["results"][1]["docs"][0].get("error").is_some());
+
+    let (status, body) = s
+        .post(
+            "/pouchports/_bulk_get?revs=true",
+            json!({"docs": [{"id": "somestuff", "rev": rev2}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"][0]["docs"][0]["ok"]["_revisions"]["ids"][0],
+        rev2.split_once('-').unwrap().1
+    );
+}
+
+#[tokio::test]
+async fn pouchdb_changes_and_all_docs_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchchanges").await;
+
+    let (status, body) = s.get("/pouchchanges/_changes?since=now").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"].as_array().unwrap().is_empty());
+    let since = body["last_seq"].to_string();
+
+    let (status, _) = s.put("/pouchchanges/one", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s
+        .get(&format!(
+            "/pouchchanges/_changes?since={since}&include_docs=true"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+    assert_eq!(body["results"][0]["doc"]["n"], 1);
+
+    let (status, body) = s.get("/pouchchanges/_changes?limit=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"].as_array().unwrap().is_empty());
+
+    let (status, _) = s.put("/pouchchanges/a", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.put("/pouchchanges/c", json!({"n": 3})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/pouchchanges/_all_docs?descending=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["one", "c", "a"]);
+
+    let (status, body) = s
+        .get("/pouchchanges/_all_docs?include_docs=true&skip=1&limit=1")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["id"], "c");
+    assert_eq!(body["rows"][0]["doc"]["n"], 3);
+}
+
+#[tokio::test]
+async fn pouchdb_mapreduce_conflicts_and_uuids_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchviews").await;
+    let (status, _) = s
+        .post(
+            "/pouchviews/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "key": "a", "value": 1},
+                {"_id": "b", "key": "b", "value": 2},
+                {"_id": "c", "key": "c", "value": 3}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/pouchviews/_design/v",
+            json!({"views": {"by_key": {"map": "function(doc){ emit(doc.key); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/pouchviews/_design/v/_view/by_key?start_key=%22b%22&end_key=%22c%22")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["key"], "b");
+    assert_eq!(rows[0]["value"], Value::Null);
+
+    // PouchDB conflict/leaf behavior.
+    let root = "00000000000000000000000000000000";
+    let (status, _) = s
+        .post(
+            "/pouchviews/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": "2-b", "_revisions": {"start": 2, "ids": ["b", root]}},
+                {"_id": "x", "_rev": "2-c", "_revisions": {"start": 2, "ids": ["c", root]}}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/pouchviews/x?conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let conflicts = body["_conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    let (status, body) = s.get("/pouchviews/_changes?style=all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "x")
+        .unwrap();
+    assert_eq!(row["changes"].as_array().unwrap().len(), 2);
+
+    let (status, body) = s.get("/_uuids?count=4").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uuids = body["uuids"].as_array().unwrap();
+    assert_eq!(uuids.len(), 4);
+    let unique: std::collections::HashSet<&str> =
+        uuids.iter().map(|uuid| uuid.as_str().unwrap()).collect();
+    assert_eq!(unique.len(), 4);
+}
