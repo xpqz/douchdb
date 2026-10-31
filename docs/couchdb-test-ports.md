@@ -27,6 +27,7 @@ one-for-one.
 | PouchDB `test.reserved.js` | `pouchdb_reserved_ids_ports` |
 | PouchDB `test.basics.js`, `test.get.js` error cases | `pouchdb_get_and_error_ports` |
 | PouchDB `test.all_docs.js` keys/descending/deleted-doc cases | `pouchdb_all_docs_keys_ports` |
+| PouchDB `test.bulk_docs.js`, `test.design_docs.js` | `pouchdb_bulk_docs_and_design_docs_ports` |
 | CouchDB `conflicts_test.exs` header/rev cases | `couchdb_conflict_request_ports` |
 
 The set covers:

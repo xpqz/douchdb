@@ -5036,3 +5036,113 @@ async fn pouchdb_all_docs_keys_ports() {
     assert_eq!(body["rows"][0]["value"]["deleted"], true);
     assert_eq!(body["rows"][0]["doc"], Value::Null);
 }
+
+#[tokio::test]
+async fn pouchdb_bulk_docs_and_design_docs_ports() {
+    let s = Server::start(false);
+    s.fresh_db("pouchbulk").await;
+
+    let (status, rows) = s
+        .post(
+            "/pouchbulk/_bulk_docs",
+            json!({"docs": [
+                {"_id": "d1", "v": 1},
+                {"_id": "d2", "v": 2}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{rows}");
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["ok"] == true));
+
+    let (status, rows) = s
+        .post(
+            "/pouchbulk/_bulk_docs",
+            json!({"docs": [
+                {"_id": "d1", "_rev": rows[0]["rev"], "v": 10},
+                {"_id": "d2", "_rev": rows[1]["rev"], "_deleted": true}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{rows}");
+    assert!(rows.as_array().unwrap().iter().all(|row| row["ok"] == true));
+    let (status, doc) = s.get("/pouchbulk/d2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+    assert_eq!(doc["reason"], "deleted");
+
+    // Duplicate ids in one bulk request: one succeeds, one conflicts.
+    let (status, rows) = s
+        .post(
+            "/pouchbulk/_bulk_docs",
+            json!({"docs": [
+                {"_id": "dup", "v": 1},
+                {"_id": "dup", "v": 2}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows = rows.as_array().unwrap();
+    assert!(rows.iter().any(|row| row["ok"] == true));
+    assert!(rows.iter().any(|row| row["error"] == "conflict"));
+
+    // new_edits=false accepts a replication revision.
+    let (status, body) = s
+        .post(
+            "/pouchbulk/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "repdoc",
+                "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "_revisions": {"start": 1, "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},
+                "v": 1
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body, json!([]));
+    let (status, doc) = s.get("/pouchbulk/repdoc").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["_rev"], "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    // Design docs are stored, retrievable, indexed and visible in _all_docs.
+    let (status, _) = s
+        .put(
+            "/pouchbulk/_design/foo",
+            json!({
+                "views": {
+                    "scores": {
+                        "map": "function(doc){ if (typeof doc.score === 'number') emit(null, doc.score); }",
+                        "reduce": "function(keys, values, rereduce){ return sum(values); }"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, design) = s.get("/pouchbulk/_design/foo").await;
+    assert_eq!(status, StatusCode::OK, "{design}");
+    assert_eq!(design["_id"], "_design/foo");
+    let (status, _) = s
+        .post(
+            "/pouchbulk/_bulk_docs",
+            json!({"docs": [
+                {"_id": "dale", "score": 3},
+                {"_id": "mikeal", "score": 5},
+                {"_id": "max", "score": 4},
+                {"_id": "nuno", "score": 3}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s
+        .get("/pouchbulk/_design/foo/_view/scores?reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 4);
+    let (status, body) = s.get("/pouchbulk/_design/foo/_view/scores").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 15);
+    let (status, body) = s.get("/pouchbulk/_all_docs?key=%22_design%2Ffoo%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+}
