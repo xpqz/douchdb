@@ -451,6 +451,7 @@ dependencies = [
  "hmac",
  "icu_collator",
  "icu_locale_core",
+ "libc",
  "md-5",
  "opentelemetry",
  "opentelemetry-otlp",

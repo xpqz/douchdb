@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone, Copy, Debug)]
@@ -79,7 +79,7 @@ pub struct ViewSpec {
     pub partitioned: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub id: String,
     pub key: Value,
@@ -1006,14 +1006,7 @@ fn is_js_ident(value: &str) -> bool {
 }
 
 fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
-    let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
-    runtime.set_memory_limit(limits.memory);
-    runtime.set_max_stack_size(512 * 1024);
-    // A view is arbitrary user code. Stop runaway loops instead of hanging the
-    // request thread forever.
-    let deadline = Instant::now() + limits.timeout;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
-    Ok(runtime)
+    crate::js::runtime(limits.timeout, limits.memory)
 }
 
 fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
@@ -1033,7 +1026,7 @@ fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result
 /// Run the map function over batches of already-serialized documents. Batching
 /// amortizes the QuickJS call/JSON boundary; callers that already hold raw
 /// bodies (cold index builds) also avoid a Rust parse/encode round trip.
-fn run_map_json(
+pub(crate) fn run_map_json(
     source: &str,
     docs: &[(String, String)],
     limits: ViewLimits,
@@ -1044,16 +1037,42 @@ fn run_map_json(
     if let Some(native) = NativeMap::parse(source) {
         return native.run_json(docs);
     }
-
     const MAX_DOCS: usize = 256;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    if crate::js::process_enabled() {
+        let mut rows = Vec::new();
+        let mut start = 0;
+        while start < docs.len() {
+            let mut end = start;
+            let mut bytes = 2;
+            while end < docs.len()
+                && end - start < MAX_DOCS
+                && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
+            {
+                bytes += docs[end].1.len() + 1;
+                end += 1;
+            }
+            let value = crate::js::process_request(
+                "map",
+                json!({"source": source, "docs": &docs[start..end]}),
+                limits,
+            )?;
+            let chunk: Vec<Row> =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            rows.extend(chunk);
+            start = end;
+        }
+        return Ok(rows);
+    }
 
     let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
 
-    context.with(|ctx| {
-        let wrapped = format!(
-            r#"
+    crate::js::guard("map function", || {
+        context.with(|ctx| {
+            let wrapped = format!(
+                r#"
             (function () {{
               function sum(values) {{
                 var total = 0;
@@ -1086,60 +1105,62 @@ fn run_map_json(
               }};
             }})()
             "#
-        );
-        let func: rquickjs::Function = ctx
-            .eval(wrapped)
-            .map_err(|error| format!("compile: {error}"))?;
+            );
+            let func: rquickjs::Function = ctx
+                .eval(wrapped)
+                .map_err(|error| format!("compile: {error}"))?;
 
-        let mut rows = Vec::new();
-        let mut start = 0;
-        while start < docs.len() {
-            let mut end = start;
-            let mut bytes = 2;
-            while end < docs.len()
-                && end - start < MAX_DOCS
-                && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
-            {
-                bytes += docs[end].1.len() + 1;
-                end += 1;
-            }
-
-            let mut batch = String::with_capacity(bytes);
-            batch.push('[');
-            for (index, (_, doc)) in docs[start..end].iter().enumerate() {
-                if index > 0 {
-                    batch.push(',');
+            let mut rows = Vec::new();
+            let mut start = 0;
+            while start < docs.len() {
+                let mut end = start;
+                let mut bytes = 2;
+                while end < docs.len()
+                    && end - start < MAX_DOCS
+                    && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
+                {
+                    bytes += docs[end].1.len() + 1;
+                    end += 1;
                 }
-                batch.push_str(doc);
-            }
-            batch.push(']');
 
-            let first_id = &docs[start].0;
-            let output: String = func
-                .call((batch,))
-                .map_err(|error| format!("{first_id}: {error}"))?;
-            let emitted: Vec<Vec<(Value, Value)>> =
-                serde_json::from_str(&output).map_err(|error| format!("{first_id}: {error}"))?;
-            if emitted.len() != end - start {
-                return Err(format!(
-                    "{first_id}: map returned {} results for {} documents",
-                    emitted.len(),
-                    end - start
-                ));
-            }
-            for (offset, pairs) in emitted.into_iter().enumerate() {
-                let id = &docs[start + offset].0;
-                for (key, value) in pairs {
-                    rows.push(Row {
-                        id: id.clone(),
-                        key,
-                        value,
-                    });
+                let mut batch = String::with_capacity(bytes);
+                batch.push('[');
+                for (index, (_, doc)) in docs[start..end].iter().enumerate() {
+                    if index > 0 {
+                        batch.push(',');
+                    }
+                    batch.push_str(doc);
                 }
+                batch.push(']');
+
+                let first_id = &docs[start].0;
+                let output: String = func
+                    .call((batch,))
+                    .map_err(|error| format!("{first_id}: {error}"))?;
+                crate::js::check_output("map function", &output)?;
+                let emitted: Vec<Vec<(Value, Value)>> = serde_json::from_str(&output)
+                    .map_err(|error| format!("{first_id}: {error}"))?;
+                if emitted.len() != end - start {
+                    return Err(format!(
+                        "{first_id}: map returned {} results for {} documents",
+                        emitted.len(),
+                        end - start
+                    ));
+                }
+                for (offset, pairs) in emitted.into_iter().enumerate() {
+                    let id = &docs[start + offset].0;
+                    for (key, value) in pairs {
+                        rows.push(Row {
+                            id: id.clone(),
+                            key,
+                            value,
+                        });
+                    }
+                }
+                start = end;
             }
-            start = end;
-        }
-        Ok(rows)
+            Ok(rows)
+        })
     })
 }
 
@@ -1395,18 +1416,26 @@ pub(crate) fn recombine(
     run_reduce(source, &[], values, true, limits)
 }
 
-fn run_reduce(
+pub(crate) fn run_reduce(
     source: &str,
     keys: &[Value],
     values: &[Value],
     rereduce: bool,
     limits: ViewLimits,
 ) -> Result<Value, String> {
+    if crate::js::process_enabled() {
+        return crate::js::process_request(
+            "reduce",
+            json!({"source": source, "keys": keys, "values": values, "rereduce": rereduce}),
+            limits,
+        );
+    }
     let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
-    context.with(|ctx| {
-        let wrapped = format!(
-            r#"
+    crate::js::guard("reduce function", || {
+        context.with(|ctx| {
+            let wrapped = format!(
+                r#"
             (function () {{
               function sum(values) {{
                 var total = 0;
@@ -1426,21 +1455,23 @@ fn run_reduce(
               }};
             }})()
             "#
-        );
-        let func: rquickjs::Function = ctx
-            .eval(wrapped)
-            .map_err(|error| format!("compile: {error}"))?;
-        // CouchDB passes null, not [], for keys during rereduce.
-        let keys = if rereduce {
-            "null".to_string()
-        } else {
-            serde_json::to_string(keys).map_err(|error| error.to_string())?
-        };
-        let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
-        let output: String = func
-            .call((keys, values, rereduce))
-            .map_err(|error| error.to_string())?;
-        serde_json::from_str(&output).map_err(|error| error.to_string())
+            );
+            let func: rquickjs::Function = ctx
+                .eval(wrapped)
+                .map_err(|error| format!("compile: {error}"))?;
+            // CouchDB passes null, not [], for keys during rereduce.
+            let keys = if rereduce {
+                "null".to_string()
+            } else {
+                serde_json::to_string(keys).map_err(|error| error.to_string())?
+            };
+            let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
+            let output: String = func
+                .call((keys, values, rereduce))
+                .map_err(|error| error.to_string())?;
+            crate::js::check_output("reduce function", &output)?;
+            serde_json::from_str(&output).map_err(|error| error.to_string())
+        })
     })
 }
 

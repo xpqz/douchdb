@@ -52,9 +52,12 @@ Current controls:
 | `set_max_stack_size(512 KiB)` | both | JS call stack / C stack growth |
 | `set_interrupt_handler` | both | Wall-clock runaway bytecode loops |
 | Batch size / byte caps | `run_map_json` | Input to one QuickJS call |
+| 16 MiB output cap | `js::check_output` | Rust-side result parsing |
+| `catch_unwind` around calls | `js::guard` | Rust panics from the bindings |
 | No host callbacks | wrapper | No Rust functions are exposed to JS |
 | No module loader | default rquickjs runtime | `import()` has nowhere to load from |
 | Native fast paths | `NativeMap` | Simple maps never enter QuickJS |
+| `--js-sandbox process` | `src/js.rs` | Runs QuickJS in a separate process with cleared environment, `/` cwd, rlimits and no database handles |
 
 Observed behaviour:
 
@@ -86,9 +89,11 @@ What the current controls do **not** cover:
   it. Removing `eval` alone is not a security boundary; it only reduces one
   route to dynamic compilation.
 
-The conclusion is that the current setup is appropriate for a trusted
-single-operator deployment, but it should not be sold as a sandbox for
-untrusted tenants.
+The conclusion is that the default in-process setup is appropriate for a
+trusted single-operator deployment, but it should not be sold as a sandbox for
+untrusted tenants. The optional `--js-sandbox process` mode is the first real
+containment step; it still needs seccomp/Landlock and a worker pool to be a
+complete answer.
 
 ## Option A: harden the in-process runtime
 
@@ -102,14 +107,59 @@ Lowest effort, no new process or wasm build:
 - lower memory/stack defaults and add a hard output cap;
 - add the CouchDB sandboxing cases to the conformance suite.
 
-This reduces accidental damage but does not fix memory-unsafety or crash
-containment. `catch_unwind` cannot catch a segfault or `abort()`. Treat this as
-hardening, not a sandbox.
+Status: the output cap and `catch_unwind` containment are implemented;
+trimming intrinsics and installing a rejecting loader are not. This reduces
+accidental damage but does not fix memory-unsafety or crash containment.
+`catch_unwind` cannot catch a segfault or `abort()`. Treat this as hardening,
+not a sandbox.
 
-## Option B: worker process (recommended first step)
+## Option B: worker process (implemented as `--js-sandbox process`)
 
-Run QuickJS in a separate `douchdb-js` process and keep the HTTP server free of
-untrusted native code. This is the model CouchDB itself uses with `couchjs`.
+Start douchdb with:
+
+```sh
+douchdb --js-sandbox process ...
+```
+
+Each map/reduce/search-index evaluation is sent to a short-lived child process
+(``douchdb --js-worker``) that has no database handles, no cluster secret and no
+inherited environment. This is the same containment model CouchDB uses with
+`couchjs`, without the long-lived dedicated process yet.
+
+What is implemented:
+
+- one request per child process over stdin/stdout JSON, with the source,
+  documents/keys/values, timeout and memory limit;
+- `env_clear()` and `current_dir("/")`, so the worker does not inherit the
+  cluster secret, data paths or CWD;
+- `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_CORE`, `RLIMIT_FSIZE` and `RLIMIT_NOFILE`;
+- `PR_SET_NO_NEW_PRIVS`;
+- a hidden `--js-worker` mode that runs the normal map/reduce/index code in the
+  child; the parent's sandbox flag is false in the child, so there is no
+  recursive spawning;
+- the existing 16 MiB output cap and QuickJS memory/stack/interrupt limits;
+- native `NativeMap` fast paths remain in the server process because they are
+  Rust, not JavaScript.
+
+The default remains `--js-sandbox native`. Use `process` for deployments where
+design documents are untrusted.
+
+What is not implemented yet:
+
+- seccomp or Landlock, so a QuickJS memory-corruption exploit could still make
+  system calls;
+- a persistent worker pool, so every JS call pays process startup (notably
+  reduce-heavy queries);
+- a parent-side wall-clock kill for a worker stuck below the JS interrupt
+  handler; the CPU rlimit is the backstop.
+
+Run:
+
+```sh
+cargo test --test conformance quickjs_process_sandbox_runs_views_reduce_and_search
+```
+
+The original shape was:
 
 ### Shape
 
@@ -121,8 +171,9 @@ douchdb (HTTP)  -- framed request -->  douchdb-js worker
 A request carries the source, the operation (`map`, `reduce`, `search_index`),
 the documents/keys/values and the limits. The response carries rows/values or a
 structured error. Framing can be length-prefixed JSON or MessagePack over
-stdin/stdout, a Unix socket or a socketpair. The worker is single-purpose and
-has no CouchDB code, database paths or network client.
+stdin/stdout, a Unix socket or a socketpair. In the implementation the child is
+the same binary in a hidden `--js-worker` mode: it runs only the map/reduce/
+index path and does not open databases or construct the HTTP state.
 
 ### Isolation
 
@@ -212,19 +263,19 @@ entirely, but currently has different language semantics, performance and
 compatibility from QuickJS. It is worth a spike for a future engine option, not
 the first move for CouchDB compatibility.
 
-## Recommendation
+## Recommendation and status
 
-Use a `JsEngine` boundary and migrate in two stages:
+Use a `JsEngine` boundary and migrate in stages:
 
-1. **Now: harden and measure.**
-   - Add sandbox conformance tests from CouchDB's view suite.
-   - Cap input/output rows and bytes; reject oversized results.
-   - Add a dedicated execution thread and panic containment.
-   - Document that in-process QuickJS is not a security boundary.
-2. **Next: worker process.**
-   - Extract the map/reduce/index wrappers behind a `JsEngine` trait.
-   - Add a supervised worker with rlimits and Linux seccomp/Landlock.
-   - Pool workers; kill and restart on timeout or crash.
+1. **Done: harden and measure.**
+   - Added CouchDB sandbox conformance cases and a deadline test.
+   - Added a 16 MiB output cap and Rust panic containment.
+   - Documented that in-process QuickJS is not a security boundary.
+2. **In progress: worker process.**
+   - Implemented `--js-sandbox process` with env clearing, cwd isolation,
+     rlimits and no database handles.
+   - Next: add seccomp/Landlock, a warmed worker pool, and parent-side kill on
+     timeout.
    - Make it the default for deployments that execute untrusted design docs.
 3. **Then: WASM engine.**
    - Build a pinned QuickJS WASM runner and run it under wasmtime/wasmi.

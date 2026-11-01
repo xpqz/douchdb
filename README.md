@@ -319,11 +319,12 @@ Behaviour and limits:
 - Map/reduce functions default to a 64 MiB heap, a 512 KiB stack and a 5 s
   wall-clock limit per query; change the heap and timeout with
   `--view-memory-mb` and `--view-timeout-ms`.
-- JavaScript runs in an in-process QuickJS runtime. The heap, stack and
-  wall-clock limits protect availability, but this is not a security boundary
-  against hostile design documents. See
-  [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md) for the threat model and
-  the worker-process/WASM options.
+- JavaScript runs in QuickJS. The default is in-process with heap, stack and
+  wall-clock limits; `--js-sandbox process` runs each evaluation in a
+  short-lived worker with a cleared environment, `/` cwd and rlimits. Neither
+  mode is a complete security boundary against hostile design documents yet
+  (the worker still needs seccomp/Landlock, and the WASM engine is future
+  work). See [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.
 - On a cluster, the coordinator fetches map rows from every node and merges
@@ -415,6 +416,7 @@ douchdb with `--cors-origins` for that origin (see below).
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
         [--advertise URL] [--seed-nodes URL,URL]
+        [--js-sandbox native|process]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--otel-endpoint URL]
@@ -433,6 +435,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
 | `--advertise` | matching `--nodes` entry | URL shown for this node in cluster views |
 | `--seed-nodes` | empty | Extra peers probed for membership discovery |
+| `--js-sandbox` | `native` | `native` runs QuickJS in-process; `process` runs each JS evaluation in a short-lived worker with cleared environment and rlimits |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
