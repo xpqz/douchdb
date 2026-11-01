@@ -57,7 +57,8 @@ Current controls:
 | No host callbacks | wrapper | No Rust functions are exposed to JS |
 | No module loader | default rquickjs runtime | `import()` has nowhere to load from |
 | Native fast paths | `NativeMap` | Simple maps never enter QuickJS |
-| `--js-sandbox process` | `src/js.rs` | Runs QuickJS in a separate process with cleared environment, `/` cwd, rlimits and no database handles |
+| `--js-sandbox process` | `src/js.rs` | Runs QuickJS in a pooled separate process with cleared environment, `/` cwd, rlimits, seccomp and no database handles |
+| `--js-sandbox wasm` | `src/js.rs`, `wasm/` | Runs QuickJS as WASI under `wasmi` with fuel, linear-memory and output limits |
 
 Observed behaviour:
 
@@ -92,8 +93,8 @@ What the current controls do **not** cover:
 The conclusion is that the default in-process setup is appropriate for a
 trusted single-operator deployment, but it should not be sold as a sandbox for
 untrusted tenants. The optional `--js-sandbox process` mode is the first real
-containment step; it still needs seccomp/Landlock and a worker pool to be a
-complete answer.
+containment step; an optional Landlock policy would add defense in depth on
+top of its seccomp denylist.
 
 ## Option A: harden the in-process runtime
 
@@ -121,19 +122,24 @@ Start douchdb with:
 douchdb --js-sandbox process ...
 ```
 
-Each map/reduce/search-index evaluation is sent to a short-lived child process
-(``douchdb --js-worker``) that has no database handles, no cluster secret and no
-inherited environment. This is the same containment model CouchDB uses with
-`couchjs`, without the long-lived dedicated process yet.
+Each map/reduce/search-index evaluation is sent to a small pool of child
+processes (``douchdb --js-worker``) that have no database handles, no cluster
+secret and no inherited environment. This is the same containment model CouchDB
+uses with `couchjs`. The pool defaults to two workers and is controlled by
+`--js-workers N`.
 
 What is implemented:
 
-- one request per child process over stdin/stdout JSON, with the source,
-  documents/keys/values, timeout and memory limit;
+- length-prefixed JSON frames over stdin/stdout to a pooled child, with the
+  source, documents/keys/values, timeout and memory limit;
+- a small worker pool (`--js-workers`, default 2) so processes are reused;
+- a watchdog that kills a worker after the request deadline + 2 s;
 - `env_clear()` and `current_dir("/")`, so the worker does not inherit the
   cluster secret, data paths or CWD;
-- `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_CORE`, `RLIMIT_FSIZE` and `RLIMIT_NOFILE`;
-- `PR_SET_NO_NEW_PRIVS`;
+- `RLIMIT_AS`, `RLIMIT_CORE`, `RLIMIT_FSIZE` and `RLIMIT_NOFILE`; the
+  per-request watchdog is the CPU backstop for pooled workers;
+- `PR_SET_NO_NEW_PRIVS` and a Linux seccomp denylist for file, network,
+  exec, process-inspection and io_uring syscalls;
 - a hidden `--js-worker` mode that runs the normal map/reduce/index code in the
   child; the parent's sandbox flag is false in the child, so there is no
   recursive spawning;
@@ -146,12 +152,9 @@ design documents are untrusted.
 
 What is not implemented yet:
 
-- seccomp or Landlock, so a QuickJS memory-corruption exploit could still make
-  system calls;
-- a persistent worker pool, so every JS call pays process startup (notably
-  reduce-heavy queries);
-- a parent-side wall-clock kill for a worker stuck below the JS interrupt
-  handler; the CPU rlimit is the backstop.
+- a Landlock filesystem policy on top of the seccomp denylist (seccomp already
+  denies the file-opening syscalls the worker needs to stop using);
+- platform-specific sandboxing outside Linux.
 
 Run:
 
@@ -203,11 +206,30 @@ This is the best risk reduction per unit of work for a Linux server and keeps
 the current QuickJS semantics and performance. It does not make QuickJS
 memory-safe; it makes a QuickJS compromise unable to reach the host.
 
-## Option C: QuickJS in WebAssembly
+## Option C: QuickJS in WebAssembly (implemented as `--js-sandbox wasm`)
 
-Compile QuickJS to `wasm32-wasip1` (or a freestanding WASM target) and run the
-module inside a WebAssembly runtime. The host never exposes a native function to
-the JS engine; the only interface is linear memory plus a small set of imports.
+Compile QuickJS to `wasm32-wasip1` and run the module inside `wasmi`. The host
+never exposes a native function to the JS engine; the only interface is linear
+memory plus WASI stdio. Start douchdb with:
+
+```sh
+douchdb --js-sandbox wasm ...
+```
+
+The checked-in `wasm/qjs-runner.wasm` is built from
+`wasm/qjs-runner/` with `quickjs-wasm-rs`. The host compiles the module once,
+then creates a fresh `Store`/instance per request with:
+
+- a WASI context containing only the request on stdin and an in-memory stdout,
+  with no preopens, environment or args;
+- a 128 MiB linear-memory cap (`StoreLimits`);
+- a fuel budget derived from the request timeout (2 million fuel per
+  millisecond, minimum 500 million);
+- a JSON request/response envelope matching the process worker.
+
+The runner has no filesystem or network imports that can reach the host; a wasm
+trap (including fuel exhaustion or memory growth failure) fails only that
+request. `NativeMap` fast paths still run in the server process.
 
 ### Shape
 
@@ -233,24 +255,19 @@ the JS engine; the only interface is linear memory plus a small set of imports.
 
 ### Build and supply chain
 
-This is the main cost. `quickjs-wasm-sys`/`quickjs-wasm-rs` from Javy are
-deprecated. A production build needs a maintained path, for example:
-
-- QuickJS-ng cross-compiled with a pinned WASI SDK, plus a tiny C shim;
-- a hermetic build script with a checksummed `.wasm` artifact checked into the
-  repository or produced by CI;
-- a reproducible build and a policy for updating QuickJS/WASI SDK/wasmtime.
-
-Without that, "wasm" becomes an unpinned binary blob or a network-dependent
-build step, which is worse than the current in-process engine.
+The runner currently uses `quickjs-wasm-rs` (deprecated upstream) and a
+WASI SDK build. The checked-in artifact is reproducible with the commands in
+`wasm/README.md`; the source is in `wasm/qjs-runner/`. A production follow-up
+should move to a maintained QuickJS WASI build (for example QuickJS-ng), pin
+the WASI SDK, and verify the artifact checksum in CI.
 
 ### Performance
 
 WASM adds a module boundary, linear-memory copies and a slower interpreter
 (QuickJS compiled to wasm is not the same as native QuickJS). The JSON bridge is
-the same shape as today, but every input/output crosses linear memory. This must
-be benchmarked on cold index builds and warm map queries before making it the
-default. Keep the native `NativeMap` fast path regardless.
+the same shape as today, but every input/output crosses linear memory. This
+still needs benchmarking on cold index builds and warm map queries before
+making it the default. Keep the native `NativeMap` fast path regardless.
 
 WASM is the right long-term default if the deployment needs a portable,
 memory-safe boundary or runs untrusted tenants on shared infrastructure. It is
@@ -271,22 +288,24 @@ Use a `JsEngine` boundary and migrate in stages:
    - Added CouchDB sandbox conformance cases and a deadline test.
    - Added a 16 MiB output cap and Rust panic containment.
    - Documented that in-process QuickJS is not a security boundary.
-2. **In progress: worker process.**
+2. **Done: worker process.**
    - Implemented `--js-sandbox process` with env clearing, cwd isolation,
-     rlimits and no database handles.
-   - Next: add seccomp/Landlock, a warmed worker pool, and parent-side kill on
-     timeout.
+     rlimits, no database handles, a seccomp denylist, a parent-side kill
+     watchdog and a warmed worker pool.
+   - Optional Landlock policy remains.
    - Make it the default for deployments that execute untrusted design docs.
-3. **Then: WASM engine.**
-   - Build a pinned QuickJS WASM runner and run it under wasmtime/wasmi.
-   - Enforce memory, epoch/fuel and output limits.
-   - Run the same `JsEngine` conformance suite and benchmarks.
-   - Offer `--js-engine=native|process|wasm`; choose the default based on the
-     threat model and measured cost.
+3. **Done: WASM engine.**
+   - Checked in a QuickJS WASI runner and run it under `wasmi`.
+   - Enforced linear memory, fuel and output limits.
+   - Exposed it as `--js-sandbox wasm` and covered it with the same view,
+     reduce, search and deadline tests.
+   - Remaining: migrate off the deprecated `quickjs-wasm-rs` build and
+     benchmark before choosing a default.
 
-This order gets crash containment quickly, keeps the door open for WASM, and
-avoids pretending that removing `eval` or setting a memory limit is a security
-sandbox.
+This gets crash containment and a portable memory-safe engine without pretending
+that removing `eval` or setting a memory limit is a security sandbox. The
+default remains `native`; `process` is the Linux containment boundary and
+`wasm` is the portable option.
 
 ## Validation matrix
 
@@ -310,8 +329,10 @@ Every engine must pass the same cases:
 - Is the deployment single-tenant/trusted, or must design docs be treated as
   hostile? That decides whether the worker process is mandatory.
 - Linux-only sandboxing or cross-platform process isolation?
-- Is a checked-in wasm artifact acceptable, or must the build be fully
-  reproducible from source?
+- Resolved for now: the runner source and the built `.wasm` are checked in;
+  CI checksum verification and a maintained upstream QuickJS WASI build remain
+  follow-ups.
 - What performance regression is acceptable for untrusted tenants?
-- Should the worker run one request per process (strongest isolation, highest
-  cost) or a warmed pool with a fresh QuickJS runtime per request?
+- Resolved for the worker path: a warmed pool with a fresh QuickJS runtime per
+  request; `--js-workers` controls its size. One process per request remains a
+  stronger-isolation option if needed.

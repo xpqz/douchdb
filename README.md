@@ -320,11 +320,11 @@ Behaviour and limits:
   wall-clock limit per query; change the heap and timeout with
   `--view-memory-mb` and `--view-timeout-ms`.
 - JavaScript runs in QuickJS. The default is in-process with heap, stack and
-  wall-clock limits; `--js-sandbox process` runs each evaluation in a
-  short-lived worker with a cleared environment, `/` cwd and rlimits. Neither
-  mode is a complete security boundary against hostile design documents yet
-  (the worker still needs seccomp/Landlock, and the WASM engine is future
-  work). See [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
+  wall-clock limits; `--js-sandbox process` uses a warmed worker pool with a
+  cleared environment, `/` cwd, rlimits, a seccomp denylist and a kill
+  watchdog; `--js-sandbox wasm` runs the checked-in QuickJS WASM runner under
+  `wasmi` with fuel and linear-memory limits. See
+  [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.
 - On a cluster, the coordinator fetches map rows from every node and merges
@@ -416,7 +416,7 @@ douchdb with `--cors-origins` for that origin (see below).
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
         [--advertise URL] [--seed-nodes URL,URL]
-        [--js-sandbox native|process]
+        [--js-sandbox native|process|wasm] [--js-workers N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--otel-endpoint URL]
@@ -435,7 +435,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
 | `--advertise` | matching `--nodes` entry | URL shown for this node in cluster views |
 | `--seed-nodes` | empty | Extra peers probed for membership discovery |
-| `--js-sandbox` | `native` | `native` runs QuickJS in-process; `process` runs each JS evaluation in a short-lived worker with cleared environment and rlimits |
+| `--js-sandbox` | `native` | `native` runs QuickJS in-process; `process` uses a warmed worker pool; `wasm` runs the checked-in WASM QuickJS runner under `wasmi` |
+| `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |

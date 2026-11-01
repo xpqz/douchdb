@@ -1040,7 +1040,7 @@ pub(crate) fn run_map_json(
     const MAX_DOCS: usize = 256;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
 
-    if crate::js::process_enabled() {
+    if crate::js::sandboxed() {
         let mut rows = Vec::new();
         let mut start = 0;
         while start < docs.len() {
@@ -1053,7 +1053,7 @@ pub(crate) fn run_map_json(
                 bytes += docs[end].1.len() + 1;
                 end += 1;
             }
-            let value = crate::js::process_request(
+            let value = crate::js::sandbox_request(
                 "map",
                 json!({"source": source, "docs": &docs[start..end]}),
                 limits,
@@ -1423,8 +1423,8 @@ pub(crate) fn run_reduce(
     rereduce: bool,
     limits: ViewLimits,
 ) -> Result<Value, String> {
-    if crate::js::process_enabled() {
-        return crate::js::process_request(
+    if crate::js::sandboxed() {
+        return crate::js::sandbox_request(
             "reduce",
             json!({"source": source, "keys": keys, "values": values, "rereduce": rereduce}),
             limits,

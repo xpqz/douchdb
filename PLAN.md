@@ -358,11 +358,12 @@ Above ~6k means something was built that nobody asked for.
   Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
   QuickJS runs in-process behind memory/stack/interrupt limits by default;
-  `--js-sandbox process` sends map/reduce/index calls to a short-lived worker
-  with a cleared environment, `/` cwd and rlimits. That contains crashes and
-  host-handle access but still needs seccomp/Landlock and a worker pool. A WASM
-  QuickJS engine is the next portable, memory-safe option. See
-  `docs/quickjs-sandbox.md`.
+  `--js-sandbox process` sends map/reduce/index calls to a warmed worker pool
+  with a cleared environment, `/` cwd, rlimits, a seccomp denylist and a
+  parent-side kill watchdog. That contains crashes and host-handle access;
+  optional Landlock policy remains. A checked-in QuickJS WASI runner under
+  `wasmi` is available via `--js-sandbox wasm`, with fuel and linear-memory
+  limits. See `docs/quickjs-sandbox.md`.
   Design documents replicate to every node; a cluster view query fails with
   `502` if a node is unreachable instead of returning partial rows.
 * **v0.2 protocol pass.** `_changes` is a true chunked continuous feed with
