@@ -10,3 +10,6 @@
 # Python caches
 __pycache__/
 *.pyc
+
+# nested WASM runner build output
+/wasm/qjs-runner/target

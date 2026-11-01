@@ -43,6 +43,7 @@ struct Args {
     seed_nodes: Vec<String>,
     sync_secs: u64,
     js_sandbox: String,
+    js_workers: usize,
     worker: bool,
     cors_origins: Vec<String>,
     view_timeout_ms: u64,
@@ -66,6 +67,7 @@ fn parse_args() -> Args {
         seed_nodes: Vec::new(),
         sync_secs: 5,
         js_sandbox: "native".to_string(),
+        js_workers: 2,
         worker: false,
         cors_origins: Vec::new(),
         view_timeout_ms: 5000,
@@ -115,6 +117,9 @@ fn parse_args() -> Args {
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
             "--js-sandbox" => args.js_sandbox = it.next().unwrap_or_else(|| "native".to_string()),
             "--js-worker" => args.worker = true,
+            "--js-workers" => {
+                args.js_workers = it.next().and_then(|value| value.parse().ok()).unwrap_or(2)
+            }
             "--view-timeout-ms" => {
                 args.view_timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(5000)
             }
@@ -141,7 +146,7 @@ fn parse_args() -> Args {
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
-                     \x20       [--js-sandbox native|process]\n\
+                     \x20       [--js-sandbox native|process|wasm] [--js-workers N]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -162,17 +167,18 @@ fn parse_args() -> Args {
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
     if args.worker {
-        if let Err(error) = js::run_worker_stdio() {
+        if let Err(error) = js::install_seccomp().and_then(|_| js::run_worker_stdio()) {
             eprintln!("js worker: {error}");
             std::process::exit(1);
         }
         return Ok(());
     }
     match args.js_sandbox.as_str() {
-        "native" => js::configure(false),
-        "process" => js::configure(true),
+        "native" => js::configure(js::Sandbox::Native, args.js_workers),
+        "process" => js::configure(js::Sandbox::Process, args.js_workers),
+        "wasm" => js::configure(js::Sandbox::Wasm, args.js_workers),
         other => {
-            eprintln!("unknown --js-sandbox value: {other} (expected native or process)");
+            eprintln!("unknown --js-sandbox value: {other} (expected native, process or wasm)");
             std::process::exit(2);
         }
     }

@@ -5654,6 +5654,7 @@ async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
             json!({
                 "views": {
                     "by_city": {"map": "function(doc){ emit(doc.city, doc.price); }"},
+                    "computed": {"map": "function(doc){ var suffix = '-x'; emit(doc.city + suffix, doc.price); }"},
                     "total": {
                         "map": "function(doc){ emit(null, doc.price); }",
                         "reduce": "function(keys, values, rereduce){ return sum(values); }"
@@ -5672,6 +5673,11 @@ async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    let (status, body) = s
+        .get("/jsprocess/_design/v/_view/computed?reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["key"], "Berlin-x");
     let (status, body) = s.get("/jsprocess/_design/v/_view/total").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["value"], 30);
@@ -5711,6 +5717,128 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "worker deadline was not enforced: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn quickjs_process_pool_handles_concurrent_queries() {
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "process".to_string(),
+        "--js-workers".to_string(),
+        "2".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jspool").await;
+    let (status, _) = s
+        .post(
+            "/jspool/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin"},
+                {"_id": "b", "city": "Paris"},
+                {"_id": "c", "city": "Berlin"},
+                {"_id": "d", "city": "Rome"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jspool/_design/v",
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let requests = (0..8).map(|_| s.get("/jspool/_design/v/_view/by_city?reduce=false"));
+    let results = futures::future::join_all(requests).await;
+    for (status, body) in results {
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 4, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
+    let args = vec!["--js-sandbox".to_string(), "wasm".to_string()];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jswasm").await;
+    let (status, _) = s
+        .post(
+            "/jswasm/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin", "price": 10},
+                {"_id": "b", "city": "Paris", "price": 20}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jswasm/_design/v",
+            json!({
+                "views": {
+                    "by_city": {"map": "function(doc){ emit(doc.city, doc.price); }"},
+                    "computed": {"map": "function(doc){ var suffix = '-x'; emit(doc.city + suffix, doc.price); }"},
+                    "total": {
+                        "map": "function(doc){ emit(null, doc.price); }",
+                        "reduce": "function(keys, values, rereduce){ return sum(values); }"
+                    }
+                },
+                "indexes": {
+                    "cities": {"index": "function(doc){ index('city', doc.city); }"}
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get("/jswasm/_design/v/_view/by_city?reduce=false").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    let (status, body) = s.get("/jswasm/_design/v/_view/computed?reduce=false").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["key"], "Berlin-x");
+    let (status, body) = s.get("/jswasm/_design/v/_view/total").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 30);
+
+    let (status, body) = s
+        .get("/jswasm/_design/v/_search/cities?q=city:Berlin&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["id"], "a");
+}
+
+#[tokio::test]
+async fn quickjs_wasm_sandbox_enforces_the_deadline() {
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "wasm".to_string(),
+        "--view-timeout-ms".to_string(),
+        "150".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jswloop").await;
+    let (status, _) = s.put("/jswloop/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jswloop/_design/v",
+            json!({"views": {"loop": {"map": "function(doc){ while (true) {} }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let started = std::time::Instant::now();
+    let (status, body) = s.get("/jswloop/_design/v/_view/loop").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "view_error");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "wasm fuel deadline was not enforced: {:?}",
         started.elapsed()
     );
 }
