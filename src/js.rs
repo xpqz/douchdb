@@ -156,7 +156,7 @@ pub fn install_seccomp() -> Result<(), String> {
     ];
     let rules: BTreeMap<i64, Vec<SeccompRule>> = denied
         .iter()
-        .map(|syscall| (*syscall as i64, Vec::new()))
+        .map(|syscall| (*syscall, Vec::new()))
         .collect();
     let arch = std::env::consts::ARCH
         .try_into()
@@ -175,6 +175,27 @@ pub fn install_seccomp() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn install_seccomp() -> Result<(), String> {
+    Ok(())
+}
+
+/// Add a Landlock layer that denies filesystem access. Best effort: kernels
+/// without Landlock still retain the seccomp denylist.
+#[cfg(target_os = "linux")]
+pub fn install_landlock() -> Result<(), String> {
+    use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, ABI};
+    let _status = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(ABI::V9))
+        .map_err(|error| format!("landlock access: {error}"))?
+        .create()
+        .map_err(|error| format!("landlock create: {error}"))?
+        .restrict_self()
+        .map_err(|error| format!("landlock restrict: {error}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_landlock() -> Result<(), String> {
     Ok(())
 }
 
@@ -645,5 +666,25 @@ fn handle_worker_request(request: Value) -> Value {
     match result {
         Ok(value) => json!({"ok": true, "value": value}),
         Err(error) => json!({"ok": false, "error": error}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn wasm_runner_matches_the_checked_in_checksum() {
+        let bytes = include_bytes!("../wasm/qjs-runner.wasm");
+        let digest = Sha256::digest(bytes);
+        let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let expected = include_str!("../wasm/qjs-runner.sha256")
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "rebuild wasm/qjs-runner.wasm or update wasm/qjs-runner.sha256"
+        );
     }
 }

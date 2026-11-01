@@ -167,7 +167,10 @@ fn parse_args() -> Args {
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
     if args.worker {
-        if let Err(error) = js::install_seccomp().and_then(|_| js::run_worker_stdio()) {
+        if let Err(error) = js::install_seccomp()
+            .and_then(|_| js::install_landlock())
+            .and_then(|_| js::run_worker_stdio())
+        {
             eprintln!("js worker: {error}");
             std::process::exit(1);
         }

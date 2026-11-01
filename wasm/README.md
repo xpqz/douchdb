@@ -4,7 +4,7 @@
 wrappers as the native view/search code. The host compiles it once, gives it a
 request on stdin and reads a JSON response from stdout. It has no filesystem or
 network capabilities: the WASI context has no preopens and only memory, fuel
-and a 256 MiB linear-memory cap are granted.
+and a 128 MiB linear-memory cap are granted.
 
 Rebuild it with the pinned toolchain:
 
@@ -23,4 +23,10 @@ Expected artifact checksum for the checked-in binary:
 
 ```text
 b01ccc8d63dd1953e6b4a4d488dddc7c223452315d5c75dc4b8e46087309f424  qjs-runner.wasm
+```
+
+`wasm/qjs-runner.sha256` is the manifest checked by the unit test:
+
+```sh
+cargo test --bin douchdb wasm_runner_matches_the_checked_in_checksum
 ```
