@@ -5916,3 +5916,64 @@ async fn process_worker_installs_the_seccomp_filter() {
         "worker has no seccomp filter: {status}"
     );
 }
+
+#[tokio::test]
+async fn changes_pagination_resumes_across_interleaved_shard_pages() {
+    use md5::{Digest, Md5};
+
+    let args = vec!["--q".to_string(), "2".to_string()];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("changespages").await;
+
+    // More than the 1,024-row internal page per shard, with IDs interleaved
+    // between the two shards. This exercises the merge cursor and a resume at
+    // the last emitted sequence.
+    let mut per_shard = [Vec::new(), Vec::new()];
+    let mut n = 0usize;
+    while per_shard[0].len() < 1_100 || per_shard[1].len() < 1_100 {
+        let id = format!("chg{n:05}");
+        let digest = Md5::digest(id.as_bytes());
+        let shard = (u32::from_be_bytes(digest[..4].try_into().unwrap()) % 2) as usize;
+        if per_shard[shard].len() < 1_100 {
+            per_shard[shard].push(id);
+        }
+        n += 1;
+    }
+    let mut expected = per_shard.concat();
+    expected.sort();
+    for chunk in expected.chunks(500) {
+        let docs: Vec<Value> = chunk.iter().map(|id| json!({"_id": id, "v": 1})).collect();
+        let (status, _) = s
+            .post("/changespages/_bulk_docs", json!({"docs": docs}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let mut since = 0u64;
+    let mut seen = Vec::new();
+    loop {
+        let (status, body) = s
+            .get(&format!("/changespages/_changes?since={since}&limit=50"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["results"].as_array().expect("results");
+        if rows.is_empty() {
+            break;
+        }
+        seen.extend(
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap().to_string()),
+        );
+        let next = body["last_seq"].as_u64().expect("numeric last_seq");
+        assert!(next >= since, "last_seq went backwards");
+        if next == since {
+            break;
+        }
+        since = next;
+        assert!(seen.len() <= expected.len(), "duplicate rows returned");
+    }
+    let unique: std::collections::HashSet<&String> = seen.iter().collect();
+    assert_eq!(unique.len(), expected.len(), "duplicate changes rows");
+    seen.sort();
+    assert_eq!(seen, expected, "change rows had gaps");
+}

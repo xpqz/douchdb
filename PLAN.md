@@ -385,6 +385,10 @@ the bulk of the growth.
   continue detached. Reads try replicas in preference order and fall back past
   a dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
   an unmet write quorum returns `202` and anti-entropy repairs the replica.
+  Anti-entropy advances a checkpoint only after every requested revision is
+  applied, already local, or explicitly unavailable from the peer; partial
+  `_bulk_get` responses leave the checkpoint behind. The streamed changes merge
+  is covered by `changes_pagination_resumes_across_interleaved_shard_pages`.
   Database create/drop are broadcast, anti-entropy pulls only the shards a node
   replicates, and internal calls authenticate with the shared admin credentials
   (client Basic/cookie auth is forwarded to peers). The v0.1 gate — kill a node mid-replication and keep serving

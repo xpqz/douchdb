@@ -54,6 +54,13 @@ request:
 4. Write them with `_bulk_docs?new_edits=false`.
 5. Store a checkpoint in a `_local` document keyed by peer and shard-map hash.
 
+Checkpoints are advanced only after every requested revision has reached a
+terminal state: applied locally, already present locally, or explicitly
+reported unavailable by the peer (purged/pruned). A partial or malformed
+`_bulk_get` response leaves the checkpoint behind and fails the pass, so the
+next tick retries those revisions. `partial_bulk_get_does_not_advance_the_checkpoint`
+covers this path.
+
 The map-hash key means a placement change starts a fresh backfill instead of
 resuming a checkpoint that filtered out newly owned documents. This path
 repairs replicas after failed writes, a restart, or a period offline. It also
