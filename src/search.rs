@@ -611,6 +611,34 @@ fn sort_compare(
     left.id.cmp(&right.id)
 }
 
+fn empty_search_response(request: &SearchRequest) -> Value {
+    let mut response = json!({
+        "total_rows": 0,
+        "bookmark": "search:0",
+        "rows": [],
+    });
+    if !request.counts.is_empty() {
+        let counts: Map<String, Value> = request
+            .counts
+            .iter()
+            .map(|field| (field.clone(), json!({})))
+            .collect();
+        response["counts"] = Value::Object(counts);
+    }
+    if !request.ranges.is_empty() {
+        let ranges: Map<String, Value> = request
+            .ranges
+            .keys()
+            .map(|field| (field.clone(), json!({})))
+            .collect();
+        response["ranges"] = Value::Object(ranges);
+    }
+    if request.group_field.is_some() {
+        response["groups"] = json!([]);
+    }
+    response
+}
+
 pub async fn query(
     db: &Db,
     ddoc: &str,
@@ -661,9 +689,20 @@ pub async fn query(
             .map(|(field, _)| field)
             .collect();
         let parser = QueryParser::for_index(&tantivy_index, default_fields);
-        parser
-            .parse_query(query_text)
-            .map_err(|error| ApiError::bad_request(format!("invalid search query: {error}")))?
+        match parser.parse_query(query_text) {
+            Ok(query) => query,
+            // A node may hold no local documents with an indexed field even
+            // though another shard does. Treat an absent field as no local
+            // matches so cluster fan-out can merge other shards' rows.
+            Err(error) if error.to_string().contains("Field does not exist") => {
+                return Ok(empty_search_response(request));
+            }
+            Err(error) => {
+                return Err(ApiError::bad_request(format!(
+                    "invalid search query: {error}"
+                )))
+            }
+        }
     };
     let addresses = searcher
         .search(&*query, &DocSetCollector)

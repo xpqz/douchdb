@@ -101,7 +101,14 @@ pub async fn pull(
                     continue;
                 }
                 if requested.insert((id.to_string(), rev.to_string())) {
-                    reqs.push(json!({"id": id, "rev": rev, "attachments": true}));
+                    // `revs` preserves the revision history; without it the
+                    // target stores a leaf with no ancestor metadata.
+                    reqs.push(json!({
+                        "id": id,
+                        "rev": rev,
+                        "revs": true,
+                        "attachments": true
+                    }));
                 }
             }
         }

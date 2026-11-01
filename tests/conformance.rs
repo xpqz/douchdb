@@ -1554,6 +1554,19 @@ async fn cluster_routes_writes_and_merges_all_docs() {
         .collect();
     assert_eq!(ids, ["d4", "d5"]);
 
+    let (status, body) = nodes[0]
+        .get("/cluster/_all_docs?descending=true&startkey=%22d5%22&skip=1&limit=2")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["offset"], 3);
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["d4", "d3"]);
+
     // Delete on the owner, then ask for the key: keys queries must still show
     // the tombstone even though range scans omit it.
     let (_, doc) = nodes[0].get("/cluster/d0").await;
@@ -1709,13 +1722,11 @@ async fn cluster_changes_limit_covers_all_nodes() {
         }
         since = body["last_seq"].as_str().unwrap().to_string();
     }
+    let total_seen = ids.len();
     ids.sort();
     ids.dedup();
-    assert_eq!(
-        ids.len(),
-        9,
-        "limited feed must eventually cover every node"
-    );
+    assert_eq!(ids.len(), 9, "limited feed missed a node");
+    assert_eq!(total_seen, 9, "limited feed returned duplicate rows");
 }
 
 fn all_shards_on(node: usize) -> Value {
@@ -2052,6 +2063,7 @@ async fn cluster_changes_survive_node_loss_and_resume() {
 
     let (status, baseline) = nodes[0].get("/cfail/_changes?since=0").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(baseline["results"].as_array().unwrap().len(), 9);
     let ids: std::collections::HashSet<&str> = baseline["results"]
         .as_array()
         .unwrap()
@@ -2083,6 +2095,26 @@ async fn cluster_changes_survive_node_loss_and_resume() {
         "resumed feed missed new change: {ids:?}"
     );
     assert!(body["last_seq"].is_string());
+
+    // A fresh replay from zero must recover changes that lived only on the
+    // dead node; fallback shards cannot reuse the survivor's checkpoint.
+    let (status, body) = nodes[0].get("/cfail/_changes?since=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: std::collections::HashSet<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    for i in 0..9 {
+        assert!(
+            ids.contains(format!("cf{i}").as_str()),
+            "missing cf{i}: {ids:?}"
+        );
+    }
+    // While the owner is down, fallback changes are at-least-once and may
+    // replay rows already seen before the checkpoint; clients dedupe by
+    // revision. The feed must still contain every old document.
 }
 
 #[tokio::test]
@@ -5950,6 +5982,7 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
     }
 
     let mut since = 0u64;
+    let mut last_seq = 0u64;
     let mut seen = Vec::new();
     loop {
         let (status, body) = s
@@ -5960,10 +5993,15 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
         if rows.is_empty() {
             break;
         }
-        seen.extend(
-            rows.iter()
-                .map(|row| row["id"].as_str().unwrap().to_string()),
-        );
+        for row in rows {
+            let seq = row["seq"].as_u64().expect("numeric seq");
+            assert!(
+                seq > last_seq,
+                "changes rows out of order: {seq} after {last_seq}"
+            );
+            last_seq = seq;
+            seen.push(row["id"].as_str().unwrap().to_string());
+        }
         let next = body["last_seq"].as_u64().expect("numeric last_seq");
         assert!(next >= since, "last_seq went backwards");
         if next == since {
@@ -5976,4 +6014,357 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
     assert_eq!(unique.len(), expected.len(), "duplicate changes rows");
     seen.sort();
     assert_eq!(seen, expected, "change rows had gaps");
+}
+
+#[tokio::test]
+async fn cluster_all_docs_keys_honour_descending_order() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("ckeysdesc").await;
+    }
+    let (status, _) = nodes[0]
+        .post(
+            "/ckeysdesc/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a"}, {"_id": "b"}, {"_id": "c"}, {"_id": "d"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for node in &nodes {
+        let (status, body) = node
+            .post(
+                "/ckeysdesc/_all_docs?descending=true&skip=1&limit=2",
+                json!({"keys": ["a", "b", "c", "d"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 4);
+        let ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["c", "b"], "descending keys via {}", node.base);
+
+        let (status, body) = node
+            .post(
+                "/ckeysdesc/_all_docs?descending=true",
+                json!({"keys": ["a", "missing", "c"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows[0]["key"], "c");
+        assert_eq!(rows[1]["error"], "not_found");
+        assert_eq!(rows[2]["id"], "a");
+    }
+}
+
+#[tokio::test]
+async fn cluster_partitioned_all_docs_keys_ranges_and_views() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    let (status, _) = nodes[0]
+        .put("/clpartkeys?partitioned=true", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let docs = json!({"docs": [
+        {"_id": "p1:a", "n": 1},
+        {"_id": "p1:b", "n": 2},
+        {"_id": "p1:c", "n": 3},
+        {"_id": "p2:a", "n": 10},
+        {"_id": "p2:b", "n": 20}
+    ]});
+    let (status, body) = nodes[0].post("/clpartkeys/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _) = nodes[1]
+        .put(
+            "/clpartkeys/_design/p",
+            json!({
+                "views": {"by_n": {"map": "function(doc){ emit(doc.n, null); }"}},
+                "indexes": {"by_n": {"index": "function(doc){ index('n', doc.n); }"}}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Design documents use the document write path; with n=1 the quorum can
+    // return before every peer has its local copy. The search fan-out needs
+    // the ddoc on every active node.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    for node in &nodes {
+        loop {
+            let response = node
+                .client
+                .get(format!("{}/clpartkeys/_design/p", node.base))
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", "test-cluster-secret")
+                .send()
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "design doc did not reach {}: {}",
+                node.base,
+                response.status()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    for node in &nodes {
+        let (status, body) = node.get("/clpartkeys/_partition/p1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["doc_count"], 3, "{}", node.base);
+
+        let (status, body) = node
+            .get("/clpartkeys/_partition/p1/_all_docs?descending=true&limit=2")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["p1:c", "p1:b"], "{}", node.base);
+
+        let (status, body) = node
+            .get("/clpartkeys/_partition/p1/_all_docs?startkey=%22p1:b%22&endkey=%22p1:c%22")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 3);
+        let ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["p1:b", "p1:c"], "{}", node.base);
+
+        let (status, body) = node
+            .post(
+                "/clpartkeys/_partition/p1/_all_docs",
+                json!({"keys": ["p1:a", "p2:a", "p1:c"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 3);
+        assert_eq!(body["rows"][0]["id"], "p1:a");
+        assert_eq!(body["rows"][1]["error"], "not_found");
+        assert_eq!(body["rows"][2]["id"], "p1:c");
+
+        let (status, body) = node
+            .post(
+                "/clpartkeys/_partition/p1/_all_docs?descending=true",
+                json!({"keys": ["p1:a", "p1:b", "p1:c"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["p1:c", "p1:b", "p1:a"], "{}", node.base);
+
+        let (status, body) = node.get("/clpartkeys/_partition/p2/_all_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 2);
+        assert!(body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"].as_str().unwrap().starts_with("p2:")));
+
+        let (status, body) = node
+            .get("/clpartkeys/_partition/p1/_design/p/_view/by_n")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 3);
+        let keys: Vec<u64> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["key"].as_u64().unwrap())
+            .collect();
+        assert_eq!(keys, [1, 2, 3], "{}", node.base);
+
+        let (status, body) = node
+            .get("/clpartkeys/_partition/p1/_design/p/_search/by_n?q=n:2")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 1, "{}", node.base);
+        assert_eq!(body["rows"][0]["id"], "p1:b");
+    }
+}
+
+#[tokio::test]
+async fn kill9_preserves_acknowledged_documents_and_changes() {
+    let mut s = Server::start(false);
+    s.fresh_db("durable").await;
+    let docs: Vec<Value> = (0..24)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let (status, body) = s.post("/durable/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body.as_array().unwrap().iter().all(|row| row["ok"] == true));
+
+    s.kill();
+    s.restart();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (status, body) = s.get("/durable/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 24);
+    let (status, body) = s.get("/durable/d23").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["n"], 23);
+    let (status, body) = s.get("/durable/_changes?since=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 24);
+}
+
+#[tokio::test]
+async fn anti_entropy_replicates_conflicts_and_tombstones() {
+    let nodes = start_cluster_with(2, "1", 2);
+    for node in &nodes {
+        node.fresh_db("clconflict").await;
+    }
+    let root = "00000000000000000000000000000000";
+    let docs = json!({"new_edits": false, "docs": [
+        {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+         "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"},
+        {"_id": "x", "_rev": "2-cccccccccccccccccccccccccccccccc",
+         "_revisions": {"start": 2, "ids": ["cccccccccccccccccccccccccccccccc", root]}, "v": "c"},
+        {"_id": "y", "_rev": "2-dddddddddddddddddddddddddddddddd", "_deleted": true,
+         "_revisions": {"start": 2, "ids": ["dddddddddddddddddddddddddddddddd", root]}}
+    ]});
+    let response = nodes[0]
+        .client
+        .post(format!("{}/clconflict/_bulk_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        // Forwarded reads stay on this node, so a 200 proves anti-entropy
+        // actually copied the revision rather than proxying to node 0.
+        let response = nodes[1]
+            .client
+            .get(format!("{}/clconflict/x?conflicts=true", nodes[1].base))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let doc: Value = response.json().await.unwrap_or(Value::Null);
+        let response = nodes[1]
+            .client
+            .get(format!(
+                "{}/clconflict/y?rev=2-dddddddddddddddddddddddddddddddd",
+                nodes[1].base
+            ))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", "test-cluster-secret")
+            .send()
+            .await
+            .unwrap();
+        let status_y = response.status();
+        let tombstone: Value = response.json().await.unwrap_or(Value::Null);
+        if status == StatusCode::OK
+            && status_y == StatusCode::OK
+            && doc["_conflicts"].as_array().map(Vec::len) == Some(1)
+            && tombstone["_deleted"] == true
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy did not copy conflicts/tombstones: x={doc} y={tombstone}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (status, body) = nodes[1]
+        .get("/clconflict/_changes?style=all_docs&since=0")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["results"].as_array().unwrap();
+    let x = rows
+        .iter()
+        .find(|row| row["id"] == "x")
+        .unwrap_or_else(|| panic!("missing x in {body}"));
+    assert_eq!(x["changes"].as_array().unwrap().len(), 2);
+    let y = rows
+        .iter()
+        .find(|row| row["id"] == "y")
+        .unwrap_or_else(|| panic!("missing y in {body}"));
+    assert_eq!(y["deleted"], true);
+}
+
+#[tokio::test]
+async fn anti_entropy_preserves_revision_history_metadata() {
+    let nodes = start_cluster_with(2, "1", 2);
+    for node in &nodes {
+        node.fresh_db("clhistory").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, first) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/clhistory/hist",
+            Some(json!({"v": 1})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let rev1 = first["rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/clhistory/hist",
+            Some(json!({"_rev": rev1, "v": 2})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let (status, doc) = nodes[1]
+            .req_with(Method::GET, "/clhistory/hist?revs=true", None, &internal)
+            .await;
+        if status == StatusCode::OK {
+            let ids = doc["_revisions"]["ids"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if ids.len() == 2 {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy lost revision history: {doc}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

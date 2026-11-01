@@ -265,9 +265,10 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   changes under clock skew.
 * **Anti-entropy:** one pull per peer per database every `--sync-secs`, using
   the same `_changes` + `_bulk_get` + `new_edits=false` protocol clients use,
-  with documents filtered to the shards this node replicates. Runs without a
-  client request; observable and controllable through
-  `/_node/_local/_replication` and the console. Discovery probes configured
+  with documents filtered to the shards this node replicates. `_bulk_get` asks
+  for `revs=true`, so revision-history metadata survives; conflict leaves and
+  tombstones are regression-tested. Runs without a client request; observable
+  and controllable through `/_node/_local/_replication` and the console. Discovery probes configured
   nodes, `--seed-nodes` and reported memberships without changing placement.
   Internal calls authenticate with the shared `--admin` credentials; a client's
   Basic auth or `_session` cookie is forwarded when routing/fan-out needs a
@@ -369,12 +370,15 @@ the bulk of the growth.
   `Tx`es into one `WriteBatch`, and acknowledges after the batch is flushed to
   the OS. rusty-leveldb does not fsync by default, so acknowledged writes are
   not power-loss durable; comparisons must state this. A write overlay makes
-  later jobs in the same group read their predecessors.
+  later jobs in the same group read their predecessors. A SIGKILL/restart
+  conformance test confirms acknowledged documents and changes survive a
+  process crash; power loss remains explicitly out of scope.
 * **Cluster routing green.** Shard map, rendezvous placement and per-document
   proxying cover CRUD, `_bulk_docs`, `_bulk_get`, `_revs_diff` and `POST /db`
   (generated ids are routed after parsing). `_all_docs` fans out to every node,
   merges by id preferring the shard owner, then applies `startkey`/`skip`/
-  `limit`; `keys` queries also surface tombstones. `_changes` fans out per node,
+  `limit`; `keys` queries also surface tombstones and preserve request order,
+  including descending keys. `_changes` fans out per node,
   dedupes replicated documents and returns a base64url version-vector `since`/
   `last_seq`; `GET /db` reports the same vector as `update_seq`. Forwarded
   subrequests carry `x-douchdb-forwarded` so the receiving peer serves them
@@ -481,7 +485,12 @@ the bulk of the growth.
   node. Reduce partials are recombined after fallback, including
   grouped and custom `rereduce` reducers. Changes use the live-document index
   for winning revisions and compact sequence tokens, avoiding per-row metadata
-  decodes and duplicate detection. A lazy per-shard sequence index caches
+  decodes and duplicate detection. Reassigned shard masks after an owner loss
+  resume from zero because the survivor's checkpoint belongs to a different
+  shard set. Cluster `_all_docs` keys are ordered after the merge, including
+  descending requests; streamed changes are tested for strict sequence order,
+  resume boundaries and duplicate-free pagination across interleaved shards.
+  A lazy per-shard sequence index caches
   winning revisions and conflict leaves, so steady-state feeds do not scan the
   LevelDB sequence table or decode metadata. Normal changes responses are
   streamed by merging shard pages and serializing bounded chunks, with
