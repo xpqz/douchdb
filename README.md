@@ -319,6 +319,11 @@ Behaviour and limits:
 - Map/reduce functions default to a 64 MiB heap, a 512 KiB stack and a 5 s
   wall-clock limit per query; change the heap and timeout with
   `--view-memory-mb` and `--view-timeout-ms`.
+- JavaScript runs in an in-process QuickJS runtime. The heap, stack and
+  wall-clock limits protect availability, but this is not a security boundary
+  against hostile design documents. See
+  [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md) for the threat model and
+  the worker-process/WASM options.
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.
 - On a cluster, the coordinator fetches map rows from every node and merges
