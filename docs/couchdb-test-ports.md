@@ -1,10 +1,10 @@
 # CouchDB test-suite ports
 
 douchdb ports a focused subset of Apache CouchDB's Elixir integration suite
-(`test/elixir/test/`). The full suite assumes attachments, Mango, search,
+(`test/elixir/test/`). The full suite assumes attachments, Mango, Nouveau,
 rewrite/show/list/update handlers, `validate_doc_update`, advanced auth and
 resharding, so tests are selected by supported feature area rather than copied
-one-for-one.
+one-for-one. Search tests are included where the feature is supported.
 
 ## Ported cases
 
