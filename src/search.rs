@@ -41,8 +41,8 @@ struct SearchMeta {
     docs: Vec<SearchDoc>,
 }
 
-#[derive(Clone, Debug)]
-struct IndexedDoc {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct IndexedDoc {
     id: String,
     fields: Map<String, Value>,
 }
@@ -131,15 +131,10 @@ pub async fn load_spec(db: &Db, ddoc_id: &str, index_name: &str) -> DbResult<Sea
 }
 
 fn engine(limits: crate::view::ViewLimits) -> Result<rquickjs::Runtime, String> {
-    let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
-    runtime.set_memory_limit(limits.memory);
-    runtime.set_max_stack_size(512 * 1024);
-    let deadline = Instant::now() + limits.timeout;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
-    Ok(runtime)
+    crate::js::runtime(limits.timeout, limits.memory)
 }
 
-fn run_index_json(
+pub(crate) fn run_index_json(
     source: &str,
     docs: &[(String, String)],
     limits: crate::view::ViewLimits,
@@ -147,11 +142,26 @@ fn run_index_json(
     if docs.is_empty() {
         return Ok(Vec::new());
     }
+    if crate::js::process_enabled() {
+        let mut out = Vec::with_capacity(docs.len());
+        for chunk in docs.chunks(128) {
+            let value = crate::js::process_request(
+                "index",
+                json!({"source": source, "docs": chunk}),
+                limits,
+            )?;
+            let mut chunk: Vec<IndexedDoc> =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            out.append(&mut chunk);
+        }
+        return Ok(out);
+    }
     let runtime = engine(limits)?;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
-    context.with(|ctx| {
-        let wrapped = format!(
-            r#"
+    crate::js::guard("index function", || {
+        context.with(|ctx| {
+            let wrapped = format!(
+                r#"
             (function () {{
               var __out = [];
               function log(message) {{ }}
@@ -175,35 +185,37 @@ fn run_index_json(
               }};
             }})()
             "#
-        );
-        let func: rquickjs::Function = ctx
-            .eval(wrapped)
-            .map_err(|error| format!("compile: {error}"))?;
-        let mut out = Vec::with_capacity(docs.len());
-        const BATCH: usize = 128;
-        for chunk in docs.chunks(BATCH) {
-            let mut batch = String::from("[");
-            for (index, (_, raw)) in chunk.iter().enumerate() {
-                if index > 0 {
-                    batch.push(',');
+            );
+            let func: rquickjs::Function = ctx
+                .eval(wrapped)
+                .map_err(|error| format!("compile: {error}"))?;
+            let mut out = Vec::with_capacity(docs.len());
+            const BATCH: usize = 128;
+            for chunk in docs.chunks(BATCH) {
+                let mut batch = String::from("[");
+                for (index, (_, raw)) in chunk.iter().enumerate() {
+                    if index > 0 {
+                        batch.push(',');
+                    }
+                    batch.push_str(raw);
                 }
-                batch.push_str(raw);
-            }
-            batch.push(']');
-            let output: String = func
-                .call((batch,))
-                .map_err(|error| format!("{}: {error}", chunk[0].0))?;
-            let emitted: Vec<(String, Vec<(String, Value)>)> =
-                serde_json::from_str(&output).map_err(|error| error.to_string())?;
-            for (id, fields) in emitted {
-                let mut map = Map::new();
-                for (name, value) in fields {
-                    map.insert(name, value);
+                batch.push(']');
+                let output: String = func
+                    .call((batch,))
+                    .map_err(|error| format!("{}: {error}", chunk[0].0))?;
+                crate::js::check_output("index function", &output)?;
+                let emitted: Vec<(String, Vec<(String, Value)>)> =
+                    serde_json::from_str(&output).map_err(|error| error.to_string())?;
+                for (id, fields) in emitted {
+                    let mut map = Map::new();
+                    for (name, value) in fields {
+                        map.insert(name, value);
+                    }
+                    out.push(IndexedDoc { id, fields: map });
                 }
-                out.push(IndexedDoc { id, fields: map });
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     })
 }
 

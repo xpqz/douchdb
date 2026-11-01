@@ -357,10 +357,12 @@ Above ~6k means something was built that nobody asked for.
   `_view_indexes/` and update from `_changes`; design changes rebuild them.
   Strings use ICU4X collation, large groups rereduce in 1000-row batches, heap
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
-  QuickJS currently runs in-process behind memory/stack/interrupt limits; that
-  is an availability boundary, not a security sandbox. Worker-process isolation
-  is the planned next step, with a WASM QuickJS engine as the portable,
-  memory-safe option. See `docs/quickjs-sandbox.md`.
+  QuickJS runs in-process behind memory/stack/interrupt limits by default;
+  `--js-sandbox process` sends map/reduce/index calls to a short-lived worker
+  with a cleared environment, `/` cwd and rlimits. That contains crashes and
+  host-handle access but still needs seccomp/Landlock and a worker pool. A WASM
+  QuickJS engine is the next portable, memory-safe option. See
+  `docs/quickjs-sandbox.md`.
   Design documents replicate to every node; a cluster view query fails with
   `502` if a node is unreachable instead of returning partial rows.
 * **v0.2 protocol pass.** `_changes` is a true chunked continuous feed with

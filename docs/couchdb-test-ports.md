@@ -76,7 +76,8 @@ These ports exposed and fixed:
 - Show/list/rewrite/update handlers and `validate_doc_update`.
 - JWT, proxy auth, users DB and security-object administration.
 - Resharding, cluster setup/config, compaction/disk-monitor internals.
-- JavaScript changes filters and view sandboxing limits.
+- JavaScript changes filters and the full CouchDB view sandboxing matrix;
+  a focused subset is covered by `quickjs_view_sandbox_ports`.
 - CouchDB's attachment, local-doc and replication suites; douchdb has separate
   conformance coverage for replication and local documents.
 

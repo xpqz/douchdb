@@ -5556,3 +5556,161 @@ async fn background_replication_repairs_a_missed_shard_without_a_client() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["v"], 1);
 }
+
+#[tokio::test]
+async fn quickjs_view_sandbox_ports() {
+    let s = Server::start(false);
+    s.fresh_db("jsandbox").await;
+    let (status, _) = s
+        .put(
+            "/jsandbox/doc",
+            json!({"integer": 1, "string": "1", "array": [1, 2, 3]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsandbox/_design/v",
+            json!({"views": {
+                "mutate": {"map": "function(doc){ doc.integer = 2; doc.array[0] = 0; emit(null, doc); }"},
+                "gc": {"map": "function(doc){ gc(); emit(null, doc); }"},
+                "internals": {"map": "function(doc){ map_funs.push(1); emit(null, doc); }"},
+                "escape": {"map": "function(doc){ var glob = emit.constructor('return this')(); emit(doc._id, null); }"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Mutation is local to the JS value; the stored document and include_docs
+    // still see the original fields.
+    let (status, body) = s
+        .get("/jsandbox/_design/v/_view/mutate?include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"]["integer"], 2);
+    assert_eq!(body["rows"][0]["value"]["array"][0], 0);
+    assert_eq!(body["rows"][0]["doc"]["integer"], 1);
+    assert_eq!(body["rows"][0]["doc"]["array"][0], 1);
+
+    // Interpreter internals are not part of the view environment.
+    for view in ["gc", "internals"] {
+        let (status, body) = s.get(&format!("/jsandbox/_design/v/_view/{view}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{view}: {body}");
+        assert_eq!(body["error"], "view_error", "{view}: {body}");
+    }
+
+    // Function-constructor access reaches the isolated QuickJS global, not the
+    // Rust host.
+    let (status, body) = s.get("/jsandbox/_design/v/_view/escape").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["id"], "doc");
+}
+
+#[tokio::test]
+async fn quickjs_view_deadline_stops_an_infinite_loop() {
+    let args = vec!["--view-timeout-ms".to_string(), "150".to_string()];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsloop").await;
+    let (status, _) = s.put("/jsloop/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsloop/_design/v",
+            json!({"views": {"loop": {"map": "function(doc){ while (true) {} }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let started = std::time::Instant::now();
+    let (status, body) = s.get("/jsloop/_design/v/_view/loop").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "view_error");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "infinite loop was not interrupted in time: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
+    let args = vec!["--js-sandbox".to_string(), "process".to_string()];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsprocess").await;
+    let (status, _) = s
+        .post(
+            "/jsprocess/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin", "price": 10},
+                {"_id": "b", "city": "Paris", "price": 20}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsprocess/_design/v",
+            json!({
+                "views": {
+                    "by_city": {"map": "function(doc){ emit(doc.city, doc.price); }"},
+                    "total": {
+                        "map": "function(doc){ emit(null, doc.price); }",
+                        "reduce": "function(keys, values, rereduce){ return sum(values); }"
+                    }
+                },
+                "indexes": {
+                    "cities": {"index": "function(doc){ index('city', doc.city); }"}
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/jsprocess/_design/v/_view/by_city?reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    let (status, body) = s.get("/jsprocess/_design/v/_view/total").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 30);
+
+    let (status, body) = s
+        .get("/jsprocess/_design/v/_search/cities?q=city:Berlin&include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["id"], "a");
+}
+
+#[tokio::test]
+async fn quickjs_process_sandbox_enforces_the_deadline() {
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "process".to_string(),
+        "--view-timeout-ms".to_string(),
+        "150".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsploop").await;
+    let (status, _) = s.put("/jsploop/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsploop/_design/v",
+            json!({"views": {"loop": {"map": "function(doc){ while (true) {} }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let started = std::time::Instant::now();
+    let (status, body) = s.get("/jsploop/_design/v/_view/loop").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "view_error");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "worker deadline was not enforced: {:?}",
+        started.elapsed()
+    );
+}

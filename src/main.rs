@@ -9,6 +9,7 @@ mod discovery;
 mod error;
 mod etf;
 mod fabric;
+mod js;
 mod replicate;
 mod rev;
 mod revtree;
@@ -41,6 +42,8 @@ struct Args {
     advertise: String,
     seed_nodes: Vec<String>,
     sync_secs: u64,
+    js_sandbox: String,
+    worker: bool,
     cors_origins: Vec<String>,
     view_timeout_ms: u64,
     view_memory_mb: usize,
@@ -62,6 +65,8 @@ fn parse_args() -> Args {
         advertise: String::new(),
         seed_nodes: Vec::new(),
         sync_secs: 5,
+        js_sandbox: "native".to_string(),
+        worker: false,
         cors_origins: Vec::new(),
         view_timeout_ms: 5000,
         view_memory_mb: 64,
@@ -108,6 +113,8 @@ fn parse_args() -> Args {
                     .collect()
             }
             "--sync-secs" => args.sync_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(5),
+            "--js-sandbox" => args.js_sandbox = it.next().unwrap_or_else(|| "native".to_string()),
+            "--js-worker" => args.worker = true,
             "--view-timeout-ms" => {
                 args.view_timeout_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(5000)
             }
@@ -134,6 +141,7 @@ fn parse_args() -> Args {
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
                      \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
+                     \x20       [--js-sandbox native|process]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -153,6 +161,21 @@ fn parse_args() -> Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
+    if args.worker {
+        if let Err(error) = js::run_worker_stdio() {
+            eprintln!("js worker: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    match args.js_sandbox.as_str() {
+        "native" => js::configure(false),
+        "process" => js::configure(true),
+        other => {
+            eprintln!("unknown --js-sandbox value: {other} (expected native or process)");
+            std::process::exit(2);
+        }
+    }
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     if args.nodes.len() > 1 {
         if args.me >= args.nodes.len() {
