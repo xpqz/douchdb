@@ -5,8 +5,10 @@ LevelDB, runnable as a Q-shard × N-replica cluster.
 
 The goal is not to reimplement all of CouchDB. It is a server that PouchDB and
 CouchDB can replicate against in both directions, with CouchDB-compatible
-revision ids, HTTP shapes and status codes. Map/reduce views run on an embedded
-QuickJS engine; Mango, `_replicator`, lists and shows are not implemented.
+revision ids, HTTP shapes and status codes. Map/reduce views and search indexes
+run on QuickJS — native, worker-process or WASM — and design-document JavaScript
+gets no network or filesystem access. Mango, `_replicator`, lists and shows are
+not implemented.
 
 See [PLAN.md](PLAN.md) for the design, decisions and known limits.
 

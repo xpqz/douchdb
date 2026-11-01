@@ -2,7 +2,9 @@
 //!
 //! All writes for one request are staged as an ordered list of (key, value)
 //! operations and applied as a single LevelDB `WriteBatch`, so a `_bulk_docs`
-//! of a thousand documents costs one fsync, not a thousand.
+//! of a thousand documents costs one OS flush, not a thousand. rusty-leveldb
+//! does not fsync, so this is process-crash durability, not power-loss
+//! durability.
 
 use crate::cluster::ShardMap;
 pub use crate::error::{ApiError, DbResult};
