@@ -3,8 +3,9 @@
 `qjs-runner.wasm` is a WASI command that evaluates the same map/reduce/index
 wrappers as the native view/search code. The host compiles it once, gives it a
 request on stdin and reads a JSON response from stdout. It has no filesystem or
-network capabilities: the WASI context has no preopens and only memory, fuel
-and a 128 MiB linear-memory cap are granted.
+network capabilities: the WASI context has no preopens, environment or args,
+and the host grants only the request/stdout pipes plus WASI clock/random,
+memory, fuel and a 128 MiB linear-memory cap.
 
 Rebuild it with the pinned toolchain:
 

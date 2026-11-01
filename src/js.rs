@@ -182,13 +182,17 @@ pub fn install_seccomp() -> Result<(), String> {
 /// without Landlock still retain the seccomp denylist.
 #[cfg(target_os = "linux")]
 pub fn install_landlock() -> Result<(), String> {
-    use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, ABI};
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, RestrictSelfAttr, Ruleset, RulesetAttr, ABI,
+    };
     let _status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V9))
         .map_err(|error| format!("landlock access: {error}"))?
         .create()
         .map_err(|error| format!("landlock create: {error}"))?
+        .all_threads(true)
+        .map_err(|error| format!("landlock threads: {error}"))?
         .restrict_self()
         .map_err(|error| format!("landlock restrict: {error}"))?;
     Ok(())

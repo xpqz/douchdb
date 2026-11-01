@@ -5490,15 +5490,23 @@ async fn local_shard_docs(node: &Server, db: &str, shard: u32) -> u64 {
 async fn background_replication_repairs_a_missed_shard_without_a_client() {
     use md5::{Digest, Md5};
 
-    let nodes = start_cluster_with(2, "1", 1);
+    // Full replication makes the target shard deterministic: both nodes hold
+    // it, so a local-only write on node 0 leaves node 1 to be repaired.
+    let nodes = start_cluster_with(2, "1", 2);
     for node in &nodes {
         node.fresh_db("rfan").await;
     }
     let q = 4u32;
-    let (_, map) = nodes[0].get("/_node/_local/_dbs/rfan").await;
+    let (status, map) = nodes[0].get("/_node/_local/_dbs/rfan").await;
+    assert_eq!(status, StatusCode::OK, "{map}");
     let target = (0..q)
-        .find(|shard| map["replicas"][*shard as usize] == json!([1]))
-        .expect("node 1 owns a shard");
+        .find(|shard| {
+            map["replicas"][*shard as usize]
+                .as_array()
+                .map(|replicas| replicas.contains(&json!(1)))
+                .unwrap_or(false)
+        })
+        .expect("node 1 replicates a shard");
     let mut id = String::new();
     for n in 0..10_000 {
         let candidate = format!("miss{n}");
