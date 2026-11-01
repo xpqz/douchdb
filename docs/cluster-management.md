@@ -49,7 +49,8 @@ replication protocol clients use, but it runs on a timer without a client
 request:
 
 1. Every `--sync-secs` seconds, pull `_changes` from each peer.
-2. Fetch the referenced revisions with `_bulk_get`.
+2. Fetch the referenced revisions with `_bulk_get?revs=true`, preserving the
+   revision history metadata.
 3. Keep only documents whose shard this node replicates.
 4. Write them with `_bulk_docs?new_edits=false`.
 5. Store a checkpoint in a `_local` document keyed by peer and shard-map hash.
@@ -69,6 +70,15 @@ client read.
 
 The replicator is pull-based. There is no separate push scheduler: normal
 writes already fan out to replicas, and the timer repairs what they missed.
+
+### Changes after an owner loss
+
+When an owner is unreachable, the coordinator reassigns its shards to live
+replicas. Those reassigned masks start at `since=0`: the surviving node's
+checkpoint describes its own shards, not the newly borrowed ones. Preferred
+masks stay disjoint, so replaying from zero fills gaps. Reassigned shard masks
+are at-least-once: while an owner is down, rows already delivered before the
+checkpoint may be replayed, so clients should deduplicate by revision id.
 
 ## Replication controls
 

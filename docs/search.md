@@ -308,6 +308,10 @@ does not need valid design documents and does not remove views.
 - **Unsupported CouchDB search options.** `include_fields`, `group_limit`,
   `group_sort` and `stale` are not implemented. `facet`/`store` index options
   are accepted but ignored.
+- **Missing fields are empty, not fatal.** A node whose local index has no
+  documents for a queried field returns no matches instead of failing the
+  cluster merge. A query for a completely unknown field therefore returns an
+  empty result set.
 - **Cluster info is local.** `_search_info` and `_index_info` do not aggregate
   across nodes.
 - **Bookmarks are offsets.** A malformed bookmark restarts at offset 0, and

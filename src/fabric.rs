@@ -716,8 +716,13 @@ pub(crate) async fn cluster_all_docs(
             }
         }
 
+        let ordered_keys: Vec<&String> = if opts.descending {
+            keys.iter().rev().collect()
+        } else {
+            keys.iter().collect()
+        };
         let mut rows = Vec::new();
-        for key in keys.iter().skip(opts.skip).take(opts.limit) {
+        for key in ordered_keys.into_iter().skip(opts.skip).take(opts.limit) {
             if let Some(row) = found.get(key).cloned() {
                 rows.push(row);
             } else if let Some(row) = errors.get(key).cloned() {
@@ -1530,7 +1535,10 @@ pub(crate) async fn cluster_changes(
             let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
             let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
             let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-                let since = since[node];
+                // The failed owner's sequence is not meaningful for the
+                // survivor's remaining shards. Start the reassigned mask at 0;
+                // preferred masks remain disjoint, so ids do not overlap.
+                let since = 0;
                 let doc_ids = doc_ids.clone();
                 async move {
                     (
@@ -1646,7 +1654,8 @@ pub(crate) async fn cluster_changes(
         let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
         let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
         let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-            let since = since[node];
+            // Reassigned shards have no useful checkpoint on the survivor.
+            let since = 0;
             let doc_ids = doc_ids.clone();
             async move {
                 (
@@ -2004,7 +2013,14 @@ pub(crate) async fn cluster_search(
     for (node, result) in batches.into_iter().enumerate() {
         match result {
             Ok(value) => merge_search_batch(&mut batch, value),
-            Err(_) => failed.push(node),
+            Err(error) => {
+                tracing::warn!(
+                    "search node {node} failed: {} {}",
+                    error.status,
+                    error.reason
+                );
+                failed.push(node)
+            }
         }
     }
 
