@@ -359,9 +359,9 @@ Above ~6k means something was built that nobody asked for.
   and time limits are configurable, and `_view_cleanup` removes stale indexes.
   QuickJS runs in-process behind memory/stack/interrupt limits by default;
   `--js-sandbox process` sends map/reduce/index calls to a warmed worker pool
-  with a cleared environment, `/` cwd, rlimits, a seccomp denylist and a
-  parent-side kill watchdog. That contains crashes and host-handle access;
-  optional Landlock policy remains. A checked-in QuickJS WASI runner under
+  with a cleared environment, `/` cwd, rlimits, a seccomp denylist, a
+  best-effort Landlock filesystem layer and a parent-side kill watchdog. That
+  contains crashes and host-handle access. A checked-in QuickJS WASI runner under
   `wasmi` is available via `--js-sandbox wasm`, with fuel and linear-memory
   limits. See `docs/quickjs-sandbox.md`.
   Design documents replicate to every node; a cluster view query fails with

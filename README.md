@@ -321,9 +321,10 @@ Behaviour and limits:
   `--view-memory-mb` and `--view-timeout-ms`.
 - JavaScript runs in QuickJS. The default is in-process with heap, stack and
   wall-clock limits; `--js-sandbox process` uses a warmed worker pool with a
-  cleared environment, `/` cwd, rlimits, a seccomp denylist and a kill
-  watchdog; `--js-sandbox wasm` runs the checked-in QuickJS WASM runner under
-  `wasmi` with fuel and linear-memory limits. See
+  cleared environment, `/` cwd, rlimits, a seccomp denylist, a best-effort
+  Landlock filesystem layer and a kill watchdog; `--js-sandbox wasm` runs the
+  checked-in QuickJS WASM runner under `wasmi` with fuel and linear-memory
+  limits. See
   [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.
@@ -440,7 +441,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
-| `--view-memory-mb` | `64` | QuickJS heap limit per view query |
+| `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
 | `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |
 
