@@ -5850,3 +5850,69 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn quickjs_sandbox_exposes_no_host_globals() {
+    for mode in ["native", "process", "wasm"] {
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsglobals{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/doc"), json!({"v": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/v"),
+                json!({"views": {"probe": {"map": "function(doc){ var names = ['require','process','fetch','XMLHttpRequest','WebSocket','Deno','Bun','fs','os','net','console','print']; var found = []; for (var i = 0; i < names.length; i++) { if (typeof globalThis[names[i]] !== 'undefined') found.push(names[i]); } emit(null, found); }"}}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = s.get(&format!("/{db}/_design/v/_view/probe")).await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["rows"][0]["value"], json!([]), "{mode}: {body}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_worker_installs_the_seccomp_filter() {
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "process".to_string(),
+        "--js-workers".to_string(),
+        "1".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsseccomp").await;
+    let (status, _) = s.put("/jsseccomp/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsseccomp/_design/v",
+            json!({"views": {"probe": {"map": "function(doc){ var x = 1; emit(doc._id + '-' + x, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/jsseccomp/_design/v/_view/probe").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let parent = format!("PPid:\t{}", s.child.id());
+    let worker = std::fs::read_dir("/proc")
+        .expect("proc")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|pid| {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            cmdline
+                .windows(b"--js-worker".len())
+                .any(|window| window == b"--js-worker")
+                && status.lines().any(|line| line == parent)
+        })
+        .expect("a process worker");
+    let status = std::fs::read_to_string(format!("/proc/{worker}/status")).expect("status");
+    assert!(
+        status.lines().any(|line| line == "Seccomp:\t2"),
+        "worker has no seccomp filter: {status}"
+    );
+}

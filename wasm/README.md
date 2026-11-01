@@ -16,14 +16,14 @@ cargo build --release --target wasm32-wasip1
 cp target/wasm32-wasip1/release/qjs-runner.wasm ../
 ```
 
-The runner uses `quickjs-wasm-rs` (Apache-2.0 WITH LLVM-exception), which builds
-QuickJS through the WASI SDK. Keep the generated `.wasm` in sync with the
-source; `cargo test` exercises the checked-in artifact through `wasmi`.
+The runner uses the maintained `rquickjs` crate (MIT) with QuickJS (MIT),
+built through the WASI SDK. Keep the generated `.wasm` in sync with the source;
+`cargo test` exercises the checked-in artifact through `wasmi`.
 
 Expected artifact checksum for the checked-in binary:
 
 ```text
-b01ccc8d63dd1953e6b4a4d488dddc7c223452315d5c75dc4b8e46087309f424  qjs-runner.wasm
+88dd6a707c7d4ee99c1e92ab35dc172308fe8d79cc6b0cb4e39905bda06f71f2  qjs-runner.wasm
 ```
 
 `wasm/qjs-runner.sha256` is the manifest checked by the unit test:

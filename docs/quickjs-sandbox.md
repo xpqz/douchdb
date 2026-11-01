@@ -14,6 +14,30 @@ and does not protect, and the measured trade-offs. The short version:
 - The same JavaScript API and conformance tests run behind a small engine
   boundary so modes can change without changing view/search semantics.
 
+## Capability guarantee
+
+No engine mode gives design-document JavaScript network or filesystem access:
+
+- The wrappers expose only CouchDB helpers (`emit`, `sum`, `log`, `isArray`,
+  `toJSON` or `index`). There is no `require`, `process`, `fetch`,
+  `XMLHttpRequest`, `WebSocket`, `fs`, `os`, `net`, `console` or module loader.
+  `quickjs_sandbox_exposes_no_host_globals` checks this in native, process and
+  wasm modes.
+- **Native:** there are no host callbacks at all, so JS has no file or socket
+  objects to call. This is still an in-process engine and not crash-safe.
+- **Process:** the worker starts with a cleared environment, `/` cwd and no
+  database/HTTP handles. A seccomp denylist rejects `open`, `openat`,
+  `socket`, `connect`, `execve` and related syscalls; a best-effort Landlock
+  layer denies filesystem access across all threads. `process_worker_installs_the_seccomp_filter`
+  checks the filter is active.
+- **WASM:** the WASI context has no preopens, environment or args. The module's
+  only host pipes are the request stdin and response stdout, plus WASI
+  clock/random; the store has fuel and a 128 MiB linear-memory cap.
+
+The OS-level layers are defense in depth: even a memory-corruption bug in
+QuickJS should not turn into host file or network access. They are not a claim
+that native mode is safe for hostile design documents.
+
 ## Threat model
 
 The attacker can create or modify a design document and make the server run it:
@@ -40,8 +64,8 @@ What must be protected:
 ## Current implementation
 
 In native mode, both `src/view.rs` and `src/search.rs` create one
-`rquickjs::Runtime` and one `Context::full` per query, then evaluate a wrapper that defines the CouchDB
-helpers (`emit`, `sum`, `log`, `isArray`, `toJSON` or `index`). The runtime is
+`rquickjs::Runtime` and one `Context::full` per query, then evaluate a
+wrapper that defines the CouchDB helpers (`emit`, `sum`, `log`, `isArray`, `toJSON` or `index`). The runtime is
 dropped when the query finishes.
 
 Current controls:
@@ -153,10 +177,13 @@ What is implemented:
 The default remains `--js-sandbox native`. Use `process` for deployments where
 design documents are untrusted.
 
-What is not implemented yet:
+Platform note:
 
-- platform-specific filesystem sandboxing outside Linux (process rlimits still
-  apply); a kernel without Landlock falls back to the seccomp denylist.
+- Process-mode syscall/filesystem confinement (seccomp and Landlock) is
+  Linux-specific. On other platforms, process mode still gets a cleared
+  environment, process isolation and rlimits where available, but a hard
+  portable boundary should use `--js-sandbox wasm`. A kernel without Landlock
+  falls back to the seccomp denylist.
 
 Run the mode tests:
 
@@ -218,7 +245,8 @@ douchdb --js-sandbox wasm ...
 ```
 
 The checked-in `wasm/qjs-runner.wasm` is built from
-`wasm/qjs-runner/` with `quickjs-wasm-rs`. The host compiles the module once,
+`wasm/qjs-runner/` with the maintained `rquickjs` crate and a WASI SDK. The host
+compiles the module once,
 then creates a fresh `Store`/instance per request with:
 
 - a WASI context containing only the request on stdin and an in-memory stdout,
@@ -255,12 +283,10 @@ request. `NativeMap` fast paths still run in the server process.
 
 ### Build and supply chain
 
-The runner currently uses `quickjs-wasm-rs` (deprecated upstream) and a
-WASI SDK build. The checked-in artifact is reproducible with the commands in
-`wasm/README.md`; the source is in `wasm/qjs-runner/`. A production follow-up
-should move to a maintained QuickJS WASI build (for example QuickJS-ng) and
-pin the WASI SDK. The checked-in artifact checksum is enforced by
-`js::tests::wasm_runner_matches_the_checked_in_checksum`.
+The runner uses the maintained `rquickjs` crate and a pinned WASI SDK. The
+checked-in artifact is reproducible with the commands in `wasm/README.md`; the
+source is in `wasm/qjs-runner/`. The checked-in artifact checksum is enforced
+by `js::tests::wasm_runner_matches_the_checked_in_checksum`.
 
 ### Performance
 
@@ -283,17 +309,17 @@ index builds plus 10 warm queries. Release build, Linux x86_64, 16 CPUs:
 
 | Metric | native | process | wasm |
 |---|---:|---:|---:|
-| cold map (2,000 docs) | 13.7 ms | 30.7 ms | 333 ms |
-| cold custom reduce | 13.3 ms | 29.2 ms | 378 ms |
-| cold search index | 51.0 ms | 76.8 ms | 409 ms |
-| warm map p50 | 0.29 ms | 0.29 ms | 0.28 ms |
-| warm custom reduce p50 | 2.68 ms | 5.41 ms | 62.2 ms |
-| warm search query p50 | 1.92 ms | 2.03 ms | 1.93 ms |
+| cold map (2,000 docs) | 14.6 ms | 29.8 ms | 281 ms |
+| cold custom reduce | 13.2 ms | 27.3 ms | 307 ms |
+| cold search index | 55.9 ms | 79.8 ms | 380 ms |
+| warm map p50 | 0.30 ms | 0.29 ms | 0.29 ms |
+| warm custom reduce p50 | 2.78 ms | 5.44 ms | 51.3 ms |
+| warm search query p50 | 1.78 ms | 1.91 ms | 1.94 ms |
 
 Warm map and search queries use the persisted index and do not enter the
 engine, so they are effectively identical. The differences are in cold index
-builds and custom reduces: process mode adds about 1.5–2.2× over native, while
-wasm adds roughly 8× for search and 20–30× for map/reduce because `wasmi`
+builds and custom reduces: process mode adds about 1.5–2× over native, while
+wasm adds roughly 7× for search and 20–25× for map/reduce because `wasmi`
 interprets QuickJS compiled to wasm.
 That is the expected trade-off for a memory-safe portable boundary, not a
 reason to make wasm the default.
@@ -330,8 +356,8 @@ Use a `JsEngine` boundary and migrate in stages:
    - Enforced linear memory, fuel and output limits.
    - Exposed it as `--js-sandbox wasm` and covered it with the same view,
      reduce, search and deadline tests.
-   - Benchmark recorded below; remaining: migrate off the deprecated
-     `quickjs-wasm-rs` build and choose a default per deployment.
+   - Built with the maintained `rquickjs` crate; benchmark recorded below.
+     Choose a default per deployment.
 
 This gets crash containment and a portable memory-safe engine without pretending
 that removing `eval` or setting a memory limit is a security sandbox. The
@@ -361,9 +387,9 @@ Every engine must pass the same cases:
   hostile? That decides whether the worker process is mandatory.
 - Resolved: process mode is Linux-hardened; wasm is the cross-platform
   memory-safe option.
-- Resolved for now: the runner source and the built `.wasm` are checked in,
-  and `cargo test` enforces the artifact checksum. A maintained upstream
-  QuickJS WASI build remains a follow-up.
+- Resolved: the runner source and the built `.wasm` are checked in, it uses
+  the maintained `rquickjs` crate, and `cargo test` enforces the artifact
+  checksum.
 - Cost is measured in the table above; choose the mode per deployment and
   threat model.
 - Resolved for the worker path: a warmed pool with a fresh QuickJS runtime per

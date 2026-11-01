@@ -1,7 +1,7 @@
 # douchdb — CouchDB wire-compatible database in Rust on LevelDB
 
-Status: plan, decisions locked. Target: a small, clustered, PouchDB-and-CouchDB
-compatible document store.
+Status: implemented, living design and status. Target: a small, clustered,
+PouchDB-and-CouchDB compatible document store.
 
 ## Locked decisions
 
@@ -10,7 +10,8 @@ compatible document store.
 | Compatibility | CouchDB **wire** compatibility | Revision ids must be byte-identical to CouchDB's. This forces an Erlang External Term Format encoder and order-preserving JSON. See "The rev hash". |
 | Cluster membership | Static node list from config | No gossip, no membership protocol, no Raft. The default shard map is a pure function of (node list, q); explicit rebalance maps are versioned and reconciled by anti-entropy. Discovery probes peers for management but does not change placement. |
 | Storage | `rusty-leveldb` (pure Rust) | One implementation, no C++ toolchain, single static binary. Risk is concentrated here: its API is `&mut self` for *all* operations, including reads. |
-| Not used | Raft, Mango, `_replicator`, `_users` | Where the code-size win comes from. Views use an embedded QuickJS engine rather than a server-side JS platform. |
+| JavaScript isolation | QuickJS with no host capabilities | Design-document JS sees only the CouchDB helpers (`emit`, `sum`, `log`, `index`); there are no network or filesystem APIs. A pooled worker process with seccomp/Landlock, or a WASI/WASM engine, contains interpreter bugs. |
+| Not used | Raft, Mango, `_replicator`, `_users` | Where the code-size win comes from. Views and search use QuickJS rather than a general server-side JS platform. |
 
 ## Goal and non-goals
 
@@ -19,10 +20,11 @@ that CouchDB can replicate to and from, storing data in LevelDB, running as a
 Q-shard × N-replica cluster.
 
 **Non-goals, deliberately:** attachments, Mango, `_replicator` database,
-`_users` database machinery beyond auth, per-document ETags, multipart
-`_bulk_docs`. Attachments are rejected rather than stored. Map/reduce
-views are implemented with an embedded QuickJS runtime; lists, shows, update
-handlers and a full server-side JavaScript platform are not.
+`_users` database machinery beyond auth, multipart `_bulk_docs`. Attachments
+are rejected rather than stored. Map/reduce views and search indexes are
+implemented with QuickJS; lists, shows, update handlers and a general
+server-side JavaScript platform are not. Design-document JavaScript never gets
+network or filesystem access in any engine mode.
 
 ## The one architectural idea
 
@@ -64,7 +66,15 @@ Corollary: **single-node is the cluster with Q=1, N=1.** No separate code path.
 ```
 
 Crates: `axum`, `tokio`, `serde_json` (**with `preserve_order`**), `rusty-leveldb`,
-`reqwest`, `md-5`, `tracing`.
+`reqwest`, `md-5`, `tracing`, `rquickjs`, `tantivy`, `icu_collator`,
+`wasmi`/`wasmi_wasi`, and Linux-only `seccompiler`/`landlock`.
+
+Map/reduce views and search indexes are evaluated by QuickJS. The default
+engine is in-process behind memory/stack/interrupt limits;
+`--js-sandbox process` moves evaluations to a pooled worker with cleared
+environment, rlimits, seccomp and Landlock; `--js-sandbox wasm` runs a checked-in
+QuickJS WASI module under `wasmi` with fuel and linear-memory limits. None of
+these exposes network or filesystem APIs to JavaScript.
 
 Because the LevelDB handle is `&mut` for reads as well as writes, the shard
 actor is not an optimisation — it is the only way to share a shard. Reads and
@@ -93,6 +103,20 @@ Doc ids are raw UTF-8 bytes, which sorts identically to CouchDB's binary
 ordering, so `_all_docs` pagination and `startkey`/`endkey` match with no
 collation layer. `_local` lives in its own prefix and is excluded from
 `_all_docs`, as in CouchDB.
+
+Each database directory also contains:
+
+| Path | Purpose |
+|---|---|
+| `db.json` | database uuid, shard count and partitioned flag |
+| `shard-map.json`, `pending-shard-map.json` | versioned placement metadata |
+| `shard-0000`, `shard-0001`, ... | one LevelDB per shard |
+| `_view_indexes/` | persistent map/reduce indexes, one directory per view |
+| `_search_indexes/` | Tantivy indexes plus a JSON sidecar of indexed values |
+
+View and search indexes are derived data: they can be deleted and rebuilt from
+documents and design documents. `_view_cleanup` and `_search_cleanup` remove
+them.
 
 **Write path.** Sequence numbers are allocated in memory and persisted *in the
 same WriteBatch* as the document, so a crash can never leave a gap or a document
@@ -181,9 +205,23 @@ Must work, because PouchDB calls it:
 `GET /` (welcome, with `couchdb` version field), `PUT/GET/DELETE /db`,
 `GET/PUT/DELETE /db/doc` (`?rev=`, `?new_edits=false`, `?revs=`, `?open_revs=`,
 `?conflicts=`), `POST /db`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
-`_changes` (`normal`/`longpoll`/`continuous`, `since`, `style=all_docs`,
+`_changes` (`normal`/`longpoll`/`continuous`/SSE, `since`, `style=all_docs`,
 `filter=_doc_ids`, `heartbeat`), `_revs_diff`, `_local/*`, `_ensure_full_commit`,
-`_revs_limit`, `_purge`, `_compact`, `_uuids`, `_session`.
+`_revs_limit`, `_purge`, `_compact`, `_uuids`, `_session`, `_security`,
+`_db_updates`, `_dbs_info`, `_all_dbs` pagination and `_membership`.
+
+Views and search add:
+
+`_design/{ddoc}/_view/{view}` and `_view_cleanup`; `_design/{ddoc}/_search/{index}`,
+`_search_info`, `_search_cleanup` and `_index_info?type=search`; partitioned
+`_partition/{p}/...` forms for documents, views and search.
+
+Cluster management adds:
+
+`_node/_local/_dbs`, `_node/_local/_dbs/{db}/shards`, `_node/_local/_dbs/{db}/rebalance`,
+`_node/_local/_dbs/{db}/cleanup`, `_node/_local/_cluster`,
+`_node/_local/_cluster/discover` and `_node/_local/_replication` plus
+`run`/`pause`/`resume`. The embedded console is served at `/_utils/`.
 
 Wire compatibility also means matching the boring parts: `{"error","reason"}`
 bodies, status codes (`409` on conflict, `412` on bad rev, `404` on missing db),
@@ -230,9 +268,10 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   with documents filtered to the shards this node replicates. Runs without a
   client request; observable and controllable through
   `/_node/_local/_replication` and the console. Discovery probes configured
-  nodes, `--seed-nodes` and reported memberships without changing placement. Internal calls
-  authenticate with the shared `--admin` credentials; a client's Basic auth or
-  `_session` cookie is forwarded when routing/fan-out needs a peer.
+  nodes, `--seed-nodes` and reported memberships without changing placement.
+  Internal calls authenticate with the shared `--admin` credentials; a client's
+  Basic auth or `_session` cookie is forwarded when routing/fan-out needs a
+  peer.
 * **Database lifecycle:** create and delete are broadcast to every configured
   node. Design documents are replicated to every node (views need them to map
   the node's local shards). A node that is offline during the operation must be
@@ -248,30 +287,36 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
 
 | Component | LOC |
 |---|---|
-| ETF encoder | 250 |
-| Rev hashing, rev trees, winner selection | 650 |
-| Store: key codec, shard actor, group commit | 700 |
-| HTTP handlers, params, error/shape compatibility | 1400 |
-| Cluster: shard map, rendezvous, proxy, anti-entropy, version vector | 700 |
-| Auth (JWT issued by `_session`, cluster-friendly) | 250 |
-| Config, main, misc | 300 |
-| **Total** | **~4250** |
+| HTTP handlers, params, error/shape compatibility | ~3,550 |
+| Fabric: routing, replica fan-out, quorum, view/search merge | ~2,200 |
+| Database, rev trees, key codec, shard actor | ~3,200 |
+| Views | ~1,900 |
+| Search | ~900 |
+| QuickJS controls and sandbox modes | ~700 |
+| Cluster metadata, discovery, replication, status | ~1,000 |
+| ETF, rev hashing, winner selection | ~700 |
+| Auth, telemetry, console hosting, main | ~700 |
+| **Total** | **~15,000** |
 
-Above ~6k means something was built that nobody asked for.
+The original ~4k budget was for documents and cluster routing. Views, search,
+Tantivy, cluster management and the JavaScript sandbox were added later and are
+the bulk of the growth.
 
 ## Milestones
 
 0. **Wire-compat spike (blocking).** ETF encoder + rev hash, validated against a
-   real CouchDB on a document corpus. Nothing else starts until this is green.
-1. **Single-node store.** Doc CRUD, rev trees, `_bulk_docs`, `_all_docs`.
+   real CouchDB on a document corpus. Done.
+1. **Single-node store.** Doc CRUD, rev trees, `_bulk_docs`, `_all_docs`. Done.
 2. **Replication round-trips.** `_changes`, `_revs_diff`, `_bulk_get`, `_local`,
-   `new_edits=false`. CI gate: `pouch.replicate()` both directions, and
-   CouchDB→douchdb, douchdb→CouchDB.
+   `new_edits=false`. Done, including PouchDB and CouchDB round-trips.
 3. ~~**Attachments.**~~ Removed in v0.2; the API rejects `_attachments`.
-4. **Cluster.** Shard map, routing, quorum, anti-entropy. Ship v0.1 only when a
-   three-node cluster survives killing a node mid-replication.
+4. **Cluster.** Shard map, routing, quorum, anti-entropy. Done, including
+   versions, rebalance/cleanup and node-loss failover.
 5. **Ersatz CouchDB.** `_purge`, `_compact`, `_session`, `_security`,
-   `_membership`, metrics.
+   `_membership`, metrics. Done.
+6. **Views, search and cluster management.** Partitioned databases, durable view
+   indexes, Tantivy search, the cluster/replication console and the
+   native/process/WASM QuickJS sandbox. Done.
 
 ## Risks
 
@@ -285,21 +330,28 @@ Above ~6k means something was built that nobody asked for.
 4. **Wire-compat surface creep.** Every quirk discovered (`ETag` format,
    `_changes` line framing, `open_revs` shape) is small but there are many.
    Keep a conformance test file per endpoint; refuse features by default.
+5. **JavaScript memory safety.** QuickJS is C. In-process native mode is an
+   availability boundary, not a security boundary. Untrusted deployments
+   should use `--js-sandbox process` (Linux seccomp/Landlock) or
+   `--js-sandbox wasm` (memory-safe, portable).
+6. **WASM performance.** The WASI engine is roughly 20–30× slower than native
+   for cold map/reduce work; keep it optional until that trade-off is
+   acceptable for the deployment.
 
 ## Open questions
 
-* ~~Should `_compact` map to `compact_range`, or be a no-op that returns `ok`?~~
-  **Decided:** map to `compact_range`, return `202 Accepted` immediately. A
-  no-op would make PouchDB's `compact()` lie about reclaiming space, and
-  `compact_range` is what LevelDB is for. The call is synchronous inside the
-  shard actor, so a large compaction delays that shard's next request; that is
-  the same trade-off the write path already makes for `&mut self`. Measured at
-  10 GB: compaction blocks the shard for 26.9 s, so a background job that still
-  takes the actor lock would not help latency; the real fix is more shards
-  (`q > 1`) so the stall is divided, or an observable `compact_running` flag
-  plus scheduling compaction off the request path. Left synchronous for now,
-  recorded as a known 27 s p99 per shard at 10 GB.
-* ~~Attachment chunk size vs read amplification for `pouch.getAttachment`.~~
+* **WASM QuickJS upstream.** The checked-in runner uses the maintained
+  `rquickjs` crate and a pinned WASI SDK; the artifact is checksum-tested.
+* **Default JavaScript engine.** Native is fastest and trusted-only;
+  process is the Linux containment boundary; WASM is portable and
+  memory-safe but slower. Keep the default explicit and deployment-driven.
+* **Non-Linux process sandboxing.** Resolved by guidance: process syscall/
+  filesystem confinement is Linux-only; use the portable `--js-sandbox wasm`
+  engine on other hosts that need a hard boundary.
+* **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
+  ~27 s. More shards or an observable `compact_running` flag plus off-path
+  scheduling remain options; `_compact` maps to `compact_range` and returns
+  `202 Accepted`.
 
 ## Progress
 
@@ -366,8 +418,9 @@ Above ~6k means something was built that nobody asked for.
   contains crashes and host-handle access. A checked-in QuickJS WASI runner under
   `wasmi` is available via `--js-sandbox wasm`, with fuel and linear-memory
   limits. See `docs/quickjs-sandbox.md`.
-  Design documents replicate to every node; a cluster view query fails with
-  `502` if a node is unreachable instead of returning partial rows.
+  Design documents replicate to every node; a cluster view query falls back to
+  live replicas when an owner is unreachable and fails with `502` only when no
+  replica can answer.
 * **v0.2 protocol pass.** `_changes` is a true chunked continuous feed with
   heartbeat and an SSE `feed=eventsource` variant; bulk reads/writes batch shard and peer work; COPY, conditional
   ETags, gzip, request IDs and bodyless HEAD are implemented; attachments were
@@ -463,6 +516,19 @@ Above ~6k means something was built that nobody asked for.
   controlled runs. Cluster routing, replica selection, quorum reads/writes and
   internal node calls live in `src/fabric.rs`; HTTP handlers only call that
   layer.
+* **Cluster management and replication controls.** `GET /_node/_local/_cluster`
+  reports membership, discovery probes, shard maps and replicator state.
+  `--advertise` / `--seed-nodes` drive best-effort peer discovery without
+  changing placement. `GET/POST /_node/_local/_replication` exposes per-db/peer
+  checkpoints, manual sync, and pause/resume for the background anti-entropy
+  puller. The console cluster page uses these endpoints and adds rebalance and
+  cleanup actions.
+* **JavaScript sandbox.** QuickJS has no host network/filesystem APIs in any
+  mode. `--js-sandbox process` uses a pooled worker with cleared environment,
+  rlimits, a seccomp denylist, a best-effort Landlock filesystem layer and a
+  watchdog; `--js-sandbox wasm` runs a checked-in QuickJS WASI module under
+  `wasmi` with fuel, linear-memory and output limits. The default remains
+  in-process with memory/stack/interrupt limits.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes
@@ -472,8 +538,9 @@ Above ~6k means something was built that nobody asked for.
   serialisation) is recorded below.
 * **Web console.** `/_utils/` serves an embedded Vue 3 console (`ui/`, vendored
   runtime, no build step). It browses databases and documents, edits JSON, tails
-  `_changes`, shows database info, signs in through `_session`, and has a
-  toggleable request log with both directions' JSON. It talks only to the
+  `_changes`, shows database info, signs in through `_session`, has a cluster
+  page for discovery, shard maps, replication status and rebalance/cleanup, and
+  has a toggleable request log with both directions' JSON. It talks only to the
   public HTTP API; the static assets are the only addition to the server.
   CORS is opt-in via `--cors-origins` (exact origins or `https://*.example.com`,
   or `*`), with echoed origins, credentials, preflight and CORS headers on

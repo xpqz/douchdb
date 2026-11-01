@@ -80,7 +80,7 @@ pub struct LiveDoc {
 /// A batch of changes plus the sequence counter, committed atomically.
 ///
 /// Staged as plain operations rather than a `WriteBatch` so the shard actor can
-/// merge several request batches into one fsync.
+/// merge several request batches into one OS flush.
 pub struct Tx {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
@@ -769,7 +769,9 @@ impl ShardHandle {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
         tokio::spawn(async move {
             // Group commit: run a job, then everything already queued, and
-            // acknowledge only after the merged batch has been fsynced.
+            // acknowledge only after the merged batch has been flushed to the
+            // OS. rusty-leveldb does not fsync, so this is not power-loss
+            // durable.
             while let Some(job) = rx.recv().await {
                 let mut acks = vec![job(&mut shard)];
                 for _ in 1..64 {
