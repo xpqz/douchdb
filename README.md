@@ -476,8 +476,9 @@ router; there is no coordinator role.
 - `--q` fixes the shard count when a database is created.
 - `md5(docid)` selects the shard; rendezvous hashing over the node list selects
   `--n` distinct replicas, in preference order. The first is the primary.
-- A write goes to the first reachable replica and is copied to the rest of the
-  set. A read tries replicas in order and falls back if the primary is down.
+- A write is sent to every replica in the shard set and returns once the
+  requested quorum acknowledges; the remaining writes continue detached. A
+  read tries replicas in order and falls back if the primary is down.
 - `?w=` / `?r=` select write and read quorum (default: write quorum, single
   read). An unmet write quorum returns `202`; anti-entropy repairs the replica
   later.

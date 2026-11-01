@@ -8,7 +8,7 @@ compatible document store.
 | Decision | Choice | Consequence |
 |---|---|---|
 | Compatibility | CouchDB **wire** compatibility | Revision ids must be byte-identical to CouchDB's. This forces an Erlang External Term Format encoder and order-preserving JSON. See "The rev hash". |
-| Cluster membership | Static node list from config | No gossip, no membership protocol, no Raft. The shard map is a pure function of (node list, q), computed identically at startup on every node. No metadata to distribute. |
+| Cluster membership | Static node list from config | No gossip, no membership protocol, no Raft. The default shard map is a pure function of (node list, q); explicit rebalance maps are versioned and reconciled by anti-entropy. Discovery probes peers for management but does not change placement. |
 | Storage | `rusty-leveldb` (pure Rust) | One implementation, no C++ toolchain, single static binary. Risk is concentrated here: its API is `&mut self` for *all* operations, including reads. |
 | Not used | Raft, Mango, `_replicator`, `_users` | Where the code-size win comes from. Views use an embedded QuickJS engine rather than a server-side JS platform. |
 
@@ -200,14 +200,16 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
 * **Sharding:** `md5(docid)` → first four bytes `% q` → shard index. `q` is
   fixed at database creation, as in CouchDB.
 * **Placement:** rendezvous score of `(node, shard)`; the top `n` distinct nodes
-  form the replica set in preference order, and the first is the primary. This
-  is a pure function of `(nodes, q, n)`, so every node computes it identically
-  with no metadata to distribute. `n` is clamped to the node count.
+  form the replica set in preference order, and the first is the primary. The
+  default map is a pure function of `(nodes, q, n)`, so every node computes it
+  identically. Operators can persist a versioned balanced map through the
+  rebalance endpoint; peers reconcile map versions through anti-entropy. `n` is
+  clamped to the node count.
 * **Routing:** every node is a router; there is no coordinator role. A local
   replica calls the shard actor, a remote replica gets the same HTTP request
-  proxied. Writes go to the first reachable replica, then the resulting full
-  revision is copied to the other replicas with `new_edits=false`. Reads try
-  replicas in order and fall back past a dead primary.
+  proxied. Writes are sent to every replica in the shard set and return once
+  the requested quorum acknowledges; reads try replicas in order and fall back
+  past a dead primary.
 * **Membership:** `--nodes a:5984,b:5984,c:5984` is static and served verbatim
   by `GET /_membership`. Changing membership is an operator action: restart
   every node with the new list. Discovery probes configured nodes,
@@ -326,10 +328,10 @@ Above ~6k means something was built that nobody asked for.
   subrequests carry `x-douchdb-forwarded` so the receiving peer serves them
   locally instead of re-fanning out.
 * **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
-  rendezvous score. A write goes to the first reachable replica, then the full
-  revision (history plus body) is copied to the rest with
-  `new_edits=false`; reads try replicas in preference order and fall back past a
-  dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
+  rendezvous score. A write is sent to every replica in the shard set and
+  returns once the requested quorum acknowledges; remaining replica writes
+  continue detached. Reads try replicas in preference order and fall back past
+  a dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
   an unmet write quorum returns `202` and anti-entropy repairs the replica.
   Database create/drop are broadcast, anti-entropy pulls only the shards a node
   replicates, and internal calls authenticate with the shared admin credentials
