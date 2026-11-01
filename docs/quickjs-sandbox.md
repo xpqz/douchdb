@@ -142,7 +142,7 @@ What is implemented:
   per-request watchdog is the CPU backstop for pooled workers;
 - `PR_SET_NO_NEW_PRIVS`, a Linux seccomp denylist for file, network, exec,
   process-inspection and io_uring syscalls, and a best-effort Landlock layer
-  that denies filesystem access;
+  that denies filesystem access across all threads when the kernel supports it;
 - a hidden `--js-worker` mode that runs the normal map/reduce/index code in the
   child; the parent's sandbox flag is false in the child, so there is no
   recursive spawning;
