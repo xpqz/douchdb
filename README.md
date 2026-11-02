@@ -807,9 +807,10 @@ not fsync. See [docs/durability.md](docs/durability.md). Known limits:
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - Version vectors are keyed per node, not per shard replica.
-- `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
-  shard for ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency`
-  bounds concurrent compactions across databases, and `GET /db` reports
+- `_compact` still blocks the owning shard actor, but runs through
+  `block_in_place` so it does not pin a Tokio worker; at 10 GB the shard stall is
+  ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency` bounds
+  concurrent compactions across databases, and `GET /db` reports
   `compact_running`.
 - No Mango or lists/shows. Attachments are not supported.
 

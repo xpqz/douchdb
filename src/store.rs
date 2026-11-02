@@ -827,7 +827,11 @@ impl Shard {
 
     pub fn compact(&mut self) -> Result<()> {
         self.flush_pending()?;
-        self.db.compact_range(&[], &[])?;
+        // Compaction is a long, blocking LevelDB call (tens of seconds on a
+        // large shard). Keep it on this shard actor, which owns the mutable
+        // handle, but let Tokio replace the worker thread while it runs so
+        // other shards and HTTP requests keep making progress.
+        tokio::task::block_in_place(|| self.db.compact_range(&[], &[]))?;
         self.db.flush()?;
         Ok(())
     }

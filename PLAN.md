@@ -472,8 +472,9 @@ the bulk of the growth.
   unmet quorum is `503`. The Docker build includes the embedded WASI runner, a
   GitHub Actions workflow runs fmt/clippy/tests/both wasm backends/container
   build, search rebuilds are serialized per index and run on the blocking pool,
-  and `_compact` has a configurable node-wide concurrency bound plus a visible
-  `compact_running` flag. Durability is explicitly positioned as non-primary in
+  and `_compact` has a configurable node-wide concurrency bound, a visible
+  `compact_running` flag, and runs the blocking LevelDB call through
+  `block_in_place` so it does not pin a Tokio worker. Durability is explicitly positioned as non-primary in
   `docs/durability.md`. Observability handlers moved out of `api.rs` into
   `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
