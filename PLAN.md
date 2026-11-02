@@ -464,7 +464,8 @@ the bulk of the growth.
   `_all_dbs`. Admission is per principal: global and per-user in-flight bounds,
   an optional token bucket, separate heavy view/search permits, and a background
   permit for anti-entropy/discovery. Excess work is rejected with `429` and
-  `Retry-After` instead of queued without bound. Deliberately no `_users`
+  `Retry-After` instead of queued without bound. The console has an Access page
+  for per-database `_security` members/admins. Deliberately no `_users`
   database, IAM, row-level security, weighted shares or cross-coordinator
   scheduler; see `docs/multiuser.md`.
 * **Single-node baseline.** `scripts/perf_sweep.py` records CRUD, bulk,

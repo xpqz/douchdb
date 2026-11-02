@@ -33,6 +33,7 @@
         <button class="ghost icon" @click="refreshAll" title="Refresh databases">↻</button>
         <button class="ghost" @click="openCluster" data-testid="open-cluster">Cluster</button>
         <button class="ghost" @click="openMetrics" data-testid="open-metrics">Metrics</button>
+        <button class="ghost" @click="openAccess" data-testid="open-access">Access</button>
 
         <template v-if="user">
           <span class="user" data-testid="current-user">● {{ user }}</span>
@@ -587,6 +588,133 @@
               </table>
             </template>
           </section>
+
+          <!-- access ---------------------------------------------------->
+          <section v-if="view === 'access'" class="page">
+            <div class="view-head">
+              <h1>Access</h1>
+              <nav class="tabs">
+                <button class="active">Database security</button>
+                <button @click="openCluster">Cluster</button>
+                <button @click="openMetrics">Metrics</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button @click="loadAccess" data-testid="access-refresh">Refresh</button>
+              <span class="spacer"></span>
+              <span class="muted" v-if="accessRows.length">
+                {{ accessRows.length }} databases
+              </span>
+            </div>
+
+            <p class="muted">
+              Membership is database-level. Members can read and write all
+              documents in a database; admins can also write design documents and
+              change this object. An empty security object follows
+              <span class="mono">--default-security</span> (admin-only unless
+              explicitly open).
+            </p>
+
+            <div class="cards metrics-cards" v-if="user">
+              <div class="card">
+                <h3>Signed in as</h3>
+                <div class="metric-big">{{ user }}</div>
+                <p class="muted">
+                  <span v-if="isAdmin" class="pill ok">server admin</span>
+                  <span v-else class="pill">user</span>
+                </p>
+              </div>
+              <div class="card">
+                <h3>Databases visible</h3>
+                <div class="metric-big">{{ accessRows.length }}</div>
+                <p class="muted">Only databases this principal can access are listed.</p>
+              </div>
+            </div>
+
+            <p v-if="accessError" class="error" data-testid="access-error">{{ accessError }}</p>
+            <p v-if="accessLoading && !accessRows.length" class="muted">Loading access…</p>
+
+            <table class="grid" data-testid="access-table">
+              <thead>
+                <tr>
+                  <th>database</th>
+                  <th>members</th>
+                  <th>admins</th>
+                  <th>access</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in accessRows" :key="row.name">
+                  <td class="mono">{{ row.name }}</td>
+                  <td class="muted">{{ principalText(row.security.members) }}</td>
+                  <td class="muted">{{ principalText(row.security.admins) }}</td>
+                  <td>
+                    <span :class="['pill', securityLabel(row) === 'default' ? 'warn' : 'ok']">
+                      {{ securityLabel(row) }}
+                    </span>
+                  </td>
+                  <td class="right">
+                    <button class="link" @click="openSecurity(row)" data-testid="edit-security">
+                      edit
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="!accessRows.length && !accessLoading && !accessError" class="empty">
+              No databases are visible to this principal.
+            </p>
+          </section>
+
+          <!-- security editor ------------------------------------------->
+          <div v-if="securityForm.open" class="modal-backdrop" @click.self="securityForm.open = false">
+            <form class="modal" @submit.prevent="saveSecurity" data-testid="security-modal">
+              <h2>Database access</h2>
+              <p class="muted mono">{{ securityForm.db }}</p>
+              <label>
+                Member names
+                <input
+                  v-model="securityForm.memberNames"
+                  placeholder="alice, bob"
+                  data-testid="security-members"
+                >
+              </label>
+              <label>
+                Member roles
+                <input v-model="securityForm.memberRoles" placeholder="analyst, ops">
+              </label>
+              <label>
+                Admin names
+                <input v-model="securityForm.adminNames" placeholder="alice">
+              </label>
+              <label>
+                Admin roles
+                <input v-model="securityForm.adminRoles" placeholder="db-admins">
+              </label>
+              <p class="muted">
+                Comma-separated. Roles are matched against the users file. Setting
+                admins without members makes the database admin-only.
+              </p>
+              <p v-if="securityForm.error" class="error" data-testid="security-error">
+                {{ securityForm.error }}
+              </p>
+              <div class="modal-actions">
+                <button type="button" class="ghost" @click="securityForm.open = false">
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  class="primary"
+                  :disabled="securityForm.saving"
+                  data-testid="save-security"
+                >
+                  {{ securityForm.saving ? 'Saving…' : 'Save access' }}
+                </button>
+              </div>
+            </form>
+          </div>
 
           <!-- documents -------------------------------------------------->
           <section v-if="view === 'docs'" class="page">
