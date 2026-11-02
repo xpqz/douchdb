@@ -683,6 +683,16 @@ python3 scripts/perf_cluster.py --docs 6000 --spread --native
 python3 scripts/perf_isolated.py --nodes 1,2,3
 ```
 
+JavaScript sandbox throughput is measured separately in
+[docs/performance.md](docs/performance.md#javascript-sandbox-throughput) and
+[docs/quickjs-sandbox.md](docs/quickjs-sandbox.md):
+
+```sh
+cargo build --release --features wasmtime
+python3 scripts/js_sandbox_bench.py \
+  --modes native,process,wasm-wasmi,wasm-wasmtime --docs 2000
+```
+
 `loadgen` can also be run directly against any node or load balancer; see
 [docs/performance-cluster.md](docs/performance-cluster.md).
 
