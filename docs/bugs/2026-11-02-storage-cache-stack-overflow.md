@@ -34,7 +34,9 @@ capture was truncated before the caller, so the fix should not be read as proof
 that every possible cache-corruption source is gone. It removes the recursive
 destruction visible in the trace and the identified list/map divergence path.
 Release validation covered a 100,000-document write, complete changes-feed
-pagination, process restart and a Docker restart with 20,000 documents.
+pagination, process restart and a Docker restart with 20,000 documents. The
+ARM64 image was rebuilt from the fix; a 5,000-document write, complete changes
+pagination and container restart passed under QEMU.
 
 Keep the vendored cache tests in CI, and re-run a large ARM64 import plus
 concurrent changes/repair before treating the storage layer as fully signed
