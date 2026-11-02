@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{AllQuery, QueryParser};
@@ -13,6 +14,7 @@ use tantivy::schema::{
     Field, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
 use tantivy::Index;
+use tokio::sync::Mutex as AsyncMutex;
 
 const SEARCH_VERSION: u8 = 2;
 const PAGE_LIMIT: usize = 2000;
@@ -283,7 +285,33 @@ async fn build_index(
     // snapshot that may have missed it.
     let last_seq = db.update_seq();
     let docs = db.map_docs(None).await?;
-    let indexed = run_index_json(&spec.source, &docs, limits).map_err(|reason| {
+    let path = index_dir(db, ddoc, index_name);
+    let source = spec.source.clone();
+    let design = design_signature(spec);
+    let ddoc = ddoc.to_string();
+    let index_name = index_name.to_string();
+    // QuickJS/Tantivy work is CPU- and IO-bound. Run it on the blocking pool so
+    // a search rebuild cannot occupy a Tokio async worker for its full duration.
+    tokio::task::spawn_blocking(move || {
+        build_index_files(
+            path, docs, &source, last_seq, design, ddoc, index_name, limits,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?
+}
+
+fn build_index_files(
+    path: PathBuf,
+    docs: Vec<(String, String)>,
+    source: &str,
+    last_seq: u64,
+    design: String,
+    ddoc: String,
+    index_name: String,
+    limits: crate::view::ViewLimits,
+) -> DbResult<(PathBuf, SearchMeta)> {
+    let indexed = run_index_json(source, &docs, limits).map_err(|reason| {
         ApiError::new(
             500,
             "search_index_error",
@@ -292,7 +320,6 @@ async fn build_index(
     })?;
     let kinds = infer_kinds(&indexed);
 
-    let path = index_dir(db, ddoc, index_name);
     if path.exists() {
         std::fs::remove_dir_all(&path)
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
@@ -356,9 +383,9 @@ async fn build_index(
     let meta = SearchMeta {
         version: SEARCH_VERSION,
         last_seq,
-        design: design_signature(spec),
-        ddoc: ddoc.to_string(),
-        name: index_name.to_string(),
+        design,
+        ddoc,
+        name: index_name,
         docs: indexed
             .into_iter()
             .map(|doc| SearchDoc {
@@ -371,6 +398,16 @@ async fn build_index(
     Ok((path, meta))
 }
 
+fn build_lock(path: &Path) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|poison| poison.into_inner());
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
 async fn ensure_index(
     db: &Db,
     ddoc: &str,
@@ -380,6 +417,10 @@ async fn ensure_index(
 ) -> DbResult<(PathBuf, SearchMeta)> {
     let path = index_dir(db, ddoc, index_name);
     let signature = design_signature(spec);
+    let lock = build_lock(&path);
+    let _guard = lock.lock().await;
+    // Re-check after acquiring the per-index lock: another request may have
+    // completed the rebuild while this one waited.
     if let Some(meta) = read_meta(&path) {
         if meta.version == SEARCH_VERSION
             && meta.last_seq == db.update_seq()
@@ -947,4 +988,20 @@ pub fn all_indexes(db: &Db) -> Vec<Value> {
         }));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_locks_are_per_index() {
+        let first = build_lock(Path::new("/tmp/douchdb-search-lock-a"));
+        let second = build_lock(Path::new("/tmp/douchdb-search-lock-b"));
+        assert!(Arc::ptr_eq(
+            &first,
+            &build_lock(Path::new("/tmp/douchdb-search-lock-a"))
+        ));
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
 }

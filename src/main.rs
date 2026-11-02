@@ -14,6 +14,7 @@ mod js;
 #[cfg(feature = "wasmtime")]
 mod js_wasmtime;
 mod metrics;
+mod observability;
 mod replicate;
 mod rev;
 mod revtree;
@@ -50,6 +51,7 @@ struct Args {
     heavy_in_flight: usize,
     heavy_per_user: usize,
     background_in_flight: usize,
+    compact_concurrency: usize,
     nodes: Vec<String>,
     me: usize,
     advertise: String,
@@ -84,6 +86,7 @@ fn parse_args() -> Args {
         heavy_in_flight: 8,
         heavy_per_user: 1,
         background_in_flight: 2,
+        compact_concurrency: 1,
         nodes: Vec::new(),
         me: 0,
         advertise: String::new(),
@@ -137,6 +140,9 @@ fn parse_args() -> Args {
             }
             "--background-in-flight" => {
                 args.background_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(2)
+            }
+            "--compact-concurrency" => {
+                args.compact_concurrency = it.next().and_then(|v| v.parse().ok()).unwrap_or(1)
             }
             "--nodes" => {
                 args.nodes = it
@@ -196,6 +202,7 @@ fn parse_args() -> Args {
                      \x20       [--default-security open|admin-only]\n\
                      \x20       [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]\n\
                      \x20       [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]\n\
+                     \x20       [--compact-concurrency N]\n\
                      \x20       [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
                      \x20       [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]\n\
@@ -328,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
         dbs: RwLock::new(HashMap::new()),
         config,
         auth,
+        compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            args.compact_concurrency.max(1),
+        )),
         admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
             max_in_flight: args.max_in_flight,
             per_user_in_flight: args.per_user_in_flight,

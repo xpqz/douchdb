@@ -256,18 +256,22 @@ go to every replica.
 ### Read quorum (#44)
 
 Clustered point GET/HEAD now defaults to CouchDB’s read quorum,
-`r = (n / 2) + 1`. The coordinator prefers its local replica when it has one,
-then reads the remaining replicas concurrently and returns the winning
-revision. `?r=1` is the local fast path.
+`r = (n / 2) + 1`. The coordinator reads **all** replicas, counts reachable
+answers including explicit not-found/tombstone responses, and returns `503
+quorum_not_met` if fewer than `r` answer. Deleted winners participate in the
+comparison, so a stale live replica cannot beat a newer tombstone. `?r=1` is the
+local fast path.
 
 | Native GET, 3 nodes, n=3 | Throughput | p50 |
 |---|---:|---:|
 | Default r=2 | 18,522 req/s | 1.47 ms |
 | `?r=1` | 39,296 req/s | 0.68 ms |
 
-The quorum read roughly doubles the per-request work. Use `?r=1` for read-heavy
-workloads that can tolerate a single replica, or keep the default for
-consistency.
+The default quorum now reads every replica and enforces `r`, including tombstones
+in winner selection. The table above was measured with the earlier first-`r`
+implementation; treat those numbers as historical/lower-bound and re-measure on
+the target hardware. Use `?r=1` for read-heavy workloads that can tolerate a
+single replica, or keep the default for consistency.
 
 ### View failover (#45)
 
