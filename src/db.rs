@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Fields CouchDB strips before hashing a document body.
@@ -133,6 +133,9 @@ pub struct Db {
     pub instance_start_time: String,
     shard_map: Arc<std::sync::RwLock<ShardMap>>,
     security: Arc<std::sync::RwLock<Value>>,
+    /// Visible as `compact_running` in `GET /db`; the shard actor still owns
+    /// the actual compaction and blocks its shard while it runs.
+    compact_running: Arc<AtomicBool>,
     shards: Vec<ShardHandle>,
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
@@ -212,6 +215,7 @@ impl Db {
             instance_start_time: file.instance_start_time,
             shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
             security: Arc::new(std::sync::RwLock::new(security)),
+            compact_running: Arc::new(AtomicBool::new(false)),
             shards,
             seq: Arc::new(AtomicU64::new(seq)),
         })
@@ -412,6 +416,18 @@ impl Db {
         Ok(out)
     }
 
+    pub async fn shard_states(&self, with_digest: bool) -> DbResult<Vec<crate::store::ShardState>> {
+        let mut out = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            out.push(
+                shard
+                    .call(move |s| s.state(with_digest).map_err(ApiError::from))
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+
     fn shard(&self, docid: &str) -> &ShardHandle {
         &self.shards[self.shard_index(docid)]
     }
@@ -458,7 +474,7 @@ impl Db {
             "doc_del_count": deleted_count,
             "update_seq": update_seq,
             "purge_seq": 0,
-            "compact_running": false,
+            "compact_running": self.compact_running.load(Ordering::SeqCst),
             "disk_size": 0,
             "data_size": 0,
             "sizes": { "active": 0, "external": 0, "file": 0 },
@@ -1199,10 +1215,16 @@ impl Db {
     }
 
     pub async fn compact(&self) -> DbResult<()> {
-        for shard in &self.shards {
-            shard.call(|s| s.compact().map_err(ApiError::from)).await?;
+        self.compact_running.store(true, Ordering::SeqCst);
+        let result = async {
+            for shard in &self.shards {
+                shard.call(|s| s.compact().map_err(ApiError::from)).await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        self.compact_running.store(false, Ordering::SeqCst);
+        result
     }
 
     pub async fn ensure_full_commit(&self) -> DbResult<Value> {
@@ -1761,6 +1783,9 @@ pub struct DocOpts {
     pub deleted_conflicts: bool,
     pub attachments: bool,
     pub open_revs: Option<Vec<String>>,
+    /// Internal quorum reads need the winning tombstone instead of a 404 so
+    /// deletion can participate in revision comparison.
+    pub include_deleted: bool,
     #[allow(dead_code)]
     pub atts_since: Option<Vec<String>>,
     #[allow(dead_code)]
@@ -1849,13 +1874,21 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
                 .tree
                 .winner()
                 .ok_or_else(|| ApiError::not_found("missing"))?;
-            if meta.tree.is_deleted(&winner) {
+            if meta.tree.is_deleted(&winner) && !opts.include_deleted {
                 return Err(ApiError::not_found("deleted"));
             }
             winner
         }
     };
-    read_doc_rev(shard, id, &meta, &rev, opts)
+    match read_doc_rev(shard, id, &meta, &rev, opts) {
+        Ok(doc) => Ok(doc),
+        // A tombstone may have no stored body. Quorum reads still need the
+        // revision and deleted flag for winner selection.
+        Err(error) if opts.include_deleted && meta.tree.is_deleted(&rev) && error.status == 404 => {
+            Ok(json!({"_id": id, "_rev": rev, "_deleted": true}))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn read_doc_rev(

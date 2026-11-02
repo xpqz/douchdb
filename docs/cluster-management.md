@@ -219,10 +219,18 @@ POST /_node/_local/_dbs/{db}/rebalance
 POST /_node/_local/_dbs/{db}/cleanup
 ```
 
-`rebalance` computes a balanced map, broadcasts it, waits for each shard to
-reach the old replica count and removes copies on nodes that no longer own the
-shard. `cleanup` removes local shard data that the current map says this node
-does not replicate.
+`rebalance` computes a balanced map, broadcasts it, and verifies that every
+target replica has the **same content digest** as the old replica: document
+ids, winning revisions, deleted flags, conflict leaves and attachment metadata.
+Live-document counts alone are never accepted as proof. If old replicas disagree,
+or a target does not match before `timeout_ms`, the map is rolled back to the old
+placement and the request fails with `504`.
+
+Destructive cleanup is now explicit: pass `?cleanup=true` to `rebalance`.
+Without it, the migration is verified but the old local copies are retained.
+`POST /_node/_local/_dbs/{db}/cleanup` remains a separate manual operation that
+removes local shard data the current map says this node does not replicate. Use
+it only after a verified rebalance.
 
 ## Console
 

@@ -1410,6 +1410,9 @@ async fn compact_and_ensure_full_commit() {
     let (status, body) = s.post("/maint/_compact", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body, json!({"ok": true}));
+    let (status, info) = s.get("/maint").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["compact_running"], false);
 
     let (status, body) = s.post("/maint/_ensure_full_commit", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -1966,7 +1969,7 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
 
     let (status, body) = nodes[0]
         .post(
-            "/_node/_local/_dbs/autoreb/rebalance?timeout_ms=20000",
+            "/_node/_local/_dbs/autoreb/rebalance?timeout_ms=20000&cleanup=true",
             json!({}),
         )
         .await;
@@ -2058,6 +2061,11 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
         .map(|row| row["docs"].as_u64().unwrap())
         .sum();
     assert_eq!(total, 9, "timeout must not clean the old replica");
+    let (status, map) = nodes[0].get("/_node/_local/_dbs/timeoutreb").await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    for replicas in map["replicas"].as_array().unwrap() {
+        assert_eq!(replicas[0], 0, "timeout must restore the old shard map");
+    }
 }
 
 #[tokio::test]
@@ -2564,12 +2572,13 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     );
     assert!(body.as_array().unwrap().iter().all(|row| row["ok"] == true));
 
-    // Every document remains readable through either survivor: reads fall back
-    // to the next replica when the primary is the dead node.
+    // The default read quorum is r=2 and one of the two replicas is gone, so
+    // a quorum read must fail rather than silently serve a best-effort answer.
+    // Availability under node loss explicitly opts into the local fast path.
     let survivors = &nodes[..2];
     for i in (0..12).chain(100..106) {
         for node in survivors {
-            let (status, _) = node.get(&format!("/clkill/k{i}")).await;
+            let (status, _) = node.get(&format!("/clkill/k{i}?r=1")).await;
             assert_eq!(status, StatusCode::OK, "k{i} via {}", node.base);
         }
     }
@@ -2640,9 +2649,10 @@ async fn cluster_honours_w_and_r_quorum_parameters() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "w=1: {body}");
 
-    // r=2 tolerates the dead replica as long as one answers.
-    let (status, _) = nodes[0].get("/clquorum/q2?r=2").await;
-    assert_eq!(status, StatusCode::OK);
+    // r=2 with one replica down is a quorum failure, not a best-effort read.
+    let (status, body) = nodes[0].get("/clquorum/q2?r=2").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "quorum_not_met");
 }
 
 #[tokio::test]
@@ -7781,4 +7791,248 @@ async fn cluster_security_change_rolls_back_when_a_peer_is_down() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({}));
+}
+
+#[tokio::test]
+async fn cluster_rebalance_requires_explicit_cleanup() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("noclean").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/noclean", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("nc{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/noclean/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/noclean/rebalance?timeout_ms=20000",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("cleaned").is_none(), "{body}");
+
+    // The migration completed, but the old node keeps its local copies until
+    // cleanup is explicitly requested.
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, counts) = nodes[0]
+        .req_with(
+            Method::GET,
+            "/_node/_local/_dbs/noclean/shards",
+            None,
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{counts}");
+    let total: u64 = counts["shards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["docs"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 9, "old shards must survive until explicit cleanup");
+    let (status, body) = nodes[0].get("/noclean/_all_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 9);
+}
+
+#[tokio::test]
+async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("delreb").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/delreb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let docs: Vec<Value> = (0..8)
+        .map(|i| json!({"_id": format!("del{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/delreb/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, all) = nodes[0].get("/delreb/_all_docs").await;
+    let deletes: Vec<Value> = all["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| json!({"_id": row["id"], "_rev": row["value"]["rev"], "_deleted": true}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/delreb/_bulk_docs", json!({"docs": deletes}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, live) = nodes[0].get("/delreb/_all_docs").await;
+    assert_eq!(live["total_rows"], 0);
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/delreb/rebalance?timeout_ms=20000&cleanup=true",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Every tombstone must exist exactly once on the new owners; a deleted-only
+    // shard has live count 0, so counts alone cannot establish this.
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let mut deleted = 0u64;
+    for node in &nodes {
+        let (status, counts) = node
+            .req_with(
+                Method::GET,
+                "/_node/_local/_dbs/delreb/shards",
+                None,
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{counts}");
+        deleted += counts["shards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["deleted"].as_u64().unwrap())
+            .sum::<u64>();
+    }
+    assert_eq!(deleted, 8, "tombstones were lost during rebalance cleanup");
+
+    let (status, body) = nodes[0]
+        .get("/delreb/_changes?since=0&style=all_docs")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: std::collections::HashSet<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 8, "deleted changes were lost: {body}");
+    for row in body["results"].as_array().unwrap() {
+        assert_eq!(row["deleted"], true, "{row}");
+    }
+}
+
+#[tokio::test]
+async fn rebalance_verifies_conflict_leaves_before_cleanup() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("confreb").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/confreb", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let root = "00000000000000000000000000000000";
+    let docs = json!({"new_edits": false, "docs": [
+        {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+         "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"},
+        {"_id": "x", "_rev": "2-cccccccccccccccccccccccccccccccc",
+         "_revisions": {"start": 2, "ids": ["cccccccccccccccccccccccccccccccc", root]}, "v": "c"}
+    ]});
+    let (status, body) = nodes[0].post("/confreb/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = nodes[0].get("/confreb/x?conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_conflicts"].as_array().unwrap().len(), 1);
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/confreb/rebalance?timeout_ms=20000&cleanup=true",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = nodes[0].get("/confreb/x?conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["_conflicts"].as_array().unwrap().len(),
+        1,
+        "conflict leaf was lost during rebalance cleanup: {body}"
+    );
+}
+
+#[tokio::test]
+async fn quorum_read_prefers_tombstone_over_stale_live_replica() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("qtomb").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+
+    // Both replicas get the live revision.
+    let (status, body) = nodes[0]
+        .post("/qtomb/_bulk_docs", json!({"docs": [{"_id": "x", "v": 1}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, doc) = nodes[0]
+        .req_with(Method::GET, "/qtomb/x", None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+
+    // Delete only on node0. Node1 keeps the stale live revision.
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/qtomb/_bulk_docs",
+            Some(json!({"docs": [{"_id": "x", "_rev": rev, "_deleted": true}]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, stale) = nodes[1]
+        .req_with(Method::GET, "/qtomb/x", None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "stale replica: {stale}");
+    assert_eq!(stale["v"], 1);
+
+    // A strict quorum read sees the tombstone and a stale live copy. The
+    // tombstone is the descendant and must win; the result is 404, not stale data.
+    let (status, body) = nodes[0].get("/qtomb/x?r=2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("\"v\":1"));
+}
+
+#[tokio::test]
+async fn quorum_read_prefers_conflict_winner_across_replicas() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("qconf").await;
+    }
+    let root = "00000000000000000000000000000000";
+    let docs = json!({"new_edits": false, "docs": [
+        {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+         "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"},
+        {"_id": "x", "_rev": "2-cccccccccccccccccccccccccccccccc",
+         "_revisions": {"start": 2, "ids": ["cccccccccccccccccccccccccccccccc", root]}, "v": "c"}
+    ]});
+    let (status, body) = nodes[0].post("/qconf/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = nodes[0].get("/qconf/x?r=2&conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], "c");
+    assert_eq!(body["_conflicts"].as_array().unwrap().len(), 1);
 }

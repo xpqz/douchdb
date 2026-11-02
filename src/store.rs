@@ -8,6 +8,7 @@ use crate::revtree::RevTree;
 use anyhow::Result;
 use rusty_leveldb::{LdbIterator, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -75,6 +76,15 @@ pub struct DocMeta {
 pub struct LiveDoc {
     pub rev: String,
     pub has_attachments: bool,
+}
+
+/// Counts plus an optional content digest for rebalance verification.
+#[derive(Clone, Debug, Default)]
+pub struct ShardState {
+    pub docs: u64,
+    pub deleted: u64,
+    pub seq: u64,
+    pub digest: Option<String>,
 }
 
 /// A batch of changes plus the sequence counter, committed atomically.
@@ -328,6 +338,77 @@ impl Shard {
     /// Live and deleted document counts for this shard.
     pub fn counts(&self) -> (u64, u64) {
         (self.docs, self.deleted)
+    }
+
+    /// Content digest over document ids, winning revisions, deleted flags,
+    /// conflict leaves and attachment metadata. It deliberately excludes
+    /// per-replica sequence numbers, which differ between replicas. Two
+    /// replicas with identical replicated content produce the same digest.
+    pub fn fingerprint(&mut self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        let mut iter = self.db.new_iter()?;
+        iter.seek(b"m/");
+        let mut documents = 0u64;
+        while let Some((key, value)) = iter.current() {
+            let key = key.as_ref();
+            if !key.starts_with(b"m/") {
+                break;
+            }
+            let id = std::str::from_utf8(&key[2..])
+                .map_err(|error| anyhow::anyhow!("doc id is not UTF-8: {error}"))?;
+            let meta: DocMeta = serde_json::from_slice(value.as_ref())?;
+            hasher.update(b"doc");
+            hasher.update(id.as_bytes());
+            match meta_state(&meta) {
+                Some((winner, live, _)) => {
+                    hasher.update(winner.as_bytes());
+                    hasher.update([live as u8]);
+                }
+                None => hasher.update(b"no-winner"),
+            }
+            let mut leaves = meta.tree.leaves();
+            leaves.sort();
+            for leaf in leaves {
+                hasher.update(b"leaf");
+                hasher.update(leaf.as_bytes());
+                hasher.update([meta.tree.is_deleted(&leaf) as u8]);
+            }
+            for (rev, atts) in &meta.atts {
+                // Empty attachment vectors can differ between replicas without
+                // changing the document content.
+                if atts.is_empty() {
+                    continue;
+                }
+                hasher.update(b"att");
+                hasher.update(rev.as_bytes());
+                for (name, att) in atts {
+                    hasher.update(name.as_bytes());
+                    hasher.update(att.digest.as_bytes());
+                    hasher.update(att.length.to_be_bytes());
+                    hasher.update(att.revpos.to_be_bytes());
+                }
+            }
+            documents += 1;
+            if !iter.advance() {
+                break;
+            }
+        }
+        hasher.update(documents.to_be_bytes());
+        Ok(crate::db::hex(&hasher.finalize()))
+    }
+
+    pub fn state(&mut self, with_digest: bool) -> Result<ShardState> {
+        let (docs, deleted) = self.counts();
+        Ok(ShardState {
+            docs,
+            deleted,
+            seq: self.seq,
+            digest: if with_digest {
+                Some(self.fingerprint()?)
+            } else {
+                None
+            },
+        })
     }
 
     /// Live document count for one partition, using the in-memory live map.

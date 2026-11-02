@@ -279,9 +279,11 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   node. Design documents are replicated to every node (views need them to map
   the node's local shards). A node that is offline during the operation must be
   repaired manually.
-* **Consistency:** implement CouchDB's `?w=`/`?r=`; default quorum write, single
-  read. An unmet write quorum returns `202` and anti-entropy heals the replica.
-  Do not pretend to offer linearizability.
+* **Consistency:** implement CouchDB's `?w=`/`?r=`; default quorum write and
+  default read quorum `r=(n/2)+1`. An unmet read quorum returns `503` and includes
+  tombstones in winner comparison; `?r=1` is the local fast path. An unmet write
+  quorum returns `202` and anti-entropy heals the replica. Do not pretend to
+  offer linearizability.
 * **Operational limits:** `_purge`, `_compact` and `_revs_limit` are local to the
   receiving node; there is no inter-node TLS or separate service account, so
   cluster nodes must sit on a trusted network.
@@ -374,7 +376,8 @@ the bulk of the growth.
 * **Group commit.** The shard actor drains up to 64 queued jobs, merges their
   `Tx`es into one `WriteBatch`, and acknowledges after the batch is flushed to
   the OS. rusty-leveldb does not fsync by default, so acknowledged writes are
-  not power-loss durable; comparisons must state this. A write overlay makes
+  not power-loss durable; comparisons must state this. The explicit positioning
+  and operational guidance are in `docs/durability.md`. A write overlay makes
   later jobs in the same group read their predecessors. A SIGKILL/restart
   conformance test confirms acknowledged documents and changes survive a
   process crash; power loss remains explicitly out of scope.
@@ -391,9 +394,11 @@ the bulk of the growth.
 * **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
   rendezvous score. A write is sent to every replica in the shard set and
   returns once the requested quorum acknowledges; remaining replica writes
-  continue detached. Reads try replicas in preference order and fall back past
-  a dead primary. `?w=` and `?r=` are honoured (default write quorum, single read);
-  an unmet write quorum returns `202` and anti-entropy repairs the replica.
+  continue detached. Reads fan out to the replica set and enforce the requested
+  read quorum. `?w=` and `?r=` are honoured; the default read quorum is
+  `r=(n/2)+1`, and `?r=1` is the local fast path when a replica is unavailable.
+  An unmet read quorum returns `503`; an unmet write quorum returns `202` and
+  anti-entropy repairs the replica.
   Anti-entropy advances a checkpoint only after every requested revision is
   applied, already local, or explicitly unavailable from the peer; partial
   `_bulk_get` responses leave the checkpoint behind. The streamed changes merge
@@ -458,6 +463,19 @@ the bulk of the growth.
   page are included. Optional OTLP traces and metrics remain available via
   `--otel-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`, with a no-op default. The
   issue/branch/merge workflow is documented in `docs/process.md`.
+* **Stabilization pass.** Rebalance readiness now compares exact per-shard
+  content digests (document ids, winning revisions, deleted flags, conflict
+  leaves and attachment metadata) instead of live counts; old replicas must
+  agree, cleanup is explicit (`?cleanup=true`), and a timeout rolls the map
+  back. Point reads enforce the requested read quorum, count explicit
+  not-found/tombstone answers, and select descendants over stale live copies;
+  unmet quorum is `503`. The Docker build includes the embedded WASI runner, a
+  GitHub Actions workflow runs fmt/clippy/tests/both wasm backends/container
+  build, search rebuilds are serialized per index and run on the blocking pool,
+  and `_compact` has a configurable node-wide concurrency bound plus a visible
+  `compact_running` flag. Durability is explicitly positioned as non-primary in
+  `docs/durability.md`. Observability handlers moved out of `api.rs` into
+  `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
   token users and roles; `_security` uses CouchDB's `admins`/`members` names and
   roles, with admin-only defaults when auth is configured and filtered
@@ -525,8 +543,9 @@ the bulk of the growth.
   documents are shared as `Arc<Value>` across replica groups and forwarded
   payloads are serialized directly, avoiding one deep clone and one
   intermediate JSON tree per peer. Remaining replica writes continue detached,
-  so slow replicas do not set tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
-  the remaining replicas concurrently; `?r=1` is the local fast path. Fabric,
+  so slow replicas do not set tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, read every replica concurrently,
+  enforce the quorum and include tombstones in winner selection; `?r=1` is the
+  local fast path. Fabric,
   shard-map and rebalance counters are recorded in the in-process registry and
   also exported through the optional OpenTelemetry setup. A
   reproducible three-node `q=4`/`n=3` benchmark and before/after numbers are in

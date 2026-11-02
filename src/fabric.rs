@@ -218,65 +218,132 @@ pub(crate) async fn quorum_read(
     headers: &HeaderMap,
     r: usize,
 ) -> Response {
-    let mut best: Option<Value> = None;
-    // Strip `r` from the hop so the replica answers locally instead of
-    // starting another quorum read and bouncing the request back.
+    // Strict quorum: ask every replica, count reachable answers (including
+    // explicit not-found/tombstone answers), and fail if fewer than `r` replicas
+    // answer. Never return a successful read with fewer than `r` responses.
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
+    inner.insert("revs".to_string(), "true".to_string());
     let mut replicas = replicas_of_doc(db, docid);
     if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
-    let targets: Vec<usize> = replicas.into_iter().take(r).collect();
-    let docs = futures::future::join_all(targets.into_iter().map(|node| {
+    let r = r.min(replicas.len()).max(1);
+    let mut opts = doc_opts(q);
+    opts.revs = true;
+    opts.include_deleted = true;
+    let docs = join_all(replicas.into_iter().map(|node| {
         let inner = inner.clone();
+        let opts = opts.clone();
         async move {
             if node == st.cluster.me {
                 crate::telemetry::record_local_read();
-                return db.get_doc(docid, &doc_opts(q)).await.ok();
+                return match db.get_doc(docid, &opts).await {
+                    Ok(doc) => (true, Some(doc)),
+                    Err(error) => (error.status == 404, None),
+                };
             }
             crate::telemetry::record_remote_read();
             let peer = st.cluster.nodes[node].clone();
-            let response = proxy(
-                st,
-                &Method::GET,
-                dbname,
-                docid,
-                &inner,
-                headers,
-                Bytes::new(),
-                &peer,
-            )
-            .await;
-            if response.status().is_success() {
-                axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            } else {
-                None
+            let request = st
+                .client
+                .get(format!("{peer}/{dbname}/{docid}"))
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", st.cluster.secret.as_str())
+                .header("x-douchdb-quorum-read", "1")
+                .query(&inner);
+            let request = forward_client_auth(request, headers);
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<Value>().await {
+                        Ok(doc) => (true, Some(doc)),
+                        Err(_) => (false, None),
+                    }
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => (true, None),
+                Ok(_) => (false, None),
+                Err(_) => (false, None),
             }
         }
     }))
     .await;
-    let mut found = 0usize;
-    for doc in docs.into_iter().flatten() {
-        found += 1;
-        if best.as_ref().map(|b| better_rev(&doc, b)).unwrap_or(true) {
-            best = Some(doc);
+    let reachable = docs.iter().filter(|(reachable, _)| *reachable).count();
+    let mut best: Option<Value> = None;
+    for (_, doc) in docs {
+        if let Some(doc) = doc {
+            if best
+                .as_ref()
+                .map(|current| better_rev(&doc, current))
+                .unwrap_or(true)
+            {
+                best = Some(doc);
+            }
         }
     }
-    if found < r {
+    if reachable < r {
         crate::telemetry::record_quorum_failure();
+        return fail(ApiError::new(
+            503,
+            "quorum_not_met",
+            format!("read quorum {r} not met: {reachable} replica(s) answered"),
+        ));
     }
     match best {
+        Some(doc) if doc.get("_deleted").and_then(Value::as_bool) == Some(true) => {
+            fail(ApiError::not_found("deleted"))
+        }
         Some(doc) => doc_response(doc),
         None => fail(ApiError::not_found("missing")),
     }
 }
 
+/// Revision history from a `revs=true` document response, newest first.
+fn revision_history(doc: &Value) -> Vec<String> {
+    let Some(revisions) = doc.get("_revisions") else {
+        return Vec::new();
+    };
+    let Some(start) = revisions.get("start").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    let Some(ids) = revisions.get("ids").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    ids.iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            id.as_str()
+                .map(|id| format!("{}-{id}", start.saturating_sub(index as u64)))
+        })
+        .collect()
+}
+
+fn descends_from(candidate: &Value, current: &Value) -> bool {
+    let Some(current_rev) = current.get("_rev").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(candidate_rev) = candidate.get("_rev").and_then(Value::as_str) else {
+        return false;
+    };
+    if candidate_rev == current_rev {
+        return false;
+    }
+    revision_history(candidate)
+        .into_iter()
+        .skip(1)
+        .any(|rev| rev == current_rev)
+}
+
 pub(crate) fn better_rev(candidate: &Value, current: &Value) -> bool {
+    // A direct descendant wins even when it is a tombstone. This is the case
+    // a stale live replica would otherwise win on CouchDB's deleted-first
+    // ordering rule.
+    if descends_from(candidate, current) {
+        return true;
+    }
+    if descends_from(current, candidate) {
+        return false;
+    }
     let key = |doc: &Value| {
         let deleted = doc
             .get("_deleted")

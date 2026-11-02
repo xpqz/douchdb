@@ -294,11 +294,10 @@ does not need valid design documents and does not remove views.
   no BM25 score ordering or `_score` sort.
 - **No incremental indexing.** Every document write invalidates the index and
   the next query performs a full rebuild.
-- **No background indexer.** Builds happen in the request path, limited by the
-  view timeout and memory settings.
-- **Concurrent rebuilds are not serialized.** Two requests that both observe a
-  stale index may rebuild it redundantly; if one fails, the next request
-  rebuilds from the missing/stale metadata.
+- **No fully background indexer.** Builds still happen on the request path, but
+  QuickJS and Tantivy work runs on the blocking pool and rebuilds are serialized
+  per index. A second query waits for the first build and then reuses it. Builds
+  remain limited by the view timeout and memory settings.
 - **Indexed snapshot vs. current document.** `fields`, `counts`, ranges and
   groups come from the snapshot; `include_docs` fetches the current document.
 - **Text fields are not stored in Tantivy.** Response fields and facets come

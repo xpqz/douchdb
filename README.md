@@ -428,6 +428,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--default-security open|admin-only]
         [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]
         [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]
+        [--compact-concurrency N]
         [--nodes URL,URL] [--me INDEX] [--sync-secs N]
         [--advertise URL] [--seed-nodes URL,URL]
         [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]
@@ -454,6 +455,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--heavy-in-flight` | `8` | Global concurrent view/search requests |
 | `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
 | `--background-in-flight` | `2` | Concurrent anti-entropy/discovery passes |
+| `--compact-concurrency` | `1` | Concurrent `_compact` requests across databases on this node |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
@@ -501,11 +503,13 @@ router; there is no coordinator role.
 - `md5(docid)` selects the shard; rendezvous hashing over the node list selects
   `--n` distinct replicas, in preference order. The first is the primary.
 - A write is sent to every replica in the shard set and returns once the
-  requested quorum acknowledges; the remaining writes continue detached. A
-  read tries replicas in order and falls back if the primary is down.
-- `?w=` / `?r=` select write and read quorum (default: write quorum, single
-  read). An unmet write quorum returns `202`; anti-entropy repairs the replica
-  later.
+  requested quorum acknowledges; the remaining writes continue detached. Reads
+  fan out to the replica set and enforce the requested read quorum; `?r=1` is the
+  local fast path when a replica is unavailable.
+- `?w=` / `?r=` select write and read quorum. The default read quorum is
+  `r = (n/2)+1`; `?r=1` is the local fast path. An unmet read quorum returns
+  `503 quorum_not_met`, including tombstones in the comparison. An unmet write
+  quorum returns `202`; anti-entropy repairs the replica later.
 - Anti-entropy runs every `--sync-secs`, pulling from every peer but only for
   the shards the node replicates. It uses the shared admin credentials when
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
@@ -550,8 +554,8 @@ broadcast) and then write normally.
 - **Static membership.** There is no gossip or automatic join. Discovery
   reports peers and drift, but it does not change placement. To change the
   node list, restart every node with the new list. Rendezvous hashing and
-  anti-entropy copy data to new replicas; use `rebalance`/`cleanup` to remove
-  old copies.
+  anti-entropy copy data to new replicas; `rebalance` verifies content digests
+  before migration, and destructive cleanup requires `?cleanup=true`.
 - **AP, not linearizable.** Concurrent writes converge through CouchDB revision
   trees; there is no Raft and no global ordering beyond version vectors.
 - **Best-effort database lifecycle.** A node that is offline during a database
@@ -563,9 +567,10 @@ broadcast) and then write normally.
 - **No inter-node TLS or service accounts.** Nodes trust each other on the
   network; use a private network or a proxy if that matters.
 - **Rebalance is not consensus.** `POST /_node/_local/_dbs/{db}/rebalance`
-  computes and broadcasts a balanced map and waits for replica catch-up, but
-  it is still an operator action built on static membership, not an online
-  membership protocol.
+  computes and broadcasts a balanced map and waits for exact content digests
+  (documents, tombstones, conflict leaves), but it is still an operator action
+  built on static membership, not an online membership protocol. Timeout rolls
+  back the map; cleanup is explicit.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,
@@ -757,7 +762,11 @@ python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
 ## Tests
 
 ```sh
+cargo fmt --check
+cargo clippy --all-targets
 cargo test
+cargo test --features wasmtime
+docker build -t douchdb:ci .
 ```
 
 This runs unit tests plus integration tests that start real server processes
@@ -786,16 +795,22 @@ not test power-loss durability: rusty-leveldb does not fsync.
 
 ## Status and limits
 
-v0.1: the replication protocol, auth, views and a Q-shard × N-replica cluster
-with anti-entropy are implemented and tested. Attachments are deliberately not
-supported; documents containing `_attachments` are rejected with
-`attachments_not_supported`. Known limits:
+v0.2: the replication protocol, auth, views, search, multiuser admission, a
+Q-shard × N-replica cluster with anti-entropy, and the embedded console are
+implemented and tested. Attachments are deliberately not supported; documents
+containing `_attachments` are rejected with `attachments_not_supported`.
+
+**Durability:** DouchDB is not a power-loss-durable primary store. Writes survive
+process crashes but not necessarily power loss, because the storage layer does
+not fsync. See [docs/durability.md](docs/durability.md). Known limits:
 
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - Version vectors are keyed per node, not per shard replica.
 - `_compact` runs synchronously in the shard actor: at 10 GB it blocks that
-  shard for ~27 s (measured in [PLAN.md](PLAN.md)).
+  shard for ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency`
+  bounds concurrent compactions across databases, and `GET /db` reports
+  `compact_running`.
 - No Mango or lists/shows. Attachments are not supported.
 
 ## License
