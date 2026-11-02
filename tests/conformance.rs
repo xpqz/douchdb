@@ -69,7 +69,9 @@ impl Server {
         // Wait for the listener, and notice a child that died (e.g. port
         // collision) instead of sleeping for the whole budget.
         let mut up = false;
-        for _ in 0..100 {
+        // Wasmtime compiles the runner at startup; allow a few seconds in
+        // debug builds without delaying the usual dead-child detection.
+        for _ in 0..300 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 up = true;
                 break;
@@ -5883,6 +5885,78 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "wasm fuel deadline was not enforced: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(feature = "wasmtime")]
+#[tokio::test]
+async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "wasm".to_string(),
+        "--wasm-runtime".to_string(),
+        "wasmtime".to_string(),
+        "--view-timeout-ms".to_string(),
+        "150".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jswasmtime").await;
+    let (status, _) = s
+        .post(
+            "/jswasmtime/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "city": "Berlin", "price": 10},
+                {"_id": "b", "city": "Paris", "price": 20},
+                {"_id": "c", "city": "Berlin", "price": 30}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jswasmtime/_design/v",
+            json!({
+                "views": {
+                    "computed": {"map": "function(doc){ var suffix = '-x'; emit(doc.city + suffix, doc.price); }"},
+                    "total": {
+                        "map": "function(doc){ emit(null, doc.price); }",
+                        "reduce": "function(keys, values, rereduce){ return sum(values); }"
+                    },
+                    "loop": {"map": "function(doc){ while (true) {} }"}
+                },
+                "indexes": {
+                    "cities": {"index": "function(doc){ index('city', doc.city); }"}
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s
+        .get("/jswasmtime/_design/v/_view/computed?reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(body["rows"][0]["key"], "Berlin-x");
+
+    let (status, body) = s.get("/jswasmtime/_design/v/_view/total").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["value"], 60);
+
+    let (status, body) = s
+        .get("/jswasmtime/_design/v/_search/cities?q=city:Berlin")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 2);
+
+    let started = std::time::Instant::now();
+    let (status, body) = s.get("/jswasmtime/_design/v/_view/loop").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "view_error");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "wasmtime epoch deadline was not enforced: {:?}",
         started.elapsed()
     );
 }

@@ -18,7 +18,9 @@ cp target/wasm32-wasip1/release/qjs-runner.wasm ../
 
 The runner uses the maintained `rquickjs` crate (MIT) with QuickJS (MIT),
 built through the WASI SDK. Keep the generated `.wasm` in sync with the source;
-`cargo test` exercises the checked-in artifact through `wasmi`.
+`cargo test` exercises the checked-in artifact through `wasmi`; with
+`--features wasmtime` the same artifact also runs under the Wasmtime JIT. The
+artifact is unchanged by the host runtime choice.
 
 Expected artifact checksum for the checked-in binary:
 

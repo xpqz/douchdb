@@ -4,6 +4,12 @@
     cargo build --release
     python3 scripts/js_sandbox_bench.py --docs 2000
 
+Compare both wasm host runtimes (requires the optional backend):
+
+    cargo build --release --features wasmtime
+    python3 scripts/js_sandbox_bench.py \
+        --modes native,process,wasm-wasmi,wasm-wasmtime --docs 2000
+
 The map function uses a local variable so it cannot take the native Rust fast
 path; every mode therefore executes the same JavaScript.
 """
@@ -65,8 +71,13 @@ def percentile(values, pct):
     return values[index]
 
 
-def bench_mode(binary, mode, docs, queries):
+def bench_mode(binary, mode, docs, queries, wasm_runtime):
     port = free_port()
+    sandbox = mode
+    runtime = wasm_runtime
+    if mode.startswith("wasm-"):
+        sandbox = "wasm"
+        runtime = mode.split("-", 1)[1]
     data = f"target/js-sandbox-{mode}"
     shutil.rmtree(data, ignore_errors=True)
     log = open(data + ".log", "wb")
@@ -77,8 +88,10 @@ def bench_mode(binary, mode, docs, queries):
         "--q", "1",
         "--n", "1",
         "--sync-secs", "3600",
-        "--js-sandbox", mode,
+        "--js-sandbox", sandbox,
     ]
+    if sandbox == "wasm":
+        args += ["--wasm-runtime", runtime]
     proc = subprocess.Popen(args, stdout=log, stderr=log)
     try:
         wait_ready(port, proc)
@@ -124,7 +137,7 @@ def bench_mode(binary, mode, docs, queries):
             search_warm.append(elapsed)
         conn.close()
         return {
-            "mode": mode,
+            "mode": f"wasm-{runtime}" if sandbox == "wasm" else mode,
             "cold_map_ms": round(cold, 2),
             "warm_map_p50_ms": round(percentile(warm, 50), 2),
             "warm_map_p95_ms": round(percentile(warm, 95), 2),
@@ -147,6 +160,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", default="target/release/douchdb")
     parser.add_argument("--modes", default="native,process,wasm")
+    parser.add_argument(
+        "--wasm-runtime",
+        default="wasmi",
+        choices=["wasmi", "wasmtime"],
+        help="wasm runtime for the plain 'wasm' mode; use wasm-wasmi/wasm-wasmtime modes to compare",
+    )
     parser.add_argument("--docs", type=int, default=2000)
     parser.add_argument("--queries", type=int, default=10)
     parser.add_argument("--json-out", default="target/js-sandbox-bench.json")
@@ -155,7 +174,9 @@ def main():
     results = []
     for mode in [mode for mode in args.modes.split(",") if mode]:
         print(f"benchmarking {mode}...", flush=True)
-        results.append(bench_mode(args.bin, mode, args.docs, args.queries))
+        results.append(
+            bench_mode(args.bin, mode, args.docs, args.queries, args.wasm_runtime)
+        )
     payload = {"docs": args.docs, "queries": args.queries, "results": results}
     with open(args.json_out, "w") as output:
         json.dump(payload, output, indent=2)

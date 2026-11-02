@@ -1039,6 +1039,13 @@ pub(crate) fn run_map_json(
     }
     const MAX_DOCS: usize = 256;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
+    // Sandbox calls pay a process/wasm boundary per batch. Use a larger batch
+    // than the native path while keeping the input and output bounded.
+    let (max_docs, max_bytes) = if crate::js::sandboxed() {
+        (2048usize, 8usize * 1024 * 1024)
+    } else {
+        (MAX_DOCS, MAX_BYTES)
+    };
 
     if crate::js::sandboxed() {
         let mut rows = Vec::new();
@@ -1047,8 +1054,8 @@ pub(crate) fn run_map_json(
             let mut end = start;
             let mut bytes = 2;
             while end < docs.len()
-                && end - start < MAX_DOCS
-                && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
+                && end - start < max_docs
+                && (end == start || bytes + docs[end].1.len() < max_bytes)
             {
                 bytes += docs[end].1.len() + 1;
                 end += 1;
@@ -1117,7 +1124,7 @@ pub(crate) fn run_map_json(
                 let mut bytes = 2;
                 while end < docs.len()
                     && end - start < MAX_DOCS
-                    && (end == start || bytes + docs[end].1.len() + 1 <= MAX_BYTES)
+                    && (end == start || bytes + docs[end].1.len() < MAX_BYTES)
                 {
                     bytes += docs[end].1.len() + 1;
                     end += 1;
