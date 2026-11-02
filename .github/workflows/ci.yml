@@ -22,6 +22,8 @@ jobs:
         run: cargo test
       - name: Wasmtime backend tests
         run: cargo test --features wasmtime
+      - name: Vendored storage cache tests
+        run: cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml cache::
 
   macos:
     runs-on: macos-latest

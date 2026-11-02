@@ -1,6 +1,6 @@
 [package]
 name = "douchdb"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "CouchDB wire-compatible document database on LevelDB"
 license = "Apache-2.0"
@@ -47,3 +47,8 @@ tracing-opentelemetry = "0.34"
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 landlock = "0.4"
+
+# Local fork: iterative LRU teardown and duplicate-key eviction. Upstream
+# 4.0.2 recursively drops the owning LRU chain and can overflow worker stacks.
+[patch.crates-io]
+rusty-leveldb = { path = "vendor/rusty-leveldb" }

@@ -2,6 +2,7 @@ FROM rust:1-bookworm AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY src ./src
 COPY ui ./ui
 # `src/js.rs` embeds the checked-in QuickJS WASI runner at compile time.
