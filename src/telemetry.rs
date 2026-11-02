@@ -146,26 +146,35 @@ fn fabric_metrics() -> &'static FabricMetrics {
 }
 
 pub fn record_local_read() {
+    crate::metrics::record_fabric("local_read", 1);
     fabric_metrics().local_reads.add(1, &[]);
 }
 
 pub fn record_remote_read() {
+    crate::metrics::record_fabric("remote_read", 1);
     fabric_metrics().remote_reads.add(1, &[]);
 }
 
 pub fn record_quorum_failure() {
+    crate::metrics::record_fabric("quorum_failure", 1);
     fabric_metrics().quorum_failures.add(1, &[]);
 }
 
 pub fn record_degraded_read() {
+    crate::metrics::record_fabric("degraded_read", 1);
     fabric_metrics().degraded_reads.add(1, &[]);
 }
 
 pub fn record_fanout(nodes: u64) {
+    crate::metrics::record_fabric("fanout", nodes);
     fabric_metrics().fanout.record(nodes, &[]);
 }
 
 pub fn record_shard_map_update(pending: bool) {
+    crate::metrics::record_fabric("shard_map_update", 1);
+    if pending {
+        crate::metrics::record_fabric("shard_map_pending", 1);
+    }
     fabric_metrics().shard_map_updates.add(1, &[]);
     if pending {
         fabric_metrics().shard_map_pending.add(1, &[]);
@@ -173,14 +182,18 @@ pub fn record_shard_map_update(pending: bool) {
 }
 
 pub fn record_rebalance_started() {
+    crate::metrics::record_fabric("rebalance_started", 1);
     fabric_metrics().rebalance_started.add(1, &[]);
 }
 
 pub fn record_rebalance_completed(cleaned: u64) {
+    crate::metrics::record_fabric("rebalance_completed", 1);
+    crate::metrics::record_fabric("cleaned_shards", cleaned);
     fabric_metrics().rebalance_completed.add(1, &[]);
     fabric_metrics().cleaned_shards.add(cleaned, &[]);
 }
 
 pub fn record_rebalance_timeout() {
+    crate::metrics::record_fabric("rebalance_timeout", 1);
     fabric_metrics().rebalance_timeout.add(1, &[]);
 }

@@ -32,6 +32,7 @@
 
         <button class="ghost icon" @click="refreshAll" title="Refresh databases">↻</button>
         <button class="ghost" @click="openCluster" data-testid="open-cluster">Cluster</button>
+        <button class="ghost" @click="openMetrics" data-testid="open-metrics">Metrics</button>
 
         <template v-if="user">
           <span class="user" data-testid="current-user">● {{ user }}</span>
@@ -276,6 +277,314 @@
                   </tbody>
                 </table>
               </details>
+            </template>
+          </section>
+
+          <!-- metrics ---------------------------------------------------->
+          <section v-if="view === 'metrics'" class="page">
+            <div class="view-head">
+              <h1>Observability</h1>
+              <nav class="tabs">
+                <button class="active">Metrics</button>
+                <button @click="openCluster">Cluster</button>
+              </nav>
+            </div>
+
+            <div class="toolbar">
+              <button @click="loadMetrics" data-testid="metrics-refresh">Refresh</button>
+              <span class="spacer"></span>
+              <span class="muted" v-if="metrics">
+                {{ metrics.scope }} scope
+                <template v-if="metrics.summary"> ·
+                  {{ metrics.summary.reachable }}/{{ metrics.summary.nodes }} nodes reporting
+                </template>
+                · {{ age(metrics.generated_at) }}
+              </span>
+            </div>
+
+            <p v-if="metricsError" class="error" data-testid="metrics-error">{{ metricsError }}</p>
+            <p v-if="!metrics && !metricsError" class="muted">Loading metrics…</p>
+
+            <template v-if="metrics">
+              <div :class="['health-banner', 'health-' + metrics.health.status]">
+                <strong>{{ metrics.health.status }}</strong>
+                <span class="muted">
+                  {{ metrics.health.ok ? 'all checks pass' : 'see the checks below' }}
+                </span>
+                <span class="spacer"></span>
+                <span class="muted mono">{{ metrics.node.url }}</span>
+              </div>
+
+              <div class="cards metrics-cards">
+                <div class="card">
+                  <h3>Requests</h3>
+                  <div class="metric-big">{{ metrics.http.total }}</div>
+                  <p class="muted">
+                    {{ metrics.http.errors }} errors ·
+                    {{ humanPct(metrics.http.error_rate_pct) }} ·
+                    {{ metrics.http.in_flight }} in flight
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Latency</h3>
+                  <div class="metric-big">{{ humanMs(metrics.http.latency_ms.avg) }}</div>
+                  <p class="muted">
+                    p50 {{ humanMs(metrics.http.latency_ms.p50) }} ·
+                    p95 {{ humanMs(metrics.http.latency_ms.p95) }} ·
+                    p99 {{ humanMs(metrics.http.latency_ms.p99) }} ·
+                    max {{ humanMs(metrics.http.latency_ms.max) }}
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Storage</h3>
+                  <div class="metric-big">{{ humanBytes(metrics.storage.disk_bytes) }}</div>
+                  <p class="muted">
+                    {{ metrics.storage.databases }} databases ·
+                    {{ metrics.storage.doc_count }} docs ·
+                    {{ metrics.storage.doc_del_count }} deleted
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Process (local)</h3>
+                  <div class="metric-big">{{ Math.round(metrics.process.rss_mb) }} MB</div>
+                  <p class="muted">
+                    {{ metrics.process.threads }} threads ·
+                    up {{ humanDuration(metrics.process.uptime_secs) }} ·
+                    pid {{ metrics.process.pid }}
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Views</h3>
+                  <div class="metric-big">{{ metrics.views.queries }}</div>
+                  <p class="muted">
+                    avg {{ humanMs(metrics.views.avg_ms) }} ·
+                    max {{ humanMs(metrics.views.max_ms) }} ·
+                    {{ metrics.views.errors }} errors
+                  </p>
+                </div>
+                <div class="card">
+                  <h3>Search</h3>
+                  <div class="metric-big">{{ metrics.search.queries }}</div>
+                  <p class="muted">
+                    avg {{ humanMs(metrics.search.avg_ms) }} ·
+                    max {{ humanMs(metrics.search.max_ms) }} ·
+                    {{ metrics.search.errors }} errors
+                  </p>
+                </div>
+              </div>
+
+              <h2>Live traffic</h2>
+              <div class="spark-row">
+                <div class="spark-card">
+                  <h3>Requests/s <span class="muted">peak {{ sparkMax(metrics.http.per_second, 'requests') }}</span></h3>
+                  <svg viewBox="0 0 260 46" preserveAspectRatio="none" class="spark">
+                    <polyline :points="sparkPoints(metrics.http.per_second, 'requests')" />
+                  </svg>
+                </div>
+                <div class="spark-card">
+                  <h3>Latency/s <span class="muted">peak {{ humanMs(sparkMax(metrics.http.per_second, 'avg_ms')) }}</span></h3>
+                  <svg viewBox="0 0 260 46" preserveAspectRatio="none" class="spark">
+                    <polyline :points="sparkPoints(metrics.http.per_second, 'avg_ms')" />
+                  </svg>
+                </div>
+                <div class="spark-card">
+                  <h3>Errors/s <span class="muted">peak {{ sparkMax(metrics.http.per_second, 'errors') }}</span></h3>
+                  <svg viewBox="0 0 260 46" preserveAspectRatio="none" class="spark spark-errors">
+                    <polyline :points="sparkPoints(metrics.http.per_second, 'errors')" />
+                  </svg>
+                </div>
+              </div>
+
+              <h2>Routes</h2>
+              <table class="grid" data-testid="metrics-routes">
+                <thead>
+                  <tr>
+                    <th>route</th>
+                    <th>requests</th>
+                    <th>errors</th>
+                    <th>avg</th>
+                    <th>p50</th>
+                    <th>p95</th>
+                    <th>p99</th>
+                    <th>max</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="route in metrics.http.routes" :key="route.route">
+                    <td class="mono">{{ route.route }}</td>
+                    <td>{{ route.requests }}</td>
+                    <td>{{ route.errors }}</td>
+                    <td>{{ humanMs(route.avg_ms) }}</td>
+                    <td class="muted">{{ humanMs(route.p50_ms) }}</td>
+                    <td class="muted">{{ humanMs(route.p95_ms) }}</td>
+                    <td class="muted">{{ humanMs(route.p99_ms) }}</td>
+                    <td class="muted">{{ humanMs(route.max_ms) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!metrics.http.routes.length" class="empty">No requests recorded yet.</p>
+
+              <h2>Storage</h2>
+              <p class="muted" v-if="metrics.storage.root">
+                data root <span class="mono">{{ metrics.storage.root }}</span>
+              </p>
+              <table class="grid" data-testid="metrics-databases">
+                <thead>
+                  <tr>
+                    <th>database</th>
+                    <th>q</th>
+                    <th>documents</th>
+                    <th>deleted</th>
+                    <th>local shards</th>
+                    <th>disk</th>
+                    <th>map</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="db in metrics.databases" :key="db.name">
+                    <td class="mono">{{ db.name }}</td>
+                    <td>{{ db.q }}</td>
+                    <td>{{ db.doc_count }}</td>
+                    <td>{{ db.doc_del_count }}</td>
+                    <td>{{ db.local_shards }}</td>
+                    <td class="muted">{{ humanBytes(db.disk_bytes) }}</td>
+                    <td>
+                      <span v-if="db.pending_shard_map" class="pill warn">pending</span>
+                      <span v-else class="muted">{{ db.shard_map_version ?? '—' }}</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!metrics.databases.length" class="empty">No databases yet.</p>
+
+              <h2>Replication</h2>
+              <p>
+                <span :class="['pill', metrics.replication.running ? 'warn' : 'ok']">
+                  {{ metrics.replication.running ? 'running' : 'idle' }}
+                </span>
+                <span v-if="metrics.replication.paused" class="pill warn">paused</span>
+                <span class="muted">
+                  · {{ metrics.replication.runs }} runs · {{ metrics.replication.docs }} docs
+                </span>
+              </p>
+              <p class="error" v-if="metrics.replication.error">{{ metrics.replication.error }}</p>
+              <table class="grid" data-testid="metrics-replication">
+                <thead>
+                  <tr>
+                    <th>database</th>
+                    <th>peer</th>
+                    <th>state</th>
+                    <th>docs</th>
+                    <th>last finished</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="entry in metrics.replication.entries" :key="entry.db + entry.peer">
+                    <td class="mono">{{ entry.db }}</td>
+                    <td class="mono">{{ entry.peer }}</td>
+                    <td>
+                      <span :class="['pill', entry.state === 'ok' ? 'ok' : (entry.state === 'error' ? 'danger' : 'warn')]">
+                        {{ entry.state }}
+                      </span>
+                    </td>
+                    <td>{{ entry.docs }}</td>
+                    <td class="muted">{{ age(entry.finished) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="!metrics.replication.entries.length" class="empty">No replication passes yet.</p>
+
+              <h2>Fabric</h2>
+              <table class="grid metrics-kv" data-testid="metrics-fabric">
+                <tbody>
+                  <tr><td>local reads</td><td>{{ metrics.fabric.local_reads }}</td></tr>
+                  <tr><td>remote reads</td><td>{{ metrics.fabric.remote_reads }}</td></tr>
+                  <tr><td>quorum failures</td><td>{{ metrics.fabric.quorum_failures }}</td></tr>
+                  <tr><td>degraded reads</td><td>{{ metrics.fabric.degraded_reads }}</td></tr>
+                  <tr><td>fan-out operations</td><td>{{ metrics.fabric.fanout_count }}</td></tr>
+                  <tr><td>fan-out average / max</td><td>{{ metrics.fabric.fanout_avg.toFixed(1) }} / {{ metrics.fabric.fanout_max }}</td></tr>
+                  <tr><td>shard-map updates</td><td>{{ metrics.fabric.shard_map_updates }}</td></tr>
+                  <tr><td>pending shard maps</td><td>{{ metrics.fabric.shard_map_pending }}</td></tr>
+                  <tr><td>rebalances started / completed / timed out</td><td>{{ metrics.fabric.rebalance_started }} / {{ metrics.fabric.rebalance_completed }} / {{ metrics.fabric.rebalance_timeout }}</td></tr>
+                  <tr><td>cleaned shards</td><td>{{ metrics.fabric.cleaned_shards }}</td></tr>
+                </tbody>
+              </table>
+
+              <h2>Nodes</h2>
+              <table class="grid" data-testid="metrics-nodes">
+                <thead>
+                  <tr>
+                    <th>node</th>
+                    <th>reachable</th>
+                    <th>health</th>
+                    <th>latency</th>
+                    <th>requests</th>
+                    <th>errors</th>
+                    <th>rss</th>
+                    <th>uptime</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="node in metrics.nodes" :key="node.url">
+                    <td class="mono">
+                      {{ node.url }}
+                      <span v-if="node.index === metrics.node.index" class="pill ok">local</span>
+                    </td>
+                    <td>
+                      <span :class="['pill', node.reachable ? 'ok' : 'danger']">
+                        {{ node.reachable ? 'up' : 'down' }}
+                      </span>
+                      <span v-if="node.error" class="muted small">{{ node.error }}</span>
+                    </td>
+                    <td>
+                      <span v-if="node.health" :class="['pill', node.health.status === 'ok' ? 'ok' : (node.health.status === 'critical' ? 'danger' : 'warn')]">
+                        {{ node.health.status }}
+                      </span>
+                      <span v-else class="muted">—</span>
+                    </td>
+                    <td class="muted">{{ node.reachable ? humanMs(node.latency_ms) : '—' }}</td>
+                    <td>{{ node.http ? node.http.total : '—' }}</td>
+                    <td>{{ node.http ? node.http.errors : '—' }}</td>
+                    <td class="muted">{{ node.process ? Math.round(node.process.rss_mb) + ' MB' : '—' }}</td>
+                    <td class="muted">{{ node.process ? humanDuration(node.process.uptime_secs) : '—' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <h2>Health checks</h2>
+              <template v-if="metrics.scope === 'cluster'">
+                <p class="muted" v-if="!metrics.health.failing.length">
+                  Every reporting node passes its local checks.
+                </p>
+                <table v-else class="grid" data-testid="metrics-health-failing">
+                  <thead><tr><th>node</th><th>status</th><th>failing checks</th></tr></thead>
+                  <tbody>
+                    <tr v-for="node in metrics.health.failing" :key="node.url">
+                      <td class="mono">{{ node.url }}</td>
+                      <td><span :class="['pill', node.status === 'critical' ? 'danger' : 'warn']">{{ node.status }}</span></td>
+                      <td>
+                        <span v-for="check in node.checks.filter((item) => item.status !== 'ok')" :key="check.name" class="pill warn">
+                          {{ check.name }}: {{ check.detail }}
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </template>
+              <table class="grid" data-testid="metrics-health">
+                <thead><tr><th>check</th><th>status</th><th>detail</th></tr></thead>
+                <tbody>
+                  <tr v-for="check in (metrics.local ? metrics.local.health.checks : metrics.health.checks)" :key="check.name">
+                    <td>{{ check.name }}</td>
+                    <td>
+                      <span :class="['pill', check.status === 'ok' ? 'ok' : (check.status === 'critical' ? 'danger' : 'warn')]">
+                        {{ check.status }}
+                      </span>
+                    </td>
+                    <td class="muted">{{ check.detail }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </template>
           </section>
 

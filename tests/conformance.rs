@@ -474,6 +474,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(html.contains("id=\"app\""), "Vue mount point missing");
     assert!(html.contains("vendor/vue.global.prod.js"));
     assert!(html.contains("data-testid=\"open-cluster\""));
+    assert!(html.contains("data-testid=\"open-metrics\""));
+    assert!(html.contains("data-testid=\"metrics-routes\""));
 
     let response = s
         .client
@@ -492,6 +494,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(app.contains("createApp"), "not a Vue application");
     assert!(app.contains("/_node/_local/_cluster"));
     assert!(app.contains("/_node/_local/_replication"));
+    assert!(app.contains("/_node/_local/_metrics"));
+    assert!(app.contains("loadMetrics"));
     // The console may only use the public CouchDB API, never a private route.
     assert!(!app.contains("/api/"), "console uses a private API path");
 
@@ -6367,4 +6371,205 @@ async fn anti_entropy_preserves_revision_history_metadata() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test]
+async fn observability_metrics_and_health_report_local_state() {
+    let s = Server::start(false);
+    s.fresh_db("obsmetrics").await;
+    let docs: Vec<Value> = (0..6)
+        .map(|i| json!({"_id": format!("m{i}"), "n": i}))
+        .collect();
+    let (status, _) = s
+        .post("/obsmetrics/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = s.get("/obsmetrics/m0").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.get("/obsmetrics/_all_docs").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.get("/obsmetrics/_changes").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.get("/obsmetrics/_design/missing/_view/x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = s
+        .put(
+            "/obsmetrics/_design/metrics",
+            json!({
+                "views": {"by_n": {"map": "function(doc){ if (doc.n !== undefined) emit(doc.n, null); }"}},
+                "indexes": {"by_n": {"index": "function(doc){ index('n', doc.n); }"}}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, view) = s.get("/obsmetrics/_design/metrics/_view/by_n").await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view["total_rows"].as_u64().unwrap() >= 6, "{view}");
+    let (status, search) = s
+        .get("/obsmetrics/_design/metrics/_search/by_n?q=n:2")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert_eq!(search["total_rows"], 1);
+
+    // The unauthenticated liveness probe exposes status and no data paths.
+    let (status, health) = s.get("/_health").await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["status"], "ok", "{health}");
+    let names: Vec<&str> = health["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "process",
+        "storage",
+        "placement",
+        "databases",
+        "cluster",
+        "replication",
+        "http",
+    ] {
+        assert!(names.contains(&name), "missing {name} check: {health}");
+    }
+
+    let (status, health) = s.get("/_node/_local/_health").await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["status"], "ok", "{health}");
+    assert!(health["checks"].as_array().unwrap().len() >= 7);
+
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    assert_eq!(metrics["scope"], "local");
+    assert_eq!(metrics["node"]["index"], 0);
+    assert!(metrics["process"]["pid"].as_u64().unwrap() > 0);
+    assert!(metrics["process"]["rss_bytes"].as_u64().unwrap() > 0);
+    assert!(metrics["process"]["uptime_secs"].as_u64().is_some());
+    assert!(metrics["http"]["total"].as_u64().unwrap() >= 5);
+    assert!(metrics["http"]["errors"].as_u64().unwrap() >= 1);
+    assert!(metrics["http"]["latency_ms"]["p95"].as_f64().is_some());
+    assert_eq!(metrics["http"]["per_second"].as_array().unwrap().len(), 60);
+    assert_eq!(metrics["storage"]["databases"], 1);
+    assert!(metrics["storage"]["disk_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(metrics["databases"][0]["name"], "obsmetrics");
+    assert!(metrics["databases"][0]["doc_count"].as_u64().unwrap() >= 6);
+    assert!(metrics["databases"][0]["disk_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(metrics["databases"][0]["local_shards"], 1);
+    assert_eq!(metrics["health"]["status"], "ok", "{metrics}");
+    assert_eq!(metrics["nodes"].as_array().unwrap().len(), 1);
+    assert!(metrics["views"]["queries"].as_u64().unwrap() >= 1);
+    assert!(metrics["search"]["queries"].as_u64().unwrap() >= 1);
+    assert!(metrics["views"]["avg_ms"].as_f64().is_some());
+    assert!(metrics["search"]["avg_ms"].as_f64().is_some());
+    assert!(
+        metrics["http"]["status_classes"]["4xx"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+
+    // Route labels are templates, never document ids.
+    let routes: Vec<&str> = metrics["http"]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| route["route"].as_str().unwrap())
+        .collect();
+    assert!(routes.contains(&"/{db}/_all_docs"), "{routes:?}");
+    assert!(routes.contains(&"/{db}/doc"), "{routes:?}");
+    assert!(routes.contains(&"/{db}/_changes"), "{routes:?}");
+    assert!(
+        !routes.iter().any(|route| route.contains("m0")),
+        "route labels must not contain document ids: {routes:?}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_metrics_and_health_aggregate_across_nodes() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clobs").await;
+    }
+    let docs: Vec<Value> = (0..12).map(|i| json!({"_id": format!("o{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/clobs/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for node in &nodes[..2] {
+        let (status, body) = node.get("/clobs/_all_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let (status, local) = nodes[0].get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{local}");
+    assert_eq!(local["scope"], "local");
+
+    // Discovery starts with the nodes and replica writes finish in the
+    // background; wait for the first pass before treating a not-yet-probed
+    // peer or a not-yet-visible shard count as a permanent failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let cluster = loop {
+        let (status, body) = nodes[0].get("/_node/_local/_metrics?cluster=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["health"]["status"] == "ok"
+            && body["storage"]["doc_count"].as_u64().unwrap_or(0) >= 12
+        {
+            break body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cluster metrics did not settle: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(cluster["scope"], "cluster");
+    assert_eq!(cluster["summary"]["nodes"], 3);
+    assert_eq!(cluster["summary"]["reachable"], 3, "{cluster}");
+    assert_eq!(cluster["nodes"].as_array().unwrap().len(), 3);
+    assert!(cluster["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["reachable"] == true));
+    assert!(cluster["http"]["total"].as_u64().unwrap() >= local["http"]["total"].as_u64().unwrap());
+    assert!(cluster["http"]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| route["route"] == "/{db}/_all_docs"));
+    assert_eq!(cluster["storage"]["databases"], 1);
+    assert!(cluster["storage"]["doc_count"].as_u64().unwrap() >= 12);
+    assert!(cluster["databases"][0]["nodes_reporting"].as_u64().unwrap() >= 1);
+    assert!(cluster["replication"]["runs"].as_u64().unwrap() >= 1);
+    assert!(cluster["fabric"]["fanout_count"].as_u64().unwrap() >= 1);
+    assert_eq!(cluster["health"]["status"], "ok", "{cluster}");
+
+    let (status, health) = nodes[0].get("/_node/_local/_health?cluster=true").await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["scope"], "cluster");
+    assert_eq!(health["status"], "ok", "{health}");
+    assert_eq!(health["nodes"].as_array().unwrap().len(), 3);
+
+    // A dead peer makes the cluster view degraded and names it explicitly.
+    nodes[2].kill();
+    let (status, cluster) = nodes[0].get("/_node/_local/_metrics?cluster=true").await;
+    assert_eq!(status, StatusCode::OK, "{cluster}");
+    assert_eq!(cluster["summary"]["reachable"], 2, "{cluster}");
+    let dead = cluster["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["index"] == 2)
+        .expect("dead node listed");
+    assert_eq!(dead["reachable"], false);
+    assert_eq!(cluster["health"]["status"], "degraded", "{cluster}");
+    assert!(!cluster["health"]["failing"].as_array().unwrap().is_empty());
+
+    let (status, health) = nodes[0].get("/_node/_local/_health?cluster=true").await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["scope"], "cluster");
+    assert_eq!(health["status"], "critical", "{health}");
+    assert_eq!(health["nodes"].as_array().unwrap().len(), 3);
 }

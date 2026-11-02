@@ -88,6 +88,9 @@
       const dbInfo = ref(null);
       const cluster = ref(null);
       const clusterError = ref('');
+      const metrics = ref(null);
+      const metricsError = ref('');
+      const metricsLoading = ref(false);
 
       const viewDefs = ref([]);
       const selectedDesign = ref(null);
@@ -289,6 +292,7 @@
         if (user.value) await loadDbs();
         await loadServerInfo();
         if (view.value === 'cluster') await loadCluster();
+        else if (view.value === 'metrics') await loadMetrics();
         else if (currentDb.value && view.value !== 'doc') applyRoute();
       }
 
@@ -384,6 +388,84 @@
         return (db.shards || []).filter((shard) => shard.local).length;
       }
 
+      // ----- observability ----------------------------------------------
+
+      function humanBytes(value) {
+        const bytes = Number(value) || 0;
+        if (bytes >= 1024 ** 4) return `${(bytes / 1024 ** 4).toFixed(2)} TB`;
+        if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+        if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+        if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${bytes} B`;
+      }
+
+      function humanMs(value) {
+        const ms = Number(value) || 0;
+        if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+        if (ms >= 10) return `${ms.toFixed(0)} ms`;
+        return `${ms.toFixed(2)} ms`;
+      }
+
+      function humanPct(value) {
+        return `${(Number(value) || 0).toFixed(1)}%`;
+      }
+
+      function humanDuration(seconds) {
+        let value = Math.max(0, Math.round(Number(seconds) || 0));
+        const days = Math.floor(value / 86400);
+        value -= days * 86400;
+        const hours = Math.floor(value / 3600);
+        value -= hours * 3600;
+        const minutes = Math.floor(value / 60);
+        if (days) return `${days}d ${hours}h`;
+        if (hours) return `${hours}h ${minutes}m`;
+        if (minutes) return `${minutes}m`;
+        return `${value}s`;
+      }
+
+      function sparkMax(series, key) {
+        return (series || []).reduce(
+          (max, point) => Math.max(max, Number(point[key]) || 0),
+          0
+        );
+      }
+
+      function sparkPoints(series, key) {
+        if (!series || !series.length) return '';
+        const width = 260;
+        const height = 46;
+        const values = series.map((point) => Number(point[key]) || 0);
+        const max = Math.max(1, ...values);
+        const step = width / Math.max(1, values.length - 1);
+        return values
+          .map((value, index) => {
+            const x = index * step;
+            const y = height - (value / max) * (height - 2) - 1;
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+          })
+          .join(' ');
+      }
+
+      async function loadMetrics() {
+        metricsLoading.value = true;
+        try {
+          metrics.value = await call('GET', '/_node/_local/_metrics?cluster=true');
+          metricsError.value = '';
+        } catch (error) {
+          metricsError.value = error.data
+            ? pretty(error.data)
+            : error.message || String(error);
+          if (error.status !== 401) handleError(error, 'Cannot read metrics');
+        } finally {
+          metricsLoading.value = false;
+        }
+      }
+
+      function openMetrics() {
+        if (location.hash === '#/metrics') applyRoute();
+        else location.hash = '#/metrics';
+      }
+
       function dbHash(name, sub) {
         return `#/db/${enc(name)}/${sub}`;
       }
@@ -406,6 +488,11 @@
         if (raw === 'cluster') {
           view.value = 'cluster';
           loadCluster();
+          return;
+        }
+        if (raw === 'metrics') {
+          view.value = 'metrics';
+          loadMetrics();
           return;
         }
         const parts = raw.split('/');
@@ -1120,6 +1207,9 @@
         setInterval(() => {
           if (view.value === 'cluster') loadCluster();
         }, 5000);
+        setInterval(() => {
+          if (view.value === 'metrics') loadMetrics();
+        }, 5000);
       });
 
       return {
@@ -1151,6 +1241,9 @@
         dbInfo,
         cluster,
         clusterError,
+        metrics,
+        metricsError,
+        metricsLoading,
         toast,
         toastKind,
         pretty,
@@ -1160,6 +1253,14 @@
         loadServerInfo,
         openCluster,
         loadCluster,
+        openMetrics,
+        loadMetrics,
+        humanBytes,
+        humanMs,
+        humanPct,
+        humanDuration,
+        sparkPoints,
+        sparkMax,
         discoverNow,
         syncNow,
         toggleReplication,

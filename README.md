@@ -404,6 +404,9 @@ step**. It provides:
 - database info and `_compact`;
 - a cluster page with node discovery, shard maps, background replication
   status, and controls to discover, sync, pause/resume and rebalance;
+- an observability page with live request/latency/error sparklines, route and
+  database tables, replication and fabric counters, per-node health and cluster
+  aggregation;
 - CouchDB `_session` sign-in when the server runs with `--admin`;
 - a toggleable **request log** that records every HTTP call with method, path,
   status, timing, request JSON and response JSON.
@@ -572,7 +575,29 @@ HTTP niceties: `If-Match` on writes, `If-None-Match`/304 on reads, `COPY` with
 
 ## Observability
 
-OpenTelemetry export is optional and off by default. Set an OTLP HTTP endpoint:
+Metrics and health are collected in-process and work without any collector.
+The console page at `/_utils/#/metrics` shows them live; the same data is
+available as JSON:
+
+```sh
+curl localhost:5984/_health                          # unauthenticated probe
+curl localhost:5984/_node/_local/_health            # detailed checks
+curl localhost:5984/_node/_local/_metrics           # process-local metrics
+curl 'localhost:5984/_node/_local/_metrics?cluster=true'  # merged across peers
+curl 'localhost:5984/_node/_local/_health?cluster=true'   # worst node health
+```
+
+The local metrics include HTTP counters, per-route p50/p95/p99 latency, a
+120-second live history, view/search query latency, fabric read/quorum/fan-out
+counters, shard-map and rebalance state, per-database and per-shard storage,
+process RSS/threads/uptime, and the replication/discovery snapshots. Route
+labels are templates, so document ids never become metric cardinality.
+
+`?cluster=true` fans out to every configured peer, sums counters, merges latency
+buckets before recomputing percentiles, aggregates per-shard document counts and
+reports unreachable nodes as degraded health.
+
+OpenTelemetry export is optional and additive. Set an OTLP HTTP endpoint:
 
 ```sh
 ./target/release/douchdb --otel-endpoint http://127.0.0.1:4318
@@ -580,12 +605,13 @@ OpenTelemetry export is optional and off by default. Set an OTLP HTTP endpoint:
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 ./target/release/douchdb
 ```
 
-Every HTTP request produces an OTLP trace span (`http.request`) and two metrics:
-`http.server.requests` and `http.server.duration.ms`, labelled by method and
-status. Logs remain on the normal formatting subscriber. Without an endpoint
+Every HTTP request produces an OTLP trace span (`http.request`), the
+`http.server.requests` and `http.server.duration.ms` metrics, plus fabric
+counters. Logs remain on the normal formatting subscriber. Without an endpoint
 the telemetry layer is a no-op, so the single-binary deployment has no collector
-dependency. See [docs/opentelemetry.md](docs/opentelemetry.md) for collector
-configuration, the local capture demo, signal names and cluster notes.
+dependency. See [docs/opentelemetry.md](docs/opentelemetry.md) for endpoint
+shapes, the local capture demo, signal names, cluster notes and health
+semantics.
 
 See [docs/process.md](docs/process.md) for the issue/branch workflow used for
 this work.
