@@ -498,6 +498,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(app.contains("/_node/_local/_replication"));
     assert!(app.contains("/_node/_local/_metrics"));
     assert!(app.contains("loadMetrics"));
+    // The request log must not retain login credentials.
+    assert!(app.contains("[redacted credentials]"));
     // The console may only use the public CouchDB API, never a private route.
     assert!(!app.contains("/api/"), "console uses a private API path");
 
@@ -7151,4 +7153,623 @@ async fn global_admission_limit_protects_capacity_across_users() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn assert_no_access(status: StatusCode, label: &str) {
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+        "{label}: expected 401/403, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn cross_user_isolation_is_watertight() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let admin = admin_auth();
+    let alice = bearer("alice-token");
+    let bob = bearer("bob-token");
+
+    // Two private databases, one shared database, and one admin-only database
+    // with an explicitly empty member list.
+    for name in ["alice-db", "bob-db", "shared-db", "admins-only"] {
+        let (status, body) = s
+            .req_with(Method::PUT, &format!("/{name}"), Some(json!({})), &admin)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+    }
+    for (db, admins, members) in [
+        ("alice-db", json!(["alice"]), json!(["alice"])),
+        ("bob-db", json!(["bob"]), json!(["bob"])),
+        ("shared-db", json!([]), json!(["alice", "bob"])),
+        ("admins-only", json!(["alice"]), json!([])),
+    ] {
+        let (status, body) = s
+            .req_with(
+                Method::PUT,
+                &format!("/{db}/_security"),
+                Some(json!({
+                    "admins": {"names": admins, "roles": []},
+                    "members": {"names": members, "roles": []}
+                })),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{db}: {body}");
+    }
+
+    // Distinct documents with the same id in two databases.
+    for (db, auth, secret) in [
+        ("alice-db", &alice, "alice-secret"),
+        ("bob-db", &bob, "bob-secret"),
+    ] {
+        let (status, body) = s
+            .req_with(
+                Method::PUT,
+                &format!("/{db}/shared"),
+                Some(json!({"owner": db, "secret": secret})),
+                auth,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{db}: {body}");
+        let (status, body) = s
+            .req_with(
+                Method::PUT,
+                &format!("/{db}/only-{db}"),
+                Some(json!({"only": db})),
+                auth,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{db}: {body}");
+        let (status, body) = s
+            .req_with(
+                Method::PUT,
+                &format!("/{db}/_local/checkpoint"),
+                Some(json!({"db": db})),
+                auth,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{db}: {body}");
+        let (status, body) = s
+            .req_with(
+                Method::PUT,
+                &format!("/{db}/_design/v"),
+                Some(json!({
+                    "views": {"by_owner": {"map": "function(doc){ if (doc.owner) emit(doc.owner, doc.secret); }"}},
+                    "indexes": {"by_owner": {"index": "function(doc){ index('owner', doc.owner); index('secret', doc.secret); }"}}
+                })),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{db}: {body}");
+    }
+
+    // Shared database: members can read/write ordinary docs but not design docs.
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/shared-db/normal",
+            Some(json!({"shared": true})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/shared-db/_design/v",
+            Some(json!({"views": {}})),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, alice_doc) = s
+        .req_with(Method::GET, "/alice-db/shared", None, &alice)
+        .await;
+    let alice_rev = alice_doc["_rev"].as_str().unwrap().to_string();
+    let (_, bob_doc) = s.req_with(Method::GET, "/bob-db/shared", None, &bob).await;
+    let bob_rev = bob_doc["_rev"].as_str().unwrap().to_string();
+    assert_ne!(alice_rev, bob_rev);
+
+    // Alice's own data is visible and complete.
+    let (status, body) = s
+        .req_with(Method::GET, "/alice-db/shared", None, &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["secret"], "alice-secret");
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/alice-db/_all_docs",
+            Some(json!({"keys": ["shared", "bob-db-only"]})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "shared");
+    assert_eq!(body["rows"][1]["error"], "not_found");
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(!text.contains("bob-secret"), "{text}");
+
+    // Another database's revision does not resolve in Alice's database.
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            &format!("/alice-db/shared?rev={bob_rev}"),
+            None,
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/alice-db/_bulk_get",
+            Some(json!({"docs": [{"id": "shared", "rev": bob_rev}]})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/alice-db/_revs_diff",
+            Some(json!({"shared": [bob_rev]})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+
+    // Views, search, changes, all_docs and local docs stay inside the database.
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            "/alice-db/_design/v/_view/by_owner?key=%22bob%22",
+            None,
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            "/alice-db/_design/v/_search/by_owner?q=owner:bob",
+            None,
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 0);
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(Method::GET, "/alice-db/_changes?since=0", None, &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            "/alice-db/_all_docs?include_docs=true",
+            None,
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    let (status, body) = s
+        .req_with(Method::GET, "/alice-db/_local/checkpoint", None, &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["db"], "alice-db");
+
+    // Every data-bearing route on Bob's database is denied to Alice.
+    let copy = Method::from_bytes(b"COPY").unwrap();
+    type DeniedRequest = (
+        &'static str,
+        Method,
+        Option<Value>,
+        Vec<(&'static str, String)>,
+    );
+    let denied: Vec<DeniedRequest> = vec![
+        ("/bob-db", Method::GET, None, vec![]),
+        ("/bob-db/shared", Method::GET, None, vec![]),
+        ("/bob-db/shared", Method::HEAD, None, vec![]),
+        ("/bob-db/shared", Method::DELETE, None, vec![]),
+        ("/bob-db/new", Method::PUT, Some(json!({"x": 1})), vec![]),
+        ("/bob-db", Method::POST, Some(json!({"x": 1})), vec![]),
+        ("/bob-db/_all_docs", Method::GET, None, vec![]),
+        (
+            "/bob-db/_all_docs",
+            Method::POST,
+            Some(json!({"keys": ["shared"]})),
+            vec![],
+        ),
+        ("/bob-db/_changes", Method::GET, None, vec![]),
+        (
+            "/bob-db/_bulk_get",
+            Method::POST,
+            Some(json!({"docs": [{"id": "shared", "rev": bob_rev}]})),
+            vec![],
+        ),
+        (
+            "/bob-db/_revs_diff",
+            Method::POST,
+            Some(json!({"shared": [bob_rev]})),
+            vec![],
+        ),
+        (
+            "/bob-db/_bulk_docs",
+            Method::POST,
+            Some(json!({"docs": [{"_id": "x"}]})),
+            vec![],
+        ),
+        ("/bob-db/_local/checkpoint", Method::GET, None, vec![]),
+        (
+            "/bob-db/_local/checkpoint",
+            Method::PUT,
+            Some(json!({"x": 1})),
+            vec![],
+        ),
+        ("/bob-db/shared?revs=true", Method::GET, None, vec![]),
+        ("/bob-db/shared?open_revs=all", Method::GET, None, vec![]),
+        ("/bob-db/shared?conflicts=true", Method::GET, None, vec![]),
+        ("/bob-db/_design/v", Method::GET, None, vec![]),
+        (
+            "/bob-db/_design/v/_view/by_owner",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        (
+            "/bob-db/_design/v/_view/by_owner?include_docs=true",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        (
+            "/bob-db/_design/v/_search/by_owner?q=*:*",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        (
+            "/bob-db/_design/v/_search/by_owner?q=*:*&include_docs=true",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        (
+            "/bob-db/_design/v/_search_info/by_owner",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        ("/bob-db/_index_info", Method::GET, None, vec![]),
+        ("/bob-db/_partition/p", Method::GET, None, vec![]),
+        ("/bob-db/_partition/p/_all_docs", Method::GET, None, vec![]),
+        ("/bob-db/_security", Method::GET, None, vec![]),
+        (
+            "/bob-db/_security",
+            Method::PUT,
+            Some(json!({"members": {"names": ["alice"]}})),
+            vec![],
+        ),
+        ("/bob-db/_revs_limit", Method::GET, None, vec![]),
+        ("/bob-db/_revs_limit", Method::PUT, Some(json!(100)), vec![]),
+        ("/bob-db/_compact", Method::POST, None, vec![]),
+        ("/bob-db/_view_cleanup", Method::POST, None, vec![]),
+        ("/bob-db/_search_cleanup", Method::POST, None, vec![]),
+        (
+            "/bob-db/_purge",
+            Method::POST,
+            Some(json!({"shared": [bob_rev]})),
+            vec![],
+        ),
+        ("/bob-db/_ensure_full_commit", Method::POST, None, vec![]),
+        (
+            "/bob-db/shared",
+            copy.clone(),
+            None,
+            vec![("Destination", "copied".to_string())],
+        ),
+        ("/bob-db", Method::DELETE, None, vec![]),
+        (
+            "/_dbs_info?keys=%5B%22bob-db%22%5D",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        ("/_db_updates", Method::GET, None, vec![]),
+        ("/_node/_local/_dbs/bob-db", Method::GET, None, vec![]),
+        (
+            "/_node/_local/_dbs/bob-db/shards",
+            Method::GET,
+            None,
+            vec![],
+        ),
+        (
+            "/_node/_local/_dbs/bob-db/security",
+            Method::PUT,
+            Some(json!({})),
+            vec![],
+        ),
+        ("/_node/_local/_metrics", Method::GET, None, vec![]),
+        ("/_node/_local/_health", Method::GET, None, vec![]),
+        ("/_node/_local/_cluster", Method::GET, None, vec![]),
+        ("/_node/_local/_replication", Method::GET, None, vec![]),
+        ("/_membership", Method::GET, None, vec![]),
+    ];
+    for (path, method, body, headers) in denied {
+        let mut request_headers = alice.clone();
+        request_headers.extend(headers);
+        let (status, response) = s.req_with(method, path, body, &request_headers).await;
+        assert_no_access(status, path);
+        let text = serde_json::to_string(&response).unwrap();
+        assert!(!text.contains("bob-secret"), "{path} leaked data: {text}");
+    }
+
+    // _all_dbs is filtered, and Bob's database name is not exposed to Alice.
+    let (status, body) = s.req_with(Method::GET, "/_all_dbs", None, &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"alice-db"), "{names:?}");
+    assert!(names.contains(&"shared-db"), "{names:?}");
+    assert!(!names.contains(&"bob-db"), "{names:?}");
+
+    // Member privilege escalation through design documents is blocked.
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/shared-db/_design/evil",
+            Some(json!({"views": {}})),
+            &alice,
+        )
+        .await;
+    assert_no_access(status, "design doc PUT");
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("\"ok\":true"));
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/shared-db/_bulk_docs",
+            Some(json!({"docs": [{"_id": "_design/evil", "views": {}}]})),
+            &alice,
+        )
+        .await;
+    assert_no_access(status, "bulk design doc");
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("\"ok\":true"));
+    let (status, body) = s
+        .req_with(
+            copy.clone(),
+            "/shared-db/_design/v",
+            None,
+            &[
+                ("Destination", "_design/copied".to_string()),
+                ("Authorization", "Bearer alice-token".to_string()),
+            ],
+        )
+        .await;
+    assert_no_access(status, "copy design doc");
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("\"ok\":true"));
+    let (status, body) = s
+        .req_with(
+            copy.clone(),
+            "/shared-db/normal",
+            None,
+            &[
+                ("Destination", "_design/copied".to_string()),
+                ("Authorization", "Bearer alice-token".to_string()),
+            ],
+        )
+        .await;
+    assert_no_access(status, "copy into design doc");
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains("\"ok\":true"));
+    for (path, body) in [
+        ("/shared-db/_compact", None),
+        ("/shared-db/_view_cleanup", None),
+        ("/shared-db/_search_cleanup", None),
+        ("/shared-db/_purge", Some(json!({"normal": []}))),
+    ] {
+        let (status, response) = s.req_with(Method::POST, path, body, &alice).await;
+        assert_no_access(status, path);
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("\"ok\":true"));
+    }
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/shared-db/_security",
+            Some(json!({"members": {"names": ["alice"]}})),
+            &alice,
+        )
+        .await;
+    assert_no_access(status, "security escalation");
+
+    // The same design-doc write succeeds for a database admin.
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/shared-db/_bulk_docs",
+            Some(json!({"docs": [{"_id": "_design/admin", "views": {}}]})),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Admin-only databases with an empty member list are not public.
+    let (status, _) = s.req_with(Method::GET, "/admins-only", None, &bob).await;
+    assert_no_access(status, "admins-only bob");
+    let (status, _) = s.req_with(Method::GET, "/admins-only", None, &[]).await;
+    assert_no_access(status, "admins-only anonymous");
+    let (status, body) = s.req_with(Method::GET, "/admins-only", None, &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Database names cannot be used for path traversal.
+    for path in ["/%2E%2E/bob-db/shared", "/..%2Fbob-db/shared"] {
+        let (status, body) = s.req_with(Method::GET, path, None, &alice).await;
+        assert_ne!(status, StatusCode::OK, "{path}: {body}");
+        assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+    }
+    // A normalized `..` path is just Alice's own database; it must not cross
+    // into Bob's data even though the raw path mentioned `bob-db`.
+    let (_, body) = s
+        .req_with(Method::GET, "/bob-db/%2E%2E/alice-db/shared", None, &alice)
+        .await;
+    assert!(!serde_json::to_string(&body).unwrap().contains("bob-secret"));
+
+    // Public endpoints do not enumerate databases or data.
+    let (status, body) = s.req_with(Method::GET, "/_health", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = serde_json::to_string(&body).unwrap();
+    for needle in ["alice-db", "bob-db", "alice-secret", "bob-secret"] {
+        assert!(
+            !text.contains(needle),
+            "public health leaked {needle}: {text}"
+        );
+    }
+    let (status, _) = s.req_with(Method::GET, "/_all_dbs", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = s.req_with(Method::GET, "/bob-db", None, &[]).await;
+    assert_no_access(status, "anonymous bob-db");
+}
+
+#[tokio::test]
+async fn longpoll_changes_stops_after_security_revocation() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let admin = admin_auth();
+    let alice = bearer("alice-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/revoke", Some(json!({})), &admin)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/revoke/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice", "bob"], "roles": []}
+            })),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let longpoll = tokio::spawn({
+        let client = s.client.clone();
+        let url = format!(
+            "{}/revoke/_changes?feed=longpoll&timeout=3000&since=0",
+            s.base
+        );
+        let auth = bearer("alice-token");
+        async move {
+            let mut request = client.get(url);
+            for (name, value) in auth {
+                request = request.header(name, value);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            (status, body)
+        }
+    });
+
+    // Give the long-poll time to enter its wait loop, then revoke Alice and
+    // create a document she must never receive.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/revoke/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["bob"], "roles": []}
+            })),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/revoke/after-revocation",
+            Some(json!({"secret": "must-not-leak"})),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), longpoll)
+        .await
+        .expect("longpoll did not finish")
+        .unwrap();
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+        "longpoll should close after revocation: {status} {body}"
+    );
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains("must-not-leak"),
+        "revoked longpoll leaked data: {body}"
+    );
+
+    // Alice can no longer read the database at all.
+    let (status, _) = s
+        .req_with(Method::GET, "/revoke/after-revocation", None, &alice)
+        .await;
+    assert_no_access(status, "revoked alice");
+}
+
+#[tokio::test]
+async fn cluster_security_change_rolls_back_when_a_peer_is_down() {
+    let mut nodes = start_cluster_with_auth(2, "3600", 2);
+    let admin = admin_auth();
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, "/secfail", Some(json!({})), &admin)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    nodes[1].kill();
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/secfail/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice"], "roles": []}
+            })),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "security_propagation_failed");
+
+    // The coordinator rolled back its local security object.
+    let (status, body) = nodes[0]
+        .req_with(Method::GET, "/secfail/_security", None, &admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({}));
 }

@@ -174,7 +174,10 @@
         const headers = {};
         let requestText = '';
         if (body !== undefined) {
-          requestText = clip(pretty(body));
+          // Never persist credentials in the request log.
+          requestText = path.startsWith('/_session')
+            ? '[redacted credentials]'
+            : clip(pretty(body));
           headers['Content-Type'] = 'application/json';
         }
 
@@ -1120,6 +1123,35 @@
         loginError.value = '';
       }
 
+      function clearUserState() {
+        databases.value = [];
+        currentDb.value = null;
+        docs.value = [];
+        totalRows.value = 0;
+        page.value = 0;
+        changes.value = [];
+        changesLastSeq.value = 0;
+        dbInfo.value = null;
+        viewDefs.value = [];
+        viewDocs.value = {};
+        selectedDesign.value = null;
+        selectedView.value = null;
+        viewResult.value = null;
+        viewError.value = '';
+        editor.id = '';
+        editor.isNew = false;
+        editor.rev = null;
+        editor.deleted = false;
+        editor.text = '{}';
+        editor.error = '';
+        editor.status = '';
+        requests.value = [];
+        selectedLog.value = null;
+        logOpen.value = false;
+        view.value = 'home';
+        location.hash = '';
+      }
+
       async function doLogin() {
         loginError.value = '';
         try {
@@ -1130,6 +1162,7 @@
           user.value = loginName.value;
           loginPass.value = '';
           loginOpen.value = false;
+          clearUserState();
           showToast(`Signed in as ${user.value}`);
           await loadDbs();
           await loadServerInfo();
@@ -1148,10 +1181,7 @@
           /* the cookie is client-side; ignore servers that do not implement it */
         }
         user.value = null;
-        databases.value = [];
-        currentDb.value = null;
-        view.value = 'home';
-        location.hash = '';
+        clearUserState();
         showToast('Signed out');
         await loadDbs();
         await loadServerInfo();

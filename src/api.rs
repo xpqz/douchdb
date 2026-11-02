@@ -242,6 +242,9 @@ fn valid_db_name(name: &str) -> bool {
 
 impl AppState {
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
+        if !valid_db_name(name) {
+            return Err(ApiError::bad_request("invalid database name"));
+        }
         if let Some(db) = self.dbs.read().await.get(name) {
             return Ok(db.clone());
         }
@@ -265,6 +268,9 @@ impl AppState {
     }
 
     pub async fn create_db(&self, name: &str, partitioned: bool) -> DbResult<Arc<Db>> {
+        if !valid_db_name(name) {
+            return Err(ApiError::bad_request("invalid database name"));
+        }
         crate::view::forget_db(&self.root.join(name));
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
@@ -289,6 +295,9 @@ impl AppState {
     }
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
+        if !valid_db_name(name) {
+            return Err(ApiError::bad_request("invalid database name"));
+        }
         self.dbs.write().await.remove(name);
         crate::view::forget_db(&self.root.join(name));
         Db::destroy(&self.root, name)?;
@@ -406,14 +415,15 @@ fn db_access(st: &AppState, principal: &Principal, db: &Db) -> Option<DbAccess> 
     if security_matches(principal, security.get("members")) {
         return Some(DbAccess::Member);
     }
-    // CouchDB semantics: no members means public. A completely empty security
-    // object is admin-only when authentication is configured, unless the
-    // operator explicitly chose `--default-security open`.
+    // A database is public only when the whole security object is empty and
+    // the operator chose `open`. This is deliberately stricter than CouchDB's
+    // "empty members means public" rule: setting admins without members must
+    // not accidentally expose the database to every authenticated user.
     if security_list_empty(&security, "members") {
-        if security_list_empty(&security, "admins") && st.config.default_admin_only {
-            None
-        } else {
+        if security_list_empty(&security, "admins") && !st.config.default_admin_only {
             Some(DbAccess::Member)
+        } else {
+            None
         }
     } else {
         None
@@ -432,6 +442,11 @@ fn require_db_access(
         Some(DbAccess::Member) => Some(forbidden()),
         None => Some(access_denied(principal)),
     }
+}
+
+fn still_allowed(st: &AppState, db: &Db, headers: &HeaderMap) -> bool {
+    let principal = st.principal(headers);
+    db_access(st, &principal, db).is_some()
 }
 
 fn requires_db_admin(rest: &str, method: &Method) -> bool {
@@ -458,10 +473,11 @@ fn requires_db_admin(rest: &str, method: &Method) -> bool {
         && !rest.contains("/_list/")
         && !rest.contains("/_update/")
     {
-        return matches!(
-            *method,
-            Method::PUT | Method::POST | Method::DELETE | Method::PATCH
-        );
+        return method.as_str() == "COPY"
+            || matches!(
+                *method,
+                Method::PUT | Method::POST | Method::DELETE | Method::PATCH
+            );
     }
     false
 }
@@ -834,7 +850,9 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri
             let mut sent = 0usize;
             let mut last_heartbeat = std::time::Instant::now();
             loop {
-                if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                if limit.map(|limit| sent >= limit).unwrap_or(false)
+                    || !st.principal(&headers).admin
+                {
                     break;
                 }
                 let (events, _) = st.db_updates.since(since);
@@ -1299,16 +1317,32 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
 
     let http = &snapshot["http"];
     let total = http["total"].as_u64().unwrap_or(0);
-    let errors = http["errors"].as_u64().unwrap_or(0);
-    let rate = http["error_rate_pct"].as_f64().unwrap_or(0.0);
+    // Authorization denials and other 4xx responses are expected client
+    // behaviour, not evidence that the server is unhealthy. Only 5xx responses
+    // contribute to the readiness signal.
+    let errors = http["status_classes"]["5xx"].as_u64().unwrap_or(0);
+    let rate = if total == 0 {
+        0.0
+    } else {
+        errors as f64 / total as f64 * 100.0
+    };
     let (status, detail) = if total < 20 {
         ("ok", format!("{total} requests sampled"))
     } else if rate >= 25.0 {
-        ("critical", format!("{rate:.1}% of {total} requests failed"))
+        (
+            "critical",
+            format!("{rate:.1}% of {total} requests failed with 5xx"),
+        )
     } else if rate >= 10.0 {
-        ("degraded", format!("{rate:.1}% of {total} requests failed"))
+        (
+            "degraded",
+            format!("{rate:.1}% of {total} requests failed with 5xx"),
+        )
     } else {
-        ("ok", format!("{rate:.1}% of {total} requests failed"))
+        (
+            "ok",
+            format!("{rate:.1}% of {total} requests failed with 5xx"),
+        )
     };
     checks.push(json!({
         "name": "http",
@@ -2133,6 +2167,80 @@ pub async fn db_metadata(
     }
 }
 
+async fn send_security(
+    st: &AppState,
+    peer: &str,
+    name: &str,
+    value: &Value,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    let request = st
+        .client
+        .put(format!("{peer}/_node/_local/_dbs/{name}/security"))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", st.cluster.secret.as_str())
+        .json(value);
+    let request = forward_client_auth(request, headers);
+    match request.send().await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
+        Err(error) => Err(format!("{peer}: {error}")),
+    }
+}
+
+/// Apply a security object locally and, in a cluster, to every peer before
+/// reporting success. A partial fan-out is rolled back so a reachable peer does
+/// not keep a newer security object than the coordinator.
+async fn set_security_everywhere(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    value: Value,
+    headers: &HeaderMap,
+) -> DbResult<()> {
+    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+        return db.set_security(value);
+    }
+    let old = db.security();
+    db.set_security(value.clone())?;
+    let peers: Vec<String> = st
+        .cluster
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != st.cluster.me)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    let mut failures = Vec::new();
+    for peer in &peers {
+        if let Err(error) = send_security(st, peer, name, &value, headers).await {
+            failures.push(error);
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let rollback_error = db.set_security(old.clone()).err();
+    for peer in &peers {
+        if let Err(error) = send_security(st, peer, name, &old, headers).await {
+            tracing::warn!("security rollback to {peer} failed: {error}");
+        }
+    }
+    let reason = failures.join("; ");
+    if let Some(error) = rollback_error {
+        return Err(ApiError::new(
+            500,
+            "security_rollback_failed",
+            format!("{reason}; local rollback failed: {}", error.reason),
+        ));
+    }
+    Err(ApiError::new(
+        502,
+        "security_propagation_failed",
+        format!("security change was not applied everywhere: {reason}"),
+    ))
+}
+
 /// Internal/replication-side security update. The public `PUT /db/_security`
 /// handler fans out here after checking database-admin access.
 pub async fn db_security_put(
@@ -2141,8 +2249,8 @@ pub async fn db_security_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin && !st.cluster.is_internal(&headers) {
+    if !st.cluster.is_internal(&headers) {
+        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     let db = match st.db(&name).await {
@@ -3001,32 +3109,10 @@ pub async fn db_rest(
                     if let Err(error) = validate_security(&value) {
                         return fail(error);
                     }
-                    if let Err(error) = db.set_security(value.clone()) {
-                        return fail(error);
+                    match set_security_everywhere(&st, &db, &name, value, &headers).await {
+                        Ok(()) => ok(),
+                        Err(error) => fail(error),
                     }
-                    if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
-                        let peers: Vec<String> = st
-                            .cluster
-                            .nodes
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| *index != st.cluster.me)
-                            .map(|(_, peer)| peer.clone())
-                            .collect();
-                        for peer in peers {
-                            let request = st
-                                .client
-                                .put(format!("{peer}/_node/_local/_dbs/{name}/security"))
-                                .header("x-douchdb-forwarded", "1")
-                                .header("x-douchdb-secret", st.cluster.secret.as_str())
-                                .json(&value);
-                            let request = forward_client_auth(request, &headers);
-                            if let Err(error) = request.send().await {
-                                tracing::warn!("security propagation to {peer} failed: {error}");
-                            }
-                        }
-                    }
-                    ok()
                 }
                 _ => fail(ApiError::new(
                     405,
@@ -3445,6 +3531,9 @@ async fn search_request(
             result.is_ok(),
         );
     }
+    if !still_allowed(st, db, headers) {
+        return access_denied(&st.principal(headers));
+    }
     match result {
         Ok(value) => json(StatusCode::OK, value),
         Err(error) => fail(error),
@@ -3591,6 +3680,9 @@ async fn view_request(
             result.is_ok(),
         );
     }
+    if !still_allowed(st, db, headers) {
+        return access_denied(&st.principal(headers));
+    }
 
     match result {
         Ok(mut value) => {
@@ -3667,6 +3759,20 @@ async fn bulk_docs(
     let Some(docs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
+    // `_bulk_docs` is a member operation for ordinary documents, but design
+    // documents are database-admin data. Check the batch, not just the route.
+    let writes_design = docs.iter().any(|doc| {
+        doc.get("_id")
+            .and_then(Value::as_str)
+            .map(|id| id.starts_with("_design/"))
+            .unwrap_or(false)
+    });
+    if writes_design {
+        let principal = st.principal(headers);
+        if let Some(response) = require_db_access(st, &principal, db, true) {
+            return response;
+        }
+    }
     for doc in &docs {
         if let Err(e) = validate_doc(doc) {
             return fail(e);
@@ -4038,6 +4144,9 @@ async fn all_docs(
     } else {
         db.all_docs(&opts).await
     };
+    if !still_allowed(st, db, headers) {
+        return access_denied(&st.principal(headers));
+    }
     match result {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
@@ -4079,11 +4188,16 @@ async fn changes(
             let mut sent = 0usize;
             let mut last_heartbeat = std::time::Instant::now();
             loop {
-                if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                if limit.map(|limit| sent >= limit).unwrap_or(false)
+                    || !still_allowed(&st, &db, &headers)
+                {
                     break;
                 }
                 match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                     Ok(value) => {
+                        if !still_allowed(&st, &db, &headers) {
+                            break;
+                        }
                         let rows = value["results"].as_array().cloned().unwrap_or_default();
                         for row in rows {
                             if limit.map(|limit| sent >= limit).unwrap_or(false) {
@@ -4162,13 +4276,17 @@ async fn changes(
                 let started = std::time::Instant::now();
                 let mut last_heartbeat = std::time::Instant::now();
                 loop {
+                    if !still_allowed(&st, &db, &headers) {
+                        break;
+                    }
                     match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                         Ok(value)
-                            if value["results"]
+                            if (value["results"]
                                 .as_array()
                                 .map(|rows| !rows.is_empty())
                                 .unwrap_or(false)
-                                || started.elapsed().as_millis() as u64 >= deadline =>
+                                || started.elapsed().as_millis() as u64 >= deadline)
+                                && still_allowed(&st, &db, &headers) =>
                         {
                             let mut line = serde_json::to_vec(&value).unwrap_or_default();
                             line.push(b'\n');
@@ -4203,6 +4321,9 @@ async fn changes(
         }
         let started = std::time::Instant::now();
         loop {
+            if !still_allowed(&st, &db, headers) {
+                return access_denied(&st.principal(headers));
+            }
             match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
                 Ok(v)
                     if v["results"]
@@ -4210,10 +4331,16 @@ async fn changes(
                         .map(|a| !a.is_empty())
                         .unwrap_or(false) =>
                 {
-                    return json(StatusCode::OK, v)
+                    if !still_allowed(&st, &db, headers) {
+                        return access_denied(&st.principal(headers));
+                    }
+                    return json(StatusCode::OK, v);
                 }
                 Ok(v) if started.elapsed().as_millis() as u64 >= deadline => {
-                    return json(StatusCode::OK, v)
+                    if !still_allowed(&st, &db, headers) {
+                        return access_denied(&st.principal(headers));
+                    }
+                    return json(StatusCode::OK, v);
                 }
                 Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
                 Err(e) => return fail(e),
@@ -4642,6 +4769,12 @@ async fn copy_doc(
     let destination = percent_decode(raw);
     if destination.is_empty() {
         return fail(ApiError::bad_request("Destination must not be empty"));
+    }
+    if destination.starts_with("_design/") {
+        let principal = st.principal(headers);
+        if let Some(response) = require_db_access(st, &principal, db, true) {
+            return response;
+        }
     }
 
     let source = match db

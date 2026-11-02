@@ -652,7 +652,9 @@ database, IAM integration, or row-level security.
 Start with `--users-file /etc/douchdb/users.json`. New databases are admin-only
 by default when authentication is configured; use `--default-security open` for
 public databases. `_security` can be changed by a database or server admin, and
-`_all_dbs` is filtered to databases the principal can access.
+`_all_dbs` is filtered to databases the principal can access. A database with
+admins but no members is admin-only, not public. In a cluster, a security change
+is applied to every peer or rolled back.
 
 Admission control is the fairness layer. Every principal is bounded by
 `--per-user-in-flight` and an optional `--per-user-rate`; all requests share
