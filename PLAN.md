@@ -67,14 +67,16 @@ Corollary: **single-node is the cluster with Q=1, N=1.** No separate code path.
 
 Crates: `axum`, `tokio`, `serde_json` (**with `preserve_order`**), `rusty-leveldb`,
 `reqwest`, `md-5`, `tracing`, `rquickjs`, `tantivy`, `icu_collator`,
-`wasmi`/`wasmi_wasi`, and Linux-only `seccompiler`/`landlock`.
+`wasmi`/`wasmi_wasi` (plus optional `wasmtime`/`wasmtime-wasi`), and Linux-only
+`seccompiler`/`landlock`.
 
 Map/reduce views and search indexes are evaluated by QuickJS. The default
 engine is in-process behind memory/stack/interrupt limits;
 `--js-sandbox process` moves evaluations to a pooled worker with cleared
 environment, rlimits, seccomp and Landlock; `--js-sandbox wasm` runs a checked-in
-QuickJS WASI module under `wasmi` with fuel and linear-memory limits. None of
-these exposes network or filesystem APIs to JavaScript.
+QuickJS WASI module under `wasmi` (default) or an optional Wasmtime Cranelift
+JIT, with linear-memory and output limits. None of these exposes network or
+filesystem APIs to JavaScript.
 
 Because the LevelDB handle is `&mut` for reads as well as writes, the shard
 actor is not an optimisation — it is the only way to share a shard. Reads and
@@ -317,7 +319,8 @@ the bulk of the growth.
    `_membership`, metrics. Done.
 6. **Views, search and cluster management.** Partitioned databases, durable view
    indexes, Tantivy search, the cluster/replication console and the
-   native/process/WASM QuickJS sandbox. Done.
+   native/process/WASM QuickJS sandbox, with an optional Wasmtime JIT for
+   WASM throughput. Done.
 
 ## Risks
 
@@ -335,9 +338,11 @@ the bulk of the growth.
    availability boundary, not a security boundary. Untrusted deployments
    should use `--js-sandbox process` (Linux seccomp/Landlock) or
    `--js-sandbox wasm` (memory-safe, portable).
-6. **WASM performance.** The WASI engine is roughly 20–30× slower than native
-   for cold map/reduce work; keep it optional until that trade-off is
-   acceptable for the deployment.
+6. **WASM performance.** The default `wasmi` interpreter is roughly 17–22×
+   slower than native for cold map/reduce work. The optional Wasmtime JIT
+   (`--features wasmtime`, `--wasm-runtime wasmtime`) narrows that to about
+   2–3× and is 4–7× faster than wasmi, making it viable for
+   throughput-sensitive deployments. Native remains fastest.
 
 ## Open questions
 
@@ -423,9 +428,10 @@ the bulk of the growth.
   `--js-sandbox process` sends map/reduce/index calls to a warmed worker pool
   with a cleared environment, `/` cwd, rlimits, a seccomp denylist, a
   best-effort Landlock filesystem layer and a parent-side kill watchdog. That
-  contains crashes and host-handle access. A checked-in QuickJS WASI runner under
-  `wasmi` is available via `--js-sandbox wasm`, with fuel and linear-memory
-  limits. See `docs/quickjs-sandbox.md`.
+  contains crashes and host-handle access. A checked-in QuickJS WASI runner is
+  available via `--js-sandbox wasm`, running under `wasmi` by default or an
+  optional Wasmtime JIT (`--wasm-runtime wasmtime`), with linear-memory and
+  output limits. See `docs/quickjs-sandbox.md`.
   Design documents replicate to every node; a cluster view query falls back to
   live replicas when an owner is unreachable and fails with `502` only when no
   replica can answer.
@@ -546,8 +552,9 @@ the bulk of the growth.
   mode. `--js-sandbox process` uses a pooled worker with cleared environment,
   rlimits, a seccomp denylist, a best-effort Landlock filesystem layer and a
   watchdog; `--js-sandbox wasm` runs a checked-in QuickJS WASI module under
-  `wasmi` with fuel, linear-memory and output limits. The default remains
-  in-process with memory/stack/interrupt limits.
+  `wasmi` (default) or an optional Wasmtime Cranelift JIT, with linear-memory
+  and output limits. The default remains in-process with memory/stack/interrupt
+  limits.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes

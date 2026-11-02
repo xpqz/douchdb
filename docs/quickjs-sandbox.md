@@ -10,7 +10,9 @@ and does not protect, and the measured trade-offs. The short version:
 - **`--js-sandbox process` contains crashes and memory-safety bugs in a pooled
   worker process with rlimits and seccomp.**
 - **`--js-sandbox wasm` is the portable, memory-safe option: QuickJS runs as
-  WASI under `wasmi` with fuel and linear-memory limits.**
+  WASI with linear-memory and output limits. `wasmi` is the lean default;
+  `--wasm-runtime wasmtime` adds an optional Cranelift JIT that is 4–7× faster
+  for map/reduce/search-index work.**
 - The same JavaScript API and conformance tests run behind a small engine
   boundary so modes can change without changing view/search semantics.
 
@@ -83,7 +85,7 @@ Current controls:
 | No module loader | default rquickjs runtime | `import()` has nowhere to load from |
 | Native fast paths | `NativeMap` | Simple maps never enter QuickJS |
 | `--js-sandbox process` | `src/js.rs` | Runs QuickJS in a pooled separate process with cleared environment, `/` cwd, rlimits, seccomp and no database handles |
-| `--js-sandbox wasm` | `src/js.rs`, `wasm/` | Runs QuickJS as WASI under `wasmi` with fuel, linear-memory and output limits |
+| `--js-sandbox wasm` | `src/js.rs`, `wasm/` | Runs QuickJS as WASI with linear-memory and output limits; `wasmi` interpreter or optional Wasmtime JIT |
 
 Observed behaviour:
 
@@ -119,8 +121,10 @@ modes address the crash, memory-safety and capability points):
 The conclusion is that the default in-process setup is appropriate for a
 trusted single-operator deployment, but it should not be sold as a sandbox for
 untrusted tenants. Use `--js-sandbox process` on Linux or `--js-sandbox wasm`
-for a portable memory-safe boundary. The process path also installs a
-best-effort Landlock filesystem layer on top of its seccomp denylist.
+for a portable memory-safe boundary; add `--wasm-runtime wasmtime` on a binary
+built with `--features wasmtime` when wasm throughput matters. The process path
+also installs a best-effort Landlock filesystem layer on top of its seccomp
+denylist.
 
 ## Option A: harden the in-process runtime
 
@@ -182,8 +186,8 @@ Platform note:
 - Process-mode syscall/filesystem confinement (seccomp and Landlock) is
   Linux-specific. On other platforms, process mode still gets a cleared
   environment, process isolation and rlimits where available, but a hard
-  portable boundary should use `--js-sandbox wasm`. A kernel without Landlock
-  falls back to the seccomp denylist.
+  portable boundary should use `--js-sandbox wasm` (optionally with the
+  Wasmtime JIT). A kernel without Landlock falls back to the seccomp denylist.
 
 Run the mode tests:
 
@@ -236,45 +240,59 @@ memory-safe; it makes a QuickJS compromise unable to reach the host.
 
 ## Option C: QuickJS in WebAssembly (implemented as `--js-sandbox wasm`)
 
-Compile QuickJS to `wasm32-wasip1` and run the module inside `wasmi`. The host
-never exposes a native function to the JS engine; the only interface is linear
-memory plus WASI stdio. Start douchdb with:
+Compile QuickJS to `wasm32-wasip1` and run the module under a WebAssembly host.
+The host never exposes a native function to the JS engine; the only interface is
+linear memory plus WASI stdio. Start douchdb with:
 
 ```sh
-douchdb --js-sandbox wasm ...
+douchdb --js-sandbox wasm --wasm-runtime wasmtime ...
 ```
 
-The checked-in `wasm/qjs-runner.wasm` is built from
-`wasm/qjs-runner/` with the maintained `rquickjs` crate and a WASI SDK. The host
-compiles the module once,
+Two host runtimes share the same checked-in runner:
+
+| `--wasm-runtime` | Crate | Characteristics |
+|---|---|---|
+| `wasmi` | pure-Rust interpreter | lean default; small dependency; slower |
+| `wasmtime` | Cranelift JIT | 4–7× faster for engine work; larger optional dependency |
+
+The Wasmtime backend is compiled with `--features wasmtime`. Without it,
+selecting `--wasm-runtime wasmtime` fails at startup with the build command.
+The default remains `wasmi`, so a plain `cargo build` stays lean.
+
+The checked-in `wasm/qjs-runner.wasm` is built from `wasm/qjs-runner/` with the
+maintained `rquickjs` crate and a WASI SDK. The host compiles the module once,
 then creates a fresh `Store`/instance per request with:
 
 - a WASI context containing only the request on stdin and an in-memory stdout,
   with no preopens, environment or args;
-- a 128 MiB linear-memory cap (`StoreLimits`);
-- a fuel budget derived from the request timeout (2 million fuel per
-  millisecond, minimum 500 million);
+- a 128 MiB linear-memory cap (`StoreLimits`), with growth failure trapping the
+  request;
 - a JSON request/response envelope matching the process worker.
 
+`wasmi` uses a fuel budget derived from the deadline. `wasmtime` uses epoch
+interruption: one background ticker advances the engine epoch every 10 ms and
+each request sets its deadline in ticks, so timeouts remain a wall-clock budget
+without per-instruction fuel accounting.
+
 The runner has no filesystem or network imports that can reach the host; a wasm
-trap (including fuel exhaustion or memory growth failure) fails only that
-request. `NativeMap` fast paths still run in the server process.
+trap (including a deadline or memory growth failure) fails only that request.
+`NativeMap` fast paths still run in the server process.
 
 ### Shape
 
 - Build a small QuickJS runner once, pinned to a QuickJS version and WASI SDK:
-  - `qjs_run(source, operation, input_json) -> output_json`
-  - an allocator/free pair for the host to copy strings.
-- Host runtime: `wasmi` (pure Rust, simpler dependency, interpreter speed);
-  `wasmtime` remains an option for higher throughput.
+  `qjs_run(source, operation, input_json) -> output_json`.
+- Default host runtime: `wasmi` (pure Rust, simpler dependency, interpreter
+  speed). Optional `wasmtime` compiles the module with Cranelift and is the
+  performance path.
 - Compile the module once at startup or embed a precompiled `.wasm`; instantiate
-  a fresh `Store`/instance per request (or use a small pool with a fresh runtime
-  inside each instance).
+  a fresh `Store`/instance per request. The Wasmtime backend precompiles at
+  startup, so the first query does not pay Cranelift compilation.
 - Memory: `StoreLimits` caps linear memory, tables and instances. The QuickJS
   heap lives inside that linear memory; the current runner does not also call
   `set_memory_limit`, so the linear-memory ceiling is the heap bound.
-- CPU: the implementation uses fuel (deterministic instruction budgets).
-  Epoch interruption remains an option for a wall-clock-style deadline.
+- CPU: `wasmi` uses fuel; `wasmtime` uses epoch interruption. Both fail only the
+  request.
 - Capability surface: no preopens, no WASI sockets, no environment. Allow only
   the WASI calls QuickJS actually needs (clock/random/stdio); ideally replace
   them with deterministic host stubs.
@@ -286,20 +304,33 @@ request. `NativeMap` fast paths still run in the server process.
 The runner uses the maintained `rquickjs` crate and a pinned WASI SDK. The
 checked-in artifact is reproducible with the commands in `wasm/README.md`; the
 source is in `wasm/qjs-runner/`. The checked-in artifact checksum is enforced
-by `js::tests::wasm_runner_matches_the_checked_in_checksum`.
+by `js::tests::wasm_runner_matches_the_checked_in_checksum`. Both host runtimes
+load the same artifact.
+
+```sh
+# lean default: wasmi only
+cargo build --release
+
+# optional performance path
+cargo build --release --features wasmtime
+```
 
 ### Performance
 
-WASM adds a module boundary, linear-memory copies and a slower interpreter
-(QuickJS compiled to wasm is not the same as native QuickJS). The JSON bridge is
-the same shape as today, but every input/output crosses linear memory. This
-is measured in the table below; it is not a default candidate for
-throughput-sensitive deployments yet. Keep the native `NativeMap` fast path
-regardless.
+WASM still adds a module boundary, linear-memory copies and a JSON bridge
+(QuickJS compiled to wasm is not the same as native QuickJS). The runtime makes
+a large difference:
 
-WASM is the right long-term default if the deployment needs a portable,
-memory-safe boundary or runs untrusted tenants on shared infrastructure. It is
-not a drop-in replacement for the current `rquickjs` calls.
+- `wasmi` interprets QuickJS and is roughly 17–22× slower than native for cold
+  map/reduce work.
+- `wasmtime` JITs QuickJS and narrows that to about 2–3× for map/reduce and
+  ~1.6× for search index builds.
+- Warm map and search queries use the persisted index and do not enter the
+  engine, so they are effectively identical in every mode.
+
+`wasmtime` is therefore viable for throughput-sensitive deployments. Native
+in-process QuickJS remains fastest, and `process` remains the Linux containment
+option.
 
 ### Measured cost
 
@@ -307,26 +338,24 @@ not a drop-in replacement for the current `rquickjs` calls.
 non-native map/reduce/search functions through each engine and records cold
 index builds plus 10 warm queries. Release build, Linux x86_64, 16 CPUs:
 
-| Metric | native | process | wasm |
-|---|---:|---:|---:|
-| cold map (2,000 docs) | 14.6 ms | 29.8 ms | 281 ms |
-| cold custom reduce | 13.2 ms | 27.3 ms | 307 ms |
-| cold search index | 55.9 ms | 79.8 ms | 380 ms |
-| warm map p50 | 0.30 ms | 0.29 ms | 0.29 ms |
-| warm custom reduce p50 | 2.78 ms | 5.44 ms | 51.3 ms |
-| warm search query p50 | 1.78 ms | 1.91 ms | 1.94 ms |
+| Metric | native | process | wasm/wasmi | wasm/wasmtime |
+|---|---:|---:|---:|---:|
+| cold map (2,000 docs) | 14.5 ms | 28.3 ms | 254 ms | 33.9 ms |
+| cold custom reduce | 13.6 ms | 24.8 ms | 282 ms | 41.9 ms |
+| cold search index | 52.1 ms | 69.7 ms | 307 ms | 81.7 ms |
+| warm map p50 | 0.29 ms | 0.30 ms | 0.32 ms | 0.30 ms |
+| warm custom reduce p50 | 2.70 ms | 5.09 ms | 51.9 ms | 10.8 ms |
+| warm search query p50 | 1.97 ms | 1.96 ms | 1.95 ms | 2.00 ms |
 
-Warm map and search queries use the persisted index and do not enter the
-engine, so they are effectively identical. The differences are in cold index
-builds and custom reduces: process mode adds about 1.5–2× over native, while
-wasm adds roughly 7× for search and 20–25× for map/reduce because `wasmi`
-interprets QuickJS compiled to wasm.
-That is the expected trade-off for a memory-safe portable boundary, not a
-reason to make wasm the default.
+Wasmtime module compilation is moved to startup (about 200 ms in release), so
+the cold-query numbers measure query work rather than JIT compilation. The
+remaining wasmtime gap is the JSON bridge and instance boundary; a future
+persistent runner would reduce it further.
 
 ```sh
-cargo build --release
-python3 scripts/js_sandbox_bench.py --docs 2000
+cargo build --release --features wasmtime
+python3 scripts/js_sandbox_bench.py \
+  --modes native,process,wasm-wasmi,wasm-wasmtime --docs 2000
 ```
 
 The JSON is written to `target/js-sandbox-bench.json`.
@@ -352,11 +381,15 @@ Use a `JsEngine` boundary and migrate in stages:
      layer, a parent-side kill watchdog and a warmed worker pool.
    - Recommended for Linux deployments that execute untrusted design docs.
 3. **Done: WASM engine.**
-   - Checked in a QuickJS WASI runner and run it under `wasmi`.
-   - Enforced linear memory, fuel and output limits.
-   - Exposed it as `--js-sandbox wasm` and covered it with the same view,
-     reduce, search and deadline tests.
-   - Built with the maintained `rquickjs` crate; benchmark recorded below.
+   - Checked in a QuickJS WASI runner and run it under `wasmi` by default.
+   - Added an optional Wasmtime/Cranelift JIT backend via
+     `--features wasmtime` and `--wasm-runtime wasmtime`; it is 4–7× faster
+     than wasmi for cold map/reduce/search-index work.
+   - Enforced linear memory, fuel/epoch deadlines and output limits in both
+     backends.
+   - Exposed it as `--js-sandbox wasm` and covered both runtimes with the same
+     view, reduce, search and deadline tests.
+   - Built with the maintained `rquickjs` crate; benchmark recorded above.
      Choose a default per deployment.
 
 This gets crash containment and a portable memory-safe engine without pretending
@@ -390,6 +423,9 @@ Every engine must pass the same cases:
 - Resolved: the runner source and the built `.wasm` are checked in, it uses
   the maintained `rquickjs` crate, and `cargo test` enforces the artifact
   checksum.
+- Resolved: wasm uses `wasmi` by default so `cargo build` stays lean.
+  `--features wasmtime` adds the Cranelift JIT backend for performance-sensitive
+  deployments; both load the same checked-in runner and enforce the same limits.
 - Cost is measured in the table above; choose the mode per deployment and
   threat model.
 - Resolved for the worker path: a warmed pool with a fresh QuickJS runtime per

@@ -67,7 +67,17 @@ pub enum Sandbox {
     Wasm,
 }
 
+/// Which WebAssembly runtime executes `qjs-runner.wasm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasmRuntime {
+    /// Pure-Rust interpreter; small dependency, slower.
+    Wasmi,
+    /// Cranelift JIT; much faster, larger optional dependency.
+    Wasmtime,
+}
+
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
+static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -81,6 +91,32 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
         Ordering::SeqCst,
     );
     MAX_WORKERS.store(workers.clamp(1, 64), Ordering::SeqCst);
+}
+
+/// Select the wasm runtime. Returns an error when Wasmtime was requested but
+/// this binary was built without the `wasmtime` feature.
+pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
+    match runtime {
+        WasmRuntime::Wasmi => {
+            WASM_RUNTIME.store(0, Ordering::SeqCst);
+            Ok(())
+        }
+        WasmRuntime::Wasmtime => {
+            #[cfg(feature = "wasmtime")]
+            {
+                crate::js_wasmtime::warm()?;
+                WASM_RUNTIME.store(1, Ordering::SeqCst);
+                Ok(())
+            }
+            #[cfg(not(feature = "wasmtime"))]
+            {
+                Err(
+                    "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
+                        .to_string(),
+                )
+            }
+        }
+    }
 }
 
 pub fn sandboxed() -> bool {
@@ -211,6 +247,7 @@ const WASM_RUNNER: &[u8] = include_bytes!("../wasm/qjs-runner.wasm");
 struct WasmEngineState {
     engine: wasmi::Engine,
     module: wasmi::Module,
+    linker: OnceLock<Result<wasmi::Linker<WasmData>, String>>,
 }
 
 struct WasmData {
@@ -226,10 +263,28 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
         let engine = wasmi::Engine::new(&config);
         let module = wasmi::Module::new(&engine, WASM_RUNNER)
             .map_err(|error| format!("wasm module: {error}"))?;
-        Ok(WasmEngineState { engine, module })
+        Ok(WasmEngineState {
+            engine,
+            module,
+            linker: OnceLock::new(),
+        })
     });
     match state {
         Ok(state) => Ok(state),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn wasmi_linker(
+    state: &'static WasmEngineState,
+) -> Result<&'static wasmi::Linker<WasmData>, String> {
+    match state.linker.get_or_init(|| {
+        let mut linker = wasmi::Linker::new(&state.engine);
+        wasmi_wasi::add_to_linker(&mut linker, |data: &mut WasmData| &mut data.wasi)
+            .map_err(|error| format!("wasm wasi: {error}"))?;
+        Ok(linker)
+    }) {
+        Ok(linker) => Ok(linker),
         Err(error) => Err(error.clone()),
     }
 }
@@ -250,15 +305,35 @@ fn wasm_request(
     );
     request.insert("memory".to_string(), json!(limits.memory));
     let body = serde_json::to_vec(&Value::Object(request)).map_err(|error| error.to_string())?;
+    wasm_run(&body, limits)
+}
 
+fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
+    if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
+        #[cfg(feature = "wasmtime")]
+        {
+            return crate::js_wasmtime::request(body, limits.timeout);
+        }
+        #[cfg(not(feature = "wasmtime"))]
+        {
+            return Err(
+                "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
+                    .to_string(),
+            );
+        }
+    }
+    wasmi_request(body, limits)
+}
+
+fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
     let state = wasm_engine()?;
-    let mut linker = wasmi::Linker::new(&state.engine);
-    wasmi_wasi::add_to_linker(&mut linker, |data: &mut WasmData| &mut data.wasi)
-        .map_err(|error| format!("wasm wasi: {error}"))?;
+    // The linker is immutable after setup; build it once per process instead of
+    // resolving every WASI import on each request.
+    let linker = wasmi_linker(state)?;
     let stdout = wasmi_wasi::wasi_common::pipe::WritePipe::new_in_memory();
     let wasi = wasmi_wasi::WasiCtxBuilder::new()
         .stdin(Box::new(wasmi_wasi::wasi_common::pipe::ReadPipe::from(
-            body,
+            body.to_vec(),
         )))
         .stdout(Box::new(stdout.clone()))
         .build();

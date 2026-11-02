@@ -144,7 +144,7 @@ pub(crate) fn run_index_json(
     }
     if crate::js::sandboxed() {
         let mut out = Vec::with_capacity(docs.len());
-        for chunk in docs.chunks(128) {
+        for chunk in docs.chunks(2048) {
             let value = crate::js::sandbox_request(
                 "index",
                 json!({"source": source, "docs": chunk}),
