@@ -1,0 +1,43 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/aarch64-linux-gnu/libthread_db.so.1".
+0x0000ffff9f9c7c24 in syscall () from /lib/aarch64-linux-gnu/libc.so.6
+
+Thread 8 "tokio-rt-worker" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xffff87ffede0 (LWP 13)]
+0x0000aaaad7cea4a8 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#0  0x0000aaaad7cea4a8 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#1  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#2  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#3  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#4  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#5  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#6  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#7  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#8  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#9  0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#10 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#11 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#12 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#13 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#14 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#15 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#16 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#17 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#18 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#19 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#20 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#21 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#22 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#23 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#24 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#25 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#26 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#27 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#28 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#29 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#30 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#31 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#32 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#33 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+#34 0x0000aaaad7cea4c4 in core[7f68c50a89fc67d0]::ptr::drop_glue::<rusty_leveldb[8fe5b26d98b55867]::cache::LRUNode<[u8; 16: usize]>> ()
+[Inferior 1 (process 1) detached]
