@@ -817,6 +817,10 @@ Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
 containing `_attachments` are rejected with `attachments_not_supported`.
 
+The `rusty-leveldb` dependency is vendored with an iterative LRU teardown and
+duplicate-key eviction fix; see `vendor/rusty-leveldb/PATCHES.md`. This
+addresses the recursive cache-drop stack overflow seen during large imports.
+
 **Durability:** DouchDB is not a power-loss-durable primary store. Writes survive
 process crashes but not necessarily power loss, because the storage layer does
 not fsync. See [docs/durability.md](docs/durability.md). Known limits:

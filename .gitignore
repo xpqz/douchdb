@@ -13,3 +13,7 @@ __pycache__/
 
 # nested WASM runner build output
 /wasm/qjs-runner/target
+
+# Vendored dependency build output
+/vendor/rusty-leveldb/target
+/vendor/rusty-leveldb/Cargo.lock
