@@ -255,11 +255,12 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   every node with the new list. Discovery probes configured nodes,
   `--seed-nodes` and reported memberships for the management console without
   changing placement. Rendezvous hashing and anti-entropy move data to new
-  replicas; the rebalance endpoint broadcasts a balanced map and waits for
-  replica catch-up, then `cleanup` removes copies on nodes that no longer own
-  the shard.
+  replicas; the rebalance endpoint broadcasts a migration map, keeps reads on
+  the old owners, freezes writes, waits for target digests, and only then
+  activates the new map. Destructive cleanup remains explicit.
 * **Sequence numbers:** one counter per database; `since` and `update_seq` are
-  base64url **version vectors** keyed by node `{node → seq}`. Clients treat
+  `v1:` comma-separated **version vectors** keyed by node `{node → seq}`
+  (legacy base64url tokens are still accepted). Clients treat
   `since` as opaque (CouchDB 2 already returns strings like `"12-g1AAA…"`), and
   `0`/`now` still work. Node keys are coarser than per-shard-replica keys, but
   resumption remains exact because a node's changes feed is one cursor. A
@@ -387,8 +388,9 @@ the bulk of the growth.
   merges by id preferring the shard owner, then applies `startkey`/`skip`/
   `limit`; `keys` queries also surface tombstones and preserve request order,
   including descending keys. `_changes` fans out per node,
-  dedupes replicated documents and returns a base64url version-vector `since`/
-  `last_seq`; `GET /db` reports the same vector as `update_seq`. Forwarded
+  dedupes replicated documents and returns a `v1:` version-vector `since`/
+  `last_seq` (legacy base64url tokens are still accepted); `GET /db` reports the
+  same vector as `update_seq`. Forwarded
   subrequests carry `x-douchdb-forwarded` so the receiving peer serves them
   locally instead of re-fanning out.
 * **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
@@ -463,20 +465,24 @@ the bulk of the growth.
   page are included. Optional OTLP traces and metrics remain available via
   `--otel-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`, with a no-op default. The
   issue/branch/merge workflow is documented in `docs/process.md`.
-* **Stabilization pass.** Rebalance readiness now compares exact per-shard
-  content digests (document ids, winning revisions, deleted flags, conflict
-  leaves and attachment metadata) instead of live counts; old replicas must
-  agree, cleanup is explicit (`?cleanup=true`), and a timeout rolls the map
-  back. Point reads enforce the requested read quorum, count explicit
-  not-found/tombstone answers, and select descendants over stale live copies;
-  unmet quorum is `503`. The Docker build includes the embedded WASI runner, a
-  GitHub Actions workflow runs fmt/clippy/tests/both wasm backends/container
-  build, search rebuilds are serialized per index and run on the blocking pool,
-  and `_compact` has a configurable node-wide concurrency bound, a visible
-  `compact_running` flag, and runs the blocking LevelDB call through
-  `block_in_place` so it does not pin a Tokio worker. Durability is explicitly positioned as non-primary in
-  `docs/durability.md`. Observability handlers moved out of `api.rs` into
-  `observability.rs`.
+* **Stabilization pass.** Rebalance readiness now compares per-shard
+  revision-metadata digests (document ids, winning revisions, deleted flags,
+  conflict leaves and attachment metadata) instead of live counts; old replicas
+  must agree, cleanup is explicit (`?cleanup=true`), and a timeout rolls the map
+  back. During verification, reads use the old active map, client writes are
+  frozen on every node for a bounded window, and anti-entropy seeds the target
+  map; activation is a separate all-peer step. Point reads enforce the
+  requested read quorum, count explicit not-found/tombstone answers, and select
+  descendants over stale live copies; unmet quorum is `503`. The Docker build
+  includes the embedded WASI runner, a GitHub Actions workflow runs
+  fmt/clippy/tests/both wasm backends/container build, search rebuilds are
+  serialized per index and run on the blocking pool, and `_compact` has a
+  configurable node-wide concurrency bound, a visible `compact_running` flag,
+  and runs the blocking LevelDB call through `block_in_place` so it does not
+  pin a Tokio worker. Non-Linux process RSS and thread metrics are explicitly
+  `null` until a platform collector is added. Durability is explicitly
+  positioned as non-primary in `docs/durability.md`. Observability handlers
+  moved out of `api.rs` into `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
   token users and roles; `_security` uses CouchDB's `admins`/`members` names and
   roles, with admin-only defaults when auth is configured and filtered
@@ -566,10 +572,11 @@ the bulk of the growth.
   pending map file, and anti-entropy reconciles newer/older peers after a
   missed update. Routing and anti-entropy read the map; anti-entropy
   checkpoints are tagged by map hash so new replicas backfill after a move. A
-  balanced planner endpoint waits for per-shard replica counts and then
-  automatically cleans old replicas; a manual cleanup endpoint remains for
-  controlled runs. Cluster routing, replica selection, quorum reads/writes and
-  internal node calls live in `src/fabric.rs`; HTTP handlers only call that
+  balanced planner endpoint verifies per-shard revision-metadata digests; a
+  timeout leaves the active map unchanged, destructive cleanup is explicit
+  (`?cleanup=true`), and writes are frozen on every node only for the bounded
+  verification window. Cluster routing, replica selection, quorum reads/writes
+  and internal node calls live in `src/fabric.rs`; HTTP handlers only call that
   layer.
 * **Cluster management and replication controls.** `GET /_node/_local/_cluster`
   reports membership, discovery probes, shard maps and replicator state.

@@ -136,6 +136,14 @@ pub struct Db {
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
     compact_running: Arc<AtomicBool>,
+    /// Target placement while a rebalance is being verified. Reads and writes
+    /// continue to use the active `shard_map`; anti-entropy uses this map to
+    /// seed the target replicas.
+    migration_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    /// Unix-millisecond deadline for the cluster-wide write freeze, or zero
+    /// when writes are allowed. A deadline lets peers recover if the
+    /// coordinating node disappears mid-rebalance.
+    rebalance_until: Arc<AtomicU64>,
     shards: Vec<ShardHandle>,
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
@@ -148,6 +156,17 @@ pub struct DbConfig {
     pub revs_limit: u64,
     pub shard_map: ShardMap,
     pub partitioned: bool,
+}
+
+/// Upper bound for a cluster-wide rebalance write freeze. If the coordinator
+/// disappears, peers resume writes after this window instead of staying frozen.
+const REBALANCE_FREEZE_MS: u64 = 420_000;
+
+fn now_millis() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 impl Db {
@@ -216,6 +235,8 @@ impl Db {
             shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
             security: Arc::new(std::sync::RwLock::new(security)),
             compact_running: Arc::new(AtomicBool::new(false)),
+            migration_map: Arc::new(std::sync::RwLock::new(None)),
+            rebalance_until: Arc::new(AtomicU64::new(0)),
             shards,
             seq: Arc::new(AtomicU64::new(seq)),
         })
@@ -351,6 +372,88 @@ impl Db {
         Ok(true)
     }
 
+    /// Placement targeted by an in-progress rebalance. Falls back to the
+    /// active map outside a migration.
+    pub fn replication_map(&self) -> ShardMap {
+        self.migration_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.shard_map())
+    }
+
+    /// Whether `node` replicates the shard that contains `docid` under the
+    /// migration target if one is active, otherwise under the active map.
+    pub fn is_replica_of(&self, docid: &str, node: usize) -> bool {
+        let shard = self.shard_index(docid) as u32;
+        let migration = self
+            .migration_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(map) = migration.as_ref() {
+            return map.replicas_of(shard).contains(&node);
+        }
+        drop(migration);
+        self.shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .replicas_of(shard)
+            .contains(&node)
+    }
+
+    pub fn set_migration_map(&self, map: ShardMap) -> DbResult<()> {
+        if !map.is_valid(self.q, map.node_count) {
+            return Err(ApiError::bad_request("invalid migration shard map"));
+        }
+        *self
+            .migration_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(map);
+        Ok(())
+    }
+
+    pub fn clear_migration_map(&self) {
+        *self
+            .migration_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    pub fn rebalance_in_progress(&self) -> bool {
+        let until = self.rebalance_until.load(Ordering::SeqCst);
+        until != 0 && now_millis() < until
+    }
+
+    /// Claim the single rebalance slot for this database and freeze writes for
+    /// a bounded verification window.
+    pub fn try_start_rebalance(&self) -> bool {
+        let deadline = now_millis().saturating_add(REBALANCE_FREEZE_MS);
+        loop {
+            let current = self.rebalance_until.load(Ordering::SeqCst);
+            if current != 0 && now_millis() < current {
+                return false;
+            }
+            if self
+                .rebalance_until
+                .compare_exchange(current, deadline, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub fn set_rebalance_in_progress(&self, in_progress: bool) {
+        self.rebalance_until.store(
+            if in_progress {
+                now_millis().saturating_add(REBALANCE_FREEZE_MS)
+            } else {
+                0
+            },
+            Ordering::SeqCst,
+        );
+    }
+
     pub fn pending_shard_map(&self) -> Option<ShardMap> {
         std::fs::read(self.path.join("pending-shard-map.json"))
             .ok()
@@ -454,6 +557,10 @@ impl Db {
     }
 
     pub async fn info(&self) -> DbResult<Value> {
+        // Snapshot the flag before queueing on the shard actors. A compaction
+        // holds its shard's actor while it runs, so reading the flag afterwards
+        // would block and report the post-compaction state instead.
+        let compact_running = self.compact_running.load(Ordering::SeqCst);
         let mut doc_count = 0;
         let mut deleted_count = 0;
         let mut update_seq = 0;
@@ -474,7 +581,7 @@ impl Db {
             "doc_del_count": deleted_count,
             "update_seq": update_seq,
             "purge_seq": 0,
-            "compact_running": self.compact_running.load(Ordering::SeqCst),
+            "compact_running": compact_running,
             "disk_size": 0,
             "data_size": 0,
             "sizes": { "active": 0, "external": 0, "file": 0 },

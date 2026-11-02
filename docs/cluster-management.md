@@ -219,18 +219,32 @@ POST /_node/_local/_dbs/{db}/rebalance
 POST /_node/_local/_dbs/{db}/cleanup
 ```
 
-`rebalance` computes a balanced map, broadcasts it, and verifies that every
-target replica has the **same content digest** as the old replica: document
-ids, winning revisions, deleted flags, conflict leaves and attachment metadata.
-Live-document counts alone are never accepted as proof. If old replicas disagree,
-or a target does not match before `timeout_ms`, the map is rolled back to the old
-placement and the request fails with `504`.
+`rebalance` uses a two-phase placement change. It first broadcasts a
+**migration map** while the old active map continues to serve reads and writes.
+Anti-entropy uses the migration map to seed the target replicas. Client writes
+are frozen on every node during verification and return
+`503 rebalance_in_progress`; reads continue to use the old owners. The freeze
+has a bounded deadline so a lost coordinator cannot leave peers read-only:
+`rebalance_in_progress` expires rather than persisting forever. Every target
+replica must have the **same revision-metadata digest** as the old replica:
+document ids, winning revisions, deleted flags, conflict leaves and attachment
+metadata. Live counts alone are never proof. If old replicas disagree or an
+old owner is unreachable, the request fails with `502` before migration. If a
+target does not match before `timeout_ms`, the migration map is cleared and the
+active map is unchanged; the request fails with `504`.
 
-Destructive cleanup is now explicit: pass `?cleanup=true` to `rebalance`.
-Without it, the migration is verified but the old local copies are retained.
+Only after every digest matches does the node activate the new map on every
+peer. A cutover failure rolls the active map back to the old placement. Client
+writes resume after activation or rollback. If the coordinating node restarts
+mid-rebalance, the active map is still the old one; peers may retain the target
+map for seeding, and the next rebalance replaces it.
+
+Destructive cleanup is explicit: pass `?cleanup=true` to `rebalance`. Without
+it, the migration is verified but the old local copies are retained.
 `POST /_node/_local/_dbs/{db}/cleanup` remains a separate manual operation that
 removes local shard data the current map says this node does not replicate. Use
-it only after a verified rebalance.
+it only after a verified rebalance; it returns `409 rebalance_in_progress`
+while a migration is running.
 
 ## Console
 

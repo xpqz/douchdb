@@ -347,9 +347,9 @@
                 </div>
                 <div class="card">
                   <h3>Process (local)</h3>
-                  <div class="metric-big">{{ Math.round(metrics.process.rss_mb) }} MB</div>
+                  <div class="metric-big">{{ processRss(metrics.process) }}</div>
                   <p class="muted">
-                    {{ metrics.process.threads }} threads ·
+                    {{ processThreads(metrics.process) }} ·
                     up {{ humanDuration(metrics.process.uptime_secs) }} ·
                     pid {{ metrics.process.pid }}
                   </p>
@@ -546,7 +546,7 @@
                     <td class="muted">{{ node.reachable ? humanMs(node.latency_ms) : '—' }}</td>
                     <td>{{ node.http ? node.http.total : '—' }}</td>
                     <td>{{ node.http ? node.http.errors : '—' }}</td>
-                    <td class="muted">{{ node.process ? Math.round(node.process.rss_mb) + ' MB' : '—' }}</td>
+                    <td class="muted">{{ processRss(node.process) }}</td>
                     <td class="muted">{{ node.process ? humanDuration(node.process.uptime_secs) : '—' }}</td>
                   </tr>
                 </tbody>

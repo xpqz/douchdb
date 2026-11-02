@@ -388,7 +388,8 @@ implement `Last-Event-ID` resume; reconnect with an explicit `since` value
 
 `_db_updates` also supports `feed=normal`, `longpoll` and `continuous`, but not
 the eventsource format. On a cluster, `since` and `last_seq` are opaque
-base64url version vectors; do not parse them client-side.
+`v1:` comma-separated version vectors (the decoder still accepts legacy
+base64url tokens); treat them as opaque and do not parse them client-side.
 
 ## Web console
 
@@ -462,7 +463,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--advertise` | matching `--nodes` entry | URL shown for this node in cluster views |
 | `--seed-nodes` | empty | Extra peers probed for membership discovery |
 | `--js-sandbox` | `native` | `native` runs QuickJS in-process; `process` uses a warmed worker pool; `wasm` runs the checked-in WASM QuickJS runner |
-| `--wasm-runtime` | `wasmi` | WASM host runtime: `wasmi` (lean interpreter) or `wasmtime` (Cranelift JIT; requires `--features wasmtime`) |
+| `--wasm-runtime` | `wasmi` | WASM host runtime: `wasmi` (lean interpreter) or `wasmtime` (Cranelift JIT; build with `--features wasmtime`, which needs Rust 1.97+) |
 | `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
@@ -524,9 +525,9 @@ router; there is no coordinator role.
   node needs them to evaluate views over its local shards.
 - Database creation and deletion are broadcast to all configured nodes; design
   documents are replicated to every node so views can run against any shard.
-- `_changes` and `GET /db` return a base64url version vector for `since` /
-  `update_seq`, so a client that saw a partial fan-out resumes without skipping
-  changes.
+- `_changes` and `GET /db` return a `v1:` comma-separated version vector for
+  `since` / `update_seq` (legacy base64url tokens are still accepted), so a
+  client that saw a partial fan-out resumes without skipping changes.
 
 All nodes must use identical `--nodes`, `--q`, `--n`, `--cluster-secret` and
 `--admin` credentials. The cluster secret authenticates internal routing headers,
@@ -554,10 +555,13 @@ broadcast) and then write normally.
 - **Static membership.** There is no gossip or automatic join. Discovery
   reports peers and drift, but it does not change placement. To change the
   node list, restart every node with the new list. Rendezvous hashing and
-  anti-entropy copy data to new replicas; `rebalance` verifies content digests
-  before migration, and destructive cleanup requires `?cleanup=true`.
-- **AP, not linearizable.** Concurrent writes converge through CouchDB revision
-  trees; there is no Raft and no global ordering beyond version vectors.
+  anti-entropy copy data to new replicas; `rebalance` verifies
+  revision-metadata digests before activation, and destructive cleanup requires
+  `?cleanup=true`.
+- **AP by default, but not unconditionally available.** Concurrent writes
+  converge through CouchDB revision trees; there is no Raft and no global
+  ordering beyond version vectors. A default quorum read can return `503` during
+  a partition; `?r=1` is the explicit local-availability trade-off.
 - **Best-effort database lifecycle.** A node that is offline during a database
   create or drop is not repaired automatically.
 - **Node-local operations.** `_purge`, `_compact` and `_revs_limit` act only on
@@ -567,10 +571,11 @@ broadcast) and then write normally.
 - **No inter-node TLS or service accounts.** Nodes trust each other on the
   network; use a private network or a proxy if that matters.
 - **Rebalance is not consensus.** `POST /_node/_local/_dbs/{db}/rebalance`
-  computes and broadcasts a balanced map and waits for exact content digests
-  (documents, tombstones, conflict leaves), but it is still an operator action
-  built on static membership, not an online membership protocol. Timeout rolls
-  back the map; cleanup is explicit.
+  uses a two-phase migration map: reads stay on the old owners, client writes
+  are briefly frozen on every node, anti-entropy seeds the targets, and the
+  active map switches only after revision-metadata digests match. Timeout
+  leaves the old map active; cleanup is explicit. It is still an operator
+  action built on static membership, not an online membership protocol.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,

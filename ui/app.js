@@ -439,6 +439,18 @@
         return `${(Number(value) || 0).toFixed(1)}%`;
       }
 
+      function processRss(process) {
+        return process && process.rss_mb !== null && process.rss_mb !== undefined
+          ? `${Math.round(process.rss_mb)} MB`
+          : '—';
+      }
+
+      function processThreads(process) {
+        return process && process.threads !== null && process.threads !== undefined
+          ? `${process.threads} threads`
+          : 'threads unavailable';
+      }
+
       function humanDuration(seconds) {
         let value = Math.max(0, Math.round(Number(seconds) || 0));
         const days = Math.floor(value / 86400);
@@ -1455,6 +1467,8 @@
         humanMs,
         humanPct,
         humanDuration,
+        processRss,
+        processThreads,
         sparkPoints,
         sparkMax,
         discoverNow,

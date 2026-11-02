@@ -98,50 +98,44 @@ impl RevTree {
         self.path(of).iter().any(|r| r == ancestor)
     }
 
-    /// Drop history older than `limit` revisions behind the deepest leaf.
+    /// Keep the newest `limit` revisions on every root-to-leaf path. Leaves are
+    /// never removed, even when another branch is much deeper. Shared ancestors
+    /// are retained once; a revision whose parent was pruned becomes a root.
     pub fn prune(&mut self, limit: u64) {
-        let limit = limit.max(1);
-        let Some(max) = self
-            .edges
-            .keys()
-            .filter_map(|rev| Rev::parse(rev).map(|r| r.pos))
-            .max()
-        else {
+        let limit = limit.max(1) as usize;
+        let leaves = self.leaves();
+        if leaves.is_empty() {
             return;
-        };
-        let floor = max.saturating_sub(limit - 1);
+        }
+        let mut keep: BTreeSet<String> = BTreeSet::new();
+        for leaf in &leaves {
+            let path = self.path(leaf);
+            let start = path.len().saturating_sub(limit);
+            for rev in &path[start..] {
+                keep.insert(rev.clone());
+            }
+        }
 
         let dead: Vec<String> = self
             .edges
             .keys()
-            .filter(|rev| Rev::parse(rev).map(|r| r.pos < floor).unwrap_or(false))
+            .filter(|rev| !keep.contains(*rev))
             .cloned()
             .collect();
         for rev in &dead {
             self.edges.remove(rev);
         }
-        let orphans: Vec<String> = self
-            .edges
-            .iter()
-            .filter(|(_, parent)| match parent {
-                Some(p) => !self.edges.contains_key(p),
-                None => false,
-            })
-            .map(|(rev, _)| rev.clone())
-            .collect();
-        for rev in orphans {
-            self.edges.insert(rev, None);
+        let known: BTreeSet<String> = self.edges.keys().cloned().collect();
+        for parent in self.edges.values_mut() {
+            let missing = parent
+                .as_ref()
+                .map(|parent| !known.contains(parent))
+                .unwrap_or(false);
+            if missing {
+                *parent = None;
+            }
         }
-        let live: BTreeSet<&String> = self.edges.keys().collect();
-        let gone: Vec<String> = self
-            .deleted
-            .iter()
-            .filter(|r| !live.contains(r))
-            .cloned()
-            .collect();
-        for rev in gone {
-            self.deleted.remove(&rev);
-        }
+        self.deleted.retain(|rev| keep.contains(rev));
     }
 }
 
@@ -235,5 +229,80 @@ mod tests {
         assert_eq!(tree.edges.len(), 3);
         assert_eq!(tree.winner().unwrap(), path[9]);
         assert!(tree.edges[&path[7]].is_none(), "pruned rev becomes a root");
+    }
+
+    #[test]
+    fn pruning_preserves_short_live_conflict_leaf() {
+        let mut tree = RevTree::default();
+        let live = format!("2-{}", id(2));
+        let live_parent = format!("1-{}", id(1));
+        let deep = [
+            format!("1-{}", id(1)),
+            format!("2-{}", id(3)),
+            format!("3-{}", id(4)),
+            format!("4-{}", id(5)),
+        ];
+        tree.merge_path(
+            &[
+                Rev::parse(&live_parent).unwrap(),
+                Rev::parse(&live).unwrap(),
+            ],
+            false,
+        );
+        tree.merge_path(
+            &deep
+                .iter()
+                .map(|rev| Rev::parse(rev).unwrap())
+                .collect::<Vec<_>>(),
+            true,
+        );
+
+        tree.prune(2);
+
+        assert!(tree.edges.contains_key(&live), "short live leaf was pruned");
+        assert!(
+            tree.edges.contains_key(&deep[3]),
+            "deep tombstone leaf was pruned"
+        );
+        assert_eq!(tree.leaves().len(), 2);
+        assert_eq!(tree.winner().unwrap(), live);
+        assert!(tree.is_deleted(&deep[3]));
+        assert!(!tree.is_deleted(&live));
+        // The deep branch's parent was pruned, so it is now a root.
+        assert!(tree.edges[&deep[2]].is_none());
+        assert_eq!(tree.edges[&live], Some(live_parent));
+    }
+
+    #[test]
+    fn pruning_never_removes_a_leaf_at_limit_one() {
+        let mut tree = RevTree::default();
+        let live = format!("2-{}", id(2));
+        let deep = [
+            format!("1-{}", id(1)),
+            format!("2-{}", id(3)),
+            format!("3-{}", id(4)),
+            format!("4-{}", id(5)),
+        ];
+        tree.merge_path(
+            &[
+                Rev::parse(&format!("1-{}", id(1))).unwrap(),
+                Rev::parse(&live).unwrap(),
+            ],
+            false,
+        );
+        tree.merge_path(
+            &deep
+                .iter()
+                .map(|rev| Rev::parse(rev).unwrap())
+                .collect::<Vec<_>>(),
+            false,
+        );
+
+        tree.prune(1);
+
+        assert_eq!(tree.leaves().len(), 2);
+        assert!(tree.edges.contains_key(&live));
+        assert!(tree.edges.contains_key(&deep[3]));
+        assert!(tree.edges.values().all(Option::is_none));
     }
 }

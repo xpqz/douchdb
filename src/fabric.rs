@@ -2,8 +2,8 @@
 //! reads/writes and internal node calls.
 
 use crate::api::{
-    doc_ids_from, doc_opts, doc_response, fail, flag, forward_client_auth, num, percent_encode,
-    AppState,
+    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, forward_client_auth, num,
+    percent_encode, AppState,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use axum::body::Bytes;
@@ -13,7 +13,7 @@ use base64::Engine;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 // Replica-set selection is deliberately centralized here so the shard map is
@@ -50,7 +50,7 @@ pub(crate) fn preferred_shard_masks(st: &AppState, db: &Db) -> Vec<Vec<bool>> {
 }
 
 pub(crate) fn is_replica_of(db: &Db, docid: &str, me: usize) -> bool {
-    db.replicas_of_doc(docid).contains(&me)
+    db.is_replica_of(docid, me)
 }
 
 /// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
@@ -218,12 +218,15 @@ pub(crate) async fn quorum_read(
     headers: &HeaderMap,
     r: usize,
 ) -> Response {
-    // Strict quorum: ask every replica, count reachable answers (including
-    // explicit not-found/tombstone answers), and fail if fewer than `r` replicas
-    // answer. Never return a successful read with fewer than `r` responses.
+    // Ask every replica. Count reachable answers (including explicit
+    // not-found/tombstone answers), and fail if fewer than `r` replica answers
+    // arrive. Internal reconciliation asks for revision histories and conflict
+    // leaves; those are stripped again unless the client requested them.
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
     inner.insert("revs".to_string(), "true".to_string());
+    inner.insert("conflicts".to_string(), "true".to_string());
+    inner.insert("deleted_conflicts".to_string(), "true".to_string());
     let mut replicas = replicas_of_doc(db, docid);
     if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
         let local = replicas.remove(index);
@@ -233,6 +236,8 @@ pub(crate) async fn quorum_read(
     let mut opts = doc_opts(q);
     opts.revs = true;
     opts.include_deleted = true;
+    opts.conflicts = true;
+    opts.deleted_conflicts = true;
     let docs = join_all(replicas.into_iter().map(|node| {
         let inner = inner.clone();
         let opts = opts.clone();
@@ -248,7 +253,7 @@ pub(crate) async fn quorum_read(
             let peer = st.cluster.nodes[node].clone();
             let request = st
                 .client
-                .get(format!("{peer}/{dbname}/{docid}"))
+                .get(format!("{peer}/{dbname}/{}", percent_encode(docid)))
                 .header("x-douchdb-forwarded", "1")
                 .header("x-douchdb-secret", st.cluster.secret.as_str())
                 .header("x-douchdb-quorum-read", "1")
@@ -269,18 +274,6 @@ pub(crate) async fn quorum_read(
     }))
     .await;
     let reachable = docs.iter().filter(|(reachable, _)| *reachable).count();
-    let mut best: Option<Value> = None;
-    for (_, doc) in docs {
-        if let Some(doc) = doc {
-            if best
-                .as_ref()
-                .map(|current| better_rev(&doc, current))
-                .unwrap_or(true)
-            {
-                best = Some(doc);
-            }
-        }
-    }
     if reachable < r {
         crate::telemetry::record_quorum_failure();
         return fail(ApiError::new(
@@ -289,13 +282,120 @@ pub(crate) async fn quorum_read(
             format!("read quorum {r} not met: {reachable} replica(s) answered"),
         ));
     }
-    match best {
-        Some(doc) if doc.get("_deleted").and_then(Value::as_bool) == Some(true) => {
-            fail(ApiError::not_found("deleted"))
-        }
-        Some(doc) => doc_response(doc),
-        None => fail(ApiError::not_found("missing")),
+    let candidates: Vec<Value> = docs.into_iter().filter_map(|(_, doc)| doc).collect();
+    if candidates.is_empty() {
+        return fail(ApiError::not_found("missing"));
     }
+
+    // Reconciliation must be order-independent. Gather the revision histories,
+    // eliminate every candidate that is an ancestor of another candidate, then
+    // choose one winner among the remaining maximal leaves.
+    let histories: Vec<Vec<String>> = candidates.iter().map(revision_history).collect();
+    let maximal: Vec<usize> = (0..candidates.len())
+        .filter(|index| {
+            let Some(rev) = candidates[*index].get("_rev").and_then(Value::as_str) else {
+                return false;
+            };
+            !(0..candidates.len()).any(|other| {
+                other != *index
+                    && histories
+                        .get(other)
+                        .map(|history| history.iter().skip(1).any(|candidate| candidate == rev))
+                        .unwrap_or(false)
+            })
+        })
+        .collect();
+    let winner_index = maximal
+        .into_iter()
+        .max_by_key(|index| {
+            let doc = &candidates[*index];
+            let deleted = doc
+                .get("_deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default();
+            let parsed = crate::rev::Rev::parse(rev);
+            let pos = parsed.as_ref().map(|rev| rev.pos).unwrap_or(0);
+            let id = parsed.map(|rev| rev.id);
+            (!deleted, pos, id)
+        })
+        .unwrap_or(0);
+    let mut winner = candidates[winner_index].clone();
+    let winner_rev = winner
+        .get("_rev")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // Merge conflict metadata from every replica. The winner's own history is
+    // not a conflict; all other non-ancestor leaves are.
+    let ancestor_revs: BTreeSet<String> = histories
+        .iter()
+        .flat_map(|history| history.iter().skip(1).cloned())
+        .collect();
+    let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
+    for doc in &candidates {
+        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
+            leaves.insert(
+                rev.to_string(),
+                doc.get("_deleted").and_then(Value::as_bool) == Some(true),
+            );
+        }
+        for (field, deleted) in [("_conflicts", false), ("_deleted_conflicts", true)] {
+            if let Some(items) = doc.get(field).and_then(Value::as_array) {
+                for item in items {
+                    if let Some(rev) = item.as_str() {
+                        leaves.insert(rev.to_string(), deleted);
+                    }
+                }
+            }
+        }
+    }
+    let mut conflicts = Vec::new();
+    let mut deleted_conflicts = Vec::new();
+    for (rev, deleted) in leaves {
+        if rev == winner_rev || ancestor_revs.contains(&rev) {
+            continue;
+        }
+        if deleted {
+            deleted_conflicts.push(rev);
+        } else {
+            conflicts.push(rev);
+        }
+    }
+    if let Some(object) = winner.as_object_mut() {
+        if flag(q, "conflicts") {
+            object.insert("_conflicts".to_string(), json!(conflicts));
+        } else {
+            object.remove("_conflicts");
+        }
+        if flag(q, "deleted_conflicts") {
+            object.insert("_deleted_conflicts".to_string(), json!(deleted_conflicts));
+        } else {
+            object.remove("_deleted_conflicts");
+        }
+        if !flag(q, "revs") {
+            object.remove("_revisions");
+        }
+    }
+
+    let explicitly_requested = q.get("rev").is_some();
+    let deleted = winner
+        .get("_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if deleted && !explicitly_requested {
+        return fail(ApiError::not_found("deleted"));
+    }
+    let etag = format!("\"{winner_rev}\"");
+    if etag_matches(headers, header::IF_NONE_MATCH, &etag) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(value) = etag.parse() {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        return response;
+    }
+    doc_response(winner)
 }
 
 /// Revision history from a `revs=true` document response, newest first.
@@ -316,48 +416,6 @@ fn revision_history(doc: &Value) -> Vec<String> {
                 .map(|id| format!("{}-{id}", start.saturating_sub(index as u64)))
         })
         .collect()
-}
-
-fn descends_from(candidate: &Value, current: &Value) -> bool {
-    let Some(current_rev) = current.get("_rev").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(candidate_rev) = candidate.get("_rev").and_then(Value::as_str) else {
-        return false;
-    };
-    if candidate_rev == current_rev {
-        return false;
-    }
-    revision_history(candidate)
-        .into_iter()
-        .skip(1)
-        .any(|rev| rev == current_rev)
-}
-
-pub(crate) fn better_rev(candidate: &Value, current: &Value) -> bool {
-    // A direct descendant wins even when it is a tombstone. This is the case
-    // a stale live replica would otherwise win on CouchDB's deleted-first
-    // ordering rule.
-    if descends_from(candidate, current) {
-        return true;
-    }
-    if descends_from(current, candidate) {
-        return false;
-    }
-    let key = |doc: &Value| {
-        let deleted = doc
-            .get("_deleted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default();
-        let parsed = crate::rev::Rev::parse(rev);
-        let pos = parsed.as_ref().map(|r| r.pos).unwrap_or(0);
-        let id = parsed.map(|r| r.id).unwrap_or_default();
-        (deleted, pos, id)
-    };
-    let a = key(candidate);
-    let b = key(current);
-    (!a.0, a.1, a.2) > (!b.0, b.1, b.2)
 }
 
 #[derive(serde::Serialize)]

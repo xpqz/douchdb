@@ -7,7 +7,8 @@ network capabilities: the WASI context has no preopens, environment or args,
 and the host grants only the request/stdout pipes plus WASI clock/random,
 memory, fuel and a 128 MiB linear-memory cap.
 
-Rebuild it with the pinned toolchain:
+Rebuild it with the following toolchain (the exact Rust and WASI SDK
+versions are not pinned by the repository):
 
 ```sh
 rustup target add wasm32-wasip1

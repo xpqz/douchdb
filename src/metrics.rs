@@ -330,31 +330,46 @@ fn route_label(path: &str) -> String {
 }
 
 fn process_json() -> Value {
-    let mut rss = 0u64;
-    let mut threads = 0u64;
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("VmRSS:") {
-                rss = value
-                    .split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    * 1024;
-            }
-            if let Some(value) = line.strip_prefix("Threads:") {
-                threads = value.trim().parse().unwrap_or(0);
+    #[cfg(target_os = "linux")]
+    {
+        let mut rss = 0u64;
+        let mut threads = 0u64;
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(value) = line.strip_prefix("VmRSS:") {
+                    rss = value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        * 1024;
+                }
+                if let Some(value) = line.strip_prefix("Threads:") {
+                    threads = value.trim().parse().unwrap_or(0);
+                }
             }
         }
+        json!({
+            "rss_bytes": rss,
+            "rss_mb": rss as f64 / (1024.0 * 1024.0),
+            "threads": threads,
+            "pid": std::process::id(),
+            "uptime_secs": uptime_secs(),
+            "started_unix": registry().started_unix,
+        })
     }
-    json!({
-        "rss_bytes": rss,
-        "rss_mb": rss as f64 / (1024.0 * 1024.0),
-        "threads": threads,
-        "pid": std::process::id(),
-        "uptime_secs": uptime_secs(),
-        "started_unix": registry().started_unix,
-    })
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Do not present an unsupported measurement as a valid zero.
+        json!({
+            "rss_bytes": Value::Null,
+            "rss_mb": Value::Null,
+            "threads": Value::Null,
+            "pid": std::process::id(),
+            "uptime_secs": uptime_secs(),
+            "started_unix": registry().started_unix,
+        })
+    }
 }
 
 fn history_json(state: &State) -> Vec<Value> {

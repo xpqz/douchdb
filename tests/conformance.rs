@@ -5768,20 +5768,40 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
     let (status, _) = s
         .put(
             "/jsploop/_design/v",
-            json!({"views": {"loop": {"map": "function(doc){ while (true) {} }"}}}),
+            json!({"views": {
+                "loop": {"map": "function(doc){ while (true) {} }"},
+                "ok": {"map": "function(doc){ var n = doc.v + 1; emit(n, null); }"}
+            }}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
+
+    // A successful worker execution first, so a startup failure cannot satisfy
+    // the deadline assertions below.
+    let (status, body) = s.get("/jsploop/_design/v/_view/ok").await;
+    assert_eq!(status, StatusCode::OK, "process worker did not run: {body}");
+    assert_eq!(body["rows"][0]["key"], 2);
 
     let started = std::time::Instant::now();
     let (status, body) = s.get("/jsploop/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
     assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("timed out"),
+        "deadline cause was not reported: {body}"
+    );
+    assert!(
         started.elapsed() < Duration::from_secs(5),
         "worker deadline was not enforced: {:?}",
         started.elapsed()
     );
+
+    // The pool recovers and serves valid work after the deadline kill.
+    let (status, body) = s.get("/jsploop/_design/v/_view/ok").await;
+    assert_eq!(status, StatusCode::OK, "worker did not recover: {body}");
 }
 
 #[tokio::test]
@@ -5809,7 +5829,7 @@ async fn quickjs_process_pool_handles_concurrent_queries() {
     let (status, _) = s
         .put(
             "/jspool/_design/v",
-            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, null); }"}}}),
+            json!({"views": {"by_city": {"map": "function(doc){ var suffix = '-x'; emit(doc.city + suffix, null); }"}}}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -5890,17 +5910,28 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     let (status, _) = s
         .put(
             "/jswloop/_design/v",
-            json!({"views": {"loop": {"map": "function(doc){ while (true) {} }"}}}),
+            json!({"views": {
+                "ok": {"map": "function(doc){ var n = doc.v + 1; emit(n, null); }"},
+                "loop": {"map": "function(doc){ while (true) {} }"}
+            }}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
+
+    // Prove the wasm worker runs before measuring the deadline, so a startup
+    // failure cannot satisfy the bounded-time assertion.
+    let (status, body) = s.get("/jswloop/_design/v/_view/ok").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["key"], 2);
 
     let started = std::time::Instant::now();
     let (status, body) = s.get("/jswloop/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
+    // The wasm interpreter is much slower than a native worker and CI may be
+    // loaded; the bound only needs to prove fuel stops the infinite loop.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(15),
         "wasm fuel deadline was not enforced: {:?}",
         started.elapsed()
     );
@@ -6536,7 +6567,10 @@ async fn observability_metrics_and_health_report_local_state() {
     assert_eq!(metrics["scope"], "local");
     assert_eq!(metrics["node"]["index"], 0);
     assert!(metrics["process"]["pid"].as_u64().unwrap() > 0);
+    #[cfg(target_os = "linux")]
     assert!(metrics["process"]["rss_bytes"].as_u64().unwrap() > 0);
+    #[cfg(not(target_os = "linux"))]
+    assert!(metrics["process"]["rss_bytes"].is_null());
     assert!(metrics["process"]["uptime_secs"].as_u64().is_some());
     assert!(metrics["http"]["total"].as_u64().unwrap() >= 5);
     assert!(metrics["http"]["errors"].as_u64().unwrap() >= 1);
@@ -8035,4 +8069,437 @@ async fn quorum_read_prefers_conflict_winner_across_replicas() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["v"], "c");
     assert_eq!(body["_conflicts"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn quorum_reconciliation_is_coordinator_independent() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("qsplit").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let root = "00000000000000000000000000000000";
+    let branches = [
+        json!({"new_edits": false, "docs": [
+            {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"}
+        ]}),
+        json!({"new_edits": false, "docs": [
+            {"_id": "x", "_rev": "2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+             "_revisions": {"start": 2, "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", root]}, "v": "a"}
+        ]}),
+        json!({"new_edits": false, "docs": [
+            {"_id": "x", "_rev": "3-cccccccccccccccccccccccccccccccc", "_deleted": true,
+             "_revisions": {"start": 3, "ids": ["cccccccccccccccccccccccccccccccc", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}}
+        ]}),
+    ];
+    for (node, branch) in nodes.iter().zip(branches) {
+        let (status, body) = node
+            .req_with(Method::POST, "/qsplit/_bulk_docs", Some(branch), &internal)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // The forwarded writes above are local-only, so the replicas really do
+    // disagree. If they were converged, the coordinator test below would prove
+    // nothing.
+    let mut local_winners = std::collections::BTreeSet::new();
+    for node in &nodes {
+        let (status, body) = node.get("/qsplit/x?r=1").await;
+        if status == StatusCode::OK {
+            local_winners.insert(body["_rev"].as_str().unwrap().to_string());
+        } else {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        }
+    }
+    assert!(
+        local_winners.contains("2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "{local_winners:?}"
+    );
+    assert!(
+        local_winners.contains("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "{local_winners:?}"
+    );
+
+    for node in &nodes {
+        let (status, body) = node
+            .get("/qsplit/x?r=3&conflicts=true&deleted_conflicts=true")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", node.base);
+        assert_eq!(body["v"], "a", "{} chose {body}", node.base);
+        assert_eq!(body["_rev"], "2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(body["_conflicts"].as_array().unwrap().len(), 0, "{}", body);
+        assert!(
+            body["_deleted_conflicts"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("3-cccccccccccccccccccccccccccccccc")),
+            "{}",
+            body
+        );
+    }
+}
+
+#[tokio::test]
+async fn quorum_peer_urls_encode_reserved_document_ids() {
+    use md5::{Digest, Md5};
+
+    let nodes = start_cluster_with(3, "3600", 2);
+    nodes[0].fresh_db("qencode").await;
+    // Decoys: an unencoded path would read one of these instead of the
+    // reserved-character document.
+    let (status, body) = nodes[0]
+        .post(
+            "/qencode/_bulk_docs",
+            json!({"docs": [
+                {"_id": "special", "value": "decoy-hash"},
+                {"_id": "question", "value": "decoy-query"},
+                {"_id": "slash", "value": "decoy-slash"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, map) = nodes[0].get("/_node/_local/_dbs/qencode").await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    let q = map["q"].as_u64().unwrap() as u32;
+    let replicas = map["replicas"].as_array().unwrap();
+
+    // A document id whose URL meaning changes unless the path segment is
+    // escaped: '#' truncates the URL fragment, '?' starts a query, and '/' is a
+    // path separator.
+    for id in ["special#id", "question?id", "slash/id"] {
+        let shard =
+            (u32::from_be_bytes(Md5::digest(id.as_bytes())[..4].try_into().unwrap()) % q) as usize;
+        let owners: Vec<usize> = replicas[shard]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node.as_u64().unwrap() as usize)
+            .collect();
+        let coordinator = (0..nodes.len())
+            .find(|node| !owners.contains(node))
+            .expect("n=2 of three nodes leaves a non-owner");
+        let (status, body) = nodes[0]
+            .post(
+                "/qencode/_bulk_docs",
+                json!({"docs": [{"_id": id, "value": id}]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let encoded = match id {
+            "special#id" => "special%23id",
+            "question?id" => "question%3Fid",
+            "slash/id" => "slash%2Fid",
+            _ => unreachable!(),
+        };
+        let (status, body) = nodes[coordinator]
+            .get(&format!("/qencode/{encoded}?r=2"))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "id {id} via non-owner {coordinator}: {body}"
+        );
+        assert_eq!(body["value"], id, "id {id}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn quorum_read_preserves_conditional_and_explicit_revision_semantics() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    nodes[0].fresh_db("qhttp").await;
+    let (status, body) = nodes[0]
+        .post("/qhttp/_bulk_docs", json!({"docs": [{"_id": "x", "v": 1}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, doc) = nodes[0].get("/qhttp/x?r=2").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    assert!(
+        doc.get("_revisions").is_none(),
+        "unsolicited _revisions: {doc}"
+    );
+
+    let (status, body) = nodes[0].get("/qhttp/x?r=2&revs=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("_revisions").is_some(),
+        "requested revs missing: {body}"
+    );
+    let (status, body) = nodes[0]
+        .req_with(Method::HEAD, "/qhttp/x?r=2", None, &[])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = nodes[0].get("/qhttp/x?r=2&open_revs=all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.is_array(), "open_revs shape: {body}");
+
+    let (status, headers, body) = nodes[0]
+        .req_headers(
+            Method::GET,
+            "/qhttp/x?r=2",
+            None,
+            &[("If-None-Match", format!("\"{rev}\""))],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED, "{body}");
+    assert_eq!(headers.get("etag"), Some(&format!("\"{rev}\"")));
+
+    let (status, deleted) = nodes[0]
+        .req(Method::DELETE, &format!("/qhttp/x?rev={rev}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tombstone_rev = deleted["rev"]
+        .as_str()
+        .or_else(|| deleted["_rev"].as_str())
+        .expect("delete returned a tombstone rev")
+        .to_string();
+
+    let (status, body) = nodes[0]
+        .get(&format!("/qhttp/x?rev={tombstone_rev}&r=2"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "explicit tombstone: {body}");
+    assert_eq!(body["_deleted"], true);
+    let (status, body) = nodes[0].get("/qhttp/x?r=2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("rebread").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/rebread", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let docs: Vec<Value> = (0..9)
+        .map(|i| json!({"_id": format!("reb{i}"), "n": i}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/rebread/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let rebalance = tokio::spawn({
+        let client = nodes[0].client.clone();
+        let url = format!(
+            "{}/_node/_local/_dbs/rebread/rebalance?timeout_ms=1500",
+            nodes[0].base
+        );
+        async move {
+            client
+                .post(url)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+
+    // Wait until the rebalance has frozen writes. Until then, writes are
+    // ordinary new documents and are harmless.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut attempt = 0usize;
+    loop {
+        let (status, body) = nodes[0]
+            .req_with(
+                Method::PUT,
+                &format!("/rebread/paused{attempt}"),
+                Some(json!({"attempt": attempt})),
+                &[],
+            )
+            .await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+            break;
+        }
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+            "unexpected write status before freeze: {status} {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rebalance never froze writes"
+        );
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The freeze is cluster-wide: a client writing through another node must
+    // also see 503, not just the coordinator.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = nodes[1]
+            .req_with(
+                Method::PUT,
+                "/rebread/peerprobe",
+                Some(json!({"peer": true})),
+                &[],
+            )
+            .await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+            break;
+        }
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+            "unexpected peer write status before freeze: {status} {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "peer writes were never frozen"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Destructive cleanup cannot run against the old map mid-migration.
+    let (status, body) = nodes[1]
+        .post("/_node/_local/_dbs/rebread/cleanup", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+
+    // Only one rebalance may own the database at a time.
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/rebread/rebalance?timeout_ms=1500",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+
+    // Reads still use the old active placement, not the incomplete target.
+    let (status, body) = nodes[0].get("/rebread/reb0").await;
+    assert_eq!(status, StatusCode::OK, "read during migration: {body}");
+    assert_eq!(body["n"], 0);
+
+    assert_eq!(rebalance.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+    let (status, body) = nodes[0].get("/rebread/reb0").await;
+    assert_eq!(status, StatusCode::OK, "read after timeout: {body}");
+    let (status, _) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/rebread/after",
+            Some(json!({"ok": true})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, map) = nodes[0].get("/_node/_local/_dbs/rebread").await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    for replicas in map["replicas"].as_array().unwrap() {
+        assert_eq!(replicas[0], 0, "timeout changed the active map: {map}");
+    }
+}
+
+#[tokio::test]
+async fn revs_limit_pruning_preserves_short_conflict_leaves() {
+    let s = Server::start(false);
+    s.fresh_db("prunelimit").await;
+    let (status, body) = s.put("/prunelimit/_revs_limit", json!(2)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let root = "11111111111111111111111111111111";
+    let short = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (status, body) = s
+        .post(
+            "/prunelimit/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": format!("4-dddddddddddddddddddddddddddddddd"),
+                 "_revisions": {"start": 4, "ids": [
+                    "dddddddddddddddddddddddddddddddd",
+                    "cccccccccccccccccccccccccccccccc",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    root
+                 ]}, "branch": "deep"},
+                {"_id": "x", "_rev": format!("2-{short}"),
+                 "_revisions": {"start": 2, "ids": [short, root]}, "branch": "short"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = s.get("/prunelimit/x?conflicts=true&revs=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "4-dddddddddddddddddddddddddddddddd");
+    assert_eq!(body["branch"], "deep");
+    assert_eq!(
+        body["_conflicts"],
+        json!([format!("2-{short}")]),
+        "short live conflict leaf was lost by pruning: {body}"
+    );
+    assert_eq!(
+        body["_revisions"]["ids"].as_array().unwrap().len(),
+        2,
+        "each branch is stemmed to the limit: {body}"
+    );
+
+    // The short branch is still readable by its own revision.
+    let (status, body) = s.get(&format!("/prunelimit/x?rev=2-{short}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "short");
+
+    let (status, body) = s.get("/prunelimit/x?open_revs=all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+}
+
+#[tokio::test]
+async fn search_cleanup_serializes_with_builds_and_stale_queries() {
+    let s = Server::start(false);
+    seed_search_docs(&s, "searchrace").await;
+    let docs: Vec<Value> = (0..120)
+        .map(|i| {
+            json!({
+                "_id": format!("bulk{i:03}"),
+                "item": format!("item{i}"),
+                "place": "p",
+                "state": "s",
+                "price": i as f64
+            })
+        })
+        .collect();
+    let (status, body) = s
+        .post("/searchrace/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let url = "/searchrace/_design/inventory/_search/fruits?q=*:*&limit=0";
+    for round in 0..4 {
+        // Change the database sequence so every query below would see a stale
+        // cached index unless it rebuilds.
+        let id = format!("race{round}");
+        let (status, body) = s
+            .post(
+                "/searchrace/_bulk_docs",
+                json!({"docs": [{"_id": id, "item": id, "place": "p", "state": "s", "price": 1.0}]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let expected = 4 + 120 + round + 1;
+
+        let ((s1, b1), (s2, b2), (s3, b3), (cs, cb)) = tokio::join!(
+            s.get(url),
+            s.get(url),
+            s.get(url),
+            s.post("/searchrace/_search_cleanup", json!({})),
+        );
+        for (status, body) in [(s1, b1), (s2, b2), (s3, b3)] {
+            assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+            assert_eq!(body["total_rows"], expected, "round {round}: {body}");
+        }
+        assert_eq!(cs, StatusCode::ACCEPTED, "round {round}: {cb}");
+    }
+
+    // Cleanup must not leave the index in a state that cannot be rebuilt.
+    let (status, body) = s.get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4 + 120 + 4);
 }
