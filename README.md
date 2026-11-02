@@ -451,7 +451,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--per-user-rate` | `0` | Requests/second per principal; `0` unlimited |
 | `--heavy-in-flight` | `8` | Global concurrent view/search requests |
 | `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
-| `--background-in-flight` | `1` | Concurrent anti-entropy/discovery passes |
+| `--background-in-flight` | `2` | Concurrent anti-entropy/discovery passes |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |

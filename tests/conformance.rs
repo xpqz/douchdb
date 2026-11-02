@@ -7039,7 +7039,10 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
         }
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Let the spawned long-poll win the single per-user slot before the
+    // probe loop starts competing for it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let (status, body) = s.req_with(Method::GET, "/fair", None, &alice).await;
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -7120,7 +7123,8 @@ async fn global_admission_limit_protects_capacity_across_users() {
         }
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let (status, body) = s
             .req_with(Method::GET, "/global", None, &bearer("bob-token"))

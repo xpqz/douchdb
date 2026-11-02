@@ -37,7 +37,7 @@ impl Default for Limits {
             per_user_rate: 0,
             heavy_in_flight: 8,
             heavy_per_user: 1,
-            background_in_flight: 1,
+            background_in_flight: 2,
         }
     }
 }

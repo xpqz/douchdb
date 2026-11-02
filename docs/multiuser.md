@@ -133,7 +133,7 @@ Limits:
 | `--per-user-rate` | `0` | Requests per second per principal; `0` is unlimited |
 | `--heavy-in-flight` | `8` | Concurrent view/search requests globally |
 | `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
-| `--background-in-flight` | `1` | Concurrent anti-entropy/discovery passes |
+| `--background-in-flight` | `2` | Concurrent anti-entropy/discovery passes |
 
 Request classes:
 
