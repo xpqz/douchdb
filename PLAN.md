@@ -474,9 +474,11 @@ the bulk of the growth.
   client writes are frozen on every node for a bounded window, and anti-entropy
   seeds the target map; activation is a separate all-peer step. Point reads
   enforce the requested read quorum, count explicit not-found/tombstone
-  answers, reconcile every leaf (including conflicts that are no local winner)
-  and select the merged tree's winner; unmet quorum is `503`, and
-  revision-shaped reads still enforce reachability. The Docker build includes
+  answers, reconcile every leaf (including conflicts that are no local winner),
+  merge ancestry from every replica before deduplicating leaf bodies, and
+  select the merged tree's winner; requested histories use the longest retained
+  path deterministically. Unmet quorum is `503`, and revision-shaped reads
+  still enforce reachability. The Docker build includes
   the embedded WASI runner, a GitHub Actions workflow runs
   fmt/clippy/tests/both wasm backends/container build, search rebuilds are
   serialized per index and run on the blocking pool, and `_compact` has a
