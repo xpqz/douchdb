@@ -6647,3 +6647,508 @@ async fn cluster_metrics_and_health_aggregate_across_nodes() {
     assert_eq!(health["status"], "critical", "{health}");
     assert_eq!(health["nodes"].as_array().unwrap().len(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Multiuser auth, database security and fair admission
+//
+// These tests define the contract before the implementation. They use a small
+// users file with token credentials and the CouchDB-shaped `_security` object.
+
+struct UsersFile {
+    path: PathBuf,
+}
+
+impl UsersFile {
+    fn new(contents: &str) -> UsersFile {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "douchdb-users-{}-{}.json",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&path, contents).expect("write users file");
+        UsersFile { path }
+    }
+
+    fn arg(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
+impl Drop for UsersFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+const USERS: &str = r#"{"users":[
+    {"name":"alice","token":"alice-token","roles":["analyst"]},
+    {"name":"bob","token":"bob-token","roles":[]},
+    {"name":"root","token":"root-token","roles":["_admin"]}
+]}"#;
+
+fn bearer(token: &str) -> Vec<(&'static str, String)> {
+    vec![("Authorization", format!("Bearer {token}"))]
+}
+
+fn basic(name: &str, secret: &str) -> Vec<(&'static str, String)> {
+    vec![(
+        "Authorization",
+        format!(
+            "Basic {}",
+            base64_encode(format!("{name}:{secret}").as_bytes())
+        ),
+    )]
+}
+
+fn admin_auth() -> Vec<(&'static str, String)> {
+    basic("admin", "douchdb")
+}
+
+fn users_server_args(users: &UsersFile) -> Vec<String> {
+    vec!["--users-file".to_string(), users.arg()]
+}
+
+#[tokio::test]
+async fn users_file_authenticates_tokens_sessions_and_roles() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &bearer("alice-token"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["userCtx"]["name"], "alice");
+    assert_eq!(body["userCtx"]["roles"], json!(["analyst"]));
+
+    // Basic uses the token as the password.
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            "/_session",
+            None,
+            &basic("alice", "alice-token"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["userCtx"]["name"], "alice");
+
+    // The console flow: POST name/token, then reuse the signed cookie.
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-token"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &[("Cookie", cookie)])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["userCtx"]["name"], "alice");
+
+    // Invalid credentials are rejected, not treated as anonymous.
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &bearer("wrong-token"))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::GET,
+            "/_session",
+            None,
+            &basic("alice", "wrong-token"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // A user with the _admin role can perform server-admin operations.
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/root-created",
+            Some(json!({})),
+            &bearer("root-token"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn security_object_enforces_members_admins_roles_and_all_dbs_filtering() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let alice = bearer("alice-token");
+    let bob = bearer("bob-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/alpha", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // New databases are admin-only when authentication is configured.
+    let (status, _) = s.req_with(Method::GET, "/alpha", None, &alice).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Members can read/write ordinary documents but not design docs or security.
+    let members = json!({
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["alice", "bob"], "roles": []}
+    });
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_security",
+            Some(members),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/alpha/doc", Some(json!({"v": 1})), &alice)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.req_with(Method::GET, "/alpha/doc", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 1);
+
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_design/v",
+            Some(json!({"views": {}})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_security",
+            Some(json!({"members": {"names": ["alice"], "roles": []}})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Database admins can write design docs and change security.
+    let admins = json!({
+        "admins": {"names": ["alice"], "roles": []},
+        "members": {"names": ["alice", "bob"], "roles": []}
+    });
+    let (status, body) = s
+        .req_with(Method::PUT, "/alpha/_security", Some(admins), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_design/v",
+            Some(json!({"views": {}})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, _) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_design/v2",
+            Some(json!({"views": {}})),
+            &bob,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = s
+        .req_with(Method::GET, "/alpha/_security", None, &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["members"]["names"], json!(["alice", "bob"]));
+    let (status, _) = s
+        .req_with(Method::GET, "/alpha/_security", None, &bob)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A role can grant membership.
+    let (status, body) = s
+        .req_with(Method::PUT, "/role-db", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/role-db/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": [], "roles": ["analyst"]}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.req_with(Method::GET, "/role-db", None, &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = s.req_with(Method::GET, "/role-db", None, &bob).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // _all_dbs is filtered per principal; admins see everything.
+    let (status, body) = s.req_with(Method::GET, "/_all_dbs", None, &alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"alpha"), "{names:?}");
+    assert!(names.contains(&"role-db"), "{names:?}");
+
+    let (status, body) = s.req_with(Method::GET, "/_all_dbs", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"alpha"), "{names:?}");
+    assert!(!names.contains(&"role-db"), "{names:?}");
+
+    let (status, body) = s
+        .req_with(Method::GET, "/_all_dbs", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"alpha"), "{names:?}");
+    assert!(names.contains(&"role-db"), "{names:?}");
+
+    let (status, _) = s.req_with(Method::GET, "/_all_dbs", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Removing Alice from security takes effect on the next request.
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/alpha/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["bob"], "roles": []}
+            })),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = s.req_with(Method::GET, "/alpha", None, &alice).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = s.req_with(Method::GET, "/alpha", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn default_security_open_allows_any_authenticated_user() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.push("--default-security".to_string());
+    args.push("open".to_string());
+    let s = Server::start_with(&args, true);
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/open-db", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(Method::GET, "/open-db", None, &bearer("alice-token"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/open-db/doc",
+            Some(json!({"v": 1})),
+            &bearer("alice-token"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // open means anonymous requests are members too.
+    let (status, body) = s.req_with(Method::GET, "/open-db/doc", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--max-in-flight".to_string(),
+        "8".to_string(),
+        "--per-user-in-flight".to_string(),
+        "1".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+    let alice = bearer("alice-token");
+    let bob = bearer("bob-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/fair", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/fair/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice", "bob"], "roles": []}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Hold Alice's single slot with a long-poll changes request.
+    let longpoll = tokio::spawn({
+        let client = s.client.clone();
+        let url = format!(
+            "{}/fair/_changes?feed=longpoll&timeout=1500&since=0",
+            s.base
+        );
+        let auth = bearer("alice-token");
+        async move {
+            let mut request = client.get(url);
+            for (name, value) in auth {
+                request = request.header(name, value);
+            }
+            request.send().await.unwrap().status()
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = s.req_with(Method::GET, "/fair", None, &alice).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["error"], "too_many_requests", "{body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice was never capped: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Another user is not blocked by Alice's slot.
+    let (status, body) = s.req_with(Method::GET, "/fair", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let status = longpoll.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    // Alice's slot is released when the long-poll ends.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _) = s.req_with(Method::GET, "/fair", None, &alice).await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice did not recover: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn global_admission_limit_protects_capacity_across_users() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--max-in-flight".to_string(),
+        "1".to_string(),
+        "--per-user-in-flight".to_string(),
+        "1".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/global", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/global/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice", "bob"], "roles": []}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let longpoll = tokio::spawn({
+        let client = s.client.clone();
+        let url = format!(
+            "{}/global/_changes?feed=longpoll&timeout=1500&since=0",
+            s.base
+        );
+        let auth = bearer("alice-token");
+        async move {
+            let mut request = client.get(url);
+            for (name, value) in auth {
+                request = request.header(name, value);
+            }
+            request.send().await.unwrap().status()
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = s
+            .req_with(Method::GET, "/global", None, &bearer("bob-token"))
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["error"], "too_many_requests", "{body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "global limit did not reject bob: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let status = longpoll.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _) = s
+            .req_with(Method::GET, "/global", None, &bearer("bob-token"))
+            .await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bob did not recover: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
