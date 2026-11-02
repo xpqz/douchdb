@@ -42,8 +42,9 @@ The exact live-volume corruption has not been reproduced in this environment,
 and the original capture was truncated before the caller. The corrected cache
 tests pass in debug and release on x86_64 and on `linux/arm64` Rust 1.97; the
 ARM64 release suite previously aborted on the unsafe list. Release validation
-also covered a 100,000-document write, complete changes-feed pagination,
-process restart, and a Docker restart with 20,000 documents.
+also covered a 120,000-document write, complete changes-feed pagination,
+process restart, a 20,000-document amd64 Docker restart and a 5,000-document
+arm64 Docker restart.
 
 Re-run a large ARM64 import plus concurrent changes/repair against the exact
 existing volumes before treating the storage layer as fully signed off.
