@@ -478,6 +478,9 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(html.contains("data-testid=\"open-cluster\""));
     assert!(html.contains("data-testid=\"open-metrics\""));
     assert!(html.contains("data-testid=\"metrics-routes\""));
+    assert!(html.contains("data-testid=\"open-access\""));
+    assert!(html.contains("data-testid=\"access-table\""));
+    assert!(html.contains("data-testid=\"security-modal\""));
 
     let response = s
         .client
@@ -498,6 +501,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(app.contains("/_node/_local/_replication"));
     assert!(app.contains("/_node/_local/_metrics"));
     assert!(app.contains("loadMetrics"));
+    assert!(app.contains("/_security"));
+    assert!(app.contains("loadAccess"));
     // The request log must not retain login credentials.
     assert!(app.contains("[redacted credentials]"));
     // The console may only use the public CouchDB API, never a private route.

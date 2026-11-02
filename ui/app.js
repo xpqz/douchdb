@@ -91,6 +91,24 @@
       const metrics = ref(null);
       const metricsError = ref('');
       const metricsLoading = ref(false);
+      const accessRows = ref([]);
+      const accessError = ref('');
+      const accessLoading = ref(false);
+      const roles = ref([]);
+      const isAdmin = computed(() => roles.value.includes('_admin'));
+      const securityForm = reactive({
+        open: false,
+        db: '',
+        memberNames: '',
+        memberRoles: '',
+        adminNames: '',
+        adminRoles: '',
+        memberExtra: {},
+        adminExtra: {},
+        extra: {},
+        error: '',
+        saving: false,
+      });
 
       const viewDefs = ref([]);
       const selectedDesign = ref(null);
@@ -255,6 +273,9 @@
         membership.value = null;
         cluster.value = null;
         clusterError.value = '';
+        accessRows.value = [];
+        accessError.value = '';
+        securityForm.open = false;
         view.value = 'home';
         refreshAll();
       }
@@ -265,8 +286,12 @@
           const authenticated = data && data.info && data.info.authenticated;
           const name = data && data.userCtx && data.userCtx.name;
           user.value = authenticated && name && name !== 'null' ? name : null;
+          roles.value = authenticated && data.userCtx && Array.isArray(data.userCtx.roles)
+            ? data.userCtx.roles
+            : [];
         } catch {
           user.value = null;
+          roles.value = [];
         }
       }
 
@@ -296,6 +321,7 @@
         await loadServerInfo();
         if (view.value === 'cluster') await loadCluster();
         else if (view.value === 'metrics') await loadMetrics();
+        else if (view.value === 'access') await loadAccess();
         else if (currentDb.value && view.value !== 'doc') applyRoute();
       }
 
@@ -469,6 +495,121 @@
         else location.hash = '#/metrics';
       }
 
+      // ----- database access / _security --------------------------------
+
+      function sectionList(section, key) {
+        return section && Array.isArray(section[key]) ? section[key] : [];
+      }
+
+      function hasPrincipals(section) {
+        return sectionList(section, 'names').length > 0 || sectionList(section, 'roles').length > 0;
+      }
+
+      function principalText(section) {
+        const names = sectionList(section, 'names');
+        const roles = sectionList(section, 'roles').map((role) => `role:${role}`);
+        const values = names.concat(roles);
+        return values.length ? values.join(', ') : '—';
+      }
+
+      function securityLabel(row) {
+        const security = row.security || {};
+        if (hasPrincipals(security.members)) return 'members';
+        if (hasPrincipals(security.admins)) return 'admin-only';
+        return 'default';
+      }
+
+      function splitList(value) {
+        return String(value || '')
+          .split(',')
+          .map((part) => part.trim())
+          .filter(Boolean);
+      }
+
+      async function loadAccess() {
+        accessLoading.value = true;
+        try {
+          const names = await call('GET', '/_all_dbs');
+          const rows = await Promise.all(
+            names.map(async (name) => {
+              try {
+                const security = await call('GET', `/${enc(name)}/_security`);
+                return { name, security: security || {} };
+              } catch (error) {
+                if (error.status === 401 || error.status === 403) return null;
+                throw error;
+              }
+            })
+          );
+          accessRows.value = rows.filter(Boolean).sort((left, right) => left.name.localeCompare(right.name));
+          accessError.value = '';
+        } catch (error) {
+          accessError.value = error.data ? pretty(error.data) : error.message || String(error);
+          if (error.status !== 401) handleError(error, 'Cannot read database access');
+        } finally {
+          accessLoading.value = false;
+        }
+      }
+
+      function openAccess() {
+        if (location.hash === '#/access') applyRoute();
+        else location.hash = '#/access';
+      }
+
+      function openSecurity(row) {
+        const security = row.security || {};
+        const members = security.members || {};
+        const admins = security.admins || {};
+        const memberExtra = { ...members };
+        delete memberExtra.names;
+        delete memberExtra.roles;
+        const adminExtra = { ...admins };
+        delete adminExtra.names;
+        delete adminExtra.roles;
+        const extra = { ...security };
+        delete extra.members;
+        delete extra.admins;
+        securityForm.db = row.name;
+        securityForm.memberNames = sectionList(members, 'names').join(', ');
+        securityForm.memberRoles = sectionList(members, 'roles').join(', ');
+        securityForm.adminNames = sectionList(admins, 'names').join(', ');
+        securityForm.adminRoles = sectionList(admins, 'roles').join(', ');
+        securityForm.memberExtra = memberExtra;
+        securityForm.adminExtra = adminExtra;
+        securityForm.extra = extra;
+        securityForm.error = '';
+        securityForm.saving = false;
+        securityForm.open = true;
+      }
+
+      async function saveSecurity() {
+        securityForm.saving = true;
+        securityForm.error = '';
+        const security = {
+          ...securityForm.extra,
+          members: {
+            ...securityForm.memberExtra,
+            names: splitList(securityForm.memberNames),
+            roles: splitList(securityForm.memberRoles),
+          },
+          admins: {
+            ...securityForm.adminExtra,
+            names: splitList(securityForm.adminNames),
+            roles: splitList(securityForm.adminRoles),
+          },
+        };
+        try {
+          await call('PUT', `/${enc(securityForm.db)}/_security`, security);
+          securityForm.open = false;
+          showToast(`Updated access for ${securityForm.db}`);
+          await loadAccess();
+        } catch (error) {
+          securityForm.error = error.data ? pretty(error.data) : error.message || String(error);
+        } finally {
+          securityForm.saving = false;
+        }
+      }
+
       function dbHash(name, sub) {
         return `#/db/${enc(name)}/${sub}`;
       }
@@ -496,6 +637,11 @@
         if (raw === 'metrics') {
           view.value = 'metrics';
           loadMetrics();
+          return;
+        }
+        if (raw === 'access') {
+          view.value = 'access';
+          loadAccess();
           return;
         }
         const parts = raw.split('/');
@@ -1148,6 +1294,10 @@
         requests.value = [];
         selectedLog.value = null;
         logOpen.value = false;
+        accessRows.value = [];
+        accessError.value = '';
+        securityForm.open = false;
+        securityForm.error = '';
         view.value = 'home';
         location.hash = '';
       }
@@ -1162,6 +1312,7 @@
           user.value = loginName.value;
           loginPass.value = '';
           loginOpen.value = false;
+          await refreshSession();
           clearUserState();
           showToast(`Signed in as ${user.value}`);
           await loadDbs();
@@ -1181,6 +1332,7 @@
           /* the cookie is client-side; ignore servers that do not implement it */
         }
         user.value = null;
+        roles.value = [];
         clearUserState();
         showToast('Signed out');
         await loadDbs();
@@ -1240,6 +1392,9 @@
         setInterval(() => {
           if (view.value === 'metrics') loadMetrics();
         }, 5000);
+        setInterval(() => {
+          if (view.value === 'access' && !securityForm.open) loadAccess();
+        }, 10000);
       });
 
       return {
@@ -1274,6 +1429,11 @@
         metrics,
         metricsError,
         metricsLoading,
+        accessRows,
+        accessError,
+        accessLoading,
+        securityForm,
+        isAdmin,
         toast,
         toastKind,
         pretty,
@@ -1285,6 +1445,12 @@
         loadCluster,
         openMetrics,
         loadMetrics,
+        openAccess,
+        loadAccess,
+        openSecurity,
+        saveSecurity,
+        principalText,
+        securityLabel,
         humanBytes,
         humanMs,
         humanPct,

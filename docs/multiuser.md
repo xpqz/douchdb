@@ -178,6 +178,22 @@ in a shared browser.
 - Per-user metrics labels. The admission counters are not yet broken down by
   principal in `/_node/_local/_metrics`.
 
+## Console access management
+
+The console has an **Access** page behind the header button:
+
+- lists every database visible to the signed-in principal;
+- shows `_security` members and admins as names and `role:` entries;
+- labels empty objects as `default`, members as `members`, and admins-with-no-
+  members as `admin-only`;
+- edits member/admin names and roles with `PUT /{db}/_security`;
+- shows whether the signed-in principal is a server admin.
+
+The page is deliberately **database security only**. Creating users, generating
+or rotating tokens, and editing the users file remain file/CLI operations; there
+is no credential-management API or UI. This keeps bearer secrets out of the HTTP
+surface and avoids pretending that a local file edit propagates across a cluster.
+
 ## Cluster behavior
 
 - User credentials are forwarded on cluster fan-out; peers re-check

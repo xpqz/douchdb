@@ -409,6 +409,8 @@ step**. It provides:
 - an observability page with live request/latency/error sparklines, route and
   database tables, replication and fabric counters, per-node health and cluster
   aggregation;
+- an Access page listing each visible database's `_security` members/admins,
+  with an editor for names and roles;
 - CouchDB `_session` sign-in when the server runs with `--admin`;
 - a toggleable **request log** that records every HTTP call with method, path,
   status, timing, request JSON and response JSON.
