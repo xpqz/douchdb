@@ -83,7 +83,7 @@ fn parse_args() -> Args {
         per_user_rate: 0,
         heavy_in_flight: 8,
         heavy_per_user: 1,
-        background_in_flight: 1,
+        background_in_flight: 2,
         nodes: Vec::new(),
         me: 0,
         advertise: String::new(),
@@ -136,7 +136,7 @@ fn parse_args() -> Args {
                 args.heavy_per_user = it.next().and_then(|v| v.parse().ok()).unwrap_or(1)
             }
             "--background-in-flight" => {
-                args.background_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(1)
+                args.background_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(2)
             }
             "--nodes" => {
                 args.nodes = it
