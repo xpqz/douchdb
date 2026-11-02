@@ -31,6 +31,9 @@ not consume all interactive capacity.
   bearer token. Prefer `token_sha256` in production; keep the file `0600`.
 - `roles` is an array of strings. A user with the `_admin` role, or
   `"admin": true`, is a server admin.
+- The file is read at startup. Restart the process to apply user, token or role
+  changes; `_security` changes take effect on the next request without a
+  restart.
 - `--admin user:pass` can be used alongside a users file. The config admin is
   always a server admin.
 
@@ -79,9 +82,12 @@ the cookie is stateless, as in CouchDB.
   limit.
 - **Database member** can read/write ordinary documents and query views/search.
 - **Anonymous** is a member only when the database is public.
-- If `members.names` and `members.roles` are both empty, the database is public.
-  If the entire security object is empty, the default depends on
-  `--default-security`:
+- If `members.names` and `members.roles` are both empty **and** the admins lists
+  are also empty, the database is public only when `--default-security open`.
+  This is deliberately stricter than CouchDB: setting admins without members
+  makes a database admin-only, not public. A database is never exposed by
+  accidentally omitting the member list.
+- The default for an entirely empty security object is:
   - `admin-only` (default when `--admin` or `--users-file` is configured)
   - `open` (explicitly public, including anonymous requests)
 - With no authentication configured at all, every request is a service admin.
@@ -92,10 +98,19 @@ where they are a member or admin. `GET /_dbs_info`, `_db_updates`, `_membership`
 `/_node/...`, cluster/replication management, detailed health and metrics remain
 server-admin operations.
 
-The security object is stored in `security.json` beside the database. Changes
-are propagated to reachable peers on a best-effort basis. A peer that was
-offline during a change will keep its old copy until the change is applied
-again; cluster-wide security consensus is deliberately out of scope.
+The security object is stored in `security.json` beside the database. A security
+change is applied locally and to **every configured peer** before the coordinator
+reports success. If any peer fails, the coordinator rolls back its local copy and
+the reachable peers, and returns `502 security_propagation_failed`. This prevents
+a healthy peer from keeping a newer security object than the coordinator. If a
+peer is offline, change security when the cluster is healthy; concurrent admin
+changes should go through one coordinator. Cluster-wide security consensus is
+outside this version.
+
+Design documents are database-admin data even when written through
+`_bulk_docs` or `COPY`; a member cannot create or overwrite one through those
+routes either. Long-lived `_changes` feeds re-check database access on every
+iteration and close when the principal is revoked.
 
 ## Admission and fairness
 
@@ -135,7 +150,9 @@ limits only.
 
 `/_up`, `/_health`, `_utils` assets and the favicon are exempt. `_session` is
 admitted like any other request; a login storm is bounded by the anonymous
-principal's limits.
+principal's limits. The console request log redacts `_session` request bodies and
+is cleared on both login and logout so one user's documents are not left visible
+in a shared browser.
 
 ### What this guarantees
 
@@ -167,8 +184,9 @@ principal's limits.
   `_security` for the forwarded principal.
 - Internal requests without user credentials are service admins, trusted by the
   shared cluster secret. Do not expose the cluster secret to clients.
-- `_security` changes are fanned out to reachable peers. There is no consensus;
-  reapply after a peer returns if it missed a change.
+- `_security` changes are applied to every configured peer or rolled back. If a
+  peer is offline, the change fails; retry when the cluster is healthy. Use one
+  coordinator for concurrent admin changes.
 - Set the same `--session-secret` (or cluster secret) on every node if session
   cookies should work across nodes.
 - Admission is local to each node.
@@ -183,6 +201,9 @@ security_object_enforces_members_admins_roles_and_all_dbs_filtering
 default_security_open_allows_any_authenticated_user
 per_user_admission_caps_concurrency_and_preserves_other_users
 global_admission_limit_protects_capacity_across_users
+cross_user_isolation_is_watertight
+longpoll_changes_stops_after_security_revocation
+cluster_security_change_rolls_back_when_a_peer_is_down
 ```
 
 Unit tests in `src/admission.rs` cover per-user/global limits, the heavy lane,

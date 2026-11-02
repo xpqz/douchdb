@@ -32,7 +32,7 @@ A health response looks like:
     {"name": "databases", "status": "ok", "detail": "4 databases · 0 unreadable"},
     {"name": "cluster", "status": "ok", "detail": "3/3 placement nodes reachable"},
     {"name": "replication", "status": "ok", "detail": "12 runs · 340 docs"},
-    {"name": "http", "status": "ok", "detail": "0.4% of 1200 requests failed"}
+    {"name": "http", "status": "ok", "detail": "0.1% of 1200 requests failed with 5xx"}
   ]
 }
 ```
@@ -46,7 +46,7 @@ writable storage, not fsync semantics.
 
 The local registry records:
 
-- **HTTP**: total requests, in-flight requests, errors, error rate, status
+- **HTTP**: total requests, in-flight requests, errors, 5xx-based health error rate, status
   classes and exact codes, methods, average/p50/p95/p99/max latency, a
   12-bucket latency histogram, and a 120-second per-second rate/error/latency
   history for live sparklines.
