@@ -247,7 +247,10 @@ request log.
 - **Pull-only repair.** Background replication pulls from peers; there is no
   independent push scheduler.
 - **Per-node view.** `_cluster` and `_replication` describe the receiving node.
-  There is no cluster-wide aggregation endpoint.
+  There is no cluster-wide aggregation endpoint for those two. Cluster-wide
+  metrics and health do exist: `GET /_node/_local/_metrics?cluster=true` and
+  `GET /_node/_local/_health?cluster=true` fan out to every configured peer.
+  See [opentelemetry.md](opentelemetry.md).
 - **Pause is in memory.** Restarting a node resumes background replication.
 - **No pause of client writes.** Pausing replication does not stop normal
   replica fan-out.

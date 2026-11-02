@@ -567,7 +567,9 @@ create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
 `style=all_docs`, `filter=_doc_ids`), `_revs_diff`, `_local/*`, `_purge`,
 `_compact`,
 `_revs_limit`, `_design/{ddoc}/_view/{view}`, `_view_cleanup` and
-`_ensure_full_commit`.
+`_ensure_full_commit`. Observability endpoints: `_health`,
+`_node/_local/_health`, `_node/_local/_metrics` and their `?cluster=true`
+cluster-wide variants.
 
 HTTP niceties: `If-Match` on writes, `If-None-Match`/304 on reads, `COPY` with
 `Destination`, `HEAD` without a body, gzip responses, and

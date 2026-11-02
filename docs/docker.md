@@ -102,6 +102,17 @@ curl localhost:8080/demo/_all_docs
 Each request produces an `http.request` span and the two HTTP metrics
 documented in [opentelemetry.md](opentelemetry.md).
 
+The compose stack also serves the local console observability page at
+`http://localhost:8080/_utils/#/metrics`. It needs no collector and shows live
+sparklines, route/database/replication/fabric tables, health checks and
+per-node state. The JSON is available directly (admin credentials required):
+
+```sh
+curl -u admin:secret 'http://localhost:8080/_node/_local/_metrics?cluster=true'
+curl -u admin:secret 'http://localhost:8080/_node/_local/_health?cluster=true'
+curl 'http://localhost:8080/_health'
+```
+
 Direct checks (anonymous Grafana has the datasources provisioned):
 
 ```sh
