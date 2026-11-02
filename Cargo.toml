@@ -1,6 +1,6 @@
 [package]
 name = "douchdb"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "CouchDB wire-compatible document database on LevelDB"
 license = "Apache-2.0"

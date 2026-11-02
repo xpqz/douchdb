@@ -18,6 +18,11 @@ pub struct PullOutcome {
     pub checkpoint: Option<Value>,
 }
 
+/// Checkpoint namespace version. Bumped when the replication filter changes in
+/// a way that must re-scan history: v2 always replicates design documents, so
+/// old checkpoints that skipped them must not be reused.
+const CHECKPOINT_VERSION: u8 = 2;
+
 /// Copy everything the peer has that this node replicates, then checkpoint.
 ///
 /// One call drains the peer: it keeps requesting `_changes` pages until the
@@ -39,7 +44,7 @@ pub async fn pull(
     let map_tag = crate::db::hex(&Md5::digest(
         serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
     ));
-    let checkpoint_id = format!("ae:{}:{}", peer, map_tag);
+    let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag);
     let mut since = db
         .local_get(&checkpoint_id)
         .await
@@ -432,7 +437,7 @@ mod tests {
         let map_tag = crate::db::hex(&Md5::digest(
             serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
         ));
-        let checkpoint_id = format!("ae:{peer}:{map_tag}");
+        let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{peer}:{map_tag}");
         assert!(
             db.local_get(&checkpoint_id).await.unwrap().is_none(),
             "checkpoint advanced past a missing revision"

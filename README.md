@@ -509,10 +509,13 @@ router; there is no coordinator role.
   local fast path when a replica is unavailable.
 - `?w=` / `?r=` select write and read quorum. The default read quorum is
   `r = (n/2)+1`; `?r=1` is the local fast path. An unmet read quorum returns
-  `503 quorum_not_met`, including tombstones in the comparison. An unmet write
-  quorum returns `202`; anti-entropy repairs the replica later.
-- Anti-entropy runs every `--sync-secs`, pulling from every peer but only for
-  the shards the node replicates. It uses the shared admin credentials when
+  `503 quorum_not_met`, including tombstones and all conflict leaves in the
+  merged comparison. Revision-shaped reads (`open_revs`, `revs_info=true`)
+  still require `r` reachable replicas, but return the local response shape.
+  An unmet write quorum returns `202`; anti-entropy repairs the replica later.
+- Anti-entropy runs every `--sync-secs`, pulling from every peer for the shards
+  the node replicates plus every design document, so a returning node can
+  evaluate its local views. It uses the shared admin credentials when
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
   internal calls. This is non-client-induced replication: it catches up after
   missed writes, restarts and offline periods without a client request.
@@ -574,8 +577,10 @@ broadcast) and then write normally.
   uses a two-phase migration map: reads stay on the old owners, client writes
   are briefly frozen on every node, anti-entropy seeds the targets, and the
   active map switches only after revision-metadata digests match. Timeout
-  leaves the old map active; cleanup is explicit. It is still an operator
-  action built on static membership, not an online membership protocol.
+  leaves the old map active; cleanup is explicit. A direct placement `PUT` and
+  cleanup return `409 rebalance_in_progress` while a migration owns the
+  database. It is still an operator action built on static membership, not an
+  online membership protocol.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,

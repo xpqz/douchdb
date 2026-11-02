@@ -8364,6 +8364,14 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "rebalance_in_progress", "{body}");
 
+    // Nor can a direct active-map PUT replace the placement the rebalance is
+    // verifying. Only the migration's internal activation is allowed.
+    let (status, body) = nodes[1]
+        .put("/_node/_local/_dbs/rebread", all_shards_on(2))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+
     // Only one rebalance may own the database at a time.
     let (status, body) = nodes[0]
         .post(
@@ -8502,4 +8510,153 @@ async fn search_cleanup_serializes_with_builds_and_stale_queries() {
     let (status, body) = s.get(url).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 4 + 120 + 4);
+}
+
+#[tokio::test]
+async fn quorum_promotes_a_conflict_that_is_no_replicas_winner() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("qpromote").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let root = "00000000000000000000000000000000";
+    // Node 0 has two live branches; its local winner is 2-b..., while 2-a...
+    // is only a conflict. Node 1 holds a tombstone descending from 2-b...
+    let branches = [
+        (
+            0,
+            json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": "2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 "_revisions": {"start": 2, "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", root]}, "v": "a"},
+                {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                 "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"}
+            ]}),
+        ),
+        (
+            1,
+            json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": "3-cccccccccccccccccccccccccccccccc", "_deleted": true,
+                 "_revisions": {"start": 3, "ids": [
+                    "cccccccccccccccccccccccccccccccc",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    root
+                 ]}}
+            ]}),
+        ),
+    ];
+    for (node, body) in branches {
+        let (status, body) = nodes[node]
+            .req_with(Method::POST, "/qpromote/_bulk_docs", Some(body), &internal)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // Prove the split state: node 0's local winner is 2-b and 2-a is a
+    // conflict, while node 1 has the tombstone.
+    let (status, local) = nodes[0].get("/qpromote/x?r=1&conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{local}");
+    assert_eq!(local["_rev"], "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert_eq!(
+        local["_conflicts"],
+        json!(["2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
+        "{local}"
+    );
+
+    // The merged tree has maximal leaves 2-a (live) and 3-c (deleted), so the
+    // live conflict must win even though it is no replica's local winner.
+    for node in &nodes {
+        let (status, body) = node
+            .get("/qpromote/x?r=2&conflicts=true&deleted_conflicts=true")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["_rev"], "2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{body}");
+        assert_eq!(body["v"], "a", "{body}");
+        assert_eq!(body["_conflicts"], json!([]), "{body}");
+        assert_eq!(
+            body["_deleted_conflicts"],
+            json!(["3-cccccccccccccccccccccccccccccccc"]),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn returning_node_repairs_design_documents_after_being_offline() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("designrep").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/designrep", all_shards_on(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    nodes[1].kill();
+    let (status, body) = nodes[0]
+        .put(
+            "/designrep/_design/v",
+            json!({"views": {"by_v": {"map": "function(doc){ emit(doc.v, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    nodes[1].restart();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (status, body) = nodes[1].get("/designrep/_design/v").await;
+        if status == StatusCode::OK {
+            assert_eq!(body["_id"], "_design/v", "{body}");
+            break;
+        }
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "design document was not repaired by anti-entropy"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn revision_shaped_reads_do_not_bypass_the_read_quorum() {
+    let mut nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("qshape").await;
+    }
+    let (status, body) = nodes[0]
+        .post(
+            "/qshape/_bulk_docs",
+            json!({"docs": [{"_id": "ordinary", "v": 1}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Both replicas answer: revision-shaped responses keep their shape.
+    let (status, body) = nodes[0].get("/qshape/ordinary?r=2&revs_info=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("_revs_info").is_some(), "{body}");
+    let (status, body) = nodes[0].get("/qshape/ordinary?r=2&open_revs=all").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.is_array(), "{body}");
+
+    // With one replica down, every r=2 request must report the unmet quorum,
+    // including false-valued and revision-shaped options.
+    nodes[1].kill();
+    for query in [
+        "r=2",
+        "r=2&revs_info=false",
+        "r=2&revs_info=true",
+        "r=2&open_revs=all",
+    ] {
+        let (status, body) = nodes[0].get(&format!("/qshape/ordinary?{query}")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "query {query}: {body}"
+        );
+        assert_eq!(body["error"], "quorum_not_met", "query {query}: {body}");
+    }
 }
