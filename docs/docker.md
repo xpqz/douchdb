@@ -84,11 +84,20 @@ The `otel-lgtm` service is Grafana's all-in-one OpenTelemetry backend (pinned to
 sets `OTEL_METRIC_EXPORT_INTERVAL=5000` and `OTEL_BSP_SCHEDULE_DELAY=1000` on
 the nodes so telemetry appears promptly; production defaults are slower.
 
+- **Dashboards:** two provisioned dashboards are created automatically in the
+  **DouchDB** folder: **DouchDB Overview** (traffic, errors, latency,
+  per-method/status/node rates) and **DouchDB Fabric & Rebalance** (local vs
+  remote reads, quorum failures, fan-out, shard-map and rebalance events).
+  Grafana opens **DouchDB Overview** as its home dashboard.
 - **Traces:** Grafana → Explore → Tempo → service name `douchdb`.
 - **Metrics:** Grafana → Explore → Prometheus → query
   `http_server_requests_total` or `http_server_duration_ms_bucket`.
 - Anonymous Grafana access is enabled with the Admin role for this local demo;
   the admin password is `admin`.
+
+Dashboard JSON lives in `docker/grafana/dashboards/` and is mounted read-only;
+the provider is `docker/grafana/provisioning/dashboards/douchdb.yaml`. Edit the
+JSON and restart the `otel-lgtm` service to update the provisioned dashboards.
 
 Generate traffic through the console or directly:
 

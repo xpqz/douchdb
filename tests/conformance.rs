@@ -478,6 +478,11 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(html.contains("data-testid=\"open-cluster\""));
     assert!(html.contains("data-testid=\"open-metrics\""));
     assert!(html.contains("data-testid=\"metrics-routes\""));
+    // Fauxton-style document browsing: list, open, edit, save and delete.
+    assert!(html.contains("data-testid=\"doc-list\""));
+    assert!(html.contains("data-testid=\"doc-body\""));
+    assert!(html.contains("data-testid=\"save-doc\""));
+    assert!(html.contains("data-testid=\"delete-doc\""));
     assert!(html.contains("data-testid=\"open-access\""));
     assert!(html.contains("data-testid=\"access-table\""));
     assert!(html.contains("data-testid=\"security-modal\""));
@@ -501,6 +506,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
     assert!(app.contains("/_node/_local/_replication"));
     assert!(app.contains("/_node/_local/_metrics"));
     assert!(app.contains("loadMetrics"));
+    assert!(app.contains("consoleProcess"));
+    assert!(app.contains("dbsError"));
     assert!(app.contains("/_security"));
     assert!(app.contains("loadAccess"));
     // The request log must not retain login credentials.
@@ -6650,6 +6657,10 @@ async fn cluster_metrics_and_health_aggregate_across_nodes() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     assert_eq!(cluster["scope"], "cluster");
+    // The Process card reads the local process even in cluster scope; a
+    // missing `process` key blanked the console page.
+    assert!(cluster["process"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(cluster["process"], cluster["local"]["process"]);
     assert_eq!(cluster["summary"]["nodes"], 3);
     assert_eq!(cluster["summary"]["reachable"], 3, "{cluster}");
     assert_eq!(cluster["nodes"].as_array().unwrap().len(), 3);
@@ -8761,4 +8772,25 @@ async fn quorum_merges_ancestry_across_replicas_with_different_history_lengths()
             node.base
         );
     }
+}
+
+#[test]
+fn grafana_dashboards_are_valid_and_provisioned() {
+    for name in ["douchdb-overview.json", "douchdb-fabric.json"] {
+        let path = format!("docker/grafana/dashboards/{name}");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("missing dashboard {path}: {error}");
+        });
+        let dashboard: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("invalid dashboard {path}: {error}"));
+        assert!(dashboard["panels"]
+            .as_array()
+            .is_some_and(|panels| !panels.is_empty()));
+        assert!(dashboard["uid"].as_str().is_some());
+    }
+    let provider = std::fs::read_to_string("docker/grafana/provisioning/dashboards/douchdb.yaml")
+        .expect("dashboard provider");
+    assert!(provider.contains("/otel-lgtm/grafana-dashboards"));
+    let compose = std::fs::read_to_string("docker-compose.yml").expect("compose file");
+    assert!(compose.contains("./docker/grafana/dashboards:/otel-lgtm/grafana-dashboards:ro"));
 }

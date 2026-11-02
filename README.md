@@ -400,9 +400,13 @@ A Fauxton-style console is embedded at `http://localhost:5984/_utils/`:
 It is a single Vue 3 application with a vendored runtime — **no npm and no build
 step**. It provides:
 
-- database list, create and delete;
+- database list, create and delete, refreshed on focus and every 15 seconds
+  so databases created with `curl` appear without a manual reload; sign-in
+  guidance when the server requires authentication;
 - `_all_docs` browser with prefix search and pagination;
-- document viewer/editor with JSON validation, revisions and delete;
+- Fauxton-style document browsing: open any document by id with its own
+  deep-link, edit JSON, save, create and delete, with revision conflict
+  reporting;
 - `_changes` feed with history and live follow;
 - database info and `_compact`;
 - a cluster page with node discovery, shard maps, background replication
