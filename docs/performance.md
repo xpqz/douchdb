@@ -143,6 +143,36 @@ Storage at the end of the run:
 }
 ```
 
+## JavaScript sandbox throughput
+
+Design-document map/reduce/search-index work can run in four places: in-process
+QuickJS (`native`, the default), a worker process (`process`), or the WASI
+runner under `wasmi` or Wasmtime. The wasm boundary is memory-safe and portable,
+but the host runtime matters more than the JSON bridge.
+
+Benchmark: 2,000 documents, release build, Linux x86_64, 10 warm queries.
+`scripts/js_sandbox_bench.py --modes native,process,wasm-wasmi,wasm-wasmtime`.
+
+| Metric | native | process | wasm/wasmi | wasm/wasmtime |
+|---|---:|---:|---:|---:|
+| cold map (2,000 docs) | 14.5 ms | 28.3 ms | 254 ms | 33.9 ms |
+| cold custom reduce | 13.6 ms | 24.8 ms | 282 ms | 41.9 ms |
+| cold search index | 52.1 ms | 69.7 ms | 307 ms | 81.7 ms |
+| warm map p50 | 0.29 ms | 0.30 ms | 0.32 ms | 0.30 ms |
+| warm custom reduce p50 | 2.70 ms | 5.09 ms | 51.9 ms | 10.8 ms |
+| warm search query p50 | 1.97 ms | 1.96 ms | 1.95 ms | 2.00 ms |
+
+Warm map and search queries use the persisted index and do not enter the
+engine, so they are effectively identical. Cold index builds and custom reduces
+are the costs that differ. `wasmi` interprets QuickJS and is ~17–22× slower than
+native; Wasmtime JITs it and brings that down to ~2–3×. Build the optional
+backend with `cargo build --release --features wasmtime` and select it with
+`--js-sandbox wasm --wasm-runtime wasmtime`. Wasmtime precompiles the runner at
+startup (~200 ms in release), so the first query does not pay JIT compilation.
+
+See [quickjs-sandbox.md](quickjs-sandbox.md) for the threat model, capability
+surface and deadline/memory limits.
+
 ## Reading the numbers
 
 - **Single-document writes** are dominated by the group-commit flush path.
