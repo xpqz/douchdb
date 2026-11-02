@@ -1,6 +1,6 @@
 [package]
 name = "douchdb"
-version = "0.0.1"
+version = "0.2.0"
 edition = "2021"
 description = "CouchDB wire-compatible document database on LevelDB"
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ tantivy = "0.27"
 libc = "0.2"
 wasmi = "2.0"
 wasmi_wasi = "2.0"
+# Wasmtime 50 needs Rust 1.97+; the default wasmi build does not.
 wasmtime = { version = "50.0.1", optional = true }
 wasmtime-wasi = { version = "50.0.1", optional = true, features = ["p1"] }
 futures = "0.3"

@@ -14,7 +14,7 @@ use tantivy::schema::{
     Field, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
 use tantivy::Index;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
 const SEARCH_VERSION: u8 = 2;
 const PAGE_LIMIT: usize = 2000;
@@ -278,7 +278,9 @@ async fn build_index(
     index_name: &str,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
-) -> DbResult<(PathBuf, SearchMeta)> {
+    gate: OwnedRwLockReadGuard<()>,
+    index_guard: OwnedMutexGuard<()>,
+) -> DbResult<(PathBuf, SearchMeta, OwnedRwLockReadGuard<()>)> {
     // Capture the sequence before reading the snapshot. A write that lands
     // while the index is being built then leaves the database ahead of the
     // recorded sequence, so the next query rebuilds instead of trusting a
@@ -292,13 +294,20 @@ async fn build_index(
     let index_name = index_name.to_string();
     // QuickJS/Tantivy work is CPU- and IO-bound. Run it on the blocking pool so
     // a search rebuild cannot occupy a Tokio async worker for its full duration.
-    tokio::task::spawn_blocking(move || {
-        build_index_files(
+    let (result, gate) = tokio::task::spawn_blocking(move || {
+        // Keep both permits in the blocking task, not the request future. A
+        // cancelled request must not let cleanup race a live rebuild. The read
+        // permit is returned so a query can keep it for its whole lifetime.
+        let _index_guard = index_guard;
+        let result = build_index_files(
             path, docs, &source, last_seq, design, ddoc, index_name, limits,
-        )
+        );
+        (result, gate)
     })
     .await
-    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?
+    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    let (path, meta) = result?;
+    Ok((path, meta, gate))
 }
 
 fn build_index_files(
@@ -398,6 +407,16 @@ fn build_index_files(
     Ok((path, meta))
 }
 
+fn build_gate(db: &Db) -> Arc<RwLock<()>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
+    let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates.lock().unwrap_or_else(|poison| poison.into_inner());
+    gates
+        .entry(db.path.clone())
+        .or_insert_with(|| Arc::new(RwLock::new(())))
+        .clone()
+}
+
 fn build_lock(path: &Path) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -414,11 +433,12 @@ async fn ensure_index(
     index_name: &str,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
-) -> DbResult<(PathBuf, SearchMeta)> {
+    gate: OwnedRwLockReadGuard<()>,
+) -> DbResult<(PathBuf, SearchMeta, OwnedRwLockReadGuard<()>)> {
     let path = index_dir(db, ddoc, index_name);
     let signature = design_signature(spec);
     let lock = build_lock(&path);
-    let _guard = lock.lock().await;
+    let index_guard = lock.lock_owned().await;
     // Re-check after acquiring the per-index lock: another request may have
     // completed the rebuild while this one waited.
     if let Some(meta) = read_meta(&path) {
@@ -426,10 +446,10 @@ async fn ensure_index(
             && meta.last_seq == db.update_seq()
             && meta.design == signature
         {
-            return Ok((path, meta));
+            return Ok((path, meta, gate));
         }
     }
-    build_index(db, ddoc, index_name, spec, limits).await
+    build_index(db, ddoc, index_name, spec, limits, gate, index_guard).await
 }
 
 fn owned_value_to_json(value: OwnedValue) -> Value {
@@ -701,7 +721,11 @@ pub async fn query(
         ));
     }
     let spec = load_spec(db, ddoc, index_name).await?;
-    let (path, meta) = ensure_index(db, ddoc, index_name, &spec, limits).await?;
+    // Hold the read permit for the whole query, not just the rebuild, so a
+    // concurrent `_search_cleanup` cannot remove the index under an open
+    // searcher.
+    let gate = build_gate(db).read_owned().await;
+    let (path, meta, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(ApiError::new(
             500,
@@ -928,7 +952,8 @@ pub async fn info(
     limits: crate::view::ViewLimits,
 ) -> DbResult<Value> {
     let spec = load_spec(db, ddoc, index_name).await?;
-    let (_path, meta) = ensure_index(db, ddoc, index_name, &spec, limits).await?;
+    let gate = build_gate(db).read_owned().await;
+    let (_path, meta, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     let copies = db.replicas_of_shard(0).len().max(1);
     Ok(json!({
         "search_index": {
@@ -946,7 +971,10 @@ pub async fn info(
     }))
 }
 
-pub fn cleanup(db: &Db) -> DbResult<()> {
+pub async fn cleanup(db: &Db) -> DbResult<()> {
+    // Wait for in-flight builds (including builds whose request was cancelled)
+    // before removing their directories.
+    let _gate = build_gate(db).write_owned().await;
     let directory = db.path.join("_search_indexes");
     if directory.exists() {
         std::fs::remove_dir_all(&directory)

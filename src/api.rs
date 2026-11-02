@@ -486,6 +486,45 @@ fn requires_db_admin(rest: &str, method: &Method) -> bool {
     false
 }
 
+fn is_write_request(method: &Method, rest: &str) -> bool {
+    if method.as_str() == "COPY" || matches!(*method, Method::PUT | Method::DELETE) {
+        return true;
+    }
+    if *method != Method::POST {
+        return false;
+    }
+    // POST is also used for read-only query shapes.
+    if rest == "_all_docs" || rest == "_bulk_get" || rest == "_revs_diff" {
+        return false;
+    }
+    if rest.starts_with("_design/")
+        && (rest.contains("/_view/")
+            || rest.contains("/_search/")
+            || rest.contains("/_search_info/"))
+    {
+        return false;
+    }
+    !matches!(rest, "_search_info" | "_index_info")
+}
+
+fn reject_during_rebalance(
+    st: &AppState,
+    db: &Db,
+    method: &Method,
+    rest: &str,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    if db.rebalance_in_progress() && !is_forwarded(st, headers) && is_write_request(method, rest) {
+        Some(fail(ApiError::new(
+            503,
+            "rebalance_in_progress",
+            "writes are paused while this database changes shard placement",
+        )))
+    } else {
+        None
+    }
+}
+
 fn validate_security(value: &Value) -> DbResult<()> {
     let object = value
         .as_object()
@@ -1222,6 +1261,59 @@ async fn set_security_everywhere(
 
 /// Internal/replication-side security update. The public `PUT /db/_security`
 /// handler fans out here after checking database-admin access.
+/// Internal target-placement update used while a rebalance is being verified.
+pub async fn db_migration_put(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !st.cluster.is_internal(&headers) {
+        let principal = st.principal(&headers);
+        return access_denied(&principal);
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    let map: ShardMap = match serde_json::from_slice(&body) {
+        Ok(map) => map,
+        Err(_) => return fail(ApiError::bad_request("invalid migration shard map")),
+    };
+    if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
+        return fail(ApiError::bad_request(
+            "migration shard map does not match database q or cluster node count",
+        ));
+    }
+    match db.set_migration_map(map) {
+        Ok(()) => {
+            // Freeze client writes on this peer for the verification window.
+            db.set_rebalance_in_progress(true);
+            ok()
+        }
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn db_migration_delete(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.cluster.is_internal(&headers) {
+        let principal = st.principal(&headers);
+        return access_denied(&principal);
+    }
+    match st.db(&name).await {
+        Ok(db) => {
+            db.clear_migration_map();
+            db.set_rebalance_in_progress(false);
+            ok()
+        }
+        Err(error) => fail(error),
+    }
+}
+
 pub async fn db_security_put(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1423,62 +1515,139 @@ fn same_shard_content(left: &ShardState, right: &ShardState) -> bool {
     left.docs == right.docs && left.deleted == right.deleted && left.digest == right.digest
 }
 
+/// Per-shard source digest, or `None` while old replicas disagree, are
+/// unreachable, or did not produce a digest.
+fn source_required(
+    states: &[Option<Vec<ShardState>>],
+    old_map: &ShardMap,
+    q: u32,
+    require_digest: bool,
+) -> Option<Vec<ShardState>> {
+    let mut required = Vec::with_capacity(q as usize);
+    for shard in 0..q {
+        let mut chosen: Option<&ShardState> = None;
+        for node in old_map.replicas_of(shard) {
+            // Every old owner must answer; otherwise a replica that is merely
+            // unreachable could be dropped while it still holds newer writes.
+            let Some(state) = states
+                .get(*node)
+                .and_then(|state| state.as_ref())
+                .and_then(|state| state.get(shard as usize))
+            else {
+                return None;
+            };
+            match chosen {
+                Some(previous) if !same_shard_content(previous, state) => return None,
+                Some(_) => {}
+                None => chosen = Some(state),
+            }
+        }
+        let state = chosen?;
+        if require_digest && state.digest.is_none() {
+            return None;
+        }
+        required.push(state.clone());
+    }
+    Some(required)
+}
+
+/// Wait for the frozen old owners to settle on one digest per shard. Writes
+/// accepted just before the freeze may still be finishing, so brief
+/// disagreement is retried rather than reported as corruption.
+async fn stable_source_states(
+    st: &AppState,
+    db: &Arc<Db>,
+    old_map: &ShardMap,
+    headers: &HeaderMap,
+    grace: std::time::Duration,
+) -> DbResult<Vec<ShardState>> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        let states = futures::future::join_all(
+            (0..st.cluster.nodes.len()).map(|node| fetch_shard_states(st, db, node, headers, true)),
+        )
+        .await;
+        if let Some(required) = source_required(&states, old_map, db.q, true) {
+            return Ok(required);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::new(
+                502,
+                "rebalance_failed",
+                "old replicas did not agree on a stable content digest",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_rebalance(
     st: &AppState,
     db: &Arc<Db>,
+    old_map: &ShardMap,
     map: &ShardMap,
-    required: &[ShardState],
     headers: &HeaderMap,
     timeout_ms: u64,
 ) -> DbResult<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        let states = futures::future::join_all(
+        // Recompute the source state each round. Once writes are frozen the
+        // source stops moving, so this converges on the latest acknowledged
+        // state rather than a snapshot taken before an in-flight write landed.
+        // Counts are cheap and prune most retry rounds; compare digests only
+        // after every target has caught up on the source counts.
+        let counts = futures::future::join_all(
             (0..st.cluster.nodes.len())
                 .map(|node| fetch_shard_states(st, db, node, headers, false)),
         )
         .await;
-        let counts_ready = (0..db.q).all(|shard| {
-            let Some(required) = required.get(shard as usize) else {
-                return false;
-            };
-            map.replicas_of(shard).iter().all(|node| {
-                states
-                    .get(*node)
-                    .and_then(|state| state.as_ref())
-                    .and_then(|state| state.get(shard as usize))
-                    .map(|state| state.docs >= required.docs && state.deleted == required.deleted)
-                    .unwrap_or(false)
+        let counts_ready = source_required(&counts, old_map, db.q, false)
+            .map(|required| {
+                (0..db.q).all(|shard| {
+                    let Some(expected) = required.get(shard as usize) else {
+                        return false;
+                    };
+                    map.replicas_of(shard).iter().all(|node| {
+                        counts
+                            .get(*node)
+                            .and_then(|state| state.as_ref())
+                            .and_then(|state| state.get(shard as usize))
+                            .map(|state| {
+                                state.docs >= expected.docs && state.deleted == expected.deleted
+                            })
+                            .unwrap_or(false)
+                    })
+                })
             })
-        });
-
+            .unwrap_or(false);
         if counts_ready {
-            // Counts matching is necessary but not sufficient. Compare exact
-            // document/revision/conflict/tombstone digests before declaring a
-            // replica caught up.
             let digests = futures::future::join_all(
                 (0..st.cluster.nodes.len())
                     .map(|node| fetch_shard_states(st, db, node, headers, true)),
             )
             .await;
-            let digest_ready = (0..db.q).all(|shard| {
-                let Some(required) = required.get(shard as usize) else {
-                    return false;
-                };
-                let Some(required_digest) = required.digest.as_deref() else {
-                    return false;
-                };
-                map.replicas_of(shard).iter().all(|node| {
-                    digests
-                        .get(*node)
-                        .and_then(|state| state.as_ref())
-                        .and_then(|state| state.get(shard as usize))
-                        .and_then(|state| state.digest.as_deref())
-                        .map(|digest| digest == required_digest)
-                        .unwrap_or(false)
+            let ready = source_required(&digests, old_map, db.q, true)
+                .map(|required| {
+                    (0..db.q).all(|shard| {
+                        let Some(expected) = required.get(shard as usize) else {
+                            return false;
+                        };
+                        map.replicas_of(shard).iter().all(|node| {
+                            digests
+                                .get(*node)
+                                .and_then(|state| state.as_ref())
+                                .and_then(|state| state.get(shard as usize))
+                                .map(|state| {
+                                    state.docs >= expected.docs
+                                        && state.deleted == expected.deleted
+                                        && state.digest == expected.digest
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
                 })
-            });
-            if digest_ready {
+                .unwrap_or(false);
+            if ready {
                 return Ok(());
             }
         }
@@ -1490,12 +1659,7 @@ async fn wait_for_rebalance(
                 "new replicas did not match the old shard content before the timeout",
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(if counts_ready {
-            500
-        } else {
-            100
-        }))
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -1537,6 +1701,132 @@ async fn cleanup_all_replicas(
     Ok(out)
 }
 
+async fn send_migration(
+    st: &AppState,
+    peer: &str,
+    name: &str,
+    map: Option<&ShardMap>,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    let url = format!("{peer}/_node/_local/_dbs/{name}/migration");
+    let request = match map {
+        Some(map) => st
+            .client
+            .put(url)
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str())
+            .json(map),
+        None => st
+            .client
+            .delete(url)
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str()),
+    };
+    let request = forward_client_auth(request, headers);
+    match request.send().await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
+        Err(error) => Err(format!("{peer}: {error}")),
+    }
+}
+
+async fn set_migration_everywhere(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    map: &ShardMap,
+    headers: &HeaderMap,
+) -> DbResult<()> {
+    db.set_migration_map(map.clone())?;
+    let peers: Vec<String> = st.cluster.peers().cloned().collect();
+    let mut failures = Vec::new();
+    for peer in &peers {
+        if let Err(error) = send_migration(st, peer, name, Some(map), headers).await {
+            failures.push(error);
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    db.clear_migration_map();
+    for peer in &peers {
+        let _ = send_migration(st, peer, name, None, headers).await;
+    }
+    Err(ApiError::new(
+        502,
+        "rebalance_failed",
+        format!(
+            "migration map was not accepted everywhere: {}",
+            failures.join("; ")
+        ),
+    ))
+}
+
+async fn clear_migration_everywhere(st: &AppState, db: &Db, name: &str, headers: &HeaderMap) {
+    db.clear_migration_map();
+    for peer in st.cluster.peers() {
+        if let Err(error) = send_migration(st, peer, name, None, headers).await {
+            tracing::warn!("migration map clear on {peer} failed: {error}");
+        }
+    }
+}
+
+async fn activate_map_everywhere(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    map: &ShardMap,
+    headers: &HeaderMap,
+) -> DbResult<()> {
+    let old = db.shard_map();
+    db.set_shard_map(map.clone())?;
+    let peers: Vec<String> = st.cluster.peers().cloned().collect();
+    let mut failures = Vec::new();
+    for peer in &peers {
+        let request = st
+            .client
+            .put(format!("{peer}/_node/_local/_dbs/{name}"))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str())
+            .json(map);
+        let request = forward_client_auth(request, headers);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => failures.push(format!("{peer}: HTTP {}", response.status())),
+            Err(error) => failures.push(format!("{peer}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    // Roll back with a strictly newer version so peers that already accepted
+    // the target map also accept the old placement again.
+    let mut rollback = old;
+    rollback.version = map.version.saturating_add(1);
+    let _ = db.set_shard_map(rollback.clone());
+    for peer in &peers {
+        let request = st
+            .client
+            .put(format!("{peer}/_node/_local/_dbs/{name}"))
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str())
+            .json(&rollback);
+        let request = forward_client_auth(request, headers);
+        if let Err(error) = request.send().await {
+            tracing::warn!("rebalance rollback on {peer} failed: {error}");
+        }
+    }
+    Err(ApiError::new(
+        502,
+        "rebalance_failed",
+        format!(
+            "active map was not accepted everywhere: {}",
+            failures.join("; ")
+        ),
+    ))
+}
+
 pub async fn db_rebalance(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1552,90 +1842,74 @@ pub async fn db_rebalance(
         Err(error) => return fail(error),
     };
     let q = query(&uri);
-    // Cleanup is destructive and therefore explicit. A migration without
-    // cleanup can still be verified and used; old copies are retained.
     let cleanup = flag(&q, "cleanup");
     let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
 
+    // Freeze client writes before reading the source digests. Reads continue to
+    // use the old active map; anti-entropy is internal and remains allowed.
+    if !db.try_start_rebalance() {
+        return fail(ApiError::new(
+            409,
+            "rebalance_in_progress",
+            "another rebalance is already running for this database",
+        ));
+    }
     crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
-    let states = futures::future::join_all(
-        (0..st.cluster.nodes.len()).map(|node| fetch_shard_states(&st, &db, node, &headers, true)),
-    )
-    .await;
-    let mut required = Vec::new();
-    for shard in 0..db.q {
-        let mut chosen: Option<ShardState> = None;
-        for node in old_map.replicas_of(shard) {
-            let Some(state) = states
-                .get(*node)
-                .and_then(|state| state.as_ref())
-                .and_then(|state| state.get(shard as usize))
-            else {
-                continue;
-            };
-            if let Some(previous) = &chosen {
-                if !same_shard_content(previous, state) {
-                    return fail(ApiError::new(
-                        502,
-                        "rebalance_failed",
-                        format!(
-                            "old replicas disagree for shard {shard}; refusing to migrate ambiguous data"
-                        ),
-                    ));
-                }
-            } else {
-                chosen = Some(state.clone());
-            }
-        }
-        let Some(state) = chosen else {
-            return fail(ApiError::new(
-                502,
-                "rebalance_failed",
-                "no reachable old replica for shard",
-            ));
-        };
-        if state.digest.is_none() {
-            return fail(ApiError::new(
-                502,
-                "rebalance_failed",
-                "old replicas did not produce a content digest",
-            ));
-        }
-        required.push(state);
-    }
-
-    let map = ShardMap::balanced(
+    let mut map = ShardMap::balanced(
         db.q,
         st.cluster.nodes.len().max(1),
         st.cluster.replication_factor(),
     );
-    let (map, pending) = match apply_shard_map(&st, &db, &name, map, &headers).await {
-        Ok(result) => result,
-        Err(error) => return fail(error),
-    };
-    let mut value = json!(map.clone());
-    value["pending"] = json!(pending);
-    if pending {
-        return json(StatusCode::OK, value);
+    map.version = old_map.version.saturating_add(1);
+    // Broadcast the migration map first: it freezes writes on every peer and
+    // lets anti-entropy seed the target replicas while reads stay on the old
+    // active map.
+    if let Err(error) = set_migration_everywhere(&st, &db, &name, &map, &headers).await {
+        db.set_rebalance_in_progress(false);
+        return fail(error);
     }
 
-    if let Err(error) = wait_for_rebalance(&st, &db, &map, &required, &headers, timeout_ms).await {
+    if let Err(error) = stable_source_states(
+        &st,
+        &db,
+        &old_map,
+        &headers,
+        // Allow slow digest scans plus any in-flight write to settle.
+        std::time::Duration::from_millis(10_000),
+    )
+    .await
+    {
+        clear_migration_everywhere(&st, &db, &name, &headers).await;
+        db.set_rebalance_in_progress(false);
+        return fail(error);
+    }
+
+    if let Err(error) = wait_for_rebalance(&st, &db, &old_map, &map, &headers, timeout_ms).await {
+        // The active map never changed, so reads continued on the old owners
+        // throughout the migration attempt.
+        clear_migration_everywhere(&st, &db, &name, &headers).await;
+        db.set_rebalance_in_progress(false);
         if error.status == 504 {
             crate::telemetry::record_rebalance_timeout();
-        }
-        // The new map was only a migration direction. If the target replicas
-        // never matched the source content, put routing back on the old map so
-        // clients do not read incomplete data.
-        if let Err(rollback) = apply_shard_map(&st, &db, &name, old_map, &headers).await {
-            tracing::warn!("rebalance map rollback failed: {}", rollback.reason);
         }
         return fail(error);
     }
 
+    if let Err(error) = activate_map_everywhere(&st, &db, &name, &map, &headers).await {
+        clear_migration_everywhere(&st, &db, &name, &headers).await;
+        db.set_rebalance_in_progress(false);
+        return fail(error);
+    }
+    clear_migration_everywhere(&st, &db, &name, &headers).await;
+    db.set_rebalance_in_progress(false);
+
+    let mut value = json!(map.clone());
+    value["pending"] = json!(false);
     if !cleanup {
         return json(StatusCode::OK, value);
     }
+
     match cleanup_all_replicas(&st, &db, &headers).await {
         Ok(cleaned) => {
             let cleared = cleaned
@@ -1664,6 +1938,13 @@ pub async fn db_cleanup(
         Ok(db) => db,
         Err(error) => return fail(error),
     };
+    if db.rebalance_in_progress() {
+        return fail(ApiError::new(
+            409,
+            "rebalance_in_progress",
+            "cleanup is not allowed while this database changes shard placement",
+        ));
+    }
     let map = db.shard_map();
     let mut cleared = Vec::new();
     for shard in 0..db.q {
@@ -1912,6 +2193,9 @@ pub async fn db_root(
             if let Some(response) = require_db_access(&st, &principal, &db, false) {
                 return response;
             }
+            if let Some(response) = reject_during_rebalance(&st, &db, &Method::POST, "", &headers) {
+                return response;
+            }
             let Ok(mut doc) = json_body(&body) else {
                 return fail(ApiError::bad_request("Document must be a JSON object"));
             };
@@ -2098,6 +2382,9 @@ pub async fn db_rest(
     {
         return response;
     }
+    if let Some(response) = reject_during_rebalance(&st, &db, &method, &rest, &headers) {
+        return response;
+    }
     let q = query(&uri);
 
     match rest.as_str() {
@@ -2197,7 +2484,7 @@ pub async fn db_rest(
             }
         }
         "_search_cleanup" => {
-            return match crate::search::cleanup(&db) {
+            return match crate::search::cleanup(&db).await {
                 Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
                 Err(error) => fail(error),
             }
@@ -3630,7 +3917,12 @@ async fn doc_request(
         && st.cluster.is_clustered()
         && read_quorum > 1
         && !is_forwarded(st, headers)
+        && !q.contains_key("open_revs")
+        && !q.contains_key("revs_info")
     {
+        // `open_revs` and `revs_info` return per-revision shapes that the
+        // single-winner reconciliation above does not model. Serve those
+        // locally rather than reporting a reconciled winner under `r`.
         return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
     }
 
@@ -3777,7 +4069,7 @@ async fn get_doc(
     }
 }
 
-fn etag_matches(headers: &HeaderMap, name: header::HeaderName, etag: &str) -> bool {
+pub(crate) fn etag_matches(headers: &HeaderMap, name: header::HeaderName, etag: &str) -> bool {
     headers.get_all(name).iter().any(|value| {
         value
             .to_str()

@@ -145,17 +145,15 @@ pub fn install_seccomp() -> Result<(), String> {
     };
     use std::collections::BTreeMap;
 
-    let denied = [
-        libc::SYS_open,
+    // The legacy syscall numbers do not exist on aarch64 (it uses openat,
+    // unlinkat, clone and friends). Keep the common set portable and add the
+    // x86_64-only legacy calls where the constants exist.
+    #[allow(unused_mut)]
+    let mut denied: Vec<i64> = vec![
         libc::SYS_openat,
-        libc::SYS_creat,
-        libc::SYS_unlink,
         libc::SYS_unlinkat,
-        libc::SYS_rename,
         libc::SYS_renameat,
-        libc::SYS_mkdir,
         libc::SYS_mkdirat,
-        libc::SYS_rmdir,
         libc::SYS_openat2,
         libc::SYS_socket,
         libc::SYS_socketpair,
@@ -170,8 +168,6 @@ pub fn install_seccomp() -> Result<(), String> {
         libc::SYS_recvfrom,
         libc::SYS_execve,
         libc::SYS_execveat,
-        libc::SYS_fork,
-        libc::SYS_vfork,
         libc::SYS_ptrace,
         libc::SYS_mount,
         libc::SYS_umount2,
@@ -190,6 +186,17 @@ pub fn install_seccomp() -> Result<(), String> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
     ];
+    #[cfg(target_arch = "x86_64")]
+    denied.extend([
+        libc::SYS_open,
+        libc::SYS_creat,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_rmdir,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+    ]);
     let rules: BTreeMap<i64, Vec<SeccompRule>> = denied
         .iter()
         .map(|syscall| (*syscall, Vec::new()))
@@ -441,18 +448,25 @@ impl Worker {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // The debug binary maps ~1 GB of virtual address space before
-            // QuickJS allocates anything, so leave generous headroom. QuickJS
-            // itself enforces the per-request heap limit.
-            let memory = 4 * 1024 * 1024 * 1024u64 as libc::rlim_t;
             unsafe {
                 command.pre_exec(move || {
-                    let limit = libc::rlimit {
-                        rlim_cur: memory,
-                        rlim_max: memory,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    // The debug binary maps ~1 GB of virtual address space
+                    // before QuickJS allocates anything, so leave generous
+                    // headroom. QuickJS itself enforces the per-request heap
+                    // limit. macOS rejects RLIMIT_AS with EINVAL, so it is
+                    // skipped there; the worker still gets the other limits
+                    // and, on macOS, has no seccomp/Landlock confinement (WASM
+                    // is the portable containment option).
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let memory = 4 * 1024 * 1024 * 1024u64 as libc::rlim_t;
+                        let limit = libc::rlimit {
+                            rlim_cur: memory,
+                            rlim_max: memory,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     let zero = libc::rlimit {
                         rlim_cur: 0,
@@ -465,8 +479,11 @@ impl Worker {
                         rlim_max: 64,
                     };
                     let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &files);
-                    let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                    let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                        let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    }
                     Ok(())
                 });
             }
@@ -655,7 +672,11 @@ pub fn process_request(
             Err(error) => {
                 worker.kill();
                 pool.discard();
-                last_error = error.message;
+                last_error = if error.timed_out {
+                    format!("worker timed out: {}", error.message)
+                } else {
+                    error.message
+                };
                 // A deadline kill is not retried: the request already consumed
                 // its budget. One retry covers a worker that died between
                 // requests.
@@ -710,6 +731,7 @@ fn handle_worker_request(request: Value) -> Value {
         Some(source) => source,
         None => return json!({"ok": false, "error": "missing source"}),
     };
+    let started = Instant::now();
     let result = match request.get("kind").and_then(Value::as_str) {
         Some("map") => {
             let docs: Vec<(String, String)> =
@@ -741,6 +763,13 @@ fn handle_worker_request(request: Value) -> Value {
             crate::search::run_index_json(source, &docs, limits).map(|docs| json!(docs))
         }
         _ => return json!({"ok": false, "error": "unknown request kind"}),
+    };
+    let result = match result {
+        Err(error) if started.elapsed() >= limits.timeout => Err(format!(
+            "timed out after {} ms: {error}",
+            limits.timeout.as_millis()
+        )),
+        other => other,
     };
     match result {
         Ok(value) => json!({"ok": true, "value": value}),

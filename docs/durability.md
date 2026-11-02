@@ -29,10 +29,12 @@ failure mode.
 ## Operational guidance
 
 - Do not use DouchDB as the only copy of irreplaceable data.
-- If it is the primary store, put it behind a storage stack that provides
-  durability (for example, a replicated block device with strict flush
-  semantics) and test the actual failure mode.
-- Keep independent backups or replicate to a second durable system.
+- A stronger block device or filesystem beneath the page cache does **not**
+  repair the missing application commit barrier. The application must submit a
+  sync before it can promise power-loss durability.
+- Keep independent backups or replicate to a separately durable system with an
+  explicit acknowledgement/RPO contract. Do not describe that as local
+  durability.
 - The `scripts/storage_spike.py` check covers `kill -9`, not power loss. Do not
   read it as a power-loss guarantee.
 

@@ -37,7 +37,7 @@ pub async fn pull(
     // new replica starts from zero instead of skipping documents that were
     // filtered out under the old map.
     let map_tag = crate::db::hex(&Md5::digest(
-        serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
+        serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
     ));
     let checkpoint_id = format!("ae:{}:{}", peer, map_tag);
     let mut since = db

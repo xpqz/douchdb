@@ -149,12 +149,20 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
     let mut checks = Vec::new();
     let snapshot = crate::metrics::snapshot();
     let process = &snapshot["process"];
+    let threads = process["threads"]
+        .as_u64()
+        .map(|threads| threads.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let rss = process["rss_mb"]
+        .as_f64()
+        .map(|rss| format!("{rss:.1} MB"))
+        .unwrap_or_else(|| "unavailable".to_string());
     checks.push(json!({
         "name": "process",
         "status": "ok",
         "detail": format!(
-            "pid {} · uptime {}s · {} threads",
-            process["pid"], process["uptime_secs"], process["threads"]
+            "pid {} · uptime {}s · {} threads · {} rss",
+            process["pid"], process["uptime_secs"], threads, rss
         ),
         "uptime_secs": process["uptime_secs"],
         "rss_mb": process["rss_mb"],

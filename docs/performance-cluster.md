@@ -269,8 +269,9 @@ local fast path.
 
 The default quorum now reads every replica and enforces `r`, including tombstones
 in winner selection. The table above was measured with the earlier first-`r`
-implementation; treat those numbers as historical/lower-bound and re-measure on
-the target hardware. Use `?r=1` for read-heavy workloads that can tolerate a
+implementation; treat those numbers as historical and re-measure on the target
+hardware. They are not a lower bound: reading more replicas can reduce
+throughput and increase latency. Use `?r=1` for read-heavy workloads that can tolerate a
 single replica, or keep the default for consistency.
 
 ### View failover (#45)

@@ -406,6 +406,10 @@ async fn main() -> anyhow::Result<()> {
             "/_node/_local/_dbs/{db}/security",
             axum::routing::put(api::db_security_put),
         )
+        .route(
+            "/_node/_local/_dbs/{db}/migration",
+            axum::routing::put(api::db_migration_put).delete(api::db_migration_delete),
+        )
         .route("/_node/_local/_dbs/{db}/shards", get(api::db_shard_counts))
         .route(
             "/_node/_local/_dbs/{db}/rebalance",

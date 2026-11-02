@@ -39,8 +39,9 @@ A health response looks like:
 
 Checks are graded `ok`, `degraded` (warning) or `critical`. The overall status is
 the worst check. Power-loss durability is explicitly not claimed:
-`rusty-leveldb` does not fsync, so health checks confirm process-crash safety and
-writable storage, not fsync semantics.
+`rusty-leveldb` does not fsync, so health checks establish process/storage
+readiness, not crash-recovery correctness for a particular dataset and not fsync
+semantics. Process-crash recovery is covered by tests, not by health.
 
 ### Metrics collected
 
@@ -64,7 +65,9 @@ The local registry records:
 - **Storage and databases**: data-root disk bytes, per-database disk bytes,
   live/deleted document counts, update sequence, shard map version, pending map
   flag, and per-shard owner/replicas/local flag/document counts.
-- **Process**: RSS, thread count, PID, start time and uptime.
+- **Process**: RSS, thread count, PID, start time and uptime on Linux. On
+  macOS these measurements are reported as `null`/unavailable rather than false
+  zeros until a platform collector is added.
 - **Replication and discovery**: the same snapshots served by
   `/_node/_local/_replication` and the `cluster` endpoint.
 

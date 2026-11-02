@@ -184,9 +184,11 @@ design documents are untrusted.
 Platform note:
 
 - Process-mode syscall/filesystem confinement (seccomp and Landlock) is
-  Linux-specific. On other platforms, process mode still gets a cleared
-  environment, process isolation and rlimits where available, but a hard
-  portable boundary should use `--js-sandbox wasm` (optionally with the
+  Linux-specific. On macOS, `RLIMIT_AS` is unsupported and is skipped; the
+  other rlimits, environment clearing and process isolation still apply, but
+  there is no seccomp or Landlock layer. On other platforms, process mode still
+  gets a cleared environment, process isolation and rlimits where available, but
+  a hard portable boundary should use `--js-sandbox wasm` (optionally with the
   Wasmtime JIT). A kernel without Landlock falls back to the seccomp denylist.
 
 Run the mode tests:
@@ -301,17 +303,17 @@ trap (including a deadline or memory growth failure) fails only that request.
 
 ### Build and supply chain
 
-The runner uses the maintained `rquickjs` crate and a pinned WASI SDK. The
-checked-in artifact is reproducible with the commands in `wasm/README.md`; the
-source is in `wasm/qjs-runner/`. The checked-in artifact checksum is enforced
-by `js::tests::wasm_runner_matches_the_checked_in_checksum`. Both host runtimes
-load the same artifact.
+The runner uses the maintained `rquickjs` crate and the WASI SDK. The
+checked-in artifact can be rebuilt with the commands in `wasm/README.md`; the
+source is in `wasm/qjs-runner/`. The exact Rust/WASI SDK versions are not pinned
+by the repository, so the checksum detects artifact drift but is not a
+bit-for-bit reproducibility proof. Both host runtimes load the same artifact.
 
 ```sh
 # lean default: wasmi only
 cargo build --release
 
-# optional performance path
+# optional performance path (Wasmtime 50 with the locked dependencies needs Rust 1.97+)
 cargo build --release --features wasmtime
 ```
 
