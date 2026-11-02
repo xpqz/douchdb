@@ -10,6 +10,7 @@ mod error;
 mod etf;
 mod fabric;
 mod js;
+mod metrics;
 mod replicate;
 mod rev;
 mod revtree;
@@ -259,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(api::welcome))
         .route("/_up", get(api::up))
+        .route("/_health", get(api::health_public))
         .route("/_all_dbs", get(api::all_dbs))
         .route("/_db_updates", get(api::db_updates))
         .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
@@ -266,6 +268,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/_membership", get(api::membership))
         .route("/_node/_local/_dbs", get(api::dbs_metadata))
         .route("/_node/_local/_cluster", get(api::cluster_status))
+        .route("/_node/_local/_metrics", get(api::metrics_status))
+        .route("/_node/_local/_health", get(api::health_status))
         .route(
             "/_node/_local/_cluster/discover",
             axum::routing::post(api::cluster_discover),

@@ -442,10 +442,16 @@ the bulk of the growth.
   timeouts; request bodies and view execution are bounded; security headers are
   added to every response; a poisoned view-index mutex no longer takes down
   future queries.
-* **Observability.** Optional OTLP traces and metrics via `--otel-endpoint` /
-  `OTEL_EXPORTER_OTLP_ENDPOINT`: `http.request` spans plus request count and
-  latency metrics, with a no-op default. The issue/branch/merge workflow is
-  documented in `docs/process.md`.
+* **Observability.** An in-process metrics registry records HTTP counters,
+  per-route latency percentiles, a 120-second live history, view/search query
+  latency, fabric read/quorum/fan-out counters, shard-map and rebalance state,
+  per-database/shard storage and process RSS/threads/uptime. Local JSON lives at
+  `/_node/_local/_metrics` and `/_node/_local/_health`; `?cluster=true` fans out
+  to peers, merges counters and latency buckets, and reports unreachable nodes
+  as degraded. An unauthenticated `/_health` probe and a console observability
+  page are included. Optional OTLP traces and metrics remain available via
+  `--otel-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`, with a no-op default. The
+  issue/branch/merge workflow is documented in `docs/process.md`.
 * **Single-node baseline.** `scripts/perf_sweep.py` records CRUD, bulk,
   metadata, changes, view, large-document and compaction numbers on release
   builds; results and caveats are in `docs/performance.md`.
@@ -505,8 +511,8 @@ the bulk of the growth.
   intermediate JSON tree per peer. Remaining replica writes continue detached,
   so slow replicas do not set tail latency. There is no primary fetch-and-copy pass. Point reads default to `r=(n/2)+1`, prefer the local replica, and read
   the remaining replicas concurrently; `?r=1` is the local fast path. Fabric,
-  shard-map and rebalance metrics export through the optional OpenTelemetry
-  setup and are no-ops without an endpoint. A
+  shard-map and rebalance counters are recorded in the in-process registry and
+  also exported through the optional OpenTelemetry setup. A
   reproducible three-node `q=4`/`n=3` benchmark and before/after numbers are in
   `docs/performance-cluster.md`.
 * **Load-balanced edge.** The Compose stack puts nginx in front of all three
