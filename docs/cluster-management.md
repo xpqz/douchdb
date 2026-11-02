@@ -51,9 +51,11 @@ request:
 1. Every `--sync-secs` seconds, pull `_changes` from each peer.
 2. Fetch the referenced revisions with `_bulk_get?revs=true`, preserving the
    revision history metadata.
-3. Keep only documents whose shard this node replicates.
+3. Keep documents whose shard this node replicates, and always keep
+   `_design/` documents so every node can evaluate local views and search.
 4. Write them with `_bulk_docs?new_edits=false`.
-5. Store a checkpoint in a `_local` document keyed by peer and shard-map hash.
+5. Store a checkpoint in a `_local` document keyed by a checkpoint-namespace
+   version, peer and shard-map hash.
 
 Checkpoints are advanced only after every requested revision has reached a
 terminal state: applied locally, already present locally, or explicitly
@@ -63,10 +65,13 @@ next tick retries those revisions. `partial_bulk_get_does_not_advance_the_checkp
 covers this path.
 
 The map-hash key means a placement change starts a fresh backfill instead of
-resuming a checkpoint that filtered out newly owned documents. This path
-repairs replicas after failed writes, a restart, or a period offline. It also
-keeps the search and view indexes warm because their documents arrive without a
-client read.
+resuming a checkpoint that filtered out newly owned documents. The namespace
+version is `2`: deployments that ran the earlier filter skipped design
+documents on non-owning nodes, so their `ae2:` checkpoint starts at zero once
+and replays history to repair those documents. No manual checkpoint reset is
+needed. This path also repairs replicas after failed writes, a restart, or a
+period offline, and keeps search/view indexes warm because their documents
+arrive without a client read.
 
 The replicator is pull-based. There is no separate push scheduler: normal
 writes already fan out to replicas, and the timer repairs what they missed.
@@ -235,9 +240,20 @@ active map is unchanged; the request fails with `504`.
 
 Only after every digest matches does the node activate the new map on every
 peer. A cutover failure rolls the active map back to the old placement. Client
-writes resume after activation or rollback. If the coordinating node restarts
-mid-rebalance, the active map is still the old one; peers may retain the target
-map for seeding, and the next rebalance replaces it.
+writes resume after activation or rollback. A direct placement `PUT` or cleanup
+returns `409 rebalance_in_progress` while a migration owns the database; the
+migration's own activation/rollback requests are the only placement writes in
+that window.
+
+Recovery depends on the phase. Before activation begins, a coordinator restart
+leaves the old active map in place and only a stale target map remains for
+seeding. During activation the coordinator may already have persisted the new
+map on some peers; if it dies before completing or rolling back, placements can
+be mixed. Do not assume the old map in that case. Compare
+`GET /_node/_local/_dbs/{db}` on every node, then run a new rebalance once all
+old and new owners are reachable, or `PUT` a known-good map explicitly. Writes
+are frozen only for the bounded verification window and unfreeze when the
+coordinator clears the migration or that deadline expires.
 
 Destructive cleanup is explicit: pass `?cleanup=true` to `rebalance`. Without
 it, the migration is verified but the old local copies are retained.

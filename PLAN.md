@@ -405,8 +405,9 @@ the bulk of the growth.
   applied, already local, or explicitly unavailable from the peer; partial
   `_bulk_get` responses leave the checkpoint behind. The streamed changes merge
   is covered by `changes_pagination_resumes_across_interleaved_shard_pages`.
-  Database create/drop are broadcast, anti-entropy pulls only the shards a node
-  replicates, and internal calls authenticate with the shared admin credentials
+  Database create/drop are broadcast, anti-entropy pulls the shards a node
+  replicates plus every design document, and internal calls authenticate with
+  the shared admin credentials
   (client Basic/cookie auth is forwarded to peers). The v0.1 gate — kill a node mid-replication and keep serving
   from the survivors — is covered by
   `cluster_survives_killing_a_node_mid_replication`.
@@ -468,13 +469,15 @@ the bulk of the growth.
 * **Stabilization pass.** Rebalance readiness now compares per-shard
   revision-metadata digests (document ids, winning revisions, deleted flags,
   conflict leaves and attachment metadata) instead of live counts; old replicas
-  must agree, cleanup is explicit (`?cleanup=true`), and a timeout rolls the map
-  back. During verification, reads use the old active map, client writes are
-  frozen on every node for a bounded window, and anti-entropy seeds the target
-  map; activation is a separate all-peer step. Point reads enforce the
-  requested read quorum, count explicit not-found/tombstone answers, and select
-  descendants over stale live copies; unmet quorum is `503`. The Docker build
-  includes the embedded WASI runner, a GitHub Actions workflow runs
+  must agree, cleanup is explicit (`?cleanup=true`), and a timeout leaves the
+  active map unchanged. During verification, reads use the old active map,
+  client writes are frozen on every node for a bounded window, and anti-entropy
+  seeds the target map; activation is a separate all-peer step. Point reads
+  enforce the requested read quorum, count explicit not-found/tombstone
+  answers, reconcile every leaf (including conflicts that are no local winner)
+  and select the merged tree's winner; unmet quorum is `503`, and
+  revision-shaped reads still enforce reachability. The Docker build includes
+  the embedded WASI runner, a GitHub Actions workflow runs
   fmt/clippy/tests/both wasm backends/container build, search rebuilds are
   serialized per index and run on the blocking pool, and `_compact` has a
   configurable node-wide concurrency bound, a visible `compact_running` flag,

@@ -385,6 +385,12 @@ impl Db {
     /// Whether `node` replicates the shard that contains `docid` under the
     /// migration target if one is active, otherwise under the active map.
     pub fn is_replica_of(&self, docid: &str, node: usize) -> bool {
+        // Design documents are replicated to every node so each can evaluate
+        // views and search over its local shards; this matches normal write
+        // placement and must hold for migration targets too.
+        if docid.starts_with("_design/") {
+            return true;
+        }
         let shard = self.shard_index(docid) as u32;
         let migration = self
             .migration_map

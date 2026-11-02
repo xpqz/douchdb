@@ -1393,6 +1393,15 @@ pub async fn db_metadata_put(
         Ok(db) => db,
         Err(error) => return fail(error),
     };
+    // A migration owns placement changes until it activates or rolls back.
+    // Internal activation/rollback requests carry the forwarded marker.
+    if db.rebalance_in_progress() && !is_forwarded(&st, &headers) {
+        return fail(ApiError::new(
+            409,
+            "rebalance_in_progress",
+            "shard placement cannot change while a rebalance is running",
+        ));
+    }
     let map: ShardMap = match serde_json::from_slice(&body) {
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid shard map")),
@@ -3912,18 +3921,25 @@ async fn doc_request(
         1
     };
     let read_quorum = num(q, "r").unwrap_or(default_read_quorum);
+    // `revs_info=false` must not downgrade the requested consistency level.
+    let revision_shaped = q.contains_key("open_revs") || flag(q, "revs_info");
     if attachment.is_none()
         && (method == Method::GET || method == Method::HEAD)
         && st.cluster.is_clustered()
         && read_quorum > 1
         && !is_forwarded(st, headers)
-        && !q.contains_key("open_revs")
-        && !q.contains_key("revs_info")
     {
-        // `open_revs` and `revs_info` return per-revision shapes that the
-        // single-winner reconciliation above does not model. Serve those
-        // locally rather than reporting a reconciled winner under `r`.
-        return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
+        if revision_shaped {
+            // Revision-shaped responses are served locally, but the requested
+            // quorum still has to be reachable.
+            if let Some(response) =
+                quorum_reachable(st, db, dbname, &docid, q, headers, read_quorum).await
+            {
+                return response;
+            }
+        } else {
+            return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
+        }
     }
 
     // Serve locally if this node holds a replica; otherwise try every replica

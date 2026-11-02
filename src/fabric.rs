@@ -218,27 +218,188 @@ pub(crate) async fn quorum_read(
     headers: &HeaderMap,
     r: usize,
 ) -> Response {
-    // Ask every replica. Count reachable answers (including explicit
-    // not-found/tombstone answers), and fail if fewer than `r` replica answers
-    // arrive. Internal reconciliation asks for revision histories and conflict
-    // leaves; those are stripped again unless the client requested them.
+    // Without an explicit `rev`, ask every replica for *all* leaves with their
+    // revision histories. A conflict branch that never wins locally can still
+    // be the correct global winner, so top-level winners alone are not enough.
+    let requested_rev = q.get("rev").cloned();
+    let open_all = requested_rev.is_none();
+    let (reachable, docs) = replica_docs(st, db, dbname, docid, q, headers, open_all).await;
+    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
+    if reachable < r {
+        crate::telemetry::record_quorum_failure();
+        return fail(ApiError::new(
+            503,
+            "quorum_not_met",
+            format!("read quorum {r} not met: {reachable} replica(s) answered"),
+        ));
+    }
+    if docs.is_empty() {
+        return fail(ApiError::not_found("missing"));
+    }
+
+    // Deduplicate identical leaves reported by several replicas, then build the
+    // merged tree's ancestry from every returned history.
+    let mut unique: BTreeMap<String, Value> = BTreeMap::new();
+    for doc in docs {
+        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
+            unique.entry(rev.to_string()).or_insert(doc);
+        }
+    }
+    let docs: Vec<Value> = unique.into_values().collect();
+    if docs.is_empty() {
+        return fail(ApiError::not_found("missing"));
+    }
+    let histories: Vec<Vec<String>> = docs.iter().map(revision_history).collect();
+    let ancestor_revs: BTreeSet<String> = histories
+        .iter()
+        .flat_map(|history| history.iter().skip(1).cloned())
+        .collect();
+
+    let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
+    for doc in &docs {
+        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
+            leaves.insert(
+                rev.to_string(),
+                doc.get("_deleted").and_then(Value::as_bool) == Some(true),
+            );
+        }
+    }
+    let winner_rev = match requested_rev.as_deref() {
+        Some(rev) if leaves.contains_key(rev) => rev.to_string(),
+        Some(_) => return fail(ApiError::not_found("missing")),
+        None => match leaves
+            .iter()
+            .filter(|(rev, _)| !ancestor_revs.contains(*rev))
+            .max_by_key(|(rev, deleted)| {
+                let parsed = crate::rev::Rev::parse(rev);
+                let pos = parsed.as_ref().map(|rev| rev.pos).unwrap_or(0);
+                let id = parsed.map(|rev| rev.id);
+                (!**deleted, pos, id)
+            })
+            .map(|(rev, _)| rev.clone())
+        {
+            Some(rev) => rev,
+            None => return fail(ApiError::not_found("missing")),
+        },
+    };
+    let Some(mut winner) = docs
+        .iter()
+        .find(|doc| doc.get("_rev").and_then(Value::as_str) == Some(winner_rev.as_str()))
+        .cloned()
+    else {
+        return fail(ApiError::not_found("missing"));
+    };
+
+    // Every maximal leaf other than the winner is a conflict.
+    let mut conflicts = Vec::new();
+    let mut deleted_conflicts = Vec::new();
+    for (rev, deleted) in &leaves {
+        if *rev == winner_rev || ancestor_revs.contains(rev) {
+            continue;
+        }
+        if *deleted {
+            deleted_conflicts.push(rev.clone());
+        } else {
+            conflicts.push(rev.clone());
+        }
+    }
+    if let Some(object) = winner.as_object_mut() {
+        if flag(q, "conflicts") {
+            object.insert("_conflicts".to_string(), json!(conflicts));
+        } else {
+            object.remove("_conflicts");
+        }
+        if flag(q, "deleted_conflicts") {
+            object.insert("_deleted_conflicts".to_string(), json!(deleted_conflicts));
+        } else {
+            object.remove("_deleted_conflicts");
+        }
+        if !flag(q, "revs") {
+            object.remove("_revisions");
+        }
+    }
+
+    let explicitly_requested = requested_rev.is_some();
+    let deleted = winner
+        .get("_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if deleted && !explicitly_requested {
+        return fail(ApiError::not_found("deleted"));
+    }
+    let etag = format!("\"{winner_rev}\"");
+    if etag_matches(headers, header::IF_NONE_MATCH, &etag) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(value) = etag.parse() {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        return response;
+    }
+    doc_response(winner)
+}
+
+/// Count reachable replicas for revision-shaped responses (`open_revs`,
+/// `revs_info`) without silently downgrading the requested `r`.
+pub(crate) async fn quorum_reachable(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+    r: usize,
+) -> Option<Response> {
+    let (reachable, _) = replica_docs(st, db, dbname, docid, q, headers, false).await;
+    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
+    if reachable < r {
+        crate::telemetry::record_quorum_failure();
+        Some(fail(ApiError::new(
+            503,
+            "quorum_not_met",
+            format!("read quorum {r} not met: {reachable} replica(s) answered"),
+        )))
+    } else {
+        None
+    }
+}
+
+/// Ask every replica for a document. With `open_all`, each peer returns all
+/// leaves (`open_revs=all`) and their histories; otherwise the single winner
+/// (or the client's explicit `rev`) is returned. Explicit not-found answers
+/// count as reachable, but a transport or server failure does not.
+async fn replica_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    docid: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+    open_all: bool,
+) -> (usize, Vec<Value>) {
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
     inner.insert("revs".to_string(), "true".to_string());
-    inner.insert("conflicts".to_string(), "true".to_string());
-    inner.insert("deleted_conflicts".to_string(), "true".to_string());
+    if open_all {
+        inner.insert("open_revs".to_string(), "all".to_string());
+        inner.remove("rev");
+        inner.remove("revs_info");
+    } else {
+        inner.remove("open_revs");
+    }
+
+    let mut opts = doc_opts(&inner);
+    opts.revs = true;
+    opts.include_deleted = true;
+    if open_all {
+        opts.open_revs = Some(vec!["all".to_string()]);
+    }
+
     let mut replicas = replicas_of_doc(db, docid);
     if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
-    let r = r.min(replicas.len()).max(1);
-    let mut opts = doc_opts(q);
-    opts.revs = true;
-    opts.include_deleted = true;
-    opts.conflicts = true;
-    opts.deleted_conflicts = true;
-    let docs = join_all(replicas.into_iter().map(|node| {
+    let responses = join_all(replicas.into_iter().map(|node| {
         let inner = inner.clone();
         let opts = opts.clone();
         async move {
@@ -262,7 +423,7 @@ pub(crate) async fn quorum_read(
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
-                        Ok(doc) => (true, Some(doc)),
+                        Ok(value) => (true, Some(value)),
                         Err(_) => (false, None),
                     }
                 }
@@ -273,129 +434,23 @@ pub(crate) async fn quorum_read(
         }
     }))
     .await;
-    let reachable = docs.iter().filter(|(reachable, _)| *reachable).count();
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        return fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        ));
-    }
-    let candidates: Vec<Value> = docs.into_iter().filter_map(|(_, doc)| doc).collect();
-    if candidates.is_empty() {
-        return fail(ApiError::not_found("missing"));
-    }
 
-    // Reconciliation must be order-independent. Gather the revision histories,
-    // eliminate every candidate that is an ancestor of another candidate, then
-    // choose one winner among the remaining maximal leaves.
-    let histories: Vec<Vec<String>> = candidates.iter().map(revision_history).collect();
-    let maximal: Vec<usize> = (0..candidates.len())
-        .filter(|index| {
-            let Some(rev) = candidates[*index].get("_rev").and_then(Value::as_str) else {
-                return false;
-            };
-            !(0..candidates.len()).any(|other| {
-                other != *index
-                    && histories
-                        .get(other)
-                        .map(|history| history.iter().skip(1).any(|candidate| candidate == rev))
-                        .unwrap_or(false)
-            })
-        })
-        .collect();
-    let winner_index = maximal
-        .into_iter()
-        .max_by_key(|index| {
-            let doc = &candidates[*index];
-            let deleted = doc
-                .get("_deleted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let rev = doc.get("_rev").and_then(Value::as_str).unwrap_or_default();
-            let parsed = crate::rev::Rev::parse(rev);
-            let pos = parsed.as_ref().map(|rev| rev.pos).unwrap_or(0);
-            let id = parsed.map(|rev| rev.id);
-            (!deleted, pos, id)
-        })
-        .unwrap_or(0);
-    let mut winner = candidates[winner_index].clone();
-    let winner_rev = winner
-        .get("_rev")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    // Merge conflict metadata from every replica. The winner's own history is
-    // not a conflict; all other non-ancestor leaves are.
-    let ancestor_revs: BTreeSet<String> = histories
-        .iter()
-        .flat_map(|history| history.iter().skip(1).cloned())
-        .collect();
-    let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
-    for doc in &candidates {
-        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
-            leaves.insert(
-                rev.to_string(),
-                doc.get("_deleted").and_then(Value::as_bool) == Some(true),
-            );
-        }
-        for (field, deleted) in [("_conflicts", false), ("_deleted_conflicts", true)] {
-            if let Some(items) = doc.get(field).and_then(Value::as_array) {
-                for item in items {
-                    if let Some(rev) = item.as_str() {
-                        leaves.insert(rev.to_string(), deleted);
+    let reachable = responses.iter().filter(|(reachable, _)| *reachable).count();
+    let mut docs = Vec::new();
+    for (_, value) in responses {
+        match value {
+            Some(Value::Array(entries)) => {
+                for entry in entries {
+                    if let Some(ok) = entry.get("ok") {
+                        docs.push(ok.clone());
                     }
                 }
             }
+            Some(value) => docs.push(value),
+            None => {}
         }
     }
-    let mut conflicts = Vec::new();
-    let mut deleted_conflicts = Vec::new();
-    for (rev, deleted) in leaves {
-        if rev == winner_rev || ancestor_revs.contains(&rev) {
-            continue;
-        }
-        if deleted {
-            deleted_conflicts.push(rev);
-        } else {
-            conflicts.push(rev);
-        }
-    }
-    if let Some(object) = winner.as_object_mut() {
-        if flag(q, "conflicts") {
-            object.insert("_conflicts".to_string(), json!(conflicts));
-        } else {
-            object.remove("_conflicts");
-        }
-        if flag(q, "deleted_conflicts") {
-            object.insert("_deleted_conflicts".to_string(), json!(deleted_conflicts));
-        } else {
-            object.remove("_deleted_conflicts");
-        }
-        if !flag(q, "revs") {
-            object.remove("_revisions");
-        }
-    }
-
-    let explicitly_requested = q.get("rev").is_some();
-    let deleted = winner
-        .get("_deleted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if deleted && !explicitly_requested {
-        return fail(ApiError::not_found("deleted"));
-    }
-    let etag = format!("\"{winner_rev}\"");
-    if etag_matches(headers, header::IF_NONE_MATCH, &etag) {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        if let Ok(value) = etag.parse() {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        return response;
-    }
-    doc_response(winner)
+    (reachable, docs)
 }
 
 /// Revision history from a `revs=true` document response, newest first.
