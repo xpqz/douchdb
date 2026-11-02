@@ -48,6 +48,7 @@
     setup() {
       const baseUrl = ref(localStorage.getItem('douchdb.ui.base') || defaultBase());
       const databases = ref([]);
+      const dbsError = ref('');
       const newDb = ref('');
       const currentDb = ref(null);
       const view = ref('home'); // home | docs | doc | changes | info
@@ -90,6 +91,12 @@
       const clusterError = ref('');
       const metrics = ref(null);
       const metricsError = ref('');
+      // The Process card is local even when metrics are aggregated cluster-wide.
+      const consoleProcess = computed(() => {
+        const value = metrics.value;
+        if (!value) return null;
+        return value.local && value.local.process ? value.local.process : value.process;
+      });
       const metricsLoading = ref(false);
       const accessRows = ref([]);
       const accessError = ref('');
@@ -296,11 +303,22 @@
       }
 
       async function loadDbs() {
+        if (!user.value) {
+          databases.value = [];
+          dbsError.value = 'Sign in to list databases.';
+          return;
+        }
         try {
           databases.value = await call('GET', '/_all_dbs');
+          dbsError.value = '';
         } catch (error) {
           databases.value = [];
-          if (error.status !== 401) handleError(error, 'Cannot list databases');
+          if (error.status === 401) {
+            dbsError.value = 'Sign in to list databases.';
+          } else {
+            dbsError.value = error.message || String(error);
+            handleError(error, 'Cannot list databases');
+          }
         }
       }
 
@@ -317,7 +335,7 @@
 
       async function refreshAll() {
         await refreshSession();
-        if (user.value) await loadDbs();
+        await loadDbs();
         await loadServerInfo();
         if (view.value === 'cluster') await loadCluster();
         else if (view.value === 'metrics') await loadMetrics();
@@ -1388,9 +1406,7 @@
         if (!servedByApi && !hasSavedServer) return;
 
         await refreshSession();
-        // Avoid a guaranteed 401 (and an error in the browser console) when
-        // the server requires authentication and no session exists yet.
-        if (user.value) await loadDbs();
+        await loadDbs();
         await loadServerInfo();
         applyRoute();
         setInterval(() => {
@@ -1407,11 +1423,23 @@
         setInterval(() => {
           if (view.value === 'access' && !securityForm.open) loadAccess();
         }, 10000);
+        // A database created outside the console (for example with curl)
+        // should appear without a manual reload.
+        setInterval(() => {
+          if (user.value && document.visibilityState === 'visible') loadDbs();
+        }, 15000);
+        window.addEventListener('focus', () => {
+          if (user.value) loadDbs();
+        });
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible' && user.value) loadDbs();
+        });
       });
 
       return {
         baseUrl,
         databases,
+        dbsError,
         newDb,
         currentDb,
         view,

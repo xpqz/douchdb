@@ -114,6 +114,10 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
       GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /otel-lgtm/grafana-dashboards/douchdb-overview.json
+    volumes:
+      - ./docker/grafana/dashboards:/otel-lgtm/grafana-dashboards:ro
+      - ./docker/grafana/provisioning/dashboards/douchdb.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/douchdb.yaml:ro
 
 volumes:
   node0-data:

@@ -890,6 +890,9 @@ pub async fn metrics_status(
     value["scope"] = json!("cluster");
     value["node"] = local["node"].clone();
     value["generated_at"] = json!(now_ms());
+    // The Process card is explicitly local; expose it at the top level so the
+    // cluster response has the same shape as a local response.
+    value["process"] = local["process"].clone();
     value["local"] = local;
     let node_count = nodes.len();
     value["nodes"] = json!(nodes);

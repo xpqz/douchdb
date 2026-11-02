@@ -74,7 +74,9 @@
               <span class="db-name mono">{{ db }}</span>
             </li>
           </ul>
-          <p v-if="!databases.length" class="muted side-empty">No databases yet.</p>
+          <p v-if="!databases.length" class="muted side-empty">
+            {{ dbsError || 'No databases yet.' }}
+          </p>
         </aside>
 
         <main class="main">
@@ -347,11 +349,11 @@
                 </div>
                 <div class="card">
                   <h3>Process (local)</h3>
-                  <div class="metric-big">{{ processRss(metrics.process) }}</div>
+                  <div class="metric-big">{{ processRss(consoleProcess) }}</div>
                   <p class="muted">
-                    {{ processThreads(metrics.process) }} ·
-                    up {{ humanDuration(metrics.process.uptime_secs) }} ·
-                    pid {{ metrics.process.pid }}
+                    {{ processThreads(consoleProcess) }} ·
+                    up {{ humanDuration(consoleProcess ? consoleProcess.uptime_secs : 0) }} ·
+                    pid {{ consoleProcess ? consoleProcess.pid : '—' }}
                   </p>
                 </div>
                 <div class="card">
