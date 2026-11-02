@@ -48,7 +48,8 @@ tracing-opentelemetry = "0.34"
 seccompiler = "0.5"
 landlock = "0.4"
 
-# Local fork: iterative LRU teardown and duplicate-key eviction. Upstream
-# 4.0.2 recursively drops the owning LRU chain and can overflow worker stacks.
+# TEMPORARY local fork: UB-free LRU list (upstream PR #69) and duplicate-key
+# eviction. Published 4.0.2 corrupts the cache on Linux ARM64 release builds.
+# Revisit/remove per docs/storage-dependency.md, tracked by issue #105.
 [patch.crates-io]
 rusty-leveldb = { path = "vendor/rusty-leveldb" }

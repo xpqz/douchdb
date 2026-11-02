@@ -360,7 +360,9 @@ the bulk of the growth.
 * **Storage-cache teardown.** `rusty-leveldb` 4.0.2 is vendored with the
   UB-free circular LRU from upstream PR #69, duplicate-key eviction and
   cache-invariant tests after a recursive cache-drop stack overflow on Linux
-  ARM64 bulk imports; see `vendor/rusty-leveldb/PATCHES.md`.
+  ARM64 bulk imports; see `vendor/rusty-leveldb/PATCHES.md`. This is a
+  temporary vendored dependency: the decision and removal checklist are in
+  `docs/storage-dependency.md`, tracked by issue #105.
 * **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
   ~27 s. More shards or an observable `compact_running` flag plus off-path
   scheduling remain options; `_compact` maps to `compact_range` and returns

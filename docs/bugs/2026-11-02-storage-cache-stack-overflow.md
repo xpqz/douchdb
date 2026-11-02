@@ -30,6 +30,10 @@ one, and adds debug list/map invariant checks.
 
 See [`vendor/rusty-leveldb/PATCHES.md`](../../vendor/rusty-leveldb/PATCHES.md).
 
+This is a temporary vendoring decision. The rationale, risks and removal
+checklist are in [`docs/storage-dependency.md`](../storage-dependency.md),
+tracked by issue #105.
+
 ## Limits
 
 An earlier 0.2.4 attempt only made whole-list teardown iterative. It did not

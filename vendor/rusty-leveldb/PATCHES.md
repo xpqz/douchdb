@@ -27,6 +27,11 @@ map/forward-chain/back-link invariants under random LRU operations, and dropping
 a 100,000-node cache on a 64 KiB stack. The cache tests pass in debug and
 release on x86_64 and on `linux/arm64` Rust 1.97.
 
+This is a **temporary** vendoring decision. The rationale, risks, revisit
+triggers and removal checklist are in
+[`docs/storage-dependency.md`](../../docs/storage-dependency.md), tracked by
+issue #105.
+
 Upstream master still had the unsafe design when this fork was created
 (2026-11-02); PR #69 is open, not merged. If a fixed upstream release appears,
 prefer upgrading and remove this patch. Re-run the cache tests and the import
