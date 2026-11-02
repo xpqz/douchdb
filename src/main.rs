@@ -1,5 +1,6 @@
 //! douchdb: a CouchDB wire-compatible database on LevelDB.
 
+mod admission;
 mod api;
 mod auth;
 mod cluster;
@@ -40,6 +41,15 @@ struct Args {
     n: usize,
     revs_limit: u64,
     admin: Option<(String, String)>,
+    users_file: Option<String>,
+    session_secret: String,
+    default_security: String,
+    max_in_flight: usize,
+    per_user_in_flight: usize,
+    per_user_rate: usize,
+    heavy_in_flight: usize,
+    heavy_per_user: usize,
+    background_in_flight: usize,
     nodes: Vec<String>,
     me: usize,
     advertise: String,
@@ -65,6 +75,15 @@ fn parse_args() -> Args {
         n: 3,
         revs_limit: 1000,
         admin: None,
+        users_file: None,
+        session_secret: String::new(),
+        default_security: String::new(),
+        max_in_flight: 64,
+        per_user_in_flight: 16,
+        per_user_rate: 0,
+        heavy_in_flight: 8,
+        heavy_per_user: 1,
+        background_in_flight: 1,
         nodes: Vec::new(),
         me: 0,
         advertise: String::new(),
@@ -97,6 +116,27 @@ fn parse_args() -> Args {
                         args.admin = Some((user.to_string(), pass.to_string()));
                     }
                 }
+            }
+            "--users-file" => args.users_file = it.next(),
+            "--session-secret" => args.session_secret = it.next().unwrap_or_default(),
+            "--default-security" => args.default_security = it.next().unwrap_or_default(),
+            "--max-in-flight" => {
+                args.max_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(64)
+            }
+            "--per-user-in-flight" => {
+                args.per_user_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(16)
+            }
+            "--per-user-rate" => {
+                args.per_user_rate = it.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
+            "--heavy-in-flight" => {
+                args.heavy_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(8)
+            }
+            "--heavy-per-user" => {
+                args.heavy_per_user = it.next().and_then(|v| v.parse().ok()).unwrap_or(1)
+            }
+            "--background-in-flight" => {
+                args.background_in_flight = it.next().and_then(|v| v.parse().ok()).unwrap_or(1)
             }
             "--nodes" => {
                 args.nodes = it
@@ -152,7 +192,11 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 println!(
                     "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
-                     \x20       [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
+                     \x20       [--admin user:pass] [--users-file FILE] [--session-secret SECRET]\n\
+                     \x20       [--default-security open|admin-only]\n\
+                     \x20       [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]\n\
+                     \x20       [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]\n\
+                     \x20       [--nodes URL,URL] [--me INDEX] [--sync-secs N]\n\
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
                      \x20       [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]\n\
                      \x20       [--js-workers N]\n\
@@ -235,11 +279,40 @@ async fn main() -> anyhow::Result<()> {
     } else {
         format!("http://{}", args.listen)
     };
+    let session_secret = if !args.session_secret.trim().is_empty() {
+        Some(args.session_secret.clone())
+    } else if !args.cluster_secret.is_empty() {
+        Some(format!("{}:session", args.cluster_secret))
+    } else {
+        None
+    };
+    let auth = if let Some(path) = &args.users_file {
+        Some(
+            Auth::from_users_file(
+                args.admin.clone(),
+                std::path::Path::new(path),
+                session_secret,
+            )
+            .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        args.admin
+            .as_ref()
+            .map(|(user, pass)| Auth::new(user.clone(), pass.clone()))
+    };
+    let default_admin_only = match args.default_security.as_str() {
+        "open" => false,
+        "admin-only" => true,
+        "" => auth.is_some(),
+        other => {
+            eprintln!("unknown --default-security value: {other} (expected open or admin-only)");
+            std::process::exit(2);
+        }
+    };
     let config = Config {
         q: args.q.max(1),
         n: args.n.max(1),
         revs_limit: args.revs_limit.max(1),
-        admin: args.admin.clone(),
         nodes: args.nodes.clone(),
         me: args.me,
         sync_secs: args.sync_secs,
@@ -248,15 +321,21 @@ async fn main() -> anyhow::Result<()> {
         cors_origins: args.cors_origins.clone(),
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
+        default_admin_only,
     };
     let state = Arc::new(AppState {
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
         config,
-        auth: args
-            .admin
-            .as_ref()
-            .map(|(u, p)| Auth::new(u.clone(), p.clone())),
+        auth,
+        admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
+            max_in_flight: args.max_in_flight,
+            per_user_in_flight: args.per_user_in_flight,
+            per_user_rate: args.per_user_rate,
+            heavy_in_flight: args.heavy_in_flight,
+            heavy_per_user: args.heavy_per_user,
+            background_in_flight: args.background_in_flight,
+        })),
         cluster: Cluster {
             nodes: args.nodes.clone(),
             me: args.me,
@@ -313,6 +392,10 @@ async fn main() -> anyhow::Result<()> {
             "/_node/_local/_dbs/{db}",
             get(api::db_metadata).put(api::db_metadata_put),
         )
+        .route(
+            "/_node/_local/_dbs/{db}/security",
+            axum::routing::put(api::db_security_put),
+        )
         .route("/_node/_local/_dbs/{db}/shards", get(api::db_shard_counts))
         .route(
             "/_node/_local/_dbs/{db}/rebalance",
@@ -344,6 +427,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::cors,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::admit,
         ))
         .layer(axum::middleware::from_fn(api::log_requests))
         .layer(axum::middleware::from_fn(api::security_headers))

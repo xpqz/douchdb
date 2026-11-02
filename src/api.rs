@@ -1,7 +1,7 @@
 //! HTTP surface. The shape of every response here is dictated by CouchDB's
 //! wire protocol, not by taste.
 
-use crate::auth::Auth;
+use crate::auth::{Auth, Principal};
 use crate::cluster::{Cluster, ShardMap};
 use crate::db::{
     validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
@@ -77,6 +77,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub db_updates: DbUpdates,
     pub cluster_state: Arc<crate::cluster_state::ClusterState>,
+    pub admission: Arc<crate::admission::Admission>,
 }
 
 #[derive(Clone)]
@@ -86,7 +87,6 @@ pub struct Config {
     #[allow(dead_code)]
     pub n: usize,
     pub revs_limit: u64,
-    pub admin: Option<(String, String)>,
     #[allow(dead_code)]
     pub nodes: Vec<String>,
     #[allow(dead_code)]
@@ -101,6 +101,9 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
+    /// When true, a database with an empty `_security` object is admin-only.
+    /// This is the default whenever authentication is configured.
+    pub default_admin_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,19 +311,187 @@ impl AppState {
         names
     }
 
+    /// The caller's principal. With no auth configured every request is a
+    /// service admin, preserving the single-user default. Internal cluster
+    /// requests without user credentials are service admins; peers are trusted
+    /// by the shared cluster secret.
+    pub fn principal(&self, headers: &HeaderMap) -> Principal {
+        let Some(auth) = &self.auth else {
+            return Principal::service_admin();
+        };
+        let principal = auth.principal(headers);
+        if principal.is_authenticated() {
+            return principal;
+        }
+        if self.cluster.is_internal(headers) || self.cluster.is_internal_db(headers) {
+            return Principal::service_admin();
+        }
+        principal
+    }
+
     fn authorized(&self, headers: &HeaderMap) -> bool {
-        let Some(auth) = &self.auth else { return true };
-        if let Some(value) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
+        self.principal(headers).is_authenticated()
+    }
+}
+
+fn forbidden() -> Response {
+    json(
+        StatusCode::FORBIDDEN,
+        json!({"error": "forbidden", "reason": "You are not authorized to access this db."}),
+    )
+}
+
+fn access_denied(principal: &Principal) -> Response {
+    if principal.is_authenticated() {
+        forbidden()
+    } else {
+        unauthorized()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbAccess {
+    Member,
+    Admin,
+}
+
+fn security_matches(principal: &Principal, section: Option<&Value>) -> bool {
+    let Some(section) = section.and_then(Value::as_object) else {
+        return false;
+    };
+    if let (Some(name), Some(names)) = (
+        principal.name.as_deref(),
+        section.get("names").and_then(Value::as_array),
+    ) {
+        if names
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(name))
         {
-            if auth.check_basic(value) {
-                return true;
+            return true;
+        }
+    }
+    if let Some(roles) = section.get("roles").and_then(Value::as_array) {
+        if roles.iter().any(|role| {
+            role.as_str()
+                .map(|role| principal.has_role(role))
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn security_list_empty(security: &Value, key: &str) -> bool {
+    let Some(section) = security.get(key).and_then(Value::as_object) else {
+        return true;
+    };
+    ["names", "roles"].iter().all(|field| {
+        section
+            .get(*field)
+            .and_then(Value::as_array)
+            .map(Vec::is_empty)
+            .unwrap_or(true)
+    })
+}
+
+fn db_access(st: &AppState, principal: &Principal, db: &Db) -> Option<DbAccess> {
+    if principal.admin {
+        return Some(DbAccess::Admin);
+    }
+    let security = db.security();
+    if security_matches(principal, security.get("admins")) {
+        return Some(DbAccess::Admin);
+    }
+    if security_matches(principal, security.get("members")) {
+        return Some(DbAccess::Member);
+    }
+    // CouchDB semantics: no members means public. A completely empty security
+    // object is admin-only when authentication is configured, unless the
+    // operator explicitly chose `--default-security open`.
+    if security_list_empty(&security, "members") {
+        if security_list_empty(&security, "admins") && st.config.default_admin_only {
+            None
+        } else {
+            Some(DbAccess::Member)
+        }
+    } else {
+        None
+    }
+}
+
+fn require_db_access(
+    st: &AppState,
+    principal: &Principal,
+    db: &Db,
+    need_admin: bool,
+) -> Option<Response> {
+    match db_access(st, principal, db) {
+        Some(DbAccess::Admin) => None,
+        Some(DbAccess::Member) if !need_admin => None,
+        Some(DbAccess::Member) => Some(forbidden()),
+        None => Some(access_denied(principal)),
+    }
+}
+
+fn requires_db_admin(rest: &str, method: &Method) -> bool {
+    if rest == "_security" {
+        return *method == Method::PUT || *method == Method::POST;
+    }
+    if rest == "_compact"
+        || rest == "_view_cleanup"
+        || rest == "_search_cleanup"
+        || rest == "_purge"
+        || rest == "_sync_shards"
+    {
+        return true;
+    }
+    if rest == "_revs_limit" {
+        return *method == Method::PUT || *method == Method::POST;
+    }
+    // A design document write is `_design/{ddoc}`; queries under `_view/` and
+    // `_search/` remain member operations.
+    if rest.starts_with("_design/")
+        && !rest.contains("/_view/")
+        && !rest.contains("/_search/")
+        && !rest.contains("/_show/")
+        && !rest.contains("/_list/")
+        && !rest.contains("/_update/")
+    {
+        return matches!(
+            *method,
+            Method::PUT | Method::POST | Method::DELETE | Method::PATCH
+        );
+    }
+    false
+}
+
+fn validate_security(value: &Value) -> DbResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("security object must be an object"))?;
+    for key in ["admins", "members"] {
+        let Some(section) = object.get(key) else {
+            continue;
+        };
+        let section = section
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request(format!("`{key}` must be an object")))?;
+        for field in ["names", "roles"] {
+            let Some(list) = section.get(field) else {
+                continue;
+            };
+            let list = list.as_array().ok_or_else(|| {
+                ApiError::bad_request(format!("`{key}.{field}` must be an array"))
+            })?;
+            if !list.iter().all(Value::is_string) {
+                return Err(ApiError::bad_request(format!(
+                    "`{key}.{field}` must contain strings"
+                )));
             }
         }
-        let cookies = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
-        auth.check_cookies(cookies)
     }
+    Ok(())
 }
 
 fn unauthorized() -> Response {
@@ -390,6 +561,37 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     crate::telemetry::record_http(method.as_str(), status, duration_ms);
     tracing::info!("{} {} -> {}", method, uri, status);
     response
+}
+
+/// Per-principal admission. This is the fairness layer: no single user can fill
+/// the global in-flight pool, and view/search work uses separate heavy permits.
+pub async fn admit(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    if crate::admission::Admission::exempt(path) {
+        return next.run(req).await;
+    }
+    let principal = st.principal(req.headers());
+    let lane = crate::admission::Admission::classify(path);
+    match st.admission.try_admit(&principal, lane) {
+        Ok(_permit) => next.run(req).await,
+        Err(denied) => {
+            let mut response = json(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": "too_many_requests",
+                    "reason": denied.reason(),
+                }),
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+    }
 }
 
 /// Opt-in CORS, matching CouchDB's `[cors]` configuration. The embedded
@@ -559,6 +761,19 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
     names.sort();
     names.dedup();
 
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        let mut visible = Vec::new();
+        for name in names {
+            if let Ok(db) = st.db(&name).await {
+                if db_access(&st, &principal, &db).is_some() {
+                    visible.push(name);
+                }
+            }
+        }
+        names = visible;
+    }
+
     let descending = flag(&q, "descending");
     if descending {
         names.reverse();
@@ -596,8 +811,9 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
 /// `_db_updates` is an in-memory global feed of database lifecycle and write
 /// events. It is intentionally best-effort: a restart starts a new sequence.
 pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let q = query(&uri);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
@@ -684,8 +900,9 @@ pub async fn dbs_info(
     uri: Uri,
     body: Bytes,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let q = query(&uri);
     let keys = if method == Method::POST {
@@ -726,8 +943,9 @@ pub async fn dbs_info(
 }
 
 pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) && !st.cluster.is_internal(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let nodes: Vec<String> = if st.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
@@ -743,8 +961,9 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
 /// Cluster overview for the management console: membership, discovery probes,
 /// per-database shard maps and the background replicator snapshot.
 pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let membership: Vec<String> = if st.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
@@ -1564,8 +1783,9 @@ pub async fn metrics_status(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let q = query(&uri);
     let local = local_metrics(&st).await;
@@ -1696,8 +1916,9 @@ pub async fn health_status(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let local = local_health(&st, true).await;
     let q = query(&uri);
@@ -1812,8 +2033,9 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
 /// Probe peers and reported memberships now. Returns the previous snapshot and
 /// starts the pass in the background so a dead seed cannot block the request.
 pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     if !st.cluster_state.discovery_running() {
         tokio::spawn(crate::discovery::discover_once(st.clone()));
@@ -1829,8 +2051,9 @@ pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMa
 }
 
 pub async fn replication_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     json(StatusCode::OK, st.cluster_state.replication_json())
 }
@@ -1842,8 +2065,9 @@ pub async fn replication_run(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let db = query(&uri).get("db").cloned();
     if !st.cluster_state.replication_running() {
@@ -1856,8 +2080,9 @@ pub async fn replication_run(
 }
 
 pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     st.cluster_state.set_replication_paused(true);
     json(
@@ -1867,8 +2092,9 @@ pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderM
 }
 
 pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     st.cluster_state.set_replication_paused(false);
     json(
@@ -1879,8 +2105,9 @@ pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: Header
 
 /// mem3-style shard-map inspection and movement endpoint.
 pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let mut out = Map::new();
     for name in st.db_names().await {
@@ -1896,11 +2123,41 @@ pub async fn db_metadata(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     match st.db(&name).await {
         Ok(db) => json(StatusCode::OK, json!(db.shard_map())),
+        Err(error) => fail(error),
+    }
+}
+
+/// Internal/replication-side security update. The public `PUT /db/_security`
+/// handler fans out here after checking database-admin access.
+pub async fn db_security_put(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let principal = st.principal(&headers);
+    if !principal.admin && !st.cluster.is_internal(&headers) {
+        return access_denied(&principal);
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(error) => return fail(error),
+    };
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return fail(ApiError::bad_request("invalid security object")),
+    };
+    if let Err(error) = validate_security(&value) {
+        return fail(error);
+    }
+    match db.set_security(value) {
+        Ok(()) => ok(),
         Err(error) => fail(error),
     }
 }
@@ -1910,8 +2167,9 @@ pub async fn db_shard_counts(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let db = match st.db(&name).await {
         Ok(db) => db,
@@ -1940,8 +2198,9 @@ pub async fn db_metadata_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let db = match st.db(&name).await {
         Ok(db) => db,
@@ -2143,8 +2402,9 @@ pub async fn db_rebalance(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let db = match st.db(&name).await {
         Ok(db) => db,
@@ -2226,8 +2486,9 @@ pub async fn db_cleanup(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
+    let principal = st.principal(&headers);
+    if !principal.admin {
+        return access_denied(&principal);
     }
     let db = match st.db(&name).await {
         Ok(db) => db,
@@ -2247,30 +2508,29 @@ pub async fn db_cleanup(
 }
 
 pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let authenticated = st.authorized(&headers);
-    let name = if authenticated {
-        st.config
-            .admin
-            .as_ref()
-            .map(|(u, _)| u.clone())
-            .unwrap_or_else(|| "admin".into())
-    } else {
-        Value::Null.to_string()
-    };
-    let roles = if authenticated {
-        json!(["_admin"])
-    } else {
-        json!([])
-    };
+    let principal = st.principal(&headers);
+    let had_credentials =
+        headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE);
+    if had_credentials && !principal.is_authenticated() {
+        return unauthorized();
+    }
+    let authenticated = principal.is_authenticated();
+    let name = principal.name.clone().unwrap_or_else(|| {
+        if authenticated {
+            "admin".into()
+        } else {
+            Value::Null.to_string()
+        }
+    });
     json(
         StatusCode::OK,
         json!({
             "ok": true,
-            "userCtx": { "name": name, "roles": roles },
+            "userCtx": { "name": name, "roles": principal.roles },
             "info": {
                 "authenticated": authenticated,
                 "authentication_db": "_users",
-                "authentication_handlers": ["cookie", "default"]
+                "authentication_handlers": ["cookie", "default", "bearer"]
             }
         }),
     )
@@ -2315,26 +2575,36 @@ pub async fn session_post(State(st): State<Arc<AppState>>, body: Bytes) -> Respo
             }
         }
     }
-    let valid = match &st.config.admin {
-        Some((u, p)) => &user == u && &pass == p,
-        None => true,
+    let principal = match &st.auth {
+        Some(auth) => auth.authenticate(&user, &pass),
+        None => Some(Principal {
+            name: Some(if user.is_empty() {
+                "admin".into()
+            } else {
+                user.clone()
+            }),
+            roles: vec!["_admin".to_string()],
+            admin: true,
+        }),
     };
-    if !valid {
+    let Some(principal) = principal else {
         return json(
             StatusCode::UNAUTHORIZED,
             json!({"error": "unauthorized", "reason": "Name or password is incorrect."}),
         );
-    }
+    };
+    let name = principal.name.clone().unwrap_or_else(|| user.clone());
     let mut response = json(
         StatusCode::OK,
         json!({
             "ok": true,
-            "name": user,
-            "roles": ["_admin"],
+            "name": name,
+            "roles": principal.roles,
         }),
     );
     if let Some(auth) = &st.auth {
-        if let Ok(value) = auth.cookie_header().parse() {
+        let cookie_name = principal.name.as_deref().unwrap_or(&user);
+        if let Ok(value) = auth.cookie_header_for(cookie_name).parse() {
             response.headers_mut().insert(header::SET_COOKIE, value);
         }
     }
@@ -2352,17 +2622,18 @@ pub async fn db_root(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
-    }
     if !valid_db_name(&name) {
         return fail(ApiError::bad_request("Name must be lowercase and URL-safe"));
     }
     let q = query(&uri);
+    let principal = st.principal(&headers);
 
     let local_only = st.cluster.is_internal_db(&headers);
     match method {
         Method::PUT => {
+            if !principal.admin {
+                return access_denied(&principal);
+            }
             let partitioned = flag(&q, "partitioned");
             if let Err(e) = st.create_db(&name, partitioned).await {
                 return fail(e);
@@ -2405,6 +2676,9 @@ pub async fn db_root(
             response
         }
         Method::DELETE => {
+            if !principal.admin {
+                return access_denied(&principal);
+            }
             let local = st.drop_db(&name).await;
             if st.cluster.is_clustered() && !local_only {
                 for (i, peer) in st.cluster.nodes.iter().enumerate() {
@@ -2427,6 +2701,9 @@ pub async fn db_root(
         }
         Method::GET | Method::HEAD => match st.db(&name).await {
             Ok(db) => {
+                if let Some(response) = require_db_access(&st, &principal, &db, false) {
+                    return response;
+                }
                 if is_forwarded(&st, &headers)
                     && headers
                         .get("x-douchdb-update-seq")
@@ -2462,6 +2739,9 @@ pub async fn db_root(
                 Ok(db) => db,
                 Err(e) => return fail(e),
             };
+            if let Some(response) = require_db_access(&st, &principal, &db, false) {
+                return response;
+            }
             let Ok(mut doc) = json_body(&body) else {
                 return fail(ApiError::bad_request("Document must be a JSON object"));
             };
@@ -2634,9 +2914,6 @@ pub async fn db_rest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.authorized(&headers) {
-        return unauthorized();
-    }
     if rest.is_empty() {
         // CouchDB accepts `GET /db/` and PouchDB uses it during setup.
         return db_root(State(st), Path(name), method, uri, headers, body).await;
@@ -2645,6 +2922,12 @@ pub async fn db_rest(
         Ok(db) => db,
         Err(e) => return fail(e),
     };
+    let principal = st.principal(&headers);
+    if let Some(response) =
+        require_db_access(&st, &principal, &db, requires_db_admin(&rest, &method))
+    {
+        return response;
+    }
     let q = query(&uri);
 
     match rest.as_str() {
@@ -2709,8 +2992,42 @@ pub async fn db_rest(
         }
         "_security" => {
             return match method {
-                Method::GET => json(StatusCode::OK, json!({})),
-                Method::PUT => ok(),
+                Method::GET => json(StatusCode::OK, db.security()),
+                Method::PUT => {
+                    let value: Value = match serde_json::from_slice(&body) {
+                        Ok(value) => value,
+                        Err(_) => return fail(ApiError::bad_request("invalid security object")),
+                    };
+                    if let Err(error) = validate_security(&value) {
+                        return fail(error);
+                    }
+                    if let Err(error) = db.set_security(value.clone()) {
+                        return fail(error);
+                    }
+                    if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
+                        let peers: Vec<String> = st
+                            .cluster
+                            .nodes
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index != st.cluster.me)
+                            .map(|(_, peer)| peer.clone())
+                            .collect();
+                        for peer in peers {
+                            let request = st
+                                .client
+                                .put(format!("{peer}/_node/_local/_dbs/{name}/security"))
+                                .header("x-douchdb-forwarded", "1")
+                                .header("x-douchdb-secret", st.cluster.secret.as_str())
+                                .json(&value);
+                            let request = forward_client_auth(request, &headers);
+                            if let Err(error) = request.send().await {
+                                tracing::warn!("security propagation to {peer} failed: {error}");
+                            }
+                        }
+                    }
+                    ok()
+                }
                 _ => fail(ApiError::new(
                     405,
                     "method_not_allowed",

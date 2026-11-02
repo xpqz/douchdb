@@ -256,3 +256,7 @@ request log.
   replica fan-out.
 - **No inter-node TLS or service accounts.** Discovery and replication trust
   the shared cluster secret; run nodes on a trusted network.
+- **Security is local with best-effort propagation.** `_security` changes are
+  written to the receiving database and pushed to reachable peers. There is no
+  security consensus; reapply a change after a peer returns if it missed it.
+  Admission is also per node; see [multiuser.md](multiuser.md).

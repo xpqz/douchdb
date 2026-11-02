@@ -88,6 +88,9 @@ fn membership_nodes(probe: &NodeProbe) -> Vec<String> {
 
 /// One discovery pass. Safe to call concurrently; an in-flight pass wins.
 pub async fn discover_once(state: Arc<AppState>) {
+    let Ok(_background) = state.admission.try_background() else {
+        return;
+    };
     if !state.cluster_state.begin_discovery() {
         return;
     }

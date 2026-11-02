@@ -126,13 +126,13 @@ pub fn validate_partition(partition: &str) -> DbResult<()> {
 
 pub struct Db {
     pub name: String,
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub q: u32,
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
     shard_map: Arc<std::sync::RwLock<ShardMap>>,
+    security: Arc<std::sync::RwLock<Value>>,
     shards: Vec<ShardHandle>,
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
@@ -198,6 +198,10 @@ impl Db {
             .map(ShardHandle::initial_seq)
             .max()
             .unwrap_or(0);
+        let security = std::fs::read(path.join("security.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| json!({}));
 
         Ok(Db {
             name: name.to_string(),
@@ -207,6 +211,7 @@ impl Db {
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
             shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
+            security: Arc::new(std::sync::RwLock::new(security)),
             shards,
             seq: Arc::new(AtomicU64::new(seq)),
         })
@@ -282,6 +287,30 @@ impl Db {
         shard
             .call(move |s| s.partition_counts(&partition).map_err(ApiError::from))
             .await
+    }
+
+    pub fn security(&self) -> Value {
+        self.security
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub fn set_security(&self, value: Value) -> DbResult<()> {
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
+        std::fs::write(self.path.join("security.json"), bytes).map_err(|error| {
+            ApiError::new(
+                500,
+                "internal_server_error",
+                format!("security.json: {error}"),
+            )
+        })?;
+        *self
+            .security
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = value;
+        Ok(())
     }
 
     pub fn shard_map(&self) -> ShardMap {
