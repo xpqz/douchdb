@@ -357,10 +357,10 @@ the bulk of the growth.
 * **Non-Linux process sandboxing.** Resolved by guidance: process syscall/
   filesystem confinement is Linux-only; use the portable `--js-sandbox wasm`
   engine on other hosts that need a hard boundary.
-* **Storage-cache teardown.** `rusty-leveldb` 4.0.2 is vendored with an
-  iterative LRU teardown, duplicate-key eviction and cache-invariant tests
-  after a recursive cache-drop stack overflow on Linux ARM64 bulk imports; see
-  `vendor/rusty-leveldb/PATCHES.md`.
+* **Storage-cache teardown.** `rusty-leveldb` 4.0.2 is vendored with the
+  UB-free circular LRU from upstream PR #69, duplicate-key eviction and
+  cache-invariant tests after a recursive cache-drop stack overflow on Linux
+  ARM64 bulk imports; see `vendor/rusty-leveldb/PATCHES.md`.
 * **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
   ~27 s. More shards or an observable `compact_running` flag plus off-path
   scheduling remain options; `_compact` maps to `compact_range` and returns

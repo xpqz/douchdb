@@ -11,33 +11,39 @@ The truncated capture is in
 
 ## Root cause and fix
 
-`rusty-leveldb` 4.0.2 owns each LRU node's successor through
-`Option<Box<LRUNode<T>>>`. Dropping a long list therefore recurses once per
-node. The same cache also linked a duplicate key without unlinking the old
-node; that leaves the list and map at different lengths and can corrupt later
-evictions.
+The immediate symptom is recursive node destruction, but the underlying defect
+is undefined behaviour in `rusty-leveldb` 4.0.2's `LRUList`:
 
-The dependency is now vendored under `vendor/rusty-leveldb` with:
+- it takes raw pointers into `Box<LRUNode>` values and then moves those boxes
+  into the list while handles and `prev` pointers still refer to them;
+- every node keeps raw pointers to the inline sentinel `head`, which become
+  invalid when the list is moved;
+- `remove_last` can therefore detach a node that still owns a long successor
+  chain, causing recursive destruction during block-cache eviction.
 
-- an iterative `LRUList` drop (bounded so a corrupt list cannot spin forever);
-- duplicate-key replacement that removes the old node first;
-- a debug list/map invariant check;
-- cache tests for duplicate replacement, random LRU invariants and dropping
-  100,000 nodes on a 64 KiB stack.
+The list was replaced with the circular, heap-allocated sentinel design from
+upstream PR #69: every node, including the sentinel, is owned through
+`Box::into_raw`/`Box::from_raw`; no `Box` is moved while a handle points at it;
+link/unlink operations are O(1); teardown is iterative. The vendored copy also
+fixes duplicate-key insertion, which linked a new node without unlinking the old
+one, and adds debug list/map invariant checks.
 
 See [`vendor/rusty-leveldb/PATCHES.md`](../../vendor/rusty-leveldb/PATCHES.md).
 
 ## Limits
 
-The exact live-volume corruption was not reproduced here, and the original
-capture was truncated before the caller, so the fix should not be read as proof
-that every possible cache-corruption source is gone. It removes the recursive
-destruction visible in the trace and the identified list/map divergence path.
-Release validation covered a 100,000-document write, complete changes-feed
-pagination, process restart and a Docker restart with 20,000 documents. The
-ARM64 image was rebuilt from the fix; a 5,000-document write, complete changes
-pagination and container restart passed under QEMU.
+An earlier 0.2.4 attempt only made whole-list teardown iterative. It did not
+cover `remove_last`, which detaches a node and then drops any successors it
+still owns, and it did not remove the undefined behaviour. That version failed
+the existing-volume ARM64 validation. Version 0.2.5 replaces the list
+implementation with the UB-free design above.
 
-Keep the vendored cache tests in CI, and re-run a large ARM64 import plus
-concurrent changes/repair before treating the storage layer as fully signed
-off.
+The exact live-volume corruption has not been reproduced in this environment,
+and the original capture was truncated before the caller. The corrected cache
+tests pass in debug and release on x86_64 and on `linux/arm64` Rust 1.97; the
+ARM64 release suite previously aborted on the unsafe list. Release validation
+also covered a 100,000-document write, complete changes-feed pagination,
+process restart, and a Docker restart with 20,000 documents.
+
+Re-run a large ARM64 import plus concurrent changes/repair against the exact
+existing volumes before treating the storage layer as fully signed off.
