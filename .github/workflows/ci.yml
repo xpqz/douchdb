@@ -22,6 +22,8 @@ jobs:
         run: cargo test
       - name: Wasmtime backend tests
         run: cargo test --features wasmtime
+      # Temporary vendored patch; remove with the rest of vendor/ per
+      # docs/storage-dependency.md (issue #105).
       - name: Vendored storage cache tests
         run: cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml cache::
 
