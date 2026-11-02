@@ -263,6 +263,9 @@ pub async fn pull(
 /// Run one anti-entropy pass over every database and peer. Returns false when a
 /// pass is already in flight.
 pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
+    let Ok(_background) = state.admission.try_background() else {
+        return false;
+    };
     if !state.cluster_state.begin_replication() {
         return false;
     }

@@ -422,7 +422,11 @@ douchdb with `--cors-origins` for that origin (see below).
 
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
-        [--admin user:pass] [--nodes URL,URL] [--me INDEX] [--sync-secs N]
+        [--admin user:pass] [--users-file FILE] [--session-secret SECRET]
+        [--default-security open|admin-only]
+        [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]
+        [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]
+        [--nodes URL,URL] [--me INDEX] [--sync-secs N]
         [--advertise URL] [--seed-nodes URL,URL]
         [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]
         [--js-workers N]
@@ -438,7 +442,16 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--q` | `1` | Shards per database, fixed at creation |
 | `--n` | `2` | Replication factor, clamped to the node count |
 | `--revs-limit` | `1000` | Revision history kept per document |
-| `--admin` | none | `user:pass` for Basic auth and `_session` |
+| `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` |
+| `--users-file` | none | JSON users file with token/roles entries (see [docs/multiuser.md](docs/multiuser.md)) |
+| `--session-secret` | derived | HMAC key for `AuthSession` cookies; share it across nodes for cross-node sessions |
+| `--default-security` | `admin-only` when auth is configured | Empty `_security` databases are `admin-only` or `open` |
+| `--max-in-flight` | `64` | Global concurrent HTTP requests |
+| `--per-user-in-flight` | `16` | Concurrent requests per principal |
+| `--per-user-rate` | `0` | Requests/second per principal; `0` unlimited |
+| `--heavy-in-flight` | `8` | Global concurrent view/search requests |
+| `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
+| `--background-in-flight` | `1` | Concurrent anti-entropy/discovery passes |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
@@ -622,9 +635,40 @@ semantics.
 See [docs/process.md](docs/process.md) for the issue/branch workflow used for
 this work.
 
+## Multiuser and fairness
+
+Authentication and authorization are deliberately small: a deployment-owned
+JSON users file supplies tokens and roles, and each database has a CouchDB-shaped
+`_security` object with `admins`/`members` names and roles. There is no `_users`
+database, IAM integration, or row-level security.
+
+```json
+{"users":[
+  {"name":"alice","token_sha256":"<sha256 of the bearer token>","roles":["analyst"]},
+  {"name":"bob","token":"bob-token","roles":[]}
+]}
+```
+
+Start with `--users-file /etc/douchdb/users.json`. New databases are admin-only
+by default when authentication is configured; use `--default-security open` for
+public databases. `_security` can be changed by a database or server admin, and
+`_all_dbs` is filtered to databases the principal can access.
+
+Admission control is the fairness layer. Every principal is bounded by
+`--per-user-in-flight` and an optional `--per-user-rate`; all requests share
+`--max-in-flight`. View/search work uses separate `--heavy-in-flight` and
+`--heavy-per-user` permits, and anti-entropy/discovery uses
+`--background-in-flight`. Excess work gets `429 Too Many Requests` with
+`Retry-After` rather than an unbounded queue. This prevents one of five users
+from monopolizing request slots or heavy queries.
+
+See [docs/multiuser.md](docs/multiuser.md) for the users-file format, `_security`
+semantics, admission lanes, cluster caveats and deliberate non-goals.
+
 ## Security and operations
 
-- `_all_dbs` and `_membership` require authentication when `--admin` is set;
+- `_all_dbs` is filtered per principal when authentication is configured;
+  `_membership` and node/cluster management require server admin;
   `/_utils/` remains public so the console can render its login page.
 - Session cookies are `HttpOnly; SameSite=Strict`. There is no TLS between
   nodes; run the cluster on a trusted network or behind a TLS proxy.

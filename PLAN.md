@@ -20,7 +20,7 @@ that CouchDB can replicate to and from, storing data in LevelDB, running as a
 Q-shard × N-replica cluster.
 
 **Non-goals, deliberately:** attachments, Mango, `_replicator` database,
-`_users` database machinery beyond auth, multipart `_bulk_docs`. Attachments
+`_users` database machinery (a users file supplies identity), multipart `_bulk_docs`. Attachments
 are rejected rather than stored. Map/reduce views and search indexes are
 implemented with QuickJS; lists, shows, update handlers and a general
 server-side JavaScript platform are not. Design-document JavaScript never gets
@@ -458,6 +458,15 @@ the bulk of the growth.
   page are included. Optional OTLP traces and metrics remain available via
   `--otel-endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT`, with a no-op default. The
   issue/branch/merge workflow is documented in `docs/process.md`.
+* **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
+  token users and roles; `_security` uses CouchDB's `admins`/`members` names and
+  roles, with admin-only defaults when auth is configured and filtered
+  `_all_dbs`. Admission is per principal: global and per-user in-flight bounds,
+  an optional token bucket, separate heavy view/search permits, and a background
+  permit for anti-entropy/discovery. Excess work is rejected with `429` and
+  `Retry-After` instead of queued without bound. Deliberately no `_users`
+  database, IAM, row-level security, weighted shares or cross-coordinator
+  scheduler; see `docs/multiuser.md`.
 * **Single-node baseline.** `scripts/perf_sweep.py` records CRUD, bulk,
   metadata, changes, view, large-document and compaction numbers on release
   builds; results and caveats are in `docs/performance.md`.

@@ -1,43 +1,270 @@
-//! Minimal auth: HTTP basic, plus a stateless HMAC cookie so that any node in
-//! the cluster can validate a session without shared storage.
+//! Authentication and principals: server admin, token users and sessions.
+//!
+//! The users file is deliberately small and self-contained. It is not a
+//! replicated `_users` database; it is a deployment-owned list of tokens and
+//! roles. Passwords are not stored: a token is used as the Basic/session
+//! password. `token_sha256` is supported so the file itself need not contain
+//! bearer secrets.
 
+use axum::http::HeaderMap;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COOKIE: &str = "AuthSession";
 const TTL_SECS: u64 = 60 * 60 * 24;
 
+/// The authenticated caller. `admin` is the server-admin flag; `roles` are the
+/// user's roles. `name=None` is anonymous.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Principal {
+    pub name: Option<String>,
+    pub roles: Vec<String>,
+    pub admin: bool,
+}
+
+impl Principal {
+    pub fn service_admin() -> Principal {
+        Principal {
+            name: None,
+            roles: vec!["_admin".to_string()],
+            admin: true,
+        }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.name.is_some() || self.admin
+    }
+
+    pub fn key(&self) -> &str {
+        self.name.as_deref().unwrap_or("anonymous")
+    }
+
+    pub fn has_role(&self, role: &str) -> bool {
+        self.admin || self.roles.iter().any(|candidate| candidate == role)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct User {
+    name: String,
+    token: Option<String>,
+    token_sha256: Option<[u8; 32]>,
+    roles: Vec<String>,
+    admin: bool,
+}
+
+impl User {
+    fn matches_token(&self, token: &str) -> bool {
+        if let Some(expected) = &self.token {
+            if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
+                return true;
+            }
+        }
+        if let Some(expected) = self.token_sha256 {
+            let digest = Sha256::digest(token.as_bytes());
+            return constant_time_eq(&expected, &digest);
+        }
+        false
+    }
+}
+
 pub struct Auth {
     pub user: String,
     pub pass: String,
+    users: Vec<User>,
     secret: Vec<u8>,
 }
 
 impl Auth {
+    /// A server-admin-only auth instance. Kept for callers that only have
+    /// `--admin`.
     pub fn new(user: String, pass: String) -> Auth {
         let secret = format!("{user}:{pass}:douchdb").into_bytes();
-        Auth { user, pass, secret }
+        Auth {
+            user,
+            pass,
+            users: Vec::new(),
+            secret,
+        }
     }
 
-    pub fn check_basic(&self, header: &str) -> bool {
-        let Some(encoded) = header.strip_prefix("Basic ") else {
-            return false;
-        };
-        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-            return false;
-        };
-        let Ok(text) = String::from_utf8(decoded) else {
-            return false;
-        };
-        match text.split_once(':') {
-            Some((user, pass)) => {
-                constant_time_eq(user.as_bytes(), self.user.as_bytes())
-                    && constant_time_eq(pass.as_bytes(), self.pass.as_bytes())
+    /// Load a users file. `admin` is optional; when present, the config admin
+    /// continues to work alongside file users.
+    pub fn from_users_file(
+        admin: Option<(String, String)>,
+        path: &Path,
+        secret: Option<String>,
+    ) -> Result<Auth, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("users file {}: {error}", path.display()))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("users file {}: {error}", path.display()))?;
+        let entries = value
+            .get("users")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "users file must contain a `users` array".to_string())?;
+        let mut users: Vec<User> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "each user needs a non-empty `name`".to_string())?
+                .to_string();
+            if users.iter().any(|user| user.name == name) {
+                return Err(format!("duplicate user `{name}`"));
             }
-            None => false,
+            let token = entry
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let token_sha256 = entry
+                .get("token_sha256")
+                .and_then(Value::as_str)
+                .map(decode_hex_32)
+                .transpose()
+                .map_err(|error| format!("user `{name}`: {error}"))?;
+            if token.is_none() && token_sha256.is_none() {
+                return Err(format!("user `{name}` needs `token` or `token_sha256`"));
+            }
+            let roles: Vec<String> = entry
+                .get("roles")
+                .and_then(Value::as_array)
+                .map(|roles| {
+                    roles
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let admin = entry.get("admin").and_then(Value::as_bool).unwrap_or(false)
+                || roles.iter().any(|role| role == "_admin");
+            users.push(User {
+                name,
+                token,
+                token_sha256,
+                roles,
+                admin,
+            });
         }
+        let secret = secret
+            .filter(|secret| !secret.is_empty())
+            .map(|secret| secret.into_bytes())
+            .unwrap_or_else(|| match &admin {
+                Some((user, pass)) => format!("{user}:{pass}:douchdb").into_bytes(),
+                None => format!("douchdb-session:{}", crate::db::uuid()).into_bytes(),
+            });
+        let (user, pass) = admin.unwrap_or_default();
+        Ok(Auth {
+            user,
+            pass,
+            users,
+            secret,
+        })
+    }
+
+    fn principal_for_user(&self, user: &User) -> Principal {
+        let mut roles = user.roles.clone();
+        if user.admin && !roles.iter().any(|role| role == "_admin") {
+            roles.push("_admin".to_string());
+        }
+        Principal {
+            name: Some(user.name.clone()),
+            roles,
+            admin: user.admin,
+        }
+    }
+
+    fn principal_for_name(&self, name: &str) -> Option<Principal> {
+        if !self.user.is_empty() && name == self.user {
+            return Some(Principal {
+                name: Some(name.to_string()),
+                roles: vec!["_admin".to_string()],
+                admin: true,
+            });
+        }
+        self.users
+            .iter()
+            .find(|user| user.name == name)
+            .map(|user| self.principal_for_user(user))
+    }
+
+    fn token_principal(&self, token: &str) -> Option<Principal> {
+        self.users
+            .iter()
+            .find(|user| user.matches_token(token))
+            .map(|user| self.principal_for_user(user))
+    }
+
+    fn password_principal(&self, name: &str, password: &str) -> Option<Principal> {
+        if !self.user.is_empty()
+            && constant_time_eq(name.as_bytes(), self.user.as_bytes())
+            && constant_time_eq(password.as_bytes(), self.pass.as_bytes())
+        {
+            return Some(Principal {
+                name: Some(name.to_string()),
+                roles: vec!["_admin".to_string()],
+                admin: true,
+            });
+        }
+        self.users
+            .iter()
+            .find(|user| user.name == name && user.matches_token(password))
+            .map(|user| self.principal_for_user(user))
+    }
+
+    /// Authenticate a name/token pair for `_session`.
+    pub fn authenticate(&self, name: &str, password: &str) -> Option<Principal> {
+        self.password_principal(name, password)
+    }
+
+    pub fn principal(&self, headers: &HeaderMap) -> Principal {
+        if let Some(value) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some(token) = value.strip_prefix("Bearer ") {
+                if let Some(principal) = self.token_principal(token.trim()) {
+                    return principal;
+                }
+            }
+            if let Some(principal) = self.basic_principal(value) {
+                return principal;
+            }
+            // An Authorization header that does not authenticate is not
+            // downgraded to anonymous.
+            return Principal::default();
+        }
+        let cookies = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|value| value.to_str().ok());
+        if let Some(name) = self.cookie_user(cookies) {
+            if let Some(principal) = self.principal_for_name(&name) {
+                return principal;
+            }
+        }
+        Principal::default()
+    }
+
+    fn basic_principal(&self, header: &str) -> Option<Principal> {
+        let encoded = header.strip_prefix("Basic ")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (name, password) = text.split_once(':')?;
+        self.password_principal(name, password)
+    }
+
+    /// Compatibility wrapper used by the old auth tests.
+    #[cfg(test)]
+    pub fn check_basic(&self, header: &str) -> bool {
+        self.basic_principal(header).is_some()
     }
 
     fn sign(&self, payload: &str) -> String {
@@ -46,13 +273,18 @@ impl Auth {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(test)]
     pub fn cookie_header(&self) -> String {
+        self.cookie_header_for(&self.user)
+    }
+
+    pub fn cookie_header_for(&self, name: &str) -> String {
         let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
             + TTL_SECS;
-        let payload = format!("{}:{exp}", self.user);
+        let payload = format!("{name}:{exp}");
         let token = format!(
             "{}.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
@@ -61,8 +293,8 @@ impl Auth {
         format!("{COOKIE}={token}; Version=1; Path=/; HttpOnly; SameSite=Strict")
     }
 
-    pub fn check_cookies(&self, header: Option<&str>) -> bool {
-        let Some(header) = header else { return false };
+    fn cookie_user(&self, header: Option<&str>) -> Option<String> {
+        let header = header?;
         for part in header.split(';') {
             let Some((name, value)) = part.trim().split_once('=') else {
                 continue;
@@ -73,16 +305,13 @@ impl Auth {
             let Some((payload_b64, sig)) = value.split_once('.') else {
                 continue;
             };
-            let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
-            else {
-                continue;
-            };
-            let Ok(payload) = String::from_utf8(payload) else {
-                continue;
-            };
-            let Ok(signature) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig) else {
-                continue;
-            };
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload_b64)
+                .ok()?;
+            let payload = String::from_utf8(payload).ok()?;
+            let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(sig)
+                .ok()?;
             let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
             mac.update(payload.as_bytes());
             if mac.verify_slice(&signature).is_err() {
@@ -98,12 +327,31 @@ impl Auth {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if user == self.user && exp > now {
-                return true;
+            if exp > now {
+                return Some(user.to_string());
             }
         }
-        false
+        None
     }
+
+    /// Compatibility wrapper used by the old auth tests.
+    #[cfg(test)]
+    pub fn check_cookies(&self, header: Option<&str>) -> bool {
+        self.cookie_user(header).is_some()
+    }
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("`token_sha256` must be 64 hex characters".to_string());
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let pair = &value[index * 2..index * 2 + 2];
+        *byte =
+            u8::from_str_radix(pair, 16).map_err(|_| "`token_sha256` must be hex".to_string())?;
+    }
+    Ok(out)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -116,6 +364,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn users_auth() -> Auth {
+        Auth::from_users_file(
+            Some(("admin".into(), "secret".into())),
+            &std::env::temp_dir().join("douchdb-auth-test-users.json"),
+            Some("session-secret".into()),
+        )
+        .expect("users")
+    }
+
+    fn write_users() {
+        std::fs::write(
+            std::env::temp_dir().join("douchdb-auth-test-users.json"),
+            r#"{"users":[
+                {"name":"alice","token":"alice-token","roles":["analyst"]},
+                {"name":"root","token":"root-token","roles":["_admin"]},
+                {"name":"hashed","token_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}
+            ]}"#,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn basic_auth() {
@@ -141,5 +410,42 @@ mod tests {
         assert!(auth.check_cookies(Some(value)));
         assert!(!auth.check_cookies(Some("AuthSession=forged")));
         assert!(!auth.check_cookies(None));
+    }
+
+    #[test]
+    fn token_users_and_hashes() {
+        write_users();
+        let auth = users_auth();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer alice-token".parse().unwrap(),
+        );
+        let principal = auth.principal(&headers);
+        assert_eq!(principal.name.as_deref(), Some("alice"));
+        assert_eq!(principal.roles, vec!["analyst"]);
+        assert!(!principal.admin);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer secret".parse().unwrap(),
+        );
+        let principal = auth.principal(&headers);
+        assert_eq!(principal.name.as_deref(), Some("hashed"));
+    }
+
+    #[test]
+    fn admin_role_from_users_file() {
+        write_users();
+        let auth = users_auth();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer root-token".parse().unwrap(),
+        );
+        let principal = auth.principal(&headers);
+        assert!(principal.admin);
+        assert!(principal.has_role("_admin"));
     }
 }

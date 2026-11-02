@@ -74,7 +74,8 @@ These ports exposed and fixed:
 - Attachments and multipart requests.
 - Mango and Nouveau (search itself is implemented and its tests are ported).
 - Show/list/rewrite/update handlers and `validate_doc_update`.
-- JWT, proxy auth, users DB and security-object administration.
+- JWT, proxy auth and users DB. `_security` administration is implemented with
+  a simpler token users file; see [multiuser.md](multiuser.md).
 - Resharding, cluster setup/config, compaction/disk-monitor internals.
 - JavaScript changes filters and the full CouchDB view sandboxing matrix;
   a focused subset is covered by `quickjs_view_sandbox_ports`.
