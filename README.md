@@ -510,8 +510,11 @@ router; there is no coordinator role.
 - `?w=` / `?r=` select write and read quorum. The default read quorum is
   `r = (n/2)+1`; `?r=1` is the local fast path. An unmet read quorum returns
   `503 quorum_not_met`, including tombstones and all conflict leaves in the
-  merged comparison. Revision-shaped reads (`open_revs`, `revs_info=true`)
-  still require `r` reachable replicas, but return the local response shape.
+  merged comparison. Ancestry is merged from every replica before leaf bodies
+  are deduplicated, so a longer history on one node is not lost; requested
+  histories return the longest retained path deterministically. Revision-shaped
+  reads (`open_revs`, `revs_info=true`) still require `r` reachable replicas,
+  but return the local response shape.
   An unmet write quorum returns `202`; anti-entropy repairs the replica later.
 - Anti-entropy runs every `--sync-secs`, pulling from every peer for the shards
   the node replicates plus every design document, so a returning node can

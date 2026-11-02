@@ -8660,3 +8660,105 @@ async fn revision_shaped_reads_do_not_bypass_the_read_quorum() {
         assert_eq!(body["error"], "quorum_not_met", "query {query}: {body}");
     }
 }
+
+#[tokio::test]
+async fn quorum_merges_ancestry_across_replicas_with_different_history_lengths() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("histories").await;
+    }
+    // Node 1 keeps only the newest revision, so its tombstone history is
+    // shorter than node 2's for the identical leaf.
+    let (status, body) = nodes[1].put("/histories/_revs_limit", json!(1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, limit) = nodes[1].get("/histories/_revs_limit").await;
+    assert_eq!(limit, 1);
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let root = "00000000000000000000000000000000";
+    let live = "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let tombstone = "3-cccccccccccccccccccccccccccccccc";
+    // Node 0 only knows the live ancestor. Nodes 1 and 2 know the tombstone;
+    // node 1 prunes its history to the tombstone alone, node 2 keeps the path.
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/histories/_bulk_docs",
+            Some(json!({"new_edits": false, "docs": [
+                {"_id": "x", "_rev": live,
+                 "_revisions": {"start": 2, "ids": [
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    root
+                 ]}, "v": "stale ancestor"}
+            ]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for node in [1usize, 2] {
+        let (status, body) = nodes[node]
+            .req_with(
+                Method::POST,
+                "/histories/_bulk_docs",
+                Some(json!({"new_edits": false, "docs": [
+                    {"_id": "x", "_rev": tombstone, "_deleted": true,
+                     "_revisions": {"start": 3, "ids": [
+                        "cccccccccccccccccccccccccccccccc",
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        root
+                     ]}}
+                ]})),
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // Local histories differ for the same leaf id.
+    let (status, short) = nodes[1]
+        .get(&format!("/histories/x?r=1&rev={tombstone}&revs=true"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{short}");
+    assert_eq!(
+        short["_revisions"]["ids"].as_array().unwrap().len(),
+        1,
+        "{short}"
+    );
+    let (status, full) = nodes[2]
+        .get(&format!("/histories/x?r=1&rev={tombstone}&revs=true"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(
+        full["_revisions"]["ids"].as_array().unwrap().len(),
+        3,
+        "{full}"
+    );
+
+    // The complete history from node 2 must eliminate the stale live ancestor
+    // regardless of which coordinator answered and which history arrived first.
+    for node in &nodes {
+        let (status, body) = node.get("/histories/x?r=3").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{} returned stale data: {body}",
+            node.base
+        );
+        assert_eq!(body["reason"], "deleted", "{body}");
+
+        // Requested history is deterministic: the longest supplied path.
+        let (status, body) = node
+            .get(&format!("/histories/x?r=3&rev={tombstone}&revs=true"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", node.base);
+        assert_eq!(
+            body["_revisions"]["ids"].as_array().unwrap().len(),
+            3,
+            "{}: {body}",
+            node.base
+        );
+    }
+}

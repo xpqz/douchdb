@@ -237,72 +237,20 @@ pub(crate) async fn quorum_read(
         return fail(ApiError::not_found("missing"));
     }
 
-    // Deduplicate identical leaves reported by several replicas, then build the
-    // merged tree's ancestry from every returned history.
-    let mut unique: BTreeMap<String, Value> = BTreeMap::new();
-    for doc in docs {
-        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
-            unique.entry(rev.to_string()).or_insert(doc);
-        }
-    }
-    let docs: Vec<Value> = unique.into_values().collect();
-    if docs.is_empty() {
-        return fail(ApiError::not_found("missing"));
-    }
-    let histories: Vec<Vec<String>> = docs.iter().map(revision_history).collect();
-    let ancestor_revs: BTreeSet<String> = histories
-        .iter()
-        .flat_map(|history| history.iter().skip(1).cloned())
-        .collect();
-
-    let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
-    for doc in &docs {
-        if let Some(rev) = doc.get("_rev").and_then(Value::as_str) {
-            leaves.insert(
-                rev.to_string(),
-                doc.get("_deleted").and_then(Value::as_bool) == Some(true),
-            );
-        }
-    }
-    let winner_rev = match requested_rev.as_deref() {
-        Some(rev) if leaves.contains_key(rev) => rev.to_string(),
-        Some(_) => return fail(ApiError::not_found("missing")),
-        None => match leaves
-            .iter()
-            .filter(|(rev, _)| !ancestor_revs.contains(*rev))
-            .max_by_key(|(rev, deleted)| {
-                let parsed = crate::rev::Rev::parse(rev);
-                let pos = parsed.as_ref().map(|rev| rev.pos).unwrap_or(0);
-                let id = parsed.map(|rev| rev.id);
-                (!**deleted, pos, id)
-            })
-            .map(|(rev, _)| rev.clone())
-        {
-            Some(rev) => rev,
-            None => return fail(ApiError::not_found("missing")),
-        },
-    };
-    let Some(mut winner) = docs
-        .iter()
-        .find(|doc| doc.get("_rev").and_then(Value::as_str) == Some(winner_rev.as_str()))
-        .cloned()
-    else {
+    let Some(reconciled) = reconcile_leaves(&docs, requested_rev.as_deref()) else {
         return fail(ApiError::not_found("missing"));
     };
+    let winner_rev = reconciled
+        .winner
+        .get("_rev")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut winner = reconciled.winner;
+    let conflicts = reconciled.conflicts;
+    let deleted_conflicts = reconciled.deleted_conflicts;
+    let history = reconciled.history;
 
-    // Every maximal leaf other than the winner is a conflict.
-    let mut conflicts = Vec::new();
-    let mut deleted_conflicts = Vec::new();
-    for (rev, deleted) in &leaves {
-        if *rev == winner_rev || ancestor_revs.contains(rev) {
-            continue;
-        }
-        if *deleted {
-            deleted_conflicts.push(rev.clone());
-        } else {
-            conflicts.push(rev.clone());
-        }
-    }
     if let Some(object) = winner.as_object_mut() {
         if flag(q, "conflicts") {
             object.insert("_conflicts".to_string(), json!(conflicts));
@@ -314,7 +262,24 @@ pub(crate) async fn quorum_read(
         } else {
             object.remove("_deleted_conflicts");
         }
-        if !flag(q, "revs") {
+        if flag(q, "revs") {
+            // Return a deterministic history: the longest one supplied for
+            // this revision, not whichever replica answered first.
+            if let Some(start) = history
+                .first()
+                .and_then(|rev| crate::rev::Rev::parse(rev))
+                .map(|rev| rev.pos)
+            {
+                let ids: Vec<String> = history
+                    .iter()
+                    .filter_map(|rev| rev.split_once('-').map(|(_, id)| id.to_string()))
+                    .collect();
+                object.insert(
+                    "_revisions".to_string(),
+                    json!({"start": start, "ids": ids}),
+                );
+            }
+        } else {
             object.remove("_revisions");
         }
     }
@@ -451,6 +416,84 @@ async fn replica_docs(
         }
     }
     (reachable, docs)
+}
+
+struct Reconciled {
+    winner: Value,
+    conflicts: Vec<String>,
+    deleted_conflicts: Vec<String>,
+    history: Vec<String>,
+}
+
+/// Pure merged-tree reconciliation. `docs` may contain duplicate revision ids
+/// with different retained history lengths; ancestry is merged from every
+/// response before bodies are deduplicated, and the longest history wins
+/// deterministically. The result must not depend on input order.
+fn reconcile_leaves(docs: &[Value], requested_rev: Option<&str>) -> Option<Reconciled> {
+    let mut bodies: BTreeMap<String, Value> = BTreeMap::new();
+    let mut histories: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
+    for doc in docs {
+        let Some(rev) = doc.get("_rev").and_then(Value::as_str) else {
+            continue;
+        };
+        let history = revision_history(doc);
+        histories
+            .entry(rev.to_string())
+            .and_modify(|current| {
+                if history.len() > current.len()
+                    || (history.len() == current.len() && history > *current)
+                {
+                    *current = history.clone();
+                }
+            })
+            .or_insert(history);
+        leaves
+            .entry(rev.to_string())
+            .or_insert_with(|| doc.get("_deleted").and_then(Value::as_bool) == Some(true));
+        bodies.entry(rev.to_string()).or_insert_with(|| doc.clone());
+    }
+    if bodies.is_empty() {
+        return None;
+    }
+
+    let ancestor_revs: BTreeSet<String> = histories
+        .values()
+        .flat_map(|history| history.iter().skip(1).cloned())
+        .collect();
+    let winner_rev = match requested_rev {
+        Some(rev) if leaves.contains_key(rev) => rev.to_string(),
+        Some(_) => return None,
+        None => leaves
+            .iter()
+            .filter(|(rev, _)| !ancestor_revs.contains(*rev))
+            .max_by_key(|(rev, deleted)| {
+                let parsed = crate::rev::Rev::parse(rev);
+                let pos = parsed.as_ref().map(|rev| rev.pos).unwrap_or(0);
+                let id = parsed.map(|rev| rev.id);
+                (!**deleted, pos, id)
+            })
+            .map(|(rev, _)| rev.clone())?,
+    };
+    let winner = bodies.get(&winner_rev)?.clone();
+    let mut conflicts = Vec::new();
+    let mut deleted_conflicts = Vec::new();
+    for (rev, deleted) in &leaves {
+        if *rev == winner_rev || ancestor_revs.contains(rev) {
+            continue;
+        }
+        if *deleted {
+            deleted_conflicts.push(rev.clone());
+        } else {
+            conflicts.push(rev.clone());
+        }
+    }
+    Some(Reconciled {
+        winner,
+        conflicts,
+        deleted_conflicts,
+        history: histories.get(&winner_rev).cloned().unwrap_or_default(),
+    })
 }
 
 /// Revision history from a `revs=true` document response, newest first.
@@ -2409,4 +2452,62 @@ async fn fetch_search_mask(
         .json::<Value>()
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn doc(rev: &str, start: u64, ids: &[&str], deleted: bool) -> Value {
+        json!({
+            "_id": "x",
+            "_rev": rev,
+            "_deleted": deleted,
+            "_revisions": {"start": start, "ids": ids}
+        })
+    }
+
+    #[test]
+    fn reconcile_merges_ancestry_before_deduplicating_bodies() {
+        let live = doc("2-b", 2, &["b", "0"], false);
+        let short = doc("3-c", 3, &["c"], true);
+        let full = doc("3-c", 3, &["c", "b", "0"], true);
+
+        for docs in [
+            vec![short.clone(), full.clone(), live.clone()],
+            vec![full.clone(), live.clone(), short.clone()],
+            vec![live.clone(), short.clone(), full.clone()],
+        ] {
+            let merged = reconcile_leaves(&docs, None).expect("merged tree");
+            assert_eq!(merged.winner["_rev"], "3-c");
+            assert_eq!(merged.winner["_deleted"], true);
+            assert!(merged.conflicts.is_empty(), "{:?}", merged.conflicts);
+            assert_eq!(merged.history, ["3-c", "2-b", "1-0"]);
+        }
+    }
+
+    #[test]
+    fn reconcile_promotes_a_live_conflict_over_a_descendant_tombstone() {
+        let docs = [
+            doc("2-a", 2, &["a", "0"], false),
+            doc("2-b", 2, &["b", "0"], false),
+            doc("3-c", 3, &["c", "b", "0"], true),
+        ];
+        let merged = reconcile_leaves(&docs, None).expect("merged tree");
+        assert_eq!(merged.winner["_rev"], "2-a");
+        assert!(merged.conflicts.is_empty());
+        assert_eq!(merged.deleted_conflicts, ["3-c"]);
+    }
+
+    #[test]
+    fn reconcile_exact_revision_uses_the_longest_history() {
+        let short = doc("3-c", 3, &["c"], true);
+        let full = doc("3-c", 3, &["c", "b", "0"], true);
+        for docs in [[short.clone(), full.clone()], [full, short]] {
+            let merged = reconcile_leaves(&docs, Some("3-c")).expect("exact rev");
+            assert_eq!(merged.winner["_rev"], "3-c");
+            assert_eq!(merged.history, ["3-c", "2-b", "1-0"]);
+        }
+    }
 }
