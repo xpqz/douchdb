@@ -20,7 +20,16 @@ pub struct RevTree {
 impl RevTree {
     /// Merge a root-to-leaf path, growing the tree where it already exists.
     pub fn merge_path(&mut self, path: &[Rev], deleted: bool) {
-        for (i, rev) in path.iter().enumerate() {
+        // A path may include ancestors that were already pruned from this
+        // tree. Merging them back would turn a stemmed root into an extra
+        // leaf, so start at the first revision the tree already knows and
+        // ignore the older prefix.
+        let start = path
+            .iter()
+            .position(|rev| self.edges.contains_key(&rev.to_string()))
+            .unwrap_or(0);
+        for i in start..path.len() {
+            let rev = &path[i];
             let parent = if i == 0 {
                 None
             } else {
@@ -304,6 +313,36 @@ mod tests {
         assert!(tree.edges.contains_key(&live));
         assert!(tree.edges.contains_key(&deep[3]));
         assert!(tree.edges.values().all(Option::is_none));
+    }
+
+    #[test]
+    fn merge_ignores_ancestors_already_pruned_from_the_tree() {
+        let base = format!("1-{}", id(1));
+        let parent = format!("2-{}", id(2));
+        let leaf = format!("3-{}", id(3));
+        let sibling = format!("3-{}", id(4));
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("{parent},{leaf}")), false);
+        tree.prune(2);
+        assert!(!tree.edges.contains_key(&base));
+
+        // A later replicated path still carries the pruned base. It must not
+        // become an orphan root/leaf.
+        tree.merge_path(&revs(&format!("{base},{parent},{sibling}")), false);
+        assert!(!tree.edges.contains_key(&base));
+        assert_eq!(tree.leaves(), vec![leaf, sibling]);
+    }
+
+    #[test]
+    fn merge_extends_an_existing_leaf_without_losing_its_parent() {
+        let root = format!("1-{}", id(1));
+        let middle = format!("2-{}", id(2));
+        let leaf = format!("3-{}", id(3));
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("{root},{middle}")), false);
+        tree.merge_path(&revs(&format!("{root},{middle},{leaf}")), false);
+        assert_eq!(tree.leaves(), vec![leaf]);
+        assert_eq!(tree.edges[&middle], Some(root));
     }
 
     use proptest::prelude::*;

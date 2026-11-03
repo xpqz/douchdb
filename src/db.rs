@@ -1219,6 +1219,7 @@ impl Db {
                         }
                     }
                     ancestors.sort();
+                    ancestors.dedup();
                     ancestors.truncate(10);
                     Ok((missing, ancestors))
                 })
@@ -1638,6 +1639,17 @@ fn put_many(
         }
     }
 
+    // CouchDB merges all paths in a bulk request before applying revs_limit.
+    // Prune once here so a later branch cannot resurrect a previously pruned
+    // ancestor as an orphan root.
+    let limit = shard.revs_limit();
+    for (id, meta) in staged.iter_mut() {
+        meta.tree.prune(limit);
+        if let Ok(bytes) = serde_json::to_vec(meta) {
+            ops.push((meta_key(id), Some(bytes)));
+        }
+    }
+
     if let Err(e) = commit_ops(shard, ops) {
         shard.invalidate_latest();
         let message = e.to_string();
@@ -1768,7 +1780,6 @@ impl Stage<'_> {
         path.push(Rev::parse(&rev).expect("valid rev"));
 
         meta.tree.merge_path(&path, deleted);
-        meta.tree.prune(self.shard.revs_limit());
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
@@ -1825,7 +1836,6 @@ impl Stage<'_> {
         let changed = !known;
         if changed {
             meta.tree.merge_path(&path, deleted);
-            meta.tree.prune(self.shard.revs_limit());
         }
 
         self.ops
@@ -2179,7 +2189,11 @@ fn read_doc_rev(
         }
     }
     if opts.revs {
-        let path = meta.tree.path(rev);
+        let mut path = meta.tree.path(rev);
+        let limit = shard.revs_limit().max(1) as usize;
+        if path.len() > limit {
+            path.drain(0..path.len() - limit);
+        }
         let start = Rev::parse(rev).map(|r| r.pos).unwrap_or(0);
         let ids: Vec<String> = path
             .iter()
@@ -2192,9 +2206,12 @@ fn read_doc_rev(
         map.insert("_local_seq".into(), json!(meta.seq));
     }
     if opts.revs_info {
-        let info: Vec<Value> = meta
-            .tree
-            .path(rev)
+        let mut path = meta.tree.path(rev);
+        let limit = shard.revs_limit().max(1) as usize;
+        if path.len() > limit {
+            path.drain(0..path.len() - limit);
+        }
+        let info: Vec<Value> = path
             .iter()
             .rev()
             .map(|r| {

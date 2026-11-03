@@ -151,9 +151,7 @@ def random_scenarios(seed: int, rounds: int) -> list[tuple[str, list[Node], int 
             (
                 f"random-{round_index}",
                 nodes[1:],
-                # Shared-ancestor pruning still diverges (#127); keep random
-                # trees at the default limit until it is fixed.
-                None,
+                rng.choice([None, 1, 2, 3]),
             )
         )
     return scenarios

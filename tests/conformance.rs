@@ -841,6 +841,57 @@ async fn changes_returns_latest_per_document_and_pending() {
 }
 
 #[tokio::test]
+async fn revs_limit_truncates_each_revisions_path() {
+    let s = Server::start(false);
+    s.fresh_db("revlimit").await;
+    let base = "af8ad5700570192f918c22b2bb800165";
+    let b705 = "b705850634addeeb5a78b55d88fd3977";
+    let live = "0f619d79d9ac0858051a1e271f9b2128";
+    let deleted = "4026bdae07b424575d0a28a582302f38";
+    let deep = "4591760a792c43df397caaba9cca6e77";
+    let (status, _) = s.put("/revlimit/_revs_limit", json!(2)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Insert the shallow live branch first so the shared base stays in the
+    // tree; CouchDB still truncates the deep leaf's returned history to two.
+    for doc in [
+        json!({"_id": "doc", "_rev": format!("2-{live}"),
+               "_revisions": {"start": 2, "ids": [live, base]}, "v": "live"}),
+        json!({"_id": "doc", "_rev": format!("3-{deep}"),
+               "_revisions": {"start": 3, "ids": [deep, b705, base]}, "v": "deep"}),
+        json!({"_id": "doc", "_rev": format!("2-{deleted}"), "_deleted": true,
+               "_revisions": {"start": 2, "ids": [deleted, base]}, "v": "deleted"}),
+    ] {
+        let (status, body) = s
+            .post(
+                "/revlimit/_bulk_docs",
+                json!({"docs": [doc], "new_edits": false}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = s.get("/revlimit/doc?open_revs=all&revs=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deep_doc = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["ok"]["_rev"] == format!("3-{deep}"))
+        .expect("deep leaf");
+    assert_eq!(deep_doc["ok"]["_revisions"]["ids"], json!([deep, b705]));
+
+    let (status, body) = s
+        .get(&format!(
+            "/revlimit/doc?rev=3-{deep}&revs=true&revs_info=true&latest=true"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_revisions"]["ids"], json!([deep, b705]));
+    assert_eq!(body["_revs_info"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn deleted_leaf_cannot_be_updated_by_rev() {
     let s = Server::start(false);
     s.fresh_db("tombstones").await;
@@ -1729,6 +1780,19 @@ async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     assert_eq!(
         body["rows"][0]["doc"]["_conflicts"],
         json!([format!("2-{b}")])
+    );
+
+    let (status, body) = s
+        .post(
+            "/revs/_revs_diff",
+            json!({"a": [format!("3-{b}"), format!("3-{c}")]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["a"]["possible_ancestors"],
+        json!([format!("2-{b}"), format!("2-{c}")]),
+        "ancestors are unique"
     );
 }
 

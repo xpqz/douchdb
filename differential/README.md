@@ -95,8 +95,8 @@ deeper winners, three-way conflicts, live/deleted leaves, deleting the winner
 and a short pruning case. `--conflict-rounds N` adds seeded random trees
 (default 20).
 
-Random trees currently run at the default `_revs_limit`; shared-ancestor
-pruning still diverges and is tracked as #127.
+Random trees use seeded `revs_limit` values as well as the default, so
+shared-ancestor pruning is exercised.
 
 ## Changes pagination
 
