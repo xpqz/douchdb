@@ -2341,12 +2341,6 @@ fn all_docs_key_row(
     if deleted {
         row["value"]["deleted"] = json!(true);
     }
-    if opts.conflicts {
-        let conflicts = meta.tree.conflicts(&winner);
-        if !conflicts.is_empty() {
-            row["value"]["_conflicts"] = json!(conflicts);
-        }
-    }
     if opts.include_docs {
         if deleted {
             row["doc"] = Value::Null;
@@ -2371,11 +2365,8 @@ fn finish_all_docs(
     offset: usize,
 ) -> DbResult<Value> {
     let mut results = Vec::new();
-    for (id, rev, doc, conflicts, _deleted) in rows {
+    for (id, rev, doc, _conflicts, _deleted) in rows {
         let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-        if !conflicts.is_empty() {
-            row["value"]["_conflicts"] = json!(conflicts);
-        }
         if let Some(doc) = doc {
             row["doc"] = doc;
         }

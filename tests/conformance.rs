@@ -1555,6 +1555,18 @@ async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     let (_, body) = s.get(&format!("/revs/a?rev=2-{b}&revs=true")).await;
     assert_eq!(body["_revisions"]["start"], 2);
     assert_eq!(body["_revisions"]["ids"], json!([b, root]));
+
+    // CouchDB only emits _conflicts inside the embedded doc, never row.value.
+    let (_, body) = s.get("/revs/_all_docs?conflicts=true").await;
+    assert!(body["rows"][0]["value"].get("_conflicts").is_none());
+    let (_, body) = s
+        .get("/revs/_all_docs?conflicts=true&include_docs=true")
+        .await;
+    assert!(body["rows"][0]["value"].get("_conflicts").is_none());
+    assert_eq!(
+        body["rows"][0]["doc"]["_conflicts"],
+        json!([format!("2-{b}")])
+    );
 }
 
 #[tokio::test]
