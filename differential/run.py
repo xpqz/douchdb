@@ -4,8 +4,9 @@
 The fuzzer sends the same random document operations to a douchdb instance and
 a CouchDB instance, compares status codes, error codes, revision ids and
 subsequent document state, and minimizes the first divergence to a small,
-replayable operation list. With ``--views`` it instead drives map/reduce view
-queries against a fixed corpus and a seeded query set.
+replayable operation list. With ``--multi`` it drives multi-document endpoints;
+with ``--views`` it drives map/reduce view queries against a fixed corpus and a
+seeded query set.
 
 This is a single-node API test. It complements, but does not replace, the
 cluster and fault-injection tests in ``jepsen-clj/``.
@@ -641,6 +642,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="random view queries after the systematic set (default: 200)",
     )
     parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="run the multi-document differential suite instead of document CRUD",
+    )
+    parser.add_argument(
+        "--multi-steps",
+        type=int,
+        default=120,
+        help="multi-document operations (default: 120)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit nonzero even for allowlisted divergences",
@@ -705,6 +717,9 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.douchdb_url) != bool(args.couchdb_url):
         print("--douchdb-url and --couchdb-url must be supplied together", file=sys.stderr)
         return 2
+    if args.views and args.multi:
+        print("--views and --multi cannot be combined", file=sys.stderr)
+        return 2
 
     known_divergences = load_known_divergences(args.known_divergences)
 
@@ -738,6 +753,20 @@ def main(argv: list[str] | None = None) -> int:
                 right,
                 seed=args.seed,
                 queries=args.view_queries,
+                verbose=args.verbose,
+            )
+
+        if args.multi:
+            if args.replay:
+                print("--multi cannot be combined with --replay", file=sys.stderr)
+                return 2
+            import multi
+
+            return multi.run_multi(
+                left,
+                right,
+                seed=args.seed,
+                steps=args.multi_steps,
                 verbose=args.verbose,
             )
 

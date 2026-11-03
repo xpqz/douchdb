@@ -820,11 +820,14 @@ and minimizes any divergence to a replayable repro:
 
 ```sh
 python3 differential/run.py --seed 1
+python3 differential/run.py --multi --seed 1
 python3 differential/run.py --views --seed 1
 ```
 
-The `--views` mode drives map/reduce views, grouping, ranges, multi-key queries
-and built-in/custom reducers against the same CouchDB instance. See
+The `--multi` mode drives `_bulk_docs`, `_all_docs`, `_changes`, `_bulk_get`,
+`_revs_diff` and revision-shaped reads. The `--views` mode drives map/reduce
+views, grouping, ranges, multi-key queries and built-in/custom reducers against
+the same CouchDB instance. See
 [differential/README.md](differential/README.md) for options, known
 divergences and how to add operations.
 

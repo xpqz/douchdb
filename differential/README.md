@@ -80,6 +80,25 @@ order inside a response is not compared directly; for writes, the revision id
 independently covers document key order and number representation. Duplicate
 keys are sent as raw bodies so both servers decode them exactly as written.
 
+## Multi-document operations
+
+Run the multi-document suite:
+
+```sh
+python3 differential/run.py --multi --seed 1
+```
+
+It keeps a model of winners and revision history while sending seeded random
+operations to both servers: `_bulk_docs` writes and deletes, revision-shaped
+GETs, `open_revs=all`, `_all_docs` keys/ranges/include_docs/conflicts,
+`_changes`, `_bulk_get` and `_revs_diff`. `--multi-steps N` controls the
+operation count (default 120).
+
+Sequence values are opaque and are removed before comparison. DouchDB currently
+emits every `_changes` revision event while CouchDB emits the latest change per
+document (issue #125), so `_changes` rows are deduplicated by document id and
+the latest row per id is compared.
+
 ## Map/reduce views
 
 Run the view suite instead of document CRUD:
