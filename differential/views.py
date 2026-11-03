@@ -260,6 +260,7 @@ def run_views(
     seed: int,
     queries: int,
     verbose: bool,
+    mutations: int = 0,
 ) -> int:
     docs = corpus()
     design = design_doc()
@@ -281,6 +282,113 @@ def run_views(
     planned = systematic_queries()
     rng = random.Random(seed)
     planned.extend(random_query(rng) for _ in range(queries))
+
+    if mutations:
+        revs: dict[str, str] = {}
+        deleted: set[str] = set()
+        response = left.get(f"/{DB}/_all_docs?include_docs=true")
+        for row in response.body.get("rows", []):
+            if not row["id"].startswith("_design/"):
+                revs[row["id"]] = row["value"]["rev"]
+        ddoc_rev = left.get(f"/{DB}/{DDOC_ID}").body["_rev"]
+        mutation_rng = random.Random(seed + 1)
+        view_rng = random.Random(seed + 2)
+        for round_index in range(mutations):
+            action = mutation_rng.choice(["update", "delete", "recreate", "ddoc"])
+            if action == "ddoc":
+                threshold = mutation_rng.choice([0, 1, 2])
+                views = dict(VIEWS)
+                views["numbers"] = {
+                    "map": (
+                        "function(doc) { if (doc.n !== undefined && "
+                        f"doc.n >= {threshold}) {{ emit(doc.n, doc.n); }} }}"
+                    )
+                }
+                body = {"_id": DDOC_ID, "_rev": ddoc_rev, "views": views}
+                left_response = left.request("PUT", f"/{DB}/{DDOC_ID}", body=body)
+                right_response = right.request("PUT", f"/{DB}/{DDOC_ID}", body=body)
+                path = f"/{DB}/{DDOC_ID}"
+                if left_response.status in (200, 201):
+                    ddoc_rev = left_response.body["rev"]
+                detail = {"action": action, "threshold": threshold}
+            else:
+                doc_id = mutation_rng.choice(sorted(revs))
+                if action == "update" and doc_id in deleted:
+                    action = "recreate"
+                if action == "delete" and doc_id in deleted:
+                    action = "update"
+                body = {
+                    "_id": doc_id,
+                    "tag": mutation_rng.choice(["a", "b", "c", "d"]),
+                    "n": mutation_rng.randint(-5, 30),
+                    "s": mutation_rng.choice(["alpha", "Beta", "ä", "z"]),
+                }
+                if action == "update":
+                    body["_rev"] = revs[doc_id]
+                elif action == "delete":
+                    body["_rev"] = revs[doc_id]
+                    body["_deleted"] = True
+                left_response = left.request(
+                    "POST", f"/{DB}/_bulk_docs", body={"docs": [body]}
+                )
+                right_response = right.request(
+                    "POST", f"/{DB}/_bulk_docs", body={"docs": [body]}
+                )
+                path = f"/{DB}/_bulk_docs"
+                if left_response.status == 201 and left_response.body:
+                    result = left_response.body[0]
+                    if result.get("ok"):
+                        revs[doc_id] = result["rev"]
+                        if action == "delete":
+                            deleted.add(doc_id)
+                        else:
+                            deleted.discard(doc_id)
+                detail = {"action": action, "doc": doc_id}
+
+            problem = compare(left_response, right_response, {})
+            if problem is None:
+                for _ in range(2):
+                    view, params = random_query(view_rng)
+                    left_check = left.get(view_path(view, params))
+                    right_check = right.get(view_path(view, params))
+                    problem = compare(left_check, right_check, params)
+                    if problem:
+                        left_response, right_response = left_check, right_check
+                        path = view_path(view, params)
+                        detail = {"action": "query-after-" + action, "view": view, "params": params}
+                        break
+            if problem is None:
+                if verbose:
+                    print(f"    mutation {round_index:03d} {detail}")
+                continue
+
+            print()
+            print(f"VIEW DIVERGENCE at mutation {round_index} ({problem})")
+            print(f"  detail:  {json.dumps(detail, ensure_ascii=False, sort_keys=True)}")
+            print(f"  path:    {path}")
+            print(f"  douchdb: {describe(left_response)}")
+            print(f"  couchdb: {describe(right_response)}")
+            print()
+            directory = HERE / "artifacts" / f"views-live-{seed}"
+            directory.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "views-live",
+                "seed": seed,
+                "mutation": round_index,
+                "detail": detail,
+                "path": path,
+                "douchdb": {"status": left_response.status, "body": left_response.body},
+                "couchdb": {"status": right_response.status, "body": right_response.body},
+            }
+            (directory / "repro.json").write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False)
+            )
+            print(f"==> Wrote {directory / 'repro.json'}")
+            return 1
+
+        # After mutations, rerun a fresh systematic pass against the new corpus.
+        planned.extend(systematic_queries())
+
     print(
         f"==> Fuzzing {len(planned)} view queries over {len(docs)} documents "
         f"(seed {seed})",

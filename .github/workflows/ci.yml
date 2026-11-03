@@ -56,6 +56,7 @@ jobs:
         run: |
           python3 differential/run.py --views --seed 1 --view-queries 100 --skip-build
           python3 differential/run.py --views --seed 2 --view-queries 100 --skip-build
+          python3 differential/run.py --views --view-mutations 10 --view-queries 50 --seed 3 --skip-build
       - name: Differential conflicts
         run: |
           python3 differential/run.py --conflicts --seed 1 --conflict-rounds 10 --skip-build

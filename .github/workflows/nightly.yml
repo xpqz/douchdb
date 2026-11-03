@@ -40,6 +40,13 @@ jobs:
             python3 differential/run.py --views --seed "$seed" --view-queries 500 --skip-build
             echo "::endgroup::"
           done
+      - name: View freshness seeds
+        run: |
+          for seed in $(seq 1 5); do
+            echo "::group::views-live seed $seed"
+            python3 differential/run.py --views --view-mutations 50 --view-queries 200 --seed "$seed" --skip-build
+            echo "::endgroup::"
+          done
       - name: Conflict seeds
         run: |
           for seed in $(seq 1 10); do

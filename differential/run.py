@@ -642,6 +642,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="random view queries after the systematic set (default: 200)",
     )
     parser.add_argument(
+        "--view-mutations",
+        type=int,
+        default=0,
+        help="interleave document/design mutations before re-querying (default: 0)",
+    )
+    parser.add_argument(
         "--multi",
         action="store_true",
         help="run the multi-document differential suite instead of document CRUD",
@@ -765,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 queries=args.view_queries,
                 verbose=args.verbose,
+                mutations=args.view_mutations,
             )
 
         if args.multi:

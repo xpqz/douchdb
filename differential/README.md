@@ -132,7 +132,9 @@ keys/multi-keys, ranges, descending order, include_docs, skip/limit, Unicode
 collation, missing fields and CouchDB's query-validation errors.
 
 `--view-queries N` controls the number of random queries after the systematic
-set (default 200).
+set (default 200). `--view-mutations N` interleaves document updates, deletes,
+recreations and design-document map changes before re-querying, so index
+freshness and rebuilds are compared as well as a static corpus.
 
 CouchDB's `offset` and row order for multi-key queries follow internal legacy
 rules that are not part of its API contract. Those rows are compared as a
