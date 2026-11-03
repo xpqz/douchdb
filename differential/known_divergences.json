@@ -1,12 +1,1 @@
-{
-  "large_integer_precision": {
-    "issue": 110,
-    "description": "JSON integers outside serde_json's i64/u64 range are silently converted to floats, changing the stored value and the revision hash.",
-    "remove_when": "issue #110 is fixed and the differential run is clean with large integers enabled"
-  },
-  "duplicate_key_order": {
-    "issue": 123,
-    "description": "Duplicate JSON object keys keep the last value but the wrong position, so the revision hash differs from CouchDB.",
-    "remove_when": "issue #123 is fixed and the duplicate-key cases pass"
-  }
-}
+{}

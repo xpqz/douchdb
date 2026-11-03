@@ -228,7 +228,7 @@ fn json_body(body: &[u8]) -> DbResult<Value> {
     if body.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))
+    crate::json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))
 }
 
 fn valid_db_name(name: &str) -> bool {
@@ -3077,7 +3077,7 @@ async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response 
             Ok(None) => fail(ApiError::not_found("missing")),
             Err(e) => fail(e),
         },
-        "PUT" => match serde_json::from_slice::<Value>(body) {
+        "PUT" => match crate::json::from_slice(body) {
             Ok(doc) => {
                 if let Err(e) = validate_doc(&doc) {
                     return fail(e);
@@ -3109,7 +3109,7 @@ async fn bulk_docs(
     body: &[u8],
     headers: &HeaderMap,
 ) -> Response {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+    let Ok(value) = crate::json::from_slice(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
     let new_edits = match value.get("new_edits") {
@@ -4224,7 +4224,7 @@ async fn put_doc(
     q: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Response {
-    let mut doc = match serde_json::from_slice::<Value>(&body) {
+    let mut doc = match crate::json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return fail(ApiError::bad_request(format!("invalid JSON: {e}"))),
     };

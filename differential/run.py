@@ -159,8 +159,8 @@ def make_doc_body(value: Any, doc_id: str, rev: str | None) -> dict[str, Any]:
     return body
 
 
-def value_pool(exclude_large_integers: bool) -> list[Any]:
-    values = [
+def value_pool() -> list[Any]:
+    return [
         None,
         True,
         False,
@@ -189,23 +189,15 @@ def value_pool(exclude_large_integers: bool) -> list[Any]:
         {"b": 2, "a": 1},
         {"unicode-ключ": "значение"},
     ]
-    if exclude_large_integers:
-        values = [value for value in values if not contains_large_integer(value)]
-    return values
 
 
-def choose_value(rng: random.Random, exclude_large_integers: bool) -> Any:
-    if not exclude_large_integers and rng.random() < 0.15:
+def choose_value(rng: random.Random) -> Any:
+    if rng.random() < 0.15:
         return copy.deepcopy(rng.choice(LARGE_INTEGERS))
-    return copy.deepcopy(rng.choice(value_pool(exclude_large_integers)))
+    return copy.deepcopy(rng.choice(value_pool()))
 
 
-def generate_ops(
-    seed: int,
-    steps: int,
-    exclude_large_integers: bool,
-    exclude_duplicate_keys: bool,
-) -> list[dict[str, Any]]:
+def generate_ops(seed: int, steps: int) -> list[dict[str, Any]]:
     rng = random.Random(seed)
     docs = [
         "doc-0",
@@ -226,7 +218,7 @@ def generate_ops(
         doc = rng.choice(docs)
         roll = rng.random()
         if roll < 0.45:
-            if not exclude_duplicate_keys and rng.random() < 0.08:
+            if rng.random() < 0.08:
                 ops.append(
                     {
                         "op": "put",
@@ -241,7 +233,7 @@ def generate_ops(
                     {
                         "op": "put",
                         "doc": doc,
-                        "value": choose_value(rng, exclude_large_integers),
+                        "value": choose_value(rng),
                         "rev": rng.choice(
                             ["current", "current", "current", "none", "stale"]
                         ),
@@ -637,19 +629,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1, help="random seed (default: 1)")
     parser.add_argument("--steps", type=int, default=60, help="operations per run (default: 60)")
     parser.add_argument(
-        "--exclude-large-integers",
-        action="store_true",
-        help="omit integers outside i64/u64, so known issue #110 does not stop the run",
-    )
-    parser.add_argument(
-        "--exclude-duplicate-keys",
-        action="store_true",
-        help="omit raw bodies with duplicate keys, so known issue #123 does not stop the run",
-    )
-    parser.add_argument(
         "--strict",
         action="store_true",
-        help="exit nonzero even for known divergences",
+        help="exit nonzero even for allowlisted divergences",
     )
     parser.add_argument(
         "--no-minimize",
@@ -738,12 +720,7 @@ def main(argv: list[str] | None = None) -> int:
             ops = payload.get("minimized_ops") or payload["ops"]
             print(f"==> Replaying {len(ops)} operations from {args.replay}")
         else:
-            ops = generate_ops(
-                args.seed,
-                args.steps,
-                args.exclude_large_integers,
-                args.exclude_duplicate_keys,
-            )
+            ops = generate_ops(args.seed, args.steps)
             print(f"==> Fuzzing seed {args.seed} with {len(ops)} operations")
 
         divergence = replay(left, right, ops)

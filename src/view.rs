@@ -1563,10 +1563,7 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Number(a), Value::Number(b)) => {
-            let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
-            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-        }
+        (Value::Number(a), Value::Number(b)) => cmp_numbers(a, b),
         (Value::String(a), Value::String(b)) => compare_strings(a, b),
         (Value::Array(a), Value::Array(b)) => {
             for (left, right) in a.iter().zip(b.iter()) {
@@ -1591,6 +1588,51 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
             a.len().cmp(&b.len())
         }
         _ => Ordering::Equal,
+    }
+}
+
+fn cmp_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+    if is_integer_literal(a.as_str()) && is_integer_literal(b.as_str()) {
+        return cmp_decimal_integers(a.as_str(), b.as_str());
+    }
+    let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+}
+
+fn is_integer_literal(raw: &str) -> bool {
+    !raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+}
+
+/// Compare decimal integer literals exactly. `f64` would collapse values that
+/// differ beyond its 53-bit mantissa.
+fn cmp_decimal_integers(a: &str, b: &str) -> Ordering {
+    fn parts(raw: &str) -> (bool, &str) {
+        let (negative, digits) = match raw.strip_prefix('-') {
+            Some(digits) => (true, digits),
+            None => (false, raw),
+        };
+        let digits = digits.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        (negative && digits != "0", digits)
+    }
+
+    let (a_negative, a_digits) = parts(a);
+    let (b_negative, b_digits) = parts(b);
+    if a_negative != b_negative {
+        return if a_negative {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let magnitude = a_digits
+        .len()
+        .cmp(&b_digits.len())
+        .then_with(|| a_digits.cmp(b_digits));
+    if a_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
     }
 }
 
@@ -1623,6 +1665,21 @@ mod tests {
         for pair in ordered.windows(2) {
             assert_eq!(cmp_json(&pair[0], &pair[1]), Ordering::Less);
         }
+    }
+
+    #[test]
+    fn integers_beyond_f64_precision_collate_exactly() {
+        let smaller: Value = serde_json::from_str("123456789012345678901234567890").unwrap();
+        let larger: Value = serde_json::from_str("123456789012345678901234567891").unwrap();
+        assert_eq!(cmp_json(&smaller, &larger), Ordering::Less);
+        assert_eq!(cmp_json(&larger, &smaller), Ordering::Greater);
+
+        let negative: Value = serde_json::from_str("-123456789012345678901234567891").unwrap();
+        assert_eq!(cmp_json(&negative, &smaller), Ordering::Less);
+
+        let above_u64: Value = serde_json::from_str("18446744073709551616").unwrap();
+        let max_u64: Value = serde_json::from_str("18446744073709551615").unwrap();
+        assert_eq!(cmp_json(&max_u64, &above_u64), Ordering::Less);
     }
 
     #[test]

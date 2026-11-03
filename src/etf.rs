@@ -9,6 +9,7 @@ const VERSION_MAGIC: u8 = 131;
 const SMALL_INTEGER_EXT: u8 = 97;
 const INTEGER_EXT: u8 = 98;
 const SMALL_BIG_EXT: u8 = 110;
+const LARGE_BIG_EXT: u8 = 111;
 const NEW_FLOAT_EXT: u8 = 70;
 const SMALL_TUPLE_EXT: u8 = 104;
 const LARGE_TUPLE_EXT: u8 = 105;
@@ -25,6 +26,12 @@ pub enum Term {
     /// A JSON integer above `i64::MAX`. CouchDB's `jiffy` keeps it unsigned;
     /// casting it to `i64` would wrap and produce a different revision hash.
     UInt(u64),
+    /// A JSON integer outside both `i64` and `u64`, kept as a little-endian
+    /// magnitude so the revision hash matches CouchDB's bignum encoding.
+    BigInt {
+        negative: bool,
+        magnitude: Vec<u8>,
+    },
     Float(f64),
     Binary(Vec<u8>),
     List(Vec<Term>),
@@ -93,6 +100,20 @@ impl Term {
                 out.push(0);
                 out.extend_from_slice(&digits);
             }
+            Term::BigInt {
+                negative,
+                magnitude,
+            } => {
+                if magnitude.len() <= u8::MAX as usize {
+                    out.push(SMALL_BIG_EXT);
+                    out.push(magnitude.len() as u8);
+                } else {
+                    out.push(LARGE_BIG_EXT);
+                    out.extend((magnitude.len() as u32).to_be_bytes());
+                }
+                out.push(u8::from(*negative));
+                out.extend_from_slice(magnitude);
+            }
             Term::Float(f) => {
                 out.push(NEW_FLOAT_EXT);
                 out.extend(f.to_be_bytes());
@@ -129,6 +150,36 @@ impl Term {
     }
 }
 
+fn is_integer(raw: &str) -> bool {
+    !raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+}
+
+/// Convert a decimal integer literal to a little-endian magnitude.
+fn decimal_magnitude(raw: &str) -> (bool, Vec<u8>) {
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, raw),
+    };
+    let mut magnitude = vec![0u8];
+    for digit in digits.bytes() {
+        let mut carry = u16::from(digit - b'0');
+        for byte in &mut magnitude {
+            let value = u16::from(*byte) * 10 + carry;
+            *byte = value as u8;
+            carry = value >> 8;
+        }
+        while carry > 0 {
+            magnitude.push(carry as u8);
+            carry >>= 8;
+        }
+    }
+    while magnitude.len() > 1 && magnitude.last() == Some(&0) {
+        magnitude.pop();
+    }
+    let zero = magnitude.len() == 1 && magnitude[0] == 0;
+    (negative && !zero, magnitude)
+}
+
 /// Convert a JSON value to the term CouchDB's `jiffy` would have produced.
 ///
 /// Objects become Erlang proplists (`{Props}`) in document order, *not* maps:
@@ -146,6 +197,12 @@ pub fn from_json(value: &serde_json::Value) -> Term {
                 Term::Int(i)
             } else if let Some(u) = n.as_u64() {
                 Term::UInt(u)
+            } else if is_integer(n.as_str()) {
+                let (negative, magnitude) = decimal_magnitude(n.as_str());
+                Term::BigInt {
+                    negative,
+                    magnitude,
+                }
             } else {
                 Term::Float(n.as_f64().unwrap_or(0.0))
             }
@@ -163,7 +220,7 @@ pub fn from_json(value: &serde_json::Value) -> Term {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn atoms_are_latin1_under_minor_version_1() {
@@ -196,6 +253,36 @@ mod tests {
         );
         assert_eq!(from_json(&json!(1u64 << 63)), Term::UInt(1 << 63));
         assert_eq!(from_json(&json!(u64::MAX)), Term::UInt(u64::MAX));
+    }
+
+    #[test]
+    fn big_integers_use_erlang_big_ext() {
+        let above_u64: Value = serde_json::from_str("18446744073709551616").unwrap();
+        assert_eq!(
+            from_json(&above_u64),
+            Term::BigInt {
+                negative: false,
+                magnitude: vec![0, 0, 0, 0, 0, 0, 0, 0, 1],
+            }
+        );
+        assert_eq!(
+            from_json(&above_u64).encode(),
+            vec![131, 110, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+
+        let below_i64: Value = serde_json::from_str("-9223372036854775809").unwrap();
+        assert_eq!(
+            from_json(&below_i64).encode(),
+            vec![131, 110, 8, 1, 1, 0, 0, 0, 0, 0, 0, 0x80]
+        );
+
+        let huge: Value = serde_json::from_str(&format!("1{}", "0".repeat(700))).unwrap();
+        let encoded = from_json(&huge).encode();
+        assert_eq!(encoded[1], LARGE_BIG_EXT, "magnitude above 255 bytes");
+        assert_eq!(
+            u32::from_be_bytes(encoded[2..6].try_into().unwrap()) as usize,
+            encoded.len() - 7
+        );
     }
 
     #[test]

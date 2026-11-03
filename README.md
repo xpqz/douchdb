@@ -844,6 +844,12 @@ Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
 containing `_attachments` are rejected with `attachments_not_supported`.
 
+JSON numbers use arbitrary precision: integers beyond `i64`/`u64` are stored
+exactly and hashed with CouchDB's bignum ETF encoding. Document parsing also
+follows CouchDB's duplicate-key rule — the last value wins and the key keeps
+the position of its last occurrence — so revision ids match. The JSON object
+key `$serde_json::private::Number` is reserved by the parser and rejected.
+
 The `rusty-leveldb` dependency is temporarily vendored with a heap-sentinel
 LRU list and duplicate-key eviction fix; see
 `vendor/rusty-leveldb/PATCHES.md`. This addresses the cache corruption and

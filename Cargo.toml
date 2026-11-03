@@ -22,7 +22,8 @@ sha2 = "0.10"
 rusty-leveldb = "4"
 serde = { version = "1", features = ["derive", "rc"] }
 # preserve_order is load-bearing: CouchDB's rev hash depends on JSON key order.
-serde_json = { version = "1", features = ["preserve_order"] }
+# arbitrary_precision keeps integers beyond i64/u64 exact, including rev hashes.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

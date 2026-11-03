@@ -13,6 +13,7 @@ mod fabric;
 mod js;
 #[cfg(feature = "wasmtime")]
 mod js_wasmtime;
+mod json;
 mod metrics;
 mod observability;
 mod replicate;

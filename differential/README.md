@@ -27,10 +27,6 @@ python3 differential/run.py --seed 7 --skip-build
 # Run more operations, print each one
 python3 differential/run.py --seed 7 --steps 500 --verbose
 
-# Skip the input classes covered by open known-divergence issues
-python3 differential/run.py --seed 7 --steps 500 \
-  --exclude-large-integers --exclude-duplicate-keys
-
 # Use servers you already started
 python3 differential/run.py \
   --douchdb-url http://127.0.0.1:5984 \
@@ -89,19 +85,10 @@ keys are sent as raw bodies so both servers decode them exactly as written.
 `known_divergences.json` maps a divergence kind to an open issue. A known
 divergence is reported with its issue number and does not fail the run unless
 `--strict` is passed. Every entry must name the issue and the condition under
-which it can be removed. When an issue is fixed, delete the entry and run with
-the previously excluded input enabled.
+which it can be removed.
 
-Current entries:
-
-| Kind | Issue | Meaning |
-| --- | --- | --- |
-| `large_integer_precision` | [#110](https://github.com/xpqz/douchdb/issues/110) | Integers outside `i64`/`u64` silently become floats. |
-| `duplicate_key_order` | [#123](https://github.com/xpqz/douchdb/issues/123) | Duplicate object keys keep the wrong position, changing the revision hash. |
-
-To keep a run useful while those issues are open, pass
-`--exclude-large-integers --exclude-duplicate-keys`. New divergences still fail
-the run.
+Current entries: none. Large integers and duplicate object keys are covered by
+the default generator and match CouchDB.
 
 ## Exit status
 
