@@ -15,6 +15,16 @@ pub struct Rev {
 }
 
 impl Rev {
+    /// The revision id without the position prefix, rendered the way CouchDB
+    /// emits it: 16-byte ids as lowercase hex, anything else verbatim.
+    pub fn id_string(&self) -> String {
+        if self.id.len() == 16 {
+            self.id.iter().map(|b| format!("{b:02x}")).collect()
+        } else {
+            String::from_utf8_lossy(&self.id).into_owned()
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Rev> {
         let (pos, id) = s.split_once('-')?;
         if pos.is_empty() || pos.len() > 1 && pos.starts_with('0') {

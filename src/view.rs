@@ -1079,6 +1079,23 @@ fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result
     run_map_json(source, &serialized, limits)
 }
 
+/// Evaluate a `_changes` filter function for each document. CouchDB filters are
+/// ordinary JavaScript predicates `function(doc, req) { ... }`. Wrapping the
+/// predicate in a map function lets filters use the same native, process and
+/// WASM sandbox paths (and timeouts) as view maps.
+pub(crate) fn run_filter_json(
+    source: &str,
+    query: &str,
+    docs: &[(String, String)],
+    limits: ViewLimits,
+) -> Result<std::collections::HashSet<String>, String> {
+    let wrapped = format!(
+        "function (doc) {{ if (({source})(doc, {{\"query\":{query}}})) {{ emit(doc._id, null); }} }}"
+    );
+    let rows = run_map_json(&wrapped, docs, limits)?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
+}
+
 /// Run the map function over batches of already-serialized documents. Batching
 /// amortizes the QuickJS call/JSON boundary; callers that already hold raw
 /// bodies (cold index builds) also avoid a Rust parse/encode round trip.

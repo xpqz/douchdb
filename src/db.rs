@@ -996,10 +996,21 @@ impl Db {
         if opts.descending {
             rows.reverse();
         }
+        // Filters are evaluated after merging shard rows so every shard is
+        // scanned: a shard-local limit would otherwise drop matching rows
+        // behind non-matching documents.
+        let scanned_last = rows.last().map(|row| row.seq);
+        if let Some(filter) = &opts.filter {
+            rows = apply_change_filter(rows, filter)?;
+        }
         if let Some(limit) = opts.limit {
             rows.truncate(limit);
         }
-        let last_seq = rows.last().map(|r| r.seq).unwrap_or(opts.since);
+        let last_seq = rows
+            .last()
+            .map(|r| r.seq)
+            .or(scanned_last)
+            .unwrap_or(opts.since);
         let pending = self
             .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
             .await?;
@@ -1109,6 +1120,15 @@ impl Db {
                                     if watermark != u64::MAX {
                                         rows.retain(|row| row.seq <= watermark);
                                         done[slot] = true;
+                                    }
+                                    if let Some(filter) = &opts.filter {
+                                        match apply_change_filter(rows, filter) {
+                                            Ok(filtered) => rows = filtered,
+                                            Err(error) => {
+                                                yield Err(error);
+                                                return;
+                                            }
+                                        }
                                     }
                                     buffers[slot].extend(rows);
                                 }
@@ -1235,7 +1255,13 @@ impl Db {
         Ok(Value::Object(out))
     }
 
-    pub async fn bulk_get(&self, body: &Value, attachments: bool, revs: bool) -> DbResult<Value> {
+    pub async fn bulk_get(
+        &self,
+        body: &Value,
+        attachments: bool,
+        revs: bool,
+        latest: bool,
+    ) -> DbResult<Value> {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
@@ -1259,6 +1285,7 @@ impl Db {
                     .get("attachments")
                     .and_then(Value::as_bool)
                     .unwrap_or(attachments),
+                latest: req.get("latest").and_then(Value::as_bool).unwrap_or(latest),
                 include_deleted: true,
                 ..Default::default()
             };
@@ -1483,7 +1510,10 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
         ));
     }
     for key in obj.keys() {
-        if key.starts_with('_') && !META_FIELDS.contains(&key.as_str()) {
+        if key.starts_with('_')
+            && !META_FIELDS.contains(&key.as_str())
+            && !key.starts_with("_replication_")
+        {
             return Err(ApiError::new(
                 400,
                 "doc_validation",
@@ -2086,8 +2116,24 @@ pub struct ChangesOpts {
     pub style_all_docs: bool,
     pub descending: bool,
     pub doc_ids: Option<Vec<String>>,
+    pub filter: Option<ChangeFilter>,
+    pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
     pub owned: Option<Vec<bool>>,
+}
+
+/// Server-side `_changes` filters. `_doc_ids` stays in `doc_ids` because it is
+/// an id-only filter that does not need to load document bodies.
+#[derive(Clone, Debug)]
+pub enum ChangeFilter {
+    Design,
+    Js { source: String, query: String },
+}
+
+impl ChangeFilter {
+    fn needs_doc(&self) -> bool {
+        matches!(self, ChangeFilter::Js { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -2108,11 +2154,26 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
         .ok_or_else(|| ApiError::not_found("missing"))?;
 
     if let Some(open_revs) = &opts.open_revs {
-        let wanted: Vec<String> = if open_revs.iter().any(|r| r == "all") {
+        let mut wanted: Vec<String> = if open_revs.iter().any(|r| r == "all") {
             meta.tree.leaves()
         } else {
             open_revs.clone()
         };
+        if !open_revs.iter().any(|r| r == "all")
+            && open_revs.iter().any(|rev| Rev::parse(rev).is_none())
+        {
+            return Err(ApiError::bad_request("Invalid rev format"));
+        }
+        if opts.latest {
+            let mut seen = std::collections::HashSet::new();
+            wanted = wanted
+                .into_iter()
+                .filter_map(|rev| {
+                    let leaf = meta.tree.latest_leaf(&rev).unwrap_or(rev);
+                    seen.insert(leaf.clone()).then_some(leaf)
+                })
+                .collect();
+        }
         let mut docs = Vec::new();
         for rev in wanted {
             match read_doc_rev(shard, id, &meta, &rev, opts) {
@@ -2124,7 +2185,13 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
     }
 
     let rev = match &opts.rev {
-        Some(r) => r.clone(),
+        Some(r) => {
+            if opts.latest {
+                meta.tree.latest_leaf(r).unwrap_or_else(|| r.clone())
+            } else {
+                r.clone()
+            }
+        }
         None => {
             let winner = meta
                 .tree
@@ -2198,7 +2265,7 @@ fn read_doc_rev(
         let ids: Vec<String> = path
             .iter()
             .rev()
-            .filter_map(|r| Rev::parse(r).map(|p| hex(&p.id)))
+            .filter_map(|r| Rev::parse(r).map(|p| p.id_string()))
             .collect();
         map.insert("_revisions".into(), json!({ "start": start, "ids": ids }));
     }
@@ -2454,11 +2521,44 @@ fn finish_all_docs(
     Ok(json!({ "total_rows": total, "offset": offset, "rows": results }))
 }
 
+fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<Vec<ChangeRow>> {
+    match filter {
+        ChangeFilter::Design => Ok(rows
+            .into_iter()
+            .filter(|row| row.id.starts_with("_design/"))
+            .collect()),
+        ChangeFilter::Js { source, query } => {
+            let docs: Vec<(String, String)> = rows
+                .iter()
+                .filter_map(|row| row.doc.clone().map(|doc| (row.id.clone(), doc)))
+                .collect();
+            if docs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let matched = crate::view::run_filter_json(
+                source,
+                query,
+                &docs,
+                crate::view::ViewLimits::default(),
+            )
+            .map_err(|reason| ApiError::new(500, "unknown_error", reason))?;
+            Ok(rows
+                .into_iter()
+                .filter(|row| matched.contains(&row.id))
+                .collect())
+        }
+    }
+}
+
 fn collect_changes(
     shard: &mut crate::store::Shard,
     opts: &ChangesOpts,
 ) -> DbResult<Vec<ChangeRow>> {
-    let limit = opts.limit.unwrap_or(usize::MAX);
+    let limit = if opts.filter.is_some() {
+        usize::MAX
+    } else {
+        opts.limit.unwrap_or(usize::MAX)
+    };
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -2494,9 +2594,22 @@ fn collect_changes(
         };
         let deleted = meta.tree.is_deleted(&winner);
         let changes: Vec<(String, bool)> = if opts.style_all_docs {
-            meta.tree
+            // CouchDB lists the winner first, then the remaining leaves by
+            // descending position/id, regardless of whether the winner is
+            // live or deleted.
+            let mut leaves = meta
+                .tree
                 .leaves()
                 .into_iter()
+                .filter(|leaf| leaf != &winner)
+                .collect::<Vec<_>>();
+            leaves.sort_by(|a, b| {
+                let pa = Rev::parse(a).map(|r| (r.pos, r.id)).unwrap_or_default();
+                let pb = Rev::parse(b).map(|r| (r.pos, r.id)).unwrap_or_default();
+                pb.cmp(&pa)
+            });
+            std::iter::once(winner.clone())
+                .chain(leaves)
                 .map(|leaf| {
                     let leaf_deleted = meta.tree.is_deleted(&leaf);
                     (leaf, leaf_deleted)
@@ -2506,7 +2619,13 @@ fn collect_changes(
             vec![(winner.clone(), deleted)]
         };
 
-        let doc = if opts.include_docs {
+        let needs_doc = opts.include_docs
+            || opts
+                .filter
+                .as_ref()
+                .map(ChangeFilter::needs_doc)
+                .unwrap_or(false);
+        let doc = if needs_doc {
             read_doc_rev(
                 shard,
                 &id,
@@ -2515,6 +2634,7 @@ fn collect_changes(
                 &DocOpts {
                     rev: Some(winner.clone()),
                     include_deleted: true,
+                    conflicts: opts.conflicts,
                     ..Default::default()
                 },
             )
@@ -2571,6 +2691,8 @@ mod tests {
             style_all_docs: false,
             descending: false,
             doc_ids: None,
+            filter: None,
+            conflicts: false,
             owned: None,
         };
         let (rows, last_seq, pending) = db.changes_rows(&opts).await.unwrap();
@@ -2644,6 +2766,8 @@ mod tests {
             style_all_docs: false,
             descending: false,
             doc_ids: None,
+            filter: None,
+            conflicts: false,
             owned: None,
         };
         let (rows, last_seq, _pending) = db.changes_rows(&opts).await.unwrap();

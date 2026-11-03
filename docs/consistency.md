@@ -37,6 +37,11 @@ where behaviour is best-effort, it says so.
 - `open_revs`, `revs_info=true` and `_revisions` are revision-shaped reads.
   They still require the requested read quorum, but the response shape is
   served from the winning/local replica.
+- `latest=true` resolves an explicitly requested revision to the tip of its
+  branch, including a deleted tip, and deduplicates `open_revs` that resolve to
+  the same tip.
+- `_revisions` and `_conflicts` render revision ids the way they arrived:
+  sixteen-byte ids as lowercase hex, other ids verbatim.
 - `_bulk_get` and `_revs_diff` use the same document state; `_bulk_get` returns
   tombstones when the requested revision is deleted.
 
@@ -51,8 +56,12 @@ where behaviour is best-effort, it says so.
   and, as in CouchDB 3.5, ignores `since`.
 - `pending` is the number of documents after `last_seq` in the requested
   direction.
-- `style=all_docs` includes all leaf revisions; the default includes only the
-  winner.
+- `style=all_docs` includes all leaf revisions; the winner is first and the
+  remaining leaves follow in descending position order. The default includes
+  only the winner.
+- `filter=_design`, `filter=_doc_ids`, named design-document filters and
+  `filter=_view` with `view=<ddoc>/<view>` are supported. `conflicts=true`
+  adds `_conflicts` to the embedded winner document.
 - Continuous, longpoll and SSE feeds are at-least-once. Clients must dedupe by
   document id and revision, and must not assume a row is delivered exactly
   once.
@@ -70,6 +79,9 @@ where behaviour is best-effort, it says so.
 - `startkey`/`endkey`, `descending`, `inclusive_end`, `keys`, `skip` and
   `limit` follow CouchDB. `offset` is the insertion point of the start key plus
   skip, capped at `total_rows`.
+- `key` is a range query over live rows, so it omits deleted documents;
+  `keys` is the lookup form that reports deleted rows. `update_seq=true` adds
+  the local update sequence to the response.
 - `_all_docs` is not a snapshot. Concurrent writes may appear between pages.
 
 ## Views and search
@@ -123,6 +135,7 @@ where behaviour is best-effort, it says so.
 
 - No multi-document transactions or atomic cross-document writes.
 - No Mango, lists, shows, or attachments.
+- `validate_doc_update` functions are accepted but not executed (#129).
 - No cross-database atomicity.
 - No linearizable `_changes` cursors across independent clients; cursors are
   per-feed opaque values.

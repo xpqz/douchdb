@@ -841,6 +841,319 @@ async fn changes_returns_latest_per_document_and_pending() {
 }
 
 #[tokio::test]
+async fn changes_style_all_docs_lists_the_winner_first() {
+    let s = Server::start(false);
+    s.fresh_db("chstyle").await;
+    let base = "af8ad5700570192f918c22b2bb800165";
+    let mid = "b705850634addeeb5a78b55d88fd3977";
+    let live = "cccccccccccccccccccccccccccccccc";
+    let deleted = "99999999999999999999999999999999";
+    let winner = "ffffffffffffffffffffffffffffffff";
+    let docs = [
+        json!({"_id": "foo", "_rev": format!("1-{base}"),
+               "_revisions": {"start": 1, "ids": [base]}, "v": 0}),
+        json!({"_id": "foo", "_rev": format!("3-{live}"),
+               "_revisions": {"start": 3, "ids": [live, mid, base]}, "v": 3}),
+        json!({"_id": "foo", "_rev": format!("2-{deleted}"), "_deleted": true,
+               "_revisions": {"start": 2, "ids": [deleted, base]}, "v": 2}),
+        json!({"_id": "foo", "_rev": format!("4-{winner}"),
+               "_revisions": {"start": 4, "ids": [winner, mid, live, base]}, "v": 4}),
+    ];
+    for doc in docs {
+        let (status, body) = s
+            .post(
+                "/chstyle/_bulk_docs",
+                json!({"docs": [doc], "new_edits": false}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = s
+        .get("/chstyle/_changes?style=all_docs&include_docs=true&conflicts=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revs: Vec<String> = body["results"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["rev"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        revs,
+        vec![
+            format!("4-{winner}"),
+            format!("3-{live}"),
+            format!("2-{deleted}")
+        ],
+        "winner first, then leaves by descending position"
+    );
+    assert_eq!(
+        body["results"][0]["doc"]["_conflicts"],
+        json!([format!("3-{live}")])
+    );
+}
+
+#[tokio::test]
+async fn changes_filters_support_design_named_view_and_shorthand() {
+    let s = Server::start(false);
+    s.fresh_db("chfilter").await;
+    let docs = json!({"docs": [
+        {"_id": "0", "integer": 0},
+        {"_id": "1", "integer": 1},
+        {"_id": "2", "integer": 2},
+        {"_id": "_design/foo", "integer": 4,
+         "filters": {"even": "function (doc) { return doc.integer % 2 === 1; }"},
+         "views": {"even": {"map": "function (doc) { if (doc.integer % 2 === 1) { emit(doc._id, null); } }"}}},
+        {"_id": "_design/even", "filters": {"even": "function (doc) { return doc.integer % 2 === 0; }"}}
+    ]});
+    let (status, body) = s.post("/chfilter/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = s.get("/chfilter/_changes?filter=_design").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["_design/even", "_design/foo"]);
+
+    let (status, body) = s.get("/chfilter/_changes?filter=foo/even").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["1"]);
+
+    let (status, body) = s.get("/chfilter/_changes?filter=_view&view=foo/even").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["1"]);
+
+    let (status, body) = s.get("/chfilter/_changes?filter=even").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["0", "2", "_design/foo"]);
+
+    let (status, _) = s.get("/chfilter/_changes?filter=missing/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = s.get("/chfilter/_changes?filter=_view").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn bulk_docs_handles_local_docs_and_rejects_replicated_docs_without_rev() {
+    let s = Server::start(false);
+    s.fresh_db("bulkedge").await;
+
+    let (status, body) = s
+        .post(
+            "/bulkedge/_bulk_docs",
+            json!({"docs": [{"_id": "_local/bar"}, {"_id": "baz"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["ok"], true);
+    assert_eq!(body[0]["id"], "_local/bar");
+    assert_eq!(body[1]["ok"], true);
+
+    let (status, body) = s.get("/bulkedge/_local/bar").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rev = body["_rev"].as_str().unwrap().to_string();
+    let (status, body) = s
+        .post(
+            "/bulkedge/_bulk_docs",
+            json!({"docs": [{"_id": "_local/bar", "_rev": rev, "_deleted": true}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, _) = s.get("/bulkedge/_local/bar").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = s
+        .post(
+            "/bulkedge/_bulk_docs",
+            json!({"docs": [{"_id": "no-rev"}], "new_edits": false}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+}
+
+#[tokio::test]
+async fn conflict_leaves_are_listed_by_descending_position() {
+    let s = Server::start(false);
+    s.fresh_db("corder").await;
+    let (_, first) = s.put("/corder/doc", json!({"v": 0})).await;
+    let root = first["rev"].as_str().unwrap().to_string();
+    let lower = "2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let winner = "2-ffffffffffffffffffffffffffffffff";
+    let (status, body) = s
+        .post(
+            "/corder/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "doc", "_rev": lower, "v": 1},
+                {"_id": "doc", "_rev": winner, "v": 2}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/corder/doc?conflicts=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], winner);
+    assert_eq!(
+        body["_conflicts"],
+        json!([lower, root]),
+        "higher revision positions come first"
+    );
+}
+
+#[tokio::test]
+async fn latest_resolves_interior_revisions_to_the_branch_tip() {
+    let s = Server::start(false);
+    s.fresh_db("latestrev").await;
+    let (_, first) = s.put("/latestrev/doc", json!({"version": "first"})).await;
+    let first_rev = first["rev"].as_str().unwrap().to_string();
+    let (_, second) = s
+        .put(
+            "/latestrev/doc",
+            json!({"_rev": first_rev, "version": "second"}),
+        )
+        .await;
+    let second_rev = second["rev"].as_str().unwrap().to_string();
+
+    let (status, body) = s
+        .get(&format!("/latestrev/doc?rev={first_rev}&latest=true"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], second_rev);
+    assert_eq!(body["version"], "second");
+
+    let open = format!(
+        "/latestrev/doc?open_revs={}&latest=true",
+        urlencoding(&json!([first_rev, second_rev]))
+    );
+    let (status, body) = s.get(&open).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        1,
+        "both requested revisions resolve to one branch tip: {body}"
+    );
+    assert_eq!(body[0]["ok"]["_rev"], second_rev);
+
+    let (status, body) = s
+        .get(&format!(
+            "/latestrev/doc?open_revs={}",
+            urlencoding(&json!(["1-almost", "not-a-rev"]))
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn all_docs_key_excludes_deleted_and_reports_update_seq() {
+    let s = Server::start(false);
+    s.fresh_db("allkey").await;
+    let (_, body) = s
+        .post(
+            "/allkey/_bulk_docs",
+            json!({"docs": [{"_id": "0"}, {"_id": "1"}]}),
+        )
+        .await;
+    let rev = body[1]["rev"].as_str().unwrap().to_string();
+    let (status, _) = s.delete(&format!("/allkey/1?rev={rev}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = s.get("/allkey/_all_docs?key=%221%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+
+    let (status, body) = s.get("/allkey/_all_docs?key=%220%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "0");
+
+    let (status, body) = s.get("/allkey/_all_docs?update_seq=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["update_seq"].as_u64().unwrap() >= 2);
+}
+
+fn urlencoding(value: &Value) -> String {
+    value
+        .to_string()
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn percent_encoded_slash_in_database_names() {
+    let s = Server::start(false);
+    let (status, body) = s.put("/encoded%2Fdb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/encoded%2Fdb").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["db_name"], "encoded/db");
+
+    let (status, body) = s.put("/encoded%2Fdb/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/encoded%2Fdb/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 1);
+
+    let (status, _) = s.delete("/encoded%2Fdb").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn replication_state_fields_round_trip() {
+    let s = Server::start(false);
+    s.fresh_db("repstate").await;
+    let (status, body) = s
+        .post(
+            "/repstate",
+            json!({
+                "_replication_id": "test",
+                "_replication_state": "triggered",
+                "_replication_state_time": 1,
+                "_replication_stats": {}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // CouchDB hashes these fields as part of the body.
+    assert_eq!(body["rev"], "1-dd04afb29523fb7974448551ed4c2a37");
+    let id = body["id"].as_str().unwrap();
+    let (status, body) = s.get(&format!("/repstate/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_replication_id"], "test");
+    assert_eq!(body["_replication_state"], "triggered");
+    assert_eq!(body["_replication_state_time"], 1);
+    assert_eq!(body["_replication_stats"], json!({}));
+}
+
+#[tokio::test]
 async fn revs_limit_truncates_each_revisions_path() {
     let s = Server::start(false);
     s.fresh_db("revlimit").await;
@@ -4728,7 +5041,7 @@ async fn changes_style_all_docs_includes_conflict_leaves() {
         .iter()
         .map(|change| change["rev"].as_str().unwrap())
         .collect();
-    assert_eq!(leaves, ["2-b", "2-c"]);
+    assert_eq!(leaves, ["2-c", "2-b"], "winner first");
 
     let (status, body) = s
         .get("/changesconf/_changes?style=all_docs&include_docs=true")

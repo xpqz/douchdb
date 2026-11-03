@@ -57,6 +57,25 @@ impl RevTree {
         self.edges.contains_key(rev) && !self.edges.values().flatten().any(|p| p == rev)
     }
 
+    /// Follow a revision to the tip of its branch. CouchDB's `latest=true`
+    /// returns that tip even when the caller names an interior revision.
+    pub fn latest_leaf(&self, rev: &str) -> Option<String> {
+        if !self.edges.contains_key(rev) {
+            return None;
+        }
+        let mut current = rev.to_string();
+        loop {
+            match self
+                .edges
+                .iter()
+                .find(|(_, parent)| parent.as_deref() == Some(current.as_str()))
+            {
+                Some((child, _)) => current = child.clone(),
+                None => return Some(current),
+            }
+        }
+    }
+
     pub fn is_deleted(&self, rev: &str) -> bool {
         self.deleted.contains(rev)
     }
@@ -76,7 +95,7 @@ impl RevTree {
             .into_iter()
             .filter(|rev| rev != winner && !self.is_deleted(rev))
             .collect();
-        out.sort();
+        self.sort_leaves_descending(&mut out);
         out
     }
 
@@ -86,8 +105,20 @@ impl RevTree {
             .into_iter()
             .filter(|rev| rev != winner && self.is_deleted(rev))
             .collect();
-        out.sort();
+        self.sort_leaves_descending(&mut out);
         out
+    }
+
+    fn sort_leaves_descending(&self, leaves: &mut [String]) {
+        leaves.sort_by(|a, b| {
+            let a = Rev::parse(a)
+                .map(|rev| (rev.pos, rev.id))
+                .unwrap_or_default();
+            let b = Rev::parse(b)
+                .map(|rev| (rev.pos, rev.id))
+                .unwrap_or_default();
+            b.cmp(&a)
+        });
     }
 
     /// Root-to-leaf path containing `rev`.
@@ -210,7 +241,7 @@ mod tests {
         );
         assert_eq!(
             tree.deleted_conflicts(&winner),
-            vec![format!("2-{}", id(2)), format!("2-{}", id(7))]
+            vec![format!("2-{}", id(7)), format!("2-{}", id(2))]
         );
     }
 

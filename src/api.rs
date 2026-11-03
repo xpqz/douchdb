@@ -4,7 +4,7 @@
 use crate::auth::{Auth, Principal};
 use crate::cluster::{Cluster, ShardMap};
 use crate::db::{
-    validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
+    validate_doc, AllDocsOpts, ApiError, ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
 };
 use crate::fabric::*;
 pub use crate::observability::{health_public, health_status, metrics_status};
@@ -234,10 +234,13 @@ fn json_body(body: &[u8]) -> DbResult<Value> {
 fn valid_db_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('_')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("//")
         && name.bytes().all(|b| {
             b.is_ascii_lowercase()
                 || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')')
+                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
         })
 }
 
@@ -3136,6 +3139,15 @@ async fn bulk_docs(
     let Some(docs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
+    if !new_edits
+        && docs
+            .iter()
+            .any(|doc| doc.get("_rev").is_none() && doc.get("_revisions").is_none())
+    {
+        return fail(ApiError::bad_request(
+            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
+        ));
+    }
     // `_bulk_docs` is a member operation for ordinary documents, but design
     // documents are database-admin data. Check the batch, not just the route.
     let writes_design = docs.iter().any(|doc| {
@@ -3195,33 +3207,78 @@ async fn bulk_docs(
         return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
     }
 
-    if !st.cluster.is_clustered() {
-        return match db.put_docs(docs, new_edits).await {
-            Ok(results) => bulk_response(new_edits, results),
-            Err(e) => fail(e),
-        };
-    }
-    // A forwarded batch has already been placed by its coordinator; write it
-    // to this node's shards and let the coordinator count the replica ack.
-    if is_forwarded(st, headers) {
-        return match db.put_docs(docs, new_edits).await {
-            Ok(results) => bulk_response(new_edits, results),
-            Err(e) => fail(e),
-        };
+    // `_local` documents live outside the shard/replica machinery. Split them
+    // out so a mixed bulk request still writes ordinary documents through the
+    // normal cluster path and returns results in request order.
+    let mut local_slots: Vec<(usize, Value)> = Vec::new();
+    let mut ordinary_slots: Vec<usize> = Vec::new();
+    let mut ordinary_docs: Vec<Value> = Vec::new();
+    for (slot, doc) in docs.into_iter().enumerate() {
+        if doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .map(|id| id.starts_with("_local/"))
+            .unwrap_or(false)
+        {
+            local_slots.push((slot, doc));
+        } else {
+            ordinary_slots.push(slot);
+            ordinary_docs.push(doc);
+        }
     }
 
-    let w = num(q, "w").unwrap_or(0);
-    match commit_docs(st, db, dbname, docs, new_edits, w, headers).await {
-        Ok((results, quorum)) => {
-            let mut response = bulk_response(new_edits, results);
-            if !quorum {
-                // CouchDB answers 202 when the write reached fewer than the
-                // requested number of replicas; anti-entropy repairs the rest.
-                *response.status_mut() = StatusCode::ACCEPTED;
-            }
-            response
+    let (ordinary_results, accepted) = if ordinary_docs.is_empty() {
+        (Vec::new(), false)
+    } else if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+        // A forwarded batch has already been placed by its coordinator; write
+        // it to this node's shards and let the coordinator count the ack.
+        match db.put_docs(ordinary_docs, new_edits).await {
+            Ok(results) => (results, false),
+            Err(e) => return fail(e),
         }
-        Err(e) => fail(e),
+    } else {
+        let w = num(q, "w").unwrap_or(0);
+        match commit_docs(st, db, dbname, ordinary_docs, new_edits, w, headers).await {
+            Ok((results, quorum)) => (results, !quorum),
+            Err(e) => return fail(e),
+        }
+    };
+
+    let mut results = vec![Value::Null; ordinary_slots.len() + local_slots.len()];
+    for (slot, result) in ordinary_slots.into_iter().zip(ordinary_results) {
+        results[slot] = result;
+    }
+    for (slot, doc) in local_slots {
+        results[slot] = put_local_bulk(db, doc).await;
+    }
+    let mut response = bulk_response(new_edits, results);
+    if accepted {
+        // CouchDB answers 202 when the write reached fewer than the requested
+        // number of replicas; anti-entropy repairs the rest.
+        *response.status_mut() = StatusCode::ACCEPTED;
+    }
+    response
+}
+
+async fn put_local_bulk(db: &Db, doc: Value) -> Value {
+    let id = doc
+        .get("_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
+    let deleted = doc
+        .get("_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result = if deleted {
+        db.local_delete(&name).await
+    } else {
+        db.local_put(&name, doc).await
+    };
+    match result {
+        Ok(value) => value,
+        Err(error) => json!({"id": id, "error": error.error, "reason": error.reason}),
     }
 }
 
@@ -3273,8 +3330,9 @@ async fn bulk_get(
     };
     let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
+    let latest = flag(q, "latest");
     if !st.cluster.is_clustered() || is_forwarded(st, headers) {
-        return match db.bulk_get(&value, attachments, revs).await {
+        return match db.bulk_get(&value, attachments, revs, latest).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
         };
@@ -3301,12 +3359,15 @@ async fn bulk_get(
             async move {
                 let sub = json!({"docs": subdocs});
                 let result = if node == st.cluster.me {
-                    db.bulk_get(&sub, attachments, revs).await
+                    db.bulk_get(&sub, attachments, revs, latest).await
                 } else {
                     let peer = st.cluster.nodes[node].clone();
                     let mut query = format!("revs={revs}");
                     if attachments {
                         query.push_str("&attachments=true");
+                    }
+                    if latest {
+                        query.push_str("&latest=true");
                     }
                     forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
                 };
@@ -3453,7 +3514,13 @@ async fn all_docs(
         ..Default::default()
     };
     if let Some(key) = key_param(q, "key") {
-        opts.keys = Some(vec![key]);
+        if q.contains_key("keys") {
+            return fail(ApiError::bad_request("`key` is incompatible with `keys`"));
+        }
+        // CouchDB treats `key` as a range query over live rows, not as a
+        // `keys` lookup: a deleted document must not appear.
+        opts.startkey = opts.startkey.or(Some(key.clone()));
+        opts.endkey = opts.endkey.or(Some(key));
     } else if let Some(raw) = q.get("keys") {
         if let Ok(Value::Array(keys)) = serde_json::from_str::<Value>(raw) {
             opts.keys = Some(
@@ -3529,7 +3596,12 @@ async fn all_docs(
         return access_denied(&st.principal(headers));
     }
     match result {
-        Ok(v) => json(StatusCode::OK, v),
+        Ok(mut value) => {
+            if flag(q, "update_seq") {
+                value["update_seq"] = json!(db.update_seq());
+            }
+            json(StatusCode::OK, value)
+        }
         Err(e) => fail(e),
     }
 }
@@ -3550,6 +3622,12 @@ async fn changes(
     let _ = method;
     let local_only = is_forwarded(&st, headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
+    // Resolve filters before a longpoll/continuous stream starts. A stream
+    // must not turn a bad filter into a 200 response that the client retries
+    // forever.
+    if let Err(error) = resolve_changes_filter(&db, q).await {
+        return fail(error);
+    }
     // Cap longpoll/continuous connections so a client cannot pin a worker for
     // an arbitrary amount of time.
     let deadline = num(q, "timeout").unwrap_or(60_000).min(300_000) as u64;
@@ -3838,6 +3916,84 @@ async fn changes_normal_raw(
         .ok()
 }
 
+async fn design_filter(
+    db: &Db,
+    spec: &str,
+    is_view: bool,
+    q: &HashMap<String, String>,
+) -> DbResult<ChangeFilter> {
+    let (ddoc, name) = spec
+        .split_once('/')
+        .ok_or_else(|| ApiError::bad_request("filter must be `design/name`"))?;
+    if ddoc.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(ApiError::not_found("missing"));
+    }
+    let id = format!("_design/{ddoc}");
+    let doc = db
+        .get_doc(&id, &DocOpts::default())
+        .await
+        .map_err(|_| ApiError::not_found("missing"))?;
+    let source = if is_view {
+        doc.get("views")
+            .and_then(|views| views.get(name))
+            .and_then(|view| view.get("map"))
+            .and_then(Value::as_str)
+    } else {
+        doc.get("filters")
+            .and_then(|filters| filters.get(name))
+            .and_then(Value::as_str)
+    }
+    .ok_or_else(|| ApiError::not_found("missing"))?;
+    let query = q
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect::<Map<String, Value>>();
+    Ok(ChangeFilter::Js {
+        source: source.to_string(),
+        query: Value::Object(query).to_string(),
+    })
+}
+
+pub(crate) async fn resolve_changes_filter(
+    db: &Db,
+    q: &HashMap<String, String>,
+) -> DbResult<Option<ChangeFilter>> {
+    let explicit = q.get("filter").map(String::as_str);
+    let view = q
+        .get("view")
+        .map(String::as_str)
+        .filter(|view| !view.is_empty());
+    match explicit {
+        // Id and selector filters are handled without loading bodies. PouchDB
+        // also applies selector filtering client-side.
+        Some("_doc_ids") | Some("_selector") => Ok(None),
+        Some("_design") => Ok(Some(ChangeFilter::Design)),
+        Some("_view") => {
+            let Some(view) = view else {
+                return Err(ApiError::bad_request("`view` parameter is required"));
+            };
+            design_filter(db, view, true, q).await.map(Some)
+        }
+        // A bare name means `_design/<name>` with the same filter name.
+        Some(name) if !name.contains('/') => {
+            let spec = format!("{name}/{name}");
+            design_filter(db, &spec, false, q).await.map(Some)
+        }
+        Some(name) => {
+            // CouchDB silently ignores malformed filters with more than one
+            // slash rather than failing the feed.
+            if name.matches('/').count() != 1 {
+                return Ok(None);
+            }
+            design_filter(db, name, false, q).await.map(Some)
+        }
+        None => match view {
+            Some(view) => design_filter(db, view, true, q).await.map(Some),
+            None => Ok(None),
+        },
+    }
+}
+
 async fn changes_options(
     st: &AppState,
     db: &Db,
@@ -3881,6 +4037,8 @@ async fn changes_options(
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
         descending: flag(q, "descending"),
         doc_ids: doc_ids_from(q, body),
+        filter: resolve_changes_filter(db, q).await?,
+        conflicts: flag(q, "conflicts"),
         owned,
     };
     Ok((opts, progress))

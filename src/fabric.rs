@@ -1713,6 +1713,7 @@ pub(crate) async fn cluster_changes(
     let include_docs = flag(q, "include_docs");
     let style_all_docs = q.get("style").map(String::as_str) == Some("all_docs");
     let doc_ids = doc_ids_from(q, body);
+    let change_filter = crate::api::resolve_changes_filter(db, q).await?;
     let limit = num(q, "limit");
 
     if let Some(limit) = limit {
@@ -1729,6 +1730,7 @@ pub(crate) async fn cluster_changes(
             let mask = mask.clone();
             let since = since[node];
             let doc_ids = doc_ids.clone();
+            let change_filter = change_filter.clone();
             async move {
                 (
                     node,
@@ -1738,10 +1740,16 @@ pub(crate) async fn cluster_changes(
                         dbname,
                         node,
                         since,
-                        Some(limit),
+                        if change_filter.is_some() {
+                            None
+                        } else {
+                            Some(limit)
+                        },
                         include_docs,
                         style_all_docs,
                         doc_ids.as_deref(),
+                        change_filter.as_ref(),
+                        q,
                         headers,
                         &mask,
                     )
@@ -1779,6 +1787,7 @@ pub(crate) async fn cluster_changes(
                 // preferred masks remain disjoint, so ids do not overlap.
                 let since = 0;
                 let doc_ids = doc_ids.clone();
+                let change_filter = change_filter.clone();
                 async move {
                     (
                         node,
@@ -1788,10 +1797,16 @@ pub(crate) async fn cluster_changes(
                             dbname,
                             node,
                             since,
-                            Some(limit),
+                            if change_filter.is_some() {
+                                None
+                            } else {
+                                Some(limit)
+                            },
                             include_docs,
                             style_all_docs,
                             doc_ids.as_deref(),
+                            change_filter.as_ref(),
+                            q,
                             headers,
                             &mask,
                         )
@@ -1863,6 +1878,7 @@ pub(crate) async fn cluster_changes(
         let mask = mask.clone();
         let since = since[node];
         let doc_ids = doc_ids.clone();
+        let change_filter = change_filter.clone();
         async move {
             (
                 node,
@@ -1876,6 +1892,8 @@ pub(crate) async fn cluster_changes(
                     include_docs,
                     style_all_docs,
                     doc_ids.as_deref(),
+                    change_filter.as_ref(),
+                    q,
                     headers,
                     &mask,
                 )
@@ -1905,6 +1923,7 @@ pub(crate) async fn cluster_changes(
             // Reassigned shards have no useful checkpoint on the survivor.
             let since = 0;
             let doc_ids = doc_ids.clone();
+            let change_filter = change_filter.clone();
             async move {
                 (
                     node,
@@ -1918,6 +1937,8 @@ pub(crate) async fn cluster_changes(
                         include_docs,
                         style_all_docs,
                         doc_ids.as_deref(),
+                        change_filter.as_ref(),
+                        q,
                         headers,
                         &mask,
                     )
@@ -1960,6 +1981,8 @@ pub(crate) async fn fetch_node_changes(
     include_docs: bool,
     style_all_docs: bool,
     doc_ids: Option<&[String]>,
+    filter: Option<&crate::db::ChangeFilter>,
+    q: &HashMap<String, String>,
     headers: &HeaderMap,
     mask: &[bool],
 ) -> DbResult<Value> {
@@ -1972,6 +1995,8 @@ pub(crate) async fn fetch_node_changes(
                 style_all_docs,
                 descending: false,
                 doc_ids: doc_ids.map(|ids| ids.to_vec()),
+                filter: filter.cloned(),
+                conflicts: crate::api::flag(q, "conflicts"),
                 owned: Some(mask.to_vec()),
             })
             .await;
@@ -1996,6 +2021,17 @@ pub(crate) async fn fetch_node_changes(
     }
     if style_all_docs {
         url.push_str("&style=all_docs");
+    }
+    if let Some(filter) = q.get("filter") {
+        url.push_str("&filter=");
+        url.push_str(filter);
+    }
+    if let Some(view) = q.get("view") {
+        url.push_str("&view=");
+        url.push_str(view);
+    }
+    if crate::api::flag(q, "conflicts") {
+        url.push_str("&conflicts=true");
     }
     let request = st
         .client
