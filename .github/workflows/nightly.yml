@@ -1,0 +1,56 @@
+name: Nightly differential
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-differential
+  cancel-in-progress: false
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile differential/*.py
+      - name: Build fuzzer image
+        run: docker build -t douchdb:differential .
+      - name: CRUD seeds
+        run: |
+          for seed in $(seq 1 10); do
+            echo "::group::CRUD seed $seed"
+            python3 differential/run.py --seed "$seed" --steps 500 --skip-build
+            echo "::endgroup::"
+          done
+      - name: Multi-document seeds
+        run: |
+          for seed in $(seq 1 10); do
+            echo "::group::multi seed $seed"
+            python3 differential/run.py --multi --seed "$seed" --multi-steps 400 --skip-build
+            echo "::endgroup::"
+          done
+      - name: View seeds
+        run: |
+          for seed in $(seq 1 10); do
+            echo "::group::views seed $seed"
+            python3 differential/run.py --views --seed "$seed" --view-queries 500 --skip-build
+            echo "::endgroup::"
+          done
+      - name: Conflict seeds
+        run: |
+          for seed in $(seq 1 10); do
+            echo "::group::conflicts seed $seed"
+            python3 differential/run.py --conflicts --seed "$seed" --conflict-rounds 100 --skip-build
+            echo "::endgroup::"
+          done
+      - name: Upload differential artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-differential-artifacts
+          path: differential/artifacts/
+          if-no-files-found: ignore

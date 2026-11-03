@@ -25,7 +25,7 @@ jobs:
       # Temporary vendored patch; remove with the rest of vendor/ per
       # docs/storage-dependency.md (issue #105).
       - name: Vendored storage cache tests
-        run: cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml cache::
+        run: "cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml cache::"
       - name: Jepsen harness syntax
         run: python3 -m py_compile jepsen/*.py
       - name: Jepsen Clojure harness compiles
@@ -35,6 +35,38 @@ jobs:
             -w /work \
             clojure:tools-deps-bookworm \
             clojure -M -e "(require 'douchdb.core)"
+
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile differential/*.py
+      - name: Build fuzzer image
+        run: docker build -t douchdb:differential .
+      - name: Differential CRUD
+        run: |
+          python3 differential/run.py --seed 1 --steps 120 --skip-build
+          python3 differential/run.py --seed 2 --steps 120 --skip-build
+      - name: Differential multi-document
+        run: |
+          python3 differential/run.py --multi --seed 1 --multi-steps 150 --skip-build
+          python3 differential/run.py --multi --seed 2 --multi-steps 150 --skip-build
+      - name: Differential views
+        run: |
+          python3 differential/run.py --views --seed 1 --view-queries 100 --skip-build
+          python3 differential/run.py --views --seed 2 --view-queries 100 --skip-build
+      - name: Differential conflicts
+        run: |
+          python3 differential/run.py --conflicts --seed 1 --conflict-rounds 10 --skip-build
+          python3 differential/run.py --conflicts --seed 2 --conflict-rounds 10 --skip-build
+      - name: Upload differential artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-artifacts
+          path: differential/artifacts/
+          if-no-files-found: ignore
 
   macos:
     runs-on: macos-latest
