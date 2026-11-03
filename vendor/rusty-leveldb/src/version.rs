@@ -84,18 +84,23 @@ impl Version {
                 // We receive both key and value from the table. Because we're using InternalKey
                 // keys, we now need to check whether the found entry's user key is equal to the
                 // one we're looking for (get() just returns the next-bigger key).
-                if let Ok(Some((k, v))) = self.table_cache.borrow_mut().get(f.borrow().num, ikey) {
-                    // We don't need to check the sequence number; get() will not return an entry
-                    // with a higher sequence number than the one in the supplied key.
-                    let (typ, _, foundkey) = parse_internal_key(&k);
-                    if typ == ValueType::TypeValue
-                        && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
-                    {
-                        return Ok(Some((v, stats)));
-                    } else if typ == ValueType::TypeDeletion {
-                        // Skip looking once we have found a deletion.
-                        return Ok(None);
+                match self.table_cache.borrow_mut().get(f.borrow().num, ikey) {
+                    Ok(Some((k, v))) => {
+                        // We don't need to check the sequence number; get() will not return an entry
+                        // with a higher sequence number than the one in the supplied key.
+                        let (typ, _, foundkey) = parse_internal_key(&k);
+                        if typ == ValueType::TypeValue
+                            && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
+                        {
+                            return Ok(Some((v, stats)));
+                        } else if typ == ValueType::TypeDeletion {
+                            // Skip looking once we have found a deletion.
+                            return Ok(None);
+                        }
                     }
+                    Ok(None) => {}
+                    // Surface checksum/I/O errors instead of treating them as a miss.
+                    Err(error) => return Err(error),
                 }
             }
         }

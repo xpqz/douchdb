@@ -22,6 +22,10 @@ jobs:
         run: cargo test
       - name: Wasmtime backend tests
         run: cargo test --features wasmtime
+      - name: Storage corruption and fail-closed checks
+        run: |
+          cargo build --release --locked
+          python3 scripts/storage_faults.py --bin target/release/douchdb
       # Temporary vendored patch; remove with the rest of vendor/ per
       # docs/storage-dependency.md (issue #105).
       - name: Vendored storage cache tests

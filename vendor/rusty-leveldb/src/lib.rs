@@ -105,7 +105,7 @@ pub use db_iter::DBIterator;
 pub use disk_env::PosixDiskEnv;
 
 pub use error::{Result, Status, StatusCode};
-pub use filter::{BloomPolicy, FilterPolicy};
+pub use filter::{BloomPolicy, FilterPolicy, NoFilterPolicy};
 pub use mem_env::MemEnv;
 pub use options::{in_memory, CompressorList, Options};
 pub use skipmap::SkipMap;

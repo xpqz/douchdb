@@ -45,8 +45,9 @@ impl Footer {
     }
 
     pub fn decode(from: &[u8]) -> Option<Footer> {
-        assert!(from.len() >= FULL_FOOTER_LENGTH);
-        assert_eq!(&from[FOOTER_LENGTH..], &MAGIC_FOOTER_ENCODED);
+        if from.len() < FULL_FOOTER_LENGTH || &from[FOOTER_LENGTH..] != MAGIC_FOOTER_ENCODED {
+            return None;
+        }
         let (meta, metalen) = BlockHandle::decode(&from[0..])?;
         let (ix, _) = BlockHandle::decode(&from[metalen..])?;
 
@@ -113,6 +114,11 @@ impl<Dst: Write> TableBuilder<Dst> {
 
     /// Like new(), but doesn't wrap the comparator in an InternalKeyCmp (for testing)
     pub fn new_raw(opt: Options, dst: Dst) -> TableBuilder<Dst> {
+        let filter_block = if opt.filter_policy.name() == "_" {
+            None
+        } else {
+            Some(FilterBlockBuilder::new(opt.filter_policy.clone()))
+        };
         TableBuilder {
             opt: opt.clone(),
             dst,
@@ -120,7 +126,7 @@ impl<Dst: Write> TableBuilder<Dst> {
             prev_block_last_key: vec![],
             num_entries: 0,
             data_block: Some(BlockBuilder::new(opt.clone())),
-            filter_block: Some(FilterBlockBuilder::new(opt.filter_policy.clone())),
+            filter_block,
             index_block: Some(BlockBuilder::new(opt)),
         }
     }

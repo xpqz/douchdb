@@ -21,11 +21,23 @@ that are exposed by large bulk imports and changes-feed reads:
    node while the old node stayed linked, so list length and map length
    diverged and later evictions could corrupt the LRU. Insert now removes the
    old entry and node first.
+3. **Silent corruption on reads.** `DB::get_internal` and `Version::get`
+   discarded table errors (`if let Ok(Some(...))`), so a bad checksum became a
+   false "not found". They now return the error; DouchDB's document reads use
+   `get_at` for the same reason. `Footer::decode` returns `None` instead of
+   asserting on a damaged table footer. Bloom filters are disabled because
+   their blocks are not checksummed; a corrupt filter could otherwise hide a
+   present key. The filter reader also validates offsets defensively.
 
 `src/cache.rs` also has regression tests for duplicate-key replacement, list/
 map/forward-chain/back-link invariants under random LRU operations, and dropping
 a 100,000-node cache on a 64 KiB stack. The cache tests pass in debug and
 release on x86_64 and on `linux/arm64` Rust 1.97.
+
+`scripts/storage_faults.py` exercises clean SIGKILL, kill-during-compaction,
+truncated tables, bit flips, removed tables and truncated manifests. Every
+scenario must preserve all 200 acknowledged documents or fail closed; it runs
+in CI.
 
 This is a **temporary** vendoring decision. The rationale, risks, revisit
 triggers and removal checklist are in

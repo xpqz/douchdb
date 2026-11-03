@@ -824,7 +824,7 @@ impl Db {
                     let mut docs = Vec::with_capacity(metas.len());
                     for (id, rev, has_attachments) in metas {
                         if !has_attachments {
-                            if let Some(body) = s.get_body(&id, &rev) {
+                            if let Some(body) = s.get_body(&id, &rev)? {
                                 docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
                                 continue;
                             }
@@ -924,8 +924,8 @@ impl Db {
                 .call(move |s| {
                     let rows = batch
                         .into_iter()
-                        .map(|(slot, key)| (slot, all_docs_key_row(s, &key, &opts)))
-                        .collect::<Vec<_>>();
+                        .map(|(slot, key)| all_docs_key_row(s, &key, &opts).map(|row| (slot, row)))
+                        .collect::<DbResult<Vec<_>>>()?;
                     Ok(rows)
                 })
                 .await?;
@@ -1156,7 +1156,7 @@ impl Db {
             let (missing, ancestors) = self
                 .shard(id)
                 .call(move |s| {
-                    let tree = s.get_meta(&id2).map(|m| m.tree).unwrap_or_default();
+                    let tree = s.get_meta(&id2)?.map(|m| m.tree).unwrap_or_default();
                     let mut missing = Vec::new();
                     let mut ancestors: Vec<String> = Vec::new();
                     for rev in &wanted {
@@ -1329,7 +1329,7 @@ impl Db {
             let done = self
                 .shard(id)
                 .call(move |s| {
-                    let Some(mut meta) = s.get_meta(&id2) else {
+                    let Some(mut meta) = s.get_meta(&id2)? else {
                         return Ok(Vec::new());
                     };
                     let mut tx = Tx::new();
@@ -1621,11 +1621,11 @@ impl Stage<'_> {
         seq
     }
 
-    fn meta(&mut self, id: &str) -> Option<DocMeta> {
+    fn meta(&mut self, id: &str) -> DbResult<Option<DocMeta>> {
         if let Some(m) = self.staged.get(id) {
-            return Some(m.clone());
+            return Ok(Some(m.clone()));
         }
-        self.shard.get_meta(id)
+        Ok(self.shard.get_meta(id)?)
     }
 
     fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
@@ -1637,7 +1637,7 @@ impl Stage<'_> {
 
     fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
         let (id, parent_rev, deleted, attachments, revisions, body) = split_doc(doc)?;
-        let mut meta = self.meta(&id).unwrap_or_default();
+        let mut meta = self.meta(&id)?.unwrap_or_default();
         let body = Value::Object(body);
 
         if !new_edits {
@@ -2034,7 +2034,7 @@ pub(crate) struct ChangeRow {
 
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
-        .get_meta(id)
+        .get_meta(id)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
 
     if let Some(open_revs) = &opts.open_revs {
@@ -2088,7 +2088,7 @@ fn read_doc_rev(
         return Err(ApiError::not_found("missing"));
     }
     let body = shard
-        .get_body(id, rev)
+        .get_body(id, rev)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
     let mut doc: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::new(500, "internal_server_error", "corrupt body"))?;
@@ -2291,7 +2291,7 @@ fn collect_all_docs(
                 continue;
             };
             let meta = if opts.conflicts {
-                shard.get_meta(id)
+                shard.get_meta(id)?
             } else {
                 None
             };
@@ -2333,9 +2333,13 @@ fn all_docs_key_row(
     shard: &mut crate::store::Shard,
     key: &str,
     opts: &AllDocsOpts,
-) -> Option<Value> {
-    let meta = shard.get_meta(key)?;
-    let winner = meta.tree.winner()?;
+) -> DbResult<Option<Value>> {
+    let Some(meta) = shard.get_meta(key)? else {
+        return Ok(None);
+    };
+    let Some(winner) = meta.tree.winner() else {
+        return Ok(None);
+    };
     let deleted = meta.tree.is_deleted(&winner);
     let mut row = json!({"id": key, "key": key, "value": {"rev": winner.clone()}});
     if deleted {
@@ -2351,12 +2355,10 @@ fn all_docs_key_row(
                 attachments: opts.attachments,
                 ..Default::default()
             };
-            if let Ok(doc) = read_doc(shard, key, &doc_opts) {
-                row["doc"] = doc;
-            }
+            row["doc"] = read_doc(shard, key, &doc_opts)?;
         }
     }
-    Some(row)
+    Ok(Some(row))
 }
 
 fn finish_all_docs(
@@ -2424,11 +2426,9 @@ fn collect_changes(
 
         let doc = if opts.include_docs {
             if entry.deleted {
-                shard
-                    .get_meta(&entry.id)
-                    .and_then(|meta| {
-                        let winner = meta.tree.winner()?;
-                        read_doc_rev(
+                if let Some(meta) = shard.get_meta(&entry.id)? {
+                    if let Some(winner) = meta.tree.winner() {
+                        let doc = read_doc_rev(
                             shard,
                             &entry.id,
                             &meta,
@@ -2437,13 +2437,19 @@ fn collect_changes(
                                 rev: Some(winner.clone()),
                                 ..Default::default()
                             },
-                        )
-                        .ok()
-                    })
-                    .and_then(|doc| serde_json::to_string(&doc).ok())
+                        )?;
+                        Some(serde_json::to_string(&doc).map_err(|error| {
+                            ApiError::new(500, "internal_server_error", error.to_string())
+                        })?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 shard
-                    .get_body(&entry.id, &entry.rev)
+                    .get_body(&entry.id, &entry.rev)?
                     .map(|body| embed_doc_meta(&entry.id, &entry.rev, &body))
             }
         } else {

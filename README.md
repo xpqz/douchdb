@@ -845,6 +845,17 @@ It reports throughput, write/read latencies, compaction latency and
 amplification, and checks process-crash durability across `kill -9`. It does
 not test power-loss durability: rusty-leveldb does not fsync.
 
+Storage corruption and fail-closed checks run against a release build:
+
+```sh
+cargo build --release
+python3 scripts/storage_faults.py --bin target/release/douchdb
+```
+
+It covers a clean SIGKILL, kill during compaction, truncated tables, bit
+flips, a removed table and a truncated manifest. Each scenario must preserve
+all acknowledged documents or refuse to serve them.
+
 ## Status and limits
 
 v0.2: the replication protocol, auth, views, search, multiuser admission, a

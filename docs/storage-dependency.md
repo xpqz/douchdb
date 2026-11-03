@@ -7,11 +7,14 @@ Decision date: 2 November 2026.
 ## Decision
 
 DouchDB currently vendors `rusty-leveldb` 4.0.2 under
-`vendor/rusty-leveldb` and applies two changes:
+`vendor/rusty-leveldb` and applies three changes:
 
 1. the circular, heap-allocated-sentinel LRU list from **upstream PR #69**
    (open and unmerged at the time of writing);
-2. a local duplicate-key eviction fix in `Cache::insert`.
+2. a local duplicate-key eviction fix in `Cache::insert`;
+3. fail-closed read handling: table/checksum errors are propagated instead of
+   becoming a false "not found", damaged footers return an error, and
+   unchecksummed bloom filters are disabled.
 
 The patch is wired through `[patch.crates-io]` in `Cargo.toml`, copied into the
 Docker build, and its cache tests run in CI. See

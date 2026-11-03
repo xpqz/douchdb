@@ -461,11 +461,17 @@ impl DB {
         {
             let current = self.current();
             let mut current = current.borrow_mut();
-            if let Ok(Some((v, st))) = current.get(lkey.internal_key()) {
-                if current.update_stats(st) {
-                    do_compaction = true;
+            match current.get(lkey.internal_key()) {
+                Ok(Some((v, st))) => {
+                    if current.update_stats(st) {
+                        do_compaction = true;
+                    }
+                    result = Some(v)
                 }
-                result = Some(v)
+                Ok(None) => {}
+                // Surface checksum/I/O errors instead of turning them into a
+                // false "not found". Document reads use get_at for this.
+                Err(error) => return Err(error),
             }
         }
 

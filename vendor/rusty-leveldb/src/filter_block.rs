@@ -146,15 +146,21 @@ impl FilterBlockReader {
     /// blk_offset is the offset of the block containing key. Returns whether the key matches the
     /// filter for the block at blk_offset.
     pub fn key_may_match(&self, blk_offset: usize, key: &[u8]) -> bool {
-        if get_filter_index(blk_offset, self.filter_base_lg2) > self.num() {
+        // A corrupt filter block must never turn a present key into a false
+        // "not found". If the offsets are inconsistent, say "may match" and
+        // force the caller to read the checksummed data block instead.
+        if self.block.len() < self.offsets_offset + 5 {
             return true;
         }
-
-        let filter_begin = self.offset_of(get_filter_index(blk_offset, self.filter_base_lg2));
-        let filter_end = self.offset_of(get_filter_index(blk_offset, self.filter_base_lg2) + 1);
-
-        assert!(filter_begin < filter_end);
-        assert!(filter_end <= self.offsets_offset);
+        let index = get_filter_index(blk_offset, self.filter_base_lg2);
+        if index > self.num() {
+            return true;
+        }
+        let filter_begin = self.offset_of(index);
+        let filter_end = self.offset_of(index + 1);
+        if filter_begin >= filter_end || filter_end > self.offsets_offset {
+            return true;
+        }
 
         self.policy
             .key_may_match(key, &self.block[filter_begin..filter_end])

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -234,24 +235,52 @@ fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
     })
 }
 
-fn read_counter(db: &mut DB, key: &[u8]) -> Option<u64> {
-    db.get(key)
+fn db_get_checked(db: &mut DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    let snapshot = db.get_snapshot();
+    let value = db
+        .get_at(&snapshot, key)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(value.map(|bytes| bytes.to_vec()))
+}
+
+fn read_counter(db: &mut DB, key: &[u8]) -> Result<Option<u64>> {
+    Ok(db_get_checked(db, key)?
         .filter(|bytes| bytes.len() == 8)
-        .map(|bytes| u64::from_be_bytes(bytes[..].try_into().unwrap()))
+        .map(|bytes| u64::from_be_bytes(bytes[..].try_into().unwrap())))
 }
 
 impl Shard {
     pub fn open(dir: impl AsRef<Path>, revs_limit: u64) -> Result<Shard> {
+        let path = dir.as_ref();
+        let had_tables = std::fs::read_dir(path)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    matches!(
+                        entry.path().extension().and_then(|ext| ext.to_str()),
+                        Some("ldb" | "sst")
+                    )
+                })
+            })
+            .unwrap_or(false);
         let mut opts = Options::default();
         opts.create_if_missing = true;
-        let mut db = DB::open(dir, opts)?;
-        let seq = db
-            .get(b"z/seq")
+        opts.paranoid_checks = true;
+        // Bloom filters are not checksummed. A corrupt filter can turn a
+        // present key into a false "not found"; without one, the checksummed
+        // data block is always read.
+        opts.filter_policy = Rc::new(Box::new(rusty_leveldb::NoFilterPolicy::new()));
+        let mut db = DB::open(path, opts)?;
+        let seq = db_get_checked(&mut db, b"z/seq")?
             .filter(|b| b.len() == 8)
             .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
             .unwrap_or(0);
-        let revs_limit = db
-            .get(b"z/revs_limit")
+        if had_tables && seq == 0 {
+            anyhow::bail!(
+                "corrupt shard {}: table files are present but no sequence state",
+                path.display()
+            );
+        }
+        let revs_limit = db_get_checked(&mut db, b"z/revs_limit")?
             .filter(|b| b.len() == 8)
             .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
             .unwrap_or(revs_limit);
@@ -259,8 +288,8 @@ impl Shard {
         // Counters are new in this version. Existing databases get them
         // backfilled once on first open, then every metadata write keeps them
         // in sync.
-        let stored = read_counter(&mut db, b"z/doc_count")
-            .zip(read_counter(&mut db, b"z/doc_deleted_count"));
+        let stored = read_counter(&mut db, b"z/doc_count")?
+            .zip(read_counter(&mut db, b"z/doc_deleted_count")?);
         let (docs, deleted) = match stored {
             Some(pair) => pair,
             None => {
@@ -330,7 +359,7 @@ impl Shard {
             })?;
             let mut entries = BTreeMap::new();
             for (seq, id) in pairs {
-                let Some(meta) = self.get_meta(&id) else {
+                let Some(meta) = self.get_meta(&id)? else {
                     continue;
                 };
                 if meta.seq != seq {
@@ -501,13 +530,32 @@ impl Shard {
         self.db.get(key).map(|b| b.to_vec())
     }
 
-    pub fn get_meta(&mut self, docid: &str) -> Option<DocMeta> {
-        self.get(&meta_key(docid))
-            .and_then(|b| serde_json::from_slice(&b).ok())
+    /// Like `get`, but surfaces LevelDB I/O and checksum errors instead of
+    /// turning them into `None`. Document reads use this so corruption is a
+    /// 500, never a silent 404.
+    pub fn get_checked(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self.overlay.get(key) {
+            return Ok(value.clone());
+        }
+        let snapshot = self.db.get_snapshot();
+        let value = self
+            .db
+            .get_at(&snapshot, key)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(value.map(|bytes| bytes.to_vec()))
     }
 
-    pub fn get_body(&mut self, docid: &str, rev: &str) -> Option<Vec<u8>> {
-        self.get(&body_key(docid, rev))
+    pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {
+        let Some(bytes) = self.get_checked(&meta_key(docid))? else {
+            return Ok(None);
+        };
+        let meta = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("corrupt metadata for {docid}: {error}"))?;
+        Ok(Some(meta))
+    }
+
+    pub fn get_body(&mut self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        self.get_checked(&body_key(docid, rev))
     }
 
     /// Every key/value pair under `prefix`, starting at `start`. Only used by
