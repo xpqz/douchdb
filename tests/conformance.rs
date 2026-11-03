@@ -212,8 +212,38 @@ impl Server {
     async fn put(&self, path: &str, body: Value) -> (StatusCode, Value) {
         self.req(Method::PUT, path, Some(body)).await
     }
+
+    /// PUT a body whose exact bytes matter, such as duplicate keys or a large
+    /// integer that `json!` would have rounded.
+    async fn put_raw(&self, path: &str, body: &str) -> (StatusCode, Value) {
+        let response = self
+            .client
+            .put(format!("{}{path}", self.base))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_owned())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let value = response.json().await.unwrap_or(Value::Null);
+        (status, value)
+    }
     async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
         self.req(Method::POST, path, Some(body)).await
+    }
+
+    async fn post_raw(&self, path: &str, body: &str) -> (StatusCode, Value) {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_owned())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let value = response.json().await.unwrap_or(Value::Null);
+        (status, value)
     }
     async fn get(&self, path: &str) -> (StatusCode, Value) {
         self.req(Method::GET, path, None).await
@@ -645,6 +675,134 @@ async fn document_crud_matches_couchdb_rev_ids() {
     let (status, body) = s.put("/crud/tomb", json!({"_deleted": true})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn large_integers_round_trip_and_match_couchdb_rev_ids() {
+    let s = Server::start(false);
+    s.fresh_db("bigints").await;
+
+    for (id, literal, rev) in [
+        (
+            "positive",
+            "123456789012345678901234567890",
+            "1-da1bd830ce681811ea5692e0ec6bd683",
+        ),
+        (
+            "negative",
+            "-9223372036854775809",
+            "1-d7430b145a784f813a500d355bd26d42",
+        ),
+        (
+            "above-u64",
+            "18446744073709551616",
+            "1-02621d7913faebde4c9d1efebd8500b4",
+        ),
+    ] {
+        let (status, body) = s
+            .put_raw(&format!("/bigints/{id}"), &format!(r#"{{"a":{literal}}}"#))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{id}: {body}");
+        assert_eq!(body["rev"], rev, "{id}");
+
+        let (status, body) = s.get(&format!("/bigints/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["a"].to_string(), literal, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn duplicate_object_keys_use_last_position_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("dups").await;
+
+    let (status, body) = s.put_raw("/dups/doc", r#"{"a":1,"b":2,"a":3}"#).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "1-cf8195ee4268460f49235c8e98d42c6f");
+
+    let (status, body) = s.get("/dups/doc").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["_id", "_rev", "b", "a"]);
+    assert_eq!(body["a"], 3);
+
+    let (status, body) = s
+        .put_raw("/dups/nested", r#"{"x":{"a":1,"b":2,"a":3}}"#)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "1-5fcb279318097164360622d44905a944");
+
+    let (status, body) = s.put_raw("/dups/first", r#"{"a":1,"a":2,"b":3}"#).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "1-d76c74eb7f5aa9bbe9f01ebde895887c");
+    let (_, body) = s.get("/dups/first").await;
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["_id", "_rev", "a", "b"]);
+}
+
+#[tokio::test]
+async fn bulk_docs_applies_the_same_number_and_duplicate_rules() {
+    let s = Server::start(false);
+    s.fresh_db("bulkrules").await;
+
+    let (status, body) = s
+        .post_raw(
+            "/bulkrules/_bulk_docs",
+            r#"{"docs":[{"_id":"dup","a":1,"b":2,"a":3},{"_id":"big","n":123456789012345678901234567890}]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["rev"], "1-cf8195ee4268460f49235c8e98d42c6f");
+    assert_eq!(body[1]["rev"], "1-b3362bb3fea88f4e11bf86a8651536a9");
+
+    let (_, body) = s.get("/bulkrules/dup").await;
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["_id", "_rev", "b", "a"]);
+    let (_, body) = s.get("/bulkrules/big").await;
+    assert_eq!(body["n"].to_string(), "123456789012345678901234567890");
+}
+
+#[tokio::test]
+async fn float_spellings_are_canonicalised_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("floats").await;
+
+    for (id, literal, stored, rev) in [
+        (
+            "exponent",
+            "1e2",
+            "100.0",
+            "1-fcb573f41c731df1c79b9d2a8111e8e7",
+        ),
+        (
+            "trailing",
+            "1.00",
+            "1.0",
+            "1-8a159b695bf2bd957f1a435bfd6e1739",
+        ),
+        (
+            "leading",
+            "0.10",
+            "0.1",
+            "1-5974d01f385519e930e5a28349efba27",
+        ),
+        (
+            "negative-zero",
+            "-0",
+            "0",
+            "1-dcf485487e051d7f9b7c62bd4265a425",
+        ),
+    ] {
+        let (status, body) = s
+            .put_raw(&format!("/floats/{id}"), &format!(r#"{{"a":{literal}}}"#))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{id}: {body}");
+        assert_eq!(body["rev"], rev, "{id}");
+
+        let (status, body) = s.get(&format!("/floats/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["a"].to_string(), stored, "{id}");
+    }
 }
 
 #[tokio::test]
