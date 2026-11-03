@@ -653,6 +653,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="multi-document operations (default: 120)",
     )
     parser.add_argument(
+        "--conflicts",
+        action="store_true",
+        help="run the revision-tree/conflict differential suite",
+    )
+    parser.add_argument(
+        "--conflict-rounds",
+        type=int,
+        default=20,
+        help="random revision trees after the fixed scenarios (default: 20)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit nonzero even for allowlisted divergences",
@@ -717,8 +728,8 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.douchdb_url) != bool(args.couchdb_url):
         print("--douchdb-url and --couchdb-url must be supplied together", file=sys.stderr)
         return 2
-    if args.views and args.multi:
-        print("--views and --multi cannot be combined", file=sys.stderr)
+    if sum((args.views, args.multi, args.conflicts)) > 1:
+        print("--views, --multi and --conflicts are mutually exclusive", file=sys.stderr)
         return 2
 
     known_divergences = load_known_divergences(args.known_divergences)
@@ -768,6 +779,20 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 steps=args.multi_steps,
                 verbose=args.verbose,
+            )
+
+        if args.conflicts:
+            if args.replay:
+                print("--conflicts cannot be combined with --replay", file=sys.stderr)
+                return 2
+            import conflicts
+
+            return conflicts.run_conflicts(
+                left,
+                right,
+                verbose=args.verbose,
+                rounds=args.conflict_rounds,
+                seed=args.seed,
             )
 
         if args.replay:

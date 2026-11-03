@@ -80,6 +80,24 @@ order inside a response is not compared directly; for writes, the revision id
 independently covers document key order and number representation. Duplicate
 keys are sent as raw bodies so both servers decode them exactly as written.
 
+## Revision trees and conflicts
+
+Run the conflict suite:
+
+```sh
+python3 differential/run.py --conflicts --seed 1
+```
+
+It inserts branches with `_bulk_docs?new_edits=false` and compares the winner,
+`open_revs=all`, `_revisions`, `_all_docs?conflicts`, `_changes` and
+`_revs_diff` against CouchDB. Fixed scenarios cover equal-depth branches,
+deeper winners, three-way conflicts, live/deleted leaves, deleting the winner
+and a short pruning case. `--conflict-rounds N` adds seeded random trees
+(default 20).
+
+Random trees currently run at the default `_revs_limit`; shared-ancestor
+pruning still diverges and is tracked as #127.
+
 ## Multi-document operations
 
 Run the multi-document suite:
