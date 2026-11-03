@@ -182,10 +182,49 @@ mod tests {
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), false);
         tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(9))), false);
-        assert_eq!(tree.leaves().len(), 2);
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(5))), true);
+        assert_eq!(tree.leaves().len(), 3);
         let winner = tree.winner().unwrap();
-        assert_eq!(winner, format!("2-{}", id(9)), "higher rev id wins the tie");
+        assert_eq!(
+            winner,
+            format!("2-{}", id(9)),
+            "a live leaf beats a deleted leaf and the higher id wins"
+        );
         assert_eq!(tree.conflicts(&winner).len(), 1);
+        assert_eq!(tree.deleted_conflicts(&winner).len(), 1);
+    }
+
+    #[test]
+    fn conflicts_and_deleted_conflicts_exclude_the_winner_and_sort() {
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(8))), false);
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(3))), false);
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(7))), true);
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), true);
+        let winner = tree.winner().unwrap();
+        assert_eq!(winner, format!("2-{}", id(8)));
+        assert_eq!(
+            tree.conflicts(&winner),
+            vec![format!("2-{}", id(3))],
+            "live conflicts only, sorted"
+        );
+        assert_eq!(
+            tree.deleted_conflicts(&winner),
+            vec![format!("2-{}", id(2)), format!("2-{}", id(7))]
+        );
+    }
+
+    #[test]
+    fn ancestor_checks_follow_the_stored_path() {
+        let root = format!("1-{}", id(1));
+        let middle = format!("2-{}", id(2));
+        let leaf = format!("3-{}", id(3));
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("{root},{middle},{leaf}")), false);
+        assert!(tree.is_ancestor_of(&root, &leaf));
+        assert!(tree.is_ancestor_of(&middle, &leaf));
+        assert!(!tree.is_ancestor_of(&leaf, &middle));
+        assert!(!tree.is_ancestor_of(&format!("1-{}", id(9)), &leaf));
     }
 
     #[test]

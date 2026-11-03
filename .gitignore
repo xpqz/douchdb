@@ -23,3 +23,6 @@ __pycache__/
 /jepsen-clj/logs/
 /jepsen-clj/.cpcache/
 /jepsen-clj/.clj-kondo/
+
+# cargo-mutants output
+/mutants.out/

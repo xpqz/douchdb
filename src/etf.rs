@@ -238,6 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn integer_boundaries_use_the_expected_etf_tags() {
+        assert_eq!(Term::Int(i32::MAX as i64).encode()[1], INTEGER_EXT);
+        assert_eq!(Term::Int(i32::MAX as i64 + 1).encode()[1], SMALL_BIG_EXT);
+        assert_eq!(Term::Int(i32::MIN as i64).encode()[1], INTEGER_EXT);
+        assert_eq!(Term::Int(i32::MIN as i64 - 1).encode()[1], SMALL_BIG_EXT);
+        assert_eq!(Term::Int(i64::MIN).encode()[1], SMALL_BIG_EXT);
+        assert_eq!(Term::Int(i64::MAX).encode()[1], SMALL_BIG_EXT);
+        assert_eq!(Term::UInt(255).encode()[1], SMALL_INTEGER_EXT);
+        assert_eq!(Term::UInt(256).encode()[1], INTEGER_EXT);
+        assert_eq!(Term::UInt(i32::MAX as u64 + 1).encode()[1], SMALL_BIG_EXT);
+        assert_eq!(Term::UInt(u64::MAX).encode()[1], SMALL_BIG_EXT);
+    }
+
+    #[test]
     fn unsigned_integers_above_i64_are_not_wrapped() {
         // CouchDB's jiffy keeps these unsigned. Casting to i64 would encode a
         // negative number and change every revision hash containing one.

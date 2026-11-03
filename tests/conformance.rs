@@ -3355,6 +3355,39 @@ async fn cluster_honours_w_and_r_quorum_parameters() {
 }
 
 #[tokio::test]
+async fn cluster_default_write_quorum_is_a_majority() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clquorumdefault").await;
+    }
+    nodes[2].kill();
+
+    let (status, body) = nodes[0]
+        .post(
+            "/clquorumdefault/_bulk_docs",
+            json!({"docs": [{"_id": "majority"}]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "default w=2 is still satisfied by two live replicas: {body}"
+    );
+
+    let (status, body) = nodes[0]
+        .post(
+            "/clquorumdefault/_bulk_docs?w=3",
+            json!({"docs": [{"_id": "all"}]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "w=3 cannot be met with one replica down: {body}"
+    );
+}
+
+#[tokio::test]
 async fn view_index_updates_incrementally_and_persists() {
     let s = Server::start(false);
     s.fresh_db("incview").await;
