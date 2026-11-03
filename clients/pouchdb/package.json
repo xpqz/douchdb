@@ -1,0 +1,15 @@
+{
+  "name": "douchdb-pouchdb-compat",
+  "private": true,
+  "version": "0.0.0",
+  "description": "PouchDB 9 client compatibility checks against douchdb",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "dependencies": {
+    "pouchdb-adapter-http": "9.0.0",
+    "pouchdb-adapter-memory": "9.0.0",
+    "pouchdb-core": "9.0.0",
+    "pouchdb-replication": "9.0.0"
+  }
+}

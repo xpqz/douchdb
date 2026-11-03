@@ -77,6 +77,39 @@ jobs:
           path: differential/artifacts/
           if-no-files-found: ignore
 
+  clients:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: clients/pouchdb/package-lock.json
+      - name: Build douchdb image
+        run: docker build -t douchdb:clients .
+      - name: Start douchdb
+        run: |
+          docker run -d --name douchdb-clients -p 127.0.0.1:25985:5984 douchdb:clients \
+            --listen 0.0.0.0:5984 --data /data
+          for i in $(seq 1 120); do
+            curl -fsS http://127.0.0.1:25985/ >/dev/null 2>&1 && exit 0
+            sleep 0.5
+          done
+          docker logs douchdb-clients
+          exit 1
+      - name: PouchDB 9 client compatibility
+        run: |
+          cd clients/pouchdb
+          npm ci
+          node run.js http://127.0.0.1:25985
+      - name: Server logs on failure
+        if: failure()
+        run: docker logs douchdb-clients || true
+      - name: Stop douchdb
+        if: always()
+        run: docker rm -f douchdb-clients || true
+
   macos:
     runs-on: macos-latest
     steps:

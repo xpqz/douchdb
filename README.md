@@ -836,6 +836,18 @@ reducers against the same CouchDB instance. See
 [differential/README.md](differential/README.md) for options, known
 divergences and how to add operations.
 
+A PouchDB 9 client compatibility suite exercises the real `pouchdb-core` client
+against douchdb, including replication, `allDocs`, `bulkGet`, tombstones and
+conflicts:
+
+```sh
+cd clients/pouchdb
+npm ci
+node run.js http://127.0.0.1:5984
+```
+
+See [clients/README.md](clients/README.md).
+
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:
 
