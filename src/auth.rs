@@ -365,18 +365,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn users_auth() -> Auth {
+    // Tests run in parallel, so each one needs its own users file. Sharing a
+    // fixed path lets one test read the file while another has truncated it.
+    fn users_auth(name: &str) -> Auth {
         Auth::from_users_file(
             Some(("admin".into(), "secret".into())),
-            &std::env::temp_dir().join("douchdb-auth-test-users.json"),
+            &std::env::temp_dir().join(name),
             Some("session-secret".into()),
         )
         .expect("users")
     }
 
-    fn write_users() {
+    fn write_users(name: &str) {
         std::fs::write(
-            std::env::temp_dir().join("douchdb-auth-test-users.json"),
+            std::env::temp_dir().join(name),
             r#"{"users":[
                 {"name":"alice","token":"alice-token","roles":["analyst"]},
                 {"name":"root","token":"root-token","roles":["_admin"]},
@@ -414,8 +416,9 @@ mod tests {
 
     #[test]
     fn token_users_and_hashes() {
-        write_users();
-        let auth = users_auth();
+        let file = "douchdb-auth-test-token-users.json";
+        write_users(file);
+        let auth = users_auth(file);
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -437,8 +440,9 @@ mod tests {
 
     #[test]
     fn admin_role_from_users_file() {
-        write_users();
-        let auth = users_auth();
+        let file = "douchdb-auth-test-admin-users.json";
+        write_users(file);
+        let auth = users_auth(file);
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
