@@ -95,8 +95,8 @@ Current entries:
 
 | Kind | Issue | Meaning |
 | --- | --- | --- |
-| `large_integer_precision` | [#110](https://github.com/skruger/douchdb/issues/110) | Integers outside `i64`/`u64` silently become floats. |
-| `duplicate_key_order` | [#123](https://github.com/skruger/douchdb/issues/123) | Duplicate object keys keep the wrong position, changing the revision hash. |
+| `large_integer_precision` | [#110](https://github.com/xpqz/douchdb/issues/110) | Integers outside `i64`/`u64` silently become floats. |
+| `duplicate_key_order` | [#123](https://github.com/xpqz/douchdb/issues/123) | Duplicate object keys keep the wrong position, changing the revision hash. |
 
 To keep a run useful while those issues are open, pass
 `--exclude-large-integers --exclude-duplicate-keys`. New divergences still fail
