@@ -6452,6 +6452,7 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 }
 
 #[tokio::test]
+#[allow(unused_mut, clippy::useless_vec)]
 async fn js_sandboxes_agree_on_view_rows() {
     let docs = json!({"docs": [
         {"_id": "a", "city": "Berlin", "price": 10, "s": "héllo"},
