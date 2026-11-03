@@ -19,8 +19,17 @@ used so the many process-spawning conformance tests did not dominate the run.
 171 mutants tested: 105 caught, 35 missed, 20 unviable, 11 timeouts
 ```
 
-After the run, additional tests were added for the missed revision-tree
-conflict/ancestor paths and ETF integer boundaries.
+After the run, tests closed the actionable survivors: revision-tree
+conflict/ancestor assertions, full sign-and-magnitude ETF assertions at the
+`i64` boundaries, tuple 255/256 boundaries, signed zero, negative bignums with
+a zero low byte, and JSON reserved-key scanning through escaped quotes and
+whitespace. A follow-up `cargo mutants --iterate` rerun caught 18 more
+mutants; the three remaining survivors below are equivalent.
+
+Run with `TMPDIR` on disk-backed storage. A first run left two build trees in
+`/tmp` (a 14 GB tmpfs); `rust-lld` then died with SIGBUS and a batch of
+innocent mutants was recorded as unviable after `Disk quota exceeded`. That
+run was discarded and rerun in place against the on-disk `target/`.
 
 ## Triage of surviving mutants
 
@@ -41,14 +50,17 @@ conflict/ancestor paths and ETF integer boundaries.
 
 - Integer tag boundaries (`i32`/`i64` guards, unsigned boundaries, bignum
   length): **missing tests**, now covered by
-  `integer_boundaries_use_the_expected_etf_tags` and the proptest
-  `decimal_magnitude_matches_u128/i128`.
-- Loop shifts and carry conditions in `decimal_magnitude`: equivalent for the
-  tested small values; the u128/i128 proptest covers the non-trivial carry
-  paths. A mutation that turns the conversion into an infinite loop is
-  reported as a timeout rather than a pass.
-- Tuple/list length guards: **unviable** or only reachable with >255 elements;
-  the relevant max is tested indirectly by the bignum encoding tests.
+  `integer_boundaries_use_the_expected_etf_tags`,
+  `big_integers_encode_the_full_sign_and_magnitude` and the proptest
+  `decimal_magnitude_matches_u128/i128`. The tag-only assertions were not
+  enough: they leave broken shifts, masks and sign tests alive.
+- Tuple length guards: **missing tests**, now covered by
+  `tuple_length_selects_the_small_or_large_form` (255 versus 256 elements).
+- Carry shifts and trim conditions that cannot change an emitted magnitude
+  are **equivalent**: the trim loop only runs for a leading zero byte the
+  converter cannot produce, and the sign comparison never sees zero because
+  zero takes the small-integer arm. A mutation that turns the conversion into
+  an infinite loop is reported as a timeout rather than a pass.
 
 ### JSON
 
@@ -57,8 +69,9 @@ conflict/ancestor paths and ETF integer boundaries.
 - `has_reserved_number_key` index/increment mutants: several **timeout**
   because a broken increment stops making progress. The scanner is bounded by
   the input length and only runs on request bodies; the timeout result is
-  treated as a detection, not a pass. Tests cover the top-level, nested and
-  escaped reserved key.
+  treated as a detection, not a pass. `reserved_number_key_is_found_through_escapes_and_whitespace`
+  covers the top-level, nested, whitespace-separated and escaped-quote cases
+  that previously let the scanner desynchronise and miss the reserved key.
 - Arbitrary-input parser mutants: covered by the proptest
   `arbitrary_bytes_never_panic` and `arbitrary_text_never_panics`.
 

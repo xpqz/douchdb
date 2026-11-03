@@ -252,6 +252,66 @@ mod tests {
     }
 
     #[test]
+    fn big_integers_encode_the_full_sign_and_magnitude() {
+        // The tag alone is not enough: a broken shift or mask still emits
+        // SMALL_BIG_EXT with the wrong digits, and a broken sign test still
+        // emits the right tag with the wrong sign byte.
+        assert_eq!(
+            Term::Int(1_i64 << 32).encode(),
+            vec![131, SMALL_BIG_EXT, 5, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            Term::Int(i64::MAX).encode(),
+            vec![
+                131,
+                SMALL_BIG_EXT,
+                8,
+                0,
+                255,
+                255,
+                255,
+                255,
+                255,
+                255,
+                255,
+                0x7f
+            ]
+        );
+        assert_eq!(
+            Term::Int(i64::MIN).encode(),
+            vec![131, SMALL_BIG_EXT, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0x80]
+        );
+    }
+
+    #[test]
+    fn tuple_length_selects_the_small_or_large_form() {
+        let small = Term::Tuple(vec![Term::Int(0); 255]).encode();
+        assert_eq!(small[1], SMALL_TUPLE_EXT);
+        assert_eq!(small[2], 255);
+
+        let large = Term::Tuple(vec![Term::Int(0); 256]).encode();
+        assert_eq!(large[1], LARGE_TUPLE_EXT);
+        assert_eq!(&large[2..6], &[0, 0, 1, 0], "256 elements, big-endian");
+        assert_eq!(large.len(), 6 + 256 * 2);
+    }
+
+    #[test]
+    fn decimal_magnitude_handles_signed_zero() {
+        assert_eq!(decimal_magnitude("0"), (false, vec![0]));
+        assert_eq!(decimal_magnitude("-0"), (false, vec![0]));
+    }
+
+    #[test]
+    fn negative_bignum_keeps_its_sign_when_the_low_byte_is_zero() {
+        let value: Value = serde_json::from_str("-18446744073709551616").unwrap();
+        let encoded = from_json(&value).encode();
+        assert_eq!(encoded[1], SMALL_BIG_EXT);
+        assert_eq!(encoded[2], 9, "2^64 needs nine magnitude bytes");
+        assert_eq!(encoded[3], 1, "negative sign byte");
+        assert_eq!(&encoded[4..], &[0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
     fn unsigned_integers_above_i64_are_not_wrapped() {
         // CouchDB's jiffy keeps these unsigned. Casting to i64 would encode a
         // negative number and change every revision hash containing one.

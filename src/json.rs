@@ -301,6 +301,30 @@ mod tests {
     }
 
     #[test]
+    fn reserved_number_key_is_found_through_escapes_and_whitespace() {
+        // The pre-scan must skip over escaped quotes instead of treating the
+        // escaped quote as the end of the string, and must allow whitespace
+        // between the key and its colon.
+        assert!(from_slice(br#"{"$serde_json::private::Number" : 1}"#).is_err());
+        assert!(from_slice(br#"{ "$serde_json::private::Number": 1}"#).is_err());
+        assert!(
+            from_slice(br#"{"a\"b": 1, "$serde_json::private::Number": 2}"#).is_err(),
+            "an escaped quote before the reserved key must not hide it"
+        );
+        assert!(
+            from_slice(br#"{"v": "a\"b", "$serde_json::private::Number": 2}"#).is_err(),
+            "an escaped quote in an earlier value must not hide the key"
+        );
+        assert!(
+            from_slice(br#"{"nested": {"a\"b": 1, "$serde_json::private::Number": 2}}"#).is_err()
+        );
+
+        // The same escaping and whitespace are fine for ordinary keys.
+        let value = from_slice(br#"{"a\"b" : 1}"#).unwrap();
+        assert_eq!(value[r#"a"b"#], 1);
+    }
+
+    #[test]
     fn arrays_and_nested_objects_keep_duplicate_order() {
         let value = from_slice(br#"[{"a":1,"a":2},{"b":1,"c":2,"b":3}]"#).unwrap();
         assert_eq!(value[0]["a"], 2);

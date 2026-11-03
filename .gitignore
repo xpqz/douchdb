@@ -26,3 +26,4 @@ __pycache__/
 
 # cargo-mutants output
 /mutants.out/
+/mutants.out.old/
