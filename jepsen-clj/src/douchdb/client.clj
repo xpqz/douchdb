@@ -10,9 +10,6 @@
             [jepsen.client :as client]
             [jepsen.independent :as independent]))
 
-(def ^:const read-quorum 2)
-(def ^:const write-quorum 2)
-
 (defn- doc-id [key]
   (str "k-" key))
 
@@ -23,7 +20,7 @@
   "Returns {:ok true :doc doc-or-nil} or {:ok false :response response}."
   [c key]
   (let [response (http/request :get (doc-url c key)
-                               {:query-params {"r" (str read-quorum)}})]
+                               {:query-params {"r" (str (:read-quorum c))}})]
     (case (:status response)
       200 {:ok true :doc (:body response)}
       404 {:ok true :doc nil}
@@ -36,7 +33,7 @@
         headers (cond-> {"Content-Type" "application/json"}
                   (and rev if-match?) (assoc "If-Match" (str "\"" rev "\"")))]
     (http/request :put (doc-url c key)
-                  {:query-params {"w" (str write-quorum)}
+                  {:query-params {"w" (str (:write-quorum c))}
                    :headers headers
                    :body (json/generate-string body)})))
 
@@ -95,10 +92,30 @@
               {:type :fail :error :revision-mismatch}
               result)))))))
 
-(defrecord DouchClient [node db-name]
+(defn- cas-write-register
+  "Reads the current value and CASes it to new-value with If-Match. A lost race
+  is a failed write; the conditional PUT cannot have changed the document."
+  [c key new-value]
+  (let [{:keys [ok doc response]} (fetch c key)]
+    (if-not ok
+      {:type :info :error (str "read-before-cas failed: " (:status response))}
+      (let [rev (get doc :_rev)]
+        (if (nil? doc)
+          (let [result (classify-write (put-doc! c key new-value nil false))]
+            (if (= :conflict (:type result))
+              {:type :fail :error :concurrent-create}
+              result))
+          (let [result (classify-write (put-doc! c key new-value rev true))]
+            (if (= :conflict (:type result))
+              {:type :fail :error :revision-mismatch}
+              result)))))))
+
+(defrecord DouchClient [node db-name read-quorum write-quorum]
   client/Client
   (open! [_ test node]
-    (->DouchClient node (:db-name test)))
+    (->DouchClient node (:db-name test)
+                   (:read-quorum test 2)
+                   (:write-quorum test 2)))
 
   (close! [_ _])
 
@@ -119,7 +136,8 @@
                        :type (:type result)
                        :value (independent/tuple key (:value result))))
         :cas (let [[expected new-value] value]
-               (completed op (cas-register c key expected new-value)))))))
+               (completed op (cas-register c key expected new-value)))
+        :cas-write (completed op (cas-write-register c key value))))))
 
 (defn douchdb []
-  (->DouchClient nil nil))
+  (->DouchClient nil nil nil nil))

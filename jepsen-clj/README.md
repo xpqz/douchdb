@@ -37,15 +37,43 @@ Useful options:
 
 ```text
 -t, --time-limit SECONDS       test duration (default 30)
--c, --concurrency N            concurrent clients, even (default 8)
+-c, --concurrency N            concurrent clients (default 8)
+-w, --workload WORKLOAD        register, contention or cas
 -i, --nemesis-interval SECONDS fault/recovery period (default 10)
 -f, --fault kill|partition     fault type (default kill)
 -n, --no-nemesis               run without faults
+    --read-quorum N            read quorum r, 1-3 (default 2)
+    --write-quorum N           write quorum w, 1-3 (default 2)
+    --no-final-reads           skip the final read of every key
     --nodes NODES              comma-separated container names
     --db NAME                  database name (default jepsen)
     --network NAME             Docker network (default douchdb-jepsen-net)
 -s, --seed SEED                random seed
 ```
+
+`register` uses one writer and one reader per key. `contention` uses two
+writers and one reader, so writers race on the same revision; concurrency must
+be a multiple of 3. `cas` uses an If-Match writer and a reader; concurrency
+must be even.
+
+Run the quorum matrix with:
+
+```sh
+./jepsen-clj/run.sh --no-nemesis --read-quorum 1 --write-quorum 1
+./jepsen-clj/run.sh --no-nemesis --read-quorum 2 --write-quorum 2
+./jepsen-clj/run.sh --no-nemesis --read-quorum 3 --write-quorum 3
+```
+
+A single-node profile uses the same harness with one node and one replica:
+
+```sh
+DOUCHDB_NODES=douchdb-jepsen-0 DOUCHDB_N=1 DOUCHDB_Q=1 \
+  ./jepsen-clj/run.sh --no-nemesis --read-quorum 1 --write-quorum 1
+```
+
+After the timed workload, the final generator reads every key once, so a write
+that was acknowledged but disappeared by the end of the test is still checked.
+Pass `--no-final-reads` to omit it.
 
 `run.sh` builds `douchdb:jepsen` from the repository `Dockerfile`, builds the
 runner image, creates `douchdb-jepsen-net`, and starts three node containers on
@@ -65,30 +93,39 @@ and checker results are written under `jepsen-clj/store/`.
   anti-entropy, shared cluster secret.
 - **Control:** Jepsen's SSH transport is configured with `:dummy? true`.
   Database setup and teardown use HTTP directly; no SSH server is needed.
-- **Client:** `douchdb.client`, using `r=2` reads and `w=2` writes. A write is
-  a read of the current revision followed by a conditional `PUT` with `_rev`.
-  A lost revision race is a `:fail`; a `202` or transport error is `:info`.
-  CAS is implemented (`If-Match` plus `_rev`) but is not in the default
-  generator.
-- **Workload:** `jepsen.independent/concurrent-generator`, two clients per key,
-  one reserved for writes and one for reads. With concurrency 8 that is four
-  independent registers active at once.
+- **Client:** `douchdb.client`, using configurable `r`/`w` quorums (default
+  `r=2`, `w=2`). A write is a read of the current revision followed by a
+  conditional `PUT` with `_rev`. A lost revision race is a `:fail`; a `202` or
+  transport error is `:info`. `cas` uses `If-Match` plus `_rev`.
+- **Workloads:** `register` runs one reserved writer and one reader per key.
+  `contention` runs two writers and one reader, exercising lost revision races.
+  `cas` runs an If-Match writer and a reader.
+- **Final reads:** after the time limit, one read of every generated key runs
+  outside the timed section, so an acknowledged write that vanished by the end
+  of the test still fails the checker.
 - **Faults:** a custom Docker nemesis. `kill` uses `docker kill`/`docker
   start`; `partition` uses `docker network disconnect`/`connect`. The nemesis
   starts and reconnects every node during teardown.
-- **Checker:** `jepsen.checker/linearizable` with
-  `knossos.model/cas-register`, wrapped by `jepsen.independent/checker`.
+- **Checker:** `jepsen.checker/linearizable` with a CAS-register model wrapped
+  by `jepsen.independent/checker`. The model accepts the CAS workload's
+  `:cas-write` operation as a successful write.
 
 ## Validation
 
-On 2026-11-03 against the current tree, with concurrency 8 and a
-10-second fault interval. Counts are operations in the top-level history:
+On 2026-11-03 against the current tree. Counts are operations in the top-level
+history; the first three rows are the original register runs.
 
-| Scenario | Duration | Completed ops | Indeterminate | Failed | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| no faults | 10s | 6,065 | 0 | 0 | valid |
-| kill/restart | 30s | 12,142 | 104 | 0 | valid |
-| network partition | 30s | 11,336 | 18 | 0 | valid |
+| Scenario | Workload | r/w | Duration | Completed | Indeterminate | Failed | Result |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| no faults | register | 2/2 | 10s | 6,065 | 0 | 0 | valid |
+| kill/restart | register | 2/2 | 30s | 12,142 | 104 | 0 | valid |
+| network partition | register | 2/2 | 30s | 11,336 | 18 | 0 | valid |
+| no faults | register | 1/1 | 8s | 14,132 | 0 | 0 | valid |
+| no faults | register | 3/3 | 8s | 10,576 | 0 | 0 | valid |
+| no faults | contention (c=9) | 2/2 | 10s | 12,510 | 0 | 0 | valid |
+| kill/restart | contention (c=9) | 2/2 | 20s | 15,726 | — | — | valid |
+| no faults | cas | 2/2 | 10s | 12,960 | 0 | 0 | valid |
+| single node | register | 1/1 | 8s | 9,292 | 0 | 0 | valid |
 
 `Indeterminate` operations are expected while a node is down: the request may
 have reached some replicas but not a write quorum, or the client may have lost
