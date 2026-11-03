@@ -31,10 +31,11 @@ impl Server {
 
     /// Start a node with extra CLI arguments (`--q`, `--nodes`, `--me`, ...).
     fn start_with(extra: &[String], admin: bool) -> Server {
-        for attempt in 0..20 {
+        for attempt in 0..100 {
             if let Some(server) = Server::spawn_on(free_port(), extra, admin, attempt) {
                 return server;
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
         panic!("douchdb did not start");
     }
