@@ -28,6 +28,13 @@ jobs:
         run: cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml cache::
       - name: Jepsen harness syntax
         run: python3 -m py_compile jepsen/*.py
+      - name: Jepsen Clojure harness compiles
+        run: |
+          docker run --rm \
+            -v "$PWD/jepsen-clj:/work" \
+            -w /work \
+            clojure:tools-deps-bookworm \
+            clojure -M -e "(require 'douchdb.core)"
 
   macos:
     runs-on: macos-latest
