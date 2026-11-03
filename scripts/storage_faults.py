@@ -215,7 +215,7 @@ def damage(data, kind, rng):
 
 
 def scenario(binary, kind, port, rng):
-    directory = tempfile.mkdtemp(prefix="douchdb-fault-", dir="/tmp/opencode")
+    directory = tempfile.mkdtemp(prefix="douchdb-fault-")
     data = os.path.join(directory, "data")
     log = os.path.join(directory, "server.log")
     try:
