@@ -45,6 +45,9 @@ Useful options:
     --read-quorum N            read quorum r, 1-3 (default 2)
     --write-quorum N           write quorum w, 1-3 (default 2)
     --no-final-reads           skip the final read of every key
+    --liveness-interval-ms MS  container/health sample interval (default 500)
+    --max-indeterminate-pct N  fail above this indeterminate percentage (default 20)
+    --no-liveness              disable runtime liveness sampling
     --nodes NODES              comma-separated container names
     --db NAME                  database name (default jepsen)
     --network NAME             Docker network (default douchdb-jepsen-net)
@@ -109,6 +112,24 @@ and checker results are written under `jepsen-clj/store/`.
 - **Checker:** `jepsen.checker/linearizable` with a CAS-register model wrapped
   by `jepsen.independent/checker`. The model accepts the CAS workload's
   `:cas-write` operation as a successful write.
+
+## Liveness
+
+A background monitor samples each node's Docker state and HTTP health every
+500 ms. The liveness checker compares outages with the nemesis history:
+
+- a node that stops or loses health inside an expected kill/partition window is
+  allowed;
+- a node that stops outside one fails the run;
+- restart-count increases outside an expected window fail the run;
+- indeterminate operations above `--max-indeterminate-pct` fail the run;
+- throughput and the longest gap between successful operations are recorded.
+
+Samples are written to `liveness.edn` under the run's `store` directory.
+
+`.github/workflows/jepsen-nightly.yml` runs a 30-second no-fault smoke plus
+10-minute kill and partition soaks with fixed seeds and uploads `store/` and
+`logs/`.
 
 ## Validation
 

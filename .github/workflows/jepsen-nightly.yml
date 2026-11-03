@@ -1,0 +1,38 @@
+name: Nightly Jepsen
+
+on:
+  schedule:
+    - cron: "47 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-jepsen
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: No-fault smoke
+        run: |
+          ./jepsen-clj/run.sh --no-nemesis --time-limit 30 \
+            --seed 1001 --liveness-interval-ms 500
+      - name: Kill/restart soak
+        run: |
+          ./jepsen-clj/run.sh --fault kill --time-limit 600 \
+            --seed 2001 --nemesis-interval 10 --liveness-interval-ms 500
+      - name: Network partition soak
+        run: |
+          ./jepsen-clj/run.sh --fault partition --time-limit 600 \
+            --seed 2002 --nemesis-interval 10 --liveness-interval-ms 500
+      - name: Upload Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-nightly-results
+          path: |
+            jepsen-clj/store/
+            jepsen-clj/logs/
+          if-no-files-found: ignore

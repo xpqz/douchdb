@@ -11,6 +11,7 @@
             [clojure.tools.cli :as cli]
             [douchdb.client :as dc]
             [douchdb.db :as db]
+            [douchdb.liveness :as liveness]
             [douchdb.nemesis :as dn]
             [jepsen.checker :as checker]
             [jepsen.control :as control]
@@ -49,6 +50,15 @@
     :parse-fn #(Long/parseLong %)
     :validate [#(and (>= % 1) (<= % 3)) "must be 1, 2 or 3"]]
    [nil "--no-final-reads" "Skip the final read of every key"]
+   [nil "--liveness-interval-ms MS" "Container/health sample interval"
+    :default 500
+    :parse-fn #(Long/parseLong %)
+    :validate [#(pos? %) "must be positive"]]
+   [nil "--max-indeterminate-pct PCT" "Fail above this indeterminate percentage"
+    :default 20.0
+    :parse-fn #(Double/parseDouble %)
+    :validate [#(and (>= % 0.0) (<= % 100.0)) "must be between 0 and 100"]]
+   [nil "--no-liveness" "Disable container/health liveness sampling"]
    ["-i" "--nemesis-interval SECONDS" "Seconds between fault and recovery"
     :default 10
     :parse-fn #(Long/parseLong %)
@@ -130,7 +140,8 @@
 
 (defn- test-map
   [{:keys [nodes time-limit concurrency nemesis-interval fault no-nemesis
-           network seed workload read-quorum write-quorum no-final-reads]
+           network seed workload read-quorum write-quorum no-final-reads
+           liveness max-indeterminate-pct liveness-interval-ms]
     db-name :db}]
   (let [tracked (independent/track-keys (make-workload workload))
         body (cond->> tracked
@@ -159,7 +170,14 @@
                         nemesis/noop
                         (dn/docker-nemesis network))
              :generator generator
-             :checker (checker)
+             :checker (if liveness
+                        (checker/compose
+                          {:linearizable (checker)
+                           :liveness (liveness/checker
+                                       {:samples (:samples liveness)
+                                        :max-indeterminate-pct max-indeterminate-pct
+                                        :liveness-interval-ms liveness-interval-ms})})
+                        (checker))
              :time-limit time-limit}
       seed (assoc :seed seed))))
 
@@ -197,10 +215,12 @@
             (println (str "concurrency must be a multiple of " group-size
                           " for the " (:workload options) " workload")))
           (System/exit 2))
-        (let [test (test-map options)]
-        (try
-          (let [result (jepsen/run! test)
-                results (:results result)]
+        (let [monitor (when-not (:no-liveness options)
+                        (liveness/start! nodes (:liveness-interval-ms options)))
+              test (test-map (assoc options :liveness monitor))]
+          (try
+            (let [result (jepsen/run! test)
+                  results (:results result)]
             (println)
             (println "Jepsen results:")
             (pp/pprint results)
@@ -212,4 +232,6 @@
             (System/exit (if (true? (:valid? results)) 0 1)))
           (catch Exception e
             (.printStackTrace e)
-            (System/exit 1))))))))
+            (System/exit 1))
+          (finally
+            (when monitor (liveness/stop! monitor)))))))))
