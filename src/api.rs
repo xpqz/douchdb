@@ -2938,6 +2938,16 @@ async fn view_request(
                 }
             }
         }
+        let group_level = num(q, "group_level");
+        if group_level.is_some_and(|level| level > 0)
+            && q.get("group").is_some_and(|_| !flag(q, "group"))
+        {
+            return Err(ApiError::new(
+                400,
+                "query_parse_error",
+                "Can't specify group=false and group_level>0 at the same time",
+            ));
+        }
         Ok(crate::view::ViewQuery {
             key: view_json_param(q, "key")?,
             keys,
@@ -2959,8 +2969,10 @@ async fn view_request(
             skip: num(q, "skip").unwrap_or(0),
             limit: num(q, "limit").unwrap_or(usize::MAX),
             reduce: q.get("reduce").map(|_| flag(q, "reduce")),
-            group: flag(q, "group"),
-            group_level: num(q, "group_level").unwrap_or(0),
+            // CouchDB: an explicit group_level wins over group. With
+            // group_level=0 the result is ungrouped even if group=true.
+            group: group_level.is_none() && flag(q, "group"),
+            group_level: group_level.unwrap_or(0),
             include_docs: flag(q, "include_docs"),
             attachments: flag(q, "attachments"),
             update_seq: flag(q, "update_seq"),

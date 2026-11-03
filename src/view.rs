@@ -474,6 +474,62 @@ pub fn finish(
     docs: HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
+    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    let grouped = query.group || query.group_level > 0;
+    if !reduce && grouped {
+        return Err(ApiError::new(
+            400,
+            "query_parse_error",
+            "Invalid use of grouping on a map view.",
+        ));
+    }
+    if reduce && query.include_docs {
+        return Err(ApiError::new(
+            400,
+            "query_parse_error",
+            "`include_docs` is invalid for reduce",
+        ));
+    }
+    if let Some(keys) = &query.keys {
+        if keys.len() != 1
+            && (query.key.is_some() || query.startkey.is_some() || query.endkey.is_some())
+        {
+            return Err(ApiError::new(
+                400,
+                "query_parse_error",
+                "`keys` is incompatible with `key`, `start_key` and `end_key`",
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (&query.startkey, &query.endkey) {
+        let order = cmp_json(start, end);
+        let invalid = if query.descending {
+            order == std::cmp::Ordering::Less
+        } else {
+            order == std::cmp::Ordering::Greater
+        };
+        if invalid {
+            let hint = if query.descending {
+                "reverse your start_key and end_key or set descending=false"
+            } else {
+                "reverse your start_key and end_key or set descending=true"
+            };
+            return Err(ApiError::new(
+                400,
+                "query_parse_error",
+                format!("No rows can match your key range, {hint}"),
+            ));
+        }
+    }
+    if reduce {
+        if !grouped && query.keys.as_ref().is_some_and(|keys| keys.len() != 1) {
+            return Err(ApiError::new(
+                400,
+                "query_parse_error",
+                "Multi-key fetches for reduce views must use `group=true`",
+            ));
+        }
+    }
     render(spec, &rows, &docs, query)
 }
 
@@ -1171,7 +1227,7 @@ pub(crate) fn run_map_json(
     })
 }
 
-fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize) {
+fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize, usize) {
     let mut total_rows = query.total_rows_override.unwrap_or(rows.len());
     let mut ordered: Vec<&Row> = if query.descending {
         rows.iter().rev().collect()
@@ -1193,9 +1249,30 @@ fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize)
         total_rows = ordered.len();
     }
 
+    // The offset is the number of rows before the query's starting key. It is
+    // computed before `key`/`keys` filtering, because CouchDB reports the
+    // insertion point even when no row matches.
+    let before_start = if let Some(key) = &query.key {
+        count_before_key(&ordered, key, query.descending)
+    } else if let Some(keys) = &query.keys {
+        match keys.as_slice() {
+            [key] => count_before_key(&ordered, key, query.descending),
+            // CouchDB's offset for multi-key queries follows an internal
+            // legacy rule; it is not compared by the differential fuzzer.
+            _ => 0,
+        }
+    } else {
+        count_before_start(&ordered, query)
+    };
+
     if let Some(keys) = &query.keys {
         let mut selected = Vec::new();
-        for key in keys {
+        let ordered_keys: Vec<&Value> = if query.descending {
+            keys.iter().rev().collect()
+        } else {
+            keys.iter().collect()
+        };
+        for key in ordered_keys {
             for row in &ordered {
                 if cmp_json(&row.key, key) == Ordering::Equal {
                     selected.push(*row);
@@ -1206,11 +1283,11 @@ fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize)
     } else if let Some(key) = &query.key {
         ordered.retain(|row| cmp_json(&row.key, key) == Ordering::Equal);
     }
-    (ordered, total_rows)
+    (ordered, total_rows, before_start)
 }
 
 fn selected_row_ids(rows: &[Row], query: &ViewQuery) -> Vec<String> {
-    let (mut ordered, _) = ordered_rows(rows, query);
+    let (mut ordered, _, _) = ordered_rows(rows, query);
     ordered.retain(|row| in_range(row, query));
     let skip = query.skip.min(ordered.len());
     ordered
@@ -1227,8 +1304,9 @@ fn render(
     docs: &HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
-    let (mut ordered, total_rows) = ordered_rows(rows, query);
-    let before_start = count_before_start(&ordered, query);
+    let (mut ordered, total_rows, before_start) = ordered_rows(rows, query);
+    let available = total_rows.saturating_sub(before_start);
+    let skip = query.skip.min(available);
     ordered.retain(|row| in_range(row, query));
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
 
@@ -1241,6 +1319,12 @@ fn render(
             ));
         };
         let groups = group_rows(ordered, query);
+        if !query.group
+            && query.group_level == 0
+            && groups.iter().all(|(_, members)| members.is_empty())
+        {
+            return Ok(json!({"rows": []}));
+        }
         let mut out = Vec::new();
         for (key, members) in groups {
             let value = match reducer.as_str() {
@@ -1269,10 +1353,11 @@ fn render(
             };
             out.push(json!({"key": key, "value": value}));
         }
-        return Ok(json!({"rows": out}));
+        let skip = query.skip.min(out.len());
+        let selected: Vec<Value> = out.into_iter().skip(skip).take(query.limit).collect();
+        return Ok(json!({"rows": selected}));
     }
 
-    let skip = query.skip.min(ordered.len());
     let take = query.limit;
     let selected = ordered.into_iter().skip(skip).take(take);
     let rows: Vec<Value> = selected
@@ -1310,6 +1395,16 @@ fn count_before_start(rows: &[&Row], query: &ViewQuery) -> usize {
                 Some(id) => row.id < *id,
                 None => false,
             },
+        })
+        .count()
+}
+
+fn count_before_key(rows: &[&Row], key: &Value, descending: bool) -> usize {
+    rows.iter()
+        .filter(|row| match cmp_json(&row.key, key) {
+            Ordering::Less => !descending,
+            Ordering::Greater => descending,
+            Ordering::Equal => false,
         })
         .count()
 }

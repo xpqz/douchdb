@@ -3534,6 +3534,32 @@ async fn views_map_reduce_collation_and_query_options() {
         .await;
     assert_eq!(body["rows"].as_array().unwrap().len(), 2);
 
+    // A key with no rows still reports its insertion point as the offset.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?key=%22Munich%22")
+        .await;
+    assert_eq!(body["offset"], 2);
+    assert!(body["rows"].as_array().unwrap().is_empty());
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?key=%22Munich%22&skip=1")
+        .await;
+    assert_eq!(body["offset"], 3);
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?key=%22Munich%22&descending=true")
+        .await;
+    assert_eq!(body["offset"], 2);
+
+    // A reversed range is an error in the matching direction.
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/by_city?startkey=%22Paris%22&endkey=%22Berlin%22")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/by_city?startkey=%22Paris%22&endkey=%22Berlin%22&descending=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     let (_, body) = s
         .get("/shop/_design/shop/_view/by_city?startkey=%22Berlin%22&endkey=%22Paris%22&include_docs=true")
         .await;
@@ -3554,6 +3580,18 @@ async fn views_map_reduce_collation_and_query_options() {
         .map(|row| row["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["c", "d", "a", "b"]);
+
+    // Descending reverses the requested key order as well as row order.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/by_city?keys=%5B%22Berlin%22%2C%22Paris%22%5D&descending=true")
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["d", "c", "b", "a"]);
 
     // Built-in reduces.
     let (_, body) = s.get("/shop/_design/shop/_view/count").await;
@@ -3577,6 +3615,72 @@ async fn views_map_reduce_collation_and_query_options() {
     assert_eq!(body["rows"].as_array().unwrap().len(), 2);
     assert_eq!(body["rows"][0]["key"], "Berlin");
     assert_eq!(body["rows"][0]["value"], 2);
+
+    // Reduce rows honour skip and limit, including grouped output.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/count?group=true&limit=1")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["key"], "Berlin");
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/count?group=true&skip=1")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["key"], "Paris");
+    let (_, body) = s.get("/shop/_design/shop/_view/count?skip=1").await;
+    assert!(body["rows"].as_array().unwrap().is_empty());
+
+    // An ungrouped reduce over no matching rows returns no row.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/count?startkey=%22zzz%22")
+        .await;
+    assert!(body["rows"].as_array().unwrap().is_empty());
+
+    // Multi-key fetches on a reduce view require group=true.
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/count?keys=%5B%22Berlin%22%2C%22Paris%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/count?group=true&keys=%5B%22Berlin%22%2C%22Paris%22%5D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    // An explicit group_level=0 overrides group=true and gives a global row.
+    let (_, body) = s
+        .get("/shop/_design/shop/_view/count?group=true&group_level=0")
+        .await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["key"], Value::Null);
+    assert_eq!(body["rows"][0]["value"], 4);
+
+    // Contradictory grouping and incompatible keys/ranges are query errors.
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/count?group=false&group_level=2")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+    let (status, body) = s
+        .get(
+            "/shop/_design/shop/_view/count?keys=%5B%22Berlin%22%2C%22Paris%22%5D&startkey=%22Paris%22",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+
+    // Grouping a map view and include_docs on a reduce view are query errors.
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/by_city?group=true&reduce=false")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
+    let (status, body) = s
+        .get("/shop/_design/shop/_view/count?include_docs=true")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "query_parse_error");
 
     let (_, body) = s
         .get("/shop/_design/shop/_view/by_type_city?group_level=1")
