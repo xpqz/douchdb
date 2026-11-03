@@ -791,7 +791,8 @@ impl Db {
             rows.reverse();
         }
         let selected: Vec<_> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
-        finish_all_docs(selected, total_rows as usize, before_start + opts.skip)
+        let offset = (before_start + opts.skip).min(total_rows as usize);
+        finish_all_docs(selected, total_rows as usize, offset)
     }
 
     /// Documents for a view build, as JSON text with `_id` and `_rev` already
@@ -1213,6 +1214,7 @@ impl Db {
                     .get("attachments")
                     .and_then(Value::as_bool)
                     .unwrap_or(attachments),
+                include_deleted: true,
                 ..Default::default()
             };
             grouped[self.shard_index(&id)].push((slot, id, opts));
@@ -1658,6 +1660,9 @@ impl Stage<'_> {
                 if !meta.tree.edges.contains_key(&rev) || !meta.tree.is_leaf(&rev) {
                     return Err(ApiError::conflict());
                 }
+                if meta.tree.is_deleted(&rev) {
+                    return Err(ApiError::conflict());
+                }
                 Some(rev)
             }
             None => match meta.tree.winner() {
@@ -1980,6 +1985,7 @@ pub struct AllDocsOpts {
     pub startkey: Option<String>,
     pub endkey: Option<String>,
     pub descending: bool,
+    pub inclusive_end: bool,
     pub limit: usize,
     pub skip: usize,
 }
@@ -1995,6 +2001,7 @@ impl Default for AllDocsOpts {
             startkey: None,
             endkey: None,
             descending: false,
+            inclusive_end: true,
             limit: usize::MAX,
             skip: 0,
         }
@@ -2221,9 +2228,23 @@ fn collect_all_docs(
         if !empty_range {
             if opts.descending {
                 let range = match (start, end) {
-                    (Some(start), Some(end)) => (Bound::Included(end), Bound::Included(start)),
+                    (Some(start), Some(end)) => (
+                        if opts.inclusive_end {
+                            Bound::Included(end)
+                        } else {
+                            Bound::Excluded(end)
+                        },
+                        Bound::Included(start),
+                    ),
                     (Some(start), None) => (Bound::Unbounded, Bound::Included(start)),
-                    (None, Some(end)) => (Bound::Included(end), Bound::Unbounded),
+                    (None, Some(end)) => (
+                        if opts.inclusive_end {
+                            Bound::Included(end)
+                        } else {
+                            Bound::Excluded(end)
+                        },
+                        Bound::Unbounded,
+                    ),
                     (None, None) => (Bound::Unbounded, Bound::Unbounded),
                 };
                 for (id, doc) in live.range::<str, _>(range).rev() {
@@ -2234,9 +2255,23 @@ fn collect_all_docs(
                 }
             } else {
                 let range = match (start, end) {
-                    (Some(start), Some(end)) => (Bound::Included(start), Bound::Included(end)),
+                    (Some(start), Some(end)) => (
+                        Bound::Included(start),
+                        if opts.inclusive_end {
+                            Bound::Included(end)
+                        } else {
+                            Bound::Excluded(end)
+                        },
+                    ),
                     (Some(start), None) => (Bound::Included(start), Bound::Unbounded),
-                    (None, Some(end)) => (Bound::Unbounded, Bound::Included(end)),
+                    (None, Some(end)) => (
+                        Bound::Unbounded,
+                        if opts.inclusive_end {
+                            Bound::Included(end)
+                        } else {
+                            Bound::Excluded(end)
+                        },
+                    ),
                     (None, None) => (Bound::Unbounded, Bound::Unbounded),
                 };
                 for (id, doc) in live.range::<str, _>(range) {

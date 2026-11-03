@@ -3444,6 +3444,10 @@ async fn all_docs(
         startkey: key_param(q, "startkey").or_else(|| key_param(q, "start_key")),
         endkey: key_param(q, "endkey").or_else(|| key_param(q, "end_key")),
         descending: flag(q, "descending"),
+        inclusive_end: q
+            .get("inclusive_end")
+            .map(|value| value != "false")
+            .unwrap_or(true),
         limit: num(q, "limit").unwrap_or(usize::MAX),
         skip: num(q, "skip").unwrap_or(0),
         ..Default::default()

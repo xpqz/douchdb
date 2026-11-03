@@ -678,6 +678,46 @@ async fn document_crud_matches_couchdb_rev_ids() {
 }
 
 #[tokio::test]
+async fn deleted_leaf_cannot_be_updated_by_rev() {
+    let s = Server::start(false);
+    s.fresh_db("tombstones").await;
+
+    let (_, body) = s.put("/tombstones/doc", json!({"a": 1})).await;
+    let rev1 = body["rev"].as_str().unwrap().to_string();
+    let (status, body) = s.delete(&format!("/tombstones/doc?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let rev2 = body["rev"].as_str().unwrap().to_string();
+
+    let (status, body) = s
+        .put("/tombstones/doc", json!({"_rev": rev2, "a": 2}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "conflict");
+
+    let (status, body) = s
+        .post(
+            "/tombstones/_bulk_docs",
+            json!({"docs": [{"_id": "doc", "_rev": rev2, "_deleted": true}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body[0]["error"], "conflict");
+
+    // _bulk_get returns the tombstone, not a missing-document error.
+    let (status, body) = s
+        .post("/tombstones/_bulk_get", json!({"docs": [{"id": "doc"}]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["docs"][0]["ok"]["_deleted"], true);
+    assert_eq!(body["results"][0]["docs"][0]["ok"]["_rev"], rev2);
+
+    // Creating a new revision without a rev is how CouchDB recreates a
+    // deleted document.
+    let (status, body) = s.put("/tombstones/doc", json!({"a": 3})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
 async fn large_integers_round_trip_and_match_couchdb_rev_ids() {
     let s = Server::start(false);
     s.fresh_db("bigints").await;
@@ -927,6 +967,37 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
         .map(|row| row["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["c", "e"]);
+
+    // Offset is capped at total_rows even when skip overshoots.
+    let (_, body) = s.get("/ranges/_all_docs?skip=100").await;
+    assert_eq!(body["offset"], 4);
+    assert!(body["rows"].as_array().unwrap().is_empty());
+    let (_, body) = s.get("/ranges/_all_docs?startkey=%22zzz%22&skip=4").await;
+    assert_eq!(body["offset"], 4);
+
+    // inclusive_end=false excludes the end key in both directions.
+    let (_, body) = s
+        .get("/ranges/_all_docs?startkey=%22a%22&endkey=%22e%22&inclusive_end=false")
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a", "c"]);
+    let (_, body) = s
+        .get(
+            "/ranges/_all_docs?startkey=%22f%22&endkey=%22a%22&inclusive_end=false&descending=true",
+        )
+        .await;
+    let ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["f", "e", "c"]);
 
     let (_, body) = s
         .get("/ranges/_all_docs?startkey=%22c%22&limit=1&skip=1")

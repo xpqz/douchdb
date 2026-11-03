@@ -1075,6 +1075,9 @@ pub(crate) async fn fetch_all_docs(
     if opts.descending {
         query.push("descending=true".to_string());
     }
+    if !opts.inclusive_end {
+        query.push("inclusive_end=false".to_string());
+    }
     if opts.skip > 0 {
         query.push(format!("skip={}", opts.skip));
     }
