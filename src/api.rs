@@ -3775,6 +3775,9 @@ async fn changes_normal_raw(
     }
     let me = st.cluster.me;
     let initial_seq = progress.get(me).copied().unwrap_or(0);
+    let pending_descending = opts.descending;
+    let pending_owned = opts.owned.clone();
+    let pending_db = db.clone();
     let mut rows = Box::pin(Db::changes_stream_arc(db.clone(), opts));
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"results\":["));
@@ -3807,6 +3810,14 @@ async fn changes_normal_raw(
         } else {
             last_seq.to_string()
         };
+        let pending = if rewrite {
+            0
+        } else {
+            pending_db
+                .changes_pending(last_seq, pending_descending, pending_owned.as_deref())
+                .await
+                .unwrap_or(0)
+        };
         buffer.push_str("],\"last_seq\":");
         if rewrite {
             buffer.push('"');
@@ -3815,7 +3826,7 @@ async fn changes_normal_raw(
         } else {
             buffer.push_str(&last_seq_json);
         }
-        buffer.push_str(",\"pending\":0}");
+        buffer.push_str(&format!(",\"pending\":{pending}}}"));
         if !buffer.is_empty() {
             yield Ok(Bytes::from(buffer));
         }
@@ -4415,4 +4426,52 @@ pub async fn not_found() -> Response {
         StatusCode::NOT_FOUND,
         json!({"error": "not_found", "reason": "missing"}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn percent_decode_round_trips_encoded_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
+            let encoded: String = bytes.iter().map(|byte| format!("%{byte:02X}")).collect();
+            let decoded = percent_decode(&encoded);
+            prop_assert_eq!(decoded, String::from_utf8_lossy(&bytes));
+        }
+
+        #[test]
+        fn percent_decode_never_panics(text in ".{0,300}") {
+            let _ = percent_decode(&text);
+        }
+
+        #[test]
+        fn shard_mask_round_trips_valid_sets(q in 1u32..64, selected in prop::collection::vec(any::<bool>(), 1..64)) {
+            let mut selected = selected;
+            selected.resize(q as usize, false);
+            let raw = selected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, on)| on.then(|| index.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mask = parse_shard_mask(&raw, q).unwrap_or_else(|| panic!("failed to parse {raw}"));
+            prop_assert_eq!(mask.len(), q as usize);
+            prop_assert_eq!(mask, selected);
+        }
+
+        #[test]
+        fn shard_mask_never_panics(raw in ".{0,120}", q in 0u32..64) {
+            let _ = parse_shard_mask(&raw, q);
+        }
+    }
+
+    #[test]
+    fn percent_decode_handles_plus_and_bad_escapes() {
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%C3%A9"), "é");
+    }
 }

@@ -98,6 +98,30 @@ pub fn shard_index_for(docid: &str, q: u32, partitioned: bool) -> usize {
     shard_index(docid, q)
 }
 
+/// Pure form of the changes watermark rule: only shards with an allocated but
+/// uncommitted sequence constrain the cursor, and the cursor never goes below
+/// `since`.
+pub(crate) fn changes_watermark_from(
+    committed: &[u64],
+    reserved: &[u64],
+    since: u64,
+    owned: Option<&[bool]>,
+) -> u64 {
+    let mut safe = u64::MAX;
+    for index in 0..committed.len().min(reserved.len()) {
+        if owned
+            .map(|mask| !mask.get(index).copied().unwrap_or(false))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if reserved[index] > committed[index] {
+            safe = safe.min(committed[index].max(since));
+        }
+    }
+    safe
+}
+
 /// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
 pub fn validate_partition(partition: &str) -> DbResult<()> {
     if partition.is_empty() {
@@ -477,24 +501,17 @@ impl Db {
     /// while that shard still has an allocated-but-uncommitted sequence;
     /// otherwise the next request skips the later-visible row.
     pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
-        let mut safe = u64::MAX;
-        for index in 0..self.shards.len() {
-            if owned
-                .map(|mask| !mask.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let committed = self.committed_seq[index].load(Ordering::SeqCst);
-            let reserved = self.reserved_seq[index].load(Ordering::SeqCst);
-            // Only shards with an allocated-but-uncommitted sequence constrain
-            // the cursor. A shard with nothing in flight cannot later publish
-            // a sequence below `since`, so it imposes no bound.
-            if reserved > committed {
-                safe = safe.min(committed.max(since));
-            }
-        }
-        safe
+        let committed: Vec<u64> = self
+            .committed_seq
+            .iter()
+            .map(|seq| seq.load(Ordering::SeqCst))
+            .collect();
+        let reserved: Vec<u64> = self
+            .reserved_seq
+            .iter()
+            .map(|seq| seq.load(Ordering::SeqCst))
+            .collect();
+        changes_watermark_from(&committed, &reserved, since, owned)
     }
 
     pub fn pending_shard_map(&self) -> Option<ShardMap> {
@@ -949,7 +966,10 @@ impl Db {
         }))
     }
 
-    pub(crate) async fn changes_rows(&self, opts: &ChangesOpts) -> DbResult<(Vec<ChangeRow>, u64)> {
+    pub(crate) async fn changes_rows(
+        &self,
+        opts: &ChangesOpts,
+    ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
         let mut rows = Vec::new();
         for (index, shard) in self.shards.iter().enumerate() {
             if opts
@@ -980,11 +1000,35 @@ impl Db {
             rows.truncate(limit);
         }
         let last_seq = rows.last().map(|r| r.seq).unwrap_or(opts.since);
-        Ok((rows, last_seq))
+        let pending = self
+            .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
+            .await?;
+        Ok((rows, last_seq, pending))
+    }
+
+    pub(crate) async fn changes_pending(
+        &self,
+        after: u64,
+        descending: bool,
+        owned: Option<&[bool]>,
+    ) -> DbResult<usize> {
+        let mut pending = 0usize;
+        for (index, shard) in self.shards.iter().enumerate() {
+            if owned
+                .map(|owned| !owned.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            pending += shard
+                .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
+                .await?;
+        }
+        Ok(pending)
     }
 
     pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
-        let (rows, last_seq) = self.changes_rows(opts).await?;
+        let (rows, last_seq, pending) = self.changes_rows(opts).await?;
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             let mut entry = json!({
@@ -1002,7 +1046,7 @@ impl Db {
             }
             results.push(entry);
         }
-        Ok(json!({ "results": results, "last_seq": last_seq, "pending": 0 }))
+        Ok(json!({ "results": results, "last_seq": last_seq, "pending": pending }))
     }
 
     /// Stream changes rows in global sequence order by merging a page at a
@@ -1376,6 +1420,9 @@ impl Db {
                     } else {
                         s.commit(tx)?;
                     }
+                    if !removed.is_empty() {
+                        s.invalidate_latest();
+                    }
                     Ok(removed)
                 })
                 .await?;
@@ -1592,6 +1639,7 @@ fn put_many(
     }
 
     if let Err(e) = commit_ops(shard, ops) {
+        shard.invalidate_latest();
         let message = e.to_string();
         return results
             .into_iter()
@@ -1603,6 +1651,18 @@ fn put_many(
             })
             .collect();
     }
+    let ok_ids: std::collections::HashSet<String> = results
+        .iter()
+        .filter_map(|(_, result)| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    shard.update_latest(&staged, &ok_ids);
     results
 }
 
@@ -2386,80 +2446,71 @@ fn collect_changes(
         return Ok(Vec::new());
     }
 
-    let mut selected = Vec::new();
-    {
-        let by_seq = shard.seq_entries()?;
-        for (seq, entry) in by_seq.range(opts.since.saturating_add(1)..) {
-            if let Some(ids) = &opts.doc_ids {
-                if !ids.iter().any(|id| id.as_str() == &*entry.id) {
-                    continue;
-                }
-            }
-            selected.push((*seq, entry.clone()));
-            if !opts.descending && selected.len() >= limit {
-                break;
-            }
-        }
+    // CouchDB returns one row per document at its latest sequence, not one
+    // row per historical sequence entry. `latest_changes` is maintained on
+    // writes and built lazily from metadata.
+    let mut candidates: Vec<(u64, String)> = shard
+        .latest_changes()?
+        .iter()
+        .filter(|(_, seq)| opts.descending || **seq > opts.since)
+        .map(|(id, seq)| (*seq, id.clone()))
+        .collect();
+    if let Some(ids) = &opts.doc_ids {
+        candidates.retain(|(_, id)| ids.iter().any(|wanted| wanted == id));
     }
+    candidates.sort_by_key(|(seq, _)| *seq);
+    if opts.descending {
+        candidates.reverse();
+    }
+    candidates.truncate(limit);
 
-    let mut rows = Vec::with_capacity(selected.len());
-    for (seq, entry) in selected {
-        let changes = if opts.style_all_docs {
-            // Rebuild revision-tree leaf order without touching LevelDB. The
-            // winner is merged back into the cached non-winning leaves.
-            let mut leaves = Vec::with_capacity(1 + entry.other_leaves.len());
-            let mut winner_inserted = false;
-            for (rev, deleted) in &entry.other_leaves {
-                if !winner_inserted && rev.as_ref() > entry.rev.as_ref() {
-                    leaves.push((entry.rev.to_string(), entry.deleted));
-                    winner_inserted = true;
-                }
-                leaves.push((rev.to_string(), *deleted));
-            }
-            if !winner_inserted {
-                leaves.push((entry.rev.to_string(), entry.deleted));
-            }
-            leaves
+    let mut rows = Vec::with_capacity(candidates.len());
+    for (seq, id) in candidates {
+        let Some(meta) = shard.get_meta(&id)? else {
+            continue;
+        };
+        if meta.seq != seq {
+            continue;
+        }
+        let Some(winner) = meta.tree.winner() else {
+            continue;
+        };
+        let deleted = meta.tree.is_deleted(&winner);
+        let changes: Vec<(String, bool)> = if opts.style_all_docs {
+            meta.tree
+                .leaves()
+                .into_iter()
+                .map(|leaf| {
+                    let leaf_deleted = meta.tree.is_deleted(&leaf);
+                    (leaf, leaf_deleted)
+                })
+                .collect()
         } else {
-            vec![(entry.rev.to_string(), entry.deleted)]
+            vec![(winner.clone(), deleted)]
         };
 
         let doc = if opts.include_docs {
-            if entry.deleted {
-                if let Some(meta) = shard.get_meta(&entry.id)? {
-                    if let Some(winner) = meta.tree.winner() {
-                        let doc = read_doc_rev(
-                            shard,
-                            &entry.id,
-                            &meta,
-                            &winner,
-                            &DocOpts {
-                                rev: Some(winner.clone()),
-                                ..Default::default()
-                            },
-                        )?;
-                        Some(serde_json::to_string(&doc).map_err(|error| {
-                            ApiError::new(500, "internal_server_error", error.to_string())
-                        })?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                shard
-                    .get_body(&entry.id, &entry.rev)?
-                    .map(|body| embed_doc_meta(&entry.id, &entry.rev, &body))
-            }
+            read_doc_rev(
+                shard,
+                &id,
+                &meta,
+                &winner,
+                &DocOpts {
+                    rev: Some(winner.clone()),
+                    include_deleted: true,
+                    ..Default::default()
+                },
+            )
+            .ok()
+            .and_then(|doc| serde_json::to_string(&doc).ok())
         } else {
             None
         };
         rows.push(ChangeRow {
-            id: entry.id.to_string(),
+            id,
             seq,
             changes,
-            deleted: entry.deleted,
+            deleted,
             doc,
         });
     }
@@ -2475,6 +2526,54 @@ mod tests {
             .map(|i| format!("shard{shard}-{i}"))
             .find(|id| db.shard_index(id) == shard)
             .expect("document id for shard")
+    }
+
+    #[tokio::test]
+    async fn changes_limit_reports_pending_documents() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let docs: Vec<Value> = (0..5)
+            .map(|i| json!({"_id": format!("p{i}"), "n": i}))
+            .collect();
+        db.put_docs(docs, true).await.unwrap();
+
+        let opts = ChangesOpts {
+            since: 0,
+            limit: Some(2),
+            include_docs: false,
+            style_all_docs: false,
+            descending: false,
+            doc_ids: None,
+            owned: None,
+        };
+        let (rows, last_seq, pending) = db.changes_rows(&opts).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(last_seq, 2);
+        assert_eq!(pending, 3, "three documents remain after the page");
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&ChangesOpts {
+                descending: true,
+                ..opts
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(last_seq, 4);
+        assert_eq!(pending, 3, "three older documents remain descending");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2530,7 +2629,7 @@ mod tests {
             doc_ids: None,
             owned: None,
         };
-        let (rows, last_seq) = db.changes_rows(&opts).await.unwrap();
+        let (rows, last_seq, _pending) = db.changes_rows(&opts).await.unwrap();
         assert!(rows.iter().all(|row| row.seq <= committed), "{rows:?}");
         assert_eq!(last_seq, committed);
 
@@ -2541,11 +2640,79 @@ mod tests {
             since: last_seq,
             ..opts
         };
-        let (rows, _) = db.changes_rows(&resumed).await.unwrap();
+        let (rows, _, _) = db.changes_rows(&resumed).await.unwrap();
         assert!(rows.iter().any(|row| row.id == later));
         assert!(rows.iter().all(|row| row.seq > last_seq));
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn watermark_respects_every_in_flight_shard(
+            committed in prop::collection::vec(0u64..1000, 1..8),
+            reserved in prop::collection::vec(0u64..1000, 1..8),
+            since in 0u64..1000,
+            owned in prop::option::of(prop::collection::vec(any::<bool>(), 1..8)),
+        ) {
+            let mut reserved = reserved;
+            // Make the two arrays the same shape and ensure reserved >= committed.
+            reserved.resize(committed.len(), 0);
+            for (r, c) in reserved.iter_mut().zip(&committed) {
+                *r = (*r).max(*c);
+            }
+            let mask = owned.as_ref().map(|m| {
+                let mut m = m.clone();
+                m.resize(committed.len(), false);
+                m
+            });
+            let watermark = changes_watermark_from(
+                &committed,
+                &reserved,
+                since,
+                mask.as_deref(),
+            );
+
+            for index in 0..committed.len() {
+                if mask.as_ref().is_some_and(|m| !m[index]) {
+                    continue;
+                }
+                if reserved[index] > committed[index] {
+                    prop_assert!(watermark <= committed[index].max(since));
+                    prop_assert!(watermark >= since);
+                }
+            }
+            if watermark != u64::MAX {
+                prop_assert!(watermark >= since);
+            }
+        }
+
+        #[test]
+        fn shard_placement_is_deterministic_and_in_range(
+            docid in ".{0,80}",
+            q in 1u32..64,
+        ) {
+            let a = shard_index(&docid, q);
+            let b = shard_index(&docid, q);
+            prop_assert_eq!(a, b);
+            prop_assert!(a < q as usize);
+        }
+
+        #[test]
+        fn partitioned_documents_stay_in_their_partition_shard(
+            partition in "[A-Za-z0-9][A-Za-z0-9_-]{0,29}",
+            doc in "[A-Za-z0-9][A-Za-z0-9_-]{0,29}",
+            q in 2u32..64,
+        ) {
+            let first = format!("{partition}:{doc}");
+            let second = format!("{partition}:other-{doc}");
+            prop_assert_eq!(
+                shard_index_for(&first, q, true),
+                shard_index_for(&second, q, true)
+            );
+        }
     }
 }

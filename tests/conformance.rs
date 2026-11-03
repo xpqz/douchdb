@@ -789,6 +789,57 @@ async fn internal_consistency_after_concurrent_writes() {
 }
 
 #[tokio::test]
+async fn changes_returns_latest_per_document_and_pending() {
+    let s = Server::start(false);
+    s.fresh_db("latest").await;
+
+    let (_, first) = s.put("/latest/a", json!({"v": 1})).await;
+    let mut rev = first["rev"].as_str().unwrap().to_string();
+    for value in [2, 3, 4] {
+        let (status, body) = s.put("/latest/a", json!({"v": value, "_rev": rev})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        rev = body["rev"].as_str().unwrap().to_string();
+    }
+    let (_, b) = s.put("/latest/b", json!({"v": 1})).await;
+    let b_rev = b["rev"].as_str().unwrap().to_string();
+
+    let (status, body) = s.get("/latest/_changes?since=0&limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    let a_row = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "a")
+        .unwrap();
+    assert_eq!(a_row["changes"][0]["rev"], rev);
+    assert_eq!(body["pending"], 0);
+
+    let (_, page) = s.get("/latest/_changes?since=0&limit=1").await;
+    assert_eq!(page["results"].as_array().unwrap().len(), 1);
+    assert_eq!(page["pending"], 1);
+
+    let (_, descending) = s
+        .get("/latest/_changes?since=0&limit=1&descending=true")
+        .await;
+    assert_eq!(descending["results"].as_array().unwrap().len(), 1);
+    assert_eq!(descending["results"][0]["id"], "b");
+    assert_eq!(descending["pending"], 1);
+
+    let (_, all_docs) = s
+        .get("/latest/_changes?since=0&style=all_docs&include_docs=true")
+        .await;
+    let b_row = all_docs["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "b")
+        .unwrap();
+    assert_eq!(b_row["changes"][0]["rev"], b_rev);
+    assert_eq!(b_row["doc"]["_rev"], b_rev);
+}
+
+#[tokio::test]
 async fn deleted_leaf_cannot_be_updated_by_rev() {
     let s = Server::start(false);
     s.fresh_db("tombstones").await;
@@ -2871,6 +2922,137 @@ async fn replication_source_and_target_agree_after_convergence() {
         assert_eq!(status1, StatusCode::OK);
         assert_eq!(doc0, doc1, "{id}: reads differ across coordinators");
         assert_eq!(doc0["_rev"], local[0][id]["value"]["rev"], "{id}");
+    }
+}
+
+#[tokio::test]
+async fn internal_consistency_survives_node_loss_and_restart() {
+    let mut nodes = start_cluster_with(3, "1", 2);
+    for node in &nodes {
+        node.fresh_db("ccons").await;
+    }
+
+    let initial: Vec<Value> = (0..30)
+        .map(|i| json!({"_id": format!("i{i:02}"), "n": i, "s": "init"}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/ccons/_bulk_docs", json!({"docs": initial}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    nodes[2].kill();
+
+    let base = nodes[0].base.clone();
+    let client = nodes[0].client.clone();
+    let mut writers = Vec::new();
+    for worker in 0..4u32 {
+        let base = base.clone();
+        let client = client.clone();
+        writers.push(tokio::spawn(async move {
+            for index in 0..10u32 {
+                let id = format!("w{worker}-{index:02}");
+                let response = client
+                    .put(format!("{base}/ccons/{id}"))
+                    .json(&json!({"n": worker * 10 + index, "s": format!("s{worker}")}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    response.status() == StatusCode::CREATED
+                        || response.status() == StatusCode::ACCEPTED,
+                    "write {id}: {}",
+                    response.status()
+                );
+            }
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    nodes[2].restart();
+    for writer in writers {
+        writer.await.unwrap();
+    }
+
+    let expected = 30 + 40;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (_, all_docs) = nodes[2].get("/ccons/_all_docs?limit=1000").await;
+        if all_docs["total_rows"] == expected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted node did not converge: {all_docs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut changes: Vec<HashMap<String, Value>> = Vec::new();
+    let mut all_rows: Vec<HashMap<String, Value>> = Vec::new();
+    for node in &nodes {
+        let (status, body) = node
+            .get("/ccons/_changes?since=0&include_docs=true&limit=1000")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let latest: HashMap<String, Value> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.as_object_mut().unwrap().remove("seq");
+                (row["id"].as_str().unwrap().to_string(), row)
+            })
+            .collect();
+        assert_eq!(latest.len(), expected, "changes row count");
+        changes.push(latest);
+
+        let (status, body) = node
+            .get("/ccons/_all_docs?include_docs=true&limit=1000")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows: HashMap<String, Value> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row["id"].as_str().unwrap().to_string(), row["doc"].clone()))
+            .collect();
+        assert_eq!(rows.len(), expected, "all_docs row count");
+        all_rows.push(rows);
+    }
+    assert_eq!(changes[0], changes[1], "changes differ after restart");
+    assert_eq!(changes[0], changes[2], "changes differ after restart");
+    assert_eq!(all_rows[0], all_rows[1], "all_docs differ after restart");
+    assert_eq!(all_rows[0], all_rows[2], "all_docs differ after restart");
+
+    let (status, _) = nodes[0]
+        .put(
+            "/ccons/_design/check",
+            json!({"views": {"by_s": {"map": "function(doc){ if(doc.s) emit(doc.s, doc.n); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut views = Vec::new();
+    for node in &nodes {
+        let (_, body) = node
+            .get("/ccons/_design/check/_view/by_s?reduce=false&limit=1000")
+            .await;
+        views.push(body);
+    }
+    assert_eq!(views[0]["total_rows"], expected);
+    assert_eq!(views[0], views[1], "view differs after restart");
+    assert_eq!(views[0], views[2], "view differs after restart");
+
+    for id in all_rows[0].keys() {
+        let (s0, d0) = nodes[0].get(&format!("/ccons/{id}")).await;
+        let (s1, d1) = nodes[1].get(&format!("/ccons/{id}")).await;
+        let (s2, d2) = nodes[2].get(&format!("/ccons/{id}")).await;
+        assert_eq!(
+            (s0, s1, s2),
+            (StatusCode::OK, StatusCode::OK, StatusCode::OK)
+        );
+        assert_eq!(d0, d1, "{id}: read differs across coordinators");
+        assert_eq!(d0, d2, "{id}: read differs after restart");
     }
 }
 
