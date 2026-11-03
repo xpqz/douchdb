@@ -511,6 +511,10 @@ router; there is no coordinator role.
   requested quorum acknowledges; the remaining writes continue detached. Reads
   fan out to the replica set and enforce the requested read quorum; `?r=1` is the
   local fast path when a replica is unavailable.
+- Numeric `_changes` cursors are watermarked across shards: a cursor is not
+  advanced past a sequence that another shard has allocated but not yet
+  committed. Overlapping writes can therefore cause a short re-read, but not a
+  skipped document. Cluster feeds keep their opaque version-vector cursor.
 - `?w=` / `?r=` select write and read quorum. The default read quorum is
   `r = (n/2)+1`; `?r=1` is the local fast path. An unmet read quorum returns
   `503 quorum_not_met`, including tombstones and all conflict leaves in the

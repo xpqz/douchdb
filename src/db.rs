@@ -145,6 +145,10 @@ pub struct Db {
     /// coordinating node disappears mid-rebalance.
     rebalance_until: Arc<AtomicU64>,
     shards: Vec<ShardHandle>,
+    /// Last committed sequence per shard, shared with the shard actors.
+    committed_seq: Vec<Arc<AtomicU64>>,
+    /// Highest sequence allocated but not necessarily committed per shard.
+    reserved_seq: Vec<Arc<AtomicU64>>,
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
     seq: Arc<AtomicU64>,
@@ -208,11 +212,13 @@ impl Db {
             });
 
         let mut shards = Vec::new();
+        let mut committed_seq = Vec::with_capacity(file.q as usize);
+        let mut reserved_seq = Vec::with_capacity(file.q as usize);
         for i in 0..file.q {
-            shards.push(ShardHandle::spawn(
-                path.join(format!("shard-{i:04}")),
-                config.revs_limit,
-            )?);
+            let shard = ShardHandle::spawn(path.join(format!("shard-{i:04}")), config.revs_limit)?;
+            committed_seq.push(shard.seq_tracker());
+            reserved_seq.push(Arc::new(AtomicU64::new(shard.initial_seq())));
+            shards.push(shard);
         }
 
         let seq = shards
@@ -238,6 +244,8 @@ impl Db {
             migration_map: Arc::new(std::sync::RwLock::new(None)),
             rebalance_until: Arc::new(AtomicU64::new(0)),
             shards,
+            committed_seq,
+            reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
         })
     }
@@ -460,6 +468,35 @@ impl Db {
         );
     }
 
+    /// Highest sequence that is safe for a changes cursor to publish.
+    ///
+    /// Sequence numbers are allocated while a shard job is staging, but only
+    /// become visible when that job commits. Different shard actors can run
+    /// concurrently, so another shard may publish a higher sequence first. A
+    /// numeric `last_seq` must not advance past a shard's committed sequence
+    /// while that shard still has an allocated-but-uncommitted sequence;
+    /// otherwise the next request skips the later-visible row.
+    pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
+        let mut safe = u64::MAX;
+        for index in 0..self.shards.len() {
+            if owned
+                .map(|mask| !mask.get(index).copied().unwrap_or(false))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let committed = self.committed_seq[index].load(Ordering::SeqCst);
+            let reserved = self.reserved_seq[index].load(Ordering::SeqCst);
+            // Only shards with an allocated-but-uncommitted sequence constrain
+            // the cursor. A shard with nothing in flight cannot later publish
+            // a sequence below `since`, so it imposes no bound.
+            if reserved > committed {
+                safe = safe.min(committed.max(since));
+            }
+        }
+        safe
+    }
+
     pub fn pending_shard_map(&self) -> Option<ShardMap> {
         std::fs::read(self.path.join("pending-shard-map.json"))
             .ok()
@@ -638,8 +675,9 @@ impl Db {
                 continue;
             }
             let seq = self.seq.clone();
+            let reserved = self.reserved_seq[shard_idx].clone();
             let results = self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, &seq)))
+                .call(move |s| Ok(put_many(s, batch, new_edits, &seq, &reserved)))
                 .await?;
             for (i, result) in results {
                 out[i] = Some(match result {
@@ -926,6 +964,14 @@ impl Db {
             rows.append(&mut shard_rows);
         }
         rows.sort_by_key(|r| r.seq);
+        // Recompute after collecting rows so an allocation that started while
+        // the shards were being read also constrains this cursor. Rows above
+        // the watermark are withheld; the next request re-reads them rather
+        // than skipping a later-visible lower sequence.
+        let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
+        if !opts.descending && watermark != u64::MAX {
+            rows.retain(|row| row.seq <= watermark);
+        }
         if opts.descending {
             rows.reverse();
         }
@@ -1007,11 +1053,18 @@ impl Db {
                             .call(move |shard| collect_changes(shard, &shard_opts))
                             .await
                         {
-                            Ok(rows) => {
+                            Ok(mut rows) => {
                                 if rows.is_empty() {
                                     done[slot] = true;
                                 } else {
-                                    cursors[slot] = rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
+                                    cursors[slot] =
+                                        rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
+                                    let watermark = db
+                                        .changes_watermark(opts.since, opts.owned.as_deref());
+                                    if watermark != u64::MAX {
+                                        rows.retain(|row| row.seq <= watermark);
+                                        done[slot] = true;
+                                    }
                                     buffers[slot].extend(rows);
                                 }
                             }
@@ -1270,6 +1323,7 @@ impl Db {
                 .collect();
             let id2 = id.clone();
             let seq_counter = self.seq.clone();
+            let reserved = self.reserved_seq[self.shard_index(id)].clone();
             let done = self
                 .shard(id)
                 .call(move |s| {
@@ -1310,6 +1364,7 @@ impl Db {
                             // Purging the winner changes what a normal read sees,
                             // so it is a change as far as `_changes` is concerned.
                             let seq = seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            reserved.fetch_max(seq, Ordering::SeqCst);
                             meta.seq = seq;
                             tx.delete(&seq_key(old_seq));
                             tx.put(&seq_key(seq), id2.as_bytes());
@@ -1510,6 +1565,7 @@ fn put_many(
     docs: Vec<(usize, Value)>,
     new_edits: bool,
     seq: &Arc<AtomicU64>,
+    reserved: &Arc<AtomicU64>,
 ) -> Vec<(usize, DbResult<Value>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
@@ -1522,6 +1578,7 @@ fn put_many(
             ops: &mut ops,
             staged: &mut staged,
             seq,
+            reserved,
         };
         match ctx.stage(doc, new_edits) {
             Ok(value) => results.push((i, Ok(value))),
@@ -1552,11 +1609,14 @@ struct Stage<'a> {
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
     seq: &'a Arc<AtomicU64>,
+    reserved: &'a Arc<AtomicU64>,
 }
 
 impl Stage<'_> {
     fn next_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::SeqCst) + 1
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserved.fetch_max(seq, Ordering::SeqCst);
+        seq
     }
 
     fn meta(&mut self, id: &str) -> Option<DocMeta> {
@@ -1832,7 +1892,12 @@ fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
     let mut tx = Tx::new();
     for (key, value) in ops {
         if key.starts_with(b"s/") {
-            last_seq = key[2..10].try_into().ok().map(u64::from_be_bytes);
+            if let Some(seq) = key[2..10].try_into().ok().map(u64::from_be_bytes) {
+                // A document update emits the new sequence key and then
+                // deletes the old one. Keep the highest, not whichever key
+                // happens to be last in the operation list.
+                last_seq = Some(last_seq.map_or(seq, |current: u64| current.max(seq)));
+            }
         }
         match value {
             Some(v) => tx.put(&key, &v),
@@ -1948,6 +2013,7 @@ pub struct ChangesOpts {
     pub owned: Option<Vec<bool>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct ChangeRow {
     pub(crate) id: String,
     pub(crate) seq: u64,
@@ -2366,4 +2432,88 @@ fn collect_changes(
         });
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_id_for_shard(db: &Db, shard: usize) -> String {
+        (0..10_000)
+            .map(|i| format!("shard{shard}-{i}"))
+            .find(|id| db.shard_index(id) == shard)
+            .expect("document id for shard")
+    }
+
+    #[tokio::test]
+    async fn changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence() {
+        let q = 4u32;
+        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "watermark",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+
+        let ids: Vec<String> = (0..q as usize)
+            .map(|shard| doc_id_for_shard(&db, shard))
+            .collect();
+        let first: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+        db.put_docs(first, true).await.unwrap();
+        // The second write gets a higher global sequence on shard 0.
+        let later = doc_id_for_shard(&db, 0) + "-later";
+        db.put_docs(vec![json!({"_id": later})], true)
+            .await
+            .unwrap();
+
+        // Both writes are committed: no shard has a pending allocation.
+        for shard in 0..q as usize {
+            assert_eq!(
+                db.committed_seq[shard].load(Ordering::SeqCst),
+                db.reserved_seq[shard].load(Ordering::SeqCst),
+                "shard {shard} sequence bookkeeping"
+            );
+        }
+
+        // Simulate shard 1 staging a write with a sequence that is not visible
+        // yet. A cursor must not advance past shard 1's committed sequence.
+        let lagging = 1usize;
+        let committed = db.committed_seq[lagging].load(Ordering::SeqCst);
+        db.reserved_seq[lagging].store(committed + 100, Ordering::SeqCst);
+        let watermark = db.changes_watermark(0, None);
+        assert_eq!(watermark, committed);
+
+        let opts = ChangesOpts {
+            since: 0,
+            limit: None,
+            include_docs: false,
+            style_all_docs: false,
+            descending: false,
+            doc_ids: None,
+            owned: None,
+        };
+        let (rows, last_seq) = db.changes_rows(&opts).await.unwrap();
+        assert!(rows.iter().all(|row| row.seq <= committed), "{rows:?}");
+        assert_eq!(last_seq, committed);
+
+        // Once the simulated write commits, a resumed cursor sees the rows
+        // that were withheld, including the later shard-0 write.
+        db.reserved_seq[lagging].store(committed, Ordering::SeqCst);
+        let resumed = ChangesOpts {
+            since: last_seq,
+            ..opts
+        };
+        let (rows, _) = db.changes_rows(&resumed).await.unwrap();
+        assert!(rows.iter().any(|row| row.id == later));
+        assert!(rows.iter().all(|row| row.seq > last_seq));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
