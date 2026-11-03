@@ -1,0 +1,138 @@
+# Differential fuzzer: douchdb against Apache CouchDB
+
+`run.py` sends the same random document operations to a douchdb instance and a
+real CouchDB instance, then compares status codes, error codes, revision ids
+and subsequent state. When the two disagree it minimizes the operation list and
+writes a replayable repro.
+
+This is a single-node API test. It complements, but does not replace, the
+cluster and fault-injection tests in [`jepsen-clj/`](../jepsen-clj/).
+
+## Quick start
+
+```sh
+python3 differential/run.py --seed 1
+```
+
+By default this builds the `douchdb:differential` image from the repository,
+starts a one-node douchdb (`q=1`, `n=1`) and a `couchdb:3.5` container, and runs
+60 operations. Docker must be available.
+
+Common options:
+
+```sh
+# Reuse an already-built image
+python3 differential/run.py --seed 7 --skip-build
+
+# Run more operations, print each one
+python3 differential/run.py --seed 7 --steps 500 --verbose
+
+# Skip the input classes covered by open known-divergence issues
+python3 differential/run.py --seed 7 --steps 500 \
+  --exclude-large-integers --exclude-duplicate-keys
+
+# Use servers you already started
+python3 differential/run.py \
+  --douchdb-url http://127.0.0.1:5984 \
+  --couchdb-url http://admin:pass@127.0.0.1:5985
+
+# Replay a saved repro against fresh servers
+python3 differential/run.py --replay differential/artifacts/7/repro.json
+
+# Keep the containers for inspection
+python3 differential/run.py --seed 7 --keep
+```
+
+The CouchDB URL passed through `--couchdb-url` is expected to include basic
+auth credentials. The Docker path supplies `admin:pass` automatically.
+
+## What is compared
+
+Each operation is executed against both servers before the next one is chosen,
+so both see the same revision history. Operations cover:
+
+- `PUT` with no revision, the current revision, and a deliberately stale
+  revision;
+- `GET`, including `?rev=` for an old revision;
+- `DELETE` with no revision, the current revision, and a stale revision;
+- document ids containing slashes, spaces, `?`, `#`, `%` and non-ASCII
+  characters;
+- values with nested objects and arrays, unicode, booleans, null, floats,
+  integers around the `i64`/`u64` boundaries, integers beyond them, key order,
+  escaped characters, duplicate keys, and insignificant whitespace.
+
+For each operation the fuzzer compares:
+
+1. HTTP status;
+2. `error` for responses at or above 400;
+3. the full JSON body when the operation succeeds.
+
+`_rev` is part of the body comparison, so a different revision hash is a
+divergence even when the visible document value happens to match. That is
+intentional: CouchDB clients and replication depend on revision identity.
+
+## Normalization
+
+Only genuinely non-semantic differences are normalized:
+
+- generated UUIDs and timestamps, where they appear;
+- sequence numbers, which are opaque and differ between implementations;
+- prose in error messages, which is compared by `error` code rather than text.
+
+Nothing else is normalized. In particular, body key order and number
+representation are compared as JSON values, because CouchDB preserves both in
+ways that affect revisions.
+
+## Known divergences
+
+`known_divergences.json` maps a divergence kind to an open issue. A known
+divergence is reported with its issue number and does not fail the run unless
+`--strict` is passed. Every entry must name the issue and the condition under
+which it can be removed. When an issue is fixed, delete the entry and run with
+the previously excluded input enabled.
+
+Current entries:
+
+| Kind | Issue | Meaning |
+| --- | --- | --- |
+| `large_integer_precision` | [#110](https://github.com/skruger/douchdb/issues/110) | Integers outside `i64`/`u64` silently become floats. |
+| `duplicate_key_order` | [#123](https://github.com/skruger/douchdb/issues/123) | Duplicate object keys keep the wrong position, changing the revision hash. |
+
+To keep a run useful while those issues are open, pass
+`--exclude-large-integers --exclude-duplicate-keys`. New divergences still fail
+the run.
+
+## Exit status
+
+| Status | Meaning |
+| --- | --- |
+| `0` | No divergence, or only a known divergence in non-strict mode. |
+| `1` | New divergence, or a known divergence with `--strict`. |
+| `2` | Invalid arguments. |
+
+## Repros
+
+A failing seed writes `differential/artifacts/<seed>/repro.json` with the full
+operation list, the minimized list, both responses, and container logs. Replay
+it with `--replay`; the same seed also reproduces it from scratch:
+
+```sh
+python3 differential/run.py --seed 7 --steps 500
+python3 differential/run.py --replay differential/artifacts/7/repro.json
+```
+
+Minimization removes operations greedily while preserving the divergence kind
+and the operation name. It is bounded by `--max-minimize-replays` (default 200)
+because every candidate is replayed against fresh databases. Use
+`--no-minimize` to skip it.
+
+## Adding a new operation
+
+1. Add the operation to `generate_ops`.
+2. Execute it in `execute_op` against both servers.
+3. Update state in `update_state` when the response succeeds.
+4. Classify differences in `divergence_kind`.
+5. Run several seeds with `--steps 500` before committing.
+
+Keep the generator deterministic for a given seed. Do not call `random` outside
+the seeded `rng`.

@@ -814,6 +814,17 @@ partitions:
 See [jepsen-clj/README.md](jepsen-clj/README.md) for the workload, results and
 limits. The smaller Python `jepsen-couchdb` adaptation remains in `jepsen/`.
 
+A differential fuzzer runs the same random document operations against douchdb
+and a real CouchDB 3.5 instance, compares status codes, bodies and revision ids,
+and minimizes any divergence to a replayable repro:
+
+```sh
+python3 differential/run.py --seed 1
+```
+
+See [differential/README.md](differential/README.md) for options, known
+divergences and how to add operations.
+
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:
 

@@ -22,6 +22,9 @@ const ATOM_EXT: u8 = 100;
 pub enum Term {
     Atom(&'static str),
     Int(i64),
+    /// A JSON integer above `i64::MAX`. CouchDB's `jiffy` keeps it unsigned;
+    /// casting it to `i64` would wrap and produce a different revision hash.
+    UInt(u64),
     Float(f64),
     Binary(Vec<u8>),
     List(Vec<Term>),
@@ -68,6 +71,26 @@ impl Term {
                 out.push(SMALL_BIG_EXT);
                 out.push(digits.len() as u8);
                 out.push(u8::from(*i < 0));
+                out.extend_from_slice(&digits);
+            }
+            Term::UInt(u) if *u <= 255 => {
+                out.push(SMALL_INTEGER_EXT);
+                out.push(*u as u8);
+            }
+            Term::UInt(u) if *u <= i32::MAX as u64 => {
+                out.push(INTEGER_EXT);
+                out.extend((*u as u32).to_be_bytes());
+            }
+            Term::UInt(u) => {
+                let mut mag = *u;
+                let mut digits = Vec::new();
+                while mag > 0 {
+                    digits.push((mag & 0xff) as u8);
+                    mag >>= 8;
+                }
+                out.push(SMALL_BIG_EXT);
+                out.push(digits.len() as u8);
+                out.push(0);
                 out.extend_from_slice(&digits);
             }
             Term::Float(f) => {
@@ -122,7 +145,7 @@ pub fn from_json(value: &serde_json::Value) -> Term {
             if let Some(i) = n.as_i64() {
                 Term::Int(i)
             } else if let Some(u) = n.as_u64() {
-                Term::Int(u as i64)
+                Term::UInt(u)
             } else {
                 Term::Float(n.as_f64().unwrap_or(0.0))
             }
@@ -155,6 +178,24 @@ mod tests {
         assert_eq!(Term::Int(255).encode(), vec![131, 97, 255]);
         assert_eq!(Term::Int(256).encode(), vec![131, 98, 0, 0, 1, 0]);
         assert_eq!(Term::Int(-1).encode(), vec![131, 98, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn unsigned_integers_above_i64_are_not_wrapped() {
+        // CouchDB's jiffy keeps these unsigned. Casting to i64 would encode a
+        // negative number and change every revision hash containing one.
+        assert_eq!(Term::UInt(255).encode(), vec![131, 97, 255]);
+        assert_eq!(Term::UInt(256).encode(), vec![131, 98, 0, 0, 1, 0]);
+        assert_eq!(
+            Term::UInt(1 << 63).encode(),
+            vec![131, 110, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0x80]
+        );
+        assert_eq!(
+            Term::UInt(u64::MAX).encode(),
+            vec![131, 110, 8, 0, 255, 255, 255, 255, 255, 255, 255, 255]
+        );
+        assert_eq!(from_json(&json!(1u64 << 63)), Term::UInt(1 << 63));
+        assert_eq!(from_json(&json!(u64::MAX)), Term::UInt(u64::MAX));
     }
 
     #[test]

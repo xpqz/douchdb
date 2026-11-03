@@ -614,6 +614,17 @@ async fn document_crud_matches_couchdb_rev_ids() {
         json!({"error": "conflict", "reason": "Document update conflict."})
     );
 
+    // Integers above i64::MAX stay unsigned in the ETF body hash. Casting
+    // them to i64 would encode a negative number and change the rev id.
+    let (status, body) = s
+        .put("/crud/big-u64", json!({"value": 9223372036854775808u64}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["rev"], "1-60e7deb48fe40a85d83333847552f100");
+    let (status, body) = s.put("/crud/max-u64", json!({"value": u64::MAX})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["rev"], "1-b093d5afc8e54320086999e1b55c8ec6");
+
     let (status, _) = s.delete("/crud/nope").await;
     assert_eq!(
         status,
