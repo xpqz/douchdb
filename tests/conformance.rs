@@ -678,6 +678,117 @@ async fn document_crud_matches_couchdb_rev_ids() {
 }
 
 #[tokio::test]
+async fn internal_consistency_after_concurrent_writes() {
+    use futures::future::join_all;
+
+    let s = Server::start(false);
+    s.fresh_db("consistency").await;
+    let base = s.base.clone();
+    let client = s.client.clone();
+
+    let mut writers = Vec::new();
+    for worker in 0..8u32 {
+        let base = base.clone();
+        let client = client.clone();
+        writers.push(tokio::spawn(async move {
+            for index in 0..10u32 {
+                let id = format!("doc-{worker}-{index}");
+                let body = json!({"n": worker * 10 + index, "s": format!("s{}", worker)});
+                let response = client
+                    .put(format!("{base}/consistency/{id}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED);
+            }
+        }));
+    }
+    for result in join_all(writers).await {
+        result.unwrap();
+    }
+
+    let bulk_docs: Vec<Value> = (0..20)
+        .map(|index| json!({"_id": format!("bulk-{index}"), "n": index, "s": "bulk"}))
+        .collect();
+    let (status, body) = s
+        .post("/consistency/_bulk_docs", json!({"docs": bulk_docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let bulk_revs: Vec<(String, String)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().unwrap().to_string(),
+                row["rev"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    let expected = 8 * 10 + bulk_revs.len();
+    let (status, changes) = s
+        .get("/consistency/_changes?since=0&include_docs=true&style=all_docs&limit=1000")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changes}");
+    let mut latest: HashMap<String, Value> = HashMap::new();
+    for row in changes["results"].as_array().unwrap() {
+        latest.insert(row["id"].as_str().unwrap().to_string(), row.clone());
+    }
+    assert_eq!(latest.len(), expected, "one change row per document");
+
+    let (_, all_docs) = s
+        .get("/consistency/_all_docs?include_docs=true&limit=1000")
+        .await;
+    assert_eq!(all_docs["total_rows"], expected);
+    for row in all_docs["rows"].as_array().unwrap() {
+        let id = row["id"].as_str().unwrap();
+        let (status, doc) = s.get(&format!("/consistency/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(row["value"]["rev"], doc["_rev"], "{id}");
+        assert_eq!(row["doc"], doc, "{id}: _all_docs include_docs");
+
+        let change = latest
+            .get(id)
+            .unwrap_or_else(|| panic!("{id}: missing change"));
+        assert_eq!(
+            change["changes"][0]["rev"], doc["_rev"],
+            "{id}: changes rev"
+        );
+        assert_eq!(change["doc"], doc, "{id}: changes include_docs");
+    }
+
+    for (id, rev) in &bulk_revs {
+        let (status, doc) = s.get(&format!("/consistency/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(doc["_rev"], *rev, "{id}: bulk response rev");
+    }
+
+    let (status, _) = s
+        .put(
+            "/consistency/_design/check",
+            json!({"views": {
+                "by_s": {"map": "function(doc){ if (doc.s !== undefined) emit(doc.s, doc.n); }"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, view) = s
+        .get("/consistency/_design/check/_view/by_s?reduce=false&limit=200")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["total_rows"], expected);
+    for row in view["rows"].as_array().unwrap() {
+        let id = row["id"].as_str().unwrap();
+        let (_, doc) = s.get(&format!("/consistency/{id}")).await;
+        assert_eq!(row["key"], doc["s"], "{id}: view key");
+        assert_eq!(row["value"], doc["n"], "{id}: view value");
+        assert_eq!(row["id"], doc["_id"], "{id}: view id");
+    }
+}
+
+#[tokio::test]
 async fn deleted_leaf_cannot_be_updated_by_rev() {
     let s = Server::start(false);
     s.fresh_db("tombstones").await;
@@ -2678,6 +2789,88 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
             "anti-entropy did not converge: {response}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn replication_source_and_target_agree_after_convergence() {
+    let nodes = start_cluster_with(2, "1", 2);
+    for node in &nodes {
+        node.fresh_db("clagree").await;
+    }
+
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("r{i:02}"), "n": i, "s": format!("s{}", i % 3)}))
+        .collect();
+    let response = nodes[0]
+        .client
+        .post(format!("{}/clagree/_bulk_docs", nodes[0].base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut local: Vec<HashMap<String, Value>> = Vec::new();
+    loop {
+        local.clear();
+        for node in &nodes {
+            let body = node
+                .client
+                .post(format!("{}/clagree/_all_docs?include_docs=true", node.base))
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", "test-cluster-secret")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            let rows: HashMap<String, Value> = body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| (row["id"].as_str().unwrap().to_string(), row.clone()))
+                .collect();
+            local.push(rows);
+        }
+        if local.iter().all(|rows| rows.len() == 12) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replicas did not converge: {:?}",
+            local.iter().map(HashMap::len).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(local[0], local[1], "local _all_docs differ");
+
+    let mut changes: Vec<HashMap<String, Value>> = Vec::new();
+    for node in &nodes {
+        let (status, body) = node
+            .get("/clagree/_changes?since=0&include_docs=true&style=all_docs&limit=100")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut latest = HashMap::new();
+        for row in body["results"].as_array().unwrap() {
+            latest.insert(row["id"].as_str().unwrap().to_string(), row.clone());
+        }
+        changes.push(latest);
+    }
+    assert_eq!(changes[0], changes[1], "cluster _changes differ");
+
+    for id in local[0].keys() {
+        let (status0, doc0) = nodes[0].get(&format!("/clagree/{id}")).await;
+        let (status1, doc1) = nodes[1].get(&format!("/clagree/{id}")).await;
+        assert_eq!(status0, StatusCode::OK);
+        assert_eq!(status1, StatusCode::OK);
+        assert_eq!(doc0, doc1, "{id}: reads differ across coordinators");
+        assert_eq!(doc0["_rev"], local[0][id]["value"]["rev"], "{id}");
     }
 }
 
