@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -178,6 +179,7 @@ pub struct SeqEntry {
 pub struct Shard {
     db: DB,
     seq: u64,
+    seq_tracker: Option<Arc<AtomicU64>>,
     revs_limit: u64,
     /// Number of live documents, maintained on every metadata write so `GET
     /// /db` and `_all_docs` totals do not scan the whole `m/` namespace.
@@ -291,6 +293,7 @@ impl Shard {
         Ok(Shard {
             db,
             seq,
+            seq_tracker: None,
             revs_limit,
             docs,
             deleted,
@@ -303,6 +306,13 @@ impl Shard {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Share the shard's last committed sequence with the database so changes
+    /// cursors can use a safe cross-shard watermark.
+    pub fn set_seq_tracker(&mut self, tracker: Arc<AtomicU64>) {
+        tracker.fetch_max(self.seq, Ordering::SeqCst);
+        self.seq_tracker = Some(tracker);
     }
 
     /// Sequence index for `_changes`, built on first use and maintained by
@@ -688,6 +698,9 @@ impl Shard {
         if let Some(seq) = seq {
             self.seq = seq;
         }
+        if let Some(tracker) = &self.seq_tracker {
+            tracker.fetch_max(self.seq, Ordering::SeqCst);
+        }
         tx.ops
             .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
 
@@ -845,12 +858,15 @@ type Job = Box<dyn FnOnce(&mut Shard) -> Ack + Send>;
 pub struct ShardHandle {
     tx: mpsc::Sender<Job>,
     initial_seq: u64,
+    seq_tracker: Arc<AtomicU64>,
 }
 
 impl ShardHandle {
     pub fn spawn(dir: impl AsRef<Path>, revs_limit: u64) -> Result<ShardHandle> {
         let mut shard = Shard::open(dir, revs_limit)?;
         let initial_seq = shard.seq();
+        let seq_tracker = Arc::new(AtomicU64::new(initial_seq));
+        shard.set_seq_tracker(seq_tracker.clone());
         let (tx, mut rx) = mpsc::channel::<Job>(256);
         tokio::spawn(async move {
             // Group commit: run a job, then everything already queued, and
@@ -872,12 +888,21 @@ impl ShardHandle {
             }
             let _ = shard.flush_pending();
         });
-        Ok(ShardHandle { tx, initial_seq })
+        Ok(ShardHandle {
+            tx,
+            initial_seq,
+            seq_tracker,
+        })
     }
 
     /// Sequence number this shard had when it was opened.
     pub fn initial_seq(&self) -> u64 {
         self.initial_seq
+    }
+
+    /// Shared last committed sequence for this shard.
+    pub fn seq_tracker(&self) -> Arc<AtomicU64> {
+        self.seq_tracker.clone()
     }
 
     /// Run a job on the shard task, which owns the database handle.

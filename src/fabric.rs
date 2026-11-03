@@ -1665,6 +1665,15 @@ pub(crate) async fn fetch_ddoc_from_replica(
     Err(ApiError::not_found(format!("missing {ddoc}")))
 }
 
+fn last_seq_for_node(value: &Value, node: usize) -> Option<u64> {
+    let seq = value.get("last_seq")?;
+    if let Some(seq) = seq.as_u64() {
+        return Some(seq);
+    }
+    let decoded = decode_since(seq.as_str()?)?;
+    decoded.get(node).copied()
+}
+
 pub(crate) async fn cluster_changes(
     st: &AppState,
     db: &Db,
@@ -1740,12 +1749,16 @@ pub(crate) async fn cluster_changes(
         .await;
         let mut node_rows: Vec<std::collections::VecDeque<Value>> =
             (0..n).map(|_| std::collections::VecDeque::new()).collect();
+        let mut node_last: Vec<Option<u64>> = vec![None; n];
         let mut failed = Vec::new();
         let mut succeeded = false;
         for (node, response) in responses {
             match response {
                 Ok(mut value) => {
                     succeeded = true;
+                    if let Some(seq) = last_seq_for_node(&value, node) {
+                        node_last[node] = Some(seq);
+                    }
                     if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
                         node_rows[node].extend(rows);
                     }
@@ -1787,6 +1800,12 @@ pub(crate) async fn cluster_changes(
             for (node, response) in fallbacks {
                 let mut value = response?;
                 succeeded = true;
+                if let Some(seq) = last_seq_for_node(&value, node) {
+                    node_last[node] = Some(match node_last[node] {
+                        Some(previous) => previous.min(seq),
+                        None => seq,
+                    });
+                }
                 if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
                     node_rows[node].extend(rows);
                 }
@@ -1814,7 +1833,10 @@ pub(crate) async fn cluster_changes(
                 };
                 progressed = true;
                 let shard_seq = row["seq"].as_u64().unwrap_or(0);
-                progress[node] = progress[node].max(shard_seq);
+                let safe = node_last[node]
+                    .map(|seq| shard_seq.min(seq))
+                    .unwrap_or(shard_seq);
+                progress[node] = progress[node].max(safe);
                 row["seq"] = json!(encode_since(&progress));
                 out.push(row);
                 if out.len() >= limit {
@@ -2006,12 +2028,14 @@ pub(crate) fn absorb_node_changes(
     progress: &mut [u64],
     rows: &mut Vec<Value>,
 ) {
+    let node_last = last_seq_for_node(&response, node);
     let Some(Value::Array(values)) = response.get_mut("results").map(std::mem::take) else {
         return;
     };
     for mut row in values {
         let shard_seq = row["seq"].as_u64().unwrap_or(0);
-        progress[node] = progress[node].max(shard_seq);
+        let safe = node_last.map(|seq| shard_seq.min(seq)).unwrap_or(shard_seq);
+        progress[node] = progress[node].max(safe);
         row["seq"] = json!(encode_since(progress));
         rows.push(row);
     }
