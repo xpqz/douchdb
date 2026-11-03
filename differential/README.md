@@ -79,9 +79,10 @@ Only genuinely non-semantic differences are normalized:
 - sequence numbers, which are opaque and differ between implementations;
 - prose in error messages, which is compared by `error` code rather than text.
 
-Nothing else is normalized. In particular, body key order and number
-representation are compared as JSON values, because CouchDB preserves both in
-ways that affect revisions.
+Nothing else is normalized. Bodies are compared as parsed JSON values, so key
+order inside a response is not compared directly; for writes, the revision id
+independently covers document key order and number representation. Duplicate
+keys are sent as raw bodies so both servers decode them exactly as written.
 
 ## Known divergences
 
