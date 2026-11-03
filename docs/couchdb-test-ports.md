@@ -2,8 +2,7 @@
 
 douchdb ports a focused subset of Apache CouchDB's Elixir integration suite
 (`test/elixir/test/`). The full suite assumes attachments, Mango, Nouveau,
-rewrite/show/list/update handlers, `validate_doc_update`, advanced auth and
-resharding, so tests are selected by supported feature area rather than copied
+rewrite/show/list/update handlers, advanced auth and resharding, so tests are selected by supported feature area rather than copied
 one-for-one. Search tests are included where the feature is supported.
 
 ## Ported cases
@@ -73,12 +72,12 @@ These ports exposed and fixed:
 
 - Attachments and multipart requests.
 - Mango and Nouveau (search itself is implemented and its tests are ported).
-- Show/list/rewrite/update handlers and `validate_doc_update`.
+- Show/list/rewrite/update handlers.
 - JWT, proxy auth and users DB. `_security` administration is implemented with
   a simpler token users file; see [multiuser.md](multiuser.md).
 - Resharding, cluster setup/config, compaction/disk-monitor internals.
-- JavaScript changes filters and the full CouchDB view sandboxing matrix;
-  a focused subset is covered by `quickjs_view_sandbox_ports`.
+- The full CouchDB view sandboxing matrix; a focused subset is covered by
+  `quickjs_view_sandbox_ports`.
 - CouchDB's attachment, local-doc and replication suites; douchdb has separate
   conformance coverage for replication and local documents.
 

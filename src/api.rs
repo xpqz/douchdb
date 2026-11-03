@@ -193,7 +193,7 @@ fn parse_shard_mask(raw: &str, q: u32) -> Option<Vec<bool>> {
 /// True for a request a peer already routed. Such requests are served from the
 /// local node's shards: re-running the fan-out on the receiving side would send
 /// the request straight back and loop.
-fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
+pub(crate) fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
     st.cluster.is_internal(headers)
 }
 
@@ -3136,7 +3136,7 @@ async fn bulk_docs(
         }
         None => true,
     };
-    let Some(docs) = value.get("docs").and_then(Value::as_array).cloned() else {
+    let Some(mut docs) = value.get("docs").and_then(Value::as_array).cloned() else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
     if !new_edits
@@ -3207,14 +3207,31 @@ async fn bulk_docs(
         return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
     }
 
+    let principal = st.principal(headers);
+    let validation = if is_forwarded(st, headers) {
+        std::iter::repeat_with(|| None).take(docs.len()).collect()
+    } else {
+        match crate::validate::validate_docs(db, &mut docs, &principal).await {
+            Ok(errors) => errors,
+            Err(error) => return fail(error),
+        }
+    };
+
     // `_local` documents live outside the shard/replica machinery. Split them
     // out so a mixed bulk request still writes ordinary documents through the
     // normal cluster path and returns results in request order.
+    let mut results = vec![Value::Null; docs.len()];
     let mut local_slots: Vec<(usize, Value)> = Vec::new();
     let mut ordinary_slots: Vec<usize> = Vec::new();
     let mut ordinary_docs: Vec<Value> = Vec::new();
     for (slot, doc) in docs.into_iter().enumerate() {
-        if doc
+        if let Some(error) = &validation[slot] {
+            results[slot] = json!({
+                "id": doc.get("_id").cloned().unwrap_or(Value::Null),
+                "error": error.error,
+                "reason": error.reason,
+            });
+        } else if doc
             .get("_id")
             .and_then(Value::as_str)
             .map(|id| id.starts_with("_local/"))
@@ -3244,7 +3261,6 @@ async fn bulk_docs(
         }
     };
 
-    let mut results = vec![Value::Null; ordinary_slots.len() + local_slots.len()];
     for (slot, result) in ordinary_slots.into_iter().zip(ordinary_results) {
         results[slot] = result;
     }
@@ -3258,6 +3274,26 @@ async fn bulk_docs(
         *response.status_mut() = StatusCode::ACCEPTED;
     }
     response
+}
+
+async fn validate_write(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    doc: &mut Value,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let principal = st.principal(headers);
+    let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
+        Ok(functions) => functions,
+        Err(error) => return Some(fail(error)),
+    };
+    match crate::validate::validate_docs_with(&functions, db, std::slice::from_mut(doc), &principal)
+        .await
+    {
+        Ok(errors) => errors.into_iter().next().flatten().map(fail),
+        Err(error) => Some(fail(error)),
+    }
 }
 
 async fn put_local_bulk(db: &Db, doc: Value) -> Value {
@@ -4377,6 +4413,9 @@ async fn copy_doc(
     if let Some(rev) = destination_rev {
         copy["_rev"] = json!(rev);
     }
+    if let Some(response) = validate_write(st, db, dbname, &mut copy, headers).await {
+        return response;
+    }
     match commit_docs(
         st,
         db,
@@ -4454,6 +4493,9 @@ async fn put_doc(
         .get("_deleted")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if let Some(response) = validate_write(st, db, dbname, &mut doc, headers).await {
+        return response;
+    }
     match commit_docs(
         st,
         db,
@@ -4526,7 +4568,10 @@ async fn delete_doc(
     let Some(rev) = q.get("rev") else {
         return fail(ApiError::conflict());
     };
-    let doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
+    let mut doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
+    if let Some(response) = validate_write(st, db, dbname, &mut doc, headers).await {
+        return response;
+    }
     match commit_docs(
         st,
         db,

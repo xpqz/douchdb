@@ -23,6 +23,7 @@ mod search;
 mod store;
 mod telemetry;
 mod ui;
+mod validate;
 mod view;
 
 use api::{AppState, Config};

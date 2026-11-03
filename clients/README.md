@@ -63,7 +63,7 @@ Results against the current tree:
 | Suite | Passing | Failing | Pending | Known failures |
 | --- | ---: | ---: | ---: | --- |
 | `test.basics.js` | 390 | 2 | 0 | both are attachment tests; attachments are intentionally unsupported (#19) |
-| `test.bulk_docs.js` | 87 | 1 | 0 | `validate_doc_update` is accepted but not executed (#129) |
+| `test.bulk_docs.js` | 88 | 0 | 0 | none |
 | `test.changes.js` | 128 | 0 | 5 | none |
 | `test.conflicts.js` | 34 | 0 | 0 | none |
 | `test.get.js` | 50 | 0 | 6 | none |

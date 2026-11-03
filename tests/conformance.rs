@@ -997,6 +997,117 @@ async fn bulk_docs_handles_local_docs_and_rejects_replicated_docs_without_rev() 
 }
 
 #[tokio::test]
+async fn cluster_validation_functions_follow_design_docs_across_shards() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clvalidate").await;
+    }
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalidate/_design/validate",
+            json!({
+                "validate_doc_update": "function (doc) { \
+                    if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
+                }"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = nodes[1]
+        .put("/clvalidate/accepted", json!({"ok": true}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = nodes[1]
+        .put("/clvalidate/rejected", json!({"ok": false}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], "need ok");
+    let (status, _) = nodes[0].get("/clvalidate/rejected").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn validate_doc_update_rejects_writes_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("validation").await;
+    let (status, body) = s
+        .put(
+            "/validation/_design/validate",
+            json!({
+                "validate_doc_update": "function (newDoc) { \
+                    if (newDoc.foo === undefined) { throw {unauthorized: 'Document must have a foo.'}; } \
+                    if (newDoc.foo === 'bad') { throw {forbidden: 'bad foo'}; } \
+                }"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = s.put("/validation/no-foo", json!({"bar": 1})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "unauthorized");
+    assert_eq!(body["reason"], "Document must have a foo.");
+    let (status, _) = s.get("/validation/no-foo").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = s.put("/validation/bad", json!({"foo": "bad"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "forbidden");
+    assert_eq!(body["reason"], "bad foo");
+
+    let (status, body) = s.put("/validation/ok", json!({"foo": "good"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A batch applies valid documents and reports rejected ones in order.
+    let (status, body) = s
+        .post(
+            "/validation/_bulk_docs",
+            json!({"docs": [
+                {"_id": "ok2", "foo": "good"},
+                {"_id": "missing", "bar": 1},
+                {"_id": "bad", "foo": "bad"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 3);
+    assert_eq!(body[0]["ok"], true);
+    assert_eq!(body[1]["error"], "unauthorized");
+    assert_eq!(body[2]["error"], "forbidden");
+    let (status, _) = s.get("/validation/ok2").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.get("/validation/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The replicated-write path is validated too.
+    let (status, body) = s
+        .post(
+            "/validation/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "replicated", "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 "_revisions": {"start": 1, "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "unauthorized");
+    let (status, _) = s.get("/validation/replicated").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Removing the required field from an update is rejected without changing
+    // the stored revision.
+    let (_, current) = s.get("/validation/ok").await;
+    let rev = current["_rev"].as_str().unwrap();
+    let (status, body) = s
+        .put("/validation/ok", json!({"_rev": rev, "bar": 2}))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let (_, current) = s.get("/validation/ok").await;
+    assert_eq!(current["_rev"], rev);
+}
+
+#[tokio::test]
 async fn conflict_leaves_are_listed_by_descending_position() {
     let s = Server::start(false);
     s.fresh_db("corder").await;

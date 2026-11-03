@@ -13,6 +13,11 @@ where behaviour is best-effort, it says so.
   leaf; a stale or deleted leaf returns `409 conflict`.
 - `_bulk_docs` applies each document independently. A failed document does not
   roll back successful documents in the same request.
+- `validate_doc_update` functions from live design documents run on every
+  document write, including deletes, `_bulk_docs` batches and replicated writes
+  received through the HTTP API. A throw of `{unauthorized: reason}` is `401`;
+  `{forbidden: reason}` is `403`. Design and `_local` documents are exempt.
+  Validators run through the same QuickJS/process/WASM sandbox as view code.
 - `new_edits=false` inserts the supplied revision path as-is. It is the
   replication path and may create conflict leaves. Duplicate paths are
   idempotent.
@@ -135,7 +140,6 @@ where behaviour is best-effort, it says so.
 
 - No multi-document transactions or atomic cross-document writes.
 - No Mango, lists, shows, or attachments.
-- `validate_doc_update` functions are accepted but not executed (#129).
 - No cross-database atomicity.
 - No linearizable `_changes` cursors across independent clients; cursors are
   per-feed opaque values.
@@ -150,6 +154,7 @@ where behaviour is best-effort, it says so.
 | CouchDB CRUD, revision ids, ETags, error shapes | `document_crud_matches_couchdb_rev_ids`, `couchdb_basics_ports`, `basic`, `differential/run.py` |
 | Big integers, duplicate keys, float spellings | `large_integers_round_trip_and_match_couchdb_rev_ids`, `duplicate_object_keys_use_last_position_like_couchdb`, `float_spellings_are_canonicalised_like_couchdb` |
 | `_bulk_docs`, `_all_docs`, `_bulk_get`, `_revs_diff` | `bulk_docs_and_all_docs`, `changes_revs_diff_and_bulk_get`, `differential/run.py --multi` |
+| `validate_doc_update` rejects and accepts writes | `validate_doc_update_rejects_writes_like_couchdb`, `cluster_validation_functions_follow_design_docs_across_shards`, `validate::tests::design_validators_reject_and_accept_documents` |
 | `_changes` latest row, limit, pending, pagination | `changes_returns_latest_per_document_and_pending`, `all_docs_ranges_and_changes_limits_after_deletes`, `differential/run.py --changes` |
 | Cluster write/read quorums and `503`/`202` | `cluster_honours_w_and_r_quorum_parameters`, `quorum_read_prefers_tombstone_over_stale_live_replica`, `quorum_read_preserves_conditional_and_explicit_revision_semantics` |
 | Conflict winner, leaf retention and revision ancestry | `quorum_read_prefers_conflict_winner_across_replicas`, `quorum_reconciliation_is_coordinator_independent`, `quorum_merges_ancestry_across_replicas_with_different_history_lengths`, `differential/run.py --conflicts` |
@@ -170,7 +175,7 @@ where behaviour is best-effort, it says so.
 
 | Surface | Tested |
 | --- | --- |
-| CouchDB HTTP API: documents, bulk, all_docs, changes, revisions, views, reduce | Yes, conformance + differential |
+| CouchDB HTTP API: documents, bulk, all_docs, changes, revisions, views, reduce, validation | Yes, conformance + differential |
 | CouchDB 3.5 `couchdb:3.5` server | Yes |
 | PouchDB-style document/replication protocol | CouchDB ports + `jepsen` Python harness; upstream PouchDB suite tracked in #122 |
 | CouchDB replicator as a client | Partial; `_changes`/`_revs_diff`/`_bulk_get`/`new_edits=false` |

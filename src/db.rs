@@ -176,6 +176,9 @@ pub struct Db {
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
     seq: Arc<AtomicU64>,
+    /// Cached `validate_doc_update` sources. Invalidated when a design
+    /// document is written.
+    validation: Arc<std::sync::RwLock<Option<Vec<String>>>>,
 }
 
 #[derive(Clone)]
@@ -271,6 +274,7 @@ impl Db {
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
+            validation: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -351,6 +355,69 @@ impl Db {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// All `validate_doc_update` functions from live design documents.
+    ///
+    /// Loading is cached until a design document is written. The scan walks
+    /// the shard's latest-change index, so it does not read ordinary document
+    /// bodies.
+    pub async fn validation_functions(&self) -> DbResult<Vec<String>> {
+        if let Some(functions) = self
+            .validation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+        {
+            return Ok(functions);
+        }
+
+        let mut ids = Vec::new();
+        for shard in &self.shards {
+            let mut found = shard
+                .call(|s| {
+                    Ok(s.latest_changes()?
+                        .keys()
+                        .filter(|id| id.starts_with("_design/"))
+                        .cloned()
+                        .collect::<Vec<String>>())
+                })
+                .await?;
+            ids.append(&mut found);
+        }
+        ids.sort();
+        ids.dedup();
+
+        let mut functions = Vec::new();
+        for id in ids {
+            let shard = &self.shards[self.shard_index(&id)];
+            let id_for_shard = id.clone();
+            let doc = shard
+                .call(move |s| {
+                    let Some(meta) = s.get_meta(&id_for_shard)? else {
+                        return Ok(None);
+                    };
+                    let Some(winner) = meta.tree.winner() else {
+                        return Ok(None);
+                    };
+                    if meta.tree.is_deleted(&winner) {
+                        return Ok(None);
+                    }
+                    read_doc_rev(s, &id_for_shard, &meta, &winner, &DocOpts::default()).map(Some)
+                })
+                .await?;
+            if let Some(doc) = doc {
+                if let Some(source) = doc.get("validate_doc_update").and_then(Value::as_str) {
+                    functions.push(source.to_string());
+                }
+            }
+        }
+
+        *self
+            .validation
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(functions.clone());
+        Ok(functions)
     }
 
     pub fn set_security(&self, value: Value) -> DbResult<()> {
@@ -666,6 +733,12 @@ impl Db {
                 "douchdb does not support attachments",
             ));
         }
+        let touches_design = docs.iter().any(|doc| {
+            doc.get("_id")
+                .and_then(Value::as_str)
+                .map(|id| id.starts_with("_design/"))
+                .unwrap_or(false)
+        });
         let mut out: Vec<Option<Value>> = vec![None; docs.len()];
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
@@ -704,6 +777,13 @@ impl Db {
                     }),
                 });
             }
+        }
+
+        if touches_design {
+            *self
+                .validation
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
         }
 
         Ok(out.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
