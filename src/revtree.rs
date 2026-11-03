@@ -305,4 +305,76 @@ mod tests {
         assert!(tree.edges.contains_key(&deep[3]));
         assert!(tree.edges.values().all(Option::is_none));
     }
+
+    use proptest::prelude::*;
+
+    fn branch_strategy() -> impl Strategy<Value = (Vec<Rev>, bool)> {
+        (
+            1usize..8,
+            prop::collection::vec(any::<u8>(), 8),
+            any::<bool>(),
+        )
+            .prop_map(|(length, ids, deleted)| {
+                let mut path = vec![Rev {
+                    pos: 1,
+                    id: b"root".to_vec(),
+                }];
+                for (index, id) in ids.into_iter().take(length.saturating_sub(1)).enumerate() {
+                    path.push(Rev {
+                        pos: (index + 2) as u64,
+                        id: format!("{id:02x}").into_bytes(),
+                    });
+                }
+                (path, deleted)
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn pruning_preserves_leaves_and_winner(
+            branches in prop::collection::vec(branch_strategy(), 1..20),
+            limit in 1u64..8,
+        ) {
+            let mut tree = RevTree::default();
+            for (path, deleted) in &branches {
+                tree.merge_path(path, *deleted);
+            }
+            let leaves = tree.leaves();
+            let winner = tree.winner();
+            for leaf in &leaves {
+                prop_assert!(tree.edges.contains_key(leaf));
+            }
+
+            tree.prune(limit);
+
+            prop_assert_eq!(tree.leaves(), leaves);
+            prop_assert_eq!(tree.winner(), winner);
+            for leaf in tree.leaves() {
+                let path = tree.path(&leaf);
+                prop_assert_eq!(path.last(), Some(&leaf));
+            }
+
+            let once = tree.clone();
+            tree.prune(limit);
+            prop_assert_eq!(&tree, &once);
+        }
+
+        #[test]
+        fn prune_one_leaves_only_tips(
+            branches in prop::collection::vec(branch_strategy(), 1..20),
+        ) {
+            let mut tree = RevTree::default();
+            for (path, deleted) in &branches {
+                tree.merge_path(path, *deleted);
+            }
+            let leaves = tree.leaves();
+            tree.prune(1);
+            let mut edges: Vec<String> = tree.edges.keys().cloned().collect();
+            edges.sort();
+            let mut expected = leaves;
+            expected.sort();
+            prop_assert_eq!(edges, expected);
+            prop_assert!(tree.edges.values().all(Option::is_none));
+        }
+    }
 }

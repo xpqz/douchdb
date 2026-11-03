@@ -330,4 +330,18 @@ mod tests {
         assert_eq!(value["d"].to_string(), "0");
         assert_eq!(value["e"].to_string(), "123456789012345678901234567890");
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = from_slice(&bytes);
+        }
+
+        #[test]
+        fn arbitrary_text_never_panics(text in ".{0,300}") {
+            let _ = from_slice(text.as_bytes());
+        }
+    }
 }

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a6b0310538a560f6285087fe4a0e4b814831ba5f62c9e9e9a86ac7905922432a # shrinks to branches = [([Rev { pos: 1, id: [114, 111, 111, 116] }, Rev { pos: 2, id: [48, 48] }], false), ([Rev { pos: 1, id: [114, 111, 111, 116] }], false), ([Rev { pos: 1, id: [114, 111, 111, 116] }, Rev { pos: 2, id: [48, 49] }, Rev { pos: 3, id: [48, 48] }], false)], limit = 2

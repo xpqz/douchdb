@@ -342,4 +342,30 @@ mod tests {
         assert_eq!(encoded[2], 1, "object is an arity-1 tuple");
         assert_eq!(encoded[3], LIST_EXT, "containing a proplist");
     }
+
+    use proptest::prelude::*;
+
+    fn trimmed_le(bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = bytes.to_vec();
+        while bytes.len() > 1 && bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    proptest! {
+        #[test]
+        fn decimal_magnitude_matches_u128(n in any::<u128>()) {
+            let (negative, magnitude) = decimal_magnitude(&n.to_string());
+            prop_assert!(!negative);
+            prop_assert_eq!(magnitude, trimmed_le(&n.to_le_bytes()));
+        }
+
+        #[test]
+        fn decimal_magnitude_matches_i128(n in any::<i128>()) {
+            let (negative, magnitude) = decimal_magnitude(&n.to_string());
+            prop_assert_eq!(negative, n < 0);
+            prop_assert_eq!(magnitude, trimmed_le(&n.unsigned_abs().to_le_bytes()));
+        }
+    }
 }
