@@ -17,3 +17,9 @@ __pycache__/
 # Vendored dependency build output
 /vendor/rusty-leveldb/target
 /vendor/rusty-leveldb/Cargo.lock
+
+# Jepsen Clojure harness output
+/jepsen-clj/store/
+/jepsen-clj/logs/
+/jepsen-clj/.cpcache/
+/jepsen-clj/.clj-kondo/

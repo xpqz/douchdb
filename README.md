@@ -802,6 +802,18 @@ with:
 cargo test --test conformance couchdb_
 ```
 
+A real Jepsen test (Jepsen framework, Knossos linearizability checker) runs a
+disposable three-node cluster in Docker and injects node kills or network
+partitions:
+
+```sh
+./jepsen-clj/run.sh --fault kill --time-limit 30
+./jepsen-clj/run.sh --fault partition --time-limit 30
+```
+
+See [jepsen-clj/README.md](jepsen-clj/README.md) for the workload, results and
+limits. The smaller Python `jepsen-couchdb` adaptation remains in `jepsen/`.
+
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:
 
