@@ -6259,6 +6259,59 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 }
 
 #[tokio::test]
+async fn js_sandboxes_agree_on_view_rows() {
+    let docs = json!({"docs": [
+        {"_id": "a", "city": "Berlin", "price": 10, "s": "héllo"},
+        {"_id": "b", "city": "Paris", "price": 20, "s": "😀"},
+        {"_id": "c", "city": "Berlin", "price": 30, "s": ""},
+        {"_id": "d", "city": "Zürich", "price": 5}
+    ]});
+    let ddoc = json!({"views": {
+        "fields": {"map": "function(doc){ emit(doc.city, doc.price); }"},
+        "computed": {"map": "function(doc){ if (doc.price) emit(doc.city + \"-\" + doc.price, doc.price * 2); }"},
+        "nested": {"map": "function(doc){ if (doc.city) emit([doc.city, doc.price], {c: doc.city}); }"},
+        "unicode": {"map": "function(doc){ if (doc.s !== undefined) emit(doc.s, doc.s.length); }"}
+    }});
+
+    let mut servers = vec![
+        Server::start(false),
+        Server::start_with(&["--js-sandbox".to_string(), "process".to_string()], false),
+        Server::start_with(&["--js-sandbox".to_string(), "wasm".to_string()], false),
+    ];
+    #[cfg(feature = "wasmtime")]
+    servers.push(Server::start_with(
+        &[
+            "--js-sandbox".to_string(),
+            "wasm".to_string(),
+            "--wasm-runtime".to_string(),
+            "wasmtime".to_string(),
+        ],
+        false,
+    ));
+
+    let mut baseline: Option<Vec<Value>> = None;
+    for (index, s) in servers.iter().enumerate() {
+        s.fresh_db("jsagree").await;
+        let (status, _) = s.post("/jsagree/_bulk_docs", docs.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "server {index}");
+        let (status, body) = s.put("/jsagree/_design/v", ddoc.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "server {index}: {body}");
+        let mut rows = Vec::new();
+        for view in ["fields", "computed", "nested", "unicode"] {
+            let (status, body) = s
+                .get(&format!("/jsagree/_design/v/_view/{view}?reduce=false"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "server {index} {view}: {body}");
+            rows.push(body);
+        }
+        match &baseline {
+            None => baseline = Some(rows),
+            Some(expected) => assert_eq!(&rows, expected, "server {index} disagreed"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     let args = vec![
         "--js-sandbox".to_string(),

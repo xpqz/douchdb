@@ -1825,6 +1825,72 @@ mod tests {
     }
 
     #[test]
+    fn native_map_matches_javascript_for_generated_corpus() {
+        let docs: Vec<(String, Value)> = vec![
+            (
+                "a".to_string(),
+                json!({"_id": "a", "_rev": "1-a", "a": "Berlin", "b": 2,
+                       "strange-key": "v", "unicode-ключ": "значение",
+                       "nested": {"x": [1, 2, {"y": null}]}}),
+            ),
+            (
+                "b".to_string(),
+                json!({"_id": "b", "_rev": "1-b", "a": null, "b": true}),
+            ),
+            (
+                "c".to_string(),
+                json!({"_id": "c", "_rev": "1-c", "a": [1, "two", false]}),
+            ),
+            (
+                "d".to_string(),
+                json!({"_id": "d", "_rev": "1-d", "b": 9223372036854775808u64}),
+            ),
+            (
+                "e".to_string(),
+                serde_json::from_str::<Value>(
+                    r#"{"_id":"e","_rev":"1-e","a":123456789012345678901234567890,"b":-1}"#,
+                )
+                .unwrap(),
+            ),
+        ];
+        let sources = [
+            "function(doc){ emit(doc.a, doc.b); }",
+            "function(doc){ emit(doc.a, 1); }",
+            "function(doc){ emit(doc.a); }",
+            "(doc) => { emit(doc[\"strange-key\"], doc[\"strange-key\"]); }",
+            "function(doc) { emit(doc[\"unicode-ключ\"], doc.a); }",
+            "function(doc){ emit(doc.missing, doc.b); }",
+            "function(doc){ emit(doc.b, doc.nested); }",
+        ];
+        for source in sources {
+            let native = NativeMap::parse(source)
+                .unwrap_or_else(|| panic!("native parser rejected {source}"));
+            let native_rows = native.run_values(&docs);
+            let javascript = run_map(source, &docs, ViewLimits::default())
+                .unwrap_or_else(|error| panic!("JS rejected {source}: {error}"));
+            assert_eq!(native_rows.len(), javascript.len(), "{source}");
+            for (left, right) in native_rows.iter().zip(javascript.iter()) {
+                assert_eq!(left.id, right.id, "{source}");
+                assert_eq!(left.key, right.key, "{source}");
+                assert_eq!(left.value, right.value, "{source}");
+            }
+
+            let raw: Vec<(String, String)> = docs
+                .iter()
+                .map(|(id, doc)| (id.clone(), serde_json::to_string(doc).unwrap()))
+                .collect();
+            let raw_rows = native
+                .run_json(&raw)
+                .unwrap_or_else(|error| panic!("raw native parse failed for {source}: {error}"));
+            for (left, right) in raw_rows.iter().zip(javascript.iter()) {
+                assert_eq!(left.id, right.id, "raw {source}");
+                assert_eq!(left.key, right.key, "raw {source}");
+                assert_eq!(left.value, right.value, "raw {source}");
+            }
+        }
+    }
+
+    #[test]
     fn native_raw_json_field_extraction_matches_parsed_documents() {
         let docs = vec![
             (
