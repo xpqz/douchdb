@@ -881,7 +881,9 @@ removal checklist are tracked in
 
 **Durability:** DouchDB is not a power-loss-durable primary store. Writes survive
 process crashes but not necessarily power loss, because the storage layer does
-not fsync. See [docs/durability.md](docs/durability.md). Known limits:
+not fsync. See [docs/durability.md](docs/durability.md). The per-document,
+quorum, `_changes`, view and replication guarantees, non-guarantees and their
+test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
