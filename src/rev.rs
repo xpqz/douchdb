@@ -7,18 +7,30 @@ use md5::{Digest, Md5};
 use serde_json::Value;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Rev {
     pub pos: u64,
     /// Decoded revision id: 16 raw bytes for hex ids, UTF-8 bytes otherwise.
     pub id: Vec<u8>,
+    /// Whether the id was written as 32 hex characters and must be rendered
+    /// back as hex. A raw 16-byte id is not the same thing.
+    pub hex: bool,
 }
+
+impl PartialEq for Rev {
+    fn eq(&self, other: &Self) -> bool {
+        // Provenance does not change the underlying CouchDB rev id.
+        self.pos == other.pos && self.id == other.id
+    }
+}
+
+impl Eq for Rev {}
 
 impl Rev {
     /// The revision id without the position prefix, rendered the way CouchDB
     /// emits it: 16-byte ids as lowercase hex, anything else verbatim.
     pub fn id_string(&self) -> String {
-        if self.id.len() == 16 {
+        if self.hex {
             self.id.iter().map(|b| format!("{b:02x}")).collect()
         } else {
             String::from_utf8_lossy(&self.id).into_owned()
@@ -36,29 +48,21 @@ impl Rev {
         }
         // couch_doc:parse_revid/2 decodes 32-character ids as hex, otherwise
         // keeps the id as raw bytes.
-        let id = if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            decode_hex(id)?
+        let (id, hex) = if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            (decode_hex(id)?, true)
         } else {
-            id.as_bytes().to_vec()
+            (id.as_bytes().to_vec(), false)
         };
         if id.is_empty() {
             return None;
         }
-        Some(Rev { pos, id })
+        Some(Rev { pos, id, hex })
     }
 }
 
 impl fmt::Display for Rev {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-", self.pos)?;
-        if self.id.len() == 16 {
-            for b in &self.id {
-                write!(f, "{b:02x}")?;
-            }
-            Ok(())
-        } else {
-            f.write_str(&String::from_utf8_lossy(&self.id))
-        }
+        write!(f, "{}-{}", self.pos, self.id_string())
     }
 }
 
@@ -161,6 +165,10 @@ mod tests {
         let r = Rev::parse("1-tombstone").unwrap();
         assert_eq!(r.id, b"tombstone");
         assert_eq!(r.to_string(), "1-tombstone");
+        // A 16-character raw id is not a decoded 32-character hex id.
+        let r = Rev::parse("1-0123456789abcdef").unwrap();
+        assert_eq!(r.id_string(), "0123456789abcdef");
+        assert_eq!(r.to_string(), "1-0123456789abcdef");
     }
 
     #[test]
@@ -214,6 +222,7 @@ mod tests {
             rev: Rev {
                 pos,
                 id: vec![pos as u8; 16],
+                hex: false,
             },
             deleted,
         }

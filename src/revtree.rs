@@ -427,11 +427,13 @@ mod tests {
                 let mut path = vec![Rev {
                     pos: 1,
                     id: b"root".to_vec(),
+                    hex: false,
                 }];
                 for (index, id) in ids.into_iter().take(length.saturating_sub(1)).enumerate() {
                     path.push(Rev {
                         pos: (index + 2) as u64,
                         id: format!("{id:02x}").into_bytes(),
+                        hex: false,
                     });
                 }
                 (path, deleted)

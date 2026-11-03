@@ -41,7 +41,7 @@ where behaviour is best-effort, it says so.
   branch, including a deleted tip, and deduplicates `open_revs` that resolve to
   the same tip.
 - `_revisions` and `_conflicts` render revision ids the way they arrived:
-  sixteen-byte ids as lowercase hex, other ids verbatim.
+  32-character hex ids as lowercase hex, other ids verbatim.
 - `_bulk_get` and `_revs_diff` use the same document state; `_bulk_get` returns
   tombstones when the requested revision is deleted.
 
