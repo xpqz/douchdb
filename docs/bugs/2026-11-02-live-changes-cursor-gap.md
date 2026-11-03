@@ -47,8 +47,10 @@ backwards. This is fixed to take the maximum.
   rows are withheld, and verifies a resumed cursor sees them.
 - The same test updates an existing document, covering the `commit_ops`
   highest-sequence fix.
-- Concurrent 100,000-document release probe: three local readers accumulated
-  all 100,000 ids, zero missing, cursor reached 100,000; replay also matched.
+- Concurrent 150,000-document release probe: three local readers and one
+  public cluster-feed reader accumulated all 150,000 ids, zero missing; each
+  local cursor reached 150,000 and the cluster vector reached
+  `v1:150000,0,0`.
 - Full suites: 68 unit + 125 integration; 69 + 126 with `wasmtime`.
 - Clippy clean; release build passes.
 
