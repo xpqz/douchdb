@@ -820,9 +820,12 @@ and minimizes any divergence to a replayable repro:
 
 ```sh
 python3 differential/run.py --seed 1
+python3 differential/run.py --views --seed 1
 ```
 
-See [differential/README.md](differential/README.md) for options, known
+The `--views` mode drives map/reduce views, grouping, ranges, multi-key queries
+and built-in/custom reducers against the same CouchDB instance. See
+[differential/README.md](differential/README.md) for options, known
 divergences and how to add operations.
 
 The 10 GB storage spike starts its own server and writes ~10 GB under

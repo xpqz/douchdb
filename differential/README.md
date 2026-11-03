@@ -80,6 +80,32 @@ order inside a response is not compared directly; for writes, the revision id
 independently covers document key order and number representation. Duplicate
 keys are sent as raw bodies so both servers decode them exactly as written.
 
+## Map/reduce views
+
+Run the view suite instead of document CRUD:
+
+```sh
+python3 differential/run.py --views --seed 1
+```
+
+This seeds a fixed corpus of 41 documents and a design document with map,
+`_count`, `_sum`, `_stats` and custom-reduce views, then runs systematic and
+seeded-random queries. Coverage includes array keys, grouping and group levels,
+keys/multi-keys, ranges, descending order, include_docs, skip/limit, Unicode
+collation, missing fields and CouchDB's query-validation errors.
+
+`--view-queries N` controls the number of random queries after the systematic
+set (default 200).
+
+CouchDB's `offset` and row order for multi-key queries follow internal legacy
+rules that are not part of its API contract. Those rows are compared as a
+multiset and the multi-key offset is ignored; single-key and range queries are
+compared exactly, including offset.
+
+Search is not covered: stock `couchdb:3.5` has no `_search` endpoint (it
+requires Clouseau), so there is nothing to compare against. DouchDB's search
+endpoint is covered by the conformance tests.
+
 ## Known divergences
 
 `known_divergences.json` maps a divergence kind to an open issue. A known

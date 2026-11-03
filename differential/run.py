@@ -4,7 +4,8 @@
 The fuzzer sends the same random document operations to a douchdb instance and
 a CouchDB instance, compares status codes, error codes, revision ids and
 subsequent document state, and minimizes the first divergence to a small,
-replayable operation list.
+replayable operation list. With ``--views`` it instead drives map/reduce view
+queries against a fixed corpus and a seeded query set.
 
 This is a single-node API test. It complements, but does not replace, the
 cluster and fault-injection tests in ``jepsen-clj/``.
@@ -629,6 +630,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1, help="random seed (default: 1)")
     parser.add_argument("--steps", type=int, default=60, help="operations per run (default: 60)")
     parser.add_argument(
+        "--views",
+        action="store_true",
+        help="run the map/reduce differential suite instead of document CRUD",
+    )
+    parser.add_argument(
+        "--view-queries",
+        type=int,
+        default=200,
+        help="random view queries after the systematic set (default: 200)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit nonzero even for allowlisted divergences",
@@ -714,6 +726,20 @@ def main(argv: list[str] | None = None) -> int:
 
         left = Http(douchdb_url)
         right = Http(couchdb_url, auth="admin:pass")
+
+        if args.views:
+            if args.replay:
+                print("--views cannot be combined with --replay", file=sys.stderr)
+                return 2
+            import views
+
+            return views.run_views(
+                left,
+                right,
+                seed=args.seed,
+                queries=args.view_queries,
+                verbose=args.verbose,
+            )
 
         if args.replay:
             payload = json.loads(args.replay.read_text())
