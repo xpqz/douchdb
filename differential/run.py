@@ -664,6 +664,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="run the revision-tree/conflict differential suite",
     )
     parser.add_argument(
+        "--changes",
+        action="store_true",
+        help="run the _changes limit/descending/pagination differential suite",
+    )
+    parser.add_argument(
         "--conflict-rounds",
         type=int,
         default=20,
@@ -734,8 +739,11 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.douchdb_url) != bool(args.couchdb_url):
         print("--douchdb-url and --couchdb-url must be supplied together", file=sys.stderr)
         return 2
-    if sum((args.views, args.multi, args.conflicts)) > 1:
-        print("--views, --multi and --conflicts are mutually exclusive", file=sys.stderr)
+    if sum((args.views, args.multi, args.conflicts, args.changes)) > 1:
+        print(
+            "--views, --multi, --conflicts and --changes are mutually exclusive",
+            file=sys.stderr,
+        )
         return 2
 
     known_divergences = load_known_divergences(args.known_divergences)
@@ -801,6 +809,14 @@ def main(argv: list[str] | None = None) -> int:
                 rounds=args.conflict_rounds,
                 seed=args.seed,
             )
+
+        if args.changes:
+            if args.replay:
+                print("--changes cannot be combined with --replay", file=sys.stderr)
+                return 2
+            import changes
+
+            return changes.run_changes(left, right, verbose=args.verbose)
 
         if args.replay:
             payload = json.loads(args.replay.read_text())

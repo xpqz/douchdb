@@ -116,10 +116,10 @@ def all_docs_query(rng: random.Random, model: Model) -> tuple[str, dict[str, str
 
 
 def changes_params(rng: random.Random) -> dict[str, str]:
-    # CouchDB returns one row per document; douchdb currently returns every
-    # sequence event (issue #125). Ask for the whole backlog and compare the
-    # latest row per id, so limit/pending/row-count semantics do not mask
-    # revision correctness.
+    # Bulk writes can assign sequences in a different order in CouchDB, so
+    # this suite compares the full latest-per-document feed as a map. Exact
+    # limit/descending/pagination coverage lives in --changes, which writes
+    # documents one at a time.
     params = {"limit": "1000"}
     if rng.random() < 0.5:
         params["include_docs"] = "true"
@@ -179,7 +179,7 @@ def run_multi(
     docs = initial_docs()
     for http in (left, right):
         http.request("DELETE", f"/{DB}")
-        response = http.request("PUT", f"/{DB}")
+        response = http.request("PUT", f"/{DB}" + ("?q=1" if http is right else ""))
         if response.status not in (201, 202):
             raise RuntimeError(f"could not create {DB}: {response.status} {response.raw}")
         response = http.request("POST", f"/{DB}/_bulk_docs", body=envelope(docs))

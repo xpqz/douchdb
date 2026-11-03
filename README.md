@@ -821,17 +821,20 @@ and minimizes any divergence to a replayable repro:
 ```sh
 python3 differential/run.py --seed 1
 python3 differential/run.py --multi --seed 1
+python3 differential/run.py --changes
 python3 differential/run.py --views --seed 1
 python3 differential/run.py --conflicts --seed 1
 ```
 
 The `--multi` mode drives `_bulk_docs`, `_all_docs`, `_changes`, `_bulk_get`,
-`_revs_diff` and revision-shaped reads. `--conflicts` inserts arbitrary
-revision trees with `new_edits=false` and compares winners, leaves, conflicts
-and tombstones. The `--views` mode drives map/reduce views, grouping, ranges,
-multi-key queries and built-in/custom reducers against the same CouchDB
-instance. See [differential/README.md](differential/README.md) for options,
-known divergences and how to add operations.
+`_revs_diff` and revision-shaped reads. `--changes` compares `_changes`
+limits, descending order and cursor pagination with sequential writes.
+`--conflicts` inserts arbitrary revision trees with `new_edits=false` and
+compares winners, leaves, conflicts and tombstones. The `--views` mode drives
+map/reduce views, grouping, ranges, multi-key queries and built-in/custom
+reducers against the same CouchDB instance. See
+[differential/README.md](differential/README.md) for options, known
+divergences and how to add operations.
 
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:

@@ -98,6 +98,25 @@ and a short pruning case. `--conflict-rounds N` adds seeded random trees
 Random trees currently run at the default `_revs_limit`; shared-ancestor
 pruning still diverges and is tracked as #127.
 
+## Changes pagination
+
+Run the dedicated `_changes` suite:
+
+```sh
+python3 differential/run.py --changes
+```
+
+It writes documents one at a time so CouchDB and douchdb allocate sequences in
+the same logical order, then compares full feeds, limits, descending order,
+`include_docs`, `style=all_docs`, `limit=0` and ascending cursor pagination.
+Sequence values are opaque and stripped; row order, revisions, deletions,
+bodies and `pending` counts are compared.
+
+The `--multi` suite also compares `_changes`, but it uses bulk writes. CouchDB
+can assign bulk sequences in a different order, so that suite compares the full
+latest-per-document feed as a map. Exact limit/descending/pagination coverage
+is in `--changes`.
+
 ## Multi-document operations
 
 Run the multi-document suite:

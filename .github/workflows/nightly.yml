@@ -54,6 +54,8 @@ jobs:
             python3 differential/run.py --conflicts --seed "$seed" --conflict-rounds 100 --skip-build
             echo "::endgroup::"
           done
+      - name: Changes pagination
+        run: python3 differential/run.py --changes --skip-build
       - name: Upload differential artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -61,3 +63,14 @@ jobs:
           name: nightly-differential-artifacts
           path: differential/artifacts/
           if-no-files-found: ignore
+
+      - name: Install nightly and cargo-fuzz
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz JSON, ETF and revision trees
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run json -- -runs=5000
+          cargo +nightly fuzz run etf -- -runs=5000
+          cargo +nightly fuzz run revtree -- -runs=5000

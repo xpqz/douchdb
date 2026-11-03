@@ -168,7 +168,7 @@ def run_conflicts(
     for scenario, nodes, revs_limit in selected:
         for http in (left, right):
             http.request("DELETE", f"/{DB}")
-            response = http.request("PUT", f"/{DB}")
+            response = http.request("PUT", f"/{DB}" + ("?q=1" if http is right else ""))
             if response.status not in (201, 202):
                 raise RuntimeError(f"could not create {DB}: {response.status} {response.raw}")
             if revs_limit is not None:
