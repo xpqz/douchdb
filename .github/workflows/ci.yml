@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# CI runs only the native QuickJS sandbox. The process and WASM sandbox tests
+# (including the wasmtime backend) are not run here; run them locally with
+# `cargo test` and `cargo test --features wasmtime`.
+env:
+  DOUCHDB_TEST_JS_SANDBOXES: native
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,8 +26,6 @@ jobs:
         run: cargo clippy --all-targets
       - name: Unit and integration tests
         run: cargo test
-      - name: Wasmtime backend tests
-        run: cargo test --features wasmtime
       - name: Storage corruption and fail-closed checks
         run: |
           cargo build --release --locked

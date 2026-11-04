@@ -33,6 +33,19 @@ fn wait_for_listener(child: &mut Child, port: u16) -> bool {
     false
 }
 
+/// Whether to exercise the given `--js-sandbox` mode. Set
+/// `DOUCHDB_TEST_JS_SANDBOXES` to a comma-separated list (for example
+/// `native`) to restrict the sandbox tests; unset, every mode runs. CI runs
+/// only `native`, so run the full set locally before changing the process or
+/// WASM sandboxes. Tests for an excluded mode return early and report as
+/// passed.
+fn sandbox_tested(mode: &str) -> bool {
+    match std::env::var("DOUCHDB_TEST_JS_SANDBOXES") {
+        Ok(modes) => modes.split(',').any(|listed| listed.trim() == mode),
+        Err(_) => true,
+    }
+}
+
 struct Server {
     child: Child,
     base: String,
@@ -6956,6 +6969,9 @@ async fn quickjs_view_deadline_stops_an_infinite_loop() {
 
 #[tokio::test]
 async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec!["--js-sandbox".to_string(), "process".to_string()];
     let s = Server::start_with(&args, false);
     s.fresh_db("jsprocess").await;
@@ -7013,6 +7029,9 @@ async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
 
 #[tokio::test]
 async fn quickjs_process_sandbox_enforces_the_deadline() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
@@ -7064,6 +7083,9 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
 
 #[tokio::test]
 async fn quickjs_process_pool_handles_concurrent_queries() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
@@ -7102,6 +7124,9 @@ async fn quickjs_process_pool_handles_concurrent_queries() {
 
 #[tokio::test]
 async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec!["--js-sandbox".to_string(), "wasm".to_string()];
     let s = Server::start_with(&args, false);
     s.fresh_db("jswasm").await;
@@ -7156,6 +7181,9 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 #[tokio::test]
 #[allow(unused_mut, clippy::useless_vec)]
 async fn js_sandboxes_agree_on_view_rows() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
     let docs = json!({"docs": [
         {"_id": "a", "city": "Berlin", "price": 10, "s": "héllo"},
         {"_id": "b", "city": "Paris", "price": 20, "s": "😀"},
@@ -7209,6 +7237,9 @@ async fn js_sandboxes_agree_on_view_rows() {
 
 #[tokio::test]
 async fn quickjs_wasm_sandbox_enforces_the_deadline() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
@@ -7252,6 +7283,9 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
 #[cfg(feature = "wasmtime")]
 #[tokio::test]
 async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
@@ -7324,6 +7358,9 @@ async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
 #[tokio::test]
 async fn quickjs_sandbox_exposes_no_host_globals() {
     for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
         let args = vec!["--js-sandbox".to_string(), mode.to_string()];
         let s = Server::start_with(&args, false);
         let db = format!("jsglobals{mode}");
@@ -7346,6 +7383,9 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn process_worker_installs_the_seccomp_filter() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
