@@ -105,14 +105,6 @@ impl Cluster {
         self.n.max(1).min(self.nodes.len().max(1))
     }
 
-    pub fn shard_of(&self, docid: &str, q: u32) -> u32 {
-        if q <= 1 {
-            return 0;
-        }
-        let digest = Md5::digest(docid.as_bytes());
-        u32::from_be_bytes(digest[..4].try_into().unwrap()) % q
-    }
-
     /// Rendezvous hashing over `(node, shard)`. The highest `n` scores are the
     /// replica set, in preference order. Every node computes the same list from
     /// the same static configuration, so no metadata needs distributing.
@@ -138,44 +130,6 @@ impl Cluster {
     /// it, while the remaining replicas receive the same revision.
     pub fn owner_of_shard(&self, shard: u32) -> usize {
         self.replicas_of_shard(shard).first().copied().unwrap_or(0)
-    }
-
-    pub fn owner_of_doc(&self, docid: &str, q: u32) -> usize {
-        self.owner_of_shard(self.shard_of(docid, q))
-    }
-
-    #[allow(dead_code)]
-    pub fn replicas_of_doc(&self, docid: &str, q: u32) -> Vec<usize> {
-        // Every node needs design documents to evaluate views over its local
-        // shards, even when its replica set for the document would be smaller.
-        // `_local` documents stay node-local.
-        if docid.starts_with("_design/") {
-            if self.nodes.is_empty() {
-                return vec![0];
-            }
-            return (0..self.nodes.len()).collect();
-        }
-        self.replicas_of_shard(self.shard_of(docid, q))
-    }
-
-    #[allow(dead_code)]
-    pub fn is_replica_of(&self, docid: &str, q: u32) -> bool {
-        !self.is_clustered() || self.replicas_of_doc(docid, q).contains(&self.me)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_local(&self, docid: &str, q: u32) -> bool {
-        !self.is_clustered() || self.owner_of_doc(docid, q) == self.me
-    }
-
-    #[allow(dead_code)]
-    pub fn owner_url(&self, docid: &str, q: u32) -> Option<&str> {
-        if self.is_local(docid, q) {
-            return None;
-        }
-        self.nodes
-            .get(self.owner_of_doc(docid, q))
-            .map(String::as_str)
     }
 
     /// True only for a peer that presents the shared cluster secret. A client
@@ -235,12 +189,10 @@ mod tests {
     }
 
     #[test]
-    fn shards_are_stable_and_spread() {
+    fn shard_owners_are_spread() {
         let cluster = cluster(1);
-        assert_eq!(cluster.shard_of("doc", 8), cluster.shard_of("doc", 8));
-        let spread: std::collections::HashSet<_> = (0..200)
-            .map(|i| cluster.owner_of_doc(&format!("d{i}"), 8))
-            .collect();
+        let spread: std::collections::HashSet<_> =
+            (0..64).map(|shard| cluster.owner_of_shard(shard)).collect();
         assert_eq!(spread.len(), 3, "all nodes own something");
     }
 
@@ -248,9 +200,8 @@ mod tests {
     fn single_node_owns_everything() {
         let cluster = Cluster::default();
         assert!(!cluster.is_clustered());
-        assert!(cluster.is_local("anything", 8));
-        assert_eq!(cluster.owner_url("anything", 8), None);
-        assert_eq!(cluster.replicas_of_doc("anything", 8), vec![0]);
+        assert_eq!(cluster.replicas_of_shard(0), vec![0]);
+        assert_eq!(cluster.owner_of_shard(0), 0);
     }
 
     #[test]
@@ -285,10 +236,9 @@ mod tests {
             n: 2,
             secret: String::new(),
         };
-        for i in 0..50 {
-            let id = format!("doc-{i}");
-            assert_eq!(a.owner_of_doc(&id, 4), b.owner_of_doc(&id, 4));
-            assert_eq!(a.replicas_of_doc(&id, 4), b.replicas_of_doc(&id, 4));
+        for shard in 0..50 {
+            assert_eq!(a.owner_of_shard(shard), b.owner_of_shard(shard));
+            assert_eq!(a.replicas_of_shard(shard), b.replicas_of_shard(shard));
         }
     }
 
@@ -303,13 +253,6 @@ mod tests {
         }
         // A larger factor is clamped to the node count.
         assert_eq!(cluster(9).replicas_of_shard(0).len(), 3);
-    }
-
-    #[test]
-    fn design_documents_replicate_to_every_node() {
-        let c = cluster(1);
-        assert_eq!(c.replicas_of_doc("_design/foo", 4).len(), 3);
-        assert_eq!(c.replicas_of_doc("ordinary", 4).len(), 1);
     }
 
     #[test]

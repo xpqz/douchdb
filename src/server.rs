@@ -108,10 +108,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
     let config = Config {
         q: args.q.max(1),
-        n: args.n.max(1),
         revs_limit: args.revs_limit.max(1),
-        nodes: args.nodes.clone(),
-        me: args.me,
         sync_secs: args.sync_secs,
         seeds: args.seed_nodes.clone(),
         advertise: advertise.clone(),

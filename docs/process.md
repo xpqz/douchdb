@@ -18,3 +18,10 @@
    the previous state; individual commits remain available on the merge.
 7. Never leave an issue branch open after its merge, and never commit unrelated
    work to a task branch.
+
+## Code rules
+
+- **Never silence dead code with `#[allow(dead_code)]`.** Delete unused code
+  instead; git history keeps it if it is needed again. An allowance hides the
+  item from every later dead-code check, and modules are `pub`, so the compiler
+  no longer reports unused public items on its own.

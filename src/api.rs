@@ -86,15 +86,8 @@ pub struct AppState {
 
 #[derive(Clone)]
 pub struct Config {
-    #[allow(dead_code)]
     pub q: u32,
-    #[allow(dead_code)]
-    pub n: usize,
     pub revs_limit: u64,
-    #[allow(dead_code)]
-    pub nodes: Vec<String>,
-    #[allow(dead_code)]
-    pub me: usize,
     pub sync_secs: u64,
     /// Additional peers probed for membership discovery.
     pub seeds: Vec<String>,
