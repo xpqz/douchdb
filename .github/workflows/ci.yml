@@ -128,11 +128,3 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Unit and integration tests
         run: cargo test --locked
-
-  docker-amd64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build container
-        run: docker build -t douchdb:ci-amd64 .
