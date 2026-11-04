@@ -1,0 +1,165 @@
+"""Live _changes completeness probe: concurrent writers, cursor-driven readers.
+
+Usage: live_probe.py <douchdb-binary> <scratch-dir> [docs]
+Starts a 3-node q=4 n=3 cluster, writes `docs` documents from four writer
+threads while six readers follow the feed, and reports missing ids per reader.
+"""
+import json, os, random, shutil, subprocess, sys, threading, time, urllib.request
+from urllib.parse import urlencode
+
+BIN, SCRATCH = sys.argv[1], sys.argv[2]
+TOTAL = int(sys.argv[3]) if len(sys.argv) > 3 else 150_000
+SECRET = "probe-cluster-secret-0123456789"
+PORTS = [26984, 26985, 26986]
+URLS = [f"http://127.0.0.1:{p}" for p in PORTS]
+DB = "liveprobe"
+INTERNAL = {"x-douchdb-forwarded": "1", "x-douchdb-secret": SECRET}
+
+
+def request(method, url, body=None, headers=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("content-type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read() or b"null")
+
+
+def start():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    os.makedirs(SCRATCH)
+    procs = []
+    for i, port in enumerate(PORTS):
+        log = open(f"{SCRATCH}/node{i}.log", "w")
+        procs.append(subprocess.Popen(
+            [BIN, "--listen", f"127.0.0.1:{port}", "--data", f"{SCRATCH}/node{i}",
+             "--q", "4", "--n", "3", "--nodes", ",".join(URLS), "--me", str(i),
+             "--cluster-secret", SECRET, "--sync-secs", "5"],
+            stdout=log, stderr=log))
+    for url in URLS:
+        for _ in range(200):
+            try:
+                request("GET", url + "/")
+                break
+            except Exception:
+                time.sleep(0.05)
+    return procs
+
+
+ids = [f"doc{i:07d}" for i in range(TOTAL)]
+expected = set(ids)
+done = threading.Event()
+results = {}
+
+
+def follow_normal(name, url, headers):
+    seen, since, empty = set(), 0, 0
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        _, resp = request("GET", f"{url}/{DB}/_changes?" + urlencode(
+            {"since": since, "limit": 1000, "style": "all_docs"}), headers=headers)
+        seen.update(r["id"] for r in resp["results"])
+        since = resp["last_seq"]
+        if not resp["results"]:
+            if done.is_set():
+                empty += 1
+                if empty >= 6:
+                    break
+            time.sleep(0.01)
+        else:
+            empty = 0
+    results[name] = seen
+
+
+def follow_longpoll(name, url):
+    seen, since, empty = set(), 0, 0
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        _, resp = request("GET", f"{url}/{DB}/_changes?" + urlencode(
+            {"since": since, "feed": "longpoll", "timeout": 500, "style": "all_docs"}))
+        seen.update(r["id"] for r in resp["results"])
+        since = resp["last_seq"]
+        if not resp["results"] and done.is_set():
+            empty += 1
+            if empty >= 3:
+                break
+        elif resp["results"]:
+            empty = 0
+    results[name] = seen
+
+
+def follow_continuous(name, url):
+    seen = set()
+    req = urllib.request.Request(f"{url}/{DB}/_changes?" + urlencode(
+        {"since": 0, "feed": "continuous", "timeout": 900000, "heartbeat": 1000,
+         "style": "all_docs"}))
+    last_row = time.monotonic()
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        for line in resp:
+            line = line.strip()
+            if line:
+                row = json.loads(line)
+                if "id" in row:
+                    seen.add(row["id"])
+                    last_row = time.monotonic()
+            if done.is_set() and (len(seen) >= TOTAL or time.monotonic() - last_row > 5):
+                break
+    results[name] = seen
+
+
+def writer(chunk):
+    for start in range(0, len(chunk), 500):
+        batch = [{"_id": i, "n": 1} for i in chunk[start:start + 500]]
+        status, body = request("POST", f"{random.choice(URLS)}/{DB}/_bulk_docs",
+                               {"docs": batch}, timeout=120)
+        assert status in (201, 202), (status, body)
+        assert all("ok" in row for row in body), body[:3]
+
+
+procs = start()
+try:
+    request("PUT", f"{URLS[0]}/{DB}")
+    readers = [threading.Thread(target=follow_normal, args=(f"local node{i}", URLS[i], INTERNAL))
+               for i in range(3)]
+    readers += [threading.Thread(target=follow_normal, args=("public normal via node0", URLS[0], None)),
+                threading.Thread(target=follow_longpoll, args=("public longpoll via node2", URLS[2])),
+                threading.Thread(target=follow_continuous, args=("public continuous via node1", URLS[1]))]
+    for t in readers:
+        t.start()
+    time.sleep(0.5)
+    shuffled = ids[:]
+    random.Random(7).shuffle(shuffled)
+    chunks = [shuffled[i::4] for i in range(4)]
+    began = time.monotonic()
+    writers = [threading.Thread(target=writer, args=(c,)) for c in chunks]
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join()
+    print(f"wrote {TOTAL} docs in {time.monotonic() - began:.1f}s", flush=True)
+    # Acknowledged writes may still be landing on the third replica. Readers
+    # stop only once every node holds every document locally.
+    for url in URLS:
+        while True:
+            _, info = request("GET", f"{url}/{DB}", headers=INTERNAL)
+            if info.get("doc_count") == TOTAL:
+                break
+            time.sleep(0.1)
+    print(f"all replicas complete after {time.monotonic() - began:.1f}s", flush=True)
+    done.set()
+    for t in readers:
+        t.join()
+    failed = False
+    for name in sorted(results):
+        missing = expected - results[name]
+        extra = results[name] - expected
+        print(f"{name}: received {len(results[name])}, missing {len(missing)}, unexpected {len(extra)}"
+              + (f", e.g. {sorted(missing)[:3]}" if missing else ""), flush=True)
+        failed |= bool(missing or extra)
+    sys.exit(1 if failed else 0)
+finally:
+    for p in procs:
+        p.terminate()
+    for p in procs:
+        p.wait()

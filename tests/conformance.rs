@@ -7858,6 +7858,97 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
 }
 
 #[tokio::test]
+async fn live_changes_cursor_sees_every_document_under_concurrent_writes() {
+    // Sequence numbers are global but shards commit independently, so a
+    // lower sequence can become visible after a higher one. A reader that
+    // forwards `last_seq` while writes overlap must still see every document.
+    let args = vec!["--q".to_string(), "4".to_string()];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("livegap").await;
+    let total = 12_000usize;
+    let writers = 4usize;
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let reader = {
+        let client = s.client.clone();
+        let base = s.base.clone();
+        let written = written.clone();
+        tokio::spawn(async move {
+            let mut seen = std::collections::HashSet::new();
+            let mut since = Value::from(0);
+            let mut idle = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            // Once every write is acknowledged, a few empty pages in a row
+            // mean the cursor has reached the end.
+            while seen.len() < total && idle < 20 && std::time::Instant::now() < deadline {
+                let body: Value = client
+                    .get(format!("{base}/livegap/_changes"))
+                    .query(&[("since", since.to_string()), ("limit", "500".to_string())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let rows = body["results"].as_array().unwrap();
+                for row in rows {
+                    seen.insert(row["id"].as_str().unwrap().to_string());
+                }
+                since = body["last_seq"].clone();
+                if rows.is_empty() {
+                    if written.load(std::sync::atomic::Ordering::SeqCst) {
+                        idle += 1;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                } else {
+                    idle = 0;
+                }
+            }
+            seen
+        })
+    };
+
+    let mut tasks = Vec::new();
+    for writer in 0..writers {
+        let client = s.client.clone();
+        let base = s.base.clone();
+        tasks.push(tokio::spawn(async move {
+            for batch in (writer..total)
+                .step_by(writers)
+                .collect::<Vec<_>>()
+                .chunks(250)
+            {
+                let docs: Vec<Value> = batch
+                    .iter()
+                    .map(|i| json!({"_id": format!("live{i:06}")}))
+                    .collect();
+                let response = client
+                    .post(format!("{base}/livegap/_bulk_docs"))
+                    .json(&json!({"docs": docs}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED);
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    written.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let seen = reader.await.unwrap();
+    let (_, info) = s.get("/livegap").await;
+    assert_eq!(info["doc_count"], total);
+    assert_eq!(
+        seen.len(),
+        total,
+        "the live cursor skipped {} documents",
+        total - seen.len()
+    );
+}
+
+#[tokio::test]
 async fn cluster_all_docs_keys_honour_descending_order() {
     let nodes = start_cluster_with(2, "3600", 1);
     for node in &nodes {
