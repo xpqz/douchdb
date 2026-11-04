@@ -462,4 +462,95 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn pull_sends_node_credentials_and_the_cluster_secret() {
+        // Peers accept the cluster secret alone today; the node's own
+        // credentials are still sent so a peer that checks them would work.
+        type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+        async fn record(
+            State(seen): State<Seen>,
+            uri: axum::http::Uri,
+            headers: axum::http::HeaderMap,
+        ) -> Json<Value> {
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            seen.lock().unwrap().push((
+                uri.path().to_string(),
+                header("authorization"),
+                header("x-douchdb-secret"),
+            ));
+            if uri.path().ends_with("_changes") {
+                return Json(json!({
+                    "results": [{"seq": 1, "id": "a",
+                                 "changes": [{"rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}],
+                    "last_seq": 1
+                }));
+            }
+            Json(json!({"results": [{"id": "a", "docs": [{"ok": {
+                "_id": "a",
+                "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "_revisions": {"start": 1, "ids": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}
+            }}]}]}))
+        }
+
+        let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "ae",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .expect("db");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route("/ae/_changes", get(record))
+            .route("/ae/_bulk_get", post(record))
+            .with_state(seen.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let peer = format!("http://{addr}");
+        let cluster = Cluster {
+            nodes: vec![peer.clone()],
+            me: 0,
+            n: 1,
+            secret: "test-secret".to_string(),
+        };
+        let auth = Auth::new("node".to_string(), "pw".to_string());
+        pull(&db, &peer, &reqwest::Client::new(), &cluster, Some(&auth))
+            .await
+            .expect("pull");
+
+        use base64::Engine;
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("node:pw")
+        );
+        let seen = seen.lock().unwrap().clone();
+        let paths: Vec<&str> = seen.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert!(paths.contains(&"/ae/_changes"), "{paths:?}");
+        assert!(paths.contains(&"/ae/_bulk_get"), "{paths:?}");
+        for (path, authorization, secret) in &seen {
+            assert_eq!(authorization.as_deref(), Some(basic.as_str()), "{path}");
+            assert_eq!(secret.as_deref(), Some("test-secret"), "{path}");
+        }
+
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

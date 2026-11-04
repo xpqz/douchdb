@@ -596,8 +596,8 @@ broadcast) and then write normally.
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,
 `cluster_survives_killing_a_node_mid_replication`,
-`authenticated_cluster_anti_entropy_uses_node_credentials`,
-`cluster_forwards_session_cookies_to_peers`,
+`authenticated_cluster_anti_entropy_converges`,
+`cluster_serves_session_cookie_clients`,
 `cluster_management_reports_discovery_and_runs_replication` and
 `discovery_follows_seed_membership`.
 

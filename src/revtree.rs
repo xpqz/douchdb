@@ -254,6 +254,19 @@ mod tests {
     }
 
     #[test]
+    fn higher_position_wins_among_live_leaves() {
+        let mut tree = RevTree::default();
+        // The longer branch has the lower revision id, so only position can
+        // make it win.
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(9))), false);
+        tree.merge_path(
+            &revs(&format!("1-{},2-{},3-{}", id(1), id(2), id(3))),
+            false,
+        );
+        assert_eq!(tree.winner().unwrap(), format!("3-{}", id(3)));
+    }
+
+    #[test]
     fn deleted_loses_to_undeleted_regardless_of_position() {
         let mut tree = RevTree::default();
         // Two real leaves: a short live branch and a longer tombstoned one.

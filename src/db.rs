@@ -2907,6 +2907,21 @@ mod tests {
 
     use proptest::prelude::*;
 
+    #[test]
+    fn watermark_ignores_settled_and_unowned_shards() {
+        // Nothing in flight: no bound.
+        assert_eq!(changes_watermark_from(&[5, 9], &[5, 9], 0, None), u64::MAX);
+        // Shard 1 is in flight at 9; shard 0 is settled.
+        assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 0, None), 9);
+        // The same in-flight shard is not ours, so it does not hold us back.
+        assert_eq!(
+            changes_watermark_from(&[5, 9], &[5, 12], 0, Some(&[true, false])),
+            u64::MAX
+        );
+        // Never below `since`.
+        assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 20, None), 20);
+    }
+
     proptest! {
         #[test]
         fn watermark_respects_every_in_flight_shard(
@@ -2933,18 +2948,16 @@ mod tests {
                 mask.as_deref(),
             );
 
-            for index in 0..committed.len() {
-                if mask.as_ref().is_some_and(|m| !m[index]) {
-                    continue;
-                }
-                if reserved[index] > committed[index] {
-                    prop_assert!(watermark <= committed[index].max(since));
-                    prop_assert!(watermark >= since);
-                }
-            }
-            if watermark != u64::MAX {
-                prop_assert!(watermark >= since);
-            }
+            // The cursor may advance to the lowest committed sequence of any
+            // owned shard that still has an allocated, uncommitted write, but
+            // never below `since`. With nothing in flight it is unbounded.
+            let expected = (0..committed.len())
+                .filter(|&index| mask.as_ref().is_none_or(|m| m[index]))
+                .filter(|&index| reserved[index] > committed[index])
+                .map(|index| committed[index].max(since))
+                .min()
+                .unwrap_or(u64::MAX);
+            prop_assert_eq!(watermark, expected);
         }
 
         #[test]

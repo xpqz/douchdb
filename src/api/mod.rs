@@ -442,4 +442,29 @@ mod tests {
         assert_eq!(percent_decode("%2"), "%2");
         assert_eq!(percent_decode("%C3%A9"), "é");
     }
+
+    #[test]
+    fn forward_client_auth_copies_credentials_and_nothing_else() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic Ym9iOnB3"),
+        );
+        headers.insert(header::COOKIE, HeaderValue::from_static("AuthSession=abc"));
+        headers.insert("x-douchdb-secret", HeaderValue::from_static("forged"));
+        let request = forward_client_auth(reqwest::Client::new().get("http://peer/db"), &headers)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["authorization"], "Basic Ym9iOnB3");
+        assert_eq!(request.headers()["cookie"], "AuthSession=abc");
+        assert!(request.headers().get("x-douchdb-secret").is_none());
+
+        let bare = forward_client_auth(
+            reqwest::Client::new().get("http://peer/db"),
+            &HeaderMap::new(),
+        )
+        .build()
+        .unwrap();
+        assert!(bare.headers().is_empty());
+    }
 }

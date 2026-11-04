@@ -318,6 +318,14 @@ mod tests {
         assert!(
             from_slice(br#"{"nested": {"a\"b": 1, "$serde_json::private::Number": 2}}"#).is_err()
         );
+        // A string value would otherwise be accepted as a number, so these
+        // can only be rejected by the pre-scan seeing past the whitespace.
+        assert!(from_slice(br#"{"a": 1, "$serde_json::private::Number" : "5"}"#).is_err());
+        assert!(from_slice(
+            br#"{"a": 1, "$serde_json::private::Number"
+:"5"}"#
+        )
+        .is_err());
 
         // The same escaping and whitespace are fine for ordinary keys.
         let value = from_slice(br#"{"a\"b" : 1}"#).unwrap();

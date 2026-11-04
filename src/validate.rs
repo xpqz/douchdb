@@ -8,13 +8,17 @@
 
 use crate::auth::Principal;
 use crate::db::{AllDocsOpts, ApiError, Db, DbResult, DocOpts};
+use crate::rev::Rev;
 use crate::view::{run_map_json, ViewLimits};
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
-/// Load validators for this write. A single node can use the cached local
-/// design documents; a cluster coordinator fetches the `_design/` range from
-/// every shard owner so a design document on another shard is still applied.
+/// Load validators for this write. A single node uses its cached local design
+/// documents. Design documents are replicated to every node, but one that
+/// missed a design-document write would skip that validator until
+/// anti-entropy repaired it, so a cluster coordinator reads the `_design/`
+/// range from every reachable node and keeps the newest revision of each.
 pub(crate) async fn validation_functions(
     st: &crate::api::AppState,
     db: &Db,
@@ -31,29 +35,48 @@ pub(crate) async fn validation_functions(
         limit: usize::MAX,
         ..Default::default()
     };
-    let value = crate::fabric::cluster_all_docs(
-        crate::fabric::ClusterRead {
-            st,
-            db,
-            dbname,
-            headers,
-        },
-        &opts,
+    let read = crate::fabric::ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    };
+    let responses = futures::future::join_all(
+        (0..st.cluster.nodes.len())
+            .map(|node| crate::fabric::fetch_all_docs(read, node, &opts, None)),
     )
-    .await?;
-    let mut functions = Vec::new();
-    if let Some(rows) = value.get("rows").and_then(Value::as_array) {
+    .await;
+    // Newest revision of each design document, by id. An unreachable node
+    // simply contributes nothing.
+    let mut newest: BTreeMap<String, ((u64, Vec<u8>), Value)> = BTreeMap::new();
+    for value in responses.into_iter().flatten() {
+        let Some(rows) = value.get("rows").and_then(Value::as_array) else {
+            continue;
+        };
         for row in rows {
-            if let Some(source) = row
-                .get("doc")
-                .and_then(|doc| doc.get("validate_doc_update"))
-                .and_then(Value::as_str)
-            {
-                functions.push(source.to_string());
+            let (Some(id), Some(rev), Some(doc)) = (
+                row.get("id").and_then(Value::as_str),
+                row.pointer("/value/rev")
+                    .and_then(Value::as_str)
+                    .and_then(Rev::parse),
+                row.get("doc"),
+            ) else {
+                continue;
+            };
+            let order = (rev.pos, rev.id);
+            if newest.get(id).is_none_or(|(current, _)| order > *current) {
+                newest.insert(id.to_string(), (order, doc.clone()));
             }
         }
     }
-    Ok(functions)
+    Ok(newest
+        .into_values()
+        .filter_map(|(_, doc)| {
+            doc.get("validate_doc_update")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
 }
 
 pub(crate) async fn validate_docs(

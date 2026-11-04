@@ -1059,17 +1059,35 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
     for node in &nodes {
         node.fresh_db("clvalidate").await;
     }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    // Only node 0 stores the design document, as if node 1 missed the write
+    // and anti-entropy (off here) has not repaired it. Node 1 must still apply
+    // the validator when it coordinates a write.
     let (status, body) = nodes[0]
-        .put(
-            "/clvalidate/_design/validate",
-            json!({
+        .req_with(
+            Method::POST,
+            "/clvalidate/_bulk_docs",
+            Some(json!({"docs": [{
+                "_id": "_design/validate",
                 "validate_doc_update": "function (doc) { \
                     if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
                 }"
-            }),
+            }]})),
+            &internal,
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, _) = nodes[1]
+        .req_with(Method::GET, "/clvalidate/_design/validate", None, &internal)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "node 1 must not hold the design doc"
+    );
 
     let (status, body) = nodes[1]
         .put("/clvalidate/accepted", json!({"ok": true}))
@@ -1082,6 +1100,45 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
     assert_eq!(body["reason"], "need ok");
     let (status, _) = nodes[0].get("/clvalidate/rejected").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cluster_validation_uses_the_newest_design_doc_revision() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clvalnew").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let validator = |reason: &str| {
+        format!("function (doc) {{ if (doc.ok !== true) {{ throw {{forbidden: '{reason}'}}; }} }}")
+    };
+    let one = "11111111111111111111111111111111";
+    let two = "22222222222222222222222222222222";
+    // Node 1 still has revision 1; node 0 has moved on to revision 2.
+    for (node, revs, reason) in [(1, vec![one], "old"), (0, vec![two, one], "new")] {
+        let (status, body) = nodes[node]
+            .req_with(
+                Method::POST,
+                "/clvalnew/_bulk_docs",
+                Some(json!({"new_edits": false, "docs": [{
+                    "_id": "_design/validate",
+                    "_rev": format!("{}-{}", revs.len(), revs[0]),
+                    "_revisions": {"start": revs.len(), "ids": revs},
+                    "validate_doc_update": validator(reason),
+                }]})),
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    for node in &nodes {
+        let (status, body) = node.put("/clvalnew/rejected", json!({"ok": false})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["reason"], "new", "{body}");
+    }
 }
 
 #[tokio::test]
@@ -3009,7 +3066,7 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
 
     let (status, body) = nodes[0]
         .post(
-            "/_node/_local/_dbs/timeoutreb/rebalance?timeout_ms=500",
+            "/_node/_local/_dbs/timeoutreb/rebalance?timeout_ms=500&cleanup=true",
             json!({}),
         )
         .await;
@@ -3292,6 +3349,8 @@ async fn cluster_full_replica_reads_survive_two_node_loss() {
 
     nodes[1].kill();
     nodes[2].kill();
+    let (_, metrics) = nodes[0].get("/_node/_local/_metrics").await;
+    let degraded_before = metrics["fabric"]["degraded_reads"].as_u64().unwrap();
 
     // With n=3 on three nodes, node0 holds every shard. Shard-masked reads
     // must use those local replicas and not require any surviving peer.
@@ -3345,6 +3404,14 @@ async fn cluster_full_replica_reads_survive_two_node_loss() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["f00"]["missing"][0], missing);
+
+    // Answered from the local replicas: no read had to fall back.
+    let (_, metrics) = nodes[0].get("/_node/_local/_metrics").await;
+    assert_eq!(
+        metrics["fabric"]["degraded_reads"].as_u64().unwrap(),
+        degraded_before,
+        "reads fell back instead of using the local replica"
+    );
 }
 
 #[tokio::test]
@@ -3353,10 +3420,16 @@ async fn cluster_post_creates_the_document_on_its_owner() {
     for node in &nodes {
         node.fresh_db("clpost").await;
     }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (_, map) = nodes[0].get("/_node/_local/_dbs/clpost").await;
+    let mut forwarded = false;
 
     // POST generates the id after the request arrives, so the handler must
     // route the resulting document rather than writing it to the local shards.
-    for _ in 0..10 {
+    for _ in 0..20 {
         let (status, body) = nodes[0].post("/clpost", json!({"x": 1})).await;
         assert_eq!(status, StatusCode::CREATED);
         let id = body["id"].as_str().unwrap().to_string();
@@ -3370,7 +3443,19 @@ async fn cluster_post_creates_the_document_on_its_owner() {
             );
             assert_eq!(doc["x"], 1);
         }
+        // The owner itself stores it, not just a node that can proxy to it.
+        let shard = douchdb::db::shard_index(&id, map["q"].as_u64().unwrap() as u32);
+        let owner = map["replicas"][shard][0].as_u64().unwrap() as usize;
+        let (status, _) = nodes[owner]
+            .req_with(Method::GET, &format!("/clpost/{id}"), None, &internal)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{id} is not on its owner {owner}");
+        forwarded |= owner != 0;
     }
+    assert!(
+        forwarded,
+        "no generated id was owned by node 1; nothing was routed"
+    );
 }
 
 #[tokio::test]
@@ -3639,12 +3724,14 @@ async fn internal_consistency_survives_node_loss_and_restart() {
 
 #[tokio::test]
 async fn cluster_anti_entropy_drains_a_large_backlog_in_one_pass() {
-    let nodes = start_cluster_with(2, "1", 2);
+    // Background passes are off; the test triggers exactly one.
+    let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("cldrain").await;
     }
 
-    let total = 1000usize;
+    // Several 1,000-document pull pages.
+    let total = 3500usize;
     let docs: Vec<Value> = (0..total)
         .map(|i| json!({"_id": format!("b{i:04}"), "n": i}))
         .collect();
@@ -3659,31 +3746,39 @@ async fn cluster_anti_entropy_drains_a_large_backlog_in_one_pass() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    // More than the old 200-document-per-interval cap. One anti-entropy pass
-    // must drain every page rather than stopping after a single batch.
-    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let (_, before) = nodes[1].get("/_node/_local/_replication").await;
+    let runs_before = before["runs"].as_u64().unwrap_or(0);
+    let (status, _) = nodes[1]
+        .post("/_node/_local/_replication/run?db=cldrain", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let response = nodes[1]
-            .client
-            .post(format!("{}/cldrain/_all_docs", nodes[1].base))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", "test-cluster-secret")
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
-        if response["total_rows"] == total {
+        let (_, status) = nodes[1].get("/_node/_local/_replication").await;
+        if status["runs"].as_u64().unwrap_or(0) > runs_before && status["running"] == false {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "anti-entropy did not drain the backlog: {response}"
+            "the pass never finished: {status}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // That single pass must have drained every page.
+    let response = nodes[1]
+        .client
+        .post(format!("{}/cldrain/_all_docs", nodes[1].base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(response["total_rows"], total, "one pass left a backlog");
 }
 
 #[tokio::test]
@@ -3763,22 +3858,34 @@ async fn cluster_survives_killing_a_node_mid_replication() {
         "initial write: {status}"
     );
 
-    // Kill a node while anti-entropy is still moving shards around.
-    nodes[2].kill();
+    // Kill a node that serves some of the reader's shards, while
+    // anti-entropy is still moving shards around.
+    let ids: Vec<String> = (0..12).map(|i| format!("k{i}")).collect();
+    let (reader, victim) = fallback_pair(&nodes, "clkill", &ids).await;
+    nodes[victim].kill();
 
     // _all_docs falls back to the surviving replicas.
-    let (status, body) = nodes[0].get("/clkill/_all_docs").await;
+    let (status, body) = nodes[reader].get("/clkill/_all_docs").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 12);
     // The changes feed falls back to the surviving replicas too.
-    let (status, body) = nodes[0].get("/clkill/_changes").await;
+    let (status, body) = nodes[reader].get("/clkill/_changes").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["last_seq"].is_string());
+    let changed: std::collections::HashSet<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    for id in &ids {
+        assert!(changed.contains(id.as_str()), "_changes lost {id}: {body}");
+    }
 
     let second: Vec<Value> = (100..106)
         .map(|i| json!({"_id": format!("k{i}"), "n": i}))
         .collect();
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .post("/clkill/_bulk_docs", json!({"docs": second}))
         .await;
     assert!(
@@ -3790,9 +3897,9 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     // The default read quorum is r=2 and one of the two replicas is gone, so
     // a quorum read must fail rather than silently serve a best-effort answer.
     // Availability under node loss explicitly opts into the local fast path.
-    let survivors = &nodes[..2];
+    let survivors: Vec<&Server> = (0..3).filter(|n| *n != victim).map(|n| &nodes[n]).collect();
     for i in (0..12).chain(100..106) {
-        for node in survivors {
+        for node in &survivors {
             let (status, _) = node.get(&format!("/clkill/k{i}?r=1")).await;
             assert_eq!(status, StatusCode::OK, "k{i} via {}", node.base);
         }
@@ -3803,7 +3910,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let mut seen = std::collections::HashSet::new();
-        for node in survivors {
+        for node in &survivors {
             let body: Value = node
                 .client
                 .post(format!("{}/clkill/_all_docs", node.base))
@@ -3827,6 +3934,53 @@ async fn cluster_survives_killing_a_node_mid_replication() {
             std::time::Instant::now() < deadline,
             "survivors did not converge: {} of 18 docs",
             seen.len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A document written to one survivor only reaches the other through
+    // anti-entropy: no client write path copies it.
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (_, map) = nodes[reader].get("/_node/_local/_dbs/clkill").await;
+    let alive: Vec<usize> = (0..3).filter(|n| *n != victim).collect();
+    let (id, owner, writer) = (0..)
+        .map(|i| format!("ae{i}"))
+        .find_map(|id| {
+            let shard = douchdb::db::shard_index(&id, 4);
+            let owners: Vec<usize> = map["replicas"][shard]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node.as_u64().unwrap() as usize)
+                .collect();
+            let owner = *alive.iter().find(|n| owners.contains(n))?;
+            let writer = *alive.iter().find(|n| **n != owner)?;
+            Some((id, owner, writer))
+        })
+        .unwrap();
+    let (status, body) = nodes[writer]
+        .req_with(
+            Method::POST,
+            "/clkill/_bulk_docs",
+            Some(json!({"docs": [{"_id": id, "late": true}]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, _) = nodes[owner]
+            .req_with(Method::GET, &format!("/clkill/{id}"), None, &internal)
+            .await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anti-entropy never copied {id} from node {writer} to its owner {owner}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -3901,6 +4055,21 @@ async fn cluster_default_write_quorum_is_a_majority() {
         StatusCode::ACCEPTED,
         "w=3 cannot be met with one replica down: {body}"
     );
+
+    // With only one live replica the default (a majority, 2 of 3) is not
+    // met either: the write is accepted but not confirmed.
+    nodes[1].kill();
+    let (status, body) = nodes[0]
+        .post(
+            "/clquorumdefault/_bulk_docs",
+            json!({"docs": [{"_id": "minority"}]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "default w=2 cannot be met by one live replica: {body}"
+    );
 }
 
 #[tokio::test]
@@ -3921,7 +4090,8 @@ async fn view_index_updates_incrementally_and_persists() {
     let (status, _) = s
         .put(
             "/incview/_design/v",
-            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, 1); }"}}}),
+            // A random value shows whether an unchanged document was re-mapped.
+            json!({"views": {"by_city": {"map": "function(doc){ emit(doc.city, Math.random()); }"}}}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -3932,12 +4102,28 @@ async fn view_index_updates_incrementally_and_persists() {
     let index_dir = s.dir.join("incview").join("_view_indexes");
     assert!(index_dir.is_dir(), "view index directory was not created");
 
+    let value_of = |body: &Value, id: &str| {
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .map(|row| row["value"].clone())
+            .unwrap()
+    };
+    let a_value = value_of(&body, "a");
+
     // A new document is picked up through _changes, without a rebuild.
     let (status, _) = s.put("/incview/c", json!({"city": "Paris"})).await;
     assert_eq!(status, StatusCode::CREATED);
     let (_, body) = s.get("/incview/_design/v/_view/by_city").await;
     assert_eq!(body["total_rows"], 3);
     assert_eq!(body["rows"][2]["id"], "c");
+    assert_eq!(
+        value_of(&body, "a"),
+        a_value,
+        "unchanged doc a was re-mapped"
+    );
 
     // Moving a document between keys removes its old row.
     let (_, doc) = s.get("/incview/b").await;
@@ -4422,7 +4608,7 @@ async fn cluster_search_survives_a_node_loss_via_replicas() {
 }
 
 #[tokio::test]
-async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
+async fn authenticated_cluster_anti_entropy_converges() {
     let nodes = start_cluster_with_auth(2, "1", 2);
     let basic = format!("Basic {}", base64_encode(b"admin:douchdb"));
     let auth = [("Authorization", basic.clone())];
@@ -4436,8 +4622,9 @@ async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
         .await;
     assert_eq!(status, StatusCode::OK, "database create was authenticated");
 
-    // Write only on node 0; node 1 must pull the documents with the node's
-    // own credentials, not the client's (there is no client here).
+    // Write only on node 0; node 1 must pull the documents with no client
+    // request involved. Peers accept the cluster secret, so this cannot see
+    // which credentials are sent; `replicate::tests` checks those headers.
     let docs: Vec<Value> = (0..6)
         .map(|i| json!({"_id": format!("as{i}"), "n": i}))
         .collect();
@@ -4482,7 +4669,7 @@ async fn authenticated_cluster_anti_entropy_uses_node_credentials() {
 }
 
 #[tokio::test]
-async fn cluster_forwards_session_cookies_to_peers() {
+async fn cluster_serves_session_cookie_clients() {
     let nodes = start_cluster_with_auth(2, "3600", 2);
 
     let response = nodes[0]
@@ -4503,7 +4690,8 @@ async fn cluster_forwards_session_cookies_to_peers() {
         .to_string();
     let auth = [("Cookie", cookie)];
 
-    // Database create is broadcast, so the peer must receive the cookie.
+    // Database create is broadcast. Peers accept the cluster secret, so this
+    // cannot see whether the cookie is forwarded; `api::tests` checks that.
     let (status, _) = nodes[0]
         .req_with(Method::PUT, "/cookiecl", Some(json!({})), &auth)
         .await;
@@ -4518,7 +4706,7 @@ async fn cluster_forwards_session_cookies_to_peers() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Both fan-outs call peers: a 401 here would fail the request.
+    // Reads and writes through a cookie-authenticated client still work.
     let (status, body) = nodes[0]
         .req_with(
             Method::POST,
@@ -5044,7 +5232,7 @@ async fn partitioned_database_documents_info_and_views() {
 
 #[tokio::test]
 async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
-    let mut nodes = start_cluster_with(3, "3600", 3);
+    let mut nodes = start_cluster_with(3, "3600", 2);
     let (status, _) = nodes[0].put("/clpart?partitioned=true", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
 
@@ -5086,9 +5274,12 @@ async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
+    let (_, map) = nodes[0].get("/_node/_local/_dbs/clpart").await;
     let mut even_shards = std::collections::HashSet::new();
     for shard in 0..4 {
-        let (status, body) = nodes[0]
+        // Read each shard from a node that holds a replica of it.
+        let holder = map["replicas"][shard][0].as_u64().unwrap() as usize;
+        let (status, body) = nodes[holder]
             .req_with(
                 Method::GET,
                 &format!("/clpart/_all_docs?shards={shard}"),
@@ -5139,13 +5330,16 @@ async fn cluster_partitioned_database_propagates_and_isolates_partitions() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // Partitioned reduce and map queries fall back to replicas after node loss.
-    nodes[2].kill();
-    let (status, body) = nodes[0]
+    // A partition hashes as `{partition}:foo`; kill the node that serves the
+    // "even" shard for a coordinator without its own replica.
+    let (reader, victim) = fallback_pair(&nodes, "clpart", &["even:foo".to_string()]).await;
+    nodes[victim].kill();
+    let (status, body) = nodes[reader]
         .get("/clpart/_partition/even/_design/p/_view/count")
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["value"], 12);
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .get("/clpart/_partition/even/_design/p/_view/by_n")
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -5358,11 +5552,11 @@ async fn couchdb_basics_ports() {
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert_eq!(headers.get("etag"), Some(&etag));
 
-    let (status, _, body) = s
+    let (status, head_headers, body) = s
         .req_headers(Method::HEAD, &format!("/{name}/doc0"), None, &[])
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers.get("etag"), Some(&etag));
+    assert_eq!(head_headers.get("etag"), Some(&etag));
     assert_eq!(body, Value::Null);
 
     let (status, body) = s
@@ -5777,13 +5971,26 @@ async fn couchdb_view_collation_ports() {
         .iter()
         .map(|row| row["key"].clone())
         .collect();
-    assert_eq!(keys, values);
+    // Keys come from JavaScript, as in CouchDB's view server, so the stored
+    // `3.0` is emitted as `3`. CouchDB's own test compares with `===`, where
+    // the two are equal.
+    let expected: Vec<Value> = values
+        .iter()
+        .map(|value| {
+            if *value == json!(3.0) {
+                json!(3)
+            } else {
+                value.clone()
+            }
+        })
+        .collect();
+    assert_eq!(keys, expected);
 
     let (status, body) = s
         .get("/couchcollation/_design/foo/_view/foo?descending=true")
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let mut reversed = values.clone();
+    let mut reversed = expected.clone();
     reversed.reverse();
     let keys: Vec<Value> = body["rows"]
         .as_array()
@@ -6189,10 +6396,13 @@ async fn pouchdb_local_docs_revs_diff_and_bulk_get_ports() {
 async fn pouchdb_changes_and_all_docs_ports() {
     let s = Server::start(false);
     s.fresh_db("pouchchanges").await;
+    // An earlier write, so `now` is not simply sequence 0.
+    let (status, _) = s.put("/pouchchanges/zero", json!({"n": 0})).await;
+    assert_eq!(status, StatusCode::CREATED);
 
     let (status, body) = s.get("/pouchchanges/_changes?since=now").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["results"].as_array().unwrap().is_empty());
+    assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
     let since = body["last_seq"].to_string();
 
     let (status, _) = s.put("/pouchchanges/one", json!({"n": 1})).await;
@@ -6222,7 +6432,7 @@ async fn pouchdb_changes_and_all_docs_ports() {
         .iter()
         .map(|row| row["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["one", "c", "a"]);
+    assert_eq!(ids, ["zero", "one", "c", "a"]);
 
     let (status, body) = s
         .get("/pouchchanges/_all_docs?include_docs=true&skip=1&limit=1")
@@ -7629,6 +7839,22 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
     assert_eq!(unique.len(), expected.len(), "duplicate changes rows");
     seen.sort();
     assert_eq!(seen, expected, "change rows had gaps");
+
+    // One unlimited request has to read past each shard's first internal
+    // page of 1,024 rows; the limited pages above never do.
+    let (status, body) = s.get("/changespages/_changes?since=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut all: Vec<String> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    all.sort();
+    assert_eq!(
+        all, expected,
+        "unlimited feed lost rows past the first page"
+    );
 }
 
 #[tokio::test]
@@ -9458,7 +9684,9 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
 
 #[tokio::test]
 async fn rebalance_verifies_conflict_leaves_before_cleanup() {
-    let nodes = start_cluster_with(3, "1", 1);
+    // Background anti-entropy is off, so the target replica only changes when
+    // the test triggers a pass.
+    let nodes = start_cluster_with(3, "3600", 1);
     for node in &nodes {
         node.fresh_db("confreb").await;
     }
@@ -9466,33 +9694,79 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
         .put("/_node/_local/_dbs/confreb", all_shards_on(0))
         .await;
     assert_eq!(status, StatusCode::OK);
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+
+    // A document whose shard moves away from node 0 in the balanced map
+    // (shard s goes to node s % 3).
+    let id = (0..)
+        .map(|i| format!("x{i}"))
+        .find(|id| !douchdb::db::shard_index(id, 4).is_multiple_of(3))
+        .unwrap();
+    let target = douchdb::db::shard_index(&id, 4) % 3;
 
     let root = "00000000000000000000000000000000";
-    let docs = json!({"new_edits": false, "docs": [
-        {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-         "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"},
-        {"_id": "x", "_rev": "2-cccccccccccccccccccccccccccccccc",
-         "_revisions": {"start": 2, "ids": ["cccccccccccccccccccccccccccccccc", root]}, "v": "c"}
-    ]});
-    let (status, body) = nodes[0].post("/confreb/_bulk_docs", docs).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let (status, body) = nodes[0].get("/confreb/x?conflicts=true").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["_conflicts"].as_array().unwrap().len(), 1);
-
+    let branch = |rev: &str, v: &str| {
+        json!({"_id": id, "_rev": format!("2-{rev}"),
+               "_revisions": {"start": 2, "ids": [rev, root]}, "v": v})
+    };
+    let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let c = "cccccccccccccccccccccccccccccccc";
     let (status, body) = nodes[0]
         .post(
-            "/_node/_local/_dbs/confreb/rebalance?timeout_ms=20000&cleanup=true",
-            json!({}),
+            "/confreb/_bulk_docs",
+            json!({"new_edits": false, "docs": [branch(b, "b"), branch(c, "c")]}),
         )
         .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // The target already holds the same document with only one leaf: same
+    // document count as the source, different content.
+    let (status, body) = nodes[target]
+        .req_with(
+            Method::POST,
+            "/confreb/_bulk_docs",
+            Some(json!({"new_edits": false, "docs": [branch(b, "b")]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let rebalance = tokio::spawn({
+        let client = nodes[0].client.clone();
+        let url = format!(
+            "{}/_node/_local/_dbs/confreb/rebalance?timeout_ms=20000&cleanup=true",
+            nodes[0].base
+        );
+        async move {
+            let response = client.post(url).json(&json!({})).send().await.unwrap();
+            let status = response.status();
+            (
+                status,
+                response.json::<Value>().await.unwrap_or(Value::Null),
+            )
+        }
+    });
+    // Counts already match, so only the content digest can hold the
+    // rebalance back until the missing leaf has been copied.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !rebalance.is_finished(),
+        "rebalance completed before the target had every conflict leaf"
+    );
+    let (status, _) = nodes[target]
+        .post("/_node/_local/_replication/run?db=confreb", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, body) = rebalance.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, body) = nodes[0].get("/confreb/x?conflicts=true").await;
+    let (status, body) = nodes[0].get(&format!("/confreb/{id}?conflicts=true")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["_conflicts"].as_array().unwrap().len(),
-        1,
+        body["_conflicts"],
+        json!([format!("2-{b}")]),
         "conflict leaf was lost during rebalance cleanup: {body}"
     );
 }
@@ -9537,9 +9811,13 @@ async fn quorum_read_prefers_tombstone_over_stale_live_replica() {
 
     // A strict quorum read sees the tombstone and a stale live copy. The
     // tombstone is the descendant and must win; the result is 404, not stale data.
-    let (status, body) = nodes[0].get("/qtomb/x?r=2").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(!serde_json::to_string(&body).unwrap().contains("\"v\":1"));
+    // Coordinating from either replica gives the same answer, including from
+    // node1, whose own copy is the stale one.
+    for node in &nodes {
+        let (status, body) = node.get("/qtomb/x?r=2").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!serde_json::to_string(&body).unwrap().contains("\"v\":1"));
+    }
 }
 
 #[tokio::test]
@@ -9548,20 +9826,38 @@ async fn quorum_read_prefers_conflict_winner_across_replicas() {
     for node in &nodes {
         node.fresh_db("qconf").await;
     }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    // Each replica holds only one branch, so the winner and its conflict can
+    // only come from merging both replicas.
     let root = "00000000000000000000000000000000";
-    let docs = json!({"new_edits": false, "docs": [
-        {"_id": "x", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-         "_revisions": {"start": 2, "ids": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", root]}, "v": "b"},
-        {"_id": "x", "_rev": "2-cccccccccccccccccccccccccccccccc",
-         "_revisions": {"start": 2, "ids": ["cccccccccccccccccccccccccccccccc", root]}, "v": "c"}
-    ]});
-    let (status, body) = nodes[0].post("/qconf/_bulk_docs", docs).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let branches = [
+        ("b", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ("c", "cccccccccccccccccccccccccccccccc"),
+    ];
+    for (node, (v, id)) in nodes.iter().zip(branches) {
+        let docs = json!({"new_edits": false, "docs": [
+            {"_id": "x", "_rev": format!("2-{id}"),
+             "_revisions": {"start": 2, "ids": [id, root]}, "v": v}
+        ]});
+        let (status, body) = node
+            .req_with(Method::POST, "/qconf/_bulk_docs", Some(docs), &internal)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
 
-    let (status, body) = nodes[0].get("/qconf/x?r=2&conflicts=true").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["v"], "c");
-    assert_eq!(body["_conflicts"].as_array().unwrap().len(), 1);
+    for node in &nodes {
+        let (status, body) = node.get("/qconf/x?r=2&conflicts=true").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["v"], "c", "{body}");
+        assert_eq!(
+            body["_conflicts"],
+            json!(["2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -9876,9 +10172,18 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     assert_eq!(body["error"], "rebalance_in_progress", "{body}");
 
     // Reads still use the old active placement, not the incomplete target.
-    let (status, body) = nodes[0].get("/rebread/reb0").await;
-    assert_eq!(status, StatusCode::OK, "read during migration: {body}");
-    assert_eq!(body["n"], 0);
+    // Anti-entropy is off, so the target owners (nodes 1 and 2 hold shards 1
+    // and 2 in the balanced map) are still empty: a read routed by the target
+    // map would miss. Read every document through node 1.
+    for i in 0..9 {
+        let (status, body) = nodes[1].get(&format!("/rebread/reb{i}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "read reb{i} during migration: {body}"
+        );
+        assert_eq!(body["n"], i);
+    }
 
     assert_eq!(rebalance.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
     let (status, body) = nodes[0].get("/rebread/reb0").await;
