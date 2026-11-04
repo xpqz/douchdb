@@ -883,7 +883,7 @@ impl Db {
             before_start += shard_offset;
             total_rows += shard_docs;
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
         if opts.descending {
             rows.reverse();
         }
@@ -1625,16 +1625,17 @@ fn doc_id(doc: &Value) -> DbResult<String> {
     }
 }
 
-fn split_doc(
-    doc: Value,
-) -> DbResult<(
-    String,
-    Option<String>,
-    bool,
-    Option<Value>,
-    Option<Value>,
-    Map<String, Value>,
-)> {
+/// A client document split into its metadata fields and its body.
+struct SplitDoc {
+    id: String,
+    rev: Option<String>,
+    deleted: bool,
+    attachments: Option<Value>,
+    revisions: Option<Value>,
+    body: Map<String, Value>,
+}
+
+fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     /// `_id`/`_rev`/... are document metadata, not body. `_conflicts` and
     /// friends are read-only decorations a client may echo back.
     const META: [&str; 9] = META_FIELDS;
@@ -1687,7 +1688,14 @@ fn split_doc(
             "Document id must not be empty",
         ));
     }
-    Ok((id, rev, deleted, attachments, revisions, body))
+    Ok(SplitDoc {
+        id,
+        rev,
+        deleted,
+        attachments,
+        revisions,
+        body,
+    })
 }
 
 fn decode_attachment(value: &Value) -> DbResult<Option<(AttMeta, Vec<u8>)>> {
@@ -1818,21 +1826,20 @@ impl Stage<'_> {
     }
 
     fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
-        let (id, parent_rev, deleted, attachments, revisions, body) = split_doc(doc)?;
-        let mut meta = self.meta(&id)?.unwrap_or_default();
-        let body = Value::Object(body);
-
+        let doc = split_doc(doc)?;
+        let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
-            return self.stage_replicated(
-                id,
-                meta,
-                parent_rev,
-                revisions,
-                deleted,
-                attachments,
-                body,
-            );
+            return self.stage_replicated(doc, meta);
         }
+        let SplitDoc {
+            id,
+            rev: parent_rev,
+            deleted,
+            attachments,
+            revisions: _,
+            body,
+        } = doc;
+        let body = Value::Object(body);
 
         let parent = match parent_rev {
             Some(rev) => {
@@ -1907,16 +1914,16 @@ impl Stage<'_> {
         Ok(json!({"ok": true, "id": id, "rev": rev}))
     }
 
-    fn stage_replicated(
-        &mut self,
-        id: String,
-        mut meta: DocMeta,
-        rev: Option<String>,
-        revisions: Option<Value>,
-        deleted: bool,
-        attachments: Option<Value>,
-        body: Value,
-    ) -> DbResult<Value> {
+    fn stage_replicated(&mut self, doc: SplitDoc, mut meta: DocMeta) -> DbResult<Value> {
+        let SplitDoc {
+            id,
+            rev,
+            deleted,
+            attachments,
+            revisions,
+            body,
+        } = doc;
+        let body = Value::Object(body);
         let rev = rev.ok_or_else(|| ApiError::bad_request("Document is missing _rev"))?;
         let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
 
@@ -2418,10 +2425,7 @@ fn collect_all_docs(
     shard: &mut crate::store::Shard,
     opts: &AllDocsOpts,
     take: usize,
-) -> DbResult<(
-    Vec<(String, Option<String>, Option<Value>, Vec<String>, bool)>,
-    usize,
-)> {
+) -> DbResult<(Vec<AllDocsRow>, usize)> {
     let start = opts.startkey.as_deref();
     let end = opts.endkey.as_deref();
     let mut rows = Vec::new();
@@ -2472,7 +2476,11 @@ fn collect_all_docs(
                     if rows.len() >= take {
                         break;
                     }
-                    rows.push((id.clone(), Some(doc.rev.clone()), None, Vec::new(), false));
+                    rows.push(AllDocsRow {
+                        id: id.clone(),
+                        rev: doc.rev.clone(),
+                        doc: None,
+                    });
                 }
             } else {
                 let range = match (start, end) {
@@ -2499,7 +2507,11 @@ fn collect_all_docs(
                     if rows.len() >= take {
                         break;
                     }
-                    rows.push((id.clone(), Some(doc.rev.clone()), None, Vec::new(), false));
+                    rows.push(AllDocsRow {
+                        id: id.clone(),
+                        rev: doc.rev.clone(),
+                        doc: None,
+                    });
                 }
             }
         }
@@ -2507,26 +2519,15 @@ fn collect_all_docs(
     };
 
     if opts.include_docs || opts.conflicts {
-        for (id, rev, doc, conflicts, _) in rows.iter_mut() {
-            let Some(rev) = rev.as_ref() else {
-                continue;
-            };
-            let meta = if opts.conflicts {
-                shard.get_meta(id)?
-            } else {
-                None
-            };
-            if let Some(meta) = &meta {
-                *conflicts = meta.tree.conflicts(rev);
-            }
+        for row in rows.iter_mut() {
             if opts.include_docs {
                 let doc_opts = DocOpts {
-                    rev: Some(rev.clone()),
+                    rev: Some(row.rev.clone()),
                     conflicts: opts.conflicts,
                     attachments: opts.attachments,
                     ..Default::default()
                 };
-                *doc = read_doc(shard, id, &doc_opts).ok();
+                row.doc = read_doc(shard, &row.id, &doc_opts).ok();
             }
         }
     }
@@ -2582,13 +2583,16 @@ fn all_docs_key_row(
     Ok(Some(row))
 }
 
-fn finish_all_docs(
-    rows: Vec<(String, Option<String>, Option<Value>, Vec<String>, bool)>,
-    total: usize,
-    offset: usize,
-) -> DbResult<Value> {
+/// One `_all_docs` row before it is rendered as JSON.
+struct AllDocsRow {
+    id: String,
+    rev: String,
+    doc: Option<Value>,
+}
+
+fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
     let mut results = Vec::new();
-    for (id, rev, doc, _conflicts, _deleted) in rows {
+    for AllDocsRow { id, rev, doc } in rows {
         let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
         if let Some(doc) = doc {
             row["doc"] = doc;

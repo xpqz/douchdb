@@ -398,7 +398,13 @@ async fn changes_options(
     let raw_since = q.get("since").map(String::as_str);
     let mut progress = if raw_since == Some("now") {
         if st.cluster.is_clustered() && !local_only {
-            cluster_update_vector(st, db, &db.name, headers).await?
+            cluster_update_vector(ClusterRead {
+                st,
+                db,
+                dbname: &db.name,
+                headers,
+            })
+            .await?
         } else {
             let mut vector = vec![0; n];
             vector[st.cluster.me] = db.update_seq();
@@ -446,7 +452,17 @@ async fn changes_once(
     local_only: bool,
 ) -> DbResult<Value> {
     if st.cluster.is_clustered() && !local_only && !flag(q, "descending") {
-        return cluster_changes(st, db, dbname, q, body, headers).await;
+        return cluster_changes(
+            ClusterRead {
+                st,
+                db,
+                dbname,
+                headers,
+            },
+            q,
+            body,
+        )
+        .await;
     }
 
     let (opts, _) = changes_options(st, db, q, body, headers, local_only).await?;

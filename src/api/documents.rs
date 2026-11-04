@@ -33,16 +33,17 @@ pub(super) async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -
     }
 }
 
-pub(super) async fn doc_request(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    rest: &str,
-    method: Method,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
+pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        headers,
+        ..
+    } = req;
+    let method = req.method.clone();
+    let body = req.body.clone();
     let (docid, attachment) = split_doc_path(rest);
     if docid.is_empty() {
         return fail(ApiError::bad_request("invalid document id"));
@@ -83,20 +84,18 @@ pub(super) async fn doc_request(
         // The peer is a replica; answer locally instead of starting another
         // quorum read and bouncing the request back.
         forward_q.insert("r".to_string(), "1".to_string());
+        let request = ForwardRequest {
+            method: &method,
+            dbname,
+            rest,
+            q: &forward_q,
+            headers,
+            body: &body,
+        };
         let mut last = None;
         for node in replicas {
             let peer = st.cluster.nodes[node].clone();
-            let response = proxy(
-                st,
-                &method,
-                dbname,
-                rest,
-                &forward_q,
-                headers,
-                body.clone(),
-                &peer,
-            )
-            .await;
+            let response = proxy(st, &request, &peer).await;
             if !unavailable(&response) {
                 return response;
             }
@@ -233,9 +232,7 @@ pub(crate) fn etag_matches(headers: &HeaderMap, name: header::HeaderName, etag: 
 }
 
 async fn check_if_match(db: &Db, docid: &str, headers: &HeaderMap) -> Option<Response> {
-    if headers.get(header::IF_MATCH).is_none() {
-        return None;
-    }
+    headers.get(header::IF_MATCH)?;
     let current = db
         .get_doc(docid, &DocOpts::default())
         .await

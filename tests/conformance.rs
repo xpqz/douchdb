@@ -93,7 +93,7 @@ impl Server {
         if admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        let mut child = cmd.spawn().expect("spawn douchdb");
+        let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
         let base = format!("http://127.0.0.1:{port}");
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -141,7 +141,7 @@ impl Server {
         if self.admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        self.child = cmd.spawn().expect("restart douchdb");
+        self.child = spawn_locked(&mut cmd).expect("restart douchdb");
         if wait_for_listener(&mut self.child, self.port) {
             std::thread::sleep(Duration::from_millis(50));
             return;
@@ -286,6 +286,20 @@ impl Drop for Server {
     }
 }
 
+/// Held while `free_port` has a probe socket open and while a server is
+/// spawned. On macOS a new socket is made close-on-exec only after it is
+/// created, so a server spawned by another test thread in that window inherits
+/// the probe listener and keeps the port. The real server then fails to bind,
+/// and the test talks to the stray socket ("Connection reset by peer").
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_locked(cmd: &mut Command) -> std::io::Result<Child> {
+    let _guard = SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cmd.spawn()
+}
+
 fn free_port() -> u16 {
     // Tests run in parallel threads. The kernel's ephemeral-port pool can hand
     // the same released port to two tests, so assign ports from a process-wide
@@ -294,10 +308,42 @@ fn free_port() -> u16 {
     loop {
         let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
         let candidate = 31000 + ((std::process::id() as usize + n * 37) % 20000);
+        let _guard = SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if std::net::TcpListener::bind(("127.0.0.1", candidate as u16)).is_ok() {
             return candidate as u16;
         }
     }
+}
+
+/// A `(reader, victim)` pair for `db`: `victim` serves `reader`'s reads of a
+/// shard that holds one of `ids` and that `reader` has no replica of. Killing
+/// `victim` forces reads coordinated by `reader` onto the degraded-read
+/// fallback for that document. Placement depends on the nodes' (random)
+/// ports, so the pair is looked up rather than fixed.
+async fn fallback_pair(nodes: &[Server], db: &str, ids: &[String]) -> (usize, usize) {
+    let (status, map) = nodes[0].get(&format!("/_node/_local/_dbs/{db}")).await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    let q = map["q"].as_u64().unwrap() as u32;
+    for (shard, replicas) in map["replicas"].as_array().unwrap().iter().enumerate() {
+        if !ids
+            .iter()
+            .any(|id| douchdb::db::shard_index(id, q) == shard)
+        {
+            continue;
+        }
+        let replicas: Vec<usize> = replicas
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node.as_u64().unwrap() as usize)
+            .collect();
+        if let Some(reader) = (0..nodes.len()).find(|node| !replicas.contains(node)) {
+            return (reader, replicas[0]);
+        }
+    }
+    panic!("every node holds every shard with a test document in {db}: {map}");
 }
 
 /// Start `n` nodes in one cluster with `q=4`. Anti-entropy is effectively off
@@ -326,7 +372,7 @@ fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool
             .join(",");
         let mut servers = Vec::new();
         let mut failed = false;
-        for i in 0..n {
+        for (i, &port) in ports.iter().enumerate() {
             let extra = vec![
                 "--q".to_string(),
                 "4".to_string(),
@@ -341,7 +387,7 @@ fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool
                 "--cluster-secret".to_string(),
                 "test-cluster-secret".to_string(),
             ];
-            match Server::spawn_on(ports[i], &extra, admin, attempt) {
+            match Server::spawn_on(port, &extra, admin, attempt) {
                 Some(server) => servers.push(server),
                 None => {
                     failed = true;
@@ -1744,13 +1790,20 @@ async fn request_body_limit_is_enforced() {
     let s = Server::start_with(&["--max-request-mb".to_string(), "1".to_string()], false);
     s.fresh_db("limits").await;
     let blob = "x".repeat(2 * 1024 * 1024);
-    let (status, _) = s
-        .post(
-            "/limits/_bulk_docs",
-            json!({"docs": [{"_id": "too-big", "blob": blob}]}),
-        )
+    // The server answers 413 and closes the connection without reading the
+    // rest of the body, so under load the client can see the reset before the
+    // response. Either way the request is refused and nothing is stored. A
+    // separate client keeps the closed connection out of the server's pool.
+    let response = Client::new()
+        .post(format!("{}/limits/_bulk_docs", s.base))
+        .json(&json!({"docs": [{"_id": "too-big", "blob": blob}]}))
+        .send()
         .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    if let Ok(response) = response {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let (status, _) = s.get("/limits/too-big").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3015,14 +3068,20 @@ async fn cluster_changes_survive_node_loss_and_resume() {
     assert_eq!(ids.len(), 9);
     let since = baseline["last_seq"].as_str().unwrap().to_string();
 
-    nodes[2].kill();
-    let (status, _) = nodes[0].put("/cfail/after", json!({"n": 100})).await;
+    let (reader, victim) = fallback_pair(
+        &nodes,
+        "cfail",
+        &(0..9).map(|i| format!("cf{i}")).collect::<Vec<_>>(),
+    )
+    .await;
+    nodes[victim].kill();
+    let (status, _) = nodes[reader].put("/cfail/after", json!({"n": 100})).await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
         "write after node loss: {status}"
     );
 
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .get(&format!("/cfail/_changes?since={since}"))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3040,7 +3099,7 @@ async fn cluster_changes_survive_node_loss_and_resume() {
 
     // A fresh replay from zero must recover changes that lived only on the
     // dead node; fallback shards cannot reuse the survivor's checkpoint.
-    let (status, body) = nodes[0].get("/cfail/_changes?since=0").await;
+    let (status, body) = nodes[reader].get("/cfail/_changes?since=0").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let ids: std::collections::HashSet<&str> = body["results"]
         .as_array()
@@ -3057,6 +3116,22 @@ async fn cluster_changes_survive_node_loss_and_resume() {
     // While the owner is down, fallback changes are at-least-once and may
     // replay rows already seen before the checkpoint; clients dedupe by
     // revision. The feed must still contain every old document.
+
+    // The `limit` path merges owner and fallback rows separately.
+    let (status, body) = nodes[reader].get("/cfail/_changes?since=0&limit=50").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: std::collections::HashSet<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    for i in 0..9 {
+        assert!(
+            ids.contains(format!("cf{i}").as_str()),
+            "limit feed missing cf{i}: {ids:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3077,21 +3152,27 @@ async fn cluster_all_docs_survives_node_loss_via_replicas() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 9);
 
-    nodes[2].kill();
+    let (reader, victim) = fallback_pair(
+        &nodes,
+        "alldocsfail",
+        &(0..9).map(|i| format!("al{i}")).collect::<Vec<_>>(),
+    )
+    .await;
+    nodes[victim].kill();
 
-    let (status, body) = nodes[0].get("/alldocsfail/_all_docs").await;
+    let (status, body) = nodes[reader].get("/alldocsfail/_all_docs").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 9);
     assert_eq!(body["rows"].as_array().unwrap().len(), 9);
 
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .get("/alldocsfail/_all_docs?startkey=%22al3%22&limit=3&skip=1")
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 9);
     assert_eq!(body["offset"], 4);
 
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .post("/alldocsfail/_all_docs", json!({"keys": ["al0", "al8"]}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -4084,6 +4165,9 @@ async fn purge_invalidates_view_indexes() {
 
 #[test]
 fn clustered_startup_requires_a_cluster_secret() {
+    let _guard = SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let output = Command::new(env!("CARGO_BIN_EXE_douchdb"))
         .env_remove("DOUCHDB_CLUSTER_SECRET")
         .args([
@@ -4245,8 +4329,11 @@ async fn cluster_view_query_survives_a_node_loss_via_replicas() {
 
     // A dead node is covered by its replicas. The fallback reads all local
     // replicas from the surviving nodes and deduplicates rows.
-    nodes[2].kill();
-    let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/by_city").await;
+    let (reader, victim) = fallback_pair(&nodes, "clviewfail", &["a", "b"].map(String::from)).await;
+    nodes[victim].kill();
+    let (status, body) = nodes[reader]
+        .get("/clviewfail/_design/v/_view/by_city")
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 2);
     let mut ids: Vec<&str> = body["rows"]
@@ -4259,10 +4346,10 @@ async fn cluster_view_query_survives_a_node_loss_via_replicas() {
     assert_eq!(ids, ["a", "b"]);
 
     // Reduce partials fall back to the dead owner's replicas too.
-    let (status, body) = nodes[0].get("/clviewfail/_design/v/_view/count").await;
+    let (status, body) = nodes[reader].get("/clviewfail/_design/v/_view/count").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["value"], 2);
-    let (status, body) = nodes[0]
+    let (status, body) = nodes[reader]
         .get("/clviewfail/_design/v/_view/count?group=true")
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -4282,6 +4369,56 @@ async fn cluster_view_query_survives_a_node_loss_via_replicas() {
         groups,
         [("Berlin".to_string(), 1), ("Paris".to_string(), 1)]
     );
+}
+
+#[tokio::test]
+async fn cluster_search_survives_a_node_loss_via_replicas() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clsearchfail").await;
+    }
+    let (status, _) = nodes[0]
+        .post(
+            "/clsearchfail/_bulk_docs",
+            json!({"docs": [
+                {"_id": "apple", "item": "apple", "place": "kitchen", "state": "new", "price": 0.99},
+                {"_id": "banana", "item": "banana", "place": "kitchen", "state": "new", "price": 1.49},
+                {"_id": "carrot", "item": "carrot", "place": "kitchen", "state": "old", "price": 0.75},
+                {"_id": "date", "item": "date", "place": "lobby", "state": "unknown", "price": 1.25}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put("/clsearchfail/_design/inventory", search_ddoc())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let url = "/clsearchfail/_design/inventory/_search/fruits?q=*:*&counts=[\"place\"]";
+    let (status, before) = nodes[0].get(url).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["total_rows"], 4);
+
+    // The dead node's shards are answered by their replicas, and results from
+    // the surviving owners are kept rather than queried again.
+    let (reader, victim) = fallback_pair(
+        &nodes,
+        "clsearchfail",
+        &["apple", "banana", "carrot", "date"].map(String::from),
+    )
+    .await;
+    nodes[victim].kill();
+    let (status, body) = nodes[reader].get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4);
+    let mut ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["apple", "banana", "carrot", "date"]);
+    assert_eq!(body["counts"], before["counts"], "{body}");
 }
 
 #[tokio::test]
@@ -6254,7 +6391,7 @@ async fn couchdb_conflict_request_ports() {
 
     let (status, body) = s
         .put(
-            &format!("/couchconflict/doc-1?rev=1-foobar"),
+            "/couchconflict/doc-1?rev=1-foobar",
             json!({"_rev": rev, "a": 2}),
         )
         .await;

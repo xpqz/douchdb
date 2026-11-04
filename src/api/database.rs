@@ -107,8 +107,13 @@ pub async fn db_root(
                         // the changes feed returns, so clients that use it as
                         // `since` do not skip another node's changes.
                         if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
-                            if let Ok(vector) =
-                                cluster_update_vector(&st, &db, &name, &headers).await
+                            if let Ok(vector) = cluster_update_vector(ClusterRead {
+                                st: &st,
+                                db: &db,
+                                dbname: &name,
+                                headers: &headers,
+                            })
+                            .await
                             {
                                 let seq = encode_since(&vector);
                                 info["update_seq"] = json!(seq);
@@ -170,20 +175,18 @@ pub async fn db_root(
             let replicas = replicas_of_doc(&db, &id);
             if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
                 let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
+                let request = ForwardRequest {
+                    method: &Method::POST,
+                    dbname: &name,
+                    rest: "",
+                    q: &q,
+                    headers: &headers,
+                    body: &forwarded,
+                };
                 let mut last = None;
                 for node in replicas {
                     let peer = st.cluster.nodes[node].clone();
-                    let response = proxy(
-                        &st,
-                        &Method::POST,
-                        &name,
-                        "",
-                        &q,
-                        &headers,
-                        Bytes::from(forwarded.clone()),
-                        &peer,
-                    )
-                    .await;
+                    let response = proxy(&st, &request, &peer).await;
                     if !unavailable(&response) {
                         return response;
                     }
@@ -324,11 +327,21 @@ pub async fn db_rest(
         return response;
     }
     let q = query(&uri);
+    let req = DbRequest {
+        st: &st,
+        db: &db,
+        name: &name,
+        method: &method,
+        uri: &uri,
+        q: &q,
+        headers: &headers,
+        body: &body,
+    };
 
     match rest.as_str() {
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
-        "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers, None).await,
+        "_all_docs" => return all_docs(req, None).await,
         "_changes" => {
             return changes(st.clone(), db.clone(), &name, &q, &method, &body, &headers).await
         }
@@ -465,7 +478,13 @@ pub async fn db_rest(
 
     if let Some((ddoc, index, info)) = search_path(&rest) {
         return search_request(
-            &st, &db, &name, &ddoc, &index, &method, &q, &uri, &body, &headers, None, info,
+            req,
+            IndexRef {
+                ddoc: &ddoc,
+                name: &index,
+            },
+            None,
+            info,
         )
         .await;
     }
@@ -490,32 +509,15 @@ pub async fn db_rest(
         }
         return match suffix {
             "" => partition_info(&st, &db, &name, partition, &method, &headers).await,
-            "_all_docs" => {
-                all_docs(
-                    &st,
-                    &db,
-                    &name,
-                    &q,
-                    &method,
-                    &body,
-                    &headers,
-                    Some(partition.to_string()),
-                )
-                .await
-            }
+            "_all_docs" => all_docs(req, Some(partition.to_string())).await,
             _ => match search_path(suffix) {
                 Some((ddoc, index, info)) => {
                     search_request(
-                        &st,
-                        &db,
-                        &name,
-                        &ddoc,
-                        &index,
-                        &method,
-                        &q,
-                        &uri,
-                        &body,
-                        &headers,
+                        req,
+                        IndexRef {
+                            ddoc: &ddoc,
+                            name: &index,
+                        },
                         Some(partition.to_string()),
                         info,
                     )
@@ -524,15 +526,11 @@ pub async fn db_rest(
                 None => match view_path(suffix) {
                     Some((ddoc, view)) => {
                         view_request(
-                            &st,
-                            &db,
-                            &name,
-                            &ddoc,
-                            &view,
-                            &method,
-                            &q,
-                            &body,
-                            &headers,
+                            req,
+                            IndexRef {
+                                ddoc: &ddoc,
+                                name: &view,
+                            },
                             Some(partition.to_string()),
                         )
                         .await
@@ -545,10 +543,15 @@ pub async fn db_rest(
 
     if let Some((ddoc, view)) = view_path(&rest) {
         return view_request(
-            &st, &db, &name, &ddoc, &view, &method, &q, &body, &headers, None,
+            req,
+            IndexRef {
+                ddoc: &ddoc,
+                name: &view,
+            },
+            None,
         )
         .await;
     }
 
-    doc_request(&st, &db, &name, &raw_rest, method, &q, &headers, body).await
+    doc_request(req, &raw_rest).await
 }
