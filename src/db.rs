@@ -98,6 +98,18 @@ pub fn shard_index_for(docid: &str, q: u32, partitioned: bool) -> usize {
     shard_index(docid, q)
 }
 
+/// Take the next global sequence for a write staged on one shard. The shard
+/// is marked in flight (`reserved > committed`) *before* the counter moves,
+/// so a changes snapshot that sees the new counter also sees the shard as
+/// in flight. Committed sequences never exceed the counter, so `counter + 1`
+/// is enough to mark it.
+fn allocate_seq(counter: &AtomicU64, reserved: &AtomicU64) -> u64 {
+    reserved.fetch_max(counter.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+    let seq = counter.fetch_add(1, Ordering::SeqCst) + 1;
+    reserved.fetch_max(seq, Ordering::SeqCst);
+    seq
+}
+
 /// Pure form of the changes watermark rule: only shards with an allocated but
 /// uncommitted sequence constrain the cursor, and the cursor never goes below
 /// `since`.
@@ -559,15 +571,26 @@ impl Db {
         );
     }
 
-    /// Highest sequence that is safe for a changes cursor to publish.
+    /// Highest sequence that is safe for a changes cursor to publish, taken
+    /// as a snapshot **before** reading any shard.
     ///
     /// Sequence numbers are allocated while a shard job is staging, but only
-    /// become visible when that job commits. Different shard actors can run
+    /// become visible when that job commits. Different shard actors run
     /// concurrently, so another shard may publish a higher sequence first. A
     /// numeric `last_seq` must not advance past a shard's committed sequence
-    /// while that shard still has an allocated-but-uncommitted sequence;
-    /// otherwise the next request skips the later-visible row.
+    /// while that shard has an allocated-but-uncommitted sequence; otherwise
+    /// the next request skips the later-visible row.
+    ///
+    /// Every sequence up to the bound is committed when the snapshot is
+    /// taken, so a read that starts afterwards sees all of them. The bound is
+    /// also capped at the global counter: anything allocated after the
+    /// snapshot is higher and is left for the next request. (Computing this
+    /// after the read is unsafe: a shard read before its commit, but
+    /// committed by the time of the check, no longer holds the cursor back.)
     pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
+        // Load the counter first: an allocation it includes has already marked
+        // its shard in flight (see `Stage::next_seq`).
+        let allocated = self.seq.load(Ordering::SeqCst);
         let committed: Vec<u64> = self
             .committed_seq
             .iter()
@@ -578,7 +601,7 @@ impl Db {
             .iter()
             .map(|seq| seq.load(Ordering::SeqCst))
             .collect();
-        changes_watermark_from(&committed, &reserved, since, owned)
+        changes_watermark_from(&committed, &reserved, since, owned).min(allocated)
     }
 
     pub fn pending_shard_map(&self) -> Option<ShardMap> {
@@ -1050,6 +1073,7 @@ impl Db {
         &self,
         opts: &ChangesOpts,
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
+        let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
         let mut rows = Vec::new();
         for (index, shard) in self.shards.iter().enumerate() {
             if opts
@@ -1065,12 +1089,9 @@ impl Db {
             rows.append(&mut shard_rows);
         }
         rows.sort_by_key(|r| r.seq);
-        // Recompute after collecting rows so an allocation that started while
-        // the shards were being read also constrains this cursor. Rows above
-        // the watermark are withheld; the next request re-reads them rather
-        // than skipping a later-visible lower sequence.
-        let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
-        if !opts.descending && watermark != u64::MAX {
+        // Rows above the watermark are withheld; the next request re-reads
+        // them rather than skipping a later-visible lower sequence.
+        if !opts.descending {
             rows.retain(|row| row.seq <= watermark);
         }
         if opts.descending {
@@ -1175,6 +1196,10 @@ impl Db {
             let mut buffers: Vec<VecDeque<ChangeRow>> =
                 (0..selected.len()).map(|_| VecDeque::new()).collect();
             let mut emitted = 0usize;
+            // One snapshot for the whole stream, taken before any shard read.
+            // The stream ends at the watermark; the client resumes from the
+            // last row it received.
+            let watermark = db.changes_watermark(opts.since, opts.owned.as_deref());
 
             loop {
                 let mut best: Option<usize> = None;
@@ -1195,10 +1220,11 @@ impl Db {
                                 } else {
                                     cursors[slot] =
                                         rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
-                                    let watermark = db
-                                        .changes_watermark(opts.since, opts.owned.as_deref());
-                                    if watermark != u64::MAX {
-                                        rows.retain(|row| row.seq <= watermark);
+                                    let fetched = rows.len();
+                                    rows.retain(|row| row.seq <= watermark);
+                                    if rows.len() < fetched {
+                                        // Rows are in sequence order, so the
+                                        // rest of this shard is above it too.
                                         done[slot] = true;
                                     }
                                     if let Some(filter) = &opts.filter {
@@ -1517,8 +1543,7 @@ impl Db {
                             let old_seq = meta.seq;
                             // Purging the winner changes what a normal read sees,
                             // so it is a change as far as `_changes` is concerned.
-                            let seq = seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            reserved.fetch_max(seq, Ordering::SeqCst);
+                            let seq = allocate_seq(&seq_counter, &reserved);
                             meta.seq = seq;
                             tx.delete(&seq_key(old_seq));
                             tx.put(&seq_key(seq), id2.as_bytes());
@@ -1806,9 +1831,7 @@ struct Stage<'a> {
 
 impl Stage<'_> {
     fn next_seq(&self) -> u64 {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.reserved.fetch_max(seq, Ordering::SeqCst);
-        seq
+        allocate_seq(self.seq, self.reserved)
     }
 
     fn meta(&mut self, id: &str) -> DbResult<Option<DocMeta>> {

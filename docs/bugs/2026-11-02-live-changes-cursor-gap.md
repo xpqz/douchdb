@@ -60,3 +60,37 @@ The exact 150,959-document ARM64 workload should be repeated against the
 release image and the public cluster-feed path, not only local forwarded
 feeds. The watermark intentionally trades duplicate re-reads for completeness
 while a shard has a write in flight.
+
+## Follow-up (2026-11-04): the watermark was taken too late
+
+A synthetic probe still lost documents with the fix above: a 3-node `q=4`,
+`n=3` release cluster, four concurrent writers and six cursor-driven readers
+(a local feed on each node, plus public normal, longpoll and continuous feeds)
+missed hundreds to thousands of IDs at only 20,000 documents.
+
+Two ordering faults remained:
+
+- **The watermark was computed after the shards were read.** Shard A is read
+  while it has sequence 10 allocated but not committed; shard B is read with 11
+  committed; A then commits 10; the watermark, computed now, no longer sees A
+  in flight, so 11 is emitted and the cursor passes 10. The same applied to
+  the per-page check in the streaming path.
+- **Allocation took the global sequence before marking the shard in flight.**
+  A snapshot between the two steps saw a new sequence on a shard that did not
+  yet look busy.
+
+Fix: `changes_watermark` is a snapshot taken **before** any shard read. It
+loads the global counter first and caps the bound at it, so every sequence up
+to the bound is committed and visible to the read that follows, and anything
+allocated later is higher. `allocate_seq` raises the shard's reserved sequence
+above the counter before moving the counter. The streaming path takes one
+snapshot per stream and only stops a shard once its rows pass the bound.
+
+Validation: the release probe at 20,000 (three runs) and 150,000 documents (two
+runs) received every ID on all six readers. The new conformance test
+`live_changes_cursor_sees_every_document_under_concurrent_writes` fails on the
+previous code in about two of three runs (it is a timing race) and passed in
+every run with the fix.
+The probe is
+[`evidence/live-changes-gap-probe-2026-11-04.py.txt`](evidence/live-changes-gap-probe-2026-11-04.py.txt):
+`python3 -I <probe> target/release/douchdb <scratch-dir> [docs]`.
