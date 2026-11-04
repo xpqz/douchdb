@@ -26,14 +26,14 @@ MUTATIONS = [
         "src/db.rs",
         "            safe = safe.min(committed[index].max(since));",
         "            safe = safe.max(committed[index].max(since));",
-        ["cargo", "test", "--locked", "--bin", "douchdb", "changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence"],
+        ["cargo", "test", "--locked", "--lib", "changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence"],
     ),
     (
         "winner prefers deleted revisions",
         "src/revtree.rs",
         "            (!self.is_deleted(rev), parsed.pos, parsed.id)",
         "            (self.is_deleted(rev), parsed.pos, parsed.id)",
-        ["cargo", "test", "--locked", "--bin", "douchdb", "conflicting_branches_both_remain"],
+        ["cargo", "test", "--locked", "--lib", "conflicting_branches_both_remain"],
     ),
     (
         "role check grants every role",
