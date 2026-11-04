@@ -388,6 +388,12 @@ fn build_index_files(
     writer
         .commit()
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    // Dropping the writer leaves its merge threads running, and they can still
+    // create and delete segment files after the build gate is released. A
+    // concurrent `_search_cleanup` then fails with "Directory not empty".
+    writer
+        .wait_merging_threads()
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let meta = SearchMeta {
         version: SEARCH_VERSION,

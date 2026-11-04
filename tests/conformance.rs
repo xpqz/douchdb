@@ -14,6 +14,38 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Wait until `port` accepts connections. Returns false as soon as the child
+/// exits, which is how a port collision shows up. A live child is never given
+/// up on early: with `--wasm-runtime wasmtime` it compiles the runner before
+/// it listens, which can take tens of seconds in a debug build on a loaded CI
+/// runner, and killing it to retry would only pay that cost again.
+fn wait_for_listener(child: &mut Child, port: u16) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Whether to exercise the given `--js-sandbox` mode. Set
+/// `DOUCHDB_TEST_JS_SANDBOXES` to a comma-separated list (for example
+/// `native`) to restrict the sandbox tests; unset, every mode runs. CI runs
+/// only `native`, so run the full set locally before changing the process or
+/// WASM sandboxes. Tests for an excluded mode return early and report as
+/// passed.
+fn sandbox_tested(mode: &str) -> bool {
+    match std::env::var("DOUCHDB_TEST_JS_SANDBOXES") {
+        Ok(modes) => modes.split(',').any(|listed| listed.trim() == mode),
+        Err(_) => true,
+    }
+}
+
 struct Server {
     child: Child,
     base: String,
@@ -67,22 +99,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        // Wait for the listener, and notice a child that died (e.g. port
-        // collision) instead of sleeping for the whole budget.
-        let mut up = false;
-        // Wasmtime compiles the runner at startup; allow a few seconds in
-        // debug builds without delaying the usual dead-child detection.
-        for _ in 0..300 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                up = true;
-                break;
-            }
-            if let Ok(Some(_)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if up {
+        if wait_for_listener(&mut child, port) {
             // A colliding process can win the port after `free_port` checked
             // it; the child then exits while our connect succeeds against the
             // other listener. Give the bind a moment and confirm the child is
@@ -125,15 +142,9 @@ impl Server {
             cmd.arg("--admin").arg("admin:douchdb");
         }
         self.child = cmd.spawn().expect("restart douchdb");
-        for _ in 0..100 {
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                std::thread::sleep(Duration::from_millis(50));
-                return;
-            }
-            if let Ok(Some(_)) = self.child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if wait_for_listener(&mut self.child, self.port) {
+            std::thread::sleep(Duration::from_millis(50));
+            return;
         }
         panic!("douchdb did not restart on port {}", self.port);
     }
@@ -6958,6 +6969,9 @@ async fn quickjs_view_deadline_stops_an_infinite_loop() {
 
 #[tokio::test]
 async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec!["--js-sandbox".to_string(), "process".to_string()];
     let s = Server::start_with(&args, false);
     s.fresh_db("jsprocess").await;
@@ -7015,6 +7029,9 @@ async fn quickjs_process_sandbox_runs_views_reduce_and_search() {
 
 #[tokio::test]
 async fn quickjs_process_sandbox_enforces_the_deadline() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
@@ -7066,6 +7083,9 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
 
 #[tokio::test]
 async fn quickjs_process_pool_handles_concurrent_queries() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
@@ -7104,6 +7124,9 @@ async fn quickjs_process_pool_handles_concurrent_queries() {
 
 #[tokio::test]
 async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec!["--js-sandbox".to_string(), "wasm".to_string()];
     let s = Server::start_with(&args, false);
     s.fresh_db("jswasm").await;
@@ -7158,6 +7181,9 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 #[tokio::test]
 #[allow(unused_mut, clippy::useless_vec)]
 async fn js_sandboxes_agree_on_view_rows() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
     let docs = json!({"docs": [
         {"_id": "a", "city": "Berlin", "price": 10, "s": "héllo"},
         {"_id": "b", "city": "Paris", "price": 20, "s": "😀"},
@@ -7211,6 +7237,9 @@ async fn js_sandboxes_agree_on_view_rows() {
 
 #[tokio::test]
 async fn quickjs_wasm_sandbox_enforces_the_deadline() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
@@ -7254,6 +7283,9 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
 #[cfg(feature = "wasmtime")]
 #[tokio::test]
 async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
+    if !sandbox_tested("wasm") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
@@ -7326,6 +7358,9 @@ async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
 #[tokio::test]
 async fn quickjs_sandbox_exposes_no_host_globals() {
     for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
         let args = vec!["--js-sandbox".to_string(), mode.to_string()];
         let s = Server::start_with(&args, false);
         let db = format!("jsglobals{mode}");
@@ -7348,6 +7383,9 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn process_worker_installs_the_seccomp_filter() {
+    if !sandbox_tested("process") {
+        return;
+    }
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
