@@ -169,37 +169,8 @@ pub async fn db_root(
             if let Err(e) = db.validate_doc_id(&id) {
                 return fail(e);
             }
-            // The id only exists after the body is parsed, so the shard's
-            // replicas are known here and a generated document can still be
-            // routed. Try each replica so a dead primary does not lose it.
-            let replicas = replicas_of_doc(&db, &id);
-            if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
-                let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
-                let request = ForwardRequest {
-                    method: &Method::POST,
-                    dbname: &name,
-                    rest: "",
-                    q: &q,
-                    headers: &headers,
-                    body: &forwarded,
-                };
-                let mut last = None;
-                for node in replicas {
-                    let peer = st.cluster.nodes[node].clone();
-                    let response = proxy(&st, &request, &peer).await;
-                    if !unavailable(&response) {
-                        return response;
-                    }
-                    last = Some(response);
-                }
-                return last.unwrap_or_else(|| {
-                    fail(ApiError::new(
-                        502,
-                        "bad_gateway",
-                        "no replica in the shard set is reachable",
-                    ))
-                });
-            }
+            // `commit_docs` routes the generated id to every replica in its
+            // shard set, so a dead primary does not lose the document.
             match commit_docs(
                 &st,
                 &db,

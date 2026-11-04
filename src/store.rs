@@ -1103,14 +1103,16 @@ mod scan_tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut shard = Shard::open(&dir, 1000).unwrap();
+        // a, c and e are flushed to disk; b and d stay in the overlay, so
+        // every scan below has to interleave the two sources.
         let mut tx = Tx::new();
-        for id in ["a", "b", "c"] {
+        for id in ["a", "c", "e"] {
             tx.put(&meta_key(id), id.as_bytes());
         }
         shard.commit_at(tx, Some(1)).unwrap();
-        // Uncommitted, so this also exercises the overlay merge path.
+        shard.flush_pending().unwrap();
         let mut tx = Tx::new();
-        for id in ["d", "e"] {
+        for id in ["b", "d"] {
             tx.put(&meta_key(id), id.as_bytes());
         }
         shard.commit_at(tx, Some(2)).unwrap();
@@ -1133,6 +1135,16 @@ mod scan_tests {
             .unwrap();
         assert_eq!(reverse, ["d", "c"]);
 
+        // Starting exactly on a flushed key must include it.
+        let mut from_disk = Vec::new();
+        shard
+            .scan_range_while(b"m/", Some(&meta_key("c")), true, |key, _| {
+                from_disk.push(String::from_utf8(key[2..].to_vec()).unwrap());
+                from_disk.len() < 2
+            })
+            .unwrap();
+        assert_eq!(from_disk, ["c", "b"]);
+
         let mut all_reverse = Vec::new();
         shard
             .scan_range_while(b"m/", None, true, |key, _| {
@@ -1141,6 +1153,15 @@ mod scan_tests {
             })
             .unwrap();
         assert_eq!(all_reverse, ["e", "d", "c", "b", "a"]);
+
+        let mut all_forward = Vec::new();
+        shard
+            .scan_range_while(b"m/", None, false, |key, _| {
+                all_forward.push(String::from_utf8(key[2..].to_vec()).unwrap());
+                true
+            })
+            .unwrap();
+        assert_eq!(all_forward, ["a", "b", "c", "d", "e"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1153,11 +1174,21 @@ mod scan_tests {
             let mut tx = Tx::new();
             tx.put(&seq_key(seq), format!("doc{seq}").as_bytes());
             shard.commit_at(tx, Some(seq)).unwrap();
+            // Sequences 1-3 on disk, 4-5 still in the overlay.
+            if seq == 3 {
+                shard.flush_pending().unwrap();
+            }
         }
         let all = shard.scan_from(b"s/", &seq_key(1)).unwrap();
         assert_eq!(all.len(), 5, "scan from seq 1 must include seq 1");
         let after = shard.scan_from(b"s/", &seq_key(2)).unwrap();
         assert_eq!(after.len(), 4, "scan from seq 2 must skip seq 1");
+        let from_disk = shard.scan_from(b"s/", &seq_key(3)).unwrap();
+        assert_eq!(
+            from_disk.len(),
+            3,
+            "scan from seq 3 must include the flushed key"
+        );
         let tail = shard.scan_from(b"s/", &seq_key(4)).unwrap();
         assert_eq!(tail.len(), 2, "scan from seq 4 must include 4 and 5");
         assert_eq!(shard.scan_from(b"s/", &seq_key(9)).unwrap().len(), 0);

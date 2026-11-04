@@ -268,5 +268,30 @@ mod tests {
             .filter(|shard| three.owner_of_shard(*shard) != four.owner_of_shard(*shard))
             .count();
         assert!(moved > 10 && moved < 100, "moved {moved} of 200 shards");
+
+        // With two replicas per shard, adding node d may only swap d into a
+        // replica set; the surviving members keep their copies.
+        let three = cluster(2);
+        let four = Cluster { n: 2, ..four };
+        let mut changed = 0;
+        for shard in 0..200 {
+            let before: std::collections::BTreeSet<usize> =
+                three.replicas_of_shard(shard).into_iter().collect();
+            let after: std::collections::BTreeSet<usize> =
+                four.replicas_of_shard(shard).into_iter().collect();
+            if before != after {
+                changed += 1;
+                assert!(after.contains(&3), "shard {shard}: {before:?} -> {after:?}");
+                assert_eq!(
+                    before.intersection(&after).count(),
+                    1,
+                    "shard {shard}: {before:?} -> {after:?}"
+                );
+            }
+        }
+        assert!(
+            changed > 10 && changed < 150,
+            "changed {changed} of 200 sets"
+        );
     }
 }

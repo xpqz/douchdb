@@ -1070,7 +1070,13 @@ fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
 
 fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
     if let Some(native) = NativeMap::parse(source) {
-        return Ok(native.run_values(docs));
+        let rows = native.run_values(docs);
+        return finish_native(rows, source, limits, |index| {
+            let (id, doc) = &docs[index];
+            serde_json::to_string(doc)
+                .map(|doc| (id.clone(), doc))
+                .map_err(|error| format!("{id}: {error}"))
+        });
     }
     let mut serialized = Vec::with_capacity(docs.len());
     for (id, doc) in docs {
@@ -1111,8 +1117,71 @@ pub(crate) fn run_map_json(
         return Ok(Vec::new());
     }
     if let Some(native) = NativeMap::parse(source) {
-        return native.run_json(docs);
+        let rows = native.run_json(docs)?;
+        return finish_native(rows, source, limits, |index| Ok(docs[index].clone()));
     }
+    run_map_js(source, docs, limits)
+}
+
+/// The native path must emit exactly what the JavaScript view server would.
+/// JavaScript numbers are doubles, so a float or an integer beyond 2^53 can
+/// come back different (`100.0` as `100`, `2^63` rounded). Re-run the
+/// documents whose rows hold such a number through QuickJS. Native maps emit
+/// exactly one row per document, so rows and documents line up by index.
+fn finish_native(
+    mut rows: Vec<Row>,
+    source: &str,
+    limits: ViewLimits,
+    doc_json: impl Fn(usize) -> Result<(String, String), String>,
+) -> Result<Vec<Row>, String> {
+    let pending: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !js_exact(&row.key) || !js_exact(&row.value))
+        .map(|(index, _)| index)
+        .collect();
+    if pending.is_empty() {
+        return Ok(rows);
+    }
+    let docs = pending
+        .iter()
+        .map(|&index| doc_json(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let javascript = run_map_js(source, &docs, limits)?;
+    if javascript.len() != pending.len() {
+        return Err(format!(
+            "map function emitted {} rows for {} documents",
+            javascript.len(),
+            pending.len()
+        ));
+    }
+    for (index, row) in pending.into_iter().zip(javascript) {
+        rows[index] = row;
+    }
+    Ok(rows)
+}
+
+/// Whether JavaScript would reproduce this value unchanged: every number in
+/// it is an integer within ±(2^53 - 1), written plainly.
+fn js_exact(value: &Value) -> bool {
+    const MAX_SAFE: u64 = (1 << 53) - 1;
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .filter(|integer| integer.unsigned_abs() <= MAX_SAFE)
+            .is_some_and(|integer| integer.to_string() == number.to_string()),
+        Value::Array(items) => items.iter().all(js_exact),
+        Value::Object(fields) => fields.values().all(js_exact),
+        _ => true,
+    }
+}
+
+/// Run a map function in QuickJS, in batches, without the native fast path.
+fn run_map_js(
+    source: &str,
+    docs: &[(String, String)],
+    limits: ViewLimits,
+) -> Result<Vec<Row>, String> {
     const MAX_DOCS: usize = 256;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
     // Sandbox calls pay a process/wasm boundary per batch. Use a larger batch
@@ -1872,6 +1941,10 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            (
+                "f".to_string(),
+                json!({"_id": "f", "_rev": "1-f", "a": 100.0, "b": [1.5, 2]}),
+            ),
         ];
         let sources = [
             "function(doc){ emit(doc.a, doc.b); }",
@@ -1883,10 +1956,17 @@ mod tests {
             "function(doc){ emit(doc.b, doc.nested); }",
         ];
         for source in sources {
-            let native = NativeMap::parse(source)
-                .unwrap_or_else(|| panic!("native parser rejected {source}"));
-            let native_rows = native.run_values(&docs);
-            let javascript = run_map(source, &docs, ViewLimits::default())
+            // Every source takes the native path; the production entry points
+            // below then re-run any row JavaScript would render differently.
+            NativeMap::parse(source).unwrap_or_else(|| panic!("native parser rejected {source}"));
+            let native_rows = run_map(source, &docs, ViewLimits::default())
+                .unwrap_or_else(|error| panic!("native map failed for {source}: {error}"));
+            let raw: Vec<(String, String)> = docs
+                .iter()
+                .map(|(id, doc)| (id.clone(), serde_json::to_string(doc).unwrap()))
+                .collect();
+            // QuickJS directly: `run_map` would take the native path again.
+            let javascript = run_map_js(source, &raw, ViewLimits::default())
                 .unwrap_or_else(|error| panic!("JS rejected {source}: {error}"));
             assert_eq!(native_rows.len(), javascript.len(), "{source}");
             for (left, right) in native_rows.iter().zip(javascript.iter()) {
@@ -1895,13 +1975,9 @@ mod tests {
                 assert_eq!(left.value, right.value, "{source}");
             }
 
-            let raw: Vec<(String, String)> = docs
-                .iter()
-                .map(|(id, doc)| (id.clone(), serde_json::to_string(doc).unwrap()))
-                .collect();
-            let raw_rows = native
-                .run_json(&raw)
+            let raw_rows = run_map_json(source, &raw, ViewLimits::default())
                 .unwrap_or_else(|error| panic!("raw native parse failed for {source}: {error}"));
+            assert_eq!(raw_rows.len(), javascript.len(), "raw {source}");
             for (left, right) in raw_rows.iter().zip(javascript.iter()) {
                 assert_eq!(left.id, right.id, "raw {source}");
                 assert_eq!(left.key, right.key, "raw {source}");
@@ -1995,15 +2071,23 @@ mod tests {
         let docs: Vec<(String, Value)> = (0..600)
             .map(|i| (format!("d{i}"), json!({"_id": format!("d{i}"), "n": i})))
             .collect();
-        let rows = run_map(
+        let raw: Vec<(String, String)> = docs
+            .iter()
+            .map(|(id, doc)| (id.clone(), serde_json::to_string(doc).unwrap()))
+            .collect();
+        // 600 documents is three QuickJS batches of at most 256; every
+        // document must come back once, in order, across the boundaries.
+        let rows = run_map_js(
             "function(doc){ emit(doc.n, doc.n); }",
-            &docs,
+            &raw,
             ViewLimits::default(),
         )
         .unwrap();
         assert_eq!(rows.len(), 600);
-        assert_eq!(rows[300].id, "d300");
-        assert_eq!(rows[300].value, json!(300));
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.id, format!("d{index}"));
+            assert_eq!(row.value, json!(index));
+        }
     }
 
     #[test]

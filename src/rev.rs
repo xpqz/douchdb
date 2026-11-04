@@ -128,22 +128,6 @@ pub fn new_revid(
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Leaf {
-    pub rev: Rev,
-    pub deleted: bool,
-}
-
-/// Pick the winning leaf the way `couch_doc:to_doc_info_path/1` does: sort
-/// descending by `{not Deleted, {Pos, RevId}}` and take the first.
-#[cfg(test)]
-pub fn winner(leaves: &[Leaf]) -> Option<&Leaf> {
-    leaves
-        .iter()
-        .max_by(|a, b| (!a.deleted, a.rev.pos, &a.rev.id).cmp(&(!b.deleted, b.rev.pos, &b.rev.id)))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -215,38 +199,6 @@ mod tests {
         assert_ne!(plain, with_att);
         assert_eq!(with_att, new_revid(false, None, &body, &[att]));
         assert_ne!(hex16(plain), hex16(with_att));
-    }
-
-    fn leaf(pos: u64, deleted: bool) -> Leaf {
-        Leaf {
-            rev: Rev {
-                pos,
-                id: vec![pos as u8; 16],
-                hex: false,
-            },
-            deleted,
-        }
-    }
-
-    #[test]
-    fn winner_prefers_higher_position() {
-        let leaves = [leaf(1, false), leaf(3, false), leaf(2, false)];
-        assert_eq!(winner(&leaves).unwrap().rev.pos, 3);
-    }
-
-    #[test]
-    fn winner_prefers_undeleted() {
-        let leaves = [leaf(1, false), leaf(9, true)];
-        assert_eq!(winner(&leaves).unwrap().rev.pos, 1);
-    }
-
-    #[test]
-    fn winner_breaks_ties_by_rev_id() {
-        let mut low = leaf(1, false);
-        low.rev.id = vec![1; 16];
-        let mut high = leaf(1, false);
-        high.rev.id = vec![2; 16];
-        assert_eq!(winner(&[low, high]).unwrap().rev.id, vec![2; 16]);
     }
 
     /// Revs recorded from a live Apache CouchDB 3.5.3 (`PUT /db/doc`).
