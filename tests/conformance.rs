@@ -9913,7 +9913,7 @@ async fn revs_limit_pruning_preserves_short_conflict_leaves() {
         .post(
             "/prunelimit/_bulk_docs",
             json!({"new_edits": false, "docs": [
-                {"_id": "x", "_rev": format!("4-dddddddddddddddddddddddddddddddd"),
+                {"_id": "x", "_rev": "4-dddddddddddddddddddddddddddddddd",
                  "_revisions": {"start": 4, "ids": [
                     "dddddddddddddddddddddddddddddddd",
                     "cccccccccccccccccccccccccccccccc",
