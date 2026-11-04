@@ -1,0 +1,254 @@
+//! Server startup: JS sandbox selection, application state, background tasks
+//! and the HTTP router.
+
+use crate::api::{self, AppState, Config};
+use crate::auth::Auth;
+use crate::cli::Args;
+use crate::cluster::Cluster;
+use crate::{admission, cluster_state, discovery, js, replicate, telemetry, ui};
+use axum::routing::{any, get};
+use axum::Router;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+
+/// Run the server (or, with `--js-worker`, a sandboxed JS worker) until
+/// shutdown.
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    if args.worker {
+        if let Err(error) = js::install_seccomp()
+            .and_then(|_| js::install_landlock())
+            .and_then(|_| js::run_worker_stdio())
+        {
+            eprintln!("js worker: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    match args.js_sandbox.as_str() {
+        "native" => js::configure(js::Sandbox::Native, args.js_workers),
+        "process" => js::configure(js::Sandbox::Process, args.js_workers),
+        "wasm" => {
+            js::configure(js::Sandbox::Wasm, args.js_workers);
+            let runtime = match args.wasm_runtime.as_str() {
+                "wasmi" => js::WasmRuntime::Wasmi,
+                "wasmtime" => js::WasmRuntime::Wasmtime,
+                other => {
+                    eprintln!("unknown --wasm-runtime value: {other} (expected wasmi or wasmtime)");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(error) = js::set_wasm_runtime(runtime) {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        other => {
+            eprintln!("unknown --js-sandbox value: {other} (expected native, process or wasm)");
+            std::process::exit(2);
+        }
+    }
+    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
+    if args.nodes.len() > 1 {
+        if args.me >= args.nodes.len() {
+            eprintln!("--me must be smaller than the number of --nodes");
+            std::process::exit(2);
+        }
+        if args.cluster_secret.trim().len() < 16 {
+            eprintln!(
+                "--cluster-secret of at least 16 characters is required with more than one --nodes entry"
+            );
+            std::process::exit(2);
+        }
+    }
+    if args.cors_origins.iter().any(|origin| origin == "*") {
+        tracing::warn!(
+            "CORS allows any origin and sends credentials; any website can act as a logged-in user"
+        );
+    }
+    std::fs::create_dir_all(&args.data)?;
+
+    let advertise = if !args.advertise.trim().is_empty() {
+        args.advertise.trim().trim_end_matches('/').to_string()
+    } else if let Some(url) = args.nodes.get(args.me) {
+        url.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", args.listen)
+    };
+    let session_secret = if !args.session_secret.trim().is_empty() {
+        Some(args.session_secret.clone())
+    } else if !args.cluster_secret.is_empty() {
+        Some(format!("{}:session", args.cluster_secret))
+    } else {
+        None
+    };
+    let auth = if let Some(path) = &args.users_file {
+        Some(
+            Auth::from_users_file(
+                args.admin.clone(),
+                std::path::Path::new(path),
+                session_secret,
+            )
+            .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        args.admin
+            .as_ref()
+            .map(|(user, pass)| Auth::new(user.clone(), pass.clone()))
+    };
+    let default_admin_only = match args.default_security.as_str() {
+        "open" => false,
+        "admin-only" => true,
+        "" => auth.is_some(),
+        other => {
+            eprintln!("unknown --default-security value: {other} (expected open or admin-only)");
+            std::process::exit(2);
+        }
+    };
+    let config = Config {
+        q: args.q.max(1),
+        revs_limit: args.revs_limit.max(1),
+        sync_secs: args.sync_secs,
+        seeds: args.seed_nodes.clone(),
+        advertise: advertise.clone(),
+        cors_origins: args.cors_origins.clone(),
+        view_timeout_ms: args.view_timeout_ms.max(1),
+        view_memory_mb: args.view_memory_mb.max(1),
+        default_admin_only,
+    };
+    let state = Arc::new(AppState {
+        root: args.data.clone(),
+        dbs: RwLock::new(HashMap::new()),
+        config,
+        auth,
+        compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            args.compact_concurrency.max(1),
+        )),
+        admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
+            max_in_flight: args.max_in_flight,
+            per_user_in_flight: args.per_user_in_flight,
+            per_user_rate: args.per_user_rate,
+            heavy_in_flight: args.heavy_in_flight,
+            heavy_per_user: args.heavy_per_user,
+            background_in_flight: args.background_in_flight,
+        })),
+        cluster: Cluster {
+            nodes: args.nodes.clone(),
+            me: args.me,
+            n: args.n.max(1),
+            secret: args.cluster_secret.clone(),
+        },
+        client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(60))
+            .build()?,
+        db_updates: api::DbUpdates::default(),
+        cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
+    });
+
+    if state.cluster.is_clustered() {
+        replicate::spawn_anti_entropy(state.clone());
+        tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
+    }
+    if state.cluster.is_clustered() || !state.config.seeds.is_empty() {
+        discovery::spawn(state.clone());
+    }
+
+    let app = Router::new()
+        .route("/", get(api::welcome))
+        .route("/_up", get(api::up))
+        .route("/_health", get(api::health_public))
+        .route("/_all_dbs", get(api::all_dbs))
+        .route("/_db_updates", get(api::db_updates))
+        .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
+        .route("/_uuids", get(api::uuids))
+        .route("/_membership", get(api::membership))
+        .route("/_node/_local/_dbs", get(api::dbs_metadata))
+        .route("/_node/_local/_cluster", get(api::cluster_status))
+        .route("/_node/_local/_metrics", get(api::metrics_status))
+        .route("/_node/_local/_health", get(api::health_status))
+        .route(
+            "/_node/_local/_cluster/discover",
+            axum::routing::post(api::cluster_discover),
+        )
+        .route("/_node/_local/_replication", get(api::replication_status))
+        .route(
+            "/_node/_local/_replication/run",
+            axum::routing::post(api::replication_run),
+        )
+        .route(
+            "/_node/_local/_replication/pause",
+            axum::routing::post(api::replication_pause),
+        )
+        .route(
+            "/_node/_local/_replication/resume",
+            axum::routing::post(api::replication_resume),
+        )
+        .route(
+            "/_node/_local/_dbs/{db}",
+            get(api::db_metadata).put(api::db_metadata_put),
+        )
+        .route(
+            "/_node/_local/_dbs/{db}/security",
+            axum::routing::put(api::db_security_put),
+        )
+        .route(
+            "/_node/_local/_dbs/{db}/migration",
+            axum::routing::put(api::db_migration_put).delete(api::db_migration_delete),
+        )
+        .route("/_node/_local/_dbs/{db}/shards", get(api::db_shard_counts))
+        .route(
+            "/_node/_local/_dbs/{db}/rebalance",
+            axum::routing::post(api::db_rebalance),
+        )
+        .route(
+            "/_node/_local/_dbs/{db}/cleanup",
+            axum::routing::post(api::db_cleanup),
+        )
+        .route(
+            "/_session",
+            get(api::session_get)
+                .post(api::session_post)
+                .delete(api::session_delete),
+        )
+        .route("/_utils", get(ui::redirect))
+        .route("/_utils/", get(ui::index))
+        .route("/_utils/{*path}", get(ui::asset))
+        .route("/favicon.ico", get(ui::favicon))
+        .route("/{db}", any(api::db_root))
+        .route("/{db}/", any(api::db_root))
+        .route("/{db}/{*rest}", any(api::db_rest))
+        .fallback(api::not_found)
+        // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
+        // multi-document `_bulk_docs`. CouchDB's limit is far higher.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            args.max_request_mb.max(1).saturating_mul(1024 * 1024),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::cors,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::admit,
+        ))
+        .layer(axum::middleware::from_fn(api::log_requests))
+        .layer(axum::middleware::from_fn(api::security_headers))
+        .layer(axum::middleware::from_fn(api::request_id))
+        .layer(axum::middleware::from_fn(api::head_only))
+        .layer(tower_http::compression::CompressionLayer::new())
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    tracing::info!("douchdb listening on {}", args.listen);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
+    Ok(())
+}

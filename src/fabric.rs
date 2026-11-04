@@ -202,6 +202,8 @@ pub(crate) async fn proxy(
     }
 }
 
+/// True when a proxied request failed to reach the peer, rather than the peer
+/// answering on behalf of the cluster.
 pub(crate) fn unavailable(response: &Response) -> bool {
     matches!(
         response.status(),
@@ -209,6 +211,7 @@ pub(crate) fn unavailable(response: &Response) -> bool {
     )
 }
 
+/// `?r=N` reads from several replicas and returns the winning revision.
 pub(crate) async fn quorum_read(
     st: &AppState,
     db: &Db,
@@ -522,6 +525,11 @@ struct BulkBody<'a, T: serde::Serialize> {
     new_edits: bool,
 }
 
+/// `new_edits=true` writes to each document's primary (the coordinating
+/// replica), then copies the resulting full revision to the other replicas with
+/// `new_edits=false`, so every replica ends with byte-identical history.
+/// `new_edits=false` (the replication path) sends the given revision to every
+/// replica directly. The bool is whether the default write quorum was met.
 pub(crate) async fn commit_docs(
     st: &AppState,
     db: &Db,
@@ -2080,6 +2088,8 @@ pub(crate) fn absorb_node_changes(
     }
 }
 
+/// Current per-node update_seq vector. Used for `since=now` and for the
+/// `update_seq` reported in `GET /db`.
 pub(crate) async fn cluster_update_vector(
     st: &AppState,
     db: &Db,

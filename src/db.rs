@@ -2149,9 +2149,6 @@ pub struct DocOpts {
     /// Internal quorum reads need the winning tombstone instead of a 404 so
     /// deletion can participate in revision comparison.
     pub include_deleted: bool,
-    #[allow(dead_code)]
-    pub atts_since: Option<Vec<String>>,
-    #[allow(dead_code)]
     pub latest: bool,
 }
 
@@ -2743,6 +2740,41 @@ mod tests {
             .map(|i| format!("shard{shard}-{i}"))
             .find(|id| db.shard_index(id) == shard)
             .expect("document id for shard")
+    }
+
+    #[tokio::test]
+    async fn design_documents_replicate_to_every_node() {
+        let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "placement",
+            DbConfig {
+                q: 4,
+                revs_limit: 100,
+                shard_map: ShardMap::balanced(4, 3, 1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.replicas_of_doc("_design/foo"), vec![0, 1, 2]);
+        assert!((0..3).all(|node| db.is_replica_of("_design/foo", node)));
+
+        let replicas = db.replicas_of_doc("ordinary");
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(
+            replicas,
+            db.replicas_of_shard(db.shard_index("ordinary") as u32)
+        );
+        assert_eq!(
+            (0..3)
+                .filter(|node| db.is_replica_of("ordinary", *node))
+                .count(),
+            1
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -133,11 +133,6 @@ impl RevTree {
         path
     }
 
-    #[allow(dead_code)]
-    pub fn is_ancestor_of(&self, ancestor: &str, of: &str) -> bool {
-        self.path(of).iter().any(|r| r == ancestor)
-    }
-
     /// Keep the newest `limit` revisions on every root-to-leaf path. Leaves are
     /// never removed, even when another branch is much deeper. Shared ancestors
     /// are retained once; a revision whose parent was pruned becomes a root.
@@ -252,10 +247,10 @@ mod tests {
         let leaf = format!("3-{}", id(3));
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("{root},{middle},{leaf}")), false);
-        assert!(tree.is_ancestor_of(&root, &leaf));
-        assert!(tree.is_ancestor_of(&middle, &leaf));
-        assert!(!tree.is_ancestor_of(&leaf, &middle));
-        assert!(!tree.is_ancestor_of(&format!("1-{}", id(9)), &leaf));
+        assert!(tree.path(&leaf).contains(&root));
+        assert!(tree.path(&leaf).contains(&middle));
+        assert!(!tree.path(&middle).contains(&leaf));
+        assert!(!tree.path(&leaf).contains(&format!("1-{}", id(9))));
     }
 
     #[test]
@@ -288,7 +283,9 @@ mod tests {
     fn ancestors_and_leaf_detection() {
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), false);
-        assert!(tree.is_ancestor_of(&format!("1-{}", id(1)), &format!("2-{}", id(2))));
+        assert!(tree
+            .path(&format!("2-{}", id(2)))
+            .contains(&format!("1-{}", id(1))));
         assert!(!tree.is_leaf(&format!("1-{}", id(1))));
         assert!(tree.is_leaf(&format!("2-{}", id(2))));
     }

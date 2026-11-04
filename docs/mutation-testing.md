@@ -6,8 +6,11 @@ Command:
 ```sh
 cargo mutants --in-place \
   --file src/revtree.rs --file src/etf.rs --file src/json.rs \
-  --timeout 45 --cargo-test-arg=--bin --cargo-test-arg=douchdb
+  --timeout 45 --cargo-test-arg=--lib
 ```
+
+(The run below used `--bin douchdb`; unit tests moved to the library target
+when the crate gained `src/lib.rs`.)
 
 Scope: the revision-tree merge/prune/winner logic, ETF integer and bignum
 encoding, and the JSON parser/reserved-key scanner. The unit-test target was

@@ -1,0 +1,554 @@
+//! Database-level endpoints. `db_rest` dispatches every `/{db}/{*rest}` path
+//! to the handlers in the sibling modules.
+
+use super::*;
+
+pub async fn db_root(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !valid_db_name(&name) {
+        return fail(ApiError::bad_request("Name must be lowercase and URL-safe"));
+    }
+    let q = query(&uri);
+    let principal = st.principal(&headers);
+
+    let local_only = st.cluster.is_internal_db(&headers);
+    match method {
+        Method::PUT => {
+            if !principal.admin {
+                return access_denied(&principal);
+            }
+            let partitioned = flag(&q, "partitioned");
+            if let Err(e) = st.create_db(&name, partitioned).await {
+                return fail(e);
+            }
+            if st.cluster.is_clustered() && !local_only {
+                for peer in st.cluster.nodes.iter() {
+                    if peer == &st.cluster.nodes[st.cluster.me] {
+                        continue;
+                    }
+                    let mut url = format!("{peer}/{name}");
+                    if partitioned {
+                        url.push_str("?partitioned=true");
+                    }
+                    let request = st
+                        .client
+                        .put(url)
+                        .header("x-douchdb-local-db", "1")
+                        .header("x-douchdb-secret", st.cluster.secret.as_str());
+                    let request = forward_client_auth(request, &headers);
+                    let response = match request.send().await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            return fail(ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
+                        }
+                    };
+                    // 412 means another node already had it, which is fine.
+                    if !response.status().is_success()
+                        && response.status() != StatusCode::PRECONDITION_FAILED
+                    {
+                        let status = response.status().as_u16();
+                        let text = response.text().await.unwrap_or_default();
+                        return fail(ApiError::new(status, "db_create_failed", text));
+                    }
+                }
+            }
+            let mut response = json(StatusCode::CREATED, json!({"ok": true}));
+            if let Ok(value) = format!("/{name}").parse() {
+                response.headers_mut().insert(header::LOCATION, value);
+            }
+            response
+        }
+        Method::DELETE => {
+            if !principal.admin {
+                return access_denied(&principal);
+            }
+            let local = st.drop_db(&name).await;
+            if st.cluster.is_clustered() && !local_only {
+                for (i, peer) in st.cluster.nodes.iter().enumerate() {
+                    if i == st.cluster.me {
+                        continue;
+                    }
+                    let request = st
+                        .client
+                        .delete(format!("{peer}/{name}"))
+                        .header("x-douchdb-local-db", "1")
+                        .header("x-douchdb-secret", st.cluster.secret.as_str());
+                    let request = forward_client_auth(request, &headers);
+                    let _ = request.send().await;
+                }
+            }
+            match local {
+                Ok(()) => ok(),
+                Err(e) => fail(e),
+            }
+        }
+        Method::GET | Method::HEAD => match st.db(&name).await {
+            Ok(db) => {
+                if let Some(response) = require_db_access(&st, &principal, &db, false) {
+                    return response;
+                }
+                if is_forwarded(&st, &headers)
+                    && headers
+                        .get("x-douchdb-update-seq")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("1")
+                {
+                    return json(StatusCode::OK, json!({"update_seq": db.update_seq()}));
+                }
+                match db.info().await {
+                    Ok(mut info) => {
+                        // In a cluster the update_seq is the same version vector
+                        // the changes feed returns, so clients that use it as
+                        // `since` do not skip another node's changes.
+                        if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
+                            if let Ok(vector) =
+                                cluster_update_vector(&st, &db, &name, &headers).await
+                            {
+                                let seq = encode_since(&vector);
+                                info["update_seq"] = json!(seq);
+                                info["committed_update_seq"] = json!(seq);
+                            }
+                        }
+                        json(StatusCode::OK, info)
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            Err(e) => fail(e),
+        },
+        Method::POST => {
+            // Create a document with a server-generated id.
+            let db = match st.db(&name).await {
+                Ok(db) => db,
+                Err(e) => return fail(e),
+            };
+            if let Some(response) = require_db_access(&st, &principal, &db, false) {
+                return response;
+            }
+            if let Some(response) = reject_during_rebalance(&st, &db, &Method::POST, "", &headers) {
+                return response;
+            }
+            let Ok(mut doc) = json_body(&body) else {
+                return fail(ApiError::bad_request("Document must be a JSON object"));
+            };
+            if let Err(e) = validate_doc(&doc) {
+                return fail(e);
+            }
+            if doc.get("_id").is_none() {
+                doc["_id"] = json!(crate::db::uuid());
+            }
+            let id = match doc.get("_id") {
+                Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                Some(Value::String(_)) => {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must not be empty",
+                    ))
+                }
+                Some(_) => {
+                    return fail(ApiError::new(
+                        400,
+                        "illegal_docid",
+                        "Document id must be a string",
+                    ))
+                }
+                None => unreachable!("id generated above"),
+            };
+            if let Err(e) = db.validate_doc_id(&id) {
+                return fail(e);
+            }
+            // The id only exists after the body is parsed, so the shard's
+            // replicas are known here and a generated document can still be
+            // routed. Try each replica so a dead primary does not lose it.
+            let replicas = replicas_of_doc(&db, &id);
+            if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
+                let forwarded = serde_json::to_vec(&doc).unwrap_or_default();
+                let mut last = None;
+                for node in replicas {
+                    let peer = st.cluster.nodes[node].clone();
+                    let response = proxy(
+                        &st,
+                        &Method::POST,
+                        &name,
+                        "",
+                        &q,
+                        &headers,
+                        Bytes::from(forwarded.clone()),
+                        &peer,
+                    )
+                    .await;
+                    if !unavailable(&response) {
+                        return response;
+                    }
+                    last = Some(response);
+                }
+                return last.unwrap_or_else(|| {
+                    fail(ApiError::new(
+                        502,
+                        "bad_gateway",
+                        "no replica in the shard set is reachable",
+                    ))
+                });
+            }
+            match commit_docs(
+                &st,
+                &db,
+                &name,
+                vec![doc],
+                true,
+                num(&q, "w").unwrap_or(0),
+                &headers,
+            )
+            .await
+            {
+                Ok((mut results, quorum)) => {
+                    let result = results.pop().unwrap_or(Value::Null);
+                    if result.get("error").is_some() {
+                        return fail(ApiError::conflict());
+                    }
+                    if flag(&q, "batch") {
+                        return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
+                    }
+                    json(
+                        if quorum {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::ACCEPTED
+                        },
+                        result,
+                    )
+                }
+                Err(e) => fail(e),
+            }
+        }
+        _ => fail(ApiError::new(
+            405,
+            "method_not_allowed",
+            "method not allowed",
+        )),
+    }
+}
+
+async fn partition_info(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    partition: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    if *method != Method::GET && *method != Method::HEAD {
+        return fail(ApiError::new(
+            405,
+            "method_not_allowed",
+            "method not allowed",
+        ));
+    }
+    if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+        let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
+        if !replicas.contains(&st.cluster.me) {
+            if let Some(node) = replicas.first() {
+                let url = format!(
+                    "{}/{name}/_partition/{}",
+                    st.cluster.nodes[*node],
+                    percent_encode(partition)
+                );
+                let request = st
+                    .client
+                    .get(url)
+                    .header("x-douchdb-forwarded", "1")
+                    .header("x-douchdb-secret", st.cluster.secret.as_str());
+                let request = forward_client_auth(request, headers);
+                return match request.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        let value = response.json::<Value>().await.unwrap_or_else(
+                            |error| json!({"error": "bad_gateway", "reason": error.to_string()}),
+                        );
+                        json(status, value)
+                    }
+                    Err(error) => fail(ApiError::new(
+                        502,
+                        "bad_gateway",
+                        format!("{}: {error}", st.cluster.nodes[*node]),
+                    )),
+                };
+            }
+        }
+    }
+    match db.partition_counts(partition).await {
+        Ok((docs, deleted)) => json(
+            StatusCode::OK,
+            json!({
+                "db_name": name,
+                "doc_count": docs,
+                "doc_del_count": deleted,
+                "partition": partition,
+                "sizes": { "active": 0, "external": 0 },
+            }),
+        ),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn db_rest(
+    State(st): State<Arc<AppState>>,
+    Path((name, rest)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if rest.is_empty() {
+        // CouchDB accepts `GET /db/` and PouchDB uses it during setup.
+        return db_root(State(st), Path(name), method, uri, headers, body).await;
+    }
+    let db = match st.db(&name).await {
+        Ok(db) => db,
+        Err(e) => return fail(e),
+    };
+    let principal = st.principal(&headers);
+    if let Some(response) =
+        require_db_access(&st, &principal, &db, requires_db_admin(&rest, &method))
+    {
+        return response;
+    }
+    if let Some(response) = reject_during_rebalance(&st, &db, &method, &rest, &headers) {
+        return response;
+    }
+    let q = query(&uri);
+
+    match rest.as_str() {
+        "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
+        "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
+        "_all_docs" => return all_docs(&st, &db, &name, &q, &method, &body, &headers, None).await,
+        "_changes" => {
+            return changes(st.clone(), db.clone(), &name, &q, &method, &body, &headers).await
+        }
+        "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
+        "_purge" => {
+            return match serde_json::from_slice::<Value>(&body) {
+                Ok(v) => match db.purge(&v).await {
+                    Ok(p) => {
+                        // A fully purged document is removed from `_changes`
+                        // entirely, so the view indexes cannot be updated
+                        // incrementally; rebuild them on the next query.
+                        if let Err(e) = crate::view::invalidate(&db).await {
+                            return fail(e);
+                        }
+                        json(StatusCode::OK, p)
+                    }
+                    Err(e) => fail(e),
+                },
+                Err(_) => fail(ApiError::bad_request("invalid JSON")),
+            };
+        }
+        "_compact" => {
+            let Ok(_permit) = st.compaction.try_acquire() else {
+                return fail(ApiError::new(
+                    409,
+                    "compaction_in_progress",
+                    "another compaction is already running on this node",
+                ));
+            };
+            if let Err(e) = db.compact().await {
+                return fail(e);
+            }
+            return json(StatusCode::ACCEPTED, json!({"ok": true}));
+        }
+        "_ensure_full_commit" => {
+            return match db.ensure_full_commit().await {
+                Ok(v) => json(StatusCode::CREATED, v),
+                Err(e) => fail(e),
+            }
+        }
+        "_revs_limit" => {
+            return match method {
+                Method::GET => match db.get_revs_limit().await {
+                    Ok(n) => json(StatusCode::OK, json!(n)),
+                    Err(e) => fail(e),
+                },
+                Method::PUT => {
+                    let limit = String::from_utf8_lossy(&body)
+                        .trim()
+                        .parse()
+                        .unwrap_or(1000);
+                    match db.set_revs_limit(limit).await {
+                        Ok(()) => ok(),
+                        Err(e) => fail(e),
+                    }
+                }
+                _ => fail(ApiError::new(
+                    405,
+                    "method_not_allowed",
+                    "method not allowed",
+                )),
+            }
+        }
+        "_security" => {
+            return match method {
+                Method::GET => json(StatusCode::OK, db.security()),
+                Method::PUT => {
+                    let value: Value = match serde_json::from_slice(&body) {
+                        Ok(value) => value,
+                        Err(_) => return fail(ApiError::bad_request("invalid security object")),
+                    };
+                    if let Err(error) = validate_security(&value) {
+                        return fail(error);
+                    }
+                    match crate::cluster_ops::set_security_everywhere(
+                        &st, &db, &name, value, &headers,
+                    )
+                    .await
+                    {
+                        Ok(()) => ok(),
+                        Err(error) => fail(error),
+                    }
+                }
+                _ => fail(ApiError::new(
+                    405,
+                    "method_not_allowed",
+                    "method not allowed",
+                )),
+            }
+        }
+        "_view_cleanup" => {
+            return match crate::view::cleanup(&db).await {
+                Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+                Err(error) => fail(error),
+            }
+        }
+        "_search_cleanup" => {
+            return match crate::search::cleanup(&db).await {
+                Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+                Err(error) => fail(error),
+            }
+        }
+        "_index_info" => {
+            let search = crate::search::all_indexes(&db);
+            let total_rows = search.len();
+            return json(
+                StatusCode::OK,
+                json!({
+                    "total_rows": total_rows,
+                    "bookmark": Value::Null,
+                    "view_indexes": [],
+                    "search_indexes": search,
+                    "nouveau_indexes": [],
+                }),
+            );
+        }
+        "_local" => return fail(ApiError::bad_request("missing local doc id")),
+        _ => {}
+    }
+
+    // `Path` percent-decodes the wildcard, which would turn an encoded slash
+    // in a document id (`a%2Fb`) into a path separator (`a`, attachment `b`).
+    // Keep the raw remainder for document routing and decode each segment only
+    // after splitting.
+    let raw_rest = uri
+        .path()
+        .strip_prefix(&format!("/{name}/"))
+        .unwrap_or(rest.as_str())
+        .to_string();
+
+    if let Some(id) = raw_rest.strip_prefix("_local/") {
+        return local_doc(&db, &percent_decode(id), &method, &body).await;
+    }
+
+    if let Some((ddoc, index, info)) = search_path(&rest) {
+        return search_request(
+            &st, &db, &name, &ddoc, &index, &method, &q, &uri, &body, &headers, None, info,
+        )
+        .await;
+    }
+
+    if let Some(tail) = rest.strip_prefix("_partition/") {
+        let (partition, suffix) = match tail.find("/_") {
+            Some(index) => (&tail[..index], &tail[index + 1..]),
+            None => (tail, ""),
+        };
+        if !db.partitioned {
+            return fail(ApiError::bad_request("database is not partitioned"));
+        }
+        if let Err(error) = crate::db::validate_partition(partition) {
+            return fail(error);
+        }
+        if let Some(requested) = q.get("partition") {
+            if requested != partition {
+                return fail(ApiError::bad_request(
+                    "Conflicting value for `partition` in query string",
+                ));
+            }
+        }
+        return match suffix {
+            "" => partition_info(&st, &db, &name, partition, &method, &headers).await,
+            "_all_docs" => {
+                all_docs(
+                    &st,
+                    &db,
+                    &name,
+                    &q,
+                    &method,
+                    &body,
+                    &headers,
+                    Some(partition.to_string()),
+                )
+                .await
+            }
+            _ => match search_path(suffix) {
+                Some((ddoc, index, info)) => {
+                    search_request(
+                        &st,
+                        &db,
+                        &name,
+                        &ddoc,
+                        &index,
+                        &method,
+                        &q,
+                        &uri,
+                        &body,
+                        &headers,
+                        Some(partition.to_string()),
+                        info,
+                    )
+                    .await
+                }
+                None => match view_path(suffix) {
+                    Some((ddoc, view)) => {
+                        view_request(
+                            &st,
+                            &db,
+                            &name,
+                            &ddoc,
+                            &view,
+                            &method,
+                            &q,
+                            &body,
+                            &headers,
+                            Some(partition.to_string()),
+                        )
+                        .await
+                    }
+                    None => fail(ApiError::not_found("missing partition endpoint")),
+                },
+            },
+        };
+    }
+
+    if let Some((ddoc, view)) = view_path(&rest) {
+        return view_request(
+            &st, &db, &name, &ddoc, &view, &method, &q, &body, &headers, None,
+        )
+        .await;
+    }
+
+    doc_request(&st, &db, &name, &raw_rest, method, &q, &headers, body).await
+}

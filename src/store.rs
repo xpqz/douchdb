@@ -39,13 +39,6 @@ pub fn seq_key(seq: u64) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
-pub fn seq_of_key(key: &[u8]) -> Option<u64> {
-    key.get(2..10)
-        .and_then(|b| b.try_into().ok())
-        .map(u64::from_be_bytes)
-}
-
 pub fn local_key(id: &str) -> Vec<u8> {
     key(b"l/", id)
 }
@@ -94,13 +87,14 @@ pub struct ShardState {
 ///
 /// Staged as plain operations rather than a `WriteBatch` so the shard actor can
 /// merge several request batches into one OS flush.
+#[derive(Default)]
 pub struct Tx {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl Tx {
     pub fn new() -> Tx {
-        Tx { ops: Vec::new() }
+        Tx::default()
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
@@ -975,7 +969,7 @@ mod tests {
     fn seq_keys_sort_numerically() {
         assert!(seq_key(2) < seq_key(10));
         assert!(seq_key(255) < seq_key(256));
-        assert_eq!(seq_of_key(&seq_key(42)).unwrap(), 42);
+        assert_eq!(seq_key(42)[2..10], 42u64.to_be_bytes());
     }
 
     #[test]
