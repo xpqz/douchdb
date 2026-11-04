@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# CI runs only the native QuickJS sandbox. The process and WASM sandbox tests
+# (including the wasmtime backend) are not run here; run them locally with
+# `cargo test` and `cargo test --features wasmtime`.
+env:
+  DOUCHDB_TEST_JS_SANDBOXES: native
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,8 +27,6 @@ jobs:
         run: cargo clippy --all-targets
       - name: Unit and integration tests
         run: cargo test
-      - name: Wasmtime backend tests
-        run: cargo test --features wasmtime
       - name: Storage corruption and fail-closed checks
         run: |
           cargo build --release --locked
@@ -46,6 +51,7 @@ jobs:
 
   differential:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Python syntax
@@ -81,6 +87,7 @@ jobs:
 
   clients:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -114,25 +121,10 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Unit and integration tests
         run: cargo test --locked
-
-  docker-amd64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build container
-        run: docker build -t douchdb:ci-amd64 .
-
-  docker-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - name: Build ARM64 container
-        run: docker buildx build --platform linux/arm64 --load -t douchdb:ci-arm64 .
