@@ -102,20 +102,26 @@ fn parse_drilldown_value(value: &Value) -> Vec<Vec<(String, Vec<Value>)>> {
 }
 
 pub(super) async fn search_request(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    index_name: &str,
-    method: &Method,
-    q: &HashMap<String, String>,
-    uri: &Uri,
-    body: &[u8],
-    headers: &HeaderMap,
+    req: DbRequest<'_>,
+    index: IndexRef<'_>,
     partition: Option<String>,
     info: bool,
 ) -> Response {
-    let _ = (dbname, headers);
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        method,
+        uri,
+        q,
+        headers,
+        body,
+    } = req;
+    let body: &[u8] = body;
+    let IndexRef {
+        ddoc,
+        name: index_name,
+    } = index;
     if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
         return fail(ApiError::new(
             405,
@@ -267,7 +273,21 @@ pub(super) async fn search_request(
         }
         crate::search::query(db, ddoc, index_name, &request, limits).await
     } else if st.cluster.is_clustered() {
-        cluster_search(st, db, dbname, ddoc, index_name, &request, limits, headers).await
+        cluster_search(
+            ClusterRead {
+                st,
+                db,
+                dbname,
+                headers,
+            },
+            IndexRef {
+                ddoc,
+                name: index_name,
+            },
+            &request,
+            limits,
+        )
+        .await
     } else {
         crate::search::query(db, ddoc, index_name, &request, limits).await
     };
@@ -288,17 +308,25 @@ pub(super) async fn search_request(
 }
 
 pub(super) async fn view_request(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
-    method: &Method,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
+    req: DbRequest<'_>,
+    view: IndexRef<'_>,
     partition: Option<String>,
 ) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        method,
+        q,
+        headers,
+        body,
+        ..
+    } = req;
+    let body: &[u8] = body;
+    let IndexRef {
+        ddoc,
+        name: view_name,
+    } = view;
     if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
         return fail(ApiError::new(
             405,
@@ -418,9 +446,37 @@ pub(super) async fn view_request(
 
     let started = std::time::Instant::now();
     let result = if let Some(reducer) = combine_reduce.as_deref() {
-        cluster_reduce(st, db, dbname, ddoc, view_name, &query, reducer, headers).await
+        cluster_reduce(
+            ClusterRead {
+                st,
+                db,
+                dbname,
+                headers,
+            },
+            IndexRef {
+                ddoc,
+                name: view_name,
+            },
+            &query,
+            reducer,
+        )
+        .await
     } else if st.cluster.is_clustered() && !is_forwarded(st, headers) {
-        match cluster_view_rows(st, db, dbname, ddoc, view_name, &query, headers).await {
+        match cluster_view_rows(
+            ClusterRead {
+                st,
+                db,
+                dbname,
+                headers,
+            },
+            IndexRef {
+                ddoc,
+                name: view_name,
+            },
+            &query,
+        )
+        .await
+        {
             Ok((spec, rows, docs, total_rows)) => {
                 if let Some(total_rows) = total_rows {
                     query.total_rows_override = Some(total_rows);

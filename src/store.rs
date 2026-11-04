@@ -225,13 +225,15 @@ impl Shard {
                 })
             })
             .unwrap_or(false);
-        let mut opts = Options::default();
-        opts.create_if_missing = true;
-        opts.paranoid_checks = true;
-        // Bloom filters are not checksummed. A corrupt filter can turn a
-        // present key into a false "not found"; without one, the checksummed
-        // data block is always read.
-        opts.filter_policy = Rc::new(Box::new(rusty_leveldb::NoFilterPolicy::new()));
+        let opts = Options {
+            create_if_missing: true,
+            paranoid_checks: true,
+            // Bloom filters are not checksummed. A corrupt filter can turn a
+            // present key into a false "not found"; without one, the
+            // checksummed data block is always read.
+            filter_policy: Rc::new(Box::new(rusty_leveldb::NoFilterPolicy::new())),
+            ..Options::default()
+        };
         let mut db = DB::open(path, opts)?;
         let seq = db_get_checked(&mut db, b"z/seq")?
             .filter(|b| b.len() == 8)

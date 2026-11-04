@@ -31,7 +31,16 @@ pub(crate) async fn validation_functions(
         limit: usize::MAX,
         ..Default::default()
     };
-    let value = crate::fabric::cluster_all_docs(st, db, dbname, &opts, headers).await?;
+    let value = crate::fabric::cluster_all_docs(
+        crate::fabric::ClusterRead {
+            st,
+            db,
+            dbname,
+            headers,
+        },
+        &opts,
+    )
+    .await?;
     let mut functions = Vec::new();
     if let Some(rows) = value.get("rows").and_then(Value::as_array) {
         for row in rows {

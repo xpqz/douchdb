@@ -289,9 +289,15 @@ async fn build_index(
     let docs = db.map_docs(None).await?;
     let path = index_dir(db, ddoc, index_name);
     let source = spec.source.clone();
-    let design = design_signature(spec);
-    let ddoc = ddoc.to_string();
-    let index_name = index_name.to_string();
+    // Everything but the documents is known before the build starts.
+    let meta = SearchMeta {
+        version: SEARCH_VERSION,
+        last_seq,
+        design: design_signature(spec),
+        ddoc: ddoc.to_string(),
+        name: index_name.to_string(),
+        docs: Vec::new(),
+    };
     // QuickJS/Tantivy work is CPU- and IO-bound. Run it on the blocking pool so
     // a search rebuild cannot occupy a Tokio async worker for its full duration.
     let (result, gate) = tokio::task::spawn_blocking(move || {
@@ -299,9 +305,7 @@ async fn build_index(
         // cancelled request must not let cleanup race a live rebuild. The read
         // permit is returned so a query can keep it for its whole lifetime.
         let _index_guard = index_guard;
-        let result = build_index_files(
-            path, docs, &source, last_seq, design, ddoc, index_name, limits,
-        );
+        let result = build_index_files(path, docs, &source, meta, limits);
         (result, gate)
     })
     .await
@@ -310,14 +314,12 @@ async fn build_index(
     Ok((path, meta, gate))
 }
 
+/// Build the index at `path` and write `meta` with the indexed documents.
 fn build_index_files(
     path: PathBuf,
     docs: Vec<(String, String)>,
     source: &str,
-    last_seq: u64,
-    design: String,
-    ddoc: String,
-    index_name: String,
+    mut meta: SearchMeta,
     limits: crate::view::ViewLimits,
 ) -> DbResult<(PathBuf, SearchMeta)> {
     let indexed = run_index_json(source, &docs, limits).map_err(|reason| {
@@ -395,20 +397,13 @@ fn build_index_files(
         .wait_merging_threads()
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
-    let meta = SearchMeta {
-        version: SEARCH_VERSION,
-        last_seq,
-        design,
-        ddoc,
-        name: index_name,
-        docs: indexed
-            .into_iter()
-            .map(|doc| SearchDoc {
-                id: doc.id,
-                fields: doc.fields,
-            })
-            .collect(),
-    };
+    meta.docs = indexed
+        .into_iter()
+        .map(|doc| SearchDoc {
+            id: doc.id,
+            fields: doc.fields,
+        })
+        .collect();
     write_meta(&path, &meta)?;
     Ok((path, meta))
 }

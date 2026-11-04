@@ -6,7 +6,6 @@ use crate::api::{
     percent_encode, AppState,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
-use axum::body::Bytes;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -91,10 +90,8 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     .await;
 
     for map in maps.into_iter().flatten() {
-        if map.version > desired.version {
-            if db.set_shard_map(map.clone()).unwrap_or(false) {
-                desired = map;
-            }
+        if map.version > desired.version && db.set_shard_map(map.clone()).unwrap_or(false) {
+            desired = map;
         }
     }
 
@@ -134,21 +131,31 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     }))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
-    if acknowledgements >= st.cluster.nodes.len().max(1) / 2 + 1 {
+    if acknowledgements > st.cluster.nodes.len().max(1) / 2 {
         db.clear_pending_shard_map();
     }
 }
 
-pub(crate) async fn proxy(
-    st: &AppState,
-    method: &Method,
-    dbname: &str,
-    rest: &str,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    body: Bytes,
-    peer: &str,
-) -> Response {
+/// A client request to replay against a peer that owns the document.
+pub(crate) struct ForwardRequest<'a> {
+    pub method: &'a Method,
+    pub dbname: &'a str,
+    /// The path after `/{dbname}/`.
+    pub rest: &'a str,
+    pub q: &'a HashMap<String, String>,
+    pub headers: &'a HeaderMap,
+    pub body: &'a [u8],
+}
+
+pub(crate) async fn proxy(st: &AppState, request: &ForwardRequest<'_>, peer: &str) -> Response {
+    let ForwardRequest {
+        method,
+        dbname,
+        rest,
+        q,
+        headers,
+        body,
+    } = *request;
     let mut url = format!("{peer}/{dbname}/{rest}");
     if !q.is_empty() {
         let encoded: Vec<String> = q
@@ -162,7 +169,7 @@ pub(crate) async fn proxy(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &url,
     );
-    let request = forward_client_auth(request, &headers);
+    let request = forward_client_auth(request, headers);
     let mut request = match headers.get(header::CONTENT_TYPE) {
         Some(value) => request.header("content-type", value),
         None => request,
@@ -809,7 +816,7 @@ pub(crate) async fn forward_json(
         .header("x-douchdb-forwarded", "1")
         .header("x-douchdb-secret", st.cluster.secret.as_str())
         .json(body);
-    let request = forward_client_auth(request, &headers);
+    let request = forward_client_auth(request, headers);
     let response = request
         .send()
         .await
@@ -829,7 +836,7 @@ pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
     db.replicas_of_shard(shard)
 }
 
-pub(crate) fn fallback_shard_masks(
+fn fallback_shard_masks(
     db: &Db,
     owned_by_node: &[Vec<bool>],
     failed: &[usize],
@@ -860,15 +867,58 @@ pub(crate) fn fallback_shard_masks(
     Ok(groups.into_iter().collect())
 }
 
-pub(crate) async fn cluster_all_docs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    opts: &AllDocsOpts,
-    headers: &HeaderMap,
-) -> DbResult<Value> {
-    let node_count = st.cluster.nodes.len();
-    let owned_by_node = preferred_shard_masks(st, db);
+/// What every cluster read needs: the database to read, and the client's
+/// headers to forward to peers.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterRead<'a> {
+    pub st: &'a AppState,
+    pub db: &'a Db,
+    pub dbname: &'a str,
+    pub headers: &'a HeaderMap,
+}
+
+/// A view or search index: a design document and the name inside it.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexRef<'a> {
+    pub ddoc: &'a str,
+    pub name: &'a str,
+}
+
+/// The `_changes` options sent unchanged to every node.
+#[derive(Clone, Copy)]
+pub(crate) struct ChangesFetch<'a> {
+    pub include_docs: bool,
+    pub style_all_docs: bool,
+    pub doc_ids: Option<&'a [String]>,
+    pub filter: Option<&'a crate::db::ChangeFilter>,
+    pub q: &'a HashMap<String, String>,
+}
+
+/// Which round of a [`scatter`] a request belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round {
+    /// The node's own preferred shards.
+    Owner,
+    /// Shards reassigned from a node that failed in the owner round.
+    Fallback,
+}
+
+/// Fan a read out to every node with at least one shard in `owned_by_node`,
+/// then send the shards of each node that failed to a live replica. Returns
+/// `(node, round, value)` for every request, owner results first. A failed
+/// fallback request fails the read; `what` names the read in the 502 returned
+/// when no request succeeds.
+async fn scatter<T, F, Fut>(
+    read: ClusterRead<'_>,
+    owned_by_node: &[Vec<bool>],
+    what: &str,
+    fetch: F,
+) -> DbResult<Vec<(usize, Round, T)>>
+where
+    F: Fn(usize, Vec<bool>, Round) -> Fut,
+    Fut: std::future::Future<Output = DbResult<T>>,
+{
+    let ClusterRead { st, db, .. } = read;
     let requests: Vec<(usize, Vec<bool>)> = owned_by_node
         .iter()
         .cloned()
@@ -876,6 +926,55 @@ pub(crate) async fn cluster_all_docs(
         .filter(|(_, mask)| mask.iter().any(|owned| *owned))
         .collect();
     crate::telemetry::record_fanout(requests.len() as u64);
+    let responses = join_all(requests.into_iter().map(|(node, mask)| {
+        let response = fetch(node, mask, Round::Owner);
+        async move { (node, response.await) }
+    }))
+    .await;
+
+    let mut values = Vec::new();
+    let mut failed = Vec::new();
+    for (node, response) in responses {
+        match response {
+            Ok(value) => values.push((node, Round::Owner, value)),
+            Err(error) => {
+                tracing::warn!(
+                    "{what} read from node {node} failed: {} {}",
+                    error.status,
+                    error.reason
+                );
+                failed.push(node);
+            }
+        }
+    }
+    if !failed.is_empty() {
+        crate::telemetry::record_degraded_read();
+        let alive: Vec<usize> = (0..st.cluster.nodes.len())
+            .filter(|node| !failed.contains(node))
+            .collect();
+        let groups = fallback_shard_masks(db, owned_by_node, &failed, &alive)?;
+        let fallbacks = join_all(groups.into_iter().map(|(node, mask)| {
+            let response = fetch(node, mask, Round::Fallback);
+            async move { (node, response.await) }
+        }))
+        .await;
+        for (node, response) in fallbacks {
+            values.push((node, Round::Fallback, response?));
+        }
+    }
+    if values.is_empty() {
+        return Err(ApiError::new(
+            502,
+            "bad_gateway",
+            format!("no {what} replica is reachable"),
+        ));
+    }
+    Ok(values)
+}
+
+pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
+    let ClusterRead { st, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(st, db);
 
     if let Some(keys) = &opts.keys {
         let mut key_opts = opts.clone();
@@ -885,53 +984,19 @@ pub(crate) async fn cluster_all_docs(
         key_opts.endkey = None;
         key_opts.descending = false;
 
-        let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
-            let node = *node;
-            let mask = mask.clone();
-            let key_opts = key_opts.clone();
-            async move {
-                (
-                    node,
-                    fetch_all_docs(st, db, dbname, node, &key_opts, headers, Some(&mask)).await,
-                )
-            }
-        }))
-        .await;
-        let mut values = Vec::new();
-        let mut failed = Vec::new();
-        for (node, response) in responses {
-            match response {
-                Ok(value) => values.push(value),
-                Err(_) => failed.push(node),
-            }
-        }
-        if !failed.is_empty() {
-            crate::telemetry::record_degraded_read();
-            let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
-            let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-            let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-                let key_opts = key_opts.clone();
-                async move {
-                    fetch_all_docs(st, db, dbname, node, &key_opts, headers, Some(&mask)).await
-                }
-            }))
-            .await;
-            for response in fallbacks {
-                values.push(response?);
-            }
-        }
-        if values.is_empty() {
-            return Err(ApiError::new(
-                502,
-                "bad_gateway",
-                "no all_docs replica is reachable",
-            ));
-        }
+        let key_opts = &key_opts;
+        let values = scatter(
+            read,
+            &owned_by_node,
+            "all_docs",
+            |node, mask, _| async move { fetch_all_docs(read, node, key_opts, Some(&mask)).await },
+        )
+        .await?;
 
         let mut total_rows = 0u64;
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut errors: HashMap<String, Value> = HashMap::new();
-        for response in values {
+        for (_, _, response) in values {
             total_rows += response["total_rows"].as_u64().unwrap_or(0);
             for row in response["rows"].as_array().cloned().unwrap_or_default() {
                 match row.get("id").and_then(Value::as_str) {
@@ -971,56 +1036,19 @@ pub(crate) async fn cluster_all_docs(
     window.skip = 0;
     window.limit = take;
 
-    let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
-        let node = *node;
-        let mask = mask.clone();
-        let window = window.clone();
-        async move {
-            (
-                node,
-                fetch_all_docs(st, db, dbname, node, &window, headers, Some(&mask)).await,
-            )
-        }
-    }))
-    .await;
-    let mut values = Vec::new();
-    let mut failed = Vec::new();
-    for (node, response) in responses {
-        match response {
-            Ok(value) => values.push(value),
-            Err(_) => failed.push(node),
-        }
-    }
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
-        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-        let fallbacks =
-            futures::future::join_all(
-                groups.into_iter().map(|(node, mask)| {
-                    let window = window.clone();
-                    async move {
-                        fetch_all_docs(st, db, dbname, node, &window, headers, Some(&mask)).await
-                    }
-                }),
-            )
-            .await;
-        for response in fallbacks {
-            values.push(response?);
-        }
-    }
-    if values.is_empty() {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no all_docs replica is reachable",
-        ));
-    }
+    let window = &window;
+    let values = scatter(
+        read,
+        &owned_by_node,
+        "all_docs",
+        |node, mask, _| async move { fetch_all_docs(read, node, window, Some(&mask)).await },
+    )
+    .await?;
 
     let mut total_rows = 0u64;
     let mut before_start = 0usize;
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for response in values {
+    for (_, _, response) in values {
         total_rows += response["total_rows"].as_u64().unwrap_or(0);
         before_start += response["offset"].as_u64().unwrap_or(0) as usize;
         for row in response["rows"].as_array().cloned().unwrap_or_default() {
@@ -1043,14 +1071,17 @@ pub(crate) async fn cluster_all_docs(
 }
 
 pub(crate) async fn fetch_all_docs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
+    read: ClusterRead<'_>,
     node: usize,
     opts: &AllDocsOpts,
-    headers: &HeaderMap,
     shards: Option<&[bool]>,
 ) -> DbResult<Value> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
     if node == st.cluster.me {
         if let Some(shards) = shards {
             return db.all_docs_owned(opts, shards).await;
@@ -1115,7 +1146,7 @@ pub(crate) async fn fetch_all_docs(
         .header("x-douchdb-forwarded", "1")
         .header("x-douchdb-secret", st.cluster.secret.as_str())
         .json(&body);
-    let request = forward_client_auth(request, &headers);
+    let request = forward_client_auth(request, headers);
     let response = request
         .send()
         .await
@@ -1132,23 +1163,29 @@ pub(crate) async fn fetch_all_docs(
 }
 
 async fn fetch_view_mask(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
+    read: ClusterRead<'_>,
+    view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
-    headers: &HeaderMap,
+    spec: &crate::view::ViewSpec,
+    limit: Option<usize>,
     node: usize,
     mask: &[bool],
-    limit: Option<usize>,
-    spec: &crate::view::ViewSpec,
 ) -> DbResult<(
     usize,
     Arc<Vec<crate::view::Row>>,
     HashMap<String, Value>,
     usize,
 )> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let IndexRef {
+        ddoc,
+        name: view_name,
+    } = view;
     if !mask.iter().any(|owned| *owned) {
         return Ok((node, Arc::new(Vec::new()), HashMap::new(), 0));
     }
@@ -1245,19 +1282,25 @@ async fn fetch_view_mask(
 }
 
 pub(crate) async fn cluster_view_rows(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
+    read: ClusterRead<'_>,
+    view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
-    headers: &HeaderMap,
 ) -> DbResult<(
     crate::view::ViewSpec,
     Arc<Vec<crate::view::Row>>,
     HashMap<String, Value>,
     Option<usize>,
 )> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let IndexRef {
+        ddoc,
+        name: view_name,
+    } = view;
     let ddoc_doc = match db.get_doc(ddoc, &DocOpts::default()).await {
         Ok(doc) => doc,
         Err(error) if error.status == 404 => {
@@ -1277,65 +1320,19 @@ pub(crate) async fn cluster_view_rows(
         && query.keys.is_none();
     let take = query.skip.saturating_add(query.limit);
 
-    let node_count = st.cluster.nodes.len();
     let owned_by_node = preferred_shard_masks(st, db);
-    let active = owned_by_node
-        .iter()
-        .filter(|mask| mask.iter().any(|owned| *owned))
-        .count();
-    crate::telemetry::record_fanout(active as u64);
     let limit = can_limit.then_some(take);
 
-    let batches = futures::future::join_all((0..node_count).map(|node| {
-        let mask = owned_by_node[node].clone();
-        let spec = spec.clone();
-        async move {
-            fetch_view_mask(
-                st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit, &spec,
-            )
-            .await
-        }
-    }))
-    .await;
-
-    let mut values = Vec::new();
-    let mut failed = Vec::new();
-    for (node, batch) in batches.into_iter().enumerate() {
-        match batch {
-            Ok(batch) => values.push(batch),
-            Err(_) => failed.push(node),
-        }
-    }
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..node_count).filter(|n| !failed.contains(n)).collect();
-        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-        let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-            let spec = spec.clone();
-            async move {
-                fetch_view_mask(
-                    st, db, dbname, ddoc, view_name, query, headers, node, &mask, limit, &spec,
-                )
-                .await
-            }
-        }))
-        .await;
-        for fallback in fallbacks {
-            values.push(fallback?);
-        }
-    }
-    if values.is_empty() {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no view replica is reachable",
-        ));
-    }
+    let spec_ref = &spec;
+    let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
+        fetch_view_mask(read, view, query, spec_ref, limit, node, &mask).await
+    })
+    .await?;
 
     let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut total_rows = 0usize;
-    for (_, rows, node_docs, node_total) in values {
+    for (_, _, (_, rows, node_docs, node_total)) in values {
         total_rows += node_total;
         docs.extend(node_docs);
         let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
@@ -1367,16 +1364,22 @@ pub(crate) async fn cluster_view_rows(
 }
 
 async fn fetch_reduce_mask(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
+    read: ClusterRead<'_>,
+    view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
-    headers: &HeaderMap,
     node: usize,
     mask: &[bool],
 ) -> DbResult<(usize, Value)> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let IndexRef {
+        ddoc,
+        name: view_name,
+    } = view;
     if node == st.cluster.me {
         let mut local = query.clone();
         local.owner_shards = Some(mask.to_vec());
@@ -1436,76 +1439,29 @@ async fn fetch_reduce_mask(
 }
 
 pub(crate) async fn cluster_reduce(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    view_name: &str,
+    read: ClusterRead<'_>,
+    view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
     reducer: &str,
-    headers: &HeaderMap,
 ) -> DbResult<Value> {
+    let ClusterRead { st, db, .. } = read;
+    let IndexRef {
+        ddoc,
+        name: view_name,
+    } = view;
     let ddoc_doc = db.get_doc(ddoc, &DocOpts::default()).await?;
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
-    let node_count = st.cluster.nodes.len();
     let owned_by_node = preferred_shard_masks(st, db);
-    let active = owned_by_node
-        .iter()
-        .filter(|mask| mask.iter().any(|owned| *owned))
-        .count();
-    crate::telemetry::record_fanout(active as u64);
-
-    let batches = futures::future::join_all((0..node_count).map(|node| {
-        let mask = owned_by_node[node].clone();
-        async move {
-            if !mask.iter().any(|owned| *owned) {
-                return Ok(None);
-            }
-            fetch_reduce_mask(st, db, dbname, ddoc, view_name, query, headers, node, &mask)
-                .await
-                .map(Some)
-        }
-    }))
-    .await;
-
-    let mut values = Vec::new();
-    let mut failed = Vec::new();
-    for (node, batch) in batches.into_iter().enumerate() {
-        match batch {
-            Ok(Some(value)) => values.push(value),
-            Ok(None) => {}
-            Err(_) => failed.push(node),
-        }
-    }
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..node_count)
-            .filter(|node| !failed.contains(node))
-            .collect();
-        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-        let fallbacks =
-            futures::future::join_all(groups.into_iter().map(|(node, mask)| async move {
-                fetch_reduce_mask(st, db, dbname, ddoc, view_name, query, headers, node, &mask)
-                    .await
-            }))
-            .await;
-        for fallback in fallbacks {
-            values.push(fallback?);
-        }
-    }
-    if values.is_empty() {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no view replica is reachable",
-        ));
-    }
+    let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
+        fetch_reduce_mask(read, view, query, node, &mask).await
+    })
+    .await?;
 
     let grouped = query.group || query.group_level > 0;
     let mut partials = Vec::new();
     let mut groups: HashMap<String, (Value, Value)> = HashMap::new();
-    for (_, value) in values {
+    for (_, _, (_, value)) in values {
         if grouped {
             for row in value["rows"].as_array().cloned().unwrap_or_default() {
                 let key = row.get("key").cloned().unwrap_or(Value::Null);
@@ -1686,17 +1642,15 @@ fn last_seq_for_node(value: &Value, node: usize) -> Option<u64> {
 }
 
 pub(crate) async fn cluster_changes(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
+    read: ClusterRead<'_>,
     q: &HashMap<String, String>,
     body: &[u8],
-    headers: &HeaderMap,
 ) -> DbResult<Value> {
+    let ClusterRead { st, db, .. } = read;
     let n = st.cluster.nodes.len();
     let now = q.get("since").map(String::as_str) == Some("now");
     let mut since = if now {
-        cluster_update_vector(st, db, dbname, headers).await?
+        cluster_update_vector(read).await?
     } else if let Some(raw) = q.get("since").map(String::as_str) {
         match decode_since(raw) {
             Some(mut vector) => {
@@ -1710,18 +1664,16 @@ pub(crate) async fn cluster_changes(
     };
     since.resize(n, 0);
     let owned_by_node = preferred_shard_masks(st, db);
-    let requests: Vec<(usize, Vec<bool>)> = owned_by_node
-        .iter()
-        .cloned()
-        .enumerate()
-        .filter(|(_, mask)| mask.iter().any(|owned| *owned))
-        .collect();
-    crate::telemetry::record_fanout(requests.len() as u64);
 
-    let include_docs = flag(q, "include_docs");
-    let style_all_docs = q.get("style").map(String::as_str) == Some("all_docs");
     let doc_ids = doc_ids_from(q, body);
     let change_filter = crate::api::resolve_changes_filter(db, q).await?;
+    let changes = ChangesFetch {
+        include_docs: flag(q, "include_docs"),
+        style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
+        doc_ids: doc_ids.as_deref(),
+        filter: change_filter.as_ref(),
+        q,
+    };
     let limit = num(q, "limit");
 
     if let Some(limit) = limit {
@@ -1733,116 +1685,41 @@ pub(crate) async fn cluster_changes(
             }));
         }
 
-        let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
-            let node = *node;
-            let mask = mask.clone();
-            let since = since[node];
-            let doc_ids = doc_ids.clone();
-            let change_filter = change_filter.clone();
-            async move {
-                (
-                    node,
-                    fetch_node_changes(
-                        st,
-                        db,
-                        dbname,
-                        node,
-                        since,
-                        if change_filter.is_some() {
-                            None
-                        } else {
-                            Some(limit)
-                        },
-                        include_docs,
-                        style_all_docs,
-                        doc_ids.as_deref(),
-                        change_filter.as_ref(),
-                        q,
-                        headers,
-                        &mask,
-                    )
-                    .await,
-                )
-            }
-        }))
-        .await;
+        let node_limit = if change_filter.is_some() {
+            None
+        } else {
+            Some(limit)
+        };
+        let since_ref = &since;
+        let responses = scatter(
+            read,
+            &owned_by_node,
+            "changes",
+            |node, mask, round| async move {
+                // The failed owner's sequence is not meaningful for the survivor's
+                // reassigned shards, so a fallback starts at 0; preferred masks are
+                // disjoint, so ids do not overlap.
+                let since = match round {
+                    Round::Owner => since_ref[node],
+                    Round::Fallback => 0,
+                };
+                fetch_node_changes(read, changes, node, &mask, since, node_limit).await
+            },
+        )
+        .await?;
         let mut node_rows: Vec<std::collections::VecDeque<Value>> =
             (0..n).map(|_| std::collections::VecDeque::new()).collect();
         let mut node_last: Vec<Option<u64>> = vec![None; n];
-        let mut failed = Vec::new();
-        let mut succeeded = false;
-        for (node, response) in responses {
-            match response {
-                Ok(mut value) => {
-                    succeeded = true;
-                    if let Some(seq) = last_seq_for_node(&value, node) {
-                        node_last[node] = Some(seq);
-                    }
-                    if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
-                        node_rows[node].extend(rows);
-                    }
-                }
-                Err(_) => failed.push(node),
+        for (node, round, mut value) in responses {
+            if let Some(seq) = last_seq_for_node(&value, node) {
+                node_last[node] = Some(match (round, node_last[node]) {
+                    (Round::Fallback, Some(previous)) => previous.min(seq),
+                    _ => seq,
+                });
             }
-        }
-        if !failed.is_empty() {
-            crate::telemetry::record_degraded_read();
-            let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
-            let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-            let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-                // The failed owner's sequence is not meaningful for the
-                // survivor's remaining shards. Start the reassigned mask at 0;
-                // preferred masks remain disjoint, so ids do not overlap.
-                let since = 0;
-                let doc_ids = doc_ids.clone();
-                let change_filter = change_filter.clone();
-                async move {
-                    (
-                        node,
-                        fetch_node_changes(
-                            st,
-                            db,
-                            dbname,
-                            node,
-                            since,
-                            if change_filter.is_some() {
-                                None
-                            } else {
-                                Some(limit)
-                            },
-                            include_docs,
-                            style_all_docs,
-                            doc_ids.as_deref(),
-                            change_filter.as_ref(),
-                            q,
-                            headers,
-                            &mask,
-                        )
-                        .await,
-                    )
-                }
-            }))
-            .await;
-            for (node, response) in fallbacks {
-                let mut value = response?;
-                succeeded = true;
-                if let Some(seq) = last_seq_for_node(&value, node) {
-                    node_last[node] = Some(match node_last[node] {
-                        Some(previous) => previous.min(seq),
-                        None => seq,
-                    });
-                }
-                if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
-                    node_rows[node].extend(rows);
-                }
+            if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
+                node_rows[node].extend(rows);
             }
-        }
-        if !succeeded {
-            return Err(ApiError::new(
-                502,
-                "bad_gateway",
-                "no changes replica is reachable",
-            ));
         }
 
         for rows in &mut node_rows {
@@ -1881,92 +1758,25 @@ pub(crate) async fn cluster_changes(
         }));
     }
 
-    let responses = futures::future::join_all(requests.iter().map(|(node, mask)| {
-        let node = *node;
-        let mask = mask.clone();
-        let since = since[node];
-        let doc_ids = doc_ids.clone();
-        let change_filter = change_filter.clone();
-        async move {
-            (
-                node,
-                fetch_node_changes(
-                    st,
-                    db,
-                    dbname,
-                    node,
-                    since,
-                    None,
-                    include_docs,
-                    style_all_docs,
-                    doc_ids.as_deref(),
-                    change_filter.as_ref(),
-                    q,
-                    headers,
-                    &mask,
-                )
-                .await,
-            )
-        }
-    }))
-    .await;
-    let mut succeeded = false;
-    let mut failed = Vec::new();
+    let since_ref = &since;
+    let responses = scatter(
+        read,
+        &owned_by_node,
+        "changes",
+        |node, mask, round| async move {
+            // Reassigned shards have no useful checkpoint on the survivor.
+            let since = match round {
+                Round::Owner => since_ref[node],
+                Round::Fallback => 0,
+            };
+            fetch_node_changes(read, changes, node, &mask, since, None).await
+        },
+    )
+    .await?;
     let mut rows = Vec::new();
     let mut progress = since.clone();
-    for (node, response) in responses {
-        match response {
-            Ok(value) => {
-                succeeded = true;
-                absorb_node_changes(value, node, &mut progress, &mut rows);
-            }
-            Err(_) => failed.push(node),
-        }
-    }
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..n).filter(|node| !failed.contains(node)).collect();
-        let groups = fallback_shard_masks(db, &owned_by_node, &failed, &alive)?;
-        let fallbacks = futures::future::join_all(groups.into_iter().map(|(node, mask)| {
-            // Reassigned shards have no useful checkpoint on the survivor.
-            let since = 0;
-            let doc_ids = doc_ids.clone();
-            let change_filter = change_filter.clone();
-            async move {
-                (
-                    node,
-                    fetch_node_changes(
-                        st,
-                        db,
-                        dbname,
-                        node,
-                        since,
-                        None,
-                        include_docs,
-                        style_all_docs,
-                        doc_ids.as_deref(),
-                        change_filter.as_ref(),
-                        q,
-                        headers,
-                        &mask,
-                    )
-                    .await,
-                )
-            }
-        }))
-        .await;
-        for (node, response) in fallbacks {
-            let value = response?;
-            succeeded = true;
-            absorb_node_changes(value, node, &mut progress, &mut rows);
-        }
-    }
-    if !succeeded {
-        return Err(ApiError::new(
-            502,
-            "bad_gateway",
-            "no changes replica is reachable",
-        ));
+    for (node, _, value) in responses {
+        absorb_node_changes(value, node, &mut progress, &mut rows);
     }
 
     // Shard masks are disjoint, so each document's change is produced by
@@ -1980,20 +1790,26 @@ pub(crate) async fn cluster_changes(
 }
 
 pub(crate) async fn fetch_node_changes(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
+    read: ClusterRead<'_>,
+    changes: ChangesFetch<'_>,
     node: usize,
+    mask: &[bool],
     since: u64,
     limit: Option<usize>,
-    include_docs: bool,
-    style_all_docs: bool,
-    doc_ids: Option<&[String]>,
-    filter: Option<&crate::db::ChangeFilter>,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    mask: &[bool],
 ) -> DbResult<Value> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let ChangesFetch {
+        include_docs,
+        style_all_docs,
+        doc_ids,
+        filter,
+        q,
+    } = changes;
     if node == st.cluster.me {
         return db
             .changes(&ChangesOpts {
@@ -2090,12 +1906,13 @@ pub(crate) fn absorb_node_changes(
 
 /// Current per-node update_seq vector. Used for `since=now` and for the
 /// `update_seq` reported in `GET /db`.
-pub(crate) async fn cluster_update_vector(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    headers: &HeaderMap,
-) -> DbResult<Vec<u64>> {
+pub(crate) async fn cluster_update_vector(read: ClusterRead<'_>) -> DbResult<Vec<u64>> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
     let out = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
         if node == st.cluster.me {
             return Ok(db.update_seq());
@@ -2205,28 +2022,32 @@ fn search_row_compare(left: &Value, right: &Value, sort: &[(String, bool)]) -> s
         .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
 }
 
-fn merge_search_batch(
-    batch: &mut (
-        usize,
-        usize,
-        HashMap<String, Value>,
-        HashMap<String, HashMap<String, u64>>,
-        HashMap<String, HashMap<String, u64>>,
-        std::collections::BTreeMap<String, (usize, Vec<Value>)>,
-    ),
-    value: Value,
-) {
-    batch.1 += value.get("total_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+/// Search results merged across nodes. Masks are disjoint, so totals and
+/// facet counts add up; rows are deduplicated by document id.
+#[derive(Default)]
+struct SearchBatch {
+    total_rows: usize,
+    rows: HashMap<String, Value>,
+    counts: HashMap<String, HashMap<String, u64>>,
+    ranges: HashMap<String, HashMap<String, u64>>,
+    groups: BTreeMap<String, (usize, Vec<Value>)>,
+}
+
+fn merge_search_batch(batch: &mut SearchBatch, value: Value) {
+    batch.total_rows += value.get("total_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
     if let Some(rows) = value.get("rows").and_then(Value::as_array) {
         for row in rows {
             if let Some(id) = row.get("id").and_then(Value::as_str) {
-                batch.2.entry(id.to_string()).or_insert_with(|| row.clone());
+                batch
+                    .rows
+                    .entry(id.to_string())
+                    .or_insert_with(|| row.clone());
             }
         }
     }
     if let Some(counts) = value.get("counts").and_then(Value::as_object) {
         for (field, values) in counts {
-            let entry = batch.3.entry(field.clone()).or_default();
+            let entry = batch.counts.entry(field.clone()).or_default();
             if let Some(values) = values.as_object() {
                 for (key, count) in values {
                     *entry.entry(key.clone()).or_default() += count.as_u64().unwrap_or(0);
@@ -2236,7 +2057,7 @@ fn merge_search_batch(
     }
     if let Some(ranges) = value.get("ranges").and_then(Value::as_object) {
         for (field, values) in ranges {
-            let entry = batch.4.entry(field.clone()).or_default();
+            let entry = batch.ranges.entry(field.clone()).or_default();
             if let Some(values) = values.as_object() {
                 for (key, count) in values {
                     *entry.entry(key.clone()).or_default() += count.as_u64().unwrap_or(0);
@@ -2251,7 +2072,7 @@ fn merge_search_batch(
                 .and_then(Value::as_str)
                 .unwrap_or("null")
                 .to_string();
-            let entry = batch.5.entry(by).or_insert_with(|| (0, Vec::new()));
+            let entry = batch.groups.entry(by).or_insert_with(|| (0, Vec::new()));
             entry.0 += group.get("total_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
             if let Some(rows) = group.get("rows").and_then(Value::as_array) {
                 entry.1.extend(rows.iter().cloned());
@@ -2263,120 +2084,31 @@ fn merge_search_batch(
 /// Union per-node search results. Each node answers for a disjoint set of
 /// shards, so total counts add up while rows are deduplicated by document id.
 pub(crate) async fn cluster_search(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    index_name: &str,
+    read: ClusterRead<'_>,
+    index: IndexRef<'_>,
     request: &crate::search::SearchRequest,
     limits: crate::view::ViewLimits,
-    headers: &HeaderMap,
 ) -> DbResult<Value> {
-    use futures::future::join_all;
-
-    let node_count = st.cluster.nodes.len();
-    let built = preferred_shard_masks(st, db);
+    let ClusterRead { st, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(st, db);
     let offset = crate::search::parse_bookmark(request.bookmark.as_deref());
     let window = offset.saturating_add(request.limit);
-    let active = built
-        .iter()
-        .filter(|mask| mask.iter().any(|owned| *owned))
-        .count();
-    crate::telemetry::record_fanout(active as u64);
-
-    let mut masks = built.clone();
-    let mut failed: Vec<usize> = Vec::new();
-    let mut batch = (
-        0usize,
-        0usize,
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        std::collections::BTreeMap::new(),
-    );
-
-    let batches = join_all((0..node_count).map(|node| {
-        let mask = masks[node].clone();
-        async move {
-            fetch_search_mask(
-                st, db, dbname, ddoc, index_name, request, limits, headers, node, &mask, window,
-            )
-            .await
-        }
-    }))
-    .await;
-
-    for (node, result) in batches.into_iter().enumerate() {
-        match result {
-            Ok(value) => merge_search_batch(&mut batch, value),
-            Err(error) => {
-                tracing::warn!(
-                    "search node {node} failed: {} {}",
-                    error.status,
-                    error.reason
-                );
-                failed.push(node)
-            }
-        }
+    let values = scatter(read, &owned_by_node, "search", |node, mask, _| async move {
+        fetch_search_mask(read, index, request, limits, window, node, &mask).await
+    })
+    .await?;
+    let mut batch = SearchBatch::default();
+    for (_, _, value) in values {
+        merge_search_batch(&mut batch, value);
     }
 
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..node_count)
-            .filter(|node| !failed.contains(node))
-            .collect();
-        if alive.is_empty() {
-            return Err(ApiError::new(
-                502,
-                "bad_gateway",
-                "no search replica is reachable",
-            ));
-        }
-        let groups = fallback_shard_masks(db, &built, &failed, &alive)?;
-        for node in &failed {
-            masks[*node] = vec![false; db.q as usize];
-        }
-        for (node, extra) in groups {
-            for shard in 0..extra.len() {
-                masks[node][shard] |= extra[shard];
-            }
-        }
-
-        batch = (
-            0,
-            0,
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            std::collections::BTreeMap::new(),
-        );
-        let batches = join_all((0..node_count).map(|node| {
-            let mask = masks[node].clone();
-            async move {
-                fetch_search_mask(
-                    st, db, dbname, ddoc, index_name, request, limits, headers, node, &mask, window,
-                )
-                .await
-            }
-        }))
-        .await;
-        let mut any = false;
-        for result in batches {
-            if let Ok(value) = result {
-                any = true;
-                merge_search_batch(&mut batch, value);
-            }
-        }
-        if !any {
-            return Err(ApiError::new(
-                502,
-                "bad_gateway",
-                "no search replica is reachable",
-            ));
-        }
-    }
-
-    let (_, total_rows, rows, counts, ranges, groups) = batch;
+    let SearchBatch {
+        total_rows,
+        rows,
+        counts,
+        ranges,
+        groups,
+    } = batch;
     let mut rows: Vec<Value> = rows.into_values().collect();
     rows.sort_by(|left, right| search_row_compare(left, right, &request.sort));
     let page: Vec<Value> = rows.into_iter().skip(offset).take(request.limit).collect();
@@ -2405,18 +2137,24 @@ pub(crate) async fn cluster_search(
 }
 
 async fn fetch_search_mask(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    ddoc: &str,
-    index_name: &str,
+    read: ClusterRead<'_>,
+    index: IndexRef<'_>,
     request: &crate::search::SearchRequest,
     limits: crate::view::ViewLimits,
-    headers: &HeaderMap,
+    window: usize,
     node: usize,
     mask: &[bool],
-    window: usize,
 ) -> DbResult<Value> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let IndexRef {
+        ddoc,
+        name: index_name,
+    } = index;
     if !mask.iter().any(|owned| *owned) {
         return Ok(json!({"total_rows": 0, "rows": [], "bookmark": "search:0"}));
     }

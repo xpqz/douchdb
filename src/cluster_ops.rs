@@ -205,13 +205,10 @@ fn source_required(
         for node in old_map.replicas_of(shard) {
             // Every old owner must answer; otherwise a replica that is merely
             // unreachable could be dropped while it still holds newer writes.
-            let Some(state) = states
+            let state = states
                 .get(*node)
                 .and_then(|state| state.as_ref())
-                .and_then(|state| state.get(shard as usize))
-            else {
-                return None;
-            };
+                .and_then(|state| state.get(shard as usize))?;
             match chosen {
                 Some(previous) if !same_shard_content(previous, state) => return None,
                 Some(_) => {}

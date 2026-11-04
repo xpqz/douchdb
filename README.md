@@ -784,7 +784,7 @@ python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --features wasmtime
 docker build -t douchdb:ci .

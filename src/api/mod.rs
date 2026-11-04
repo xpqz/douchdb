@@ -102,6 +102,19 @@ pub struct Config {
     pub default_admin_only: bool,
 }
 
+/// A request against one database, as `db_rest` hands it to a handler.
+#[derive(Clone, Copy)]
+pub(crate) struct DbRequest<'a> {
+    pub st: &'a AppState,
+    pub db: &'a Db,
+    pub name: &'a str,
+    pub method: &'a Method,
+    pub uri: &'a Uri,
+    pub q: &'a HashMap<String, String>,
+    pub headers: &'a HeaderMap,
+    pub body: &'a Bytes,
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 
@@ -407,7 +420,8 @@ mod tests {
             let raw = selected
                 .iter()
                 .enumerate()
-                .filter_map(|(index, on)| on.then(|| index.to_string()))
+                .filter(|&(_, on)| *on)
+                .map(|(index, _)| index.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
             let mask = parse_shard_mask(&raw, q).unwrap_or_else(|| panic!("failed to parse {raw}"));

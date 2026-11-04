@@ -107,6 +107,9 @@ struct StoredRowRef<'a> {
 /// A persistent index for one (database, design document, view) tuple. Rows
 /// are stored per document so a changed document can be re-mapped without
 /// walking the whole database.
+/// A raw LevelDB key and value.
+type KeyValue = (Vec<u8>, Vec<u8>);
+
 struct ViewIndex {
     db: Ldb,
     last_seq: u64,
@@ -197,8 +200,10 @@ pub fn forget_db(db_path: &Path) {
 
 impl ViewIndex {
     fn open(path: &Path) -> Result<Self, String> {
-        let mut options = LdbOptions::default();
-        options.create_if_missing = true;
+        let options = LdbOptions {
+            create_if_missing: true,
+            ..LdbOptions::default()
+        };
         let mut db = Ldb::open(path, options).map_err(|error| error.to_string())?;
         let meta = db
             .get(b"m")
@@ -257,7 +262,7 @@ impl ViewIndex {
         Ok(rows)
     }
 
-    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<KeyValue>, String> {
         let mut iterator = self.db.new_iter().map_err(|error| error.to_string())?;
         iterator.seek(prefix);
         let mut out = Vec::new();
@@ -521,14 +526,12 @@ pub fn finish(
             ));
         }
     }
-    if reduce {
-        if !grouped && query.keys.as_ref().is_some_and(|keys| keys.len() != 1) {
-            return Err(ApiError::new(
-                400,
-                "query_parse_error",
-                "Multi-key fetches for reduce views must use `group=true`",
-            ));
-        }
+    if reduce && !grouped && query.keys.as_ref().is_some_and(|keys| keys.len() != 1) {
+        return Err(ApiError::new(
+            400,
+            "query_parse_error",
+            "Multi-key fetches for reduce views must use `group=true`",
+        ));
     }
     render(spec, &rows, &docs, query)
 }
@@ -1764,7 +1767,7 @@ mod tests {
 
     #[test]
     fn couchdb_collation_orders_every_json_type() {
-        let ordered = vec![
+        let ordered = [
             Value::Null,
             json!(false),
             json!(true),

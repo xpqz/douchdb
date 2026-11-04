@@ -211,7 +211,7 @@ mod tests {
             md5: [7u8; 16],
         };
         let plain = new_revid(false, None, &body, &[]);
-        let with_att = new_revid(false, None, &body, &[att.clone()]);
+        let with_att = new_revid(false, None, &body, std::slice::from_ref(&att));
         assert_ne!(plain, with_att);
         assert_eq!(with_att, new_revid(false, None, &body, &[att]));
         assert_ne!(hex16(plain), hex16(with_att));

@@ -391,16 +391,18 @@ pub(super) async fn revs_diff(
     json(StatusCode::OK, Value::Object(out))
 }
 
-pub(super) async fn all_docs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    method: &Method,
-    body: &[u8],
-    headers: &HeaderMap,
-    partition: Option<String>,
-) -> Response {
+pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        method,
+        q,
+        headers,
+        body,
+        ..
+    } = req;
+    let body: &[u8] = body;
     let partition = partition.or_else(|| q.get("partition").cloned());
     if let Some(partition) = &partition {
         if !db.partitioned {
@@ -498,7 +500,16 @@ pub(super) async fn all_docs(
         None
     };
     let result = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
-        cluster_all_docs(st, db, dbname, &opts, headers).await
+        cluster_all_docs(
+            ClusterRead {
+                st,
+                db,
+                dbname,
+                headers,
+            },
+            &opts,
+        )
+        .await
     } else if let Some(mask) = shard_mask {
         db.all_docs_owned(&opts, &mask).await
     } else if flag(q, "owner_only") && is_forwarded(st, headers) {
