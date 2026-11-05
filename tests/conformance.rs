@@ -2809,6 +2809,46 @@ async fn cluster_changes_use_an_opaque_version_vector() {
 }
 
 #[tokio::test]
+async fn cluster_changes_report_pending_like_a_single_node() {
+    // n=1 fans out to every node; n=3 lets the coordinator read every shard
+    // locally.
+    for replication in [1, 3] {
+        let nodes = start_cluster_with(3, "3600", replication);
+        for node in &nodes {
+            node.fresh_db("clpending").await;
+        }
+        let docs: Vec<Value> = (0..30)
+            .map(|i| json!({"_id": format!("p{i:02}")}))
+            .collect();
+        let (status, _) = nodes[0]
+            .post("/clpending/_bulk_docs", json!({"docs": docs}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for node in &nodes {
+            let mut since = "0".to_string();
+            let mut seen = 0;
+            for expected in [20, 10, 0] {
+                let (status, page) = node
+                    .get(&format!("/clpending/_changes?limit=10&since={since}"))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                seen += page["results"].as_array().unwrap().len();
+                assert_eq!(
+                    page["pending"], expected,
+                    "n={replication} via {} after {seen} rows: {page}",
+                    node.base
+                );
+                since = page["last_seq"].as_str().unwrap().to_string();
+            }
+            assert_eq!(seen, 30);
+            let (_, all) = node.get("/clpending/_changes").await;
+            assert_eq!(all["pending"], 0, "{all}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn cluster_changes_limit_covers_all_nodes() {
     let nodes = start_cluster_with(3, "3600", 1);
     for node in &nodes {
