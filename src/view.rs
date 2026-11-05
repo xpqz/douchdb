@@ -133,24 +133,197 @@ struct ViewIndex {
 #[derive(Default)]
 pub struct ViewRows {
     shards: Vec<Vec<Row>>,
-    /// Per shard, a tree of partial reductions with the reducer source:
-    /// computed by the first reduce that needs it, dropped when the shard's
-    /// rows change.
-    blocks: Vec<StdMutex<Option<BlockPartials>>>,
+    /// Per shard, partial reductions for one reducer: built by the first
+    /// reduce that needs them and kept up to date across writes.
+    blocks: Vec<StdMutex<Option<BlockTree>>>,
 }
 
-/// Children per partial reduction. Level 0 reduces each `REDUCE_FANOUT` rows,
-/// and each level above combines `REDUCE_FANOUT` partials of the one below;
-/// the last at each level may be short. A span reads whole partials at the
-/// highest level they fit, so it touches fewer than `2 * REDUCE_FANOUT` rows
-/// or partials per level.
+/// Rows per block when a shard's partials are built, and children per
+/// partial at each level above. A span reads whole partials at the highest
+/// level they fit, so it touches few rows or partials per level.
 const REDUCE_FANOUT: usize = 32;
 
 /// Partial reductions by group key (by exact key for a `keys` query), with
 /// the key itself.
 pub(crate) type Partials = HashMap<String, (Value, Vec<Value>)>;
 
-type BlockPartials = (String, Arc<Vec<Vec<Value>>>);
+/// A shard's partial reductions for the reducer `source`. Blocks of
+/// consecutive rows grow and shrink as writes add and remove rows, so a write
+/// marks only the blocks it touched for recomputation, plus their parents.
+#[derive(Clone)]
+struct BlockTree {
+    source: String,
+    spans: Arc<Spans>,
+    /// Blocks whose partial a write invalidated.
+    dirty: Vec<usize>,
+}
+
+/// Block boundaries and partials.
+#[derive(Clone, Default)]
+struct Spans {
+    /// The row each block starts at, then the shard's row count.
+    starts: Vec<usize>,
+    /// `levels[0]` holds each block's partial; each level above combines
+    /// `REDUCE_FANOUT` partials of the one below, and the last may be short.
+    levels: Vec<Vec<Value>>,
+}
+
+impl BlockTree {
+    fn build(rows: &[Row], reducer: &mut JsReducer) -> Result<BlockTree, String> {
+        let mut starts: Vec<usize> = (0..rows.len()).step_by(REDUCE_FANOUT).collect();
+        starts.push(rows.len());
+        let leaves = rows
+            .chunks(REDUCE_FANOUT)
+            .map(|chunk| reduce_rows(chunk, reducer))
+            .collect::<Result<_, _>>()?;
+        let mut spans = Spans {
+            starts,
+            levels: vec![leaves],
+        };
+        spans.build_upper(reducer)?;
+        Ok(BlockTree {
+            source: reducer.source().to_string(),
+            spans: Arc::new(spans),
+            dirty: Vec::new(),
+        })
+    }
+
+    /// Follow a write to the shard. `removed[i]` says whether old row `i` was
+    /// dropped, and `inserted` holds each added row's index among the rows
+    /// kept. Returns false when there is no block to place a row in.
+    fn apply_write(&mut self, removed: &[bool], inserted: &[usize]) -> bool {
+        let spans = Arc::make_mut(&mut self.spans);
+        let count = spans.starts.len().saturating_sub(1);
+        if count == 0 {
+            return inserted.is_empty();
+        }
+        let mut sizes: Vec<usize> = spans.starts.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut touched = vec![false; count];
+        for &block in &self.dirty {
+            touched[block] = true;
+        }
+        for block in 0..count {
+            let dropped = removed[spans.starts[block]..spans.starts[block + 1]]
+                .iter()
+                .filter(|removed| **removed)
+                .count();
+            if dropped > 0 {
+                sizes[block] -= dropped;
+                touched[block] = true;
+            }
+        }
+        // A row goes to the block holding the kept row it lands before, or
+        // to the last block when it lands after every kept row.
+        let mut kept_ends = Vec::with_capacity(count);
+        let mut end = 0;
+        for size in &sizes {
+            end += size;
+            kept_ends.push(end);
+        }
+        for &at in inserted {
+            let block = kept_ends.partition_point(|end| *end <= at).min(count - 1);
+            sizes[block] += 1;
+            touched[block] = true;
+        }
+
+        let mut leaves = std::mem::take(&mut spans.levels[0]).into_iter();
+        let mut starts = vec![0];
+        let mut kept_leaves = Vec::with_capacity(count);
+        let mut dirty = Vec::new();
+        let mut start = 0;
+        for (block, size) in sizes.into_iter().enumerate() {
+            let leaf = leaves.next().unwrap_or(Value::Null);
+            if size == 0 {
+                continue;
+            }
+            // A block that has grown past twice the build size is split.
+            let pieces = if touched[block] {
+                size.div_ceil(2 * REDUCE_FANOUT)
+            } else {
+                1
+            };
+            for piece in 0..pieces {
+                start += size / pieces + usize::from(piece < size % pieces);
+                starts.push(start);
+                if touched[block] {
+                    dirty.push(kept_leaves.len());
+                    kept_leaves.push(Value::Null);
+                } else {
+                    kept_leaves.push(leaf.clone());
+                }
+            }
+        }
+        if kept_leaves.len() != count {
+            // Parents group blocks by position, so they are rebuilt.
+            spans.levels.truncate(1);
+        }
+        spans.starts = starts;
+        spans.levels[0] = kept_leaves;
+        self.dirty = dirty;
+        true
+    }
+
+    /// Recompute what writes invalidated.
+    fn refresh(&mut self, rows: &[Row], reducer: &mut JsReducer) -> Result<(), String> {
+        let stale_upper =
+            self.spans.levels.len() == 1 && self.spans.levels[0].len() > REDUCE_FANOUT;
+        if self.dirty.is_empty() && !stale_upper {
+            return Ok(());
+        }
+        let spans = Arc::make_mut(&mut self.spans);
+        for &block in &self.dirty {
+            spans.levels[0][block] =
+                reduce_rows(&rows[spans.starts[block]..spans.starts[block + 1]], reducer)?;
+        }
+        if spans.levels.len() == 1 {
+            spans.build_upper(reducer)?;
+        } else {
+            let mut changed = std::mem::take(&mut self.dirty);
+            for level in 1..spans.levels.len() {
+                changed = changed
+                    .into_iter()
+                    .map(|child| child / REDUCE_FANOUT)
+                    .collect();
+                changed.dedup();
+                for &parent in &changed {
+                    let below = &spans.levels[level - 1];
+                    let children = &below
+                        [parent * REDUCE_FANOUT..((parent + 1) * REDUCE_FANOUT).min(below.len())];
+                    spans.levels[level][parent] = combine_children(reducer, children)?;
+                }
+            }
+        }
+        self.dirty.clear();
+        Ok(())
+    }
+}
+
+impl Spans {
+    /// Add levels above the top one until a level fits in one parent.
+    fn build_upper(&mut self, reducer: &mut JsReducer) -> Result<(), String> {
+        while let Some(below) = self
+            .levels
+            .last()
+            .filter(|below| below.len() > REDUCE_FANOUT)
+        {
+            let above = below
+                .chunks(REDUCE_FANOUT)
+                .map(|chunk| combine_children(reducer, chunk))
+                .collect::<Result<_, _>>()?;
+            self.levels.push(above);
+        }
+        Ok(())
+    }
+}
+
+/// One parent's partial. A lone child is kept as it is, so a reducer that is
+/// not rereduce-safe sees the same values as a single pass.
+fn combine_children(reducer: &mut JsReducer, children: &[Value]) -> Result<Value, String> {
+    match children {
+        [single] => Ok(single.clone()),
+        _ => combine_partials(reducer, children),
+    }
+}
 
 impl Clone for ViewRows {
     fn clone(&self) -> Self {
@@ -165,9 +338,7 @@ impl Clone for ViewRows {
     }
 }
 
-fn lock_blocks(
-    slot: &StdMutex<Option<BlockPartials>>,
-) -> std::sync::MutexGuard<'_, Option<BlockPartials>> {
+fn lock_blocks(slot: &StdMutex<Option<BlockTree>>) -> std::sync::MutexGuard<'_, Option<BlockTree>> {
     slot.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -206,13 +377,33 @@ impl ViewRows {
             touched.entry(shard).or_default().1.push(row);
         }
         for (shard, (ids, mut rows)) in touched {
-            let mut kept = std::mem::take(&mut self.shards[shard]);
-            kept.retain(|row| !ids.contains(row.id.as_str()));
+            let old = std::mem::take(&mut self.shards[shard]);
+            let removed: Vec<bool> = old
+                .iter()
+                .map(|row| ids.contains(row.id.as_str()))
+                .collect();
+            let kept: Vec<Row> = old
+                .into_iter()
+                .zip(&removed)
+                .filter(|(_, removed)| !**removed)
+                .map(|(row, _)| row)
+                .collect();
             sort_rows(&mut rows);
-            self.shards[shard] = merge_sorted_rows(kept, rows);
             if let Some(slot) = self.blocks.get_mut(shard) {
-                *slot.get_mut().unwrap_or_else(|poison| poison.into_inner()) = None;
+                let tree = slot.get_mut().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(blocks) = tree.as_mut() {
+                    let inserted: Vec<usize> = rows
+                        .iter()
+                        .map(|row| {
+                            kept.partition_point(|kept| row_cmp(kept, row) == Ordering::Less)
+                        })
+                        .collect();
+                    if !blocks.apply_write(&removed, &inserted) {
+                        *tree = None;
+                    }
+                }
             }
+            self.shards[shard] = merge_sorted_rows(kept, rows);
         }
     }
 
@@ -272,38 +463,23 @@ impl ViewRows {
         assemble_reduce(partials, query, reducer)
     }
 
-    fn block_partials(
-        &self,
-        shard: usize,
-        reducer: &mut JsReducer,
-    ) -> Result<Arc<Vec<Vec<Value>>>, String> {
+    fn block_partials(&self, shard: usize, reducer: &mut JsReducer) -> Result<Arc<Spans>, String> {
         let Some(slot) = self.blocks.get(shard) else {
             return Ok(Arc::default());
         };
+        let rows = &self.shards[shard];
         let mut slot = lock_blocks(slot);
-        if let Some((_, blocks)) = slot
-            .as_ref()
-            .filter(|(source, _)| source == reducer.source())
-        {
-            return Ok(Arc::clone(blocks));
+        if let Some(tree) = slot.as_mut().filter(|tree| tree.source == reducer.source()) {
+            if let Err(error) = tree.refresh(rows, reducer) {
+                *slot = None;
+                return Err(error);
+            }
+            return Ok(Arc::clone(&tree.spans));
         }
-        let mut levels: Vec<Vec<Value>> = vec![self.shards[shard]
-            .chunks(REDUCE_FANOUT)
-            .map(|chunk| reduce_rows(chunk, reducer))
-            .collect::<Result<_, _>>()?];
-        while let Some(below) = levels.last().filter(|below| below.len() > REDUCE_FANOUT) {
-            let above = below
-                .chunks(REDUCE_FANOUT)
-                .map(|chunk| match chunk {
-                    [single] => Ok(single.clone()),
-                    _ => combine_partials(reducer, chunk),
-                })
-                .collect::<Result<_, _>>()?;
-            levels.push(above);
-        }
-        let blocks = Arc::new(levels);
-        *slot = Some((reducer.source().to_string(), Arc::clone(&blocks)));
-        Ok(blocks)
+        let tree = BlockTree::build(rows, reducer)?;
+        let spans = Arc::clone(&tree.spans);
+        *slot = Some(tree);
+        Ok(spans)
     }
 
     /// Rows `query` can return from the shards in `mask` (all when `None`).
@@ -458,54 +634,64 @@ fn equal_range<R: AsRef<Row>>(rows: &[R], key: &Value) -> (usize, usize) {
 /// whole, plus the rows and partials at either edge.
 fn reduce_span(
     rows: &[Row],
-    levels: &[Vec<Value>],
+    spans: &Spans,
     first: usize,
     end: usize,
     reducer: &mut JsReducer,
 ) -> Result<Value, String> {
-    // Units at level 0 are rows; at level k they are `levels[k - 1]`.
-    let mut take = |level: usize, from: usize, to: usize| -> Result<Vec<Value>, String> {
-        if level == 0 {
-            Ok(vec![reduce_rows(&rows[from..to], reducer)?])
-        } else {
-            Ok(levels[level - 1][from..to].to_vec())
+    let starts = &spans.starts;
+    let count = starts.len().saturating_sub(1);
+    // The whole blocks in the span: from the first block starting at or after
+    // `first` to the last ending at or before `end`.
+    let lo = starts[..count].partition_point(|start| *start < first);
+    let hi = starts[1..].partition_point(|end_of| *end_of <= end);
+    let mut parts = Vec::new();
+    if lo >= hi {
+        parts.push(reduce_rows(&rows[first..end], reducer)?);
+    } else {
+        if first < starts[lo] {
+            parts.push(reduce_rows(&rows[first..starts[lo]], reducer)?);
         }
-    };
+        parts.extend(block_parts(&spans.levels, lo, hi));
+        if starts[hi] < end {
+            parts.push(reduce_rows(&rows[starts[hi]..end], reducer)?);
+        }
+    }
+    combine_children(reducer, &parts)
+}
+
+/// The fewest stored partials covering blocks `lo..hi`, in row order.
+fn block_parts(levels: &[Vec<Value>], lo: usize, hi: usize) -> Vec<Value> {
     let mut left = Vec::new();
-    let mut right: Vec<Vec<Value>> = Vec::new();
-    let (mut lo, mut hi, mut len) = (first, end, rows.len());
+    let mut right: Vec<&[Value]> = Vec::new();
+    let (mut lo, mut hi) = (lo, hi);
     let mut level = 0;
     let middle = loop {
-        let Some(parents) = levels.get(level).map(Vec::len) else {
-            break take(level, lo, hi)?;
+        let units = &levels[level];
+        let Some(parents) = levels.get(level + 1).map(Vec::len) else {
+            break &units[lo..hi];
         };
         // The last parent may be short; it is whole when the span reaches
         // the end of this level.
         let parent_lo = lo.div_ceil(REDUCE_FANOUT);
-        let parent_hi = if hi == len {
+        let parent_hi = if hi == units.len() {
             parents
         } else {
             (hi / REDUCE_FANOUT).min(parents)
         };
         if parent_lo >= parent_hi {
-            break take(level, lo, hi)?;
+            break &units[lo..hi];
         }
-        if lo < parent_lo * REDUCE_FANOUT {
-            left.extend(take(level, lo, parent_lo * REDUCE_FANOUT)?);
-        }
-        if parent_hi * REDUCE_FANOUT < hi {
-            right.push(take(level, parent_hi * REDUCE_FANOUT, hi)?);
-        }
-        (lo, hi, len) = (parent_lo, parent_hi, parents);
+        left.extend_from_slice(&units[lo..parent_lo * REDUCE_FANOUT]);
+        right.push(&units[(parent_hi * REDUCE_FANOUT).min(hi)..hi]);
+        (lo, hi) = (parent_lo, parent_hi);
         level += 1;
     };
-    let mut parts = left;
-    parts.extend(middle);
-    parts.extend(right.into_iter().rev().flatten());
-    match parts.as_slice() {
-        [single] => Ok(single.clone()),
-        _ => combine_partials(reducer, &parts),
+    left.extend_from_slice(middle);
+    for part in right.into_iter().rev() {
+        left.extend_from_slice(part);
     }
+    left
 }
 
 fn reduce_rows(rows: &[Row], reducer: &mut JsReducer) -> Result<Value, String> {
@@ -2450,6 +2636,135 @@ mod tests {
         limits: ViewLimits,
     ) -> Result<Value, String> {
         reduce_with(&mut JsReducer::new(source, limits), keys, values)
+    }
+
+    #[test]
+    fn block_partials_follow_writes() {
+        // One shard with enough blocks for a level of parents above them.
+        let placement = (1, false);
+        let base = ViewQuery {
+            inclusive_end: true,
+            limit: usize::MAX,
+            shard_count: placement.0,
+            ..ViewQuery::default()
+        };
+        let queries = [
+            base.clone(),
+            ViewQuery {
+                group_level: 1,
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([3, 5])),
+                endkey: Some(json!([9, 2])),
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([1, 7])),
+                endkey: Some(json!([1, 9])),
+                inclusive_end: false,
+                ..base.clone()
+            },
+        ];
+        for reducer in ["_sum", "_stats", "function(k, v, re){ return sum(v); }"] {
+            let spec = ViewSpec {
+                map: String::new(),
+                reduce: Some(reducer.to_string()),
+                partitioned: false,
+            };
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            let doc_rows = |id: &str, count: u64, key: u64| -> Vec<Row> {
+                (0..count)
+                    .map(|i| Row {
+                        id: id.to_string(),
+                        key: json!([(key + i) % 13, (key * 7 + i) % 17]),
+                        value: json!(key * 10 + i),
+                    })
+                    .collect()
+            };
+            let mut rows: Vec<Row> = (0..1100)
+                .flat_map(|i| doc_rows(&format!("d{i}"), 1 + i % 3, i))
+                .collect();
+            sort_rows(&mut rows);
+            let mut view = ViewRows::from_rows(rows.clone(), placement);
+            let mut fresh = 1100;
+            for step in 0..80 {
+                let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                let pick = |n: u64| ids[n as usize % ids.len()].clone();
+                let (changed, added): (Vec<String>, Vec<Row>) = match next(5) {
+                    // New documents, sometimes a burst on one key so a block
+                    // grows past its split size.
+                    0 => {
+                        let burst = if step % 4 == 0 { 70 } else { 1 };
+                        let key = next(1000);
+                        let docs: Vec<String> =
+                            (0..burst).map(|i| format!("n{}", fresh + i)).collect();
+                        fresh += burst;
+                        let added = docs.iter().flat_map(|id| doc_rows(id, 1, key)).collect();
+                        (docs, added)
+                    }
+                    // Deletes, sometimes every document with one key so
+                    // blocks empty.
+                    1 => {
+                        let docs: Vec<String> = if step % 3 == 0 {
+                            let key = rows[next(rows.len() as u64) as usize].key.clone();
+                            rows.iter()
+                                .filter(|row| row.key == key)
+                                .map(|row| row.id.clone())
+                                .collect()
+                        } else {
+                            vec![pick(next(1 << 20))]
+                        };
+                        (docs, Vec::new())
+                    }
+                    // Key changes move a document's rows between blocks.
+                    2 => {
+                        let id = pick(next(1 << 20));
+                        let added = doc_rows(&id, 1 + next(3), next(1000));
+                        (vec![id], added)
+                    }
+                    // A value change leaves the rows in place.
+                    3 => {
+                        let id = pick(next(1 << 20));
+                        let mut added: Vec<Row> =
+                            rows.iter().filter(|row| row.id == id).cloned().collect();
+                        for row in &mut added {
+                            row.value = json!(next(100));
+                        }
+                        (vec![id], added)
+                    }
+                    _ => {
+                        let docs: Vec<String> = (0..5).map(|_| pick(next(1 << 20))).collect();
+                        let added = docs
+                            .iter()
+                            .flat_map(|id| doc_rows(id, 2, next(1000)))
+                            .collect();
+                        (docs, added)
+                    }
+                };
+                view.replace_docs(&changed, added.clone(), placement);
+                rows.retain(|row| !changed.contains(&row.id));
+                rows.extend(added);
+                sort_rows(&mut rows);
+                // Checking every third write also covers several writes
+                // landing before the next reduce.
+                if step % 3 != 2 {
+                    continue;
+                }
+                for query in &queries {
+                    let expected = render(&spec, &rows, &HashMap::new(), query).unwrap();
+                    let mut js = JsReducer::new(reducer, query.limits);
+                    let actual = view.reduce(query, None, &mut js).unwrap();
+                    assert_eq!(actual, expected, "{reducer} step {step} {query:?}");
+                }
+            }
+        }
     }
 
     #[test]
