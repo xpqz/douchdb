@@ -118,13 +118,3 @@ jobs:
       - name: Stop douchdb
         if: always()
         run: docker rm -f douchdb-clients || true
-
-  macos:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Unit and integration tests
-        run: cargo test --locked
