@@ -344,9 +344,12 @@ pub async fn db_rest(
                 Ok(v) => match db.purge(&v).await {
                     Ok(p) => {
                         // A fully purged document is removed from `_changes`
-                        // entirely, so the view indexes cannot be updated
-                        // incrementally; rebuild them on the next query.
+                        // entirely, so the view and search indexes cannot be
+                        // updated incrementally; rebuild them on the next query.
                         if let Err(e) = crate::view::invalidate(&db).await {
+                            return fail(e);
+                        }
+                        if let Err(e) = crate::search::cleanup(&db).await {
                             return fail(e);
                         }
                         json(StatusCode::OK, p)
