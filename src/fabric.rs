@@ -599,6 +599,18 @@ pub(crate) async fn commit_docs(
         crate::telemetry::record_fanout(groups.len() as u64);
         let mut successes: Vec<Option<Value>> = vec![None; total];
         let mut failures: Vec<Option<Value>> = vec![None; total];
+        // Design documents go to every node, and any node may coordinate a
+        // query against them, so their write waits for every replica to answer
+        // rather than only the quorum.
+        let mut unanswered: Vec<usize> = (0..total)
+            .map(|slot| {
+                if ids[slot].starts_with("_design/") {
+                    replicas[slot].len()
+                } else {
+                    0
+                }
+            })
+            .collect();
         let mut pending = FuturesUnordered::new();
         for (node, group) in groups {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
@@ -634,6 +646,9 @@ pub(crate) async fn commit_docs(
             let Ok((node, slots, response)) = joined else {
                 continue;
             };
+            for slot in &slots {
+                unanswered[*slot] = unanswered[*slot].saturating_sub(1);
+            }
             match response {
                 Ok(results) => {
                     for (slot, result) in slots.into_iter().zip(results) {
@@ -659,7 +674,7 @@ pub(crate) async fn commit_docs(
                     }
                 }
             }
-            if acks.iter().all(|ack| *ack >= quorum) {
+            if acks.iter().all(|ack| *ack >= quorum) && unanswered.iter().all(|left| *left == 0) {
                 break;
             }
         }
