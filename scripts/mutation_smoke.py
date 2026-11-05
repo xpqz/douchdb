@@ -45,15 +45,15 @@ MUTATIONS = [
     (
         "reduce query ignores skip",
         "src/view.rs",
-        "    let skip = query.skip.min(available);",
-        "    let skip = 0;",
+        "    for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {",
+        "    for (key, mut values) in groups.into_iter().take(query.limit) {",
         ["cargo", "test", "--locked", "--test", "conformance", "views_map_reduce_collation_and_query_options"],
     ),
     (
         "changes includes the since row",
-        "src/db.rs",
-        "        .filter(|(_, seq)| opts.descending || **seq > opts.since)",
-        "        .filter(|(_, seq)| opts.descending || **seq >= opts.since)",
+        "src/store.rs",
+        "        let start = since.checked_add(1).map(|seq| (seq, String::new()));",
+        "        let start = Some((since, String::new()));",
         ["cargo", "test", "--locked", "--test", "conformance", "changes_returns_latest_per_document_and_pending"],
     ),
 ]
