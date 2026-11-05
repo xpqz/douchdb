@@ -90,14 +90,47 @@ pub struct ShardState {
 pub struct LatestChanges {
     by_id: BTreeMap<String, u64>,
     by_seq: BTreeSet<(u64, String)>,
+    /// How many documents have their latest sequence in each bucket of
+    /// `1 << SEQ_BUCKET_BITS` sequences, so counting the documents on either
+    /// side of a cursor (the `pending` field of `_changes`) does not walk them.
+    buckets: Fenwick,
 }
+
+const SEQ_BUCKET_BITS: u32 = 8;
 
 impl LatestChanges {
     pub fn insert(&mut self, id: String, seq: u64) {
         if let Some(old) = self.by_id.insert(id.clone(), seq) {
             self.by_seq.remove(&(old, id.clone()));
+            self.buckets.add(bucket_of(old), -1);
         }
         self.by_seq.insert((seq, id));
+        self.buckets.add(bucket_of(seq), 1);
+    }
+
+    /// How many documents have their latest sequence at or below `seq`.
+    fn count_through(&self, seq: u64) -> usize {
+        let bucket = bucket_of(seq);
+        let bucket_start = (bucket as u64) << SEQ_BUCKET_BITS;
+        let below = self.buckets.prefix(bucket);
+        let within = self
+            .by_seq
+            .range((bucket_start, String::new())..)
+            .take_while(|(entry, _)| *entry <= seq)
+            .count();
+        below + within
+    }
+
+    /// How many documents `after(since)` yields.
+    pub fn count_after(&self, since: u64) -> usize {
+        self.by_seq.len() - self.count_through(since)
+    }
+
+    /// How many documents `before(before)` yields.
+    pub fn count_before(&self, before: u64) -> usize {
+        before
+            .checked_sub(1)
+            .map_or(0, |seq| self.count_through(seq))
     }
 
     /// Documents whose latest sequence is above `since`, in sequence order.
@@ -134,6 +167,46 @@ impl LatestChanges {
             ))
             .map(|(id, _)| id)
             .take_while(move |id| id.starts_with(prefix))
+    }
+}
+
+fn bucket_of(seq: u64) -> usize {
+    (seq >> SEQ_BUCKET_BITS) as usize
+}
+
+/// A Fenwick (binary indexed) tree of counts that grows as higher indexes are
+/// used.
+#[derive(Default)]
+struct Fenwick {
+    tree: Vec<usize>,
+}
+
+impl Fenwick {
+    fn add(&mut self, index: usize, delta: isize) {
+        while self.tree.len() <= index {
+            // Node `i` (1-based) sums the `i & -i` entries ending at `i`; a new
+            // node starts with whatever earlier adds put in that range.
+            let i = self.tree.len() + 1;
+            let span = i & i.wrapping_neg();
+            let sum = self.prefix(i - 1) - self.prefix(i - span);
+            self.tree.push(sum);
+        }
+        let mut i = index + 1;
+        while i <= self.tree.len() {
+            self.tree[i - 1] = self.tree[i - 1].wrapping_add_signed(delta);
+            i += i & i.wrapping_neg();
+        }
+    }
+
+    /// Sum of the entries before `end`.
+    fn prefix(&self, end: usize) -> usize {
+        let mut i = end.min(self.tree.len());
+        let mut sum = 0;
+        while i > 0 {
+            sum += self.tree[i - 1];
+            i -= i & i.wrapping_neg();
+        }
+        sum
     }
 }
 
@@ -541,9 +614,9 @@ impl Shard {
     pub fn pending_changes(&mut self, after: u64, descending: bool) -> Result<usize> {
         let latest = self.latest_changes()?;
         Ok(if descending {
-            latest.before(after).count()
+            latest.count_before(after)
         } else {
-            latest.after(after).count()
+            latest.count_after(after)
         })
     }
 
@@ -1242,6 +1315,33 @@ mod scan_tests {
         assert_eq!(tail.len(), 2, "scan from seq 4 must include 4 and 5");
         assert_eq!(shard.scan_from(b"s/", &seq_key(9)).unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_changes_counts_match_walking_the_index() {
+        let mut latest = LatestChanges::default();
+        // A fixed pseudo-random walk: new documents and updates that move a
+        // document from an old bucket to a new one, with gaps between
+        // sequences so many buckets stay empty.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut seq = 0;
+        for _ in 0..5000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            seq += 1 + state % 7;
+            latest.insert(format!("doc{}", state % 1500), seq);
+            if seq % 97 == 0 {
+                for cursor in [0, 1, seq / 3, seq / 2, seq - 1, seq, seq + 1, u64::MAX] {
+                    assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
+                    assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+                }
+            }
+        }
+        for cursor in 0..=seq + 1 {
+            assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
+            assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+        }
     }
 
     #[test]
