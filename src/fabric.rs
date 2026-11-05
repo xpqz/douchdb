@@ -572,7 +572,7 @@ pub(crate) async fn commit_docs(
         .collect();
     let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
         ids.iter().map(|id| db.placement_of_doc(id)).unzip();
-    let replication = st.cluster.replication_factor();
+    let replication = db.copies();
     // CouchDB defaults to a write quorum and lets `?w=` override it.
     let quorum = if w == 0 {
         replication / 2 + 1
@@ -1162,6 +1162,24 @@ pub(crate) async fn fetch_all_docs(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
+/// One owner's part of a cluster view query.
+#[derive(Default)]
+pub(crate) struct ViewBatch {
+    rows: Arc<Vec<crate::view::Row>>,
+    docs: HashMap<String, Value>,
+    total_rows: usize,
+    offset: usize,
+}
+
+/// Merged map rows for a cluster view query, with the counts CouchDB reports.
+pub(crate) struct ClusterViewRows {
+    pub spec: crate::view::ViewSpec,
+    pub rows: Arc<Vec<crate::view::Row>>,
+    pub docs: HashMap<String, Value>,
+    pub total_rows: usize,
+    pub offset: usize,
+}
+
 async fn fetch_view_mask(
     read: ClusterRead<'_>,
     view: IndexRef<'_>,
@@ -1170,12 +1188,7 @@ async fn fetch_view_mask(
     limit: Option<usize>,
     node: usize,
     mask: &[bool],
-) -> DbResult<(
-    usize,
-    Arc<Vec<crate::view::Row>>,
-    HashMap<String, Value>,
-    usize,
-)> {
+) -> DbResult<ViewBatch> {
     let ClusterRead {
         st,
         db,
@@ -1187,39 +1200,32 @@ async fn fetch_view_mask(
         name: view_name,
     } = view;
     if !mask.iter().any(|owned| *owned) {
-        return Ok((node, Arc::new(Vec::new()), HashMap::new(), 0));
+        return Ok(ViewBatch::default());
     }
+    // Owners apply the key range and return at most `limit` rows from their
+    // shards; the coordinator merges and pages the union.
+    let mut local = query.clone();
+    local.skip = 0;
+    local.limit = limit.unwrap_or(usize::MAX);
+    local.owner_shards = Some(mask.to_vec());
     if node == st.cluster.me {
-        let rows = crate::view::local_rows(
-            db,
-            ddoc,
-            view_name,
-            spec,
-            query.limits,
-            query.partition.as_deref(),
-        )
-        .await?;
-        let mut rows: Vec<crate::view::Row> = rows
-            .iter()
-            .filter(|row| mask.get(db.shard_index(&row.id)).copied().unwrap_or(false))
-            .cloned()
-            .collect();
-        let total_rows = rows.len();
-        if let Some(limit) = limit {
-            if query.descending {
-                let skip = rows.len().saturating_sub(limit);
-                rows = rows.split_off(skip);
-            } else {
-                rows.truncate(limit);
-            }
-        }
-        let node_docs = if query.include_docs || query.attachments {
-            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
+        let docs = if query.include_docs || query.attachments {
+            let ids = selection
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>();
             crate::view::docs_by_ids(db, query.attachments, &ids).await?
         } else {
             HashMap::new()
         };
-        return Ok((node, Arc::new(rows), node_docs, total_rows));
+        return Ok(ViewBatch {
+            rows: Arc::new(selection.rows),
+            docs,
+            total_rows: selection.total_rows,
+            offset: selection.offset,
+        });
     }
 
     let peer = &st.cluster.nodes[node];
@@ -1246,12 +1252,7 @@ async fn fetch_view_mask(
             if query.attachments { "true" } else { "false" }.to_string(),
         ),
     ];
-    if query.descending {
-        params.push(("descending", "true".to_string()));
-    }
-    if let Some(partition) = &query.partition {
-        params.push(("partition", partition.clone()));
-    }
+    push_range_params(&mut params, query);
     if let Some(limit) = limit.filter(|limit| *limit != usize::MAX) {
         params.push(("limit", limit.to_string()));
     }
@@ -1277,20 +1278,51 @@ async fn fetch_view_mask(
         .json::<Value>()
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-    let (rows, node_docs, total_rows) = decode_view_batch(value);
-    Ok((node, rows, node_docs, total_rows))
+    Ok(decode_view_batch(value))
+}
+
+/// The key-range parameters an owner applies to its own shards.
+fn push_range_params(params: &mut Vec<(&'static str, String)>, query: &crate::view::ViewQuery) {
+    if query.descending {
+        params.push(("descending", "true".to_string()));
+    }
+    let encode = |value: &Value| serde_json::to_string(value).unwrap_or_default();
+    if let Some(key) = &query.key {
+        params.push(("key", encode(key)));
+    }
+    if let Some(keys) = &query.keys {
+        // An owner only needs each key once: the coordinator restores the
+        // requested order and repetitions when it renders the merged result.
+        params.push((
+            "keys",
+            encode(&Value::Array(crate::view::unique_keys(keys))),
+        ));
+    }
+    if let Some(start) = &query.startkey {
+        params.push(("startkey", encode(start)));
+    }
+    if let Some(end) = &query.endkey {
+        params.push(("endkey", encode(end)));
+    }
+    if let Some(id) = &query.startkey_docid {
+        params.push(("startkey_docid", id.clone()));
+    }
+    if let Some(id) = &query.endkey_docid {
+        params.push(("endkey_docid", id.clone()));
+    }
+    if !query.inclusive_end {
+        params.push(("inclusive_end", "false".to_string()));
+    }
+    if let Some(partition) = &query.partition {
+        params.push(("partition", partition.clone()));
+    }
 }
 
 pub(crate) async fn cluster_view_rows(
     read: ClusterRead<'_>,
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
-) -> DbResult<(
-    crate::view::ViewSpec,
-    Arc<Vec<crate::view::Row>>,
-    HashMap<String, Value>,
-    Option<usize>,
-)> {
+) -> DbResult<ClusterViewRows> {
     let ClusterRead {
         st,
         db,
@@ -1311,13 +1343,10 @@ pub(crate) async fn cluster_view_rows(
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-    // A reduce needs the whole range. A map query can take only the global
-    // window from each owner because the owner sets are disjoint.
-    let can_limit = !reduce
-        && query.startkey.is_none()
-        && query.endkey.is_none()
-        && query.key.is_none()
-        && query.keys.is_none();
+    // Owners apply the key range themselves. A reduce needs every row in it;
+    // a map query takes only the global window from each owner because the
+    // owner sets are disjoint.
+    let can_limit = !reduce;
     let take = query.skip.saturating_add(query.limit);
 
     let owned_by_node = preferred_shard_masks(st, db);
@@ -1332,8 +1361,16 @@ pub(crate) async fn cluster_view_rows(
     let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut total_rows = 0usize;
-    for (_, _, (_, rows, node_docs, node_total)) in values {
+    let mut offset = 0usize;
+    for (_, _, batch) in values {
+        let ViewBatch {
+            rows,
+            docs: node_docs,
+            total_rows: node_total,
+            offset: node_offset,
+        } = batch;
         total_rows += node_total;
+        offset += node_offset;
         docs.extend(node_docs);
         let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
         for row in rows.iter() {
@@ -1360,7 +1397,32 @@ pub(crate) async fn cluster_view_rows(
         }
     }
     crate::view::sort_rows(&mut rows);
-    Ok((spec, Arc::new(rows), docs, Some(total_rows)))
+    Ok(ClusterViewRows {
+        spec,
+        rows: Arc::new(rows),
+        docs,
+        total_rows,
+        offset,
+    })
+}
+
+/// The reduce each owner runs on its shards: the requested key range without
+/// paging, which applies to the merged groups. For `keys`, owners return one
+/// partial per distinct exact key, so the coordinator can rebuild the
+/// requested order, repeats and group levels.
+fn owner_reduce_query(query: &crate::view::ViewQuery, mask: &[bool]) -> crate::view::ViewQuery {
+    let mut owner = query.clone();
+    owner.skip = 0;
+    owner.limit = usize::MAX;
+    owner.reduce = Some(true);
+    owner.owner_shards = Some(mask.to_vec());
+    if let Some(keys) = &query.keys {
+        owner.keys = Some(crate::view::unique_keys(keys));
+        owner.group = true;
+        owner.group_level = 0;
+        owner.descending = false;
+    }
+    owner
 }
 
 async fn fetch_reduce_mask(
@@ -1369,7 +1431,7 @@ async fn fetch_reduce_mask(
     query: &crate::view::ViewQuery,
     node: usize,
     mask: &[bool],
-) -> DbResult<(usize, Value)> {
+) -> DbResult<Value> {
     let ClusterRead {
         st,
         db,
@@ -1380,12 +1442,9 @@ async fn fetch_reduce_mask(
         ddoc,
         name: view_name,
     } = view;
+    let owner = owner_reduce_query(query, mask);
     if node == st.cluster.me {
-        let mut local = query.clone();
-        local.owner_shards = Some(mask.to_vec());
-        local.reduce = Some(true);
-        let value = crate::view::query(db, ddoc, view_name, &local).await?;
-        return Ok((node, value));
+        return crate::view::query(db, ddoc, view_name, &owner).await;
     }
 
     let peer = &st.cluster.nodes[node];
@@ -1404,15 +1463,13 @@ async fn fetch_reduce_mask(
         ("reduce", "true".to_string()),
         ("shards", selected.join(",")),
     ];
-    if query.group {
+    if owner.group {
         params.push(("group", "true".to_string()));
     }
-    if query.group_level > 0 {
-        params.push(("group_level", query.group_level.to_string()));
+    if owner.group_level > 0 {
+        params.push(("group_level", owner.group_level.to_string()));
     }
-    if let Some(partition) = &query.partition {
-        params.push(("partition", partition.clone()));
-    }
+    push_range_params(&mut params, &owner);
     let request = st
         .client
         .get(url)
@@ -1431,13 +1488,14 @@ async fn fetch_reduce_mask(
             response.text().await.unwrap_or_default(),
         ));
     }
-    let value = response
+    response
         .json::<Value>()
         .await
-        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
-    Ok((node, value))
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
 }
 
+/// Reduce on every owner and combine the partials, so only one value per
+/// group crosses the network.
 pub(crate) async fn cluster_reduce(
     read: ClusterRead<'_>,
     view: IndexRef<'_>,
@@ -1452,132 +1510,34 @@ pub(crate) async fn cluster_reduce(
     let ddoc_doc = db.get_doc(ddoc, &DocOpts::default()).await?;
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
+    crate::view::check_query(&spec, query)?;
     let owned_by_node = preferred_shard_masks(st, db);
     let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
         fetch_reduce_mask(read, view, query, node, &mask).await
     })
     .await?;
 
-    let grouped = query.group || query.group_level > 0;
-    let mut partials = Vec::new();
-    let mut groups: HashMap<String, (Value, Value)> = HashMap::new();
-    for (_, _, (_, value)) in values {
-        if grouped {
-            for row in value["rows"].as_array().cloned().unwrap_or_default() {
-                let key = row.get("key").cloned().unwrap_or(Value::Null);
-                let value = row.get("value").cloned().unwrap_or(Value::Null);
-                let hash = serde_json::to_string(&key).unwrap_or_default();
-                match groups.get_mut(&hash) {
-                    Some((_, existing)) => {
-                        let combined = combine_reduce_values(
-                            reducer,
-                            &[existing.clone(), value],
-                            query.limits,
-                        )?;
-                        *existing = combined;
-                    }
-                    None => {
-                        groups.insert(hash, (key, value));
-                    }
-                }
-            }
-        } else {
-            partials.push(
-                value["rows"]
-                    .get(0)
-                    .and_then(|row| row.get("value"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+    let mut partials = crate::view::Partials::new();
+    for (_, _, value) in values {
+        for row in value["rows"].as_array().cloned().unwrap_or_default() {
+            let key = row.get("key").cloned().unwrap_or(Value::Null);
+            let value = row.get("value").cloned().unwrap_or(Value::Null);
+            crate::view::add_partial(&mut partials, key, value);
         }
     }
-
-    if grouped {
-        let mut rows: Vec<(Value, Value)> = groups.into_values().collect();
-        rows.sort_by(|a, b| crate::view::cmp_json(&a.0, &b.0));
-        return Ok(json!({
-            "rows": rows
-                .into_iter()
-                .map(|(key, value)| json!({"key": key, "value": value}))
-                .collect::<Vec<_>>()
-        }));
-    }
-
-    let value = if partials.len() == 1 {
-        partials.pop().unwrap_or(Value::Null)
-    } else {
-        combine_reduce_values(reducer, &partials, query.limits)?
-    };
-    Ok(json!({"rows": [{"key": Value::Null, "value": value}]}))
+    let mut js = crate::view::JsReducer::new(reducer, query.limits);
+    crate::view::assemble_reduce(partials, query, &mut js).map_err(|reason| {
+        ApiError::new(
+            500,
+            "view_error",
+            format!("reduce function failed: {reason}"),
+        )
+    })
 }
 
-pub(crate) fn combine_reduce_values(
-    reducer: &str,
-    partials: &[Value],
-    limits: crate::view::ViewLimits,
-) -> DbResult<Value> {
-    match reducer {
-        "_count" => Ok(json!(partials
-            .iter()
-            .map(|value| value.as_u64().unwrap_or(0))
-            .sum::<u64>())),
-        "_sum" => {
-            let mut sum = 0.0;
-            for value in partials {
-                sum += value.as_f64().ok_or_else(|| {
-                    ApiError::new(
-                        500,
-                        "view_error",
-                        format!("_sum requires numbers, got {value}"),
-                    )
-                })?;
-            }
-            Ok(crate::view::number_value(sum))
-        }
-        "_stats" => {
-            let mut count = 0u64;
-            let mut sum = 0.0;
-            let mut sumsqr = 0.0;
-            let mut min: Option<f64> = None;
-            let mut max: Option<f64> = None;
-            for value in partials {
-                count += value.get("count").and_then(Value::as_u64).unwrap_or(0);
-                sum += value.get("sum").and_then(Value::as_f64).unwrap_or(0.0);
-                sumsqr += value.get("sumsqr").and_then(Value::as_f64).unwrap_or(0.0);
-                if let Some(number) = value.get("min").and_then(Value::as_f64) {
-                    min = Some(min.map_or(number, |current| current.min(number)));
-                }
-                if let Some(number) = value.get("max").and_then(Value::as_f64) {
-                    max = Some(max.map_or(number, |current| current.max(number)));
-                }
-            }
-            if count == 0 {
-                return Ok(json!({
-                    "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
-                }));
-            }
-            Ok(json!({
-                "sum": crate::view::number_value(sum),
-                "count": count,
-                "min": crate::view::number_value(min.unwrap_or(0.0)),
-                "max": crate::view::number_value(max.unwrap_or(0.0)),
-                "sumsqr": crate::view::number_value(sumsqr),
-            }))
-        }
-        _ => crate::view::recombine(reducer, partials, limits).map_err(|reason| {
-            ApiError::new(
-                500,
-                "view_error",
-                format!("reduce function failed: {reason}"),
-            )
-        }),
-    }
-}
-
-pub(crate) fn decode_view_batch(
-    value: Value,
-) -> (Arc<Vec<crate::view::Row>>, HashMap<String, Value>, usize) {
+pub(crate) fn decode_view_batch(value: Value) -> ViewBatch {
     let total_rows = value["total_rows"].as_u64().unwrap_or(0) as usize;
+    let offset = value["offset"].as_u64().unwrap_or(0) as usize;
     let mut rows = Vec::new();
     let mut docs = HashMap::new();
     for row in value["rows"].as_array().cloned().unwrap_or_default() {
@@ -1593,7 +1553,12 @@ pub(crate) fn decode_view_batch(
             value: row.get("value").cloned().unwrap_or(Value::Null),
         });
     }
-    (Arc::new(rows), docs, total_rows)
+    ViewBatch {
+        rows: Arc::new(rows),
+        docs,
+        total_rows,
+        offset,
+    }
 }
 
 pub(crate) fn row_key(row: &crate::view::Row) -> String {

@@ -20,14 +20,24 @@ pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build a runtime with the standard view/search limits.
 pub fn runtime(timeout: Duration, memory: usize) -> Result<rquickjs::Runtime, String> {
+    let (runtime, deadline) = reusable_runtime(memory)?;
+    *deadline.lock().unwrap_or_else(|poison| poison.into_inner()) = Instant::now() + timeout;
+    Ok(runtime)
+}
+
+/// A runtime for several calls: the caller moves the deadline before each.
+pub fn reusable_runtime(memory: usize) -> Result<(rquickjs::Runtime, Arc<Mutex<Instant>>), String> {
     let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(memory);
     runtime.set_max_stack_size(512 * 1024);
     // A view is arbitrary user code. Stop runaway loops instead of hanging the
     // request thread forever.
-    let deadline = Instant::now() + timeout;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
-    Ok(runtime)
+    let deadline = Arc::new(Mutex::new(Instant::now()));
+    let shared = Arc::clone(&deadline);
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        Instant::now() > *shared.lock().unwrap_or_else(|poison| poison.into_inner())
+    })));
+    Ok((runtime, deadline))
 }
 
 /// Contain a Rust panic from the bindings (a C `abort` or segfault is not

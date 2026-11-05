@@ -72,6 +72,12 @@ impl ShardMap {
         self.replicas_of(shard).first().copied().unwrap_or(0)
     }
 
+    /// Copies of each shard. Every shard has the same count unless a
+    /// rebalance is part way through.
+    pub fn n(&self) -> usize {
+        self.replicas.iter().map(Vec::len).max().unwrap_or(1).max(1)
+    }
+
     pub fn is_valid(&self, q: u32, node_count: usize) -> bool {
         self.q == q.max(1)
             && self.node_count == node_count
@@ -84,14 +90,26 @@ impl ShardMap {
 
 impl Cluster {
     pub fn shard_map(&self, q: u32) -> ShardMap {
+        self.shard_map_n(q, self.n)
+    }
+
+    /// A shard map with `n` copies of each shard, clamped to the node count.
+    pub fn shard_map_n(&self, q: u32, n: usize) -> ShardMap {
         let q = q.max(1);
         if self.nodes.is_empty() {
             return ShardMap::single(q);
         }
+        let n = n.max(1).min(self.nodes.len());
         ShardMap {
             q,
             node_count: self.nodes.len(),
-            replicas: (0..q).map(|shard| self.replicas_of_shard(shard)).collect(),
+            replicas: (0..q)
+                .map(|shard| {
+                    let mut replicas = self.replicas_of_shard_ranked(shard);
+                    replicas.truncate(n);
+                    replicas
+                })
+                .collect(),
             version: 0,
         }
     }
@@ -109,6 +127,13 @@ impl Cluster {
     /// replica set, in preference order. Every node computes the same list from
     /// the same static configuration, so no metadata needs distributing.
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
+        let mut replicas = self.replicas_of_shard_ranked(shard);
+        replicas.truncate(self.replication_factor());
+        replicas
+    }
+
+    /// Every node, in rendezvous preference order for `shard`.
+    fn replicas_of_shard_ranked(&self, shard: u32) -> Vec<usize> {
         if self.nodes.is_empty() {
             return vec![0];
         }
@@ -119,11 +144,7 @@ impl Cluster {
             .map(|(i, node)| (score(node, shard), i))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        ranked
-            .into_iter()
-            .take(self.replication_factor())
-            .map(|(_, i)| i)
-            .collect()
+        ranked.into_iter().map(|(_, i)| i).collect()
     }
 
     /// The first replica is the primary: reads and writes coordinate through

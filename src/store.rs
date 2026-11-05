@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusty_leveldb::{LdbIterator, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +81,60 @@ pub struct ShardState {
     pub deleted: u64,
     pub seq: u64,
     pub digest: Option<String>,
+}
+
+/// Each document's latest sequence, indexed both ways: by id to update it
+/// and to find design documents, and by sequence so a `_changes` read only
+/// touches the rows after its cursor instead of every document in the shard.
+#[derive(Default)]
+pub struct LatestChanges {
+    by_id: BTreeMap<String, u64>,
+    by_seq: BTreeSet<(u64, String)>,
+}
+
+impl LatestChanges {
+    pub fn insert(&mut self, id: String, seq: u64) {
+        if let Some(old) = self.by_id.insert(id.clone(), seq) {
+            self.by_seq.remove(&(old, id.clone()));
+        }
+        self.by_seq.insert((seq, id));
+    }
+
+    /// Documents whose latest sequence is above `since`, in sequence order.
+    pub fn after(&self, since: u64) -> impl DoubleEndedIterator<Item = (u64, &str)> {
+        let start = since.checked_add(1).map(|seq| (seq, String::new()));
+        start
+            .into_iter()
+            .flat_map(|start| self.by_seq.range(start..))
+            .map(|(seq, id)| (*seq, id.as_str()))
+    }
+
+    /// Documents whose latest sequence is below `before`, in sequence order.
+    pub fn before(&self, before: u64) -> impl DoubleEndedIterator<Item = (u64, &str)> {
+        self.by_seq
+            .range(..(before, String::new()))
+            .map(|(seq, id)| (*seq, id.as_str()))
+    }
+
+    /// Every document, in sequence order.
+    pub fn all(&self) -> impl DoubleEndedIterator<Item = (u64, &str)> {
+        self.by_seq.iter().map(|(seq, id)| (*seq, id.as_str()))
+    }
+
+    pub fn seq_of(&self, id: &str) -> Option<u64> {
+        self.by_id.get(id).copied()
+    }
+
+    /// Ids starting with `prefix`, in id order.
+    pub fn ids_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> {
+        self.by_id
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(id, _)| id)
+            .take_while(move |id| id.starts_with(prefix))
+    }
 }
 
 /// A batch of changes plus the sequence counter, committed atomically.
@@ -179,7 +233,7 @@ pub struct Shard {
     /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
-    latest: Option<BTreeMap<String, u64>>,
+    latest: Option<LatestChanges>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -447,11 +501,11 @@ impl Shard {
         Ok(self.live.as_ref().expect("live index initialized"))
     }
 
-    /// Document id -> latest sequence, built lazily from metadata. Used by
+    /// Each document's latest sequence, built lazily from metadata. Used by
     /// `_changes`, which returns one row per document.
-    pub fn latest_changes(&mut self) -> Result<&BTreeMap<String, u64>> {
+    pub fn latest_changes(&mut self) -> Result<&LatestChanges> {
         if self.latest.is_none() {
-            let mut latest = BTreeMap::new();
+            let mut latest = LatestChanges::default();
             self.scan_range_while(b"m/", None, false, |key, value| {
                 if let Ok(id) = std::str::from_utf8(&key[2..]) {
                     if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
@@ -486,16 +540,11 @@ impl Shard {
 
     pub fn pending_changes(&mut self, after: u64, descending: bool) -> Result<usize> {
         let latest = self.latest_changes()?;
-        Ok(latest
-            .values()
-            .filter(|seq| {
-                if descending {
-                    **seq < after
-                } else {
-                    **seq > after
-                }
-            })
-            .count())
+        Ok(if descending {
+            latest.before(after).count()
+        } else {
+            latest.after(after).count()
+        })
     }
 
     pub fn revs_limit(&self) -> u64 {
@@ -1193,5 +1242,40 @@ mod scan_tests {
         assert_eq!(tail.len(), 2, "scan from seq 4 must include 4 and 5");
         assert_eq!(shard.scan_from(b"s/", &seq_key(9)).unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_changes_index_moves_documents_to_their_newest_sequence() {
+        let mut latest = LatestChanges::default();
+        latest.insert("a".into(), 1);
+        latest.insert("_design/v".into(), 2);
+        latest.insert("b".into(), 3);
+        latest.insert("a".into(), 4); // a is updated: its old sequence goes
+        let after = |since| {
+            latest
+                .after(since)
+                .map(|(seq, id)| (seq, id.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            after(0),
+            [(2, "_design/v".into()), (3, "b".into()), (4, "a".into())]
+        );
+        assert_eq!(after(3), [(4, "a".to_string())]);
+        assert!(after(4).is_empty());
+        assert!(after(u64::MAX).is_empty());
+        assert_eq!(
+            latest.before(3).map(|(seq, _)| seq).collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            latest.all().rev().map(|(seq, _)| seq).collect::<Vec<_>>(),
+            [4, 3, 2]
+        );
+        assert_eq!(latest.seq_of("a"), Some(4));
+        assert_eq!(
+            latest.ids_with_prefix("_design/").collect::<Vec<_>>(),
+            ["_design/v"]
+        );
     }
 }

@@ -389,8 +389,7 @@ impl Db {
             let mut found = shard
                 .call(|s| {
                     Ok(s.latest_changes()?
-                        .keys()
-                        .filter(|id| id.starts_with("_design/"))
+                        .ids_with_prefix("_design/")
                         .cloned()
                         .collect::<Vec<String>>())
                 })
@@ -454,6 +453,21 @@ impl Db {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// Copies of each shard, from the current shard map.
+    pub fn copies(&self) -> usize {
+        self.shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .n()
+    }
+
+    /// CouchDB's `cluster` block in database info: shards, copies, and the
+    /// default write and read quorums.
+    fn cluster_info(&self) -> Value {
+        let n = self.copies();
+        json!({"q": self.q, "n": n, "w": n / 2 + 1, "r": n / 2 + 1})
     }
 
     pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
@@ -739,6 +753,7 @@ impl Db {
             "disk_format_version": 8,
             "committed_update_seq": update_seq,
             "uuid": self.uuid,
+            "cluster": self.cluster_info(),
         });
         if self.partitioned {
             info["props"] = json!({"partitioned": true});
@@ -1209,7 +1224,14 @@ impl Db {
                         let mut shard_opts = opts.clone();
                         shard_opts.since = cursors[slot];
                         shard_opts.descending = false;
-                        shard_opts.limit = Some(PAGE);
+                        // A shard never needs more rows than the request can
+                        // still return; a filter may discard rows, so it keeps
+                        // full pages.
+                        let wanted = match (opts.limit, &opts.filter) {
+                            (Some(limit), None) => limit.saturating_sub(emitted).max(1),
+                            _ => PAGE,
+                        };
+                        shard_opts.limit = Some(PAGE.min(wanted));
                         match db.shards[index]
                             .call(move |shard| collect_changes(shard, &shard_opts))
                             .await
@@ -2670,20 +2692,36 @@ fn collect_changes(
     // CouchDB returns one row per document at its latest sequence, not one
     // row per historical sequence entry. `latest_changes` is maintained on
     // writes and built lazily from metadata.
-    let mut candidates: Vec<(u64, String)> = shard
-        .latest_changes()?
-        .iter()
-        .filter(|(_, seq)| opts.descending || **seq > opts.since)
-        .map(|(id, seq)| (*seq, id.clone()))
-        .collect();
-    if let Some(ids) = &opts.doc_ids {
-        candidates.retain(|(_, id)| ids.iter().any(|wanted| wanted == id));
-    }
-    candidates.sort_by_key(|(seq, _)| *seq);
-    if opts.descending {
-        candidates.reverse();
-    }
-    candidates.truncate(limit);
+    // Read only the rows after the cursor, already in sequence order. A
+    // descending feed walks back from the newest change.
+    let latest = shard.latest_changes()?;
+    let candidates: Vec<(u64, String)> = match &opts.doc_ids {
+        Some(ids) => {
+            let mut selected: Vec<(u64, String)> = ids
+                .iter()
+                .filter_map(|id| latest.seq_of(id).map(|seq| (seq, id.clone())))
+                .filter(|(seq, _)| opts.descending || *seq > opts.since)
+                .collect();
+            selected.sort();
+            selected.dedup();
+            if opts.descending {
+                selected.reverse();
+            }
+            selected.truncate(limit);
+            selected
+        }
+        None if opts.descending => latest
+            .all()
+            .rev()
+            .take(limit)
+            .map(|(seq, id)| (seq, id.to_string()))
+            .collect(),
+        None => latest
+            .after(opts.since)
+            .take(limit)
+            .map(|(seq, id)| (seq, id.to_string()))
+            .collect(),
+    };
 
     let mut rows = Vec::with_capacity(candidates.len());
     for (seq, id) in candidates {

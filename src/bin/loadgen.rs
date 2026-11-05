@@ -7,6 +7,9 @@
 //! cargo run --release --bin loadgen -- \
 //!   --base http://127.0.0.1:5984,http://127.0.0.1:5985 \
 //!   --path '/perf/doc-{id}' --start 0 --count 10000 --concurrency 64
+//!
+//! `--method PUT --body '{"n": {id}}'` writes instead: `{id}` is replaced in
+//! both the path and the JSON body.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +24,8 @@ struct Args {
     concurrency: usize,
     pad: usize,
     timeout: Duration,
+    method: reqwest::Method,
+    body: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -32,6 +37,8 @@ fn parse_args() -> Args {
         concurrency: 32,
         pad: 6,
         timeout: Duration::from_secs(120),
+        method: reqwest::Method::GET,
+        body: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -56,6 +63,14 @@ fn parse_args() -> Args {
                 args.timeout =
                     Duration::from_secs(it.next().and_then(|v| v.parse().ok()).unwrap_or(120))
             }
+            "--method" => {
+                let method = it.next().unwrap_or_default();
+                args.method = method
+                    .to_uppercase()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("unknown method: {method}"));
+            }
+            "--body" => args.body = it.next(),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -95,15 +110,22 @@ async fn main() {
         let bases = args.bases.clone();
         let path = args.path.clone();
         let pad = args.pad;
+        let method = args.method.clone();
+        let body = args.body.clone();
         futures.push(async move {
             let mut latencies = Vec::with_capacity(hi - lo);
             for id in lo..hi {
                 let base = &bases[id % base_count];
-                let rendered = path.replace("{id}", &format!("{id:0pad$}", pad = pad));
-                let url = format!("{base}{rendered}");
+                let id = format!("{id:0pad$}", pad = pad);
+                let url = format!("{base}{}", path.replace("{id}", &id));
+                let mut request = client.request(method.clone(), &url);
+                if let Some(body) = &body {
+                    request = request
+                        .header("content-type", "application/json")
+                        .body(body.replace("{id}", &id));
+                }
                 let started = Instant::now();
-                let response = client
-                    .get(&url)
+                let response = request
                     .send()
                     .await
                     .map_err(|error| format!("{url}: {error}"))?;

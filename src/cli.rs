@@ -40,7 +40,7 @@ pub fn parse_args() -> Args {
     let mut args = Args {
         listen: "127.0.0.1:5984".into(),
         data: PathBuf::from("data"),
-        q: 1,
+        q: 2,
         n: 3,
         revs_limit: 1000,
         admin: None,
@@ -75,8 +75,8 @@ pub fn parse_args() -> Args {
         match arg.as_str() {
             "--listen" => args.listen = it.next().unwrap_or_default(),
             "--data" => args.data = PathBuf::from(it.next().unwrap_or_default()),
-            "--q" => args.q = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
-            "--n" => args.n = it.next().and_then(|v| v.parse().ok()).unwrap_or(2),
+            "--q" => args.q = it.next().and_then(|v| v.parse().ok()).unwrap_or(2),
+            "--n" => args.n = it.next().and_then(|v| v.parse().ok()).unwrap_or(3),
             "--revs-limit" => {
                 args.revs_limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(1000)
             }

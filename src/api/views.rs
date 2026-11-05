@@ -395,6 +395,7 @@ pub(super) async fn view_request(
             partition: partition.clone().or_else(|| q.get("partition").cloned()),
             partitioned: db.partitioned,
             total_rows_override: None,
+            offset_override: None,
         })
     };
 
@@ -414,19 +415,14 @@ pub(super) async fn view_request(
         }
     }
 
-    // A global `_count`/`_sum`/`_stats` with no grouping can be reduced
-    // independently on each owner and combined, instead of shipping every map
-    // row to the coordinator.
+    // Owners reduce their own shards and the coordinator combines the
+    // partials, instead of shipping every map row. `_approx_count_distinct`
+    // returns a finished estimate, which cannot be combined.
     let combine_reduce = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         match crate::view::load_spec(db, ddoc, view_name).await {
             Ok(spec) => {
                 let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
                 if reduce
-                    && query.key.is_none()
-                    && query.keys.is_none()
-                    && query.startkey.is_none()
-                    && query.endkey.is_none()
-                    && !query.descending
                     && spec
                         .reduce
                         .as_deref()
@@ -477,11 +473,10 @@ pub(super) async fn view_request(
         )
         .await
         {
-            Ok((spec, rows, docs, total_rows)) => {
-                if let Some(total_rows) = total_rows {
-                    query.total_rows_override = Some(total_rows);
-                }
-                crate::view::finish(&spec, rows, docs, &query)
+            Ok(merged) => {
+                query.total_rows_override = Some(merged.total_rows);
+                query.offset_override = Some(merged.offset);
+                crate::view::finish(&merged.spec, merged.rows, merged.docs, &query)
             }
             Err(error) => Err(error),
         }
