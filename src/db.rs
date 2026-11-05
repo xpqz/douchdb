@@ -191,7 +191,16 @@ pub struct Db {
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
     validation: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+    /// Bumped on every design-document write, so a validator load that raced
+    /// with one is not cached.
+    design_generation: Arc<AtomicU64>,
+    /// Validators merged from every node by a cluster coordinator, with the
+    /// design generation and time they were loaded.
+    cluster_validation: Arc<std::sync::RwLock<Option<ClusterValidators>>>,
 }
+
+/// Design generation, load time and sources of cluster-merged validators.
+type ClusterValidators = (u64, std::time::Instant, Vec<String>);
 
 #[derive(Clone)]
 pub struct DbConfig {
@@ -287,6 +296,8 @@ impl Db {
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
             validation: Arc::new(std::sync::RwLock::new(None)),
+            design_generation: Arc::new(AtomicU64::new(0)),
+            cluster_validation: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -384,6 +395,7 @@ impl Db {
             return Ok(functions);
         }
 
+        let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
             let mut found = shard
@@ -424,11 +436,46 @@ impl Db {
             }
         }
 
-        *self
+        let mut cached = self
             .validation
             .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(functions.clone());
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.design_generation() == generation {
+            *cached = Some(functions.clone());
+        }
         Ok(functions)
+    }
+
+    /// Generation of this node's design documents.
+    pub(crate) fn design_generation(&self) -> u64 {
+        self.design_generation.load(Ordering::SeqCst)
+    }
+
+    /// Cluster-merged validators loaded no longer than `ttl` ago and with no
+    /// design-document write on this node since.
+    pub(crate) fn cached_cluster_validators(
+        &self,
+        ttl: std::time::Duration,
+    ) -> Option<Vec<String>> {
+        let cached = self
+            .cluster_validation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (generation, loaded, functions) = cached.as_ref()?;
+        (*generation == self.design_generation() && loaded.elapsed() < ttl)
+            .then(|| functions.clone())
+    }
+
+    /// Cache cluster-merged validators read since `generation` was taken,
+    /// unless a design document was written in the meantime.
+    pub(crate) fn cache_cluster_validators(&self, generation: u64, functions: Vec<String>) {
+        let mut cached = self
+            .cluster_validation
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.design_generation() == generation {
+            *cached = Some((generation, std::time::Instant::now(), functions));
+        }
     }
 
     pub fn set_security(&self, value: Value) -> DbResult<()> {
@@ -818,6 +865,7 @@ impl Db {
         }
 
         if touches_design {
+            self.design_generation.fetch_add(1, Ordering::SeqCst);
             *self
                 .validation
                 .write()
