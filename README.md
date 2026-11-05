@@ -447,8 +447,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 |---|---|---|
 | `--listen` | `127.0.0.1:5984` | HTTP listen address |
 | `--data` | `data` | Data directory (one LevelDB per database/shard) |
-| `--q` | `1` | Shards per database, fixed at creation |
-| `--n` | `2` | Replication factor, clamped to the node count |
+| `--q` | `2` | Default shards per database, fixed at creation (CouchDB's default) |
+| `--n` | `3` | Default copies of each shard, clamped to the node count (CouchDB's default) |
 | `--revs-limit` | `1000` | Revision history kept per document |
 | `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` |
 | `--users-file` | none | JSON users file with token/roles entries (see [docs/multiuser.md](docs/multiuser.md)) |
@@ -504,7 +504,10 @@ embedded `/_utils/` console is same-origin and needs no CORS flag.
 douchdb runs as a static **Q-shard × N-replica** cluster. Every node is a
 router; there is no coordinator role.
 
-- `--q` fixes the shard count when a database is created.
+- A database's shard count and copy count are fixed when it is created:
+  `PUT /db?q=8&n=2` as in CouchDB, otherwise `--q` and `--n`. `GET /db`
+  reports them in `cluster`, with the default write and read quorums
+  (`n/2 + 1`) that writes and reads to that database use.
 - `md5(docid)` selects the shard; rendezvous hashing over the node list selects
   `--n` distinct replicas, in preference order. The first is the primary.
 - A write is sent to every replica in the shard set and returns once the

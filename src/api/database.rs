@@ -24,7 +24,24 @@ pub async fn db_root(
                 return access_denied(&principal);
             }
             let partitioned = flag(&q, "partitioned");
-            if let Err(e) = st.create_db(&name, partitioned).await {
+            let positive = |param: &str| -> Result<Option<usize>, ApiError> {
+                match q.get(param) {
+                    None => Ok(None),
+                    Some(raw) => raw
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .map(Some)
+                        .ok_or_else(|| {
+                            ApiError::bad_request(format!("`{param}` must be a positive integer"))
+                        }),
+                }
+            };
+            let (shards, copies) = match (positive("q"), positive("n")) {
+                (Ok(shards), Ok(copies)) => (shards.map(|q| q as u32), copies),
+                (Err(e), _) | (_, Err(e)) => return fail(e),
+            };
+            if let Err(e) = st.create_db(&name, partitioned, shards, copies).await {
                 return fail(e);
             }
             if st.cluster.is_clustered() && !local_only {
@@ -32,13 +49,18 @@ pub async fn db_root(
                     if peer == &st.cluster.nodes[st.cluster.me] {
                         continue;
                     }
-                    let mut url = format!("{peer}/{name}");
-                    if partitioned {
-                        url.push_str("?partitioned=true");
+                    // Peers build the same shard map from the same layout.
+                    let mut layout = vec![("partitioned", partitioned.to_string())];
+                    if let Some(shards) = shards {
+                        layout.push(("q", shards.to_string()));
+                    }
+                    if let Some(copies) = copies {
+                        layout.push(("n", copies.to_string()));
                     }
                     let request = st
                         .client
-                        .put(url)
+                        .put(format!("{peer}/{name}"))
+                        .query(&layout)
                         .header("x-douchdb-local-db", "1")
                         .header("x-douchdb-secret", st.cluster.secret.as_str());
                     let request = forward_client_auth(request, &headers);

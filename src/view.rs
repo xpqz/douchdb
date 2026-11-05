@@ -68,6 +68,10 @@ pub struct ViewQuery {
     pub partitioned: bool,
     /// Set by the cluster coordinator after summing owner-only map row counts.
     pub total_rows_override: Option<usize>,
+    /// Set once rows have already been selected (by `ViewRows::select` or a
+    /// coordinator merge): the reported offset, and a signal that the
+    /// partition and shard filters have already been applied.
+    pub offset_override: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,9 +118,539 @@ struct ViewIndex {
     db: Ldb,
     last_seq: u64,
     design: String,
+    /// Shard count and partitioning of the database, used to split the cached
+    /// rows by shard.
+    placement: (u32, bool),
     /// Sorted rows for the current index state. Warm queries reuse this
     /// instead of scanning and parsing every stored row on each request.
-    cached: Option<Arc<Vec<Row>>>,
+    cached: Option<Arc<ViewRows>>,
+}
+
+/// A view's sorted rows, split by the shard of each row's document. A query
+/// reads only the shards it is asked for, finds its key range by binary
+/// search, and copies only the rows it can return, so its cost follows the
+/// result rather than the size of the index.
+#[derive(Default)]
+pub struct ViewRows {
+    shards: Vec<Vec<Row>>,
+    /// Per shard, a tree of partial reductions with the reducer source:
+    /// computed by the first reduce that needs it, dropped when the shard's
+    /// rows change.
+    blocks: Vec<StdMutex<Option<BlockPartials>>>,
+}
+
+/// Children per partial reduction. Level 0 reduces each `REDUCE_FANOUT` rows,
+/// and each level above combines `REDUCE_FANOUT` partials of the one below;
+/// the last at each level may be short. A span reads whole partials at the
+/// highest level they fit, so it touches fewer than `2 * REDUCE_FANOUT` rows
+/// or partials per level.
+const REDUCE_FANOUT: usize = 32;
+
+/// Partial reductions by group key (by exact key for a `keys` query), with
+/// the key itself.
+pub(crate) type Partials = HashMap<String, (Value, Vec<Value>)>;
+
+type BlockPartials = (String, Arc<Vec<Vec<Value>>>);
+
+impl Clone for ViewRows {
+    fn clone(&self) -> Self {
+        ViewRows {
+            shards: self.shards.clone(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|slot| StdMutex::new(lock_blocks(slot).clone()))
+                .collect(),
+        }
+    }
+}
+
+fn lock_blocks(
+    slot: &StdMutex<Option<BlockPartials>>,
+) -> std::sync::MutexGuard<'_, Option<BlockPartials>> {
+    slot.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The rows a query can return, in key order, plus the counts CouchDB
+/// reports for the whole (shard- and partition-filtered) view.
+pub struct Selection {
+    pub rows: Vec<Row>,
+    pub total_rows: usize,
+    pub offset: usize,
+}
+
+impl ViewRows {
+    fn from_rows(rows: Vec<Row>, (q, partitioned): (u32, bool)) -> ViewRows {
+        let mut shards = vec![Vec::new(); q.max(1) as usize];
+        for row in rows {
+            let shard = crate::db::shard_index_for(&row.id, q, partitioned);
+            shards[shard].push(row);
+        }
+        for shard in &mut shards {
+            sort_rows(shard);
+        }
+        let blocks = shards.iter().map(|_| StdMutex::new(None)).collect();
+        ViewRows { shards, blocks }
+    }
+
+    /// Replace the rows of `changed` documents with `added`, shard by shard.
+    /// Both runs are sorted, so each touched shard is merged in linear time.
+    fn replace_docs(&mut self, changed: &[String], added: Vec<Row>, (q, partitioned): (u32, bool)) {
+        let mut touched: HashMap<usize, (HashSet<&str>, Vec<Row>)> = HashMap::new();
+        for id in changed {
+            let shard = crate::db::shard_index_for(id, q, partitioned);
+            touched.entry(shard).or_default().0.insert(id);
+        }
+        for row in added {
+            let shard = crate::db::shard_index_for(&row.id, q, partitioned);
+            touched.entry(shard).or_default().1.push(row);
+        }
+        for (shard, (ids, mut rows)) in touched {
+            let mut kept = std::mem::take(&mut self.shards[shard]);
+            kept.retain(|row| !ids.contains(row.id.as_str()));
+            sort_rows(&mut rows);
+            self.shards[shard] = merge_sorted_rows(kept, rows);
+            if let Some(slot) = self.blocks.get_mut(shard) {
+                *slot.get_mut().unwrap_or_else(|poison| poison.into_inner()) = None;
+            }
+        }
+    }
+
+    /// Reduce `query` over the shards in `mask` (all when `None`). Each range
+    /// or group reads the stored partials of the blocks it covers whole and
+    /// reduces only the rows at its edges.
+    pub(crate) fn reduce(
+        &self,
+        query: &ViewQuery,
+        mask: Option<&[bool]>,
+        reducer: &mut JsReducer,
+    ) -> Result<Value, String> {
+        let mut partials = Partials::new();
+        for (index, rows) in self.shards.iter().enumerate() {
+            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+                continue;
+            }
+            let blocks = self.block_partials(index, reducer)?;
+            let (lo, hi) = range_bounds(rows, query);
+            let clamp = |(first, end): (usize, usize)| (first.max(lo), end.min(hi));
+            if let Some(keys) = &query.keys {
+                for key in unique_keys(keys) {
+                    let (first, end) = clamp(equal_range(rows, &key));
+                    if first < end {
+                        let value = reduce_span(rows, &blocks, first, end, reducer)?;
+                        add_partial(&mut partials, key, value);
+                    }
+                }
+                continue;
+            }
+            let (lo, hi) = match &query.key {
+                Some(key) => clamp(equal_range(rows, key)),
+                None => (lo, hi),
+            };
+            if !query.group && query.group_level == 0 {
+                if lo < hi {
+                    let value = reduce_span(rows, &blocks, lo, hi, reducer)?;
+                    add_partial(&mut partials, Value::Null, value);
+                }
+                continue;
+            }
+            // Group keys never decrease along sorted rows, so each group is
+            // a run found by binary search.
+            let mut start = lo;
+            while start < hi {
+                let group = group_key(&rows[start].key, query.group_level);
+                let end = start
+                    + rows[start..hi].partition_point(|row| {
+                        cmp_json(&group_key(&row.key, query.group_level), &group)
+                            != Ordering::Greater
+                    });
+                let value = reduce_span(rows, &blocks, start, end, reducer)?;
+                add_partial(&mut partials, group, value);
+                start = end;
+            }
+        }
+        assemble_reduce(partials, query, reducer)
+    }
+
+    fn block_partials(
+        &self,
+        shard: usize,
+        reducer: &mut JsReducer,
+    ) -> Result<Arc<Vec<Vec<Value>>>, String> {
+        let Some(slot) = self.blocks.get(shard) else {
+            return Ok(Arc::default());
+        };
+        let mut slot = lock_blocks(slot);
+        if let Some((_, blocks)) = slot
+            .as_ref()
+            .filter(|(source, _)| source == reducer.source())
+        {
+            return Ok(Arc::clone(blocks));
+        }
+        let mut levels: Vec<Vec<Value>> = vec![self.shards[shard]
+            .chunks(REDUCE_FANOUT)
+            .map(|chunk| reduce_rows(chunk, reducer))
+            .collect::<Result<_, _>>()?];
+        while let Some(below) = levels.last().filter(|below| below.len() > REDUCE_FANOUT) {
+            let above = below
+                .chunks(REDUCE_FANOUT)
+                .map(|chunk| match chunk {
+                    [single] => Ok(single.clone()),
+                    _ => combine_partials(reducer, chunk),
+                })
+                .collect::<Result<_, _>>()?;
+            levels.push(above);
+        }
+        let blocks = Arc::new(levels);
+        *slot = Some((reducer.source().to_string(), Arc::clone(&blocks)));
+        Ok(blocks)
+    }
+
+    /// Rows `query` can return from the shards in `mask` (all when `None`).
+    /// A reduce needs every row in range; otherwise at most `skip + limit`
+    /// rows are copied. `total_rows` and `offset` follow `ordered_rows`.
+    pub fn select(&self, query: &ViewQuery, mask: Option<&[bool]>, reduce: bool) -> Selection {
+        let cap = if reduce {
+            usize::MAX
+        } else {
+            query.skip.saturating_add(query.limit)
+        };
+        let mut out = Selection {
+            rows: Vec::new(),
+            total_rows: 0,
+            offset: 0,
+        };
+        for (index, shard) in self.shards.iter().enumerate() {
+            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+                continue;
+            }
+            match &query.partition {
+                Some(partition) => {
+                    // A partition is one shard, but it shares it with other
+                    // partitions, so its rows are counted by walking it.
+                    let prefix = format!("{partition}:");
+                    let rows: Vec<&Row> = shard
+                        .iter()
+                        .filter(|row| row.id.starts_with(&prefix))
+                        .collect();
+                    select_sorted(&rows, query, cap, &mut out);
+                }
+                None => select_sorted(shard, query, cap, &mut out),
+            }
+        }
+        // Rows from one document share a shard, so a stable sort keeps the
+        // emission order of equal rows.
+        out.rows.sort_by(row_cmp);
+        if !reduce && query.keys.is_none() && out.rows.len() > cap {
+            if query.descending {
+                out.rows.drain(..out.rows.len() - cap);
+            } else {
+                out.rows.truncate(cap);
+            }
+        }
+        out
+    }
+}
+
+impl AsRef<Row> for Row {
+    fn as_ref(&self) -> &Row {
+        self
+    }
+}
+
+/// Add one sorted shard's contribution to `out`. Rows are in ascending key
+/// order; the query bounds are found by binary search on that order.
+fn select_sorted<R: AsRef<Row>>(rows: &[R], query: &ViewQuery, cap: usize, out: &mut Selection) {
+    let len = rows.len();
+    out.total_rows += len;
+    let (lo, hi) = range_bounds(rows, query);
+    let equal = |key: &Value| equal_range(rows, key);
+    let before_key = |key: &Value| {
+        let (first, end) = equal(key);
+        if query.descending {
+            len - end
+        } else {
+            first
+        }
+    };
+    out.offset += if let Some(key) = &query.key {
+        before_key(key)
+    } else if let Some(keys) = &query.keys {
+        match keys.as_slice() {
+            [key] => before_key(key),
+            _ => 0,
+        }
+    } else if query.descending {
+        len - hi
+    } else {
+        lo
+    };
+
+    // Index ranges to read, in query order.
+    let clamp = |(first, end): (usize, usize)| (first.max(lo), end.min(hi).max(first.max(lo)));
+    let ranges: Vec<(usize, usize)> = if let Some(keys) = &query.keys {
+        let ordered: Vec<&Value> = if query.descending {
+            keys.iter().rev().collect()
+        } else {
+            keys.iter().collect()
+        };
+        ordered.into_iter().map(|key| clamp(equal(key))).collect()
+    } else if let Some(key) = &query.key {
+        vec![clamp(equal(key))]
+    } else {
+        vec![(lo, hi)]
+    };
+
+    // Take up to `cap` row indexes in query order. Duplicate `keys` share a
+    // range; each row is still selected once.
+    let mut chosen = std::collections::BTreeSet::new();
+    let mut remaining = cap;
+    for (first, end) in ranges {
+        if remaining == 0 {
+            break;
+        }
+        let indexes: Box<dyn Iterator<Item = usize>> = if query.descending {
+            Box::new((first..end).rev())
+        } else {
+            Box::new(first..end)
+        };
+        for index in indexes {
+            if remaining == 0 {
+                break;
+            }
+            if chosen.insert(index) {
+                remaining -= 1;
+            }
+        }
+    }
+    out.rows
+        .extend(chosen.into_iter().map(|index| rows[index].as_ref().clone()));
+}
+
+/// The index range of sorted `rows` inside the query's start and end bounds.
+fn range_bounds<R: AsRef<Row>>(rows: &[R], query: &ViewQuery) -> (usize, usize) {
+    let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(|row| pred(row.as_ref()));
+    // Rows before the start bound are a prefix (ascending) or a suffix
+    // (descending); rows past the end bound are the opposite end.
+    let (lo, hi) = if query.descending {
+        (
+            point(&|row| past_end(row, query)),
+            point(&|row| !before_start(row, query)),
+        )
+    } else {
+        (
+            point(&|row| before_start(row, query)),
+            point(&|row| !past_end(row, query)),
+        )
+    };
+    (lo, hi.max(lo))
+}
+
+/// The index range of sorted `rows` whose key equals `key`.
+fn equal_range<R: AsRef<Row>>(rows: &[R], key: &Value) -> (usize, usize) {
+    (
+        rows.partition_point(|row| cmp_json(&row.as_ref().key, key) == Ordering::Less),
+        rows.partition_point(|row| cmp_json(&row.as_ref().key, key) != Ordering::Greater),
+    )
+}
+
+/// Reduce `rows[first..end]` from the largest stored partials it covers
+/// whole, plus the rows and partials at either edge.
+fn reduce_span(
+    rows: &[Row],
+    levels: &[Vec<Value>],
+    first: usize,
+    end: usize,
+    reducer: &mut JsReducer,
+) -> Result<Value, String> {
+    // Units at level 0 are rows; at level k they are `levels[k - 1]`.
+    let mut take = |level: usize, from: usize, to: usize| -> Result<Vec<Value>, String> {
+        if level == 0 {
+            Ok(vec![reduce_rows(&rows[from..to], reducer)?])
+        } else {
+            Ok(levels[level - 1][from..to].to_vec())
+        }
+    };
+    let mut left = Vec::new();
+    let mut right: Vec<Vec<Value>> = Vec::new();
+    let (mut lo, mut hi, mut len) = (first, end, rows.len());
+    let mut level = 0;
+    let middle = loop {
+        let Some(parents) = levels.get(level).map(Vec::len) else {
+            break take(level, lo, hi)?;
+        };
+        // The last parent may be short; it is whole when the span reaches
+        // the end of this level.
+        let parent_lo = lo.div_ceil(REDUCE_FANOUT);
+        let parent_hi = if hi == len {
+            parents
+        } else {
+            (hi / REDUCE_FANOUT).min(parents)
+        };
+        if parent_lo >= parent_hi {
+            break take(level, lo, hi)?;
+        }
+        if lo < parent_lo * REDUCE_FANOUT {
+            left.extend(take(level, lo, parent_lo * REDUCE_FANOUT)?);
+        }
+        if parent_hi * REDUCE_FANOUT < hi {
+            right.push(take(level, parent_hi * REDUCE_FANOUT, hi)?);
+        }
+        (lo, hi, len) = (parent_lo, parent_hi, parents);
+        level += 1;
+    };
+    let mut parts = left;
+    parts.extend(middle);
+    parts.extend(right.into_iter().rev().flatten());
+    match parts.as_slice() {
+        [single] => Ok(single.clone()),
+        _ => combine_partials(reducer, &parts),
+    }
+}
+
+fn reduce_rows(rows: &[Row], reducer: &mut JsReducer) -> Result<Value, String> {
+    match reducer.source() {
+        "_count" => Ok(json!(rows.len())),
+        "_sum" => reduce_sum(rows.iter().map(|row| &row.value)),
+        "_stats" => reduce_stats(rows.iter().map(|row| &row.value)),
+        "_approx_count_distinct" => reduce_approx_count_distinct(rows.iter().map(|row| &row.value)),
+        _ => {
+            let keys: Vec<Value> = rows.iter().map(|row| json!([row.id, row.key])).collect();
+            let values: Vec<Value> = rows.iter().map(|row| row.value.clone()).collect();
+            reduce_with(reducer, &keys, &values)
+        }
+    }
+}
+
+/// Each requested key once, in first-seen order.
+pub(crate) fn unique_keys(keys: &[Value]) -> Vec<Value> {
+    let mut unique: Vec<Value> = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !unique
+            .iter()
+            .any(|seen| cmp_json(seen, key) == Ordering::Equal)
+        {
+            unique.push(key.clone());
+        }
+    }
+    unique
+}
+
+pub(crate) fn add_partial(partials: &mut Partials, key: Value, value: Value) {
+    partials
+        .entry(serde_json::to_string(&key).unwrap_or_default())
+        .or_insert_with(|| (key, Vec::new()))
+        .1
+        .push(value);
+}
+
+/// The reduce response from partials gathered across shards or nodes:
+/// grouped and ordered as a single pass over the rows would be, then paged.
+pub(crate) fn assemble_reduce(
+    partials: Partials,
+    query: &ViewQuery,
+    reducer: &mut JsReducer,
+) -> Result<Value, String> {
+    let grouped = query.group || query.group_level > 0;
+    let groups: Vec<(Value, Vec<Value>)> = if let Some(keys) = &query.keys {
+        // Walk the requested keys in request order (reversed when
+        // descending), merging neighbours that share a group.
+        let ordered: Vec<&Value> = if query.descending {
+            keys.iter().rev().collect()
+        } else {
+            keys.iter().collect()
+        };
+        let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+        for key in ordered {
+            let Some((_, values)) = partials.get(&serde_json::to_string(key).unwrap_or_default())
+            else {
+                continue;
+            };
+            let group = if grouped {
+                group_key(key, query.group_level)
+            } else {
+                Value::Null
+            };
+            match groups.last_mut() {
+                Some((existing, members)) if cmp_json(existing, &group) == Ordering::Equal => {
+                    members.extend(values.iter().cloned());
+                }
+                _ => groups.push((group, values.clone())),
+            }
+        }
+        groups
+    } else {
+        let mut groups: Vec<(Value, Vec<Value>)> = partials.into_values().collect();
+        groups.sort_by(|a, b| cmp_json(&a.0, &b.0));
+        if query.descending {
+            groups.reverse();
+        }
+        groups
+    };
+
+    let mut rows = Vec::new();
+    for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {
+        let value = if values.len() == 1 {
+            values.pop().unwrap_or(Value::Null)
+        } else {
+            combine_partials(reducer, &values)?
+        };
+        rows.push(json!({"key": key, "value": value}));
+    }
+    Ok(json!({ "rows": rows }))
+}
+
+/// Combine partial reductions with the reducer's rereduce.
+pub(crate) fn combine_partials(
+    reducer: &mut JsReducer,
+    partials: &[Value],
+) -> Result<Value, String> {
+    match reducer.source() {
+        "_count" => Ok(json!(partials
+            .iter()
+            .map(|value| value.as_u64().unwrap_or(0))
+            .sum::<u64>())),
+        "_sum" => {
+            let mut sum = 0.0;
+            for value in partials {
+                sum += value
+                    .as_f64()
+                    .ok_or_else(|| format!("_sum requires numbers, got {value}"))?;
+            }
+            Ok(number_value(sum))
+        }
+        "_stats" => {
+            let mut count = 0u64;
+            let mut sum = 0.0;
+            let mut sumsqr = 0.0;
+            let mut min: Option<f64> = None;
+            let mut max: Option<f64> = None;
+            for value in partials {
+                count += value.get("count").and_then(Value::as_u64).unwrap_or(0);
+                sum += value.get("sum").and_then(Value::as_f64).unwrap_or(0.0);
+                sumsqr += value.get("sumsqr").and_then(Value::as_f64).unwrap_or(0.0);
+                if let Some(number) = value.get("min").and_then(Value::as_f64) {
+                    min = Some(min.map_or(number, |current| current.min(number)));
+                }
+                if let Some(number) = value.get("max").and_then(Value::as_f64) {
+                    max = Some(max.map_or(number, |current| current.max(number)));
+                }
+            }
+            if count == 0 {
+                return Ok(json!({
+                    "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
+                }));
+            }
+            Ok(json!({
+                "sum": number_value(sum),
+                "count": count,
+                "min": number_value(min.unwrap_or(0.0)),
+                "max": number_value(max.unwrap_or(0.0)),
+                "sumsqr": number_value(sumsqr),
+            }))
+        }
+        _ => reducer.call(&[], partials, true),
+    }
 }
 
 /// Rows are ordered by CouchDB key collation, then document id.
@@ -215,6 +749,7 @@ impl ViewIndex {
             db,
             last_seq,
             design,
+            placement: (1, false),
             cached: None,
         })
     }
@@ -251,15 +786,21 @@ impl ViewIndex {
     /// Sorted rows for the current index state. The first query after a
     /// rebuild or incremental update pays for loading/sorting; later queries
     /// reuse the same immutable snapshot.
-    fn sorted_rows(&mut self) -> Result<Arc<Vec<Row>>, String> {
+    fn sorted_rows(&mut self) -> Result<Arc<ViewRows>, String> {
         if let Some(rows) = &self.cached {
             return Ok(rows.clone());
         }
-        let mut rows = self.load_rows()?;
-        sort_rows(&mut rows);
-        let rows = Arc::new(rows);
+        let rows = Arc::new(ViewRows::from_rows(self.load_rows()?, self.placement));
         self.cached = Some(rows.clone());
         Ok(rows)
+    }
+
+    /// Record the database's placement; a change drops the cached split.
+    fn set_placement(&mut self, placement: (u32, bool)) {
+        if self.placement != placement {
+            self.placement = placement;
+            self.cached = None;
+        }
     }
 
     fn scan(&mut self, prefix: &[u8]) -> Result<Vec<KeyValue>, String> {
@@ -319,13 +860,11 @@ impl ViewIndex {
         // linear rather than a full reload.
         let next_cached = match self.cached.take() {
             Some(cached) => {
-                let changed: HashSet<&str> = changed.iter().map(String::as_str).collect();
                 // Reuse the cached allocation when no in-flight query still
                 // holds the snapshot; otherwise clone it.
                 let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
-                kept.retain(|row| !changed.contains(row.id.as_str()));
-                sort_rows(&mut added);
-                Some(Arc::new(merge_sorted_rows(kept, added)))
+                kept.replace_docs(&changed, added, self.placement);
+                Some(Arc::new(kept))
             }
             None => None,
         };
@@ -386,7 +925,7 @@ impl ViewIndex {
         self.db
             .write(batch, true)
             .map_err(|error| error.to_string())?;
-        self.cached = Some(Arc::new(rows));
+        self.cached = Some(Arc::new(ViewRows::from_rows(rows, self.placement)));
         Ok(())
     }
 }
@@ -406,23 +945,37 @@ pub async fn query_with_spec(
     query: &ViewQuery,
 ) -> DbResult<Value> {
     validate_view_partition(db, spec, query.partition.as_deref())?;
-    let rows = local_rows(
-        db,
-        ddoc_id,
-        view_name,
-        spec,
-        query.limits,
-        query.partition.as_deref(),
-    )
-    .await?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    // `_approx_count_distinct` partials are finished estimates and cannot be
+    // combined; a partition's rows are not contiguous within its shard.
+    if let Some(reducer) = spec.reduce.as_deref().filter(|reducer| {
+        reduce && *reducer != "_approx_count_distinct" && query.partition.is_none()
+    }) {
+        check_query(spec, query)?;
+        let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
+        let mut js = JsReducer::new(reducer, query.limits);
+        return rows
+            .reduce(query, query.owner_shards.as_deref(), &mut js)
+            .map_err(|reason| {
+                ApiError::new(
+                    500,
+                    "view_error",
+                    format!("reduce function failed: {reason}"),
+                )
+            });
+    }
+    let selection = local_select(db, ddoc_id, view_name, spec, query, reduce).await?;
+    let mut query = query.clone();
+    query.total_rows_override = Some(selection.total_rows);
+    query.offset_override = Some(selection.offset);
+    let rows = Arc::new(selection.rows);
     let docs = if !reduce && (query.include_docs || query.attachments) {
-        let ids = selected_row_ids(&rows, query);
+        let ids = selected_row_ids(&rows, &query);
         docs_by_ids(db, query.attachments, &ids).await?
     } else {
         HashMap::new()
     };
-    finish(spec, rows, docs, query)
+    finish(spec, rows, docs, &query)
 }
 
 /// Partitioned design docs may only be queried through `_partition`, and
@@ -448,29 +1001,18 @@ pub fn validate_view_partition(db: &Db, spec: &ViewSpec, partition: Option<&str>
     }
 }
 
-/// Local map rows, filtered to a partition when requested.
-pub async fn local_rows(
+/// The local rows `query` can return, from the shards in
+/// `query.owner_shards` (all local shards when unset).
+pub async fn local_select(
     db: &Db,
     ddoc_id: &str,
     view_name: &str,
     spec: &ViewSpec,
-    limits: ViewLimits,
-    partition: Option<&str>,
-) -> DbResult<Arc<Vec<Row>>> {
-    let rows = ensure_rows(db, ddoc_id, view_name, spec, limits).await?;
-    let rows = match partition {
-        Some(partition) => {
-            let prefix = format!("{partition}:");
-            Arc::new(
-                rows.iter()
-                    .filter(|row| row.id.starts_with(&prefix))
-                    .cloned()
-                    .collect(),
-            )
-        }
-        None => rows,
-    };
-    Ok(rows)
+    query: &ViewQuery,
+    reduce: bool,
+) -> DbResult<Selection> {
+    let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
+    Ok(rows.select(query, query.owner_shards.as_deref(), reduce))
 }
 
 pub fn finish(
@@ -479,6 +1021,12 @@ pub fn finish(
     docs: HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
+    check_query(spec, query)?;
+    render(spec, &rows, &docs, query)
+}
+
+/// Reject parameter combinations CouchDB refuses, before any rows are read.
+pub fn check_query(spec: &ViewSpec, query: &ViewQuery) -> DbResult<()> {
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
     let grouped = query.group || query.group_level > 0;
     if !reduce && grouped {
@@ -533,7 +1081,7 @@ pub fn finish(
             "Multi-key fetches for reduce views must use `group=true`",
         ));
     }
-    render(spec, &rows, &docs, query)
+    Ok(())
 }
 
 async fn ensure_rows(
@@ -542,7 +1090,7 @@ async fn ensure_rows(
     view_name: &str,
     spec: &ViewSpec,
     limits: ViewLimits,
-) -> DbResult<Arc<Vec<Row>>> {
+) -> DbResult<Arc<ViewRows>> {
     let current_seq = db.update_seq();
     let design = if NativeMap::parse(&spec.map).is_some() {
         format!(
@@ -559,6 +1107,7 @@ async fn ensure_rows(
     };
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
     let mut index = handle.lock().await;
+    index.set_placement((db.q, db.partitioned));
 
     if index.design != design || index.last_seq > current_seq {
         let rows = map_all(db, &spec.map, limits).await?;
@@ -1324,13 +1873,15 @@ fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize,
         rows.iter().collect()
     };
 
-    if let Some(partition) = &query.partition {
+    // Preselected rows are already filtered, and their counts supplied.
+    let preselected = query.offset_override.is_some();
+    if let Some(partition) = query.partition.as_ref().filter(|_| !preselected) {
         let prefix = format!("{partition}:");
         ordered.retain(|row| row.id.starts_with(&prefix));
         total_rows = ordered.len();
     }
 
-    if let Some(owned) = &query.owner_shards {
+    if let Some(owned) = query.owner_shards.as_ref().filter(|_| !preselected) {
         ordered.retain(|row| {
             let shard = crate::db::shard_index_for(&row.id, query.shard_count, query.partitioned);
             owned.get(shard).copied().unwrap_or(false)
@@ -1341,7 +1892,9 @@ fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize,
     // The offset is the number of rows before the query's starting key. It is
     // computed before `key`/`keys` filtering, because CouchDB reports the
     // insertion point even when no row matches.
-    let before_start = if let Some(key) = &query.key {
+    let before_start = if let Some(offset) = query.offset_override {
+        offset
+    } else if let Some(key) = &query.key {
         count_before_key(&ordered, key, query.descending)
     } else if let Some(keys) = &query.keys {
         match keys.as_slice() {
@@ -1407,6 +1960,7 @@ fn render(
                 "Reduce is invalid for map-only views",
             ));
         };
+        let mut js = JsReducer::new(reducer, query.limits);
         let groups = group_rows(ordered, query);
         if !query.group
             && query.group_level == 0
@@ -1427,7 +1981,7 @@ fn render(
                     let keys: Vec<Value> =
                         members.iter().map(|row| json!([row.id, row.key])).collect();
                     let values: Vec<Value> = members.iter().map(|row| row.value.clone()).collect();
-                    reduce_value(reducer, &keys, &values, query.limits)
+                    reduce_with(&mut js, &keys, &values)
                 }
             };
             let value = match value {
@@ -1472,20 +2026,42 @@ fn render(
 }
 
 fn count_before_start(rows: &[&Row], query: &ViewQuery) -> usize {
+    rows.iter().filter(|row| before_start(row, query)).count()
+}
+
+/// Whether `row` comes before the query's start bound, in query order.
+fn before_start(row: &Row, query: &ViewQuery) -> bool {
     let Some(start) = &query.startkey else {
-        return 0;
+        return false;
     };
-    rows.iter()
-        .filter(|row| match cmp_json(&row.key, start) {
-            Ordering::Less => !query.descending,
-            Ordering::Greater => query.descending,
-            Ordering::Equal => match &query.startkey_docid {
-                Some(id) if query.descending => row.id > *id,
-                Some(id) => row.id < *id,
-                None => false,
-            },
-        })
-        .count()
+    match cmp_json(&row.key, start) {
+        Ordering::Less => !query.descending,
+        Ordering::Greater => query.descending,
+        Ordering::Equal => match &query.startkey_docid {
+            Some(id) if query.descending => row.id > *id,
+            Some(id) => row.id < *id,
+            None => false,
+        },
+    }
+}
+
+/// Whether `row` comes after the query's end bound, in query order.
+fn past_end(row: &Row, query: &ViewQuery) -> bool {
+    let Some(end) = &query.endkey else {
+        return false;
+    };
+    match cmp_json(&row.key, end) {
+        Ordering::Greater => !query.descending,
+        Ordering::Less => query.descending,
+        Ordering::Equal => {
+            !query.inclusive_end
+                || match &query.endkey_docid {
+                    Some(id) if query.descending => row.id < *id,
+                    Some(id) => row.id > *id,
+                    None => false,
+                }
+        }
+    }
 }
 
 fn count_before_key(rows: &[&Row], key: &Value, descending: bool) -> usize {
@@ -1499,46 +2075,7 @@ fn count_before_key(rows: &[&Row], key: &Value, descending: bool) -> usize {
 }
 
 fn in_range(row: &Row, query: &ViewQuery) -> bool {
-    if let Some(start) = &query.startkey {
-        match cmp_json(&row.key, start) {
-            Ordering::Less if !query.descending => return false,
-            Ordering::Greater if query.descending => return false,
-            Ordering::Equal => {
-                if let Some(id) = &query.startkey_docid {
-                    if query.descending {
-                        if row.id > *id {
-                            return false;
-                        }
-                    } else if row.id < *id {
-                        return false;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(end) = &query.endkey {
-        match cmp_json(&row.key, end) {
-            Ordering::Greater if !query.descending => return false,
-            Ordering::Less if query.descending => return false,
-            Ordering::Equal => {
-                if !query.inclusive_end {
-                    return false;
-                }
-                if let Some(id) = &query.endkey_docid {
-                    if query.descending {
-                        if row.id < *id {
-                            return false;
-                        }
-                    } else if row.id > *id {
-                        return false;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    true
+    !before_start(row, query) && !past_end(row, query)
 }
 
 fn group_rows<'a>(rows: Vec<&'a Row>, query: &ViewQuery) -> Vec<(Value, Vec<&'a Row>)> {
@@ -1558,7 +2095,7 @@ fn group_rows<'a>(rows: Vec<&'a Row>, query: &ViewQuery) -> Vec<(Value, Vec<&'a 
     groups
 }
 
-fn group_key(key: &Value, level: usize) -> Value {
+pub(crate) fn group_key(key: &Value, level: usize) -> Value {
     if level == 0 {
         return key.clone();
     }
@@ -1568,13 +2105,8 @@ fn group_key(key: &Value, level: usize) -> Value {
     }
 }
 
-fn reduce_value(
-    source: &str,
-    keys: &[Value],
-    values: &[Value],
-    limits: ViewLimits,
-) -> Result<Value, String> {
-    match source {
+fn reduce_with(reducer: &mut JsReducer, keys: &[Value], values: &[Value]) -> Result<Value, String> {
+    match reducer.source() {
         "_count" => return Ok(json!(values.len())),
         "_sum" => return reduce_sum(values.iter()),
         "_stats" => return reduce_stats(values.iter()),
@@ -1591,20 +2123,11 @@ fn reduce_value(
             let start = offset * CHUNK;
             let end = (start + chunk.len()).min(keys.len());
             let chunk_keys = if start < end { &keys[start..end] } else { &[] };
-            partials.push(run_reduce(source, chunk_keys, chunk, false, limits)?);
+            partials.push(reducer.call(chunk_keys, chunk, false)?);
         }
-        return run_reduce(source, &[], &partials, true, limits);
+        return reducer.call(&[], &partials, true);
     }
-    run_reduce(source, keys, values, false, limits)
-}
-
-/// Combine partial custom-reduce values with the reducer's rereduce mode.
-pub(crate) fn recombine(
-    source: &str,
-    values: &[Value],
-    limits: ViewLimits,
-) -> Result<Value, String> {
-    run_reduce(source, &[], values, true, limits)
+    reducer.call(keys, values, false)
 }
 
 pub(crate) fn run_reduce(
@@ -1614,14 +2137,104 @@ pub(crate) fn run_reduce(
     rereduce: bool,
     limits: ViewLimits,
 ) -> Result<Value, String> {
-    if crate::js::sandboxed() {
-        return crate::js::sandbox_request(
-            "reduce",
-            json!({"source": source, "keys": keys, "values": values, "rereduce": rereduce}),
+    JsReducer::new(source, limits).call(keys, values, rereduce)
+}
+
+/// A custom JavaScript reducer, compiled on its first call and reused for the
+/// rest of one query. Every call gets the full timeout.
+pub(crate) struct JsReducer {
+    source: String,
+    limits: ViewLimits,
+    engine: Option<ReduceEngine>,
+}
+
+/// The context is declared first so it is dropped before its runtime.
+struct ReduceEngine {
+    context: rquickjs::Context,
+    _runtime: rquickjs::Runtime,
+    deadline: Arc<StdMutex<std::time::Instant>>,
+}
+
+const REDUCE_GLOBAL: &str = "__douchdb_reduce";
+
+impl JsReducer {
+    pub(crate) fn new(source: &str, limits: ViewLimits) -> Self {
+        Self {
+            source: source.to_string(),
             limits,
-        );
+            engine: None,
+        }
     }
-    let runtime = engine(limits)?;
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn call(
+        &mut self,
+        keys: &[Value],
+        values: &[Value],
+        rereduce: bool,
+    ) -> Result<Value, String> {
+        if crate::js::sandboxed() {
+            return crate::js::sandbox_request(
+                "reduce",
+                json!({"source": self.source, "keys": keys, "values": values, "rereduce": rereduce}),
+                self.limits,
+            );
+        }
+        let result = self.call_native(keys, values, rereduce);
+        if result.is_err() {
+            // A failed or interrupted call may leave the engine unusable.
+            self.engine = None;
+        }
+        result
+    }
+
+    fn call_native(
+        &mut self,
+        keys: &[Value],
+        values: &[Value],
+        rereduce: bool,
+    ) -> Result<Value, String> {
+        let timeout = self.limits.timeout;
+        if self.engine.is_none() {
+            self.engine = Some(compile_reducer(&self.source, self.limits)?);
+        }
+        let Some(engine) = &self.engine else {
+            return Err("reduce engine unavailable".to_string());
+        };
+        *engine
+            .deadline
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = std::time::Instant::now() + timeout;
+        crate::js::guard("reduce function", || {
+            engine.context.with(|ctx| {
+                let func: rquickjs::Function = ctx
+                    .globals()
+                    .get(REDUCE_GLOBAL)
+                    .map_err(|error| error.to_string())?;
+                // CouchDB passes null, not [], for keys during rereduce.
+                let keys = if rereduce {
+                    "null".to_string()
+                } else {
+                    serde_json::to_string(keys).map_err(|error| error.to_string())?
+                };
+                let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
+                let output: String = func
+                    .call((keys, values, rereduce))
+                    .map_err(|error| error.to_string())?;
+                crate::js::check_output("reduce function", &output)?;
+                serde_json::from_str(&output).map_err(|error| error.to_string())
+            })
+        })
+    }
+}
+
+fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, String> {
+    let (runtime, deadline) = crate::js::reusable_runtime(limits.memory)?;
+    *deadline.lock().unwrap_or_else(|poison| poison.into_inner()) =
+        std::time::Instant::now() + limits.timeout;
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     crate::js::guard("reduce function", || {
         context.with(|ctx| {
@@ -1650,19 +2263,15 @@ pub(crate) fn run_reduce(
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
-            // CouchDB passes null, not [], for keys during rereduce.
-            let keys = if rereduce {
-                "null".to_string()
-            } else {
-                serde_json::to_string(keys).map_err(|error| error.to_string())?
-            };
-            let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
-            let output: String = func
-                .call((keys, values, rereduce))
-                .map_err(|error| error.to_string())?;
-            crate::js::check_output("reduce function", &output)?;
-            serde_json::from_str(&output).map_err(|error| error.to_string())
+            ctx.globals()
+                .set(REDUCE_GLOBAL, func)
+                .map_err(|error| error.to_string())
         })
+    })?;
+    Ok(ReduceEngine {
+        context,
+        _runtime: runtime,
+        deadline,
     })
 }
 
@@ -1833,6 +2442,192 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reduce_value(
+        source: &str,
+        keys: &[Value],
+        values: &[Value],
+        limits: ViewLimits,
+    ) -> Result<Value, String> {
+        reduce_with(&mut JsReducer::new(source, limits), keys, values)
+    }
+
+    #[test]
+    fn block_reductions_match_a_single_pass() {
+        // Enough rows that every shard has several full blocks, keyed so
+        // groups and ranges start and end inside blocks.
+        let placement = (3, false);
+        let mut rows: Vec<Row> = (0..5000)
+            .map(|i| Row {
+                id: format!("d{i:05}"),
+                key: json!([i % 7, i % 11]),
+                value: json!(i),
+            })
+            .collect();
+        sort_rows(&mut rows);
+        let mut view = ViewRows::from_rows(rows.clone(), placement);
+        let base = ViewQuery {
+            inclusive_end: true,
+            limit: usize::MAX,
+            shard_count: placement.0,
+            ..ViewQuery::default()
+        };
+        let mut queries: Vec<ViewQuery> = vec![
+            base.clone(),
+            ViewQuery {
+                group: true,
+                ..base.clone()
+            },
+            ViewQuery {
+                group_level: 1,
+                ..base.clone()
+            },
+            ViewQuery {
+                group_level: 1,
+                descending: true,
+                skip: 1,
+                limit: 4,
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([2, 3])),
+                endkey: Some(json!([5, 1])),
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([2, 3])),
+                endkey: Some(json!([5, 1])),
+                inclusive_end: false,
+                group_level: 1,
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([5, 1])),
+                endkey: Some(json!([2, 3])),
+                descending: true,
+                group: true,
+                ..base.clone()
+            },
+            ViewQuery {
+                startkey: Some(json!([3, 4])),
+                startkey_docid: Some("d02000".into()),
+                ..base.clone()
+            },
+            ViewQuery {
+                key: Some(json!([4, 4])),
+                ..base.clone()
+            },
+            ViewQuery {
+                keys: Some(vec![
+                    json!([6, 2]),
+                    json!([1, 1]),
+                    json!([6, 2]),
+                    json!([9, 9]),
+                ]),
+                group: true,
+                ..base.clone()
+            },
+            ViewQuery {
+                keys: Some(vec![json!([1, 1]), json!([1, 5]), json!([0, 0])]),
+                group_level: 1,
+                descending: true,
+                ..base.clone()
+            },
+            ViewQuery {
+                key: Some(json!([99])),
+                ..base.clone()
+            },
+        ];
+        // Ranges that stop just short of, or exactly at, a shard's last row,
+        // whose block is shorter than the rest.
+        for k in 50..64 {
+            queries.push(ViewQuery {
+                endkey: Some(json!([6, 10])),
+                endkey_docid: Some(format!("d{:05}", 76 + 77 * k)),
+                inclusive_end: k % 2 == 0,
+                ..base.clone()
+            });
+        }
+        let masked = ViewQuery {
+            owner_shards: Some(vec![true, false, true]),
+            group_level: 1,
+            ..base.clone()
+        };
+        queries.push(masked);
+        let reducers = [
+            "_count",
+            "_sum",
+            "_stats",
+            "function(k, v, re){ return sum(v); }",
+        ];
+        let check = |view: &ViewRows, rows: &[Row], reducers: &[&str]| {
+            for &reducer in reducers {
+                let spec = ViewSpec {
+                    map: String::new(),
+                    reduce: Some(reducer.to_string()),
+                    partitioned: false,
+                };
+                for query in &queries {
+                    let expected = render(&spec, rows, &HashMap::new(), query).unwrap();
+                    let mut js = JsReducer::new(reducer, query.limits);
+                    let actual = view
+                        .reduce(query, query.owner_shards.as_deref(), &mut js)
+                        .unwrap();
+                    assert_eq!(actual, expected, "{reducer} {query:?}");
+                }
+            }
+        };
+        check(&view, &rows, &reducers);
+
+        // A write invalidates the stored partials of the shard it touches.
+        let changed: Vec<String> = (0..40).map(|i| format!("d{:05}", i * 97)).collect();
+        let added: Vec<Row> = changed
+            .iter()
+            .map(|id| Row {
+                id: id.clone(),
+                key: json!([3, 3]),
+                value: json!(100000),
+            })
+            .collect();
+        view.replace_docs(&changed, added.clone(), placement);
+        rows.retain(|row| !changed.contains(&row.id));
+        rows.extend(added);
+        sort_rows(&mut rows);
+        // The last reducer checked first, so its partials are still stored.
+        let reversed: Vec<&str> = reducers.iter().rev().copied().collect();
+        check(&view, &rows, &reversed);
+    }
+
+    #[test]
+    fn js_reducer_compiles_once_per_query() {
+        // The counter lives in the compiled closure, so it only advances if
+        // every call reuses one compilation.
+        let mut reducer = JsReducer::new(
+            "(function(){ var calls = 0; return function(k, v, re){ calls += 1; return calls; }; })()",
+            ViewLimits::default(),
+        );
+        let seen: Vec<Value> = (0..3)
+            .map(|_| reducer.call(&[], &[json!(1)], false).unwrap())
+            .collect();
+        assert_eq!(seen, vec![json!(1), json!(2), json!(3)]);
+    }
+
+    #[test]
+    fn js_reducer_gives_every_call_the_full_timeout() {
+        let limits = ViewLimits {
+            timeout: Duration::from_millis(300),
+            ..ViewLimits::default()
+        };
+        let mut reducer = JsReducer::new(
+            "function(k, v, re){ var end = Date.now() + 150; while (Date.now() < end) {} return 1; }",
+            limits,
+        );
+        for _ in 0..4 {
+            assert_eq!(reducer.call(&[], &[json!(1)], false).unwrap(), json!(1));
+        }
+        let mut endless = JsReducer::new("function(k, v, re){ while (true) {} }", limits);
+        assert!(endless.call(&[], &[json!(1)], false).is_err());
+    }
 
     #[test]
     fn couchdb_collation_orders_every_json_type() {
@@ -2119,7 +2914,7 @@ mod tests {
                 "map|",
             )
             .unwrap();
-        assert_eq!(index.sorted_rows().unwrap().len(), 2);
+        assert_eq!(index.sorted_rows().unwrap().shards[0].len(), 2);
 
         // Move a to a later key and delete b; the cached snapshot must follow.
         let mut by_doc = HashMap::new();
@@ -2135,9 +2930,9 @@ mod tests {
             .apply(vec!["a".to_string(), "b".to_string()], by_doc, 2, "map|")
             .unwrap();
         let rows = index.sorted_rows().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "a");
-        assert_eq!(rows[0].key, json!("z"));
+        assert_eq!(rows.shards[0].len(), 1);
+        assert_eq!(rows.shards[0][0].id, "a");
+        assert_eq!(rows.shards[0][0].key, json!("z"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

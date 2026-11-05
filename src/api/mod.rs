@@ -276,7 +276,15 @@ impl AppState {
         Ok(db)
     }
 
-    pub async fn create_db(&self, name: &str, partitioned: bool) -> DbResult<Arc<Db>> {
+    /// Create a database with `q` shards and `n` copies of each; `None`
+    /// takes the node's configured default.
+    pub async fn create_db(
+        &self,
+        name: &str,
+        partitioned: bool,
+        q: Option<u32>,
+        n: Option<usize>,
+    ) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
             return Err(ApiError::bad_request("invalid database name"));
         }
@@ -292,9 +300,11 @@ impl AppState {
             &self.root,
             name,
             DbConfig {
-                q: self.config.q,
+                q: q.unwrap_or(self.config.q),
                 revs_limit: self.config.revs_limit,
-                shard_map: self.cluster.shard_map(self.config.q),
+                shard_map: self
+                    .cluster
+                    .shard_map_n(q.unwrap_or(self.config.q), n.unwrap_or(self.cluster.n)),
                 partitioned,
             },
         )?);

@@ -355,14 +355,25 @@ fn start_cluster(n: usize) -> Vec<Server> {
 }
 
 fn start_cluster_with(n: usize, sync_secs: &str, replication: usize) -> Vec<Server> {
-    start_cluster_full(n, sync_secs, replication, false)
+    start_cluster_full(n, 4, sync_secs, replication, false)
 }
 
 fn start_cluster_with_auth(n: usize, sync_secs: &str, replication: usize) -> Vec<Server> {
-    start_cluster_full(n, sync_secs, replication, true)
+    start_cluster_full(n, 4, sync_secs, replication, true)
 }
 
-fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool) -> Vec<Server> {
+/// A cluster with `q` shards per database and `replication` copies of each.
+fn start_cluster_sharded(n: usize, q: u32, replication: usize) -> Vec<Server> {
+    start_cluster_full(n, q, "3600", replication, false)
+}
+
+fn start_cluster_full(
+    n: usize,
+    q: u32,
+    sync_secs: &str,
+    replication: usize,
+    admin: bool,
+) -> Vec<Server> {
     for attempt in 0..5 {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let nodes = ports
@@ -375,7 +386,7 @@ fn start_cluster_full(n: usize, sync_secs: &str, replication: usize, admin: bool
         for (i, &port) in ports.iter().enumerate() {
             let extra = vec![
                 "--q".to_string(),
-                "4".to_string(),
+                q.to_string(),
                 "--n".to_string(),
                 replication.to_string(),
                 "--nodes".to_string(),
@@ -4785,7 +4796,7 @@ async fn views_map_reduce_collation_and_query_options() {
         "count": {"map": "function(doc){ if(doc.city) emit(doc.city, null); }", "reduce": "_count"},
         "sum": {"map": map, "reduce": "_sum"},
         "stats": {"map": map, "reduce": "_stats"},
-        "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return sum(values) * 2; }"},
+        "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return rereduce ? sum(values) : sum(values) * 2; }"},
         "by_type_city": {"map": "function(doc){ emit([doc.type, doc.city], 1); }", "reduce": "_count"},
         "meta": {"map": "function(doc){ emit(doc._id, doc._rev); }"},
         "bad": {"map": "function(doc){ emit(; }"}
@@ -7949,6 +7960,168 @@ async fn live_changes_cursor_sees_every_document_under_concurrent_writes() {
 }
 
 #[tokio::test]
+async fn cluster_view_queries_match_a_single_node() {
+    // Owners apply key ranges and limits before rows cross the network, and
+    // the coordinator merges their counts. The answer must not depend on how
+    // the rows are spread: CouchDB's default q=2, n=3 first, then layouts
+    // where nodes hold disjoint shards or only some replicas.
+    for (q, replication) in [(2, 3), (4, 1), (8, 2)] {
+        assert_cluster_views_match_single_node(q, replication).await;
+    }
+}
+
+async fn assert_cluster_views_match_single_node(q: u32, replication: usize) {
+    let single = Server::start(false);
+    let nodes = start_cluster_sharded(3, q, replication);
+    let ddoc = json!({"views": {
+        "by_n": {"map": "function(doc){ emit(doc.n % 7, doc.n); emit([doc.n % 3, doc.n], null); }"},
+        "sum": {"map": "function(doc){ emit(doc.n % 5, doc.n); }", "reduce": "_sum"},
+        "cnt": {"map": "function(doc){ emit([doc.n % 3, doc.n % 4], 1); }", "reduce": "_count"},
+        "stats": {"map": "function(doc){ emit(doc.n % 5, doc.n); }", "reduce": "_stats"},
+        "js": {"map": "function(doc){ emit(doc.n % 5, doc.n); }",
+               "reduce": "function(keys, values, rereduce){ return sum(values); }"},
+        "acd": {"map": "function(doc){ emit(doc.n % 5, doc.n % 7); }",
+                "reduce": "_approx_count_distinct"}
+    }});
+    let docs: Vec<Value> = (0..60)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let servers = [&single, &nodes[0]];
+    for server in servers {
+        server.fresh_db("clviewparity").await;
+    }
+    for node in &nodes[1..] {
+        node.fresh_db("clviewparity").await;
+    }
+    for server in servers {
+        let (status, _) = server
+            .post("/clviewparity/_bulk_docs", json!({"docs": docs}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = server.put("/clviewparity/_design/v", ddoc.clone()).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let queries = [
+        "by_n",
+        "by_n?limit=5",
+        "by_n?skip=3&limit=4",
+        "by_n?key=3",
+        "by_n?key=3&descending=true",
+        "by_n?startkey=2&endkey=4",
+        "by_n?startkey=2&endkey=4&inclusive_end=false",
+        "by_n?startkey=4&endkey=2&descending=true&limit=6",
+        "by_n?startkey=3&startkey_docid=d30&limit=5",
+        "by_n?startkey=3&startkey_docid=d30&endkey=3&endkey_docid=d50",
+        "by_n?keys=[5,1,5]",
+        "by_n?keys=[5,1]&descending=true&limit=4",
+        "by_n?startkey=[1]&endkey=[1,{}]",
+        "by_n?startkey=[1,20]&limit=3&skip=1",
+        "by_n?key=99",
+        "by_n?include_docs=true&key=6&limit=2",
+        "sum",
+        "sum?group=true",
+        "sum?startkey=1&endkey=3",
+        "sum?keys=[0,4]&group=true",
+        "sum?reduce=false&key=2&limit=3",
+        "sum?key=2",
+        "sum?key=99",
+        "sum?skip=1",
+        "sum?startkey=10",
+        "sum?startkey=1&endkey=3&group=true",
+        "sum?startkey=1&endkey=3&inclusive_end=false",
+        "sum?descending=true&group=true",
+        "sum?startkey=3&endkey=1&descending=true",
+        "sum?group=true&skip=1&limit=2",
+        "sum?keys=[4,0,4]&group=true",
+        "sum?keys=[4,0]&group=true&descending=true",
+        "sum?keys=[3]",
+        "sum?startkey=1&startkey_docid=d30&endkey=1&endkey_docid=d50",
+        "cnt",
+        "cnt?group_level=1",
+        "cnt?group_level=1&startkey=[1]&endkey=[2,{}]",
+        "cnt?keys=[[1,2],[1,3],[0,0]]&group_level=1",
+        "cnt?group=true&descending=true&limit=3",
+        "cnt?startkey=[1]&endkey=[1,{}]",
+        "stats?startkey=1&endkey=3",
+        "stats?group=true&keys=[2,2]",
+        "js",
+        "js?group=true",
+        "js?startkey=1&endkey=3",
+        "js?key=4",
+        "js?keys=[1,2]&group=true",
+        "acd",
+        "acd?startkey=1&endkey=3",
+        "sum?keys=[1,2]",
+        "sum?startkey=3&endkey=1",
+    ];
+    for query in queries {
+        let path = format!("/clviewparity/_design/v/_view/{query}");
+        let (status, expected) = single.get(&path).await;
+        for node in &nodes {
+            let (node_status, actual) = node.get(&path).await;
+            assert_eq!(
+                node_status, status,
+                "q={q} n={replication} {query}: {actual}"
+            );
+            assert_eq!(
+                actual, expected,
+                "q={q} n={replication} {query} via {}",
+                node.base
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn databases_take_couchdb_shard_defaults_and_per_database_overrides() {
+    let s = Server::start(false);
+    s.fresh_db("qndefault").await;
+    let (_, info) = s.get("/qndefault").await;
+    assert_eq!(info["cluster"], json!({"q": 2, "n": 1, "w": 1, "r": 1}));
+
+    let _ = s.delete("/qnthree").await;
+    let (status, _) = s.put("/qnthree?q=3", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, info) = s.get("/qnthree").await;
+    assert_eq!(info["cluster"]["q"], 3);
+
+    for bad in ["q=0", "q=x", "n=0", "n=-1"] {
+        let (status, body) = s.put(&format!("/qnbad?{bad}"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        let (status, _) = s.get("/qnbad").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{bad} created the database");
+    }
+
+    // Every node records the requested layout, and the default quorums
+    // follow its copy count: one copy is a full write and read quorum.
+    let nodes = start_cluster_sharded(3, 4, 3);
+    let _ = nodes[0].delete("/qncluster").await;
+    let (status, _) = nodes[0].put("/qncluster?q=3&n=1", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..30)
+        .map(|i| json!({"_id": format!("d{i:02}")}))
+        .collect();
+    let (status, _) = nodes[1]
+        .post("/qncluster/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for node in &nodes {
+        let (_, info) = node.get("/qncluster").await;
+        assert_eq!(
+            info["cluster"],
+            json!({"q": 3, "n": 1, "w": 1, "r": 1}),
+            "{}",
+            node.base
+        );
+        let (_, all) = node.get("/qncluster/_all_docs").await;
+        assert_eq!(all["total_rows"], 30, "{}", node.base);
+        // A single copy satisfies the default read quorum.
+        let (status, doc) = node.get("/qncluster/d07").await;
+        assert_eq!(status, StatusCode::OK, "{}: {doc}", node.base);
+    }
+}
+
+#[tokio::test]
 async fn cluster_all_docs_keys_honour_descending_order() {
     let nodes = start_cluster_with(2, "3600", 1);
     for node in &nodes {
@@ -8387,7 +8560,7 @@ async fn observability_metrics_and_health_report_local_state() {
     assert_eq!(metrics["databases"][0]["name"], "obsmetrics");
     assert!(metrics["databases"][0]["doc_count"].as_u64().unwrap() >= 6);
     assert!(metrics["databases"][0]["disk_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(metrics["databases"][0]["local_shards"], 1);
+    assert_eq!(metrics["databases"][0]["local_shards"], 2);
     assert_eq!(metrics["health"]["status"], "ok", "{metrics}");
     assert_eq!(metrics["nodes"].as_array().unwrap().len(), 1);
     assert!(metrics["views"]["queries"].as_u64().unwrap() >= 1);

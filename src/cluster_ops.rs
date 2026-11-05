@@ -524,11 +524,7 @@ pub(crate) async fn rebalance(
     }
     crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
-    let mut map = ShardMap::balanced(
-        db.q,
-        st.cluster.nodes.len().max(1),
-        st.cluster.replication_factor(),
-    );
+    let mut map = ShardMap::balanced(db.q, st.cluster.nodes.len().max(1), old_map.n());
     map.version = old_map.version.saturating_add(1);
     // Broadcast the migration map first: it freezes writes on every peer and
     // lets anti-entropy seed the target replicas while reads stay on the old

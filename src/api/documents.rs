@@ -50,7 +50,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
     }
 
     let default_read_quorum = if st.cluster.is_clustered() {
-        st.cluster.replication_factor() / 2 + 1
+        db.copies() / 2 + 1
     } else {
         1
     };
