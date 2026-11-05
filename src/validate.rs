@@ -14,6 +14,11 @@ use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// How long a coordinator reuses validators merged from every node. A
+/// design-document write on this node drops them at once; the limit bounds how
+/// long a node that missed such a write keeps using the old set.
+const CLUSTER_VALIDATORS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Load validators for this write. A single node uses its cached local design
 /// documents. Design documents are replicated to every node, but one that
 /// missed a design-document write would skip that validator until
@@ -28,6 +33,10 @@ pub(crate) async fn validation_functions(
     if !st.cluster.is_clustered() || crate::api::is_forwarded(st, headers) {
         return db.validation_functions().await;
     }
+    if let Some(functions) = db.cached_cluster_validators(CLUSTER_VALIDATORS_TTL) {
+        return Ok(functions);
+    }
+    let generation = db.design_generation();
     let opts = AllDocsOpts {
         include_docs: true,
         startkey: Some("_design/".to_string()),
@@ -69,14 +78,16 @@ pub(crate) async fn validation_functions(
             }
         }
     }
-    Ok(newest
+    let functions: Vec<String> = newest
         .into_values()
         .filter_map(|(_, doc)| {
             doc.get("validate_doc_update")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .collect())
+        .collect();
+    db.cache_cluster_validators(generation, functions.clone());
+    Ok(functions)
 }
 
 pub(crate) async fn validate_docs(

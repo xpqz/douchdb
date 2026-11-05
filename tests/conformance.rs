@@ -1114,6 +1114,63 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
 }
 
 #[tokio::test]
+async fn cluster_validators_are_cached_until_a_design_doc_changes() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clvalcache").await;
+    }
+    let validator = |reason: &str| {
+        format!("function (doc) {{ if (doc.ok !== true) {{ throw {{forbidden: '{reason}'}}; }} }}")
+    };
+    // Node 1 coordinates a write with no validators, so it caches none.
+    let (status, body) = nodes[1]
+        .put("/clvalcache/before", json!({"ok": false}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A design-document write reaches node 1 too and drops its cache at once.
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalcache/_design/validate",
+            json!({"validate_doc_update": validator("first")}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rev = body["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[1]
+        .put("/clvalcache/rejected", json!({"ok": false}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], "first");
+
+    // A change only node 0 receives, as if node 1 missed it, still reaches
+    // node 1's writes once the cached set expires.
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/clvalcache/_bulk_docs",
+            Some(json!({"docs": [{
+                "_id": "_design/validate",
+                "_rev": rev,
+                "validate_doc_update": validator("second"),
+            }]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) = nodes[1]
+        .put("/clvalcache/rejected", json!({"ok": false}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], "second");
+}
+
+#[tokio::test]
 async fn cluster_validation_uses_the_newest_design_doc_revision() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
