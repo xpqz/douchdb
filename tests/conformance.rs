@@ -3427,20 +3427,35 @@ async fn cluster_full_replica_reads_survive_two_node_loss() {
 
 #[tokio::test]
 async fn cluster_post_creates_the_document_on_its_owner() {
-    let nodes = start_cluster(2);
-    for node in &nodes {
-        node.fresh_db("clpost").await;
-    }
+    // Placement hashes the node URLs, so some port pairs give node 0 every
+    // shard and nothing would be routed. Restart on new ports until node 1
+    // owns at least one shard.
+    let mut attempt = 0;
+    let (nodes, map) = loop {
+        let nodes = start_cluster(2);
+        for node in &nodes {
+            node.fresh_db("clpost").await;
+        }
+        let (_, map) = nodes[0].get("/_node/_local/_dbs/clpost").await;
+        let primaries = map["replicas"].as_array().unwrap();
+        if primaries.iter().any(|replicas| replicas[0] == 1) {
+            break (nodes, map);
+        }
+        attempt += 1;
+        assert!(attempt < 10, "node 1 never owned a shard: {map}");
+    };
     let internal = [
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (_, map) = nodes[0].get("/_node/_local/_dbs/clpost").await;
     let mut forwarded = false;
 
     // POST generates the id after the request arrives, so the handler must
     // route the resulting document rather than writing it to the local shards.
-    for _ in 0..20 {
+    for round in 0..200 {
+        if forwarded && round >= 20 {
+            break;
+        }
         let (status, body) = nodes[0].post("/clpost", json!({"x": 1})).await;
         assert_eq!(status, StatusCode::CREATED);
         let id = body["id"].as_str().unwrap().to_string();
@@ -4254,7 +4269,7 @@ async fn cluster_views_merge_rows_from_every_replica() {
     // see all documents after the coordinator merges the map rows.
     for node in &nodes {
         let (status, body) = node.get("/clview/_design/v/_view/by_city").await;
-        assert_eq!(status, StatusCode::OK, "view via {}", node.base);
+        assert_eq!(status, StatusCode::OK, "view via {}: {body}", node.base);
         assert_eq!(body["total_rows"], 12, "view via {}", node.base);
         let mut ids: Vec<&str> = body["rows"]
             .as_array()
@@ -4485,7 +4500,7 @@ async fn cluster_views_span_shards_with_replication_factor_one() {
     // coordinator merges all of them.
     for node in &nodes {
         let (status, body) = node.get("/clview1/_design/v/_view/by_city").await;
-        assert_eq!(status, StatusCode::OK, "view via {}", node.base);
+        assert_eq!(status, StatusCode::OK, "view via {}: {body}", node.base);
         assert_eq!(body["total_rows"], 9, "view via {}", node.base);
     }
 }
@@ -6962,7 +6977,7 @@ async fn search_fans_out_across_cluster_shards() {
         let (status, body) = node
             .get("/csearchfan/_design/inventory/_search/fruits?q=*:*")
             .await;
-        assert_eq!(status, StatusCode::OK, "search via {}", node.base);
+        assert_eq!(status, StatusCode::OK, "search via {}: {body}", node.base);
         assert_eq!(body["total_rows"], 9, "search via {}", node.base);
         assert_eq!(body["rows"].as_array().unwrap().len(), 9);
     }
