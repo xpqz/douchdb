@@ -1137,18 +1137,18 @@ impl Db {
         opts: &ChangesOpts,
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
         let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
+        let selected = self.selected_shards(opts.owned.as_deref());
+        let until = if opts.descending {
+            u64::MAX
+        } else {
+            watermark.min(self.changes_cutoff(&selected, opts).await?)
+        };
         let mut rows = Vec::new();
-        for (index, shard) in self.shards.iter().enumerate() {
-            if opts
-                .owned
-                .as_ref()
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
+        for index in selected {
             let shard_opts = opts.clone();
-            let mut shard_rows = shard.call(move |s| collect_changes(s, &shard_opts)).await?;
+            let mut shard_rows = self.shards[index]
+                .call(move |s| collect_changes(s, &shard_opts, until))
+                .await?;
             rows.append(&mut shard_rows);
         }
         rows.sort_by_key(|r| r.seq);
@@ -1179,6 +1179,47 @@ impl Db {
             .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
             .await?;
         Ok((rows, last_seq, pending))
+    }
+
+    /// Indexes of the shards in `owned`, or every shard.
+    fn selected_shards(&self, owned: Option<&[bool]>) -> Vec<usize> {
+        (0..self.shards.len())
+            .filter(|index| owned.is_none_or(|owned| owned.get(*index).copied().unwrap_or(false)))
+            .collect()
+    }
+
+    /// The highest sequence an ascending, limited, unfiltered changes read can
+    /// return: the `limit`-th lowest latest sequence after the cursor across
+    /// `shards`, read from their indexes alone. Each shard then reads metadata
+    /// only up to it rather than for `limit` rows of its own. Bounding by
+    /// sequence rather than by a per-shard count keeps the merged rows gapless
+    /// when a document moves between the two reads.
+    async fn changes_cutoff(&self, shards: &[usize], opts: &ChangesOpts) -> DbResult<u64> {
+        let Some(limit) = opts.limit else {
+            return Ok(u64::MAX);
+        };
+        if shards.len() < 2 || opts.descending || opts.filter.is_some() || opts.doc_ids.is_some() {
+            return Ok(u64::MAX);
+        }
+        let mut seqs = Vec::new();
+        for &index in shards {
+            let since = opts.since;
+            let mut found = self.shards[index]
+                .call(move |s| {
+                    Ok(s.latest_changes()?
+                        .after(since)
+                        .take(limit)
+                        .map(|(seq, _)| seq)
+                        .collect::<Vec<u64>>())
+                })
+                .await?;
+            seqs.append(&mut found);
+        }
+        if seqs.len() <= limit {
+            return Ok(u64::MAX);
+        }
+        let (_, cutoff, _) = seqs.select_nth_unstable(limit - 1);
+        Ok(*cutoff)
     }
 
     pub(crate) async fn changes_pending(
@@ -1246,14 +1287,7 @@ impl Db {
                 ));
                 return;
             }
-            let selected: Vec<usize> = (0..db.shards.len())
-                .filter(|index| {
-                    opts.owned
-                        .as_ref()
-                        .map(|owned| owned.get(*index).copied().unwrap_or(false))
-                        .unwrap_or(true)
-                })
-                .collect();
+            let selected = db.selected_shards(opts.owned.as_deref());
             let mut cursors = vec![opts.since; selected.len()];
             let mut done = vec![false; selected.len()];
             let mut buffers: Vec<VecDeque<ChangeRow>> =
@@ -1263,6 +1297,13 @@ impl Db {
             // The stream ends at the watermark; the client resumes from the
             // last row it received.
             let watermark = db.changes_watermark(opts.since, opts.owned.as_deref());
+            let watermark = match db.changes_cutoff(&selected, &opts).await {
+                Ok(cutoff) => watermark.min(cutoff),
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
 
             loop {
                 let mut best: Option<usize> = None;
@@ -1279,9 +1320,10 @@ impl Db {
                             (Some(limit), None) => limit.saturating_sub(emitted).max(1),
                             _ => PAGE,
                         };
-                        shard_opts.limit = Some(PAGE.min(wanted));
+                        let requested = PAGE.min(wanted);
+                        shard_opts.limit = Some(requested);
                         match db.shards[index]
-                            .call(move |shard| collect_changes(shard, &shard_opts))
+                            .call(move |shard| collect_changes(shard, &shard_opts, watermark))
                             .await
                         {
                             Ok(mut rows) => {
@@ -1290,11 +1332,9 @@ impl Db {
                                 } else {
                                     cursors[slot] =
                                         rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
-                                    let fetched = rows.len();
-                                    rows.retain(|row| row.seq <= watermark);
-                                    if rows.len() < fetched {
-                                        // Rows are in sequence order, so the
-                                        // rest of this shard is above it too.
+                                    if opts.filter.is_none() && rows.len() < requested {
+                                        // The shard has nothing more at or
+                                        // below the watermark.
                                         done[slot] = true;
                                     }
                                     if let Some(filter) = &opts.filter {
@@ -2724,9 +2764,11 @@ fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<
     }
 }
 
+/// Change rows from one shard. An ascending read stops at sequence `until`.
 fn collect_changes(
     shard: &mut crate::store::Shard,
     opts: &ChangesOpts,
+    until: u64,
 ) -> DbResult<Vec<ChangeRow>> {
     let limit = if opts.filter.is_some() {
         usize::MAX
@@ -2748,7 +2790,7 @@ fn collect_changes(
             let mut selected: Vec<(u64, String)> = ids
                 .iter()
                 .filter_map(|id| latest.seq_of(id).map(|seq| (seq, id.clone())))
-                .filter(|(seq, _)| opts.descending || *seq > opts.since)
+                .filter(|(seq, _)| opts.descending || (*seq > opts.since && *seq <= until))
                 .collect();
             selected.sort();
             selected.dedup();
@@ -2766,6 +2808,7 @@ fn collect_changes(
             .collect(),
         None => latest
             .after(opts.since)
+            .take_while(|(seq, _)| *seq <= until)
             .take(limit)
             .map(|(seq, id)| (seq, id.to_string()))
             .collect(),

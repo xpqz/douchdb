@@ -887,6 +887,16 @@ async fn changes_returns_latest_per_document_and_pending() {
     let (_, page) = s.get("/latest/_changes?since=0&limit=1").await;
     assert_eq!(page["results"].as_array().unwrap().len(), 1);
     assert_eq!(page["pending"], 1);
+    // Resuming from a page's last_seq starts after that row, not at it.
+    let (_, next) = s
+        .get(&format!(
+            "/latest/_changes?since={}&limit=1",
+            page["last_seq"]
+        ))
+        .await;
+    assert_eq!(next["results"].as_array().unwrap().len(), 1, "{next}");
+    assert_ne!(next["results"][0]["id"], page["results"][0]["id"], "{next}");
+    assert_eq!(next["pending"], 0);
 
     let (_, descending) = s
         .get("/latest/_changes?since=0&limit=1&descending=true")
