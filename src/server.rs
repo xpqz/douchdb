@@ -7,6 +7,7 @@ use crate::cli::Args;
 use crate::cluster::Cluster;
 use crate::{admission, cluster_state, discovery, js, replicate, telemetry, ui};
 use axum::routing::{any, get};
+use axum::serve::ListenerExt;
 use axum::Router;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -240,7 +241,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    // Streamed responses are written in several pieces. With Nagle's algorithm
+    // a later piece waits for the client's delayed ACK of the first, adding
+    // about 40 ms to every such response.
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await?
+        .tap_io(|stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!("could not set TCP_NODELAY: {error}");
+            }
+        });
     tracing::info!("douchdb listening on {}", args.listen);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
