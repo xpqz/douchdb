@@ -280,14 +280,10 @@ async fn changes_normal_raw(
         } else {
             last_seq.to_string()
         };
-        let pending = if rewrite {
-            0
-        } else {
-            pending_db
-                .changes_pending(last_seq, pending_descending, pending_owned.as_deref())
-                .await
-                .unwrap_or(0)
-        };
+        let pending = pending_db
+            .changes_pending(last_seq, pending_descending, pending_owned.as_deref())
+            .await
+            .unwrap_or(0);
         buffer.push_str("],\"last_seq\":");
         if rewrite {
             buffer.push('"');

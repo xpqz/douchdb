@@ -1690,7 +1690,9 @@ pub(crate) async fn cluster_changes(
         let mut node_rows: Vec<std::collections::VecDeque<Value>> =
             (0..n).map(|_| std::collections::VecDeque::new()).collect();
         let mut node_last: Vec<Option<u64>> = vec![None; n];
+        let mut pending = 0;
         for (node, round, mut value) in responses {
+            pending += node_pending(&value);
             if let Some(seq) = last_seq_for_node(&value, node) {
                 node_last[node] = Some(match (round, node_last[node]) {
                     (Round::Fallback, Some(previous)) => previous.min(seq),
@@ -1730,11 +1732,13 @@ pub(crate) async fn cluster_changes(
                 break;
             }
         }
+        // Rows fetched but not returned are still to come.
+        pending += node_rows.iter().map(|rows| rows.len() as u64).sum::<u64>();
 
         return Ok(json!({
             "results": out,
             "last_seq": encode_since(&progress),
-            "pending": 0,
+            "pending": pending,
         }));
     }
 
@@ -1755,7 +1759,9 @@ pub(crate) async fn cluster_changes(
     .await?;
     let mut rows = Vec::new();
     let mut progress = since.clone();
+    let mut pending = 0;
     for (node, _, value) in responses {
+        pending += node_pending(&value);
         absorb_node_changes(value, node, &mut progress, &mut rows);
     }
 
@@ -1765,8 +1771,14 @@ pub(crate) async fn cluster_changes(
     Ok(json!({
         "results": rows,
         "last_seq": encode_since(&progress),
-        "pending": 0,
+        "pending": pending,
     }))
+}
+
+/// Changes a node had left after the rows it returned, across the shards it
+/// read for this request.
+fn node_pending(response: &Value) -> u64 {
+    response.get("pending").and_then(Value::as_u64).unwrap_or(0)
 }
 
 pub(crate) async fn fetch_node_changes(
