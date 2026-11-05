@@ -1091,7 +1091,6 @@ async fn ensure_rows(
     spec: &ViewSpec,
     limits: ViewLimits,
 ) -> DbResult<Arc<ViewRows>> {
-    let current_seq = db.update_seq();
     let design = if NativeMap::parse(&spec.map).is_some() {
         format!(
             "{}|{}|native={NATIVE_MAP_VERSION}",
@@ -1108,6 +1107,10 @@ async fn ensure_rows(
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
     let mut index = handle.lock().await;
     index.set_placement((db.q, db.partitioned));
+    // Read after the lock: a query that updated the index while this one
+    // waited has moved its last_seq past any sequence read earlier, which
+    // would look like a recreated database and force a full rebuild.
+    let current_seq = db.update_seq();
 
     if index.design != design || index.last_seq > current_seq {
         let rows = map_all(db, &spec.map, limits).await?;
@@ -2450,6 +2453,63 @@ mod tests {
         limits: ViewLimits,
     ) -> Result<Value, String> {
         reduce_with(&mut JsReducer::new(source, limits), keys, values)
+    }
+
+    #[tokio::test]
+    async fn a_query_that_waits_for_the_index_does_not_rebuild_it() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-viewseq-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Arc::new(
+            Db::open(
+                &root,
+                "viewseq",
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    shard_map: crate::cluster::ShardMap::single(1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        let write = |id: &str| json!({"_id": id, "n": 1});
+        db.put_docs(vec![write("a")], true).await.unwrap();
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, doc.n); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+
+        // Another query holds the index while this one starts and waits.
+        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        let mut holder = handle.lock().await;
+        let waiting = tokio::spawn({
+            let (db, spec) = (db.clone(), spec.clone());
+            async move { ensure_rows(&db, "_design/v", "v", &spec, limits).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The holder catches the index up with writes that land meanwhile.
+        db.put_docs(vec![write("b"), write("c")], true)
+            .await
+            .unwrap();
+        let caught_up = db.update_seq();
+        holder.last_seq = caught_up;
+        drop(holder);
+
+        waiting.await.unwrap().unwrap();
+        assert_eq!(
+            handle.lock().await.last_seq,
+            caught_up,
+            "the waiting query rebuilt the index from a stale sequence"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
