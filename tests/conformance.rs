@@ -6194,6 +6194,36 @@ async fn seed_search_docs(s: &Server, db: &str) {
 }
 
 #[tokio::test]
+async fn purged_documents_leave_search_results() {
+    let s = Server::start(false);
+    seed_search_docs(&s, "searchpurge").await;
+    let url = "/searchpurge/_design/inventory/_search/fruits?q=*:*";
+    let (status, body) = s.get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4, "{body}");
+
+    let (_, doc) = s.get("/searchpurge/apple").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, body) = s.post("/searchpurge/_purge", json!({"apple": [rev]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A later write moves the database on, so the index must catch up from
+    // its changes, where a fully purged document no longer appears.
+    let (status, _) = s.put("/searchpurge/egg", json!({"item": "egg"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["banana", "carrot", "date", "egg"], "{body}");
+}
+
+#[tokio::test]
 async fn couchdb_search_ports() {
     let s = Server::start(false);
     seed_search_docs(&s, "couchsearch").await;
