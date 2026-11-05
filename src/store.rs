@@ -184,17 +184,18 @@ struct Fenwick {
 impl Fenwick {
     fn add(&mut self, index: usize, delta: isize) {
         while self.tree.len() <= index {
-            // Node `i` (1-based) sums the `i & -i` entries ending at `i`; a new
-            // node starts with whatever earlier adds put in that range.
+            // Node `i` (1-based) sums the entries ending at `i`, as many as
+            // its lowest set bit; a new node starts with whatever earlier adds
+            // put in that range.
             let i = self.tree.len() + 1;
-            let span = i & i.wrapping_neg();
+            let span = 1 << i.trailing_zeros();
             let sum = self.prefix(i - 1) - self.prefix(i - span);
             self.tree.push(sum);
         }
         let mut i = index + 1;
         while i <= self.tree.len() {
             self.tree[i - 1] = self.tree[i - 1].wrapping_add_signed(delta);
-            i += i & i.wrapping_neg();
+            i += 1 << i.trailing_zeros();
         }
     }
 
@@ -204,7 +205,7 @@ impl Fenwick {
         let mut sum = 0;
         while i > 0 {
             sum += self.tree[i - 1];
-            i -= i & i.wrapping_neg();
+            i -= 1 << i.trailing_zeros();
         }
         sum
     }
