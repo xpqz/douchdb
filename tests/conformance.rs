@@ -7925,6 +7925,124 @@ async fn couchdb_builtin_reduce_ports() {
 }
 
 #[tokio::test]
+async fn couchdb_approx_count_distinct_counts_keys() {
+    // Expected bodies were captured from CouchDB 3.5.3. `_approx_count_distinct`
+    // counts distinct emitted keys, not values.
+    let s = Server::start(false);
+    s.fresh_db("approxkeys").await;
+    let (status, _) = s
+        .post(
+            "/approxkeys/_bulk_docs",
+            json!({"docs": [
+                {"_id": "d1", "k": "a", "v": 1},
+                {"_id": "d2", "k": "b", "v": 2},
+                {"_id": "d3", "k": "a", "v": 5}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/approxkeys/_design/d",
+            json!({"views": {
+                "a": {"map": "function(d){ emit(d.k, d.v); }", "reduce": "_approx_count_distinct"},
+                "arr": {"map": "function(d){ emit([d.k, d.v % 3], d.v); }", "reduce": "_approx_count_distinct"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/approxkeys/_design/d/_view/a").await;
+    assert_eq!(body["rows"], json!([{"key": null, "value": 2}]));
+    let (_, body) = s.get("/approxkeys/_design/d/_view/a?group=true").await;
+    assert_eq!(
+        body["rows"],
+        json!([{"key": "a", "value": 1}, {"key": "b", "value": 1}])
+    );
+    let (_, body) = s.get("/approxkeys/_design/d/_view/arr").await;
+    assert_eq!(body["rows"], json!([{"key": null, "value": 3}]));
+    let (_, body) = s.get("/approxkeys/_design/d/_view/arr?group_level=1").await;
+    assert_eq!(
+        body["rows"],
+        json!([{"key": ["a"], "value": 2}, {"key": ["b"], "value": 1}])
+    );
+    let (_, body) = s.get("/approxkeys/_design/d/_view/arr?group=true").await;
+    assert_eq!(
+        body["rows"],
+        json!([
+            {"key": ["a", 1], "value": 1},
+            {"key": ["a", 2], "value": 1},
+            {"key": ["b", 2], "value": 1}
+        ])
+    );
+}
+
+/// Keys of every JSON type, with repeats, for the estimate checks below.
+const APPROX_MIXED_KEY: &str = "var n = doc.n, t = n % 6, k; \
+    if (t == 0) k = n * 10000000000; else if (t == 1) k = 'k' + n; \
+    else if (t == 2) k = [n, 'x']; else if (t == 3) k = {a: n, b: [n]}; \
+    else if (t == 4) k = n + 0.5; \
+    else { var r = n % 7; k = r == 0 ? null : r == 1 ? true : r == 2 ? false : [n % 100, n % 3]; }";
+
+fn approx_mixed_ddoc() -> Value {
+    json!({"views": {
+        "all": {"map": format!("function(doc){{ {APPROX_MIXED_KEY} emit(k, 1); }}"),
+                "reduce": "_approx_count_distinct"},
+        "lvl": {"map": format!("function(doc){{ {APPROX_MIXED_KEY} emit([doc.n % 4, k], 1); }}"),
+                "reduce": "_approx_count_distinct"}
+    }})
+}
+
+fn approx_mixed_docs() -> Vec<Value> {
+    (0..1200)
+        .map(|n| json!({"_id": format!("d{n:04}"), "n": n}))
+        .collect()
+}
+
+async fn assert_approx_mixed_estimates(s: &Server, db: &str) {
+    let (_, body) = s.get(&format!("/{db}/_design/d/_view/all")).await;
+    assert_eq!(body["rows"], json!([{"key": null, "value": 1054}]));
+    let (_, body) = s
+        .get(&format!("/{db}/_design/d/_view/lvl?group_level=1"))
+        .await;
+    assert_eq!(
+        body["rows"],
+        json!([
+            {"key": [0], "value": 303},
+            {"key": [1], "value": 226},
+            {"key": [2], "value": 298},
+            {"key": [3], "value": 232}
+        ])
+    );
+    let (_, body) = s
+        .get(&format!(
+            "/{db}/_design/d/_view/all?startkey=%22k1%22&endkey=%22k5%22"
+        ))
+        .await;
+    assert_eq!(body["rows"], json!([{"key": null, "value": 110}]));
+}
+
+#[tokio::test]
+async fn couchdb_approx_count_distinct_estimates_match() {
+    // CouchDB's estimate is a HyperLogLog (precision 11) over the SHA-1 of
+    // each key's term_to_binary, so 1054 distinct keys read as 1054 only by
+    // luck of the registers: these numbers, captured from CouchDB 3.5.3 for
+    // keys of every JSON type (integers beyond 32 bits, strings, arrays,
+    // objects, floats, booleans, null), need the same hash input for each.
+    let s = Server::start(false);
+    s.fresh_db("approxmixed").await;
+    let (status, _) = s
+        .post(
+            "/approxmixed/_bulk_docs",
+            json!({"docs": approx_mixed_docs()}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.put("/approxmixed/_design/d", approx_mixed_ddoc()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_approx_mixed_estimates(&s, "approxmixed").await;
+}
+
+#[tokio::test]
 async fn couchdb_reduce_duplicate_keys_and_structured_values() {
     // Expected bodies were captured from CouchDB 3.5. Each requested key
     // gets its own row, so a repeated key repeats its reduced value rather
@@ -10403,6 +10521,28 @@ async fn live_changes_cursor_sees_every_document_under_concurrent_writes() {
         "the live cursor skipped {} documents",
         total - seen.len()
     );
+}
+
+#[tokio::test]
+async fn cluster_approx_count_distinct_merges_shard_partials() {
+    // Owners return HyperLogLog partials and the coordinator unions them, so
+    // the estimate is the one CouchDB gives however the keys spread over
+    // shards (CouchDB 3.5.3 returns these numbers at any q).
+    for (q, replication) in [(2, 3), (4, 1)] {
+        let nodes = start_cluster_sharded(3, q, replication);
+        for node in &nodes {
+            node.fresh_db("clapprox").await;
+        }
+        let (status, _) = nodes[0]
+            .post("/clapprox/_bulk_docs", json!({"docs": approx_mixed_docs()}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = nodes[0]
+            .put("/clapprox/_design/d", approx_mixed_ddoc())
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_approx_mixed_estimates(&nodes[0], "clapprox").await;
+    }
 }
 
 #[tokio::test]
