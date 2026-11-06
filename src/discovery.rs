@@ -16,7 +16,7 @@ fn normalize(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-async fn probe(state: &AppState, url: &str, seed: bool) -> NodeProbe {
+async fn probe(state: &AppState, url: &str, seed: bool, trusted: bool) -> NodeProbe {
     let started = Instant::now();
     let mut probe = NodeProbe {
         url: url.to_string(),
@@ -45,14 +45,21 @@ async fn probe(state: &AppState, url: &str, seed: bool) -> NodeProbe {
         }
     }
 
+    // The secret and admin credentials only go to configured cluster members.
+    // Seeds and advertised URLs are unvetted; they are probed anonymously, so
+    // a node that requires admin for _membership reports an error here rather
+    // than receiving credentials it could replay.
     let mut membership = state
         .client
         .get(format!("{url}/_membership"))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", state.cluster.secret.as_str())
         .timeout(Duration::from_secs(2));
-    if let Some(auth) = &state.auth {
-        membership = membership.basic_auth(&auth.user, Some(&auth.pass));
+    if trusted {
+        membership = membership
+            .header("x-douchdb-forwarded", "1")
+            .header("x-douchdb-secret", state.cluster.secret.as_str());
+        if let Some(auth) = &state.auth {
+            membership = membership.basic_auth(&auth.user, Some(&auth.pass));
+        }
     }
     let membership = membership.send().await;
     match membership {
@@ -118,7 +125,7 @@ pub async fn discover_once(state: Arc<AppState>) {
 
     let mut probes = Vec::new();
     for (url, seed, discovered) in &candidates {
-        let mut probe = probe(&state, url, *seed).await;
+        let mut probe = probe(&state, url, *seed, configured.contains(url)).await;
         probe.discovered = *discovered;
         probes.push(probe);
     }
@@ -134,7 +141,8 @@ pub async fn discover_once(state: Arc<AppState>) {
         }
     }
     for (url, seed, discovered) in &extra {
-        let mut probe = probe(&state, url, *seed).await;
+        // `seen` already holds every configured URL, so these are never members.
+        let mut probe = probe(&state, url, *seed, false).await;
         probe.discovered = *discovered;
         probes.push(probe);
     }
