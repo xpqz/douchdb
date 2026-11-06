@@ -1985,6 +1985,9 @@ fn parse_emit_expr(raw: &str) -> Option<EmitExpr> {
     if let Some(key) = raw.strip_prefix("doc[") {
         let key = key.strip_suffix(']')?;
         let key: String = serde_json::from_str(key).ok()?;
+        if is_object_prototype_field(&key) {
+            return None;
+        }
         return Some(EmitExpr::Field(key));
     }
     serde_json::from_str(raw).ok().map(EmitExpr::Literal)
