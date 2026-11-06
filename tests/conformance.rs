@@ -6777,6 +6777,49 @@ async fn couchdb_view_include_docs_and_utf8_ports() {
 }
 
 #[tokio::test]
+async fn view_collation_orders_object_member_names_with_icu() {
+    // Order captured from CouchDB 3.5: member names collate like strings
+    // (ICU), not bytewise, so "a" < "B" and "é" < "f" < "Z".
+    let s = Server::start(false);
+    s.fresh_db("objcollation").await;
+    let keys = [
+        json!({"_": 1}),
+        json!({"a": 1}),
+        json!({"a": 1, "B": 2}),
+        json!({"b": 1, "A": 1}),
+        json!({"B": 1}),
+        json!({"é": 1}),
+        json!({"f": 1}),
+        json!({"Z": 1}),
+    ];
+    let docs: Vec<Value> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| json!({"_id": i.to_string(), "k": key}))
+        .collect();
+    let (status, _) = s
+        .post("/objcollation/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/objcollation/_design/d",
+            json!({"views": {"v": {"map": "function(doc){ emit(doc.k, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/objcollation/_design/d/_view/v").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let got: Vec<Value> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["key"].clone())
+        .collect();
+    assert_eq!(got, keys.to_vec());
+}
+
+#[tokio::test]
 async fn couchdb_view_collation_ports() {
     let s = Server::start(false);
     s.fresh_db("couchcollation").await;
