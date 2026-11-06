@@ -306,11 +306,12 @@ async fn build_index(
     gate: OwnedRwLockReadGuard<()>,
     mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
-    // Capture the sequence before reading the snapshot. A write that lands
+    // Capture the bound before reading the snapshot. A write that lands
     // while the index is being built then leaves the database ahead of the
     // recorded sequence, so the next query rebuilds instead of trusting a
-    // snapshot that may have missed it.
-    let last_seq = db.update_seq();
+    // snapshot that may have missed it. The bound is the changes watermark: a
+    // write in flight has taken a sequence but is not readable yet.
+    let last_seq = db.changes_watermark(0, None);
     let docs = db.map_docs(None).await?;
     let path = index_dir(db, ddoc, index_name);
     let source = spec.source.clone();
@@ -857,7 +858,7 @@ async fn ensure_index(
     if let Some(cached) = entry.as_ref() {
         let meta = &cached.snapshot.meta;
         if meta.version == SEARCH_VERSION && meta.design == signature {
-            let current = db.update_seq();
+            let current = db.changes_watermark(meta.last_seq, None);
             if meta.last_seq == current {
                 return Ok((cached.snapshot.clone(), gate));
             }

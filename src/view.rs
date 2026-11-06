@@ -1548,12 +1548,18 @@ async fn ensure_rows(
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
     // would look like a recreated database and force a full rebuild.
-    let current_seq = db.update_seq();
+    // The bound is the changes watermark, not the allocated counter: a write
+    // in flight has taken its sequence but is not readable yet, and an index
+    // that recorded a sequence past it would never see that write.
+    let current_seq = db.changes_watermark(index.last_seq, None);
 
     if index.design != design || index.last_seq > current_seq {
+        // Read the bound before scanning, so a write that lands during the
+        // scan stays above it and is picked up by the next update.
+        let bound = db.changes_watermark(0, None);
         let rows = map_all(db, &spec.map, limits).await?;
         index
-            .rebuild(rows, current_seq, &design)
+            .rebuild(rows, bound, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
         return index
             .sorted_rows()
@@ -1594,8 +1600,8 @@ async fn ensure_rows(
         }
         let last_seq = changes["last_seq"]
             .as_u64()
-            .unwrap_or(current_seq)
-            .max(current_seq);
+            .unwrap_or(index.last_seq)
+            .max(index.last_seq);
         index
             .apply(changed, by_doc, last_seq, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
