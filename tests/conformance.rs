@@ -2169,6 +2169,27 @@ async fn nested_slash_database_directories_are_migrated_on_startup() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// A db.json that does not parse is a server-side fault, not a missing
+/// database: the client gets 500 and the file is left for the operator.
+#[tokio::test]
+async fn corrupt_db_json_is_a_server_error_not_a_404() {
+    let mut s = Server::start(false);
+    let (status, body) = s.put("/corruptmeta", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    s.kill();
+    let db_json = s.dir.join("corruptmeta").join("db.json");
+    std::fs::write(&db_json, b"{ not json").expect("corrupt db.json");
+
+    s.restart();
+    let (status, body) = s.get("/corruptmeta").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(
+        std::fs::read(&db_json).expect("db.json"),
+        b"{ not json",
+        "the corrupt file must not be overwritten"
+    );
+}
+
 #[tokio::test]
 async fn replication_state_fields_round_trip() {
     let s = Server::start(false);
