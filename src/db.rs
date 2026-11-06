@@ -3171,6 +3171,17 @@ fn collect_changes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn uuids_do_not_repeat_in_a_tight_loop() {
+        let ids: std::collections::HashSet<String> = (0..100_000).map(|_| uuid()).collect();
+        assert_eq!(ids.len(), 100_000);
+        assert!(
+            ids.iter()
+                .all(|id| id.len() == 32
+                    && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        );
+    }
+
     fn doc_id_for_shard(db: &Db, shard: usize) -> String {
         (0..10_000)
             .map(|i| format!("shard{shard}-{i}"))

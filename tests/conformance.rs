@@ -3274,6 +3274,109 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
+/// An `AuthSession` cookie value for `name`, signed with `key`, in the format
+/// the server issues: `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`.
+fn forged_cookie(key: &[u8], name: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let payload = format!("{name}:{exp}");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    mac.update(payload.as_bytes());
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    format!(
+        "AuthSession={}.{}",
+        b64.encode(payload.as_bytes()),
+        b64.encode(mac.finalize().into_bytes())
+    )
+}
+
+async fn status_with_cookie(s: &Server, cookie: &str) -> StatusCode {
+    s.client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The session key must not be derivable from the admin credentials: anyone
+/// holding a cookie could otherwise brute-force the password offline.
+#[tokio::test]
+async fn session_key_is_not_derived_from_admin_password() {
+    let s = Server::start(true);
+    let forged = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    assert_eq!(
+        status_with_cookie(&s, &forged).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// `--session-secret` is the session key.
+#[tokio::test]
+async fn session_secret_flag_signs_cookies() {
+    let secret = "an-explicit-session-secret";
+    let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
+    let good = forged_cookie(secret.as_bytes(), "admin");
+    assert_eq!(status_with_cookie(&s, &good).await, StatusCode::OK);
+    let bad = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
+}
+
+/// Without `--session-secret` the server generates a random key once, keeps it
+/// in the data directory (owner-only) and reuses it after a restart.
+#[tokio::test]
+async fn generated_session_secret_persists_across_restarts() {
+    let mut s = Server::start(true);
+    let response = s
+        .client
+        .post(format!("{}/_session", s.base))
+        .json(&json!({"name": "admin", "password": "douchdb"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("AuthSession cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &cookie).await, StatusCode::OK);
+    s.restart();
+    assert_eq!(status_with_cookie(&s, &cookie).await, StatusCode::OK);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(s.dir.join(".session-secret")).expect("secret file");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[tokio::test]
+async fn uuids_are_unique_in_a_tight_loop() {
+    let s = Server::start(false);
+    let (status, body) = s.get("/_uuids?count=1000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uuids = body["uuids"].as_array().unwrap();
+    let unique: std::collections::HashSet<&str> =
+        uuids.iter().map(|uuid| uuid.as_str().unwrap()).collect();
+    assert_eq!(unique.len(), 1000);
+    assert!(uuids.iter().all(|u| {
+        let u = u.as_str().unwrap();
+        u.len() == 32
+            && u.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }));
+}
+
 #[tokio::test]
 async fn cluster_routes_writes_and_merges_all_docs() {
     let nodes = start_cluster(2);
