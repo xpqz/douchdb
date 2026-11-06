@@ -83,10 +83,16 @@ impl RevTree {
     /// CouchDB's rule: non-deleted beats deleted, then higher position, then
     /// greater revision id.
     pub fn winner(&self) -> Option<String> {
-        self.leaves().into_iter().max_by_key(|rev| {
-            let parsed = Rev::parse(rev).expect("well-formed rev in tree");
-            (!self.is_deleted(rev), parsed.pos, parsed.id)
-        })
+        // A leaf that does not parse (a corrupt on-disk tree) cannot win; it
+        // is skipped rather than allowed to crash the caller.
+        self.leaves()
+            .into_iter()
+            .filter_map(|rev| {
+                let parsed = Rev::parse(&rev)?;
+                Some(((!self.is_deleted(&rev), parsed.pos, parsed.id), rev))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, rev)| rev)
     }
 
     pub fn conflicts(&self, winner: &str) -> Vec<String> {
@@ -184,6 +190,18 @@ mod tests {
 
     fn id(n: u8) -> String {
         format!("{n:02x}").repeat(16)
+    }
+
+    #[test]
+    fn winner_ignores_an_unparsable_leaf() {
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("1-{}", id(1))), false);
+        tree.edges.insert("garbage".to_string(), None);
+        assert_eq!(tree.winner().unwrap(), format!("1-{}", id(1)));
+
+        let mut only_bad = RevTree::default();
+        only_bad.edges.insert("garbage".to_string(), None);
+        assert_eq!(only_bad.winner(), None);
     }
 
     #[test]
