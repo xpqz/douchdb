@@ -309,6 +309,7 @@ struct JobMark {
 /// moving it between threads after use, or sharing it, is unsound.
 pub struct Shard {
     db: DB,
+    name: ShardName,
     seq: u64,
     seq_tracker: Option<Arc<AtomicU64>>,
     revs_limit: u64,
@@ -325,6 +326,9 @@ pub struct Shard {
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
     latest: Option<LatestChanges>,
+    /// Ids under `_design/` whose metadata did not decode when `latest` was
+    /// built. Validation must not run without them, so it fails on these.
+    corrupt_design: Vec<String>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -360,13 +364,72 @@ fn db_get_checked(db: &mut DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(value.map(|bytes| bytes.to_vec()))
 }
 
+/// A stored record that was read from LevelDB successfully but cannot be
+/// decoded. This is the only error a listing may skip: it names one document.
+/// An error from LevelDB itself (I/O, checksum) is a plain `anyhow::Error`
+/// and always fails the request. Point reads and writes treat both the same.
+#[derive(Debug)]
+pub struct CorruptRecord {
+    pub id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for CorruptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "corrupt metadata for {}: {}", self.id, self.reason)
+    }
+}
+
+impl std::error::Error for CorruptRecord {}
+
+/// Which database and shard a shard actor serves, for log lines.
+#[derive(Clone, Debug)]
+pub struct ShardName {
+    db: String,
+    shard: String,
+}
+
+impl ShardName {
+    fn of(dir: &Path) -> ShardName {
+        let name = |path: Option<&Path>| {
+            path.and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        ShardName {
+            db: name(dir.parent()),
+            shard: name(Some(dir)),
+        }
+    }
+
+    /// Log and count a record a scan or listing is about to skip.
+    pub fn report_corrupt(&self, id: &str, error: &dyn std::fmt::Display) {
+        tracing::error!(
+            db = %self.db,
+            shard = %self.shard,
+            doc_id = %id,
+            error = %error,
+            "skipping corrupt record"
+        );
+        crate::telemetry::record_corrupt_record_skipped();
+    }
+}
+
 /// Decode a stored metadata record. A record that does not parse is
-/// corruption and must fail the caller, not vanish from the result.
-fn parse_meta(key: &[u8], value: &[u8]) -> Result<(String, DocMeta)> {
-    let id = key.get(2..).and_then(|id| std::str::from_utf8(id).ok());
-    let id = id.ok_or_else(|| anyhow::anyhow!("corrupt metadata key {key:?}: not UTF-8"))?;
-    let meta = serde_json::from_slice(value)
-        .map_err(|error| anyhow::anyhow!("corrupt metadata for {id}: {error}"))?;
+/// corruption: point reads and writes fail on it, and listings skip it
+/// through `ShardName::report_corrupt`.
+fn parse_meta(key: &[u8], value: &[u8]) -> std::result::Result<(String, DocMeta), CorruptRecord> {
+    let id = key
+        .get(2..)
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .ok_or_else(|| CorruptRecord {
+            id: String::from_utf8_lossy(key.get(2..).unwrap_or_default()).into_owned(),
+            reason: "key is not UTF-8".to_string(),
+        })?;
+    let meta = serde_json::from_slice(value).map_err(|error| CorruptRecord {
+        id: id.to_string(),
+        reason: error.to_string(),
+    })?;
     Ok((id.to_string(), meta))
 }
 
@@ -449,6 +512,7 @@ impl Shard {
 
         Ok(Shard {
             db,
+            name: ShardName::of(path),
             seq,
             seq_tracker: None,
             revs_limit,
@@ -456,6 +520,7 @@ impl Shard {
             deleted,
             live: None,
             latest: None,
+            corrupt_design: Vec::new(),
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -589,12 +654,9 @@ impl Shard {
         let prefix = format!("m/{partition}:");
         let mut docs = 0u64;
         let mut deleted = 0u64;
-        let mut failure = None;
-        self.scan_range_while(
-            prefix.as_bytes(),
-            None,
-            false,
-            |key, value| match parse_meta(key, value) {
+        let name = self.name.clone();
+        self.scan_range_while(prefix.as_bytes(), None, false, |key, value| {
+            match parse_meta(key, value) {
                 Ok((_, meta)) => {
                     if let Some((_, live, _)) = meta_state(&meta) {
                         if live {
@@ -603,18 +665,12 @@ impl Shard {
                             deleted += 1;
                         }
                     }
-                    true
                 }
-                Err(error) => {
-                    failure = Some(error);
-                    false
-                }
-            },
-        )?;
-        match failure {
-            Some(error) => Err(error),
-            None => Ok((docs, deleted)),
-        }
+                Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
+            }
+            true
+        })?;
+        Ok((docs, deleted))
     }
 
     /// Sorted live document ids and their winning revisions. The index is
@@ -622,9 +678,11 @@ impl Shard {
     pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {
         if self.live.is_none() {
             let mut live = BTreeMap::new();
-            let mut failure = None;
+            let name = self.name.clone();
             // `scan_range_while` merges the uncommitted overlay, so a read in
-            // the same group commit sees writes queued before it.
+            // the same group commit sees writes queued before it. A record
+            // that does not decode is left out of the index; LevelDB errors
+            // still fail the scan.
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
                     Ok((id, meta)) => {
@@ -637,17 +695,11 @@ impl Shard {
                                 },
                             );
                         }
-                        true
                     }
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
+                    Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
                 }
+                true
             })?;
-            if let Some(error) = failure {
-                return Err(error);
-            }
             self.live = Some(live);
         }
         Ok(self.live.as_ref().expect("live index initialized"))
@@ -658,25 +710,31 @@ impl Shard {
     pub fn latest_changes(&mut self) -> Result<&LatestChanges> {
         if self.latest.is_none() {
             let mut latest = LatestChanges::default();
-            let mut failure = None;
+            let name = self.name.clone();
+            let mut corrupt_design = Vec::new();
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
-                    Ok((id, meta)) => {
-                        latest.insert(id, meta.seq);
-                        true
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        false
+                    Ok((id, meta)) => latest.insert(id, meta.seq),
+                    Err(corrupt) => {
+                        name.report_corrupt(&corrupt.id, &corrupt);
+                        if corrupt.id.starts_with("_design/") {
+                            corrupt_design.push(corrupt.id);
+                        }
                     }
                 }
+                true
             })?;
-            if let Some(error) = failure {
-                return Err(error);
-            }
+            self.corrupt_design = corrupt_design;
             self.latest = Some(latest);
         }
         Ok(self.latest.as_ref().expect("latest changes initialized"))
+    }
+
+    /// Design documents whose metadata is corrupt. Their `validate_doc_update`
+    /// functions cannot be loaded, so callers must fail instead of skipping them.
+    pub fn corrupt_design_docs(&mut self) -> Result<Vec<String>> {
+        self.latest_changes()?;
+        Ok(self.corrupt_design.clone())
     }
 
     pub fn update_latest(
@@ -737,9 +795,13 @@ impl Shard {
         let Some(bytes) = self.get_checked(&meta_key(docid))? else {
             return Ok(None);
         };
-        let meta = serde_json::from_slice(&bytes)
-            .map_err(|error| anyhow::anyhow!("corrupt metadata for {docid}: {error}"))?;
+        let (_, meta) = parse_meta(&meta_key(docid), &bytes)?;
         Ok(Some(meta))
+    }
+
+    /// Where this shard lives, for logging skipped records.
+    pub fn name(&self) -> &ShardName {
+        &self.name
     }
 
     pub fn get_body(&mut self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
@@ -1878,7 +1940,7 @@ mod scan_tests {
     }
 
     #[test]
-    fn corrupt_metadata_is_an_error_not_a_missing_document() {
+    fn corrupt_metadata_is_skipped_by_scans_and_fails_closed_elsewhere() {
         let dir = temp_shard_dir("corrupt-meta");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
@@ -1887,12 +1949,13 @@ mod scan_tests {
         shard.flush_pending().unwrap();
         shard.put_raw(&meta_key("p:bad"), b"{not json");
 
-        assert!(shard.live_docs().is_err(), "live index skipped the record");
-        assert!(
-            shard.latest_changes().is_err(),
-            "changes skipped the record"
-        );
-        assert!(shard.partition_counts("p").is_err());
+        // Scans that serve many documents skip the record and count it.
+        let before = crate::metrics::corrupt_records_skipped();
+        assert_eq!(live_ids(&mut shard), ["a"]);
+        assert_eq!(shard.latest_changes().unwrap().all().count(), 1);
+        assert_eq!(shard.partition_counts("p").unwrap(), (0, 0));
+        assert!(crate::metrics::corrupt_records_skipped() >= before + 3);
+        // The anti-entropy fingerprint must not paper over it.
         assert!(shard.fingerprint().is_err());
 
         // Overwriting a record that cannot be parsed would make the counters
@@ -1918,6 +1981,19 @@ mod scan_tests {
         shard.delete_raw(b"z/doc_deleted_count");
         drop(shard);
         assert!(Shard::open(&dir, 1000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_deletes_nothing_for_a_corrupt_metadata_record() {
+        let dir = temp_shard_dir("corrupt-compact");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        // A stale-looking body next to an unreadable metadata record: the
+        // sweep cannot know it is stale, so it must keep it and fail.
+        shard.put_raw(&meta_key("bad"), b"{not json");
+        shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
+        assert!(shard.compact().is_err());
+        assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

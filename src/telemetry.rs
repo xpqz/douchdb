@@ -197,3 +197,16 @@ pub fn record_rebalance_timeout() {
     crate::metrics::record_fabric("rebalance_timeout", 1);
     fabric_metrics().rebalance_timeout.add(1, &[]);
 }
+
+/// A listing or scan skipped a stored record it could not decode.
+pub fn record_corrupt_record_skipped() {
+    crate::metrics::record_corrupt_record_skipped();
+    static COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+    COUNTER
+        .get_or_init(|| {
+            global::meter("douchdb")
+                .u64_counter("storage.corrupt_records_skipped")
+                .build()
+        })
+        .add(1, &[]);
+}

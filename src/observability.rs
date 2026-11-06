@@ -444,6 +444,7 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
     let mut rebalance_completed = 0u64;
     let mut rebalance_timeout = 0u64;
     let mut cleaned_shards = 0u64;
+    let mut corrupt_records_skipped = 0u64;
     let mut disk_bytes = 0u64;
     let mut failed_databases = 0u64;
     let mut databases: BTreeMap<String, DbAgg> = BTreeMap::new();
@@ -530,6 +531,9 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
         rebalance_completed += fabric["rebalance_completed"].as_u64().unwrap_or(0);
         rebalance_timeout += fabric["rebalance_timeout"].as_u64().unwrap_or(0);
         cleaned_shards += fabric["cleaned_shards"].as_u64().unwrap_or(0);
+        corrupt_records_skipped += snapshot["integrity"]["corrupt_records_skipped"]
+            .as_u64()
+            .unwrap_or(0);
 
         let storage = &snapshot["storage"];
         disk_bytes += storage["disk_bytes"].as_u64().unwrap_or(0);
@@ -739,6 +743,10 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
             "rebalance_timeout": rebalance_timeout,
             "cleaned_shards": cleaned_shards,
         }),
+    );
+    out.insert(
+        "integrity".to_string(),
+        json!({ "corrupt_records_skipped": corrupt_records_skipped }),
     );
     out.insert(
         "storage".to_string(),

@@ -448,6 +448,13 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
+            let corrupt = shard.call(|s| Ok(s.corrupt_design_docs()?)).await?;
+            if let Some(id) = corrupt.first() {
+                // Skipping it would let writes through unvalidated.
+                return Err(ApiError::corrupt(format!(
+                    "corrupt design document {id}: its validate_doc_update cannot be loaded"
+                )));
+            }
             let mut found = shard
                 .call(|s| {
                     Ok(s.latest_changes()?
@@ -1154,7 +1161,20 @@ impl Db {
                     for (id, rev, has_attachments) in metas {
                         if !has_attachments {
                             if let Some(body) = s.get_body(&id, &rev)? {
-                                docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
+                                // The body is spliced into the map input as
+                                // text, so check it decodes here or one bad
+                                // body would fail the whole build.
+                                let decoded = serde_json::from_slice::<serde::de::IgnoredAny>(
+                                    &body,
+                                )
+                                .map_err(|error| {
+                                    ApiError::corrupt(format!(
+                                        "corrupt body for {id} {rev}: {error}"
+                                    ))
+                                });
+                                if skip_corrupt(s, &id, decoded)?.is_some() {
+                                    docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
+                                }
                                 continue;
                             }
                         }
@@ -1164,8 +1184,10 @@ impl Db {
                             rev: Some(rev),
                             ..Default::default()
                         };
-                        let doc = read_doc(s, &id, &doc_opts)?;
-                        docs.push((id, serde_json::to_string(&doc)?));
+                        let doc = read_doc(s, &id, &doc_opts);
+                        if let Some(doc) = skip_corrupt(s, &id, doc)? {
+                            docs.push((id, serde_json::to_string(&doc)?));
+                        }
                     }
                     Ok(docs)
                 })
@@ -2524,6 +2546,25 @@ fn canonical_rev(rev: &str) -> String {
     Rev::parse(rev).map_or_else(|| rev.to_string(), |parsed| parsed.to_string())
 }
 
+/// In a listing, a document whose stored record cannot be decoded is skipped,
+/// logged and counted so one bad record does not fail the whole request.
+/// Only a decode failure (`ApiError::corrupt`) is skipped: an error from
+/// LevelDB itself, or any other failure, still fails the request.
+fn skip_corrupt<T>(
+    shard: &crate::store::Shard,
+    id: &str,
+    result: DbResult<T>,
+) -> DbResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.corrupt => {
+            shard.name().report_corrupt(id, &error);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
@@ -2615,9 +2656,11 @@ fn read_doc_rev(
         .get_body(id, rev)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
     let mut doc: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::new(500, "internal_server_error", "corrupt body"))?;
+        .map_err(|error| ApiError::corrupt(format!("corrupt body for {id} {rev}: {error}")))?;
     let Value::Object(body) = &mut doc else {
-        return Err(ApiError::new(500, "internal_server_error", "corrupt body"));
+        return Err(ApiError::corrupt(format!(
+            "corrupt body for {id} {rev}: not an object"
+        )));
     };
 
     // CouchDB serialises `_id` and `_rev` first, then the document body in the
@@ -2838,18 +2881,22 @@ fn collect_all_docs(
         before_start
     };
 
-    if opts.include_docs || opts.conflicts {
-        for row in rows.iter_mut() {
-            if opts.include_docs {
-                let doc_opts = DocOpts {
-                    rev: Some(row.rev.clone()),
-                    conflicts: opts.conflicts,
-                    attachments: opts.attachments,
-                    ..Default::default()
-                };
-                row.doc = Some(read_doc(shard, &row.id, &doc_opts)?);
+    if opts.include_docs {
+        let mut readable = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            let doc_opts = DocOpts {
+                rev: Some(row.rev.clone()),
+                conflicts: opts.conflicts,
+                attachments: opts.attachments,
+                ..Default::default()
+            };
+            let doc = read_doc(shard, &row.id, &doc_opts);
+            if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
+                row.doc = Some(doc);
+                readable.push(row);
             }
         }
+        rows = readable;
     }
 
     Ok((rows, before_start))
@@ -3003,7 +3050,8 @@ fn collect_changes(
 
     let mut rows = Vec::with_capacity(candidates.len());
     for (seq, id) in candidates {
-        let Some(meta) = shard.get_meta(&id)? else {
+        let meta = shard.get_meta(&id).map_err(ApiError::from);
+        let Some(Some(meta)) = skip_corrupt(shard, &id, meta)? else {
             continue;
         };
         if meta.seq != seq {
@@ -3046,7 +3094,7 @@ fn collect_changes(
                 .map(ChangeFilter::needs_doc)
                 .unwrap_or(false);
         let doc = if needs_doc {
-            match read_doc_rev(
+            let read = read_doc_rev(
                 shard,
                 &id,
                 &meta,
@@ -3057,7 +3105,8 @@ fn collect_changes(
                     conflicts: opts.conflicts,
                     ..Default::default()
                 },
-            ) {
+            );
+            match read {
                 Ok(doc) => Some(serde_json::to_string(&doc)?),
                 // A tombstone may have no stored body.
                 Err(error) if deleted && error.status == 404 => None,
@@ -3068,7 +3117,11 @@ fn collect_changes(
                         format!("document {id} has no stored body"),
                     ))
                 }
-                Err(error) => return Err(error),
+                // An undecodable body drops the row, as in `_all_docs`.
+                Err(error) => {
+                    skip_corrupt(shard, &id, Err::<(), _>(error))?;
+                    continue;
+                }
             }
         } else {
             None
@@ -3283,42 +3336,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn row_ids(value: &Value, rows: &str) -> Vec<String> {
+        value[rows]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_corrupt_body_is_an_error_in_listings_and_open_revs() {
-        let (db, root) = single_shard_db("body-corrupt").await;
-        let put = db
-            .put_docs(vec![json!({"_id": "a", "n": 1})], true)
+    async fn a_corrupt_design_document_fails_writes_closed() {
+        // Every write loads the validators first (`validate::validate_docs`),
+        // and an error there is the write's 500.
+        let (db, root) = single_shard_db("ddoc-ok").await;
+        db.put_docs(vec![json!({"_id": "ok1", "n": 1})], true)
             .await
             .unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
-        let corrupt_rev = rev.clone();
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A design document that cannot be decoded must not be skipped:
+        // its validate_doc_update would silently stop running.
+        let (db, root) = single_shard_db("ddoc-corrupt").await;
+        db.shards[0]
+            .call(|shard| {
+                shard.put_raw(&meta_key("_design/v"), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.validation_functions().await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        assert!(error.reason.contains("_design/v"), "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn listings_skip_corrupt_records_and_point_reads_fail() {
+        let (db, root) = single_shard_db("listing-corrupt").await;
+        // Plant the corrupt metadata before anything builds the shard's
+        // indexes, so the first scan meets it.
+        db.shards[0]
+            .call(|shard| {
+                shard.put_raw(&meta_key("bad-meta"), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let put = db
+            .put_docs(
+                vec![
+                    json!({"_id": "a", "n": 1}),
+                    json!({"_id": "bad-body", "n": 2}),
+                    json!({"_id": "c", "n": 3}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let bad_rev = put[1]["rev"].as_str().unwrap().to_string();
+        let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
-                shard.put_raw(&body_key("a", &corrupt_rev), b"{not json");
+                shard.put_raw(&body_key("bad-body", &corrupt_rev), b"{not json");
                 Ok(())
             })
             .await
             .unwrap();
 
-        let all = AllDocsOpts {
-            include_docs: true,
-            ..Default::default()
-        };
-        let error = db.all_docs(&all).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
+        let before = crate::metrics::corrupt_records_skipped();
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(row_ids(&all, "rows"), ["a", "bad-body", "c"]);
+        assert!(crate::metrics::corrupt_records_skipped() > before);
 
-        let changes = ChangesOpts {
-            include_docs: true,
-            ..Default::default()
-        };
-        let error = db.changes(&changes).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
+        let before = crate::metrics::corrupt_records_skipped();
+        let all = db
+            .all_docs(&AllDocsOpts {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&all, "rows"), ["a", "c"]);
+        assert!(
+            crate::metrics::corrupt_records_skipped() > before,
+            "the skipped body was not counted"
+        );
 
+        let changes = db.changes(&ChangesOpts::default()).await.unwrap();
+        assert_eq!(row_ids(&changes, "results"), ["a", "bad-body", "c"]);
+        let before = crate::metrics::corrupt_records_skipped();
+        let changes = db
+            .changes(&ChangesOpts {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&changes, "results"), ["a", "c"]);
+        assert!(crate::metrics::corrupt_records_skipped() > before);
+
+        // View and search builds index every readable document.
+        let docs = db.map_docs(None).await.unwrap();
+        let ids: Vec<&str> = docs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+
+        // A point read of either document still fails.
+        for id in ["bad-meta", "bad-body"] {
+            let error = db.get_doc(id, &DocOpts::default()).await.unwrap_err();
+            assert_eq!(error.status, 500, "{id}: {error}");
+        }
         let open_revs = DocOpts {
-            open_revs: Some(vec![rev]),
+            open_revs: Some(vec![bad_rev.clone()]),
             ..Default::default()
         };
-        let error = db.get_doc("a", &open_revs).await.unwrap_err();
+        let error = db.get_doc("bad-body", &open_revs).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        let rev = DocOpts {
+            rev: Some(bad_rev),
+            ..Default::default()
+        };
+        let error = db.get_doc("bad-body", &rev).await.unwrap_err();
         assert_eq!(error.status, 500, "{error}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
