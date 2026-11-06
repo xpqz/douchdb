@@ -2030,6 +2030,57 @@ async fn continuous_changes_streams_newline_json_and_heartbeats() {
 }
 
 #[tokio::test]
+async fn continuous_changes_ends_with_a_last_seq_trailer() {
+    let s = Server::start(false);
+    s.fresh_db("trailer").await;
+    for id in ["a", "b"] {
+        let (status, _) = s.put(&format!("/trailer/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let lines = |text: &str| -> Vec<Value> {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("line is JSON"))
+            .collect()
+    };
+
+    // CouchDB (chttpd_changes:end_sending_changes) closes a continuous feed
+    // that times out with {"last_seq":...,"pending":...}.
+    let text = s
+        .client
+        .get(format!(
+            "{}/trailer/_changes?feed=continuous&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows = lines(&text);
+    assert_eq!(rows.len(), 3, "{text}");
+    assert_eq!(rows[2], json!({"last_seq": 2, "pending": 0}), "{text}");
+
+    // The same trailer closes a feed that reached its limit.
+    let text = s
+        .client
+        .get(format!(
+            "{}/trailer/_changes?feed=continuous&since=0&limit=1",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows = lines(&text);
+    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
+}
+
+#[tokio::test]
 async fn changes_supports_sse_eventsource_feed() {
     let s = Server::start(false);
     s.fresh_db("sse").await;
@@ -2916,6 +2967,151 @@ async fn cluster_changes_limit_covers_all_nodes() {
     ids.dedup();
     assert_eq!(ids.len(), 9, "limited feed missed a node");
     assert_eq!(total_seen, 9, "limited feed returned duplicate rows");
+}
+
+#[tokio::test]
+async fn cluster_changes_limit_pages_make_progress_with_a_node_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clchdown").await;
+    }
+    let ids: Vec<String> = (0..12).map(|i| format!("pd{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clchdown/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (reader, victim) = fallback_pair(&nodes, "clchdown", &ids).await;
+    nodes[victim].kill();
+
+    let mut since = "0".to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut finished = false;
+    for _ in 0..30 {
+        let (status, body) = nodes[reader]
+            .get(&format!("/clchdown/_changes?since={since}&limit=2"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let results = body["results"].as_array().unwrap();
+        if results.is_empty() {
+            finished = true;
+            break;
+        }
+        for row in results {
+            seen.insert(row["id"].as_str().unwrap().to_string());
+        }
+        since = body["last_seq"].as_str().unwrap().to_string();
+    }
+    assert!(finished, "paged feed never reached the end: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        ids.len(),
+        "paged feed skipped changes: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_changes_since_now_with_a_node_down_uses_another_replica() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clnowdown").await;
+    }
+    let ids: Vec<String> = (0..9).map(|i| format!("nd{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clnowdown/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (reader, victim) = fallback_pair(&nodes, "clnowdown", &ids).await;
+    nodes[victim].kill();
+
+    let (status, body) = nodes[reader]
+        .get("/clnowdown/_changes?since=now&limit=1")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+    let since = body["last_seq"].as_str().unwrap().to_string();
+    let (status, info) = nodes[reader].get("/clnowdown").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+
+    let (status, _) = nodes[reader].put("/clnowdown/fresh", json!({})).await;
+    assert!(status == StatusCode::CREATED || status == StatusCode::ACCEPTED);
+    let (status, body) = nodes[reader]
+        .get(&format!("/clnowdown/_changes?since={since}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let got: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, vec!["fresh"], "since=now replayed history: {body}");
+}
+
+#[tokio::test]
+async fn cluster_changes_since_now_fails_when_a_shard_has_no_live_copy() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clnowgone").await;
+    }
+    nodes[2].kill();
+    // CouchDB: fabric_db_info answers {error, {nodedown, <<"progress not
+    // possible">>}}, which chttpd maps to 412.
+    let (status, body) = nodes[0].get("/clnowgone/_changes?since=now").await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
+#[tokio::test]
+async fn cluster_changes_forward_filter_query_args_to_every_shard() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clchquery").await;
+    }
+    // Node 0 holds only the design document's shard and one more; node 1
+    // holds every shard. Reads from node 0 therefore fetch the rest from node
+    // 1, which must evaluate the filter with the same `req.query`.
+    let design = douchdb::db::shard_index("_design/f", 4);
+    let replicas: Vec<Vec<usize>> = (0..4)
+        .map(|shard| {
+            if shard == design || shard == (design + 1) % 4 {
+                vec![0, 1]
+            } else {
+                vec![1]
+            }
+        })
+        .collect();
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/clchquery",
+            json!({"q": 4, "node_count": 3, "replicas": replicas}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = nodes[0]
+        .put(
+            "/clchquery/_design/f",
+            json!({"filters": {"by_kind": "function(doc, req) { return doc.kind === req.query.kind; }"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"_id": format!("fq{i}"), "kind": if i % 2 == 0 { "a&b%" } else { "c" }}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clchquery/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "{status}"
+    );
+    let (status, body) = nodes[0]
+        .get("/clchquery/_changes?filter=f/by_kind&kind=a%26b%25")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 6, "{body}");
 }
 
 fn all_shards_on(node: usize) -> Value {
