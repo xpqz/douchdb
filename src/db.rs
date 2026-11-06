@@ -448,6 +448,13 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
+            let corrupt = shard.call(|s| Ok(s.corrupt_design_docs()?)).await?;
+            if let Some(id) = corrupt.first() {
+                // Skipping it would let writes through unvalidated.
+                return Err(ApiError::corrupt(format!(
+                    "corrupt design document {id}: its validate_doc_update cannot be loaded"
+                )));
+            }
             let mut found = shard
                 .call(|s| {
                     Ok(s.latest_changes()?
@@ -3336,6 +3343,35 @@ mod tests {
             .iter()
             .map(|row| row["id"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_design_document_fails_writes_closed() {
+        // Every write loads the validators first (`validate::validate_docs`),
+        // and an error there is the write's 500.
+        let (db, root) = single_shard_db("ddoc-ok").await;
+        db.put_docs(vec![json!({"_id": "ok1", "n": 1})], true)
+            .await
+            .unwrap();
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A design document that cannot be decoded must not be skipped:
+        // its validate_doc_update would silently stop running.
+        let (db, root) = single_shard_db("ddoc-corrupt").await;
+        db.shards[0]
+            .call(|shard| {
+                shard.put_raw(&meta_key("_design/v"), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.validation_functions().await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        assert!(error.reason.contains("_design/v"), "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
