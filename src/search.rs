@@ -1453,6 +1453,14 @@ pub fn all_indexes(db: &Db) -> Vec<Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn value_in_range_ignores_multibyte_bracket_positions() {
+        let value = serde_json::json!("a");
+        assert!(!value_in_range(&value, "é"));
+        assert!(!value_in_range(&value, "[é TO z]é"));
+        assert!(!value_in_range(&value, "é[a TO z]"));
+    }
+
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_after_each_write() {
         let root = std::env::temp_dir().join(format!(

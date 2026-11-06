@@ -2262,6 +2262,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn decode_since_rejects_out_of_range_node_index() {
+        let enc = |text: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        assert_eq!(decode_since(&enc(br#"{"99999999999":1}"#)), None);
+        assert_eq!(decode_since(&enc(br#"{"1":7}"#)), Some(vec![0, 7]));
+    }
+
     fn doc(rev: &str, start: u64, ids: &[&str], deleted: bool) -> Value {
         json!({
             "_id": "x",
