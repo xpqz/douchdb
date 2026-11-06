@@ -3158,7 +3158,7 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
 
     let (status, body) = s
         .post(
@@ -3167,7 +3167,19 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
+
+    // Reading an attachment finds none, as CouchDB reports for a document
+    // that has no such attachment.
+    let (status, _) = s.put("/att/plain", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/att/plain/a.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
+    assert_eq!(body["reason"], "Document is missing attachment");
+    let (status, body) = s.get("/att/nodoc/a.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["reason"], "missing");
 
     let (status, body) = s
         .req_with(
@@ -3178,7 +3190,7 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
 }
 
 // CouchDB's `_purge` acts on leaf revisions only: a leaf and the ancestors no
@@ -3661,6 +3673,123 @@ async fn doc_writes_map_errors_to_their_status() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = s.delete("/results/d1?rev=1-abc").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// Document write errors taken from CouchDB 3.5.3: `PUT ?batch=ok` is 202
+/// without a rev, a body that is not JSON is `invalid UTF-8 JSON`, a design
+/// document with a member of the wrong type is `invalid_design_doc` and a
+/// `_deleted` that is not a boolean is `doc_validation`.
+#[tokio::test]
+async fn document_writes_validate_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("dw").await;
+
+    let (status, body) = s.put("/dw/b1?batch=ok", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "b1"}));
+    let (status, body) = s.get("/dw/b1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (method, path) in [(Method::POST, "/dw"), (Method::PUT, "/dw/j1")] {
+        for raw in ["not json", ""] {
+            let response = s
+                .client
+                .request(method.clone(), format!("{}{path}", s.base))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(raw.to_owned())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {raw:?}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"], "bad_request", "{path} {raw:?}");
+            assert_eq!(body["reason"], "invalid UTF-8 JSON", "{path} {raw:?}");
+        }
+    }
+    let (status, body) = s.post_raw("/dw/_bulk_docs", "not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "invalid UTF-8 JSON");
+
+    for (doc, reason) in [
+        (json!({"views": 1}), "`views` field must have object type"),
+        (
+            json!({"views": {"v": 1}}),
+            "`views.v` field must have object type",
+        ),
+        (
+            json!({"views": {"v": {}}}),
+            "View `v` must contain map function",
+        ),
+        (
+            json!({"views": {"v": {"map": 1}}}),
+            "`views.v.map` field must have string type",
+        ),
+        (
+            json!({"views": {"v": {"map": "function(d){}", "reduce": "_nope"}}}),
+            "`_nope` is not a supported reduce function.",
+        ),
+        (
+            json!({"language": 5}),
+            "`language` field must have string type",
+        ),
+        (
+            json!({"filters": 1}),
+            "`filters` field must have object type",
+        ),
+        (
+            json!({"filters": {"f": 1}}),
+            "`filters.f` field must have string or object type",
+        ),
+        (
+            json!({"validate_doc_update": 1}),
+            "`validate_doc_update` field must have string type",
+        ),
+        (
+            json!({"rewrites": {}}),
+            "`rewrites` field must have array or string type",
+        ),
+    ] {
+        let (status, body) = s.put("/dw/_design/bad", doc.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{doc}: {body}");
+        assert_eq!(body["error"], "invalid_design_doc", "{doc}");
+        assert_eq!(body["reason"], reason, "{doc}");
+    }
+    let mut doc = json!({"_id": "_design/bad", "views": 1});
+    let (status, body) = s.post("/dw", doc.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_design_doc");
+    // `_bulk_docs` reports the failure on the row and stores the rest.
+    doc["_id"] = json!("_design/bad2");
+    let (status, body) = s
+        .post("/dw/_bulk_docs", json!({"docs": [doc, {"_id": "ok1"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["id"], "_design/bad2");
+    assert_eq!(body[0]["error"], "invalid_design_doc");
+    assert_eq!(body[0]["reason"], "`views` field must have object type");
+    assert_eq!(body[1]["ok"], true);
+    // A well-formed design document is still accepted.
+    let (status, body) = s
+        .put(
+            "/dw/_design/good",
+            json!({"language": "javascript", "views": {"v": {"map": "function(d){}", "reduce": "_count"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for deleted in [json!("x"), json!(1), Value::Null] {
+        let (status, body) = s.put("/dw/del", json!({"_deleted": deleted})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{deleted}: {body}");
+        assert_eq!(body["error"], "doc_validation", "{deleted}");
+        assert_eq!(body["reason"], "Bad special document member: _deleted");
+        let (status, body) = s
+            .post("/dw", json!({"_id": "del", "_deleted": deleted}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{deleted}: {body}");
+        assert_eq!(body["error"], "doc_validation", "{deleted}");
+    }
+    let (status, body) = s.put("/dw/del", json!({"_deleted": false})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 #[tokio::test]
