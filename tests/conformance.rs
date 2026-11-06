@@ -8987,6 +8987,38 @@ async fn pouchdb_bulk_docs_and_design_docs_ports() {
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
 }
 
+/// `_index_info` is read-only: other methods are 405 with an `Allow` list,
+/// not a silent read (or, for PUT and DELETE, a write that goes unchecked).
+#[tokio::test]
+async fn index_info_only_answers_get_and_head() {
+    let s = Server::start(false);
+    s.fresh_db("idxinfo").await;
+    for method in [Method::POST, Method::PUT, Method::DELETE] {
+        let response = s
+            .client
+            .request(method.clone(), format!("{}/idxinfo/_index_info", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        let allow = response
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(allow, Some("GET,HEAD"), "{method}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "method_not_allowed", "{method}");
+        assert_eq!(body["reason"], "Only GET,HEAD allowed", "{method}");
+    }
+    let (status, body) = s.get("/idxinfo/_index_info").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 0);
+}
+
 #[tokio::test]
 async fn couchdb_search_sort_highlight_timeout_and_index_info_ports() {
     let s = Server::start(false);
