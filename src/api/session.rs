@@ -10,13 +10,11 @@ pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) ->
         return unauthorized();
     }
     let authenticated = principal.is_authenticated();
-    let name = principal.name.clone().unwrap_or_else(|| {
-        if authenticated {
-            "admin".into()
-        } else {
-            Value::Null.to_string()
-        }
-    });
+    let name = match &principal.name {
+        Some(name) => json!(name),
+        None if authenticated => json!("admin"),
+        None => Value::Null,
+    };
     json(
         StatusCode::OK,
         json!({

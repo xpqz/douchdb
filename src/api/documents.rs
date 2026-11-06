@@ -334,7 +334,7 @@ async fn copy_doc(
         Ok((mut results, _)) => {
             let result = results.pop().unwrap_or(Value::Null);
             if result.get("error").is_some() {
-                json(StatusCode::CONFLICT, result)
+                json(doc_error_status(&result), result)
             } else {
                 json(StatusCode::CREATED, result)
             }
@@ -418,12 +418,7 @@ async fn put_doc(
                 if let Some(obj) = result.as_object_mut() {
                     obj.remove("id");
                 }
-                let status = if result["error"] == "conflict" {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                return json(status, result);
+                return json(doc_error_status(&result), result);
             }
             // CouchDB answers 200, not 201, when a PUT lands as a tombstone.
             let status = if tombstone {
@@ -493,7 +488,7 @@ async fn delete_doc(
                 if let Some(obj) = result.as_object_mut() {
                     obj.remove("id");
                 }
-                return json(StatusCode::CONFLICT, result);
+                return json(doc_error_status(&result), result);
             }
             json(
                 if quorum {

@@ -240,11 +240,14 @@ pub async fn db_root(
             .await
             {
                 Ok((mut results, quorum)) => {
-                    let result = results.pop().unwrap_or(Value::Null);
+                    let mut result = results.pop().unwrap_or(Value::Null);
                     if result.get("error").is_some() {
-                        return fail(ApiError::conflict());
+                        if let Some(object) = result.as_object_mut() {
+                            object.remove("id");
+                        }
+                        return json(doc_error_status(&result), result);
                     }
-                    if flag(&q, "batch") {
+                    if q.get("batch").map(String::as_str) == Some("ok") {
                         return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
                     }
                     json(
@@ -362,13 +365,28 @@ pub async fn db_rest(
         body: &body,
     };
 
+    let allowed: Option<&[&str]> = match rest.as_str() {
+        "_bulk_docs"
+        | "_bulk_get"
+        | "_revs_diff"
+        | "_purge"
+        | "_compact"
+        | "_ensure_full_commit"
+        | "_view_cleanup"
+        | "_search_cleanup" => Some(&["POST"]),
+        "_changes" => Some(&["GET", "POST", "HEAD"]),
+        "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
+        _ => None,
+    };
+    if let Some(response) = allowed.and_then(|allowed| require_method(&method, allowed)) {
+        return response;
+    }
+
     match rest.as_str() {
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
         "_all_docs" => return all_docs(req, None).await,
-        "_changes" => {
-            return changes(st.clone(), db.clone(), &name, &q, &method, &body, &headers).await
-        }
+        "_changes" => return changes(st.clone(), db.clone(), &name, &q, &body, &headers).await,
         "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
         "_purge" => {
             return match serde_json::from_slice::<Value>(&body) {
@@ -415,27 +433,29 @@ pub async fn db_rest(
                     Ok(n) => json(StatusCode::OK, json!(n)),
                     Err(e) => fail(e),
                 },
-                Method::PUT => {
-                    let limit = String::from_utf8_lossy(&body)
-                        .trim()
-                        .parse()
-                        .unwrap_or(1000);
+                _ => {
+                    let limit = match serde_json::from_slice::<Value>(&body) {
+                        Ok(value) => match value.as_u64().filter(|limit| *limit > 0) {
+                            Some(limit) => limit,
+                            None => {
+                                return fail(ApiError::bad_request(
+                                    "`_revs_limit` must be a positive integer",
+                                ))
+                            }
+                        },
+                        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+                    };
                     match db.set_revs_limit(limit).await {
                         Ok(()) => ok(),
                         Err(e) => fail(e),
                     }
                 }
-                _ => fail(ApiError::new(
-                    405,
-                    "method_not_allowed",
-                    "method not allowed",
-                )),
             }
         }
         "_security" => {
             return match method {
                 Method::GET => json(StatusCode::OK, db.security()),
-                Method::PUT => {
+                _ => {
                     let value: Value = match serde_json::from_slice(&body) {
                         Ok(value) => value,
                         Err(_) => return fail(ApiError::bad_request("invalid security object")),
@@ -455,11 +475,6 @@ pub async fn db_rest(
                         Err(error) => fail(error),
                     }
                 }
-                _ => fail(ApiError::new(
-                    405,
-                    "method_not_allowed",
-                    "method not allowed",
-                )),
             };
         }
         "_view_cleanup" => {

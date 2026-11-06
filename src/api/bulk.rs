@@ -418,6 +418,9 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         ..
     } = req;
     let body: &[u8] = body;
+    if let Some(response) = require_method(method, &["GET", "HEAD", "POST"]) {
+        return response;
+    }
     let partition = partition.or_else(|| q.get("partition").cloned());
     if let Some(partition) = &partition {
         if !db.partitioned {
@@ -429,8 +432,14 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
             return fail(error);
         }
     }
-    let query_limit = q.contains_key("limit");
-    let query_skip = q.contains_key("skip");
+    let query_limit = match uint_param(q, "limit") {
+        Ok(limit) => limit,
+        Err(error) => return fail(error),
+    };
+    let query_skip = match uint_param(q, "skip") {
+        Ok(skip) => skip,
+        Err(error) => return fail(error),
+    };
     let mut opts = AllDocsOpts {
         partition: partition.clone(),
         include_docs: flag(q, "include_docs"),
@@ -443,8 +452,8 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
             .get("inclusive_end")
             .map(|value| value != "false")
             .unwrap_or(true),
-        limit: num(q, "limit").unwrap_or(usize::MAX),
-        skip: num(q, "skip").unwrap_or(0),
+        limit: query_limit.unwrap_or(usize::MAX),
+        skip: query_skip.unwrap_or(0),
         ..Default::default()
     };
     if let Some(key) = key_param(q, "key") {
@@ -456,51 +465,67 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         opts.startkey = opts.startkey.or(Some(key.clone()));
         opts.endkey = opts.endkey.or(Some(key));
     } else if let Some(raw) = q.get("keys") {
-        if let Ok(Value::Array(keys)) = serde_json::from_str::<Value>(raw) {
-            opts.keys = Some(
-                keys.into_iter()
-                    .filter_map(|key| key.as_str().map(str::to_string))
-                    .collect(),
-            );
+        match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Array(keys)) => {
+                opts.keys = Some(
+                    keys.into_iter()
+                        .filter_map(|key| key.as_str().map(str::to_string))
+                        .collect(),
+                );
+            }
+            Ok(_) => return fail(ApiError::bad_request("`keys` parameter must be an array.")),
+            Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
         }
     }
     if *method == Method::POST {
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            if opts.keys.is_none() {
-                if let Some(keys_value) = value.get("keys") {
-                    let Some(keys) = keys_value.as_array() else {
-                        return fail(ApiError::bad_request("`keys` must be an array."));
-                    };
-                    opts.keys = Some(
-                        keys.iter()
-                            .filter_map(|k| k.as_str().map(str::to_string))
-                            .collect(),
-                    );
-                }
+        let value = match body_object(body) {
+            Ok(value) => value,
+            Err(error) => return fail(error),
+        };
+        if opts.keys.is_none() {
+            if let Some(keys_value) = value.get("keys") {
+                let Some(keys) = keys_value.as_array() else {
+                    return fail(ApiError::bad_request(
+                        "`keys` body member must be an array.",
+                    ));
+                };
+                opts.keys = Some(
+                    keys.iter()
+                        .filter_map(|k| k.as_str().map(str::to_string))
+                        .collect(),
+                );
             }
-            if value
-                .get("include_docs")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                opts.include_docs = true;
+        }
+        if value
+            .get("include_docs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            opts.include_docs = true;
+        }
+        if value
+            .get("descending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            opts.descending = true;
+        }
+        let body_limit = match uint_member(&value, "limit") {
+            Ok(limit) => limit,
+            Err(error) => return fail(error),
+        };
+        let body_skip = match uint_member(&value, "skip") {
+            Ok(skip) => skip,
+            Err(error) => return fail(error),
+        };
+        if query_limit.is_none() {
+            if let Some(limit) = body_limit {
+                opts.limit = limit;
             }
-            if value
-                .get("descending")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                opts.descending = true;
-            }
-            if !query_limit {
-                if let Some(limit) = value.get("limit").and_then(Value::as_u64) {
-                    opts.limit = limit as usize;
-                }
-            }
-            if !query_skip {
-                if let Some(skip) = value.get("skip").and_then(Value::as_u64) {
-                    opts.skip = skip as usize;
-                }
+        }
+        if query_skip.is_none() {
+            if let Some(skip) = body_skip {
+                opts.skip = skip;
             }
         }
     }

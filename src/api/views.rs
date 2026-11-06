@@ -122,12 +122,8 @@ pub(super) async fn search_request(
         ddoc,
         name: index_name,
     } = index;
-    if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
-        return fail(ApiError::new(
-            405,
-            "method_not_allowed",
-            "method not allowed",
-        ));
+    if let Some(response) = require_method(method, &["GET", "POST", "HEAD"]) {
+        return response;
     }
     let limits = crate::view::ViewLimits {
         timeout: std::time::Duration::from_millis(st.config.view_timeout_ms),
@@ -146,7 +142,15 @@ pub(super) async fn search_request(
     };
     let mut supplied = false;
     if *method == Method::POST {
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        let parsed = if body.iter().all(u8::is_ascii_whitespace) {
+            None
+        } else {
+            match serde_json::from_slice::<Value>(body) {
+                Ok(value) => Some(value),
+                Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+            }
+        };
+        if let Some(value) = parsed {
             let value = match value {
                 Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
                 other => other,
@@ -327,12 +331,8 @@ pub(super) async fn view_request(
         ddoc,
         name: view_name,
     } = view;
-    if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
-        return fail(ApiError::new(
-            405,
-            "method_not_allowed",
-            "method not allowed",
-        ));
+    if let Some(response) = require_method(method, &["GET", "POST", "HEAD"]) {
+        return response;
     }
 
     let build = || -> DbResult<crate::view::ViewQuery> {
@@ -341,12 +341,23 @@ pub(super) async fn view_request(
             Some(_) => return Err(ApiError::bad_request("`keys` must be a JSON array")),
             None => None,
         };
-        if keys.is_none() && *method == Method::POST {
-            if let Ok(value) = serde_json::from_slice::<Value>(body) {
-                if let Some(array) = value.get("keys").and_then(Value::as_array) {
-                    keys = Some(array.clone());
+        let mut limit = uint_param(q, "limit")?;
+        let mut skip = uint_param(q, "skip")?;
+        if *method == Method::POST {
+            let value = body_object(body)?;
+            if keys.is_none() {
+                match value.get("keys") {
+                    Some(Value::Array(array)) => keys = Some(array.clone()),
+                    Some(_) => {
+                        return Err(ApiError::bad_request("`keys` member must be an array."))
+                    }
+                    None => {}
                 }
             }
+            let (body_limit, body_skip) =
+                (uint_member(&value, "limit")?, uint_member(&value, "skip")?);
+            limit = limit.or(body_limit);
+            skip = skip.or(body_skip);
         }
         let group_level = num(q, "group_level");
         if group_level.is_some_and(|level| level > 0)
@@ -376,8 +387,8 @@ pub(super) async fn view_request(
                 .get("inclusive_end")
                 .map(|value| value != "false")
                 .unwrap_or(true),
-            skip: num(q, "skip").unwrap_or(0),
-            limit: num(q, "limit").unwrap_or(usize::MAX),
+            skip: skip.unwrap_or(0),
+            limit: limit.unwrap_or(usize::MAX),
             reduce: q.get("reduce").map(|_| flag(q, "reduce")),
             // CouchDB: an explicit group_level wins over group. With
             // group_level=0 the result is ungrouped even if group=true.

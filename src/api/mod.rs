@@ -192,6 +192,112 @@ pub(crate) fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
     q.get(key).and_then(|v| v.parse().ok())
 }
 
+/// CouchDB answers a request with the wrong method with 405, an `Allow`
+/// header and `Only GET,POST allowed`; the caller passes the allowed methods in
+/// CouchDB's order.
+pub(crate) fn method_not_allowed(allowed: &[&str]) -> Response {
+    let list = allowed.join(",");
+    let mut response = json(
+        StatusCode::METHOD_NOT_ALLOWED,
+        json!({
+            "error": "method_not_allowed",
+            "reason": format!("Only {list} allowed"),
+        }),
+    );
+    if let Ok(value) = HeaderValue::from_str(&list) {
+        response.headers_mut().insert(header::ALLOW, value);
+    }
+    response
+}
+
+/// `Some(405 response)` unless `method` is one of `allowed`.
+pub(crate) fn require_method(method: &Method, allowed: &[&str]) -> Option<Response> {
+    if allowed.contains(&method.as_str()) {
+        None
+    } else {
+        Some(method_not_allowed(allowed))
+    }
+}
+
+/// The largest `limit` CouchDB accepts.
+const MAX_LIMIT: u64 = 576_460_752_303_423_487;
+
+/// A `limit` or `skip` query parameter. CouchDB rejects a value that is not a
+/// non-negative integer with `query_parse_error`; ignoring it would turn a
+/// typo into an unbounded query.
+pub(crate) fn uint_param(q: &HashMap<String, String>, key: &str) -> DbResult<Option<usize>> {
+    let Some(raw) = q.get(key) else {
+        return Ok(None);
+    };
+    let invalid = |kind: &str| {
+        let shown = if raw.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("\"{raw}\"")
+        };
+        ApiError::new(
+            400,
+            "query_parse_error",
+            format!("Invalid value for {kind}: {shown}"),
+        )
+    };
+    match raw.parse::<i128>() {
+        Ok(n) if n < 0 => Err(invalid("positive integer")),
+        Ok(n) if key == "limit" && n > i128::from(MAX_LIMIT) => Err(ApiError::new(
+            400,
+            "query_parse_error",
+            format!("Limit is too large, must not exceed {MAX_LIMIT}"),
+        )),
+        Ok(n) => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+        Err(_) => Err(invalid("integer")),
+    }
+}
+
+/// A `limit` or `skip` member of a JSON request body, with CouchDB's errors.
+pub(crate) fn uint_member(body: &Map<String, Value>, key: &str) -> DbResult<Option<usize>> {
+    let Some(value) = body.get(key) else {
+        return Ok(None);
+    };
+    if let Some(n) = value.as_u64() {
+        return Ok(Some(usize::try_from(n).unwrap_or(usize::MAX)));
+    }
+    let (kind, shown) = match value {
+        Value::Number(n) if n.is_i64() => ("positive integer", n.to_string()),
+        Value::String(s) => ("integer", format!("<<\"{s}\">>")),
+        other => ("integer", other.to_string()),
+    };
+    Err(ApiError::new(
+        400,
+        "query_parse_error",
+        format!("Invalid value for {kind}: {shown}"),
+    ))
+}
+
+/// A POST body that must be a JSON object. An empty body is an empty object.
+pub(crate) fn body_object(body: &[u8]) -> DbResult<Map<String, Value>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Map::new());
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(object)) => Ok(object),
+        Ok(_) => Err(ApiError::bad_request("Request body must be a JSON object")),
+        Err(_) => Err(ApiError::bad_request("invalid UTF-8 JSON")),
+    }
+}
+
+/// The HTTP status for a failed per-document write result (`{"error": ...}`).
+pub(crate) fn doc_error_status(result: &Value) -> StatusCode {
+    match result.get("error").and_then(Value::as_str) {
+        Some("conflict") => StatusCode::CONFLICT,
+        Some("forbidden") => StatusCode::FORBIDDEN,
+        Some("unauthorized") => StatusCode::UNAUTHORIZED,
+        Some("replica_unavailable" | "internal_server_error" | "unknown_error") => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
 fn parse_shard_mask(raw: &str, q: u32) -> Option<Vec<bool>> {
     let mut mask = vec![false; q as usize];
     for part in raw.split(',').filter(|part| !part.is_empty()) {
