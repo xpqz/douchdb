@@ -132,10 +132,247 @@ struct ViewIndex {
 /// result rather than the size of the index.
 #[derive(Default)]
 pub struct ViewRows {
-    shards: Vec<Vec<Row>>,
+    shards: Vec<ShardRows>,
     /// Per shard, partial reductions for one reducer: built by the first
     /// reduce that needs them and kept up to date across writes.
     blocks: Vec<StdMutex<Option<BlockTree>>>,
+}
+
+/// Rows per storage block of a shard. A write copies only the blocks it
+/// changes, and a copy of the view shares the rest.
+const ROW_BLOCK: usize = 256;
+
+/// One shard's rows in key order, held in blocks of about `ROW_BLOCK` rows.
+/// No block is empty.
+#[derive(Clone, Default)]
+struct ShardRows {
+    blocks: Vec<Arc<Vec<Row>>>,
+    /// The row each block starts at, then the shard's row count.
+    starts: Vec<usize>,
+}
+
+/// Rows in key order that a query can binary search.
+trait SortedRows {
+    fn len(&self) -> usize;
+    fn row(&self, at: usize) -> &Row;
+    fn partition_point(&self, pred: impl Fn(&Row) -> bool) -> usize;
+}
+
+impl<R: AsRef<Row>> SortedRows for [R] {
+    fn len(&self) -> usize {
+        <[R]>::len(self)
+    }
+
+    fn row(&self, at: usize) -> &Row {
+        self[at].as_ref()
+    }
+
+    fn partition_point(&self, pred: impl Fn(&Row) -> bool) -> usize {
+        <[R]>::partition_point(self, |row| pred(row.as_ref()))
+    }
+}
+
+impl SortedRows for ShardRows {
+    fn len(&self) -> usize {
+        self.starts.last().copied().unwrap_or(0)
+    }
+
+    fn row(&self, at: usize) -> &Row {
+        let block = self.block_of(at);
+        &self.blocks[block][at - self.starts[block]]
+    }
+
+    fn partition_point(&self, pred: impl Fn(&Row) -> bool) -> usize {
+        // Blocks whose last row satisfies `pred` lie wholly before the point.
+        let block = self
+            .blocks
+            .partition_point(|rows| rows.last().is_some_and(&pred));
+        match self.blocks.get(block) {
+            Some(rows) => self.starts[block] + rows.partition_point(|row| pred(row)),
+            None => self.len(),
+        }
+    }
+}
+
+impl ShardRows {
+    fn from_sorted(rows: Vec<Row>) -> ShardRows {
+        let mut rows = rows.into_iter();
+        let mut blocks = Vec::new();
+        loop {
+            let block: Vec<Row> = rows.by_ref().take(ROW_BLOCK).collect();
+            if block.is_empty() {
+                break;
+            }
+            blocks.push(Arc::new(block));
+        }
+        let mut shard = ShardRows {
+            blocks,
+            starts: Vec::new(),
+        };
+        shard.index();
+        shard
+    }
+
+    fn index(&mut self) {
+        let mut start = 0;
+        self.starts = std::iter::once(0)
+            .chain(self.blocks.iter().map(|rows| {
+                start += rows.len();
+                start
+            }))
+            .collect();
+    }
+
+    /// The block holding row `at`, or the block count when `at` is the end.
+    fn block_of(&self, at: usize) -> usize {
+        self.starts
+            .partition_point(|start| *start <= at)
+            .saturating_sub(1)
+            .min(self.blocks.len())
+    }
+
+    fn range(&self, first: usize, end: usize) -> impl Iterator<Item = &Row> + Clone {
+        let block = self.block_of(first);
+        let skip = first - self.starts.get(block).copied().unwrap_or(first);
+        self.blocks[block..]
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .skip(skip)
+            .take(end.saturating_sub(first))
+    }
+
+    /// Positions of the rows `(id, key)` emitted by the documents being
+    /// replaced, sorted. A document's rows with one key are adjacent.
+    fn positions(&self, gone: &[(&str, &Value)]) -> Vec<usize> {
+        let order =
+            |a: &(&str, &Value), b: &(&str, &Value)| cmp_json(a.1, b.1).then_with(|| a.0.cmp(b.0));
+        let mut gone = gone.to_vec();
+        gone.sort_by(order);
+        let mut positions = Vec::new();
+        for run in gone.chunk_by(|a, b| order(a, b) == Ordering::Equal) {
+            let (id, key) = run[0];
+            let row_order = |row: &Row| order(&(row.id.as_str(), &row.key), &(id, key));
+            let first = self.partition_point(|row| row_order(row) == Ordering::Less);
+            let end = self.partition_point(|row| row_order(row) != Ordering::Greater);
+            if end - first == run.len() {
+                positions.extend(first..end);
+            } else {
+                // Not where its stored key says (a float that did not survive
+                // the round trip exactly): find the document's rows by id
+                // instead, so a stale row can never be left behind.
+                positions.extend(
+                    self.range(0, self.len())
+                        .enumerate()
+                        .filter(|(_, row)| row.id == id)
+                        .map(|(at, _)| at),
+                );
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
+
+    /// Remove the rows at sorted `removed` positions and merge in sorted
+    /// `added`. Returns each added row's position among the kept rows.
+    fn replace(&mut self, removed: &[usize], added: Vec<Row>) -> Vec<usize> {
+        let mut touched = vec![false; self.blocks.len()];
+        let mut next = 0;
+        while next < removed.len() {
+            let block = self.block_of(removed[next]);
+            let (start, end) = (self.starts[block], self.starts[block + 1]);
+            let upto = next + removed[next..].partition_point(|at| *at < end);
+            let mut gone = removed[next..upto].iter().map(|at| at - start).peekable();
+            let mut at = 0;
+            Arc::make_mut(&mut self.blocks[block]).retain(|_| {
+                let drop = gone.next_if_eq(&at).is_some();
+                at += 1;
+                !drop
+            });
+            touched[block] = true;
+            next = upto;
+        }
+        // Drop emptied blocks so every block has a last row to search by.
+        let mut flags = touched.into_iter();
+        let mut touched = Vec::new();
+        self.blocks.retain(|rows| {
+            let flag = flags.next().unwrap_or(false);
+            if !rows.is_empty() {
+                touched.push(flag);
+            }
+            !rows.is_empty()
+        });
+        self.index();
+
+        let inserted: Vec<usize> = added
+            .iter()
+            .map(|row| self.partition_point(|kept| row_cmp(kept, row) == Ordering::Less))
+            .collect();
+        if !added.is_empty() && self.blocks.is_empty() {
+            self.blocks.push(Arc::default());
+            touched.push(true);
+        }
+        // A row goes to the block holding the kept row it lands before, or
+        // to the last block when it lands after every kept row.
+        let mut added = added.into_iter().zip(&inserted).peekable();
+        while let Some((row, &at)) = added.next() {
+            let block = self.block_of(at).min(self.blocks.len() - 1);
+            let mut run = vec![row];
+            while let Some((row, _)) =
+                added.next_if(|(_, &at)| self.block_of(at).min(self.blocks.len() - 1) == block)
+            {
+                run.push(row);
+            }
+            let rows = Arc::make_mut(&mut self.blocks[block]);
+            *rows = merge_sorted_rows(std::mem::take(rows), run);
+            touched[block] = true;
+        }
+        self.rebalance(&touched);
+        inserted
+    }
+
+    /// Split touched blocks grown past twice `ROW_BLOCK` and join those
+    /// shrunk below half of it to the next block.
+    fn rebalance(&mut self, touched: &[bool]) {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        let mut carry: Vec<Row> = Vec::new();
+        for (rows, &touched) in std::mem::take(&mut self.blocks).into_iter().zip(touched) {
+            if !touched && carry.is_empty() {
+                blocks.push(rows);
+                continue;
+            }
+            carry.extend(Arc::unwrap_or_clone(rows));
+            if carry.len() >= ROW_BLOCK / 2 {
+                split_into(&mut blocks, std::mem::take(&mut carry));
+            }
+        }
+        if !carry.is_empty() {
+            if let Some(last) = blocks.pop() {
+                let mut rows = Arc::unwrap_or_clone(last);
+                rows.extend(carry);
+                carry = rows;
+            }
+            split_into(&mut blocks, carry);
+        }
+        self.blocks = blocks;
+        self.index();
+    }
+}
+
+/// Push `rows` as one block, or as even pieces of about `ROW_BLOCK` when it
+/// is more than twice that.
+fn split_into(blocks: &mut Vec<Arc<Vec<Row>>>, rows: Vec<Row>) {
+    let pieces = if rows.len() > 2 * ROW_BLOCK {
+        rows.len().div_ceil(ROW_BLOCK)
+    } else {
+        1
+    };
+    let (size, extra) = (rows.len() / pieces, rows.len() % pieces);
+    let mut rows = rows.into_iter();
+    for piece in 0..pieces {
+        let take = size + usize::from(piece < extra);
+        blocks.push(Arc::new(rows.by_ref().take(take).collect()));
+    }
 }
 
 /// Rows per block when a shard's partials are built, and children per
@@ -169,12 +406,13 @@ struct Spans {
 }
 
 impl BlockTree {
-    fn build(rows: &[Row], reducer: &mut JsReducer) -> Result<BlockTree, String> {
-        let mut starts: Vec<usize> = (0..rows.len()).step_by(REDUCE_FANOUT).collect();
-        starts.push(rows.len());
-        let leaves = rows
-            .chunks(REDUCE_FANOUT)
-            .map(|chunk| reduce_rows(chunk, reducer))
+    fn build(rows: &ShardRows, reducer: &mut JsReducer) -> Result<BlockTree, String> {
+        let len = rows.len();
+        let mut starts: Vec<usize> = (0..len).step_by(REDUCE_FANOUT).collect();
+        starts.push(len);
+        let leaves = starts
+            .windows(2)
+            .map(|span| reduce_rows(rows.range(span[0], span[1]), reducer))
             .collect::<Result<_, _>>()?;
         let mut spans = Spans {
             starts,
@@ -188,10 +426,10 @@ impl BlockTree {
         })
     }
 
-    /// Follow a write to the shard. `removed[i]` says whether old row `i` was
-    /// dropped, and `inserted` holds each added row's index among the rows
-    /// kept. Returns false when there is no block to place a row in.
-    fn apply_write(&mut self, removed: &[bool], inserted: &[usize]) -> bool {
+    /// Follow a write to the shard. `removed` holds the sorted positions of
+    /// the old rows dropped, and `inserted` each added row's index among the
+    /// rows kept. Returns false when there is no block to place a row in.
+    fn apply_write(&mut self, removed: &[usize], inserted: &[usize]) -> bool {
         let spans = Arc::make_mut(&mut self.spans);
         let count = spans.starts.len().saturating_sub(1);
         if count == 0 {
@@ -202,11 +440,11 @@ impl BlockTree {
         for &block in &self.dirty {
             touched[block] = true;
         }
+        let mut next = 0;
         for block in 0..count {
-            let dropped = removed[spans.starts[block]..spans.starts[block + 1]]
-                .iter()
-                .filter(|removed| **removed)
-                .count();
+            let upto = next + removed[next..].partition_point(|at| *at < spans.starts[block + 1]);
+            let dropped = upto - next;
+            next = upto;
             if dropped > 0 {
                 sizes[block] -= dropped;
                 touched[block] = true;
@@ -264,7 +502,7 @@ impl BlockTree {
     }
 
     /// Recompute what writes invalidated.
-    fn refresh(&mut self, rows: &[Row], reducer: &mut JsReducer) -> Result<(), String> {
+    fn refresh(&mut self, rows: &ShardRows, reducer: &mut JsReducer) -> Result<(), String> {
         let stale_upper =
             self.spans.levels.len() == 1 && self.spans.levels[0].len() > REDUCE_FANOUT;
         if self.dirty.is_empty() && !stale_upper {
@@ -272,8 +510,10 @@ impl BlockTree {
         }
         let spans = Arc::make_mut(&mut self.spans);
         for &block in &self.dirty {
-            spans.levels[0][block] =
-                reduce_rows(&rows[spans.starts[block]..spans.starts[block + 1]], reducer)?;
+            spans.levels[0][block] = reduce_rows(
+                rows.range(spans.starts[block], spans.starts[block + 1]),
+                reducer,
+            )?;
         }
         if spans.levels.len() == 1 {
             spans.build_upper(reducer)?;
@@ -357,53 +597,48 @@ impl ViewRows {
             let shard = crate::db::shard_index_for(&row.id, q, partitioned);
             shards[shard].push(row);
         }
-        for shard in &mut shards {
-            sort_rows(shard);
-        }
+        let shards: Vec<ShardRows> = shards
+            .into_iter()
+            .map(|mut rows| {
+                sort_rows(&mut rows);
+                ShardRows::from_sorted(rows)
+            })
+            .collect();
         let blocks = shards.iter().map(|_| StdMutex::new(None)).collect();
         ViewRows { shards, blocks }
     }
 
-    /// Replace the rows of `changed` documents with `added`, shard by shard.
-    /// Both runs are sorted, so each touched shard is merged in linear time.
-    fn replace_docs(&mut self, changed: &[String], added: Vec<Row>, (q, partitioned): (u32, bool)) {
-        let mut touched: HashMap<usize, (HashSet<&str>, Vec<Row>)> = HashMap::new();
-        for id in changed {
+    /// Replace the rows `removed` (each an id and key) of the documents
+    /// that changed with `added`, shard by shard. Only the blocks holding
+    /// those rows are changed.
+    fn replace_docs(
+        &mut self,
+        removed: &[(String, Value)],
+        added: Vec<Row>,
+        (q, partitioned): (u32, bool),
+    ) {
+        type Touched<'a> = (Vec<(&'a str, &'a Value)>, Vec<Row>);
+        let mut touched: HashMap<usize, Touched> = HashMap::new();
+        for (id, key) in removed {
             let shard = crate::db::shard_index_for(id, q, partitioned);
-            touched.entry(shard).or_default().0.insert(id);
+            touched.entry(shard).or_default().0.push((id, key));
         }
         for row in added {
             let shard = crate::db::shard_index_for(&row.id, q, partitioned);
             touched.entry(shard).or_default().1.push(row);
         }
-        for (shard, (ids, mut rows)) in touched {
-            let old = std::mem::take(&mut self.shards[shard]);
-            let removed: Vec<bool> = old
-                .iter()
-                .map(|row| ids.contains(row.id.as_str()))
-                .collect();
-            let kept: Vec<Row> = old
-                .into_iter()
-                .zip(&removed)
-                .filter(|(_, removed)| !**removed)
-                .map(|(row, _)| row)
-                .collect();
+        for (shard, (gone, mut rows)) in touched {
+            let positions = self.shards[shard].positions(&gone);
             sort_rows(&mut rows);
+            let inserted = self.shards[shard].replace(&positions, rows);
             if let Some(slot) = self.blocks.get_mut(shard) {
                 let tree = slot.get_mut().unwrap_or_else(|poison| poison.into_inner());
                 if let Some(blocks) = tree.as_mut() {
-                    let inserted: Vec<usize> = rows
-                        .iter()
-                        .map(|row| {
-                            kept.partition_point(|kept| row_cmp(kept, row) == Ordering::Less)
-                        })
-                        .collect();
-                    if !blocks.apply_write(&removed, &inserted) {
+                    if !blocks.apply_write(&positions, &inserted) {
                         *tree = None;
                     }
                 }
             }
-            self.shards[shard] = merge_sorted_rows(kept, rows);
         }
     }
 
@@ -449,12 +684,15 @@ impl ViewRows {
             // a run found by binary search.
             let mut start = lo;
             while start < hi {
-                let group = group_key(&rows[start].key, query.group_level);
-                let end = start
-                    + rows[start..hi].partition_point(|row| {
+                let group = group_key(&rows.row(start).key, query.group_level);
+                // Rows before `start` are in earlier groups, so the point
+                // over the whole shard is the end of this group.
+                let end = rows
+                    .partition_point(|row| {
                         cmp_json(&group_key(&row.key, query.group_level), &group)
                             != Ordering::Greater
-                    });
+                    })
+                    .min(hi);
                 let value = reduce_span(rows, &blocks, start, end, reducer)?;
                 add_partial(&mut partials, group, value);
                 start = end;
@@ -506,10 +744,10 @@ impl ViewRows {
                     // partitions, so its rows are counted by walking it.
                     let prefix = format!("{partition}:");
                     let rows: Vec<&Row> = shard
-                        .iter()
+                        .range(0, shard.len())
                         .filter(|row| row.id.starts_with(&prefix))
                         .collect();
-                    select_sorted(&rows, query, cap, &mut out);
+                    select_sorted(rows.as_slice(), query, cap, &mut out);
                 }
                 None => select_sorted(shard, query, cap, &mut out),
             }
@@ -536,7 +774,12 @@ impl AsRef<Row> for Row {
 
 /// Add one sorted shard's contribution to `out`. Rows are in ascending key
 /// order; the query bounds are found by binary search on that order.
-fn select_sorted<R: AsRef<Row>>(rows: &[R], query: &ViewQuery, cap: usize, out: &mut Selection) {
+fn select_sorted<S: SortedRows + ?Sized>(
+    rows: &S,
+    query: &ViewQuery,
+    cap: usize,
+    out: &mut Selection,
+) {
     let len = rows.len();
     out.total_rows += len;
     let (lo, hi) = range_bounds(rows, query);
@@ -600,12 +843,12 @@ fn select_sorted<R: AsRef<Row>>(rows: &[R], query: &ViewQuery, cap: usize, out: 
         }
     }
     out.rows
-        .extend(chosen.into_iter().map(|index| rows[index].as_ref().clone()));
+        .extend(chosen.into_iter().map(|index| rows.row(index).clone()));
 }
 
 /// The index range of sorted `rows` inside the query's start and end bounds.
-fn range_bounds<R: AsRef<Row>>(rows: &[R], query: &ViewQuery) -> (usize, usize) {
-    let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(|row| pred(row.as_ref()));
+fn range_bounds<S: SortedRows + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, usize) {
+    let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(pred);
     // Rows before the start bound are a prefix (ascending) or a suffix
     // (descending); rows past the end bound are the opposite end.
     let (lo, hi) = if query.descending {
@@ -623,17 +866,17 @@ fn range_bounds<R: AsRef<Row>>(rows: &[R], query: &ViewQuery) -> (usize, usize) 
 }
 
 /// The index range of sorted `rows` whose key equals `key`.
-fn equal_range<R: AsRef<Row>>(rows: &[R], key: &Value) -> (usize, usize) {
+fn equal_range<S: SortedRows + ?Sized>(rows: &S, key: &Value) -> (usize, usize) {
     (
-        rows.partition_point(|row| cmp_json(&row.as_ref().key, key) == Ordering::Less),
-        rows.partition_point(|row| cmp_json(&row.as_ref().key, key) != Ordering::Greater),
+        rows.partition_point(|row| cmp_json(&row.key, key) == Ordering::Less),
+        rows.partition_point(|row| cmp_json(&row.key, key) != Ordering::Greater),
     )
 }
 
 /// Reduce `rows[first..end]` from the largest stored partials it covers
 /// whole, plus the rows and partials at either edge.
 fn reduce_span(
-    rows: &[Row],
+    rows: &ShardRows,
     spans: &Spans,
     first: usize,
     end: usize,
@@ -647,14 +890,14 @@ fn reduce_span(
     let hi = starts[1..].partition_point(|end_of| *end_of <= end);
     let mut parts = Vec::new();
     if lo >= hi {
-        parts.push(reduce_rows(&rows[first..end], reducer)?);
+        parts.push(reduce_rows(rows.range(first, end), reducer)?);
     } else {
         if first < starts[lo] {
-            parts.push(reduce_rows(&rows[first..starts[lo]], reducer)?);
+            parts.push(reduce_rows(rows.range(first, starts[lo]), reducer)?);
         }
         parts.extend(block_parts(&spans.levels, lo, hi));
         if starts[hi] < end {
-            parts.push(reduce_rows(&rows[starts[hi]..end], reducer)?);
+            parts.push(reduce_rows(rows.range(starts[hi], end), reducer)?);
         }
     }
     combine_children(reducer, &parts)
@@ -694,15 +937,18 @@ fn block_parts(levels: &[Vec<Value>], lo: usize, hi: usize) -> Vec<Value> {
     left
 }
 
-fn reduce_rows(rows: &[Row], reducer: &mut JsReducer) -> Result<Value, String> {
+fn reduce_rows<'a>(
+    rows: impl Iterator<Item = &'a Row> + Clone,
+    reducer: &mut JsReducer,
+) -> Result<Value, String> {
     match reducer.source() {
-        "_count" => Ok(json!(rows.len())),
-        "_sum" => reduce_sum(rows.iter().map(|row| &row.value)),
-        "_stats" => reduce_stats(rows.iter().map(|row| &row.value)),
-        "_approx_count_distinct" => reduce_approx_count_distinct(rows.iter().map(|row| &row.value)),
+        "_count" => Ok(json!(rows.count())),
+        "_sum" => reduce_sum(rows.map(|row| &row.value)),
+        "_stats" => reduce_stats(rows.map(|row| &row.value)),
+        "_approx_count_distinct" => reduce_approx_count_distinct(rows.map(|row| &row.value)),
         _ => {
-            let keys: Vec<Value> = rows.iter().map(|row| json!([row.id, row.key])).collect();
-            let values: Vec<Value> = rows.iter().map(|row| row.value.clone()).collect();
+            let keys: Vec<Value> = rows.clone().map(|row| json!([row.id, row.key])).collect();
+            let values: Vec<Value> = rows.map(|row| row.value.clone()).collect();
             reduce_with(reducer, &keys, &values)
         }
     }
@@ -848,7 +1094,7 @@ fn row_cmp(a: &Row, b: &Row) -> Ordering {
     cmp_json(&a.key, &b.key).then_with(|| a.id.cmp(&b.id))
 }
 
-/// Merge two already-sorted row runs.
+/// Merge two already-sorted row runs. On equal rows, `base` comes first.
 fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
     let mut out = Vec::with_capacity(base.len() + added.len());
     let mut base = base.into_iter().peekable();
@@ -1018,9 +1264,16 @@ impl ViewIndex {
         design: &str,
     ) -> Result<(), String> {
         let mut batch = WriteBatch::default();
+        // The keys of the rows being replaced locate them in the snapshot.
+        let mut removed = Vec::new();
         for id in &changed {
-            for (key, _) in self.scan(&Self::doc_prefix(id))? {
+            for (key, stored) in self.scan(&Self::doc_prefix(id))? {
                 batch.delete(&key);
+                if self.cached.is_some() {
+                    let stored: StoredRow =
+                        serde_json::from_slice(&stored).map_err(|error| error.to_string())?;
+                    removed.push((id.clone(), stored.key));
+                }
             }
         }
 
@@ -1042,14 +1295,13 @@ impl ViewIndex {
         }
 
         // Update the in-memory snapshot incrementally: drop rows for changed
-        // documents and merge in the new ones. Both runs are sorted, so this is
-        // linear rather than a full reload.
+        // documents and merge in the new ones, in the blocks they touch.
         let next_cached = match self.cached.take() {
             Some(cached) => {
                 // Reuse the cached allocation when no in-flight query still
                 // holds the snapshot; otherwise clone it.
                 let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
-                kept.replace_docs(&changed, added, self.placement);
+                kept.replace_docs(&removed, added, self.placement);
                 Some(Arc::new(kept))
             }
             None => None,
@@ -2808,7 +3060,7 @@ mod tests {
                         (docs, added)
                     }
                 };
-                view.replace_docs(&changed, added.clone(), placement);
+                view.replace_docs(&emitted(&rows, &changed), added.clone(), placement);
                 rows.retain(|row| !changed.contains(&row.id));
                 rows.extend(added);
                 sort_rows(&mut rows);
@@ -2825,6 +3077,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The id and key of each row the `changed` documents emitted.
+    fn emitted(rows: &[Row], changed: &[String]) -> Vec<(String, Value)> {
+        let changed: HashSet<&String> = changed.iter().collect();
+        rows.iter()
+            .filter(|row| changed.contains(&row.id))
+            .map(|row| (row.id.clone(), row.key.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn shard_blocks_follow_writes() {
+        let placement = (1, false);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        // Documents emit one to three rows, sometimes with the same key twice.
+        let doc_rows = |id: &str, count: u64, key: u64| -> Vec<Row> {
+            (0..count)
+                .map(|i| Row {
+                    id: id.to_string(),
+                    key: json!(key + i / 2),
+                    value: json!(i),
+                })
+                .collect()
+        };
+        let mut rows: Vec<Row> = (0..3000)
+            .flat_map(|i| doc_rows(&format!("d{i}"), 1 + i % 3, i % 500))
+            .collect();
+        sort_rows(&mut rows);
+        let mut view = ViewRows::from_rows(rows.clone(), placement);
+        let mut fresh = 0;
+        for step in 0..300 {
+            let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+            let mut pick = || ids[next(ids.len() as u64) as usize].clone();
+            let (changed, added): (Vec<String>, Vec<Row>) = match step % 4 {
+                // A burst of new documents on one key grows a block past its
+                // split size.
+                0 => {
+                    let key = next(600);
+                    let count = if step % 40 == 0 { 600 } else { 1 + next(4) };
+                    let docs: Vec<String> = (0..count).map(|i| format!("n{}-{i}", fresh)).collect();
+                    fresh += 1;
+                    let added = docs.iter().flat_map(|id| doc_rows(id, 1, key)).collect();
+                    (docs, added)
+                }
+                // Deleting a run of keys empties and shrinks blocks.
+                1 => {
+                    let low = next(600);
+                    let width = if step % 10 == 1 { 40 } else { 1 };
+                    let docs: Vec<String> = rows
+                        .iter()
+                        .filter(|row| {
+                            row.key
+                                .as_u64()
+                                .is_some_and(|key| key >= low && key < low + width)
+                        })
+                        .map(|row| row.id.clone())
+                        .collect();
+                    (docs, Vec::new())
+                }
+                2 => {
+                    let id = pick();
+                    let added = doc_rows(&id, 1 + next(3), next(600));
+                    (vec![id], added)
+                }
+                _ => {
+                    let docs: Vec<String> = (0..3).map(|_| pick()).collect();
+                    let added = docs
+                        .iter()
+                        .flat_map(|id| doc_rows(id, 2, next(600)))
+                        .collect();
+                    (docs, added)
+                }
+            };
+            let mut changed = changed;
+            changed.sort();
+            changed.dedup();
+            let before = view.clone();
+            let gone = emitted(&rows, &changed);
+            let old = &before.shards[0];
+            let mut emptied: Vec<usize> = gone
+                .iter()
+                .map(|(id, key)| old.block_of(old.positions(&[(id.as_str(), key)])[0]))
+                .collect();
+            emptied.sort_unstable();
+            emptied.dedup();
+            // Blocks a write may copy: those it removes rows from or adds
+            // rows to, and a neighbour of each it joins.
+            let touched = 2 * (emptied.len() + added.len());
+            view.replace_docs(&gone, added.clone(), placement);
+            let set: HashSet<&String> = changed.iter().collect();
+            rows.retain(|row| !set.contains(&row.id));
+            rows.extend(added);
+            sort_rows(&mut rows);
+
+            let shard = &view.shards[0];
+            let actual: Vec<(&str, &Value, &Value)> = shard
+                .range(0, shard.len())
+                .map(|row| (row.id.as_str(), &row.key, &row.value))
+                .collect();
+            let expected: Vec<(&str, &Value, &Value)> = rows
+                .iter()
+                .map(|row| (row.id.as_str(), &row.key, &row.value))
+                .collect();
+            assert_eq!(actual, expected, "step {step}");
+            let sizes: Vec<usize> = shard.blocks.iter().map(|rows| rows.len()).collect();
+            assert!(
+                sizes.iter().all(|size| (1..=2 * ROW_BLOCK).contains(size)),
+                "step {step} {sizes:?}"
+            );
+            assert!(
+                sizes.iter().filter(|size| **size < ROW_BLOCK / 2).count() <= 1,
+                "step {step} {sizes:?}"
+            );
+            assert_eq!(shard.starts.len(), sizes.len() + 1, "step {step}");
+            for (block, size) in sizes.iter().enumerate() {
+                assert_eq!(shard.starts[block + 1] - shard.starts[block], *size);
+            }
+            // The blocks a write did not touch stay shared with the copy
+            // taken before it.
+            let shared = before.shards[0]
+                .blocks
+                .iter()
+                .filter(|old| shard.blocks.iter().any(|new| Arc::ptr_eq(old, new)))
+                .count();
+            assert!(
+                shared + touched >= before.shards[0].blocks.len(),
+                "step {step}: {shared} of {} blocks shared, {touched} touched",
+                before.shards[0].blocks.len()
+            );
+        }
+
+        // A row whose recorded key does not match is still found by its id.
+        let id = rows[rows.len() / 2].id.clone();
+        view.replace_docs(&[(id.clone(), json!("not its key"))], Vec::new(), placement);
+        let shard = &view.shards[0];
+        assert!(shard.range(0, shard.len()).all(|row| row.id != id));
+
+        // Two keys one step apart whose recorded keys both read back as the
+        // lower one: the run found is short, so both rows go by id.
+        let near = |key: f64| Row {
+            id: "near".into(),
+            key: json!(key),
+            value: json!(0),
+        };
+        let above = f64::from_bits(1.0f64.to_bits() + 1);
+        view.replace_docs(&[], vec![near(1.0), near(above)], placement);
+        view.replace_docs(
+            &[("near".into(), json!(1.0)), ("near".into(), json!(1.0))],
+            Vec::new(),
+            placement,
+        );
+        let shard = &view.shards[0];
+        assert!(shard.range(0, shard.len()).all(|row| row.id != "near"));
     }
 
     #[test]
@@ -2964,7 +3376,7 @@ mod tests {
                 value: json!(100000),
             })
             .collect();
-        view.replace_docs(&changed, added.clone(), placement);
+        view.replace_docs(&emitted(&rows, &changed), added.clone(), placement);
         rows.retain(|row| !changed.contains(&row.id));
         rows.extend(added);
         sort_rows(&mut rows);
@@ -3306,8 +3718,8 @@ mod tests {
             .unwrap();
         let rows = index.sorted_rows().unwrap();
         assert_eq!(rows.shards[0].len(), 1);
-        assert_eq!(rows.shards[0][0].id, "a");
-        assert_eq!(rows.shards[0][0].key, json!("z"));
+        assert_eq!(rows.shards[0].row(0).id, "a");
+        assert_eq!(rows.shards[0].row(0).key, json!("z"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
