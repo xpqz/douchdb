@@ -8945,8 +8945,10 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
+        // The deadline is wall-clock time: long enough for the interpreter to
+        // start QuickJS in a debug build, short against the 15 s bound below.
         "--view-timeout-ms".to_string(),
-        "150".to_string(),
+        "2000".to_string(),
     ];
     let s = Server::start_with(&args, false);
     s.fresh_db("jswloop").await;
@@ -8974,10 +8976,10 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
     // The wasm interpreter is much slower than a native worker and CI may be
-    // loaded; the bound only needs to prove fuel stops the infinite loop.
+    // loaded; the bound only needs to prove the deadline stops the infinite loop.
     assert!(
         started.elapsed() < Duration::from_secs(15),
-        "wasm fuel deadline was not enforced: {:?}",
+        "wasm deadline was not enforced: {:?}",
         started.elapsed()
     );
 }
@@ -9080,6 +9082,52 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
         assert_eq!(status, StatusCode::OK, "{mode}: {body}");
         assert_eq!(body["rows"][0]["value"], json!([]), "{mode}: {body}");
     }
+}
+
+#[tokio::test]
+async fn pooled_process_worker_keeps_no_js_state_between_databases() {
+    // One worker serves both databases. CouchDB keeps JS processes alive
+    // between requests and tags them per database (couch_proc_manager); here
+    // each request builds a fresh runtime, so nothing can leak.
+    if !sandbox_tested("process") {
+        return;
+    }
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "process".to_string(),
+        "--js-workers".to_string(),
+        "1".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    for db in ["jsleaka", "jsleakb"] {
+        s.fresh_db(db).await;
+        let (status, _) = s.put(&format!("/{db}/doc"), json!({"v": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, _) = s
+        .put(
+            "/jsleaka/_design/v",
+            json!({"views": {"plant": {"map": "function(doc){ var seen = typeof globalThis.planted; globalThis.planted = 'from a'; Object.prototype.polluted = 1; emit(seen, null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsleakb/_design/v",
+            json!({"views": {"probe": {"map": "function(doc){ emit([typeof globalThis.planted, typeof ({}).polluted], null); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/jsleaka/_design/v/_view/plant").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["key"], "undefined", "{body}");
+    let (status, body) = s.get("/jsleakb/_design/v/_view/probe").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["key"],
+        json!(["undefined", "undefined"]),
+        "{body}"
+    );
 }
 
 #[cfg(target_os = "linux")]
