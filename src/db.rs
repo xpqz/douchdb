@@ -526,10 +526,13 @@ impl Db {
             return Ok(false);
         }
         if shard_map.version == current.version {
-            if shard_map.replicas != current.replicas {
-                return Ok(false);
+            // Concurrent updates can share a version. Order the placements so
+            // every node keeps the same one regardless of arrival order.
+            match shard_map.replicas.cmp(&current.replicas) {
+                std::cmp::Ordering::Equal => return Ok(true),
+                std::cmp::Ordering::Less => return Ok(false),
+                std::cmp::Ordering::Greater => {}
             }
-            return Ok(true);
         }
         std::fs::write(
             self.path.join("shard-map.json"),
@@ -2896,6 +2899,44 @@ mod tests {
             .map(|i| format!("shard{shard}-{i}"))
             .find(|id| db.shard_index(id) == shard)
             .expect("document id for shard")
+    }
+
+    #[test]
+    fn equal_version_shard_maps_converge_on_one_winner() {
+        let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::db::uuid()));
+        let open = |name: &str| {
+            Db::open(
+                &root,
+                name,
+                DbConfig {
+                    q: 2,
+                    revs_limit: 100,
+                    shard_map: ShardMap::balanced(2, 2, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap()
+        };
+        let map = |replicas: Vec<Vec<usize>>| ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas,
+            version: 1,
+        };
+        let a = map(vec![vec![0], vec![0]]);
+        let b = map(vec![vec![1], vec![1]]);
+
+        let first = open("tie-a");
+        assert!(first.set_shard_map(a.clone()).unwrap());
+        let first_accepts_b = first.set_shard_map(b.clone()).unwrap();
+        let second = open("tie-b");
+        assert!(second.set_shard_map(b.clone()).unwrap());
+        let second_accepts_a = second.set_shard_map(a.clone()).unwrap();
+
+        // Exactly one of the two competing maps wins on both replicas.
+        assert_ne!(first_accepts_b, second_accepts_a);
+        assert_eq!(first.shard_map().replicas, second.shard_map().replicas);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

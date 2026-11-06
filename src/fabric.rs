@@ -52,6 +52,15 @@ pub(crate) fn is_replica_of(db: &Db, docid: &str, me: usize) -> bool {
     db.is_replica_of(docid, me)
 }
 
+/// Whether a map reported by a peer may replace ours.
+///
+/// The node count must match this process's cluster size, or routed requests
+/// would index past the node list. Equal versions are eligible so that the
+/// deterministic tiebreak in `Db::set_shard_map` can settle concurrent updates.
+fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size: usize) -> bool {
+    map.node_count == cluster_size.max(1) && map.version >= version
+}
+
 /// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
 /// older peers receive the local or pending map. This runs from anti-entropy,
 /// so a metadata update that missed a peer is repaired after that peer returns.
@@ -90,7 +99,16 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     .await;
 
     for map in maps.into_iter().flatten() {
-        if map.version > desired.version && db.set_shard_map(map.clone()).unwrap_or(false) {
+        if adoptable_peer_map(&map, desired.version, st.cluster.nodes.len())
+            && db.set_shard_map(map.clone()).unwrap_or(false)
+        {
+            if db
+                .pending_shard_map()
+                .is_some_and(|pending| pending.version <= map.version)
+            {
+                // The adopted map supersedes (or beat the tiebreak against) ours.
+                db.clear_pending_shard_map();
+            }
             desired = map;
         }
     }
@@ -2266,6 +2284,18 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn peer_map_with_foreign_node_count_is_not_adoptable() {
+        let mut foreign = crate::cluster::ShardMap::balanced(4, 4, 1);
+        foreign.version = 5;
+        assert!(!adoptable_peer_map(&foreign, 1, 3));
+        let mut ours = crate::cluster::ShardMap::balanced(4, 3, 1);
+        ours.version = 5;
+        assert!(adoptable_peer_map(&ours, 1, 3));
+        assert!(adoptable_peer_map(&ours, 5, 3));
+        assert!(!adoptable_peer_map(&ours, 6, 3));
+    }
 
     #[test]
     fn decode_since_rejects_out_of_range_node_index() {
