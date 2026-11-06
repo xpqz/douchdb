@@ -1740,6 +1740,105 @@ async fn percent_encoded_slash_in_database_names() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// CouchDB (mochiweb) decodes '+' as a space in URL paths as well as in query
+/// strings, so `a+b` names the document "a b" and only `a%2Bb` names "a+b".
+/// Verified against couchdb:3.5; a literal plus in a path would diverge.
+#[tokio::test]
+async fn plus_in_paths_and_query_strings_decodes_as_space() {
+    let s = Server::start(false);
+    let (status, body) = s.put("/plusdb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = s.put("/plusdb/a+b", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "a b");
+    let (status, body) = s.put("/plusdb/c%2Bd", json!({"v": 2})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "c+d");
+
+    let (status, body) = s.get("/plusdb/a+b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_id"], "a b");
+    let (status, body) = s.get("/plusdb/a%20b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.get("/plusdb/a%2Bb").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = s.get("/plusdb/c%2Bd").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.get("/plusdb/c+d").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = s.get("/plusdb/_all_docs?key=%22a+b%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "a b");
+    let (status, body) = s.get("/plusdb/_all_docs?key=%22a%2Bb%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(0));
+}
+
+/// The database segment is decoded like any other path segment, so `a+b` is
+/// the name "a b", which CouchDB 3.5 refuses on create with
+/// `illegal_database_name` and reports as missing everywhere else. Only
+/// `a%2Bb` names the legal database "a+b".
+#[tokio::test]
+async fn plus_in_database_names_decodes_as_space() {
+    let s = Server::start(false);
+    let reason = |name: &str| {
+        format!(
+            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+        )
+    };
+    for (path, name) in [("/pa+b", "pa b"), ("/px%20y", "px y")] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
+        assert_eq!(body["reason"], reason(name), "{path}: {body}");
+    }
+
+    let (status, body) = s.put("/pa%2Bb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/pa%2Bb").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["db_name"], "pa+b");
+    let (status, body) = s.put("/pa%2Bb/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, body) = s.get("/_all_dbs").await;
+    let listed: Vec<&str> = body
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(listed.contains(&"pa+b"), "{body}");
+    assert!(!listed.contains(&"pa b"), "{body}");
+
+    // Reading, writing or deleting the database "pa b" finds nothing.
+    for (method, path) in [
+        ("GET", "/pa+b"),
+        ("DELETE", "/pa+b"),
+        ("POST", "/pa+b"),
+        ("GET", "/pa+b/doc"),
+        ("PUT", "/pa+b/doc"),
+        ("GET", "/pa+b/_all_docs"),
+    ] {
+        let (status, body) = match method {
+            "GET" => s.get(path).await,
+            "DELETE" => s.delete(path).await,
+            "POST" => s.post(path, json!({})).await,
+            _ => s.put(path, json!({})).await,
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {body}");
+        assert_eq!(body["error"], "not_found", "{method} {path}: {body}");
+        assert_eq!(
+            body["reason"], "Database does not exist.",
+            "{method} {path}: {body}"
+        );
+    }
+    let (status, body) = s.get("/pa%2Bb/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.delete("/pa%2Bb").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// Stop the server for good, then start it again on the same data directory.
 /// `restart` alone leaves the old process running, and the pooled HTTP
 /// connections point at it, so a test of what a fresh process reads from disk
@@ -6033,6 +6132,32 @@ async fn cluster_database_creation_and_drop_are_broadcast() {
             "db survived on {}",
             node.base
         );
+    }
+}
+
+/// The database "a+b" (created as `a%2Bb`) round-trips through the peer URLs,
+/// which encode `+` as `%2B`; the receiving node must not read it as a space.
+#[tokio::test]
+async fn cluster_plus_database_name_round_trips_between_nodes() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    let (status, body) = nodes[0].put("/cp%2Bq", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        let (status, body) = node.put(&format!("/cp%2Bq/doc{i}"), json!({"n": i})).await;
+        assert_eq!(status, StatusCode::CREATED, "{}: {body}", node.base);
+    }
+    for node in &nodes {
+        let (status, body) = node.get("/cp%2Bq").await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", node.base);
+        assert_eq!(body["db_name"], "cp+q");
+        let (_, listed) = node.get("/_all_dbs").await;
+        assert!(listed.to_string().contains("\"cp+q\""), "{listed}");
+        for i in 0..nodes.len() {
+            let (status, doc) = node.get(&format!("/cp%2Bq/doc{i}")).await;
+            assert_eq!(status, StatusCode::OK, "{}: {doc}", node.base);
+        }
+        let (status, body) = node.get("/cp+q").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}: {body}", node.base);
     }
 }
 
