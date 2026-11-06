@@ -306,11 +306,12 @@ async fn build_index(
     gate: OwnedRwLockReadGuard<()>,
     mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
-    // Capture the sequence before reading the snapshot. A write that lands
+    // Capture the bound before reading the snapshot. A write that lands
     // while the index is being built then leaves the database ahead of the
     // recorded sequence, so the next query rebuilds instead of trusting a
-    // snapshot that may have missed it.
-    let last_seq = db.update_seq();
+    // snapshot that may have missed it. The bound is the changes watermark: a
+    // write in flight has taken a sequence but is not readable yet.
+    let last_seq = db.changes_watermark(0, None);
     let docs = db.map_docs(None).await?;
     let path = index_dir(db, ddoc, index_name);
     let source = spec.source.clone();
@@ -489,10 +490,15 @@ async fn update_index(
     let since = entry
         .as_ref()
         .map_or(0, |cached| cached.snapshot.meta.last_seq);
+    // Read the bound once and record it: every sequence up to it was
+    // committed before it was read, so a gap left by a write that never
+    // finished does not keep the index behind.
+    let last_seq = db.changes_watermark(since, None);
     let changes = db
         .changes(&crate::db::ChangesOpts {
             since,
             include_docs: true,
+            until: Some(last_seq),
             ..Default::default()
         })
         .await?;
@@ -513,7 +519,6 @@ async fn update_index(
             live.push((id.to_string(), doc.to_string()));
         }
     }
-    let last_seq = changes["last_seq"].as_u64().unwrap_or(since).max(since);
     let source = spec.source.clone();
     let placement = (db.q, db.partitioned);
     // As in a rebuild, the permits travel with the blocking work so a
@@ -857,7 +862,7 @@ async fn ensure_index(
     if let Some(cached) = entry.as_ref() {
         let meta = &cached.snapshot.meta;
         if meta.version == SEARCH_VERSION && meta.design == signature {
-            let current = db.update_seq();
+            let current = db.changes_watermark(meta.last_seq, None);
             if meta.last_seq == current {
                 return Ok((cached.snapshot.clone(), gate));
             }
@@ -1587,6 +1592,177 @@ mod tests {
                 assert_eq!(!marker.exists(), rebuilds, "step {step} rebuilt");
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_search_index_does_not_move_past_a_write_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-flight-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchflight",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        // Design documents on shard 0, so reading them never touches shard 1.
+        let (inc, full) = (on_shard(0, "_design/inc"), on_shard(0, "_design/full"));
+        let (a, c, e, d) = (
+            on_shard(0, "a"),
+            on_shard(0, "c"),
+            on_shard(0, "e"),
+            on_shard(1, "d"),
+        );
+        let index = "function(doc){ index('name', doc.name); }";
+        for ddoc in [&inc, &full] {
+            db.put_docs(
+                vec![json!({"_id": ddoc, "indexes": {"idx": {"index": index}}})],
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let limits = crate::view::ViewQuery::default().limits;
+        let search = |ddoc: &str| {
+            let db = &db;
+            let ddoc = ddoc.to_string();
+            async move {
+                let request = SearchRequest {
+                    query: "name:fig".to_string(),
+                    limit: 200,
+                    ..SearchRequest::default()
+                };
+                query(db, &ddoc, "idx", &request, limits).await.unwrap()
+            }
+        };
+        let last_seq = |ddoc: &str| {
+            let entry = index_entry(&index_dir(&db, ddoc, "idx"));
+            async move {
+                let guard = entry.lock().await;
+                guard.as_ref().map(|cached| cached.snapshot.meta.last_seq)
+            }
+        };
+        let put = |id: &str| db.put_docs(vec![json!({"_id": id, "name": "fig"})], true);
+        put(&a).await.unwrap();
+        search(&inc).await;
+        let built = last_seq(&inc).await.unwrap();
+
+        // Shard 1 holds an allocated, uncommitted sequence while a later
+        // write on shard 0 commits. An incremental update must stop short.
+        let held = db.start_in_flight_write(1);
+        put(&c).await.unwrap();
+        search(&inc).await;
+        let seq = last_seq(&inc).await.unwrap();
+        assert!(
+            (built..held).contains(&seq),
+            "incremental update recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // So must a rebuild.
+        let held = db.start_in_flight_write(1);
+        put(&e).await.unwrap();
+        search(&full).await;
+        let seq = last_seq(&full).await.unwrap();
+        assert!(
+            seq < held,
+            "rebuild recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // Once the shard commits, a later write on it reaches both indexes.
+        put(&d).await.unwrap();
+        for ddoc in [&inc, &full] {
+            let result = search(ddoc).await;
+            assert_eq!(result["total_rows"], 4, "{ddoc}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_sequence_does_not_keep_a_search_index_behind() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-gap-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchgap",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let ddoc = on_shard(0, "_design/gap");
+        let (a, c) = (on_shard(0, "a"), on_shard(0, "c"));
+        let index = "function(doc){ index('name', doc.name); }";
+        db.put_docs(
+            vec![json!({"_id": ddoc, "indexes": {"idx": {"index": index}}})],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let search = || async {
+            let request = SearchRequest {
+                query: "name:fig".to_string(),
+                limit: 200,
+                ..SearchRequest::default()
+            };
+            query(&db, &ddoc, "idx", &request, limits).await.unwrap()
+        };
+        db.put_docs(vec![json!({"_id": a, "name": "fig"})], true)
+            .await
+            .unwrap();
+        search().await;
+
+        // A write commits, then a sequence above it is taken and abandoned,
+        // as by a write whose flush failed. Any later job on the shard
+        // counts the abandoned sequence as settled.
+        db.put_docs(vec![json!({"_id": c, "name": "fig"})], true)
+            .await
+            .unwrap();
+        let abandoned = db.start_in_flight_write(1);
+        db.get_doc(&on_shard(1, "x"), &Default::default())
+            .await
+            .ok();
+        assert_eq!(db.update_seq(), abandoned);
+
+        let result = search().await;
+        assert_eq!(result["total_rows"], 2);
+        let entry = index_entry(&index_dir(&db, &ddoc, "idx"));
+        let guard = entry.lock().await;
+        let recorded = guard.as_ref().map(|cached| cached.snapshot.meta.last_seq);
+        assert_eq!(
+            recorded,
+            Some(abandoned),
+            "the index stays behind a sequence no write will commit"
+        );
+        drop(guard);
+        drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
 

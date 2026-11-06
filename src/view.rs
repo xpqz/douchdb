@@ -1548,12 +1548,18 @@ async fn ensure_rows(
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
     // would look like a recreated database and force a full rebuild.
-    let current_seq = db.update_seq();
+    // The bound is the changes watermark, not the allocated counter: a write
+    // in flight has taken its sequence but is not readable yet, and an index
+    // that recorded a sequence past it would never see that write.
+    let current_seq = db.changes_watermark(index.last_seq, None);
 
     if index.design != design || index.last_seq > current_seq {
+        // Read the bound before scanning, so a write that lands during the
+        // scan stays above it and is picked up by the next update.
+        let bound = db.changes_watermark(0, None);
         let rows = map_all(db, &spec.map, limits).await?;
         index
-            .rebuild(rows, current_seq, &design)
+            .rebuild(rows, bound, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
         return index
             .sorted_rows()
@@ -1565,6 +1571,7 @@ async fn ensure_rows(
             .changes(&ChangesOpts {
                 since: index.last_seq,
                 include_docs: true,
+                until: Some(current_seq),
                 ..Default::default()
             })
             .await?;
@@ -1592,12 +1599,11 @@ async fn ensure_rows(
         for row in rows {
             by_doc.entry(row.id.clone()).or_default().push(row);
         }
-        let last_seq = changes["last_seq"]
-            .as_u64()
-            .unwrap_or(current_seq)
-            .max(current_seq);
+        // Every sequence up to the bound was committed before it was read and
+        // the changes above covered them all, so a gap left by a write that
+        // never finished does not keep the index behind.
         index
-            .apply(changed, by_doc, last_seq, &design)
+            .apply(changed, by_doc, current_seq, &design)
             .map_err(|error| ApiError::new(500, "view_index_error", error))?;
     }
 
@@ -2947,6 +2953,157 @@ mod tests {
             caught_up,
             "the waiting query rebuilt the index from a stale sequence"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_view_does_not_move_past_a_write_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-viewflight-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "viewflight",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let (a, c, e, d) = (
+            on_shard(0, "a"),
+            on_shard(0, "c"),
+            on_shard(0, "e"),
+            on_shard(1, "d"),
+        );
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let last_seq = |name: &str| {
+            let handle = index_handle(&index_path(&db, "_design/v", name)).unwrap();
+            async move { handle.lock().await.last_seq }
+        };
+        db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "inc", &spec, limits)
+            .await
+            .unwrap();
+        let built = last_seq("inc").await;
+
+        // Shard 1 holds an allocated, uncommitted sequence while a later
+        // write on shard 0 commits. An incremental update must stop short.
+        let held = db.start_in_flight_write(1);
+        db.put_docs(vec![json!({"_id": c})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "inc", &spec, limits)
+            .await
+            .unwrap();
+        let seq = last_seq("inc").await;
+        assert!(
+            (built..held).contains(&seq),
+            "incremental update recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // So must a rebuild.
+        let held = db.start_in_flight_write(1);
+        db.put_docs(vec![json!({"_id": e})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "full", &spec, limits)
+            .await
+            .unwrap();
+        let seq = last_seq("full").await;
+        assert!(
+            seq < held,
+            "rebuild recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // Once the shard commits, a later write on it reaches both indexes.
+        db.put_docs(vec![json!({"_id": d})], true).await.unwrap();
+        for name in ["inc", "full"] {
+            let rows = ensure_rows(&db, "_design/v", name, &spec, limits)
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = rows
+                .shards
+                .iter()
+                .flat_map(|shard| shard.blocks.iter().flat_map(|block| block.iter()))
+                .map(|row| row.id.clone())
+                .collect();
+            ids.sort();
+            let mut expected = vec![a.clone(), c.clone(), e.clone(), d.clone()];
+            expected.sort();
+            assert_eq!(ids, expected, "{name} index");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_sequence_does_not_keep_a_view_behind() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-viewgap-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "viewgap",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let (a, c) = (on_shard(0, "a"), on_shard(0, "c"));
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+
+        // A write commits, then a sequence above it is taken and abandoned,
+        // as by a write whose flush failed. Any later job on the shard
+        // counts the abandoned sequence as settled.
+        db.put_docs(vec![json!({"_id": c})], true).await.unwrap();
+        let abandoned = db.start_in_flight_write(1);
+        db.get_doc(&on_shard(1, "x"), &Default::default())
+            .await
+            .ok();
+        assert_eq!(db.update_seq(), abandoned);
+
+        ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        assert_eq!(
+            handle.lock().await.last_seq,
+            abandoned,
+            "the index stays behind a sequence no write will commit"
+        );
+        drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
 

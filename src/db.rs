@@ -886,10 +886,22 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// Current committed sequence counter. This is the same database-wide
-    /// counter used for `update_seq`, without asking every shard actor.
+    /// Current allocated sequence counter. This is the same database-wide
+    /// counter used for `update_seq`, without asking every shard actor. A
+    /// write in flight has already taken its sequence, so this can be ahead
+    /// of what `changes` returns; indexes bound themselves with
+    /// `changes_watermark` instead.
     pub fn update_seq(&self) -> u64 {
         self.seq.load(Ordering::SeqCst)
+    }
+
+    /// Allocate a sequence on `shard` as a write still in flight would: the
+    /// counter has moved but the shard has not committed it. Any later job on
+    /// that shard counts it as committed, as for a write that never finished,
+    /// so a test must not touch the shard again before the code under test.
+    #[cfg(test)]
+    pub(crate) fn start_in_flight_write(&self, shard: usize) -> u64 {
+        allocate_seq(&self.seq, &self.reserved_seq[shard])
     }
 
     /// Owner and replica list for a document, computed with one shard-map
@@ -1301,7 +1313,9 @@ impl Db {
         &self,
         opts: &ChangesOpts,
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
-        let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
+        let watermark = opts
+            .until
+            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_deref()));
         let selected = self.selected_shards(opts.owned.as_deref());
         let until = if opts.descending {
             u64::MAX
@@ -2510,6 +2524,10 @@ pub struct ChangesOpts {
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
     pub owned: Option<Vec<bool>>,
+    /// Internal: a watermark the caller already read with `changes_watermark`.
+    /// Rows above it are withheld, and the feed does not take a newer one, so
+    /// a caller that records it as its position has seen every row up to it.
+    pub until: Option<u64>,
 }
 
 /// Server-side `_changes` filters. `_doc_ids` stays in `doc_ids` because it is
@@ -3694,6 +3712,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, last_seq, pending) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -3769,6 +3788,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, last_seq, _pending) = db.changes_rows(&opts).await.unwrap();
         assert!(rows.iter().all(|row| row.seq <= committed), "{rows:?}");
@@ -3841,6 +3861,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, _, pending) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(
