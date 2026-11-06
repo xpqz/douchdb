@@ -10936,18 +10936,20 @@ async fn login_succeeds_while_anonymous_bucket_is_full() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    // Hold every anonymous slot with long-poll changes requests.
-    let held: Vec<_> = (0..2)
-        .map(|_| {
-            let client = s.client.clone();
-            let url = format!(
-                "{}/flood/_changes?feed=longpoll&timeout=20000&since=now",
-                s.base
-            );
-            tokio::spawn(async move { client.get(url).send().await.map(|r| r.status()) })
-        })
-        .collect();
-    // The anonymous bucket is full once an anonymous probe is rejected.
+    // Hold every anonymous slot with long-poll changes requests. A holder
+    // that raced a probe for a slot is rejected and finishes at once, so it is
+    // restarted until the bucket is full.
+    let hold = || {
+        let client = s.client.clone();
+        let url = format!(
+            "{}/flood/_changes?feed=longpoll&timeout=20000&since=0",
+            s.base
+        );
+        tokio::spawn(async move { client.get(url).send().await.map(|r| r.status()) })
+    };
+    let mut held = vec![hold(), hold()];
+    // The bucket is full once an anonymous probe is rejected: only the two
+    // holders can be occupying its slots then.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let (status, _) = s.req_with(Method::GET, "/flood", None, &[]).await;
@@ -10958,6 +10960,9 @@ async fn login_succeeds_while_anonymous_bucket_is_full() {
             std::time::Instant::now() < deadline,
             "anonymous bucket never filled: {status}"
         );
+        for task in held.iter_mut().filter(|task| task.is_finished()) {
+            *task = hold();
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 

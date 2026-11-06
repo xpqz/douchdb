@@ -39,10 +39,6 @@ impl Principal {
         self.name.is_some() || self.admin
     }
 
-    pub fn key(&self) -> &str {
-        self.name.as_deref().unwrap_or("anonymous")
-    }
-
     pub fn has_role(&self, role: &str) -> bool {
         self.admin || self.roles.iter().any(|candidate| candidate == role)
     }
@@ -59,6 +55,10 @@ struct User {
 
 impl User {
     fn matches_token(&self, token: &str) -> bool {
+        // An empty credential never authenticates, whatever the entry holds.
+        if token.is_empty() {
+            return false;
+        }
         if let Some(expected) = &self.token {
             if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
                 return true;
@@ -71,6 +71,10 @@ impl User {
         false
     }
 }
+
+/// Shortest accepted plaintext user token. Tokens are the only credential, so
+/// a trivially guessable one is a startup error rather than a quiet hole.
+const MIN_TOKEN_LEN: usize = 8;
 
 const SECRET_FILE: &str = ".session-secret";
 
@@ -160,7 +164,9 @@ impl Auth {
     }
 
     /// Load a users file. `admin` is optional; when present, the config admin
-    /// continues to work alongside file users.
+    /// continues to work alongside file users. A file user may not share the
+    /// config admin's name: a session cookie carries only the name, so it
+    /// would resolve to the admin.
     pub fn from_users_file(
         admin: Option<(String, String)>,
         path: &Path,
@@ -185,6 +191,11 @@ impl Auth {
             if users.iter().any(|user| user.name == name) {
                 return Err(format!("duplicate user `{name}`"));
             }
+            if admin.as_ref().is_some_and(|(user, _)| *user == name) {
+                return Err(format!(
+                    "user `{name}` has the same name as the --admin user"
+                ));
+            }
             let token = entry
                 .get("token")
                 .and_then(Value::as_str)
@@ -197,6 +208,19 @@ impl Auth {
                 .map_err(|error| format!("user `{name}`: {error}"))?;
             if token.is_none() && token_sha256.is_none() {
                 return Err(format!("user `{name}` needs `token` or `token_sha256`"));
+            }
+            if token
+                .as_deref()
+                .is_some_and(|token| token.chars().count() < MIN_TOKEN_LEN)
+            {
+                return Err(format!(
+                    "user `{name}`: `token` must be at least {MIN_TOKEN_LEN} characters"
+                ));
+            }
+            if token_sha256 == Some(Sha256::digest(b"").into()) {
+                return Err(format!(
+                    "user `{name}`: `token_sha256` is the hash of an empty token"
+                ));
             }
             let roles: Vec<String> = entry
                 .get("roles")
@@ -262,6 +286,9 @@ impl Auth {
     }
 
     fn password_principal(&self, name: &str, password: &str) -> Option<Principal> {
+        if password.is_empty() {
+            return None;
+        }
         if !self.user.is_empty()
             && constant_time_eq(name.as_bytes(), self.user.as_bytes())
             && constant_time_eq(password.as_bytes(), self.pass.as_bytes())
