@@ -1112,6 +1112,62 @@ mod tests {
 }
 
 #[cfg(test)]
+mod panic_tests {
+    use super::*;
+
+    fn handle() -> ShardHandle {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-panic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ShardHandle::spawn(&dir, 1000).unwrap()
+    }
+
+    fn put(key: &'static [u8]) -> impl FnOnce(&mut Shard) -> std::result::Result<(), ApiError> {
+        move |shard| {
+            let mut tx = Tx::new();
+            tx.put(key, b"v");
+            shard.commit_at(tx, None).map_err(ApiError::from)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_fails_only_its_caller() {
+        let handle = handle();
+        let result: std::result::Result<(), ApiError> =
+            handle.call(|_| panic!("boom in job")).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.status, 500);
+        assert!(error.reason.contains("boom in job"), "{}", error.reason);
+        handle.call(|_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_written_before_a_panic_survives_and_the_partial_job_is_discarded() {
+        let handle = handle();
+        handle.call(put(b"x/before")).await.unwrap();
+        let result: std::result::Result<(), ApiError> = handle
+            .call(|shard| {
+                put(b"x/partial")(shard)?;
+                panic!("after partial write");
+            })
+            .await;
+        assert!(result.is_err());
+        let (before, partial) = handle
+            .call(|shard| Ok((shard.get(b"x/before"), shard.get(b"x/partial"))))
+            .await
+            .unwrap();
+        assert_eq!(before.as_deref(), Some(b"v".as_slice()));
+        assert_eq!(partial, None);
+    }
+}
+
+#[cfg(test)]
 mod scan_tests {
     use super::*;
     use crate::rev::Rev;

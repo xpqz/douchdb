@@ -187,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn winner_ignores_an_unparsable_leaf() {
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("1-{}", id(1))), false);
+        tree.edges.insert("garbage".to_string(), None);
+        assert_eq!(tree.winner().unwrap(), format!("1-{}", id(1)));
+
+        let mut only_bad = RevTree::default();
+        only_bad.edges.insert("garbage".to_string(), None);
+        assert_eq!(only_bad.winner(), None);
+    }
+
+    #[test]
     fn single_path_winner_is_the_tip() {
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), false);
