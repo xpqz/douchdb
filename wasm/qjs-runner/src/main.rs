@@ -42,8 +42,9 @@ fn run(input: &str) -> Result<Value, String> {
                     var all = [];
                     for (var i = 0; i < docs.length; i++) {{
                       __out = [];
+                      var __id = docs[i]._id;
                       __map(docs[i]);
-                      for (var j = 0; j < __out.length; j++) all.push({{id: docs[i]._id, key: __out[j][0], value: __out[j][1]}});
+                      for (var j = 0; j < __out.length; j++) all.push({{id: __id, key: __out[j][0], value: __out[j][1]}});
                     }}
                     return JSON.stringify(all);
                   }};
@@ -74,10 +75,11 @@ fn run(input: &str) -> Result<Value, String> {
                     var all = [];
                     for (var i = 0; i < docs.length; i++) {{
                       __out = [];
+                      var __id = docs[i]._id;
                       __index(docs[i]);
                       var fields = {{}};
                       for (var j = 0; j < __out.length; j++) fields[__out[j][0]] = __out[j][1];
-                      all.push({{id: docs[i]._id, fields: fields}});
+                      all.push({{id: __id, fields: fields}});
                     }}
                     return JSON.stringify(all);
                   }};
@@ -86,6 +88,19 @@ fn run(input: &str) -> Result<Value, String> {
             (script, raw)
         }
         "reduce" => {
+            // Same checks and messages as the process worker (src/js.rs): a
+            // rereduce carries null keys, everything else must be an array.
+            if let Some(keys) = request.get("keys").filter(|keys| !keys.is_null()) {
+                serde_json::from_value::<Vec<Value>>(keys.clone())
+                    .map_err(|error| format!("reduce keys: {error}"))?;
+            }
+            match request.get("values") {
+                Some(values) => {
+                    serde_json::from_value::<Vec<Value>>(values.clone())
+                        .map_err(|error| format!("reduce values: {error}"))?;
+                }
+                None => return Err("reduce values are missing".to_string()),
+            }
             let keys = serde_json::to_string(&request.get("keys").cloned().unwrap_or(Value::Null)).unwrap();
             let values = serde_json::to_string(&request.get("values").cloned().unwrap_or(Value::Null)).unwrap();
             let rereduce = request.get("rereduce").and_then(Value::as_bool).unwrap_or(false);
