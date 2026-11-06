@@ -2604,6 +2604,18 @@ async fn local_docs_and_revs_limit() {
     let (status, body) = s.delete("/local/_local/loose").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["reason"], "missing");
+    // _bulk_docs, unlike DELETE, reports a missing local doc as deleted.
+    let (status, body) = s
+        .post(
+            "/local/_bulk_docs",
+            json!({"docs": [{"_id": "_local/loose", "_deleted": true}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body,
+        json!([{"ok": true, "id": "_local/loose", "rev": "0-0"}])
+    );
     let (status, _) = s.delete("/local/_local/checkpoint").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = s.get("/local/_local/checkpoint").await;
