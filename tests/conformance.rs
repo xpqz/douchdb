@@ -6055,6 +6055,8 @@ async fn cluster_internal_requests_encode_db_names_and_doc_ids() {
             node.base
         );
         assert_eq!(body["db_name"], "a/b");
+        let (_, listed) = node.get("/_all_dbs").await;
+        assert!(listed.to_string().contains("\"a/b\""), "{listed}");
     }
 
     let ids = ["q?x=1", "h#frag", "100%", "a%2Fb", "p/q", "plain"];

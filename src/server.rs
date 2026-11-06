@@ -70,6 +70,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     std::fs::create_dir_all(&args.data)?;
+    crate::db::migrate_nested_dbs(&args.data).map_err(anyhow::Error::msg)?;
 
     let advertise = if !args.advertise.trim().is_empty() {
         args.advertise.trim().trim_end_matches('/').to_string()

@@ -149,7 +149,7 @@ async fn local_metrics(st: &AppState) -> Value {
                     .count();
                 let docs: u64 = counts.iter().map(|(docs, _)| *docs).sum();
                 let deleted: u64 = counts.iter().map(|(_, deleted)| *deleted).sum();
-                let db_path = st.root.join(name);
+                let db_path = crate::db::db_path(&st.root, name);
                 let bytes = tokio::task::spawn_blocking(move || dir_size(&db_path))
                     .await
                     .unwrap_or(0);

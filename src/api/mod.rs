@@ -470,8 +470,8 @@ impl AppState {
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
-        crate::view::forget_db(&self.root.join(name));
-        crate::search::forget_db(&self.root.join(name));
+        crate::view::forget_db(&crate::db::db_path(&self.root, name));
+        crate::search::forget_db(&crate::db::db_path(&self.root, name));
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
                 412,
@@ -503,8 +503,8 @@ impl AppState {
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
         self.dbs.write().await.remove(name);
-        crate::view::forget_db(&self.root.join(name));
-        crate::search::forget_db(&self.root.join(name));
+        crate::view::forget_db(&crate::db::db_path(&self.root, name));
+        crate::search::forget_db(&crate::db::db_path(&self.root, name));
         Db::destroy(&self.root, name)?;
         self.db_updates.record(name, "deleted");
         Ok(())
@@ -515,8 +515,12 @@ impl AppState {
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten() {
                 if entry.path().join("db.json").is_file() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        names.push(name.to_string());
+                    if let Some(name) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(crate::db::dir_name_to_db_name)
+                    {
+                        names.push(name);
                     }
                 }
             }
