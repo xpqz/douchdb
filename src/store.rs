@@ -323,6 +323,10 @@ pub struct Shard {
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Test seam: make the next `flush_pending` fail as a LevelDB write error
+    /// would, after the queued operations have been drained.
+    #[cfg(test)]
+    fail_next_flush: bool,
 }
 
 fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
@@ -434,7 +438,14 @@ impl Shard {
             latest: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
+            #[cfg(test)]
+            fail_next_flush: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_flush_failure(&mut self) {
+        self.fail_next_flush = true;
     }
 
     pub fn seq(&self) -> u64 {
@@ -976,6 +987,10 @@ impl Shard {
                 None => batch.delete(&key),
             }
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_flush) {
+            anyhow::bail!("injected write failure");
+        }
         self.db.write(batch, true)?;
         self.overlay.clear();
         Ok(())
@@ -1283,6 +1298,40 @@ mod panic_tests {
     }
 
     #[tokio::test]
+    async fn an_errored_reservation_does_not_hold_back_the_committed_sequence() {
+        let handle = handle();
+        let reserved = handle.reserved_seq();
+        let result: std::result::Result<(), ApiError> = handle
+            .call(move |_| {
+                reserved.fetch_max(5, Ordering::SeqCst);
+                Err(ApiError::bad_request("failed after reserving"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(handle.seq_tracker().load(Ordering::SeqCst) >= 5);
+    }
+
+    #[tokio::test]
+    async fn a_failed_group_flush_fails_the_caller_and_leaves_no_trace() {
+        let handle = handle();
+        handle.call(put(b"k/one")).await.unwrap();
+        handle
+            .call(|shard| {
+                shard.inject_flush_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(handle.call(put(b"k/two")).await.is_err());
+        let seen = handle
+            .call(|shard| Ok((shard.get(b"k/one"), shard.get(b"k/two"))))
+            .await
+            .unwrap();
+        assert_eq!(seen, (Some(b"v".to_vec()), None));
+        handle.call(put(b"k/three")).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn jobs_run_on_a_dedicated_thread_not_a_tokio_worker() {
         let handle = handle();
         let (in_runtime, name) = handle
@@ -1411,6 +1460,41 @@ mod scan_tests {
         drop(shard);
         let shard = Shard::open(&dir, 1000).unwrap();
         assert_eq!(shard.counts(), (0, 2), "missing counters are backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_flush_restores_the_state_on_disk() {
+        let dir = temp_shard_dir("flush-fail");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        // Build the lazy indexes so the failure has to repair them too.
+        assert_eq!(live_ids(&mut shard), vec!["a"]);
+        assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
+
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
+        shard.commit_at(tx, Some(2)).unwrap();
+        shard.inject_flush_failure();
+        assert!(shard.flush_pending().is_err());
+
+        assert!(shard.get(&meta_key("b")).is_none(), "unwritten doc visible");
+        assert_eq!(shard.counts(), (1, 0));
+        assert_eq!(shard.seq(), 1);
+        assert_eq!(live_ids(&mut shard), vec!["a"]);
+        assert_eq!(shard.latest_changes().unwrap().seq_of("b"), None);
+
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("c"), &meta(false, 3)).unwrap();
+        shard.commit_at(tx, Some(3)).unwrap();
+        shard.flush_pending().unwrap();
+        drop(shard);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(live_ids(&mut shard), vec!["a", "c"]);
+        assert_eq!(shard.counts(), (2, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

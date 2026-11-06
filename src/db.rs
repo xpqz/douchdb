@@ -3057,6 +3057,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "flushfail",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let good = doc_id_for_shard(&db, 0);
+        let lost = (0..10_000)
+            .map(|i| format!("lost-{i}"))
+            .find(|id| db.shard_index(id) == 0)
+            .expect("second document id for shard 0");
+        db.put_docs(vec![json!({"_id": good})], true).await.unwrap();
+        // Build the lazy indexes so the failure has to repair them.
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(all["total_rows"], 1);
+
+        db.shards[0]
+            .call(|s| {
+                s.inject_flush_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let failed = db.put_docs(vec![json!({"_id": lost})], true).await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        assert!(db.get_doc(&lost, &DocOpts::default()).await.is_err());
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(all["rows"].as_array().unwrap().len(), 1, "{all}");
+        assert_eq!(db.info().await.unwrap()["doc_count"], 1);
+
+        // The changes cursor is not held back by the lost write.
+        assert_eq!(db.changes_watermark(0, None), db.seq.load(Ordering::SeqCst));
+        let opts = ChangesOpts {
+            since: 0,
+            limit: None,
+            include_docs: false,
+            style_all_docs: false,
+            descending: false,
+            doc_ids: None,
+            filter: None,
+            conflicts: false,
+            owned: None,
+        };
+        let (rows, _, pending) = db.changes_rows(&opts).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            [good.as_str()]
+        );
+        assert_eq!(pending, 0);
+
+        // The shard accepts the write again.
+        let results = db.put_docs(vec![json!({"_id": lost})], true).await.unwrap();
+        assert!(results[0].get("error").is_none(), "{results:?}");
+        assert_eq!(db.info().await.unwrap()["doc_count"], 2);
+        let (rows, last_seq, _) = db.changes_rows(&opts).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(last_seq, db.seq.load(Ordering::SeqCst));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     use proptest::prelude::*;
 
     #[test]
