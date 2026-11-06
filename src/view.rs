@@ -986,7 +986,8 @@ pub(crate) fn assemble_reduce(
     let grouped = query.group || query.group_level > 0;
     let groups: Vec<(Value, Vec<Value>)> = if let Some(keys) = &query.keys {
         // Walk the requested keys in request order (reversed when
-        // descending), merging neighbours that share a group.
+        // descending). Each requested key is its own row, even when it
+        // repeats, as in CouchDB.
         let ordered: Vec<&Value> = if query.descending {
             keys.iter().rev().collect()
         } else {
@@ -1003,12 +1004,7 @@ pub(crate) fn assemble_reduce(
             } else {
                 Value::Null
             };
-            match groups.last_mut() {
-                Some((existing, members)) if cmp_json(existing, &group) == Ordering::Equal => {
-                    members.extend(values.iter().cloned());
-                }
-                _ => groups.push((group, values.clone())),
-            }
+            groups.push((group, values.clone()));
         }
         groups
     } else {
@@ -1042,45 +1038,14 @@ pub(crate) fn combine_partials(
             .iter()
             .map(|value| value.as_u64().unwrap_or(0))
             .sum::<u64>())),
-        "_sum" => {
-            let mut sum = 0.0;
-            for value in partials {
-                sum += value
-                    .as_f64()
-                    .ok_or_else(|| format!("_sum requires numbers, got {value}"))?;
-            }
-            Ok(number_value(sum))
-        }
-        "_stats" => {
-            let mut count = 0u64;
-            let mut sum = 0.0;
-            let mut sumsqr = 0.0;
-            let mut min: Option<f64> = None;
-            let mut max: Option<f64> = None;
-            for value in partials {
-                count += value.get("count").and_then(Value::as_u64).unwrap_or(0);
-                sum += value.get("sum").and_then(Value::as_f64).unwrap_or(0.0);
-                sumsqr += value.get("sumsqr").and_then(Value::as_f64).unwrap_or(0.0);
-                if let Some(number) = value.get("min").and_then(Value::as_f64) {
-                    min = Some(min.map_or(number, |current| current.min(number)));
-                }
-                if let Some(number) = value.get("max").and_then(Value::as_f64) {
-                    max = Some(max.map_or(number, |current| current.max(number)));
-                }
-            }
-            if count == 0 {
-                return Ok(json!({
-                    "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
-                }));
-            }
-            Ok(json!({
-                "sum": number_value(sum),
-                "count": count,
-                "min": number_value(min.unwrap_or(0.0)),
-                "max": number_value(max.unwrap_or(0.0)),
-                "sumsqr": number_value(sumsqr),
-            }))
-        }
+        // A partial that is already an error stays the error.
+        "_sum" => match partials.iter().find(|value| {
+            value.get("error").and_then(Value::as_str) == Some("builtin_reduce_error")
+        }) {
+            Some(error) => Ok(error.clone()),
+            None => reduce_sum(partials),
+        },
+        "_stats" => reduce_stats(partials),
         _ => reducer.call(&[], partials, true),
     }
 }
@@ -1394,13 +1359,7 @@ pub async fn query_with_spec(
         let mut js = JsReducer::new(reducer, query.limits);
         return rows
             .reduce(query, query.owner_shards.as_deref(), &mut js)
-            .map_err(|reason| {
-                ApiError::new(
-                    500,
-                    "view_error",
-                    format!("reduce function failed: {reason}"),
-                )
-            });
+            .map_err(|reason| reduce_failure(&reason));
     }
     let selection = local_select(db, ddoc_id, view_name, spec, query, reduce).await?;
     let mut query = query.clone();
@@ -2026,6 +1985,9 @@ fn parse_emit_expr(raw: &str) -> Option<EmitExpr> {
     if let Some(key) = raw.strip_prefix("doc[") {
         let key = key.strip_suffix(']')?;
         let key: String = serde_json::from_str(key).ok()?;
+        if is_object_prototype_field(&key) {
+            return None;
+        }
         return Some(EmitExpr::Field(key));
     }
     serde_json::from_str(raw).ok().map(EmitExpr::Literal)
@@ -2433,13 +2395,7 @@ fn render(
             };
             let value = match value {
                 Ok(value) => value,
-                Err(reason) => {
-                    return Err(ApiError::new(
-                        500,
-                        "view_error",
-                        format!("reduce function failed: {reason}"),
-                    ))
-                }
+                Err(reason) => return Err(reduce_failure(&reason)),
             };
             out.push(json!({"key": key, "value": value}));
         }
@@ -2533,7 +2489,15 @@ fn group_rows<'a>(rows: Vec<&'a Row>, query: &ViewQuery) -> Vec<(Value, Vec<&'a 
     for row in rows {
         let key = group_key(&row.key, query.group_level);
         match groups.last_mut() {
-            Some((existing, members)) if cmp_json(existing, &key) == Ordering::Equal => {
+            // A repeated requested key lists its rows again, and starts a
+            // group of its own.
+            Some((existing, members))
+                if cmp_json(existing, &key) == Ordering::Equal
+                    && !(query.keys.is_some()
+                        && members
+                            .first()
+                            .is_some_and(|first| std::ptr::eq(*first, row))) =>
+            {
                 members.push(row);
             }
             _ => groups.push((key, vec![row])),
@@ -2624,6 +2588,8 @@ impl JsReducer {
         rereduce: bool,
     ) -> Result<Value, String> {
         if crate::js::sandboxed() {
+            // CouchDB passes null, not [], for keys during rereduce.
+            let keys = if rereduce { Value::Null } else { json!(keys) };
             return crate::js::sandbox_request(
                 "reduce",
                 json!({"source": self.source, "keys": keys, "values": values, "rereduce": rereduce}),
@@ -2722,45 +2688,230 @@ fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, Str
     })
 }
 
-fn reduce_sum<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
-    let mut sum = 0.0;
-    for value in values {
-        let number = value
-            .as_f64()
-            .ok_or_else(|| format!("_sum requires numbers, got {value}"))?;
-        sum += number;
+const SUM_ERROR_REASON: &str = "The _sum function requires that map values be numbers, arrays of numbers, or objects. Objects cannot be mixed with other data structures. Objects can be arbitrarily nested, provided that the values for all fields are themselves numbers, arrays of numbers, or objects.";
+
+/// Prefix that marks a reduce failure CouchDB reports as `invalid_value`.
+const INVALID_VALUE: &str = "invalid_value: ";
+
+/// The HTTP error for a failed reduce.
+pub(crate) fn reduce_failure(reason: &str) -> ApiError {
+    match reason.strip_prefix(INVALID_VALUE) {
+        Some(reason) => ApiError::new(500, "invalid_value", reason),
+        None => ApiError::new(
+            500,
+            "view_error",
+            format!("reduce function failed: {reason}"),
+        ),
     }
-    Ok(number_value(sum))
 }
 
-fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
-    let mut count = 0usize;
-    let mut sum = 0.0;
-    let mut sumsqr = 0.0;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
+/// Built-in `_sum`, as in CouchDB's `couch_query_servers`: numbers add,
+/// arrays add element by element (a number counts as a one-element array),
+/// and objects add member by member. Invalid input is not a failed request
+/// but an error object in place of the reduced value.
+fn reduce_sum<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+    let mut acc = json!(0);
     for value in values {
-        let number = value
-            .as_f64()
-            .ok_or_else(|| format!("_stats requires numbers, got {value}"))?;
-        count += 1;
-        sum += number;
-        sumsqr += number * number;
-        min = min.min(number);
-        max = max.max(number);
+        match sum_values(value, &acc) {
+            Ok(sum) => acc = sum,
+            Err(cause) => {
+                return Ok(json!({
+                    "error": "builtin_reduce_error",
+                    "reason": SUM_ERROR_REASON,
+                    "caused_by": cause,
+                }))
+            }
+        }
     }
-    if count == 0 {
-        return Ok(json!({
-            "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
-        }));
+    Ok(acc)
+}
+
+/// Add `value` to `acc`; the error is the offending value.
+fn sum_values(value: &Value, acc: &Value) -> Result<Value, Value> {
+    match (value, acc) {
+        (Value::Number(a), Value::Number(b)) => Ok(sum_numbers(a, b)),
+        (Value::Array(a), Value::Array(b)) => sum_arrays(b, a),
+        (Value::Number(_), Value::Array(b)) => sum_arrays(b, std::slice::from_ref(value)),
+        (Value::Array(a), Value::Number(_)) => sum_arrays(std::slice::from_ref(acc), a),
+        (Value::Object(a), Value::Object(b)) => {
+            let mut a: Vec<(&String, &Value)> = a.iter().collect();
+            let mut b: Vec<(&String, &Value)> = b.iter().collect();
+            a.sort_by(|x, y| x.0.cmp(y.0));
+            b.sort_by(|x, y| x.0.cmp(y.0));
+            let mut out = serde_json::Map::new();
+            let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+            loop {
+                match (a.peek(), b.peek()) {
+                    (Some((ka, va)), Some((kb, vb))) => match ka.cmp(kb) {
+                        Ordering::Equal => {
+                            out.insert((*ka).clone(), sum_values(va, vb)?);
+                            a.next();
+                            b.next();
+                        }
+                        Ordering::Less => {
+                            out.insert((*ka).clone(), (*va).clone());
+                            a.next();
+                        }
+                        Ordering::Greater => {
+                            out.insert((*kb).clone(), (*vb).clone());
+                            b.next();
+                        }
+                    },
+                    (Some(_), None) => {
+                        out.extend(a.map(|(k, v)| (k.clone(), v.clone())));
+                        break;
+                    }
+                    (None, _) => {
+                        out.extend(b.map(|(k, v)| (k.clone(), v.clone())));
+                        break;
+                    }
+                }
+            }
+            Ok(Value::Object(out))
+        }
+        // The first object takes the place of the initial zero.
+        (Value::Object(_), Value::Number(zero)) if zero.as_f64() == Some(0.0) => Ok(value.clone()),
+        (Value::Object(_), Value::Array(_)) => Err(acc.clone()),
+        _ => Err(value.clone()),
     }
-    Ok(json!({
-        "sum": number_value(sum),
-        "count": count,
-        "min": number_value(min),
-        "max": number_value(max),
-        "sumsqr": number_value(sumsqr),
-    }))
+}
+
+fn sum_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Value {
+    number_value(a.as_f64().unwrap_or(0.0) + b.as_f64().unwrap_or(0.0))
+}
+
+/// Element-wise sum; the longer array's tail is kept. The error is the
+/// unsummable remainder of `acc`.
+fn sum_arrays(acc: &[Value], value: &[Value]) -> Result<Value, Value> {
+    let mut out = Vec::with_capacity(acc.len().max(value.len()));
+    for index in 0..acc.len().max(value.len()) {
+        match (acc.get(index), value.get(index)) {
+            (Some(Value::Number(a)), Some(Value::Number(b))) => out.push(sum_numbers(a, b)),
+            (Some(x), None) => out.push(x.clone()),
+            (None, Some(y)) => out.push(y.clone()),
+            _ => return Err(Value::Array(acc.get(index..).unwrap_or_default().to_vec())),
+        }
+    }
+    Ok(Value::Array(out))
+}
+
+#[derive(Clone, Copy)]
+struct Stats {
+    sum: f64,
+    count: u64,
+    min: f64,
+    max: f64,
+    sumsqr: f64,
+}
+
+enum StatsValue {
+    One(Stats),
+    Many(Vec<StatsValue>),
+}
+
+fn invalid_value(reason: impl std::fmt::Display) -> String {
+    format!("{INVALID_VALUE}{reason}")
+}
+
+/// Read a map value or partial for `_stats`: a number, a stats object, or an
+/// array of those.
+fn stats_input(value: &Value) -> Result<StatsValue, String> {
+    match value {
+        Value::Number(number) => {
+            let n = number.as_f64().unwrap_or(0.0);
+            Ok(StatsValue::One(Stats {
+                sum: n,
+                count: 1,
+                min: n,
+                max: n,
+                sumsqr: n * n,
+            }))
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(stats_input)
+            .collect::<Result<_, _>>()
+            .map(StatsValue::Many),
+        Value::Object(members) => {
+            let field = |name: &str| -> Result<f64, String> {
+                match members.get(name) {
+                    None => Err(invalid_value(format!(
+                        "user _stats input missing required field {name} ({value})"
+                    ))),
+                    Some(Value::Number(number)) => Ok(number.as_f64().unwrap_or(0.0)),
+                    Some(other) => Err(invalid_value(format!(
+                        "non-numeric _stats input received for {name}: {other}"
+                    ))),
+                }
+            };
+            Ok(StatsValue::One(Stats {
+                sum: field("sum")?,
+                count: field("count")? as u64,
+                min: field("min")?,
+                max: field("max")?,
+                sumsqr: field("sumsqr")?,
+            }))
+        }
+        other => Err(invalid_value(format!("non-numeric _stats input: {other}"))),
+    }
+}
+
+fn merge_stats(acc: StatsValue, next: StatsValue) -> Result<StatsValue, String> {
+    match (acc, next) {
+        (StatsValue::One(a), StatsValue::One(b)) => Ok(StatsValue::One(Stats {
+            sum: a.sum + b.sum,
+            count: a.count + b.count,
+            min: a.min.min(b.min),
+            max: a.max.max(b.max),
+            sumsqr: a.sumsqr + b.sumsqr,
+        })),
+        (StatsValue::Many(a), StatsValue::Many(b)) if a.len() == b.len() => a
+            .into_iter()
+            .zip(b)
+            .map(|(a, b)| merge_stats(a, b))
+            .collect::<Result<_, _>>()
+            .map(StatsValue::Many),
+        (StatsValue::Many(_), StatsValue::Many(_)) => {
+            Err(invalid_value("_stats arrays must have the same length"))
+        }
+        _ => Err(invalid_value(
+            "The _stats function requires that map values be numbers or arrays of numbers, not a mix of both",
+        )),
+    }
+}
+
+fn stats_json(value: &StatsValue) -> Value {
+    match value {
+        StatsValue::One(stats) => json!({
+            "sum": number_value(stats.sum),
+            "count": stats.count,
+            "min": number_value(stats.min),
+            "max": number_value(stats.max),
+            "sumsqr": number_value(stats.sumsqr),
+        }),
+        StatsValue::Many(items) => Value::Array(items.iter().map(stats_json).collect()),
+    }
+}
+
+/// Built-in `_stats`: numbers, stats objects (as produced by an earlier
+/// `_stats`) and arrays of either, combined element by element.
+fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+    let mut acc: Option<StatsValue> = None;
+    for value in values {
+        let next = stats_input(value)?;
+        acc = Some(match acc {
+            None => next,
+            Some(acc) => merge_stats(acc, next)?,
+        });
+    }
+    Ok(acc.map_or_else(
+        || {
+            json!({
+                "sum": 0, "count": 0, "min": null, "max": null, "sumsqr": 0
+            })
+        },
+        |acc| stats_json(&acc),
+    ))
 }
 
 fn reduce_approx_count_distinct<'a>(
@@ -2816,11 +2967,12 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
         }
         (Value::Object(a), Value::Object(b)) => {
             // CouchDB object collation follows the stored member order, not
-            // lexicographic key order.
+            // sorted key order, and compares member names like strings.
             let a: Vec<_> = a.iter().collect();
             let b: Vec<_> = b.iter().collect();
             for (left, right) in a.iter().zip(b.iter()) {
-                let order = left.0.cmp(right.0).then_with(|| cmp_json(left.1, right.1));
+                let order =
+                    compare_strings(left.0, right.0).then_with(|| cmp_json(left.1, right.1));
                 if order != Ordering::Equal {
                     return order;
                 }
@@ -2897,6 +3049,133 @@ mod tests {
         limits: ViewLimits,
     ) -> Result<Value, String> {
         reduce_with(&mut JsReducer::new(source, limits), keys, values)
+    }
+
+    fn sum_of(values: &[Value]) -> Value {
+        reduce_value("_sum", &[], values, ViewLimits::default()).unwrap()
+    }
+
+    fn stats_of(values: &[Value]) -> Result<Value, String> {
+        reduce_value("_stats", &[], values, ViewLimits::default())
+    }
+
+    #[test]
+    fn grouping_a_repeated_requested_key_keeps_one_group_per_occurrence() {
+        let row = |id: &str, key: &str| Row {
+            id: id.to_string(),
+            key: json!(key),
+            value: json!(1),
+        };
+        let rows = [row("d1", "a"), row("d3", "a")];
+        // The rows of key "a", listed once per occurrence in `keys`.
+        let listed: Vec<&Row> = rows.iter().chain(rows.iter()).collect();
+        let query = ViewQuery {
+            keys: Some(vec![json!("a"), json!("a")]),
+            group: true,
+            ..ViewQuery::default()
+        };
+        let groups = group_rows(listed, &query);
+        assert_eq!(groups.len(), 2);
+        assert!(groups
+            .iter()
+            .all(|(key, members)| key == "a" && members.len() == 2));
+    }
+
+    // The expected values below were captured from CouchDB 3.5.
+    #[test]
+    fn sum_adds_arrays_and_objects_like_couchdb() {
+        assert_eq!(sum_of(&[json!([1, 2, 3]), json!([1])]), json!([2, 2, 3]));
+        assert_eq!(sum_of(&[json!([1]), json!([1, 2, 3])]), json!([2, 2, 3]));
+        assert_eq!(sum_of(&[json!([1, 2]), json!(5)]), json!([6, 2]));
+        assert_eq!(sum_of(&[json!([]), json!([])]), json!([0]));
+        assert_eq!(sum_of(&[json!([1, "x"])]), json!([1, "x"]));
+        assert_eq!(sum_of(&[json!({}), json!({})]), json!({}));
+        assert_eq!(
+            sum_of(&[json!({"a": 1}), json!({"b": 2}), json!({"a": 3})]),
+            json!({"a": 4, "b": 2})
+        );
+        assert_eq!(
+            sum_of(&[json!({"b": 1, "a": 2}), json!({"a": 1})]),
+            json!({"a": 3, "b": 1})
+        );
+        // A lone object is returned as it is, in its own member order.
+        let lone = sum_of(&[json!({"b": 1, "a": 2})]);
+        assert_eq!(serde_json::to_string(&lone).unwrap(), r#"{"b":1,"a":2}"#);
+        assert_eq!(sum_of(&[json!({"a": "s"})]), json!({"a": "s"}));
+        assert_eq!(
+            sum_of(&[json!({"a": [1, 2]}), json!({"a": [3]})]),
+            json!({"a": [4, 2]})
+        );
+        assert_eq!(
+            sum_of(&[json!({"a": 1}), json!({"a": [3]})]),
+            json!({"a": [4]})
+        );
+        assert_eq!(
+            sum_of(&[json!({"a": {"b": 1}}), json!({"a": {"b": 2, "c": 1}})]),
+            json!({"a": {"b": 3, "c": 1}})
+        );
+    }
+
+    #[test]
+    fn sum_reports_invalid_values_as_an_error_object() {
+        let cause = |values: &[Value]| {
+            let result = sum_of(values);
+            assert_eq!(result["error"], "builtin_reduce_error", "{result}");
+            assert_eq!(result["reason"], SUM_ERROR_REASON);
+            result["caused_by"].clone()
+        };
+        assert_eq!(cause(&[json!(1), Value::Null]), Value::Null);
+        assert_eq!(cause(&[json!(true)]), json!(true));
+        assert_eq!(cause(&[json!("x")]), json!("x"));
+        assert_eq!(cause(&[json!({"a": 1}), json!(2)]), json!(2));
+        assert_eq!(cause(&[json!([1]), json!({"a": 1})]), json!([1]));
+        assert_eq!(cause(&[json!([[1]])]), json!([0]));
+    }
+
+    #[test]
+    fn stats_accepts_arrays_and_stats_objects_like_couchdb() {
+        let one = json!({"sum": 3, "count": 2, "min": 1, "max": 2, "sumsqr": 5});
+        assert_eq!(stats_of(std::slice::from_ref(&one)).unwrap(), one);
+        assert_eq!(
+            stats_of(&[one.clone(), json!(4)]).unwrap(),
+            json!({"sum": 7, "count": 3, "min": 1, "max": 4, "sumsqr": 21})
+        );
+        assert_eq!(
+            stats_of(&[json!(4), one.clone()]).unwrap(),
+            json!({"sum": 7, "count": 3, "min": 1, "max": 4, "sumsqr": 21})
+        );
+        assert_eq!(
+            stats_of(&[json!([1, 2]), json!([3, 4])]).unwrap(),
+            json!([
+                {"sum": 4, "count": 2, "min": 1, "max": 3, "sumsqr": 10},
+                {"sum": 6, "count": 2, "min": 2, "max": 4, "sumsqr": 20}
+            ])
+        );
+        assert_eq!(stats_of(&[json!([]), json!([])]).unwrap(), json!([]));
+        assert_eq!(
+            stats_of(&[json!([one.clone()]), json!([1])]).unwrap(),
+            json!([{"sum": 4, "count": 3, "min": 1, "max": 2, "sumsqr": 6}])
+        );
+    }
+
+    #[test]
+    fn stats_rejects_invalid_values_as_invalid_value() {
+        for values in [
+            vec![json!("x")],
+            vec![json!(1), json!("x")],
+            vec![Value::Null],
+            vec![json!(true)],
+            vec![json!([1, "x"])],
+            vec![json!({"a": 1})],
+            vec![json!({"sum": 3, "count": 2, "min": 1, "max": 2})],
+            vec![json!({"sum": "a", "count": 2, "min": 1, "max": 2, "sumsqr": 5})],
+            vec![json!({"sum": 1, "count": 1, "min": null, "max": null, "sumsqr": 1})],
+            vec![json!(1), json!([1, 2])],
+            vec![json!([1, 2]), json!([3])],
+        ] {
+            let error = stats_of(&values).unwrap_err();
+            assert_eq!(reduce_failure(&error).error, "invalid_value", "{values:?}");
+        }
     }
 
     #[tokio::test]
@@ -3473,7 +3752,7 @@ mod tests {
             },
             ViewQuery {
                 keys: Some(vec![json!([1, 1]), json!([1, 5]), json!([0, 0])]),
-                group_level: 1,
+                group: true,
                 descending: true,
                 ..base.clone()
             },

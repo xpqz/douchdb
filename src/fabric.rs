@@ -1628,13 +1628,8 @@ pub(crate) async fn cluster_reduce(
         }
     }
     let mut js = crate::view::JsReducer::new(reducer, query.limits);
-    crate::view::assemble_reduce(partials, query, &mut js).map_err(|reason| {
-        ApiError::new(
-            500,
-            "view_error",
-            format!("reduce function failed: {reason}"),
-        )
-    })
+    crate::view::assemble_reduce(partials, query, &mut js)
+        .map_err(|reason| crate::view::reduce_failure(&reason))
 }
 
 pub(crate) fn decode_view_batch(value: Value) -> ViewBatch {
