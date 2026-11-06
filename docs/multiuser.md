@@ -26,16 +26,23 @@ not consume all interactive capacity.
 }
 ```
 
-- `name` is required and must be unique.
+- `name` is required and must be unique, and must differ from the `--admin`
+  user name (a session cookie carries only the name, so a clash would let the
+  file user's cookie act as the admin). A clash is a startup error.
 - Provide exactly one of `token` or `token_sha256`. The hash is SHA-256 of the
   bearer token. Prefer `token_sha256` in production; keep the file `0600`.
+  A plaintext `token` must be at least 8 characters, and a `token_sha256` of
+  the empty string is refused; both are startup errors. An empty credential
+  never authenticates.
 - `roles` is an array of strings. A user with the `_admin` role, or
   `"admin": true`, is a server admin.
 - The file is read at startup. Restart the process to apply user, token or role
   changes; `_security` changes take effect on the next request without a
   restart.
 - `--admin user:pass` can be used alongside a users file. The config admin is
-  always a server admin.
+  always a server admin. Both parts must be non-empty; a value without a
+  `:` (or with an empty part) is a startup error rather than silently leaving
+  authentication disabled.
 
 Start with:
 
@@ -140,6 +147,7 @@ Limits:
 Request classes:
 
 - **Normal**: point reads/writes, `_all_docs`, `_changes`, bulk operations.
+- **Login**: `POST /_session`, charged to a shared login bucket (see below).
 - **Heavy**: paths containing `/_view/` or `/_search/`.
 - **Background**: anti-entropy and discovery. These bypass per-user accounting
   and use the background permit.
@@ -150,9 +158,14 @@ other users read and write. A no-auth or internal service principal has no
 per-user identity to share fairly; it is bounded by the global and heavy-global
 limits only.
 
-`/_up`, `/_health`, `_utils` assets and the favicon are exempt. `_session` is
-admitted like any other request; a login storm is bounded by the anonymous
-principal's limits. The console request log redacts `_session` request bodies and
+`/_up`, `/_health`, `_utils` assets and the favicon are exempt.
+
+Admission buckets are keyed on anonymous, named user, or login, so a user
+literally named `anonymous` does not share the anonymous bucket. `POST
+/_session` is its own lane: logins are charged to one shared login bucket (with
+the same per-principal limits) rather than to the caller, so unauthenticated
+traffic cannot starve logins, and a login storm is bounded by that bucket and
+the global limit. The console request log redacts `_session` request bodies and
 is cleared on both login and logout so one user's documents are not left visible
 in a shared browser.
 
@@ -230,7 +243,8 @@ cluster_security_without_quorum_is_accepted_and_converges
 ```
 
 Unit tests in `src/admission.rs` cover per-user/global limits, the heavy lane,
-the background lane, path classification and token-bucket refill. Unit tests in
+the background lane, the login lane and anonymous/user key separation, path
+classification and token-bucket refill. Unit tests in
 `src/auth.rs` cover tokens, hashes, roles, sessions and admin roles.
 
 ## Deliberate non-goals
