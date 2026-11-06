@@ -11976,6 +11976,41 @@ fn admin_without_colon_is_a_startup_error() {
 }
 
 #[test]
+fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
+    use std::io::Read;
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("douchdb-badq-{}-{}", std::process::id(), port));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    cmd.arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&dir)
+        .args(["--q", "abc"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(done)) = child.try_wait() {
+            status = Some(done);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.expect("--q abc must stop startup, but the server kept running");
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--q") && stderr.contains("abc"), "{stderr}");
+}
+
+#[test]
 fn users_file_name_colliding_with_admin_is_a_startup_error() {
     let users = UsersFile::new(r#"{"users":[{"name":"admin","token":"long-enough-token"}]}"#);
     let mut args = users_server_args(&users);
