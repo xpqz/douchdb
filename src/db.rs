@@ -886,10 +886,22 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// Current committed sequence counter. This is the same database-wide
-    /// counter used for `update_seq`, without asking every shard actor.
+    /// Current allocated sequence counter. This is the same database-wide
+    /// counter used for `update_seq`, without asking every shard actor. A
+    /// write in flight has already taken its sequence, so this can be ahead
+    /// of what `changes` returns; indexes bound themselves with
+    /// `changes_watermark` instead.
     pub fn update_seq(&self) -> u64 {
         self.seq.load(Ordering::SeqCst)
+    }
+
+    /// Allocate a sequence on `shard` as a write still in flight would: the
+    /// counter has moved but the shard has not committed it. Any later job on
+    /// that shard counts it as committed, as for a write that never finished,
+    /// so a test must not touch the shard again before the code under test.
+    #[cfg(test)]
+    pub(crate) fn start_in_flight_write(&self, shard: usize) -> u64 {
+        allocate_seq(&self.seq, &self.reserved_seq[shard])
     }
 
     /// Owner and replica list for a document, computed with one shard-map

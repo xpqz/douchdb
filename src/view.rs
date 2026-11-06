@@ -2950,6 +2950,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn a_view_does_not_move_past_a_write_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-viewflight-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "viewflight",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let (a, c, e, d) = (
+            on_shard(0, "a"),
+            on_shard(0, "c"),
+            on_shard(0, "e"),
+            on_shard(1, "d"),
+        );
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let last_seq = |name: &str| {
+            let handle = index_handle(&index_path(&db, "_design/v", name)).unwrap();
+            async move { handle.lock().await.last_seq }
+        };
+        db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "inc", &spec, limits)
+            .await
+            .unwrap();
+        let built = last_seq("inc").await;
+
+        // Shard 1 holds an allocated, uncommitted sequence while a later
+        // write on shard 0 commits. An incremental update must stop short.
+        let held = db.start_in_flight_write(1);
+        db.put_docs(vec![json!({"_id": c})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "inc", &spec, limits)
+            .await
+            .unwrap();
+        let seq = last_seq("inc").await;
+        assert!(
+            (built..held).contains(&seq),
+            "incremental update recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // So must a rebuild.
+        let held = db.start_in_flight_write(1);
+        db.put_docs(vec![json!({"_id": e})], true).await.unwrap();
+        ensure_rows(&db, "_design/v", "full", &spec, limits)
+            .await
+            .unwrap();
+        let seq = last_seq("full").await;
+        assert!(
+            seq < held,
+            "rebuild recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // Once the shard commits, a later write on it reaches both indexes.
+        db.put_docs(vec![json!({"_id": d})], true).await.unwrap();
+        for name in ["inc", "full"] {
+            let rows = ensure_rows(&db, "_design/v", name, &spec, limits)
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = rows
+                .shards
+                .iter()
+                .flat_map(|shard| shard.blocks.iter().flat_map(|block| block.iter()))
+                .map(|row| row.id.clone())
+                .collect();
+            ids.sort();
+            let mut expected = vec![a.clone(), c.clone(), e.clone(), d.clone()];
+            expected.sort();
+            assert_eq!(ids, expected, "{name} index");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn block_partials_follow_writes() {
         // One shard with enough blocks for a level of parents above them.

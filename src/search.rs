@@ -1591,6 +1591,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_search_index_does_not_move_past_a_write_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-flight-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchflight",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        // Design documents on shard 0, so reading them never touches shard 1.
+        let (inc, full) = (on_shard(0, "_design/inc"), on_shard(0, "_design/full"));
+        let (a, c, e, d) = (
+            on_shard(0, "a"),
+            on_shard(0, "c"),
+            on_shard(0, "e"),
+            on_shard(1, "d"),
+        );
+        let index = "function(doc){ index('name', doc.name); }";
+        for ddoc in [&inc, &full] {
+            db.put_docs(
+                vec![json!({"_id": ddoc, "indexes": {"idx": {"index": index}}})],
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let limits = crate::view::ViewQuery::default().limits;
+        let search = |ddoc: &str| {
+            let db = &db;
+            let ddoc = ddoc.to_string();
+            async move {
+                let request = SearchRequest {
+                    query: "name:fig".to_string(),
+                    limit: 200,
+                    ..SearchRequest::default()
+                };
+                query(db, &ddoc, "idx", &request, limits).await.unwrap()
+            }
+        };
+        let last_seq = |ddoc: &str| {
+            let entry = index_entry(&index_dir(&db, ddoc, "idx"));
+            async move {
+                let guard = entry.lock().await;
+                guard.as_ref().map(|cached| cached.snapshot.meta.last_seq)
+            }
+        };
+        let put = |id: &str| db.put_docs(vec![json!({"_id": id, "name": "fig"})], true);
+        put(&a).await.unwrap();
+        search(&inc).await;
+        let built = last_seq(&inc).await.unwrap();
+
+        // Shard 1 holds an allocated, uncommitted sequence while a later
+        // write on shard 0 commits. An incremental update must stop short.
+        let held = db.start_in_flight_write(1);
+        put(&c).await.unwrap();
+        search(&inc).await;
+        let seq = last_seq(&inc).await.unwrap();
+        assert!(
+            (built..held).contains(&seq),
+            "incremental update recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // So must a rebuild.
+        let held = db.start_in_flight_write(1);
+        put(&e).await.unwrap();
+        search(&full).await;
+        let seq = last_seq(&full).await.unwrap();
+        assert!(
+            seq < held,
+            "rebuild recorded last_seq {seq}, past the in-flight sequence {held}"
+        );
+
+        // Once the shard commits, a later write on it reaches both indexes.
+        put(&d).await.unwrap();
+        for ddoc in [&inc, &full] {
+            let result = search(ddoc).await;
+            assert_eq!(result["total_rows"], 4, "{ddoc}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn a_damaged_index_is_rebuilt_when_opened() {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-damaged-{}-{}",
