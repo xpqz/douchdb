@@ -5,14 +5,16 @@ use super::*;
 
 pub async fn db_root(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !valid_db_name(&name) {
-        return fail(ApiError::bad_request("Name must be lowercase and URL-safe"));
+    // CouchDB validates a name only when creating it; for every other method an
+    // illegal name is simply a database that does not exist.
+    if method == Method::PUT && !valid_db_name(&name) {
+        return fail(illegal_db_name(&name));
     }
     let q = query(&uri);
     let principal = st.principal(&headers);
@@ -330,7 +332,8 @@ async fn partition_info(
 
 pub async fn db_rest(
     State(st): State<Arc<AppState>>,
-    Path((name, rest)): Path<(String, String)>,
+    DbName(name): DbName,
+    Path((_, rest)): Path<(String, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -338,7 +341,7 @@ pub async fn db_rest(
 ) -> Response {
     if rest.is_empty() {
         // CouchDB accepts `GET /db/` and PouchDB uses it during setup.
-        return db_root(State(st), Path(name), method, uri, headers, body).await;
+        return db_root(State(st), DbName(name), method, uri, headers, body).await;
     }
     let db = match st.db(&name).await {
         Ok(db) => db,

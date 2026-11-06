@@ -6135,6 +6135,32 @@ async fn cluster_database_creation_and_drop_are_broadcast() {
     }
 }
 
+/// The database "a+b" (created as `a%2Bb`) round-trips through the peer URLs,
+/// which encode `+` as `%2B`; the receiving node must not read it as a space.
+#[tokio::test]
+async fn cluster_plus_database_name_round_trips_between_nodes() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    let (status, body) = nodes[0].put("/cp%2Bq", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        let (status, body) = node.put(&format!("/cp%2Bq/doc{i}"), json!({"n": i})).await;
+        assert_eq!(status, StatusCode::CREATED, "{}: {body}", node.base);
+    }
+    for node in &nodes {
+        let (status, body) = node.get("/cp%2Bq").await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", node.base);
+        assert_eq!(body["db_name"], "cp+q");
+        let (_, listed) = node.get("/_all_dbs").await;
+        assert!(listed.to_string().contains("\"cp+q\""), "{listed}");
+        for i in 0..nodes.len() {
+            let (status, doc) = node.get(&format!("/cp%2Bq/doc{i}")).await;
+            assert_eq!(status, StatusCode::OK, "{}: {doc}", node.base);
+        }
+        let (status, body) = node.get("/cp+q").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}: {body}", node.base);
+    }
+}
+
 #[tokio::test]
 async fn cluster_internal_requests_encode_db_names_and_doc_ids() {
     // `a/b` is a legal database name (CouchDB clients send it as `a%2Fb`) and

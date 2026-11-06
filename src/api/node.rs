@@ -172,7 +172,7 @@ pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -
 
 pub async fn db_metadata(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
     let principal = st.principal(&headers);
@@ -188,7 +188,7 @@ pub async fn db_metadata(
 /// Internal target-placement update used while a rebalance is being verified.
 pub async fn db_migration_put(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -227,7 +227,7 @@ pub async fn db_migration_put(
 
 pub async fn db_migration_delete(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
     if !st.cluster.is_internal(&headers) {
@@ -247,7 +247,7 @@ pub async fn db_migration_delete(
 /// Internal security inspection for anti-entropy: the object and its version.
 pub async fn db_security_get(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
     if !st.cluster.is_internal(&headers) {
@@ -271,7 +271,7 @@ pub async fn db_security_get(
 /// than the stored one is rejected with 409.
 pub async fn db_security_put(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -309,7 +309,7 @@ pub async fn db_security_put(
 
 pub async fn db_shard_counts(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -347,7 +347,7 @@ pub async fn db_shard_counts(
 
 pub async fn db_metadata_put(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -384,7 +384,7 @@ pub async fn db_metadata_put(
 
 pub async fn db_rebalance(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -408,7 +408,7 @@ pub async fn db_rebalance(
 
 pub async fn db_cleanup(
     State(st): State<Arc<AppState>>,
-    Path(name): Path<String>,
+    DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
     let principal = st.principal(&headers);

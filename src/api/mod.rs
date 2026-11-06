@@ -398,6 +398,43 @@ fn json_body(body: &[u8]) -> DbResult<Value> {
     crate::json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))
 }
 
+/// A database name taken from the URL path. The segment is decoded the way
+/// CouchDB (mochiweb) decodes every path segment, `+` as a space and then
+/// `%XX` escapes, so `a+b` is the name "a b" and only `a%2Bb` is "a+b". axum's
+/// `Path` decodes the escapes first and leaves `+` alone, which cannot tell the
+/// two apart, so the segment is read from the raw URI path: the first one, or
+/// the one after `/_node/_local/_dbs/` on the node endpoints.
+pub(crate) struct DbName(pub String);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for DbName {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let mut segments = parts.uri.path().trim_start_matches('/').split('/');
+        let raw = match segments.next() {
+            Some("_node") => segments.nth(2),
+            first => first,
+        };
+        raw.map(|segment| DbName(percent_decode(segment)))
+            .ok_or_else(|| fail(ApiError::bad_request("missing database name")))
+    }
+}
+
+/// CouchDB's answer to creating a database with an illegal name.
+fn illegal_db_name(name: &str) -> ApiError {
+    ApiError::new(
+        400,
+        "illegal_database_name",
+        format!(
+            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+        ),
+    )
+}
+
 fn valid_db_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('_')
@@ -425,7 +462,7 @@ impl AppState {
 
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
-            return Err(ApiError::bad_request("invalid database name"));
+            return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(db) = self.dbs.read().await.get(name) {
             return Ok(db.clone());
@@ -466,7 +503,7 @@ impl AppState {
         n: Option<usize>,
     ) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
-            return Err(ApiError::bad_request("invalid database name"));
+            return Err(illegal_db_name(name));
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
@@ -498,7 +535,7 @@ impl AppState {
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
         if !valid_db_name(name) {
-            return Err(ApiError::bad_request("invalid database name"));
+            return Err(ApiError::not_found("Database does not exist."));
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
