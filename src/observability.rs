@@ -3,7 +3,7 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use crate::api::{access_denied, flag, forward_client_auth, query, AppState};
+use crate::api::{access_denied, flag, internal_request, query, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
@@ -776,20 +776,6 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
     out
 }
 
-fn peer_request<'a>(
-    st: &'a AppState,
-    headers: &'a HeaderMap,
-    url: &'a str,
-    path: &'a str,
-) -> reqwest::RequestBuilder {
-    let request = st
-        .client
-        .get(format!("{url}{path}"))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str());
-    forward_client_auth(request, headers)
-}
-
 /// Local or cluster-wide metrics. `?cluster=true` fans out to every configured
 /// peer and merges counters, latency buckets and health.
 pub async fn metrics_status(
@@ -831,7 +817,14 @@ pub async fn metrics_status(
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
         let started = std::time::Instant::now();
-        let request = peer_request(&st, &headers, &url, "/_node/_local/_metrics?local=1");
+        let request = internal_request(
+            &st,
+            reqwest::Method::GET,
+            &url,
+            &["_node", "_local", "_metrics"],
+            Some(&headers),
+        )
+        .query(&[("local", "1")]);
         async move {
             let result = match request.send().await {
                 Ok(response) if response.status().is_success() => {
@@ -953,7 +946,14 @@ pub async fn health_status(
         .map(|(index, url)| (index, url.clone()))
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
-        let request = peer_request(&st, &headers, &url, "/_node/_local/_health?local=1");
+        let request = internal_request(
+            &st,
+            reqwest::Method::GET,
+            &url,
+            &["_node", "_local", "_health"],
+            Some(&headers),
+        )
+        .query(&[("local", "1")]);
         async move {
             let result = match request.send().await {
                 Ok(response) if response.status().is_success() => response

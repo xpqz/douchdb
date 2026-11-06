@@ -4923,6 +4923,96 @@ async fn cluster_database_creation_and_drop_are_broadcast() {
 }
 
 #[tokio::test]
+async fn cluster_internal_requests_encode_db_names_and_doc_ids() {
+    // `a/b` is a legal database name (CouchDB clients send it as `a%2Fb`) and
+    // document ids may hold `?`, `#`, `%` and `/`. Every internal peer URL
+    // must percent-encode them so the receiving node decodes exactly once.
+    let nodes = start_cluster_sharded(3, 4, 1);
+    let db = "/a%2Fb";
+    let (status, body) = nodes[0].put(db, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for node in &nodes {
+        let (status, body) = node.get(db).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "db missing via {}: {body}",
+            node.base
+        );
+        assert_eq!(body["db_name"], "a/b");
+    }
+
+    let ids = ["q?x=1", "h#frag", "100%", "a%2Fb", "p/q", "plain"];
+    let encode = |id: &str| {
+        id.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    for (i, id) in ids.iter().enumerate() {
+        let node = &nodes[i % nodes.len()];
+        let (status, body) = node
+            .put(&format!("{db}/{}", encode(id)), json!({"n": i}))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "put {id} via {}: {body}",
+            node.base
+        );
+    }
+    let ddoc = json!({"views": {"v": {
+        "map": "function(doc){ emit(doc.n, 1); }",
+        "reduce": "_count",
+    }}});
+    let (status, body) = nodes[0].put(&format!("{db}/_design/d"), ddoc).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Every node reads every document, whether or not it holds a replica.
+    for node in &nodes {
+        for (i, id) in ids.iter().enumerate() {
+            let (status, doc) = node.get(&format!("{db}/{}", encode(id))).await;
+            assert_eq!(status, StatusCode::OK, "get {id} via {}: {doc}", node.base);
+            assert_eq!(doc["_id"], *id);
+            assert_eq!(doc["n"], i);
+        }
+        let (status, all) = node.get(&format!("{db}/_all_docs")).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["rows"].as_array().map(Vec::len), Some(ids.len() + 1));
+        let path = format!("{db}/_design/d/_view/v?reduce=false");
+        let (status, view) = node.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["rows"].as_array().map(Vec::len), Some(ids.len()));
+        let (status, reduced) = node.get(&format!("{db}/_design/d/_view/v")).await;
+        assert_eq!(status, StatusCode::OK, "{reduced}");
+        assert_eq!(reduced["rows"][0]["value"], ids.len());
+        let (status, changes) = node.get(&format!("{db}/_changes")).await;
+        assert_eq!(status, StatusCode::OK, "{changes}");
+        assert_eq!(
+            changes["results"].as_array().map(Vec::len),
+            Some(ids.len() + 1)
+        );
+    }
+
+    // Dropping through a node broadcasts to the others.
+    let (status, _) = nodes[1].delete(db).await;
+    assert_eq!(status, StatusCode::OK);
+    for node in &nodes {
+        let (status, _) = node.get(db).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "db survived on {}",
+            node.base
+        );
+    }
+}
+
+#[tokio::test]
 async fn views_map_reduce_collation_and_query_options() {
     let s = Server::start(false);
     s.fresh_db("shop").await;

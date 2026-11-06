@@ -2,8 +2,8 @@
 //! reads/writes and internal node calls.
 
 use crate::api::{
-    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, forward_client_auth, num,
-    percent_encode, AppState,
+    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, forward_client_auth,
+    internal_request, internal_request_raw, num, peer_url, percent_encode, AppState,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use axum::http::{header, HeaderMap, Method, StatusCode};
@@ -74,27 +74,21 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let maps = join_all(st.cluster.peers().map(|peer| {
-        let url = format!("{peer}/_node/_local/_dbs/{}", db.name);
-        async move {
-            let request = st
-                .client
-                .get(url)
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str());
-            let request = if let Some(auth) = &st.auth {
-                request.basic_auth(&auth.user, Some(&auth.pass))
-            } else {
-                request
-            };
-            request
-                .send()
-                .await
-                .ok()?
-                .json::<crate::cluster::ShardMap>()
-                .await
-                .ok()
-        }
+    let maps = join_all(st.cluster.peers().map(|peer| async move {
+        let request = internal_request(
+            st,
+            reqwest::Method::GET,
+            peer,
+            &["_node", "_local", "_dbs", &db.name],
+            None,
+        );
+        request
+            .send()
+            .await
+            .ok()?
+            .json::<crate::cluster::ShardMap>()
+            .await
+            .ok()
     }))
     .await;
 
@@ -128,18 +122,15 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     let responses = join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
-            let request = st
-                .client
-                .put(format!("{peer}/_node/_local/_dbs/{}", db.name))
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str())
-                .header("content-type", "application/json")
-                .body(payload);
-            let request = if let Some(auth) = &st.auth {
-                request.basic_auth(&auth.user, Some(&auth.pass))
-            } else {
-                request
-            };
+            let request = internal_request(
+                st,
+                reqwest::Method::PUT,
+                &peer,
+                &["_node", "_local", "_dbs", &db.name],
+                None,
+            )
+            .header("content-type", "application/json")
+            .body(payload);
             request
                 .send()
                 .await
@@ -174,7 +165,8 @@ pub(crate) async fn proxy(st: &AppState, request: &ForwardRequest<'_>, peer: &st
         headers,
         body,
     } = *request;
-    let mut url = format!("{peer}/{dbname}/{rest}");
+    // `rest` is the caller's still-encoded remainder; only the name is encoded.
+    let mut url = format!("{}/{rest}", peer_url(peer, &[dbname]));
     if !q.is_empty() {
         let encoded: Vec<String> = q
             .iter()
@@ -405,14 +397,15 @@ async fn replica_docs(
             }
             crate::telemetry::record_remote_read();
             let peer = st.cluster.nodes[node].clone();
-            let request = st
-                .client
-                .get(format!("{peer}/{dbname}/{}", percent_encode(docid)))
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str())
-                .header("x-douchdb-quorum-read", "1")
-                .query(&inner);
-            let request = forward_client_auth(request, headers);
+            let request = internal_request(
+                st,
+                reqwest::Method::GET,
+                &peer,
+                &[dbname, docid],
+                Some(headers),
+            )
+            .header("x-douchdb-quorum-read", "1")
+            .query(&inner);
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
@@ -800,14 +793,17 @@ async fn forward_bulk_owned<T>(
 where
     T: serde::Serialize,
 {
-    let request = client
-        .post(format!("{peer}/{dbname}/_bulk_docs"))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", secret)
-        .json(&BulkBody {
-            docs: &docs,
-            new_edits,
-        });
+    let request = internal_request_raw(
+        &client,
+        &secret,
+        reqwest::Method::POST,
+        &peer,
+        &[&dbname, "_bulk_docs"],
+    )
+    .json(&BulkBody {
+        docs: &docs,
+        new_edits,
+    });
     let request = forward_client_auth(request, &headers);
     let response = request
         .send()
@@ -838,18 +834,19 @@ pub(crate) async fn forward_json(
     body: &Value,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
-    let mut url = format!("{peer}/{dbname}/{endpoint}");
-    if !query.is_empty() {
-        url.push('?');
-        url.push_str(query);
-    }
-    let request = st
-        .client
-        .post(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .json(body);
-    let request = forward_client_auth(request, headers);
+    let params: Vec<(&str, &str)> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let request = internal_request(
+        st,
+        reqwest::Method::POST,
+        peer,
+        &[dbname, endpoint],
+        Some(headers),
+    )
+    .query(&params)
+    .json(body);
     let response = request
         .send()
         .await
@@ -1122,7 +1119,7 @@ pub(crate) async fn fetch_all_docs(
         return db.all_docs(opts).await;
     }
     let peer = &st.cluster.nodes[node];
-    let mut query = Vec::new();
+    let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(shards) = shards {
         let selected: Vec<String> = shards
             .iter()
@@ -1130,56 +1127,51 @@ pub(crate) async fn fetch_all_docs(
             .filter(|(_, owned)| **owned)
             .map(|(shard, _)| shard.to_string())
             .collect();
-        query.push(format!("shards={}", selected.join(",")));
+        query.push(("shards", selected.join(",")));
     }
     if let Some(partition) = &opts.partition {
-        query.push(format!("partition={}", percent_encode(partition)));
+        query.push(("partition", partition.clone()));
     }
     if opts.include_docs {
-        query.push("include_docs=true".to_string());
+        query.push(("include_docs", "true".to_string()));
     }
     if opts.conflicts {
-        query.push("conflicts=true".to_string());
+        query.push(("conflicts", "true".to_string()));
     }
     if opts.attachments {
-        query.push("attachments=true".to_string());
+        query.push(("attachments", "true".to_string()));
     }
     if opts.descending {
-        query.push("descending=true".to_string());
+        query.push(("descending", "true".to_string()));
     }
     if !opts.inclusive_end {
-        query.push("inclusive_end=false".to_string());
+        query.push(("inclusive_end", "false".to_string()));
     }
     if opts.skip > 0 {
-        query.push(format!("skip={}", opts.skip));
+        query.push(("skip", opts.skip.to_string()));
     }
     if opts.limit != usize::MAX {
-        query.push(format!("limit={}", opts.limit));
+        query.push(("limit", opts.limit.to_string()));
     }
     if let Some(start) = &opts.startkey {
-        let encoded = serde_json::to_string(start).unwrap_or_default();
-        query.push(format!("startkey={}", percent_encode(&encoded)));
+        query.push(("startkey", serde_json::to_string(start).unwrap_or_default()));
     }
     if let Some(end) = &opts.endkey {
-        let encoded = serde_json::to_string(end).unwrap_or_default();
-        query.push(format!("endkey={}", percent_encode(&encoded)));
-    }
-    let mut url = format!("{peer}/{dbname}/_all_docs");
-    if !query.is_empty() {
-        url.push('?');
-        url.push_str(&query.join("&"));
+        query.push(("endkey", serde_json::to_string(end).unwrap_or_default()));
     }
     let body = match &opts.keys {
         Some(keys) => json!({"keys": keys, "include_docs": opts.include_docs}),
         None => json!({}),
     };
-    let request = st
-        .client
-        .post(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .json(&body);
-    let request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::POST,
+        peer,
+        &[dbname, "_all_docs"],
+        Some(headers),
+    )
+    .query(&query)
+    .json(&body);
     let response = request
         .send()
         .await
@@ -1262,11 +1254,6 @@ async fn fetch_view_mask(
     }
 
     let peer = &st.cluster.nodes[node];
-    let url = format!(
-        "{peer}/{dbname}/{}/_view/{}",
-        percent_encode(ddoc),
-        percent_encode(view_name)
-    );
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -1289,13 +1276,14 @@ async fn fetch_view_mask(
     if let Some(limit) = limit.filter(|limit| *limit != usize::MAX) {
         params.push(("limit", limit.to_string()));
     }
-    let mut request = st
-        .client
-        .get(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .query(&params);
-    request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, ddoc, "_view", view_name],
+        Some(headers),
+    )
+    .query(&params);
     let response = request
         .send()
         .await
@@ -1356,23 +1344,12 @@ pub(crate) async fn cluster_view_rows(
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
 ) -> DbResult<ClusterViewRows> {
-    let ClusterRead {
-        st,
-        db,
-        dbname,
-        headers,
-    } = read;
+    let ClusterRead { st, db, .. } = read;
     let IndexRef {
         ddoc,
         name: view_name,
     } = view;
-    let ddoc_doc = match db.get_doc(ddoc, &DocOpts::default()).await {
-        Ok(doc) => doc,
-        Err(error) if error.status == 404 => {
-            fetch_ddoc_from_replica(st, db, dbname, ddoc, headers).await?
-        }
-        Err(error) => return Err(error),
-    };
+    let ddoc_doc = design_doc(read, ddoc).await?;
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
@@ -1481,11 +1458,6 @@ async fn fetch_reduce_mask(
     }
 
     let peer = &st.cluster.nodes[node];
-    let url = format!(
-        "{peer}/{dbname}/{}/_view/{}",
-        percent_encode(ddoc),
-        percent_encode(view_name)
-    );
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -1503,13 +1475,14 @@ async fn fetch_reduce_mask(
         params.push(("group_level", owner.group_level.to_string()));
     }
     push_range_params(&mut params, &owner);
-    let request = st
-        .client
-        .get(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .query(&params);
-    let request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, ddoc, "_view", view_name],
+        Some(headers),
+    )
+    .query(&params);
     let response = request
         .send()
         .await
@@ -1540,7 +1513,7 @@ pub(crate) async fn cluster_reduce(
         ddoc,
         name: view_name,
     } = view;
-    let ddoc_doc = db.get_doc(ddoc, &DocOpts::default()).await?;
+    let ddoc_doc = design_doc(read, ddoc).await?;
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     crate::view::check_query(&spec, query)?;
@@ -1603,6 +1576,23 @@ pub(crate) fn row_key(row: &crate::view::Row) -> String {
     )
 }
 
+/// The design document from this node, or from a replica when the shard that
+/// owns it lives elsewhere.
+async fn design_doc(read: ClusterRead<'_>, ddoc: &str) -> DbResult<Value> {
+    let ClusterRead {
+        st,
+        db,
+        dbname,
+        headers,
+    } = read;
+    match db.get_doc(ddoc, &DocOpts::default()).await {
+        Err(error) if error.status == 404 => {
+            fetch_ddoc_from_replica(st, db, dbname, ddoc, headers).await
+        }
+        other => other,
+    }
+}
+
 pub(crate) async fn fetch_ddoc_from_replica(
     st: &AppState,
     db: &Db,
@@ -1615,10 +1605,13 @@ pub(crate) async fn fetch_ddoc_from_replica(
             continue;
         }
         let peer = st.cluster.nodes[node].clone();
-        let mut request = st
-            .client
-            .get(format!("{peer}/{dbname}/{}", percent_encode(ddoc)));
-        request = forward_client_auth(request, headers);
+        let request = internal_request(
+            st,
+            reqwest::Method::GET,
+            &peer,
+            &[dbname, ddoc],
+            Some(headers),
+        );
         if let Ok(response) = request.send().await {
             if response.status().is_success() {
                 if let Ok(value) = response.json::<Value>().await {
@@ -1843,36 +1836,34 @@ pub(crate) async fn fetch_node_changes(
         .filter(|(_, owned)| **owned)
         .map(|(shard, _)| shard.to_string())
         .collect();
-    let mut url = format!(
-        "{peer}/{dbname}/_changes?since={since}&shards={}",
-        selected.join(",")
-    );
+    let mut params: Vec<(&str, String)> =
+        vec![("since", since.to_string()), ("shards", selected.join(","))];
     if let Some(limit) = limit {
-        url.push_str(&format!("&limit={limit}"));
+        params.push(("limit", limit.to_string()));
     }
     if include_docs {
-        url.push_str("&include_docs=true");
+        params.push(("include_docs", "true".to_string()));
     }
     if style_all_docs {
-        url.push_str("&style=all_docs");
+        params.push(("style", "all_docs".to_string()));
     }
     if let Some(filter) = q.get("filter") {
-        url.push_str("&filter=");
-        url.push_str(filter);
+        params.push(("filter", filter.clone()));
     }
     if let Some(view) = q.get("view") {
-        url.push_str("&view=");
-        url.push_str(view);
+        params.push(("view", view.clone()));
     }
     if crate::api::flag(q, "conflicts") {
-        url.push_str("&conflicts=true");
+        params.push(("conflicts", "true".to_string()));
     }
-    let request = st
-        .client
-        .get(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str());
-    let request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, "_changes"],
+        Some(headers),
+    )
+    .query(&params);
     let request = if let Some(ids) = doc_ids {
         request
             .query(&[("filter", "_doc_ids")])
@@ -1928,13 +1919,8 @@ pub(crate) async fn cluster_update_vector(read: ClusterRead<'_>) -> DbResult<Vec
             return Ok(db.update_seq());
         }
         let peer = &st.cluster.nodes[node];
-        let request = st
-            .client
-            .get(format!("{peer}/{dbname}"))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-update-seq", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str());
-        let request = forward_client_auth(request, headers);
+        let request = internal_request(st, reqwest::Method::GET, peer, &[dbname], Some(headers))
+            .header("x-douchdb-update-seq", "1");
         let seq = match request.send().await {
             Ok(response) if response.status().is_success() => response
                 .json::<Value>()
@@ -2182,11 +2168,6 @@ async fn fetch_search_mask(
     }
 
     let peer = &st.cluster.nodes[node];
-    let url = format!(
-        "{peer}/{dbname}/{}/_search/{}",
-        percent_encode(ddoc),
-        percent_encode(index_name)
-    );
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -2256,13 +2237,14 @@ async fn fetch_search_mask(
         params.push(("highlight_number", request.highlight_number.to_string()));
     }
 
-    let mut outgoing = st
-        .client
-        .get(url)
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .query(&params);
-    outgoing = forward_client_auth(outgoing, headers);
+    let outgoing = internal_request(
+        st,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, ddoc, "_search", index_name],
+        Some(headers),
+    )
+    .query(&params);
     let response = outgoing
         .send()
         .await

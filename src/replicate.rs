@@ -1,6 +1,6 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
-use crate::api::AppState;
+use crate::api::{internal_request_raw, AppState};
 use crate::auth::Auth;
 use crate::cluster::Cluster;
 use crate::db::Db;
@@ -62,15 +62,18 @@ pub async fn pull(
             other => other.to_string(),
         };
 
-        let mut changes = client
-            .get(format!("{peer}/{}/_changes", db.name))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", cluster.secret.as_str())
-            .query(&[
-                ("since", since_param.as_str()),
-                ("style", "all_docs"),
-                ("limit", &BATCH.to_string()),
-            ]);
+        let mut changes = internal_request_raw(
+            client,
+            &cluster.secret,
+            reqwest::Method::GET,
+            peer,
+            &[&db.name, "_changes"],
+        )
+        .query(&[
+            ("since", since_param.as_str()),
+            ("style", "all_docs"),
+            ("limit", &BATCH.to_string()),
+        ]);
         if let Some(auth) = auth {
             changes = changes.basic_auth(&auth.user, Some(&auth.pass));
         }
@@ -121,11 +124,14 @@ pub async fn pull(
         let mut received: BTreeMap<(String, String), Value> = BTreeMap::new();
         let mut unavailable: BTreeSet<(String, String)> = BTreeSet::new();
         if !reqs.is_empty() {
-            let mut bulk = client
-                .post(format!("{peer}/{}/_bulk_get", db.name))
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", cluster.secret.as_str())
-                .json(&json!({"docs": reqs}));
+            let mut bulk = internal_request_raw(
+                client,
+                &cluster.secret,
+                reqwest::Method::POST,
+                peer,
+                &[&db.name, "_bulk_get"],
+            )
+            .json(&json!({"docs": reqs}));
             if let Some(auth) = auth {
                 bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
             }
