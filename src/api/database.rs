@@ -383,6 +383,7 @@ pub async fn db_rest(
         | "_view_cleanup"
         | "_search_cleanup" => Some(&["POST"]),
         "_changes" => Some(&["GET", "POST", "HEAD"]),
+        "_index_info" => Some(&["GET", "HEAD"]),
         "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
         _ => None,
     };
