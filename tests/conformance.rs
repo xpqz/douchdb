@@ -1681,6 +1681,217 @@ async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
+/// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
+/// counts only design documents in `total_rows` (the offset still counts
+/// every document before the range); `_local_docs` reports null `total_rows`
+/// and `offset`, revision `0-1`, and a `not_found` row for a missing local key.
+#[tokio::test]
+async fn design_docs_and_local_docs_list_their_ranges() {
+    let s = Server::start(false);
+    s.fresh_db("dd").await;
+    for (path, doc) in [
+        ("/dd/_design/x", json!({"views": {}})),
+        ("/dd/_design/y", json!({"views": {}})),
+        ("/dd/d1", json!({"a": 1})),
+        ("/dd/zz", json!({"b": 2})),
+        ("/dd/_local/l1", json!({"a": 1})),
+        ("/dd/_local/l2", json!({"b": 2})),
+    ] {
+        let (status, body) = s.put(path, doc).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+    }
+    let ids = |body: &Value| -> Vec<String> {
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap_or("-").to_string())
+            .collect()
+    };
+
+    let (status, body) = s.get("/dd/_design_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["_design/x", "_design/y"]);
+    assert_eq!(body["total_rows"], 2);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["rows"][0]["key"], "_design/x");
+    assert!(body["rows"][0]["value"]["rev"].is_string());
+
+    let (_, body) = s.get("/dd/_design_docs?include_docs=true&limit=1").await;
+    assert_eq!(body["rows"][0]["doc"]["_id"], "_design/x");
+    assert_eq!(ids(&body), ["_design/x"]);
+    let (_, body) = s.get("/dd/_design_docs?descending=true").await;
+    assert_eq!(ids(&body), ["_design/y", "_design/x"]);
+    assert_eq!(body["offset"], 2);
+    let (_, body) = s.get("/dd/_design_docs?skip=1").await;
+    assert_eq!(ids(&body), ["_design/y"]);
+    assert_eq!(body["offset"], 1);
+    let (_, body) = s
+        .get("/dd/_design_docs?startkey=%22_design/x%22&endkey=%22_design/y%22&inclusive_end=false")
+        .await;
+    assert_eq!(ids(&body), ["_design/x"]);
+    let (_, body) = s.get("/dd/_design_docs?key=%22_design/y%22").await;
+    assert_eq!(ids(&body), ["_design/y"]);
+    assert_eq!(body["offset"], 1);
+    let (_, body) = s.get("/dd/_design_docs?startkey=%22a%22").await;
+    assert_eq!(ids(&body), Vec::<String>::new());
+    assert_eq!(body["offset"], 2);
+    let (_, body) = s
+        .post(
+            "/dd/_design_docs",
+            json!({"keys": ["_design/y", "d1", "nope", 1, "_design/x"]}),
+        )
+        .await;
+    assert_eq!(ids(&body), ["_design/y", "_design/x"]);
+    assert_eq!(body["total_rows"], 2);
+    assert_eq!(body["offset"], Value::Null);
+    let (status, body) = s.get("/dd/_design_docs?descending=maybe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "query_parse_error");
+    let (status, body) = s.put("/dd/_design_docs", json!({})).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    assert_eq!(body["reason"], "Only GET,HEAD,POST allowed");
+
+    let (status, body) = s.get("/dd/_local_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["_local/l1", "_local/l2"]);
+    assert_eq!(body["total_rows"], Value::Null);
+    assert_eq!(body["offset"], Value::Null);
+    assert_eq!(body["rows"][0]["value"], json!({"rev": "0-1"}));
+    let (_, body) = s.get("/dd/_local_docs?include_docs=true&limit=1").await;
+    assert_eq!(
+        body["rows"][0]["doc"],
+        json!({"_id": "_local/l1", "_rev": "0-1", "a": 1})
+    );
+    let (_, body) = s
+        .get("/dd/_local_docs?descending=true&limit=1&skip=1")
+        .await;
+    assert_eq!(ids(&body), ["_local/l1"]);
+    let (_, body) = s
+        .get("/dd/_local_docs?endkey=%22_local/l2%22&inclusive_end=false")
+        .await;
+    assert_eq!(ids(&body), ["_local/l1"]);
+    let (_, body) = s.get("/dd/_local_docs?startkey=%22_local/l2%22").await;
+    assert_eq!(ids(&body), ["_local/l2"]);
+    let (_, body) = s
+        .post(
+            "/dd/_local_docs",
+            json!({"keys": ["_local/l1", "d1", "_local/zz"]}),
+        )
+        .await;
+    assert_eq!(body["rows"][0]["id"], "_local/l1");
+    assert_eq!(
+        body["rows"][1],
+        json!({"key": "_local/zz", "error": "not_found"})
+    );
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(2));
+    let (_, body) = s.get("/dd/_local_docs?update_seq=true").await;
+    assert_eq!(body["update_seq"], Value::Null);
+    let (status, body) = s.get("/dd/_local_docs?key=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = s.get("/nodb/_design_docs").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cluster_design_docs_come_from_every_shard() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("cdd").await;
+    }
+    let (status, body) = nodes[0]
+        .post(
+            "/cdd/_bulk_docs",
+            json!({"docs": [
+                {"_id": "_design/a", "views": {}},
+                {"_id": "_design/b", "views": {}},
+                {"_id": "_design/c", "views": {}},
+                {"_id": "a1"}, {"_id": "z1"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for node in &nodes {
+        let (status, body) = node.get("/cdd/_design_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["_design/a", "_design/b", "_design/c"],
+            "{}",
+            node.base
+        );
+        assert_eq!(body["total_rows"], 3, "{}", node.base);
+        let (_, body) = node
+            .get("/cdd/_design_docs?descending=true&limit=2&include_docs=true")
+            .await;
+        assert_eq!(body["rows"][0]["id"], "_design/c", "{}", node.base);
+        assert_eq!(body["rows"][1]["doc"]["_id"], "_design/b", "{}", node.base);
+        assert_eq!(body["total_rows"], 3, "{}", node.base);
+        let (_, body) = node
+            .post(
+                "/cdd/_design_docs",
+                json!({"keys": ["_design/b", "a1", "_design/q"]}),
+            )
+            .await;
+        assert_eq!(body["rows"][0]["id"], "_design/b", "{}", node.base);
+        assert_eq!(body["rows"][1]["error"], "not_found", "{}", node.base);
+        assert_eq!(
+            body["rows"].as_array().map(Vec::len),
+            Some(2),
+            "{}",
+            node.base
+        );
+    }
+}
+
+/// CouchDB 3.5.3 answers a non-string entry in `keys` with a `not_found` row
+/// that echoes the key; douchdb used to drop it, shifting every later row.
+#[tokio::test]
+async fn all_docs_keys_with_non_string_entries_get_not_found_rows() {
+    let s = Server::start(false);
+    s.fresh_db("nonstr").await;
+    let (status, _) = s.put("/nonstr/d1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let keys = json!([1, "d1", null, {"a": 1}, "zz", true]);
+    let expected = |rows: &Value| {
+        assert_eq!(rows[0], json!({"key": 1, "error": "not_found"}));
+        assert_eq!(rows[1]["id"], "d1");
+        assert_eq!(rows[2], json!({"key": null, "error": "not_found"}));
+        assert_eq!(rows[3], json!({"key": {"a": 1}, "error": "not_found"}));
+        assert_eq!(rows[4], json!({"key": "zz", "error": "not_found"}));
+        assert_eq!(rows[5], json!({"key": true, "error": "not_found"}));
+        assert_eq!(rows.as_array().map(Vec::len), Some(6));
+    };
+    let (status, body) = s
+        .post("/nonstr/_all_docs", json!({ "keys": keys.clone() }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    expected(&body["rows"]);
+    let encoded = keys.to_string().replace('"', "%22");
+    let (status, body) = s.get(&format!("/nonstr/_all_docs?keys={encoded}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    expected(&body["rows"]);
+
+    // `skip` and `limit` count the error rows too.
+    let (status, body) = s
+        .post(
+            "/nonstr/_all_docs?skip=1&limit=2",
+            json!({"keys": [1, "d1", null]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "d1");
+    assert_eq!(body["rows"][1], json!({"key": null, "error": "not_found"}));
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(2));
+}
+
 #[tokio::test]
 async fn all_docs_key_excludes_deleted_and_reports_update_seq() {
     let s = Server::start(false);
@@ -3158,7 +3369,7 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
 
     let (status, body) = s
         .post(
@@ -3167,7 +3378,19 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
+
+    // Reading an attachment finds none, as CouchDB reports for a document
+    // that has no such attachment.
+    let (status, _) = s.put("/att/plain", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/att/plain/a.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
+    assert_eq!(body["reason"], "Document is missing attachment");
+    let (status, body) = s.get("/att/nodoc/a.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["reason"], "missing");
 
     let (status, body) = s
         .req_with(
@@ -3178,7 +3401,7 @@ async fn attachments_are_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "attachments_not_supported");
+    assert_eq!(body["error"], "bad_request");
 }
 
 // CouchDB's `_purge` acts on leaf revisions only: a leaf and the ancestors no
@@ -3527,6 +3750,113 @@ async fn invalid_query_parameters_are_rejected() {
     assert_eq!(body, json!(12));
 }
 
+/// Query-parameter validation taken from CouchDB 3.5.3: `_changes` rejects bad
+/// `since`/`feed`/`heartbeat`/`timeout`, view and `_all_docs` queries reject
+/// bad booleans and non-JSON keys, and `_uuids` validates `count`.
+#[tokio::test]
+async fn query_parameters_are_validated_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("qp").await;
+    let (status, _) = s
+        .put(
+            "/qp/_design/v",
+            json!({"views": {"a": {"map": "function(d){emit(d._id,1)}"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.put("/qp/d1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for (query, reason) in [
+        (
+            "since=abc",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "since=-1",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "since=",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "feed=bogus",
+            "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
+        ),
+        (
+            "heartbeat=abc",
+            "Invalid heartbeat value. Expecting a positive integer value (in milliseconds).",
+        ),
+        (
+            "heartbeat=-1",
+            "The heartbeat value should be a positive integer (in milliseconds).",
+        ),
+        (
+            "heartbeat=0",
+            "The heartbeat value should be a positive integer (in milliseconds).",
+        ),
+        (
+            "timeout=abc",
+            "The timeout parameter should be a non-negative integer",
+        ),
+        (
+            "timeout=-1",
+            "The timeout value should be a non-negative integer",
+        ),
+    ] {
+        let (status, body) = s.get(&format!("/qp/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["error"], "bad_request", "{query}");
+        assert_eq!(body["reason"], reason, "{query}");
+    }
+    for query in ["since=0", "since=now", "timeout=0", "heartbeat=1000"] {
+        let (status, body) = s.get(&format!("/qp/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    }
+
+    for base in ["/qp/_all_docs", "/qp/_design/v/_view/a"] {
+        for name in ["descending", "include_docs", "inclusive_end", "update_seq"] {
+            let (status, body) = s.get(&format!("{base}?{name}=maybe")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{base}?{name}: {body}");
+            assert_eq!(body["error"], "query_parse_error", "{base}?{name}");
+            assert_eq!(
+                body["reason"], "Invalid boolean parameter: \"maybe\"",
+                "{base}?{name}"
+            );
+        }
+        for name in ["key", "startkey", "endkey"] {
+            let (status, body) = s.get(&format!("{base}?{name}=abc")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{base}?{name}: {body}");
+            assert_eq!(body["error"], "bad_request", "{base}?{name}");
+            assert_eq!(body["reason"], "invalid UTF-8 JSON", "{base}?{name}");
+            let (status, body) = s.get(&format!("{base}?{name}=%22abc%22")).await;
+            assert_eq!(status, StatusCode::OK, "{base}?{name}: {body}");
+        }
+        let (status, body) = s.get(&format!("{base}?descending=TRUE")).await;
+        assert_eq!(status, StatusCode::OK, "{base}: {body}");
+    }
+
+    for (query, reason) in [
+        ("count=abc", "count must be a positive integer"),
+        ("count=-1", "count must be a positive integer"),
+        ("count=", "count must be a positive integer"),
+        ("count=1001", "count parameter too large"),
+        ("count=100000", "count parameter too large"),
+    ] {
+        let (status, body) = s.get(&format!("/_uuids?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["error"], "bad_request", "{query}");
+        assert_eq!(body["reason"], reason, "{query}");
+    }
+    let (status, body) = s.get("/_uuids?count=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"uuids": []}));
+    let (status, body) = s.get("/_uuids?count=1000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["uuids"].as_array().map(Vec::len), Some(1000));
+}
+
 /// `POST /db?batch=ok` answers 202 with no rev (CouchDB 3.5.3); a malformed
 /// `_rev` is a 400 `Invalid rev format` for POST and DELETE, not a 409.
 #[tokio::test]
@@ -3554,6 +3884,123 @@ async fn doc_writes_map_errors_to_their_status() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = s.delete("/results/d1?rev=1-abc").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// Document write errors taken from CouchDB 3.5.3: `PUT ?batch=ok` is 202
+/// without a rev, a body that is not JSON is `invalid UTF-8 JSON`, a design
+/// document with a member of the wrong type is `invalid_design_doc` and a
+/// `_deleted` that is not a boolean is `doc_validation`.
+#[tokio::test]
+async fn document_writes_validate_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("dw").await;
+
+    let (status, body) = s.put("/dw/b1?batch=ok", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "b1"}));
+    let (status, body) = s.get("/dw/b1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (method, path) in [(Method::POST, "/dw"), (Method::PUT, "/dw/j1")] {
+        for raw in ["not json", ""] {
+            let response = s
+                .client
+                .request(method.clone(), format!("{}{path}", s.base))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(raw.to_owned())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {raw:?}");
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"], "bad_request", "{path} {raw:?}");
+            assert_eq!(body["reason"], "invalid UTF-8 JSON", "{path} {raw:?}");
+        }
+    }
+    let (status, body) = s.post_raw("/dw/_bulk_docs", "not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "invalid UTF-8 JSON");
+
+    for (doc, reason) in [
+        (json!({"views": 1}), "`views` field must have object type"),
+        (
+            json!({"views": {"v": 1}}),
+            "`views.v` field must have object type",
+        ),
+        (
+            json!({"views": {"v": {}}}),
+            "View `v` must contain map function",
+        ),
+        (
+            json!({"views": {"v": {"map": 1}}}),
+            "`views.v.map` field must have string type",
+        ),
+        (
+            json!({"views": {"v": {"map": "function(d){}", "reduce": "_nope"}}}),
+            "`_nope` is not a supported reduce function.",
+        ),
+        (
+            json!({"language": 5}),
+            "`language` field must have string type",
+        ),
+        (
+            json!({"filters": 1}),
+            "`filters` field must have object type",
+        ),
+        (
+            json!({"filters": {"f": 1}}),
+            "`filters.f` field must have string or object type",
+        ),
+        (
+            json!({"validate_doc_update": 1}),
+            "`validate_doc_update` field must have string type",
+        ),
+        (
+            json!({"rewrites": {}}),
+            "`rewrites` field must have array or string type",
+        ),
+    ] {
+        let (status, body) = s.put("/dw/_design/bad", doc.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{doc}: {body}");
+        assert_eq!(body["error"], "invalid_design_doc", "{doc}");
+        assert_eq!(body["reason"], reason, "{doc}");
+    }
+    let mut doc = json!({"_id": "_design/bad", "views": 1});
+    let (status, body) = s.post("/dw", doc.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_design_doc");
+    // `_bulk_docs` reports the failure on the row and stores the rest.
+    doc["_id"] = json!("_design/bad2");
+    let (status, body) = s
+        .post("/dw/_bulk_docs", json!({"docs": [doc, {"_id": "ok1"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["id"], "_design/bad2");
+    assert_eq!(body[0]["error"], "invalid_design_doc");
+    assert_eq!(body[0]["reason"], "`views` field must have object type");
+    assert_eq!(body[1]["ok"], true);
+    // A well-formed design document is still accepted.
+    let (status, body) = s
+        .put(
+            "/dw/_design/good",
+            json!({"language": "javascript", "views": {"v": {"map": "function(d){}", "reduce": "_count"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for deleted in [json!("x"), json!(1), Value::Null] {
+        let (status, body) = s.put("/dw/del", json!({"_deleted": deleted})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{deleted}: {body}");
+        assert_eq!(body["error"], "doc_validation", "{deleted}");
+        assert_eq!(body["reason"], "Bad special document member: _deleted");
+        let (status, body) = s
+            .post("/dw", json!({"_id": "del", "_deleted": deleted}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{deleted}: {body}");
+        assert_eq!(body["error"], "doc_validation", "{deleted}");
+    }
+    let (status, body) = s.put("/dw/del", json!({"_deleted": false})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 #[tokio::test]
@@ -8710,6 +9157,38 @@ async fn pouchdb_bulk_docs_and_design_docs_ports() {
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
 }
 
+/// `_index_info` is read-only: other methods are 405 with an `Allow` list,
+/// not a silent read (or, for PUT and DELETE, a write that goes unchecked).
+#[tokio::test]
+async fn index_info_only_answers_get_and_head() {
+    let s = Server::start(false);
+    s.fresh_db("idxinfo").await;
+    for method in [Method::POST, Method::PUT, Method::DELETE] {
+        let response = s
+            .client
+            .request(method.clone(), format!("{}/idxinfo/_index_info", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        let allow = response
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(allow, Some("GET,HEAD"), "{method}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "method_not_allowed", "{method}");
+        assert_eq!(body["reason"], "Only GET,HEAD allowed", "{method}");
+    }
+    let (status, body) = s.get("/idxinfo/_index_info").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 0);
+}
+
 #[tokio::test]
 async fn couchdb_search_sort_highlight_timeout_and_index_info_ports() {
     let s = Server::start(false);
@@ -10085,6 +10564,37 @@ async fn databases_take_couchdb_shard_defaults_and_per_database_overrides() {
         // A single copy satisfies the default read quorum.
         let (status, doc) = node.get("/qncluster/d07").await;
         assert_eq!(status, StatusCode::OK, "{}: {doc}", node.base);
+    }
+}
+
+#[tokio::test]
+async fn cluster_all_docs_keys_with_non_string_entries_get_not_found_rows() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("cnonstr").await;
+    }
+    let (status, _) = nodes[0]
+        .post(
+            "/cnonstr/_bulk_docs",
+            json!({"docs": [{"_id": "a"}, {"_id": "b"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for node in &nodes {
+        let (status, body) = node
+            .post("/cnonstr/_all_docs", json!({"keys": [1, "a", null, "b"]}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = &body["rows"];
+        assert_eq!(rows[0], json!({"key": 1, "error": "not_found"}), "{body}");
+        assert_eq!(rows[1]["id"], "a", "{body}");
+        assert_eq!(
+            rows[2],
+            json!({"key": null, "error": "not_found"}),
+            "{body}"
+        );
+        assert_eq!(rows[3]["id"], "b", "{body}");
+        assert_eq!(rows.as_array().map(Vec::len), Some(4), "{body}");
     }
 }
 
@@ -13184,13 +13694,16 @@ async fn changes_since_with_huge_node_index_does_not_abort() {
     s.put("/hugesince/a", json!({"v": 1})).await;
 
     // base64url({"99999999999":1}) is a legacy cluster token naming a node far
-    // outside the cluster. It must be treated as an unparseable since, not
-    // allocated as a vector.
+    // outside the cluster. It must be treated as a malformed since (a 400, as
+    // in CouchDB), not allocated as a vector.
     let (status, body) = s
         .get("/hugesince/_changes?since=eyI5OTk5OTk5OTk5OSI6MX0")
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["reason"],
+        "Malformed sequence supplied in 'since' parameter."
+    );
 
     let (status, _) = s.get("/hugesince").await;
     assert_eq!(status, StatusCode::OK);

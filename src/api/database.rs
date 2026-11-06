@@ -181,10 +181,15 @@ pub async fn db_root(
             if let Some(response) = reject_during_rebalance(&st, &db, &Method::POST, "", &headers) {
                 return response;
             }
-            let Ok(mut doc) = json_body(&body) else {
-                return fail(ApiError::bad_request("Document must be a JSON object"));
+            // CouchDB reads the body as JSON first; an empty one is as
+            // invalid as garbage.
+            let Ok(mut doc) = crate::json::from_slice(&body) else {
+                return fail(ApiError::bad_request("invalid UTF-8 JSON"));
             };
             if let Err(e) = validate_doc(&doc) {
+                return fail(e);
+            }
+            if let Err(e) = validate_design_doc(&doc) {
                 return fail(e);
             }
             if doc.get("_id").is_none() {
@@ -378,6 +383,7 @@ pub async fn db_rest(
         | "_view_cleanup"
         | "_search_cleanup" => Some(&["POST"]),
         "_changes" => Some(&["GET", "POST", "HEAD"]),
+        "_index_info" => Some(&["GET", "HEAD"]),
         "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
         _ => None,
     };
@@ -389,6 +395,8 @@ pub async fn db_rest(
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
         "_all_docs" => return all_docs(req, None).await,
+        "_design_docs" => return design_docs(req).await,
+        "_local_docs" => return local_docs(req).await,
         "_changes" => return changes(st.clone(), db.clone(), &name, &q, &body, &headers).await,
         "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
         "_purge" => {

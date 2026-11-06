@@ -408,8 +408,10 @@ fn route_label(path: &str) -> String {
         "_session",
     ];
     const NODE: [&str; 5] = ["_dbs", "_cluster", "_metrics", "_health", "_replication"];
-    const DB: [&str; 13] = [
+    const DB: [&str; 15] = [
         "_all_docs",
+        "_design_docs",
+        "_local_docs",
         "_bulk_docs",
         "_bulk_get",
         "_changes",

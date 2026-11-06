@@ -18,6 +18,61 @@ fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
     }
 }
 
+/// CouchDB's `_changes` rejects a malformed `since` rather than reading it as
+/// 0: it must be `now`, a non-negative integer or an opaque sequence token
+/// (`N-<base64>`). douchdb's own cluster tokens decode through `decode_since`.
+fn validate_since(raw: &str, nodes: usize) -> DbResult<()> {
+    let opaque = raw.split_once('-').is_some_and(|(seq, token)| {
+        !seq.is_empty()
+            && seq.bytes().all(|b| b.is_ascii_digit())
+            && !token.is_empty()
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    if raw == "now" || raw.parse::<u64>().is_ok() || opaque || decode_since(raw, nodes).is_some() {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "Malformed sequence supplied in 'since' parameter.",
+    ))
+}
+
+/// The `heartbeat` parameter in milliseconds; `true` asks for CouchDB's
+/// default of one minute.
+fn changes_heartbeat(q: &HashMap<String, String>) -> DbResult<Option<std::time::Duration>> {
+    let Some(raw) = q.get("heartbeat") else {
+        return Ok(None);
+    };
+    if raw == "true" {
+        return Ok(Some(std::time::Duration::from_millis(60_000)));
+    }
+    match raw.parse::<i64>() {
+        Ok(n) if n > 0 => Ok(Some(std::time::Duration::from_millis(n.unsigned_abs()))),
+        Ok(_) => Err(ApiError::bad_request(
+            "The heartbeat value should be a positive integer (in milliseconds).",
+        )),
+        Err(_) => Err(ApiError::bad_request(
+            "Invalid heartbeat value. Expecting a positive integer value (in milliseconds).",
+        )),
+    }
+}
+
+fn changes_timeout(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
+    let Some(raw) = q.get("timeout") else {
+        return Ok(None);
+    };
+    match raw.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+        Ok(_) => Err(ApiError::bad_request(
+            "The timeout value should be a non-negative integer",
+        )),
+        Err(_) => Err(ApiError::bad_request(
+            "The timeout parameter should be a non-negative integer",
+        )),
+    }
+}
+
 pub(super) async fn changes(
     st: Arc<AppState>,
     db: Arc<Db>,
@@ -32,6 +87,24 @@ pub(super) async fn changes(
     };
     let local_only = is_forwarded(&st, headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
+    if !["normal", "continuous", "live", "longpoll", "eventsource"].contains(&feed) {
+        return fail(ApiError::bad_request(
+            "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
+        ));
+    }
+    if let Some(raw) = q.get("since") {
+        if let Err(error) = validate_since(raw, st.cluster.nodes.len().max(1)) {
+            return fail(error);
+        }
+    }
+    let timeout = match changes_timeout(q) {
+        Ok(timeout) => timeout,
+        Err(error) => return fail(error),
+    };
+    let heartbeat = match changes_heartbeat(q) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => return fail(error),
+    };
     // Resolve filters before a longpoll/continuous stream starts. A stream
     // must not turn a bad filter into a 200 response that the client retries
     // forever.
@@ -40,10 +113,7 @@ pub(super) async fn changes(
     }
     // Cap longpoll/continuous connections so a client cannot pin a worker for
     // an arbitrary amount of time.
-    let deadline = num(q, "timeout").unwrap_or(60_000).min(300_000) as u64;
-    let heartbeat = num(q, "heartbeat")
-        .filter(|value| *value > 0)
-        .map(|value| std::time::Duration::from_millis(value as u64));
+    let deadline = timeout.unwrap_or(60_000).min(300_000) as u64;
 
     let eventsource = feed == "eventsource";
     if feed == "continuous" || eventsource {

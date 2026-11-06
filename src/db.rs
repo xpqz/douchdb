@@ -1079,11 +1079,7 @@ impl Db {
 
     pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<Value>> {
         if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
-            return Err(ApiError::new(
-                400,
-                "attachments_not_supported",
-                "douchdb does not support attachments",
-            ));
+            return Err(attachments_unsupported());
         }
         let touches_design = docs.iter().any(|doc| {
             doc.get("_id")
@@ -1327,7 +1323,7 @@ impl Db {
     async fn all_docs_by_keys(
         &self,
         opts: &AllDocsOpts,
-        keys: &[String],
+        keys: &[Value],
         owned: Option<&[bool]>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
@@ -1356,12 +1352,12 @@ impl Db {
             }
         }
 
-        let ordered_keys: Vec<String> = if opts.descending {
+        let ordered_keys: Vec<Value> = if opts.descending {
             keys.iter().rev().cloned().collect()
         } else {
             keys.to_vec()
         };
-        let page: Vec<String> = ordered_keys
+        let page: Vec<Value> = ordered_keys
             .iter()
             .skip(opts.skip)
             .take(opts.limit)
@@ -1373,6 +1369,12 @@ impl Db {
             included.fill(true);
         }
         for (slot, key) in page.iter().enumerate() {
+            // CouchDB answers a key that is not a string with a `not_found`
+            // row; it names no document on any shard.
+            let Some(key) = key.as_str() else {
+                included[slot] = true;
+                continue;
+            };
             if let Some(partition) = &opts.partition {
                 if !key.starts_with(&format!("{partition}:")) {
                     continue;
@@ -1386,7 +1388,7 @@ impl Db {
                 continue;
             }
             included[slot] = true;
-            grouped[shard].push((slot, key.clone()));
+            grouped[shard].push((slot, key.to_string()));
         }
 
         let mut results: Vec<Option<Value>> = vec![None; page.len()];
@@ -1901,6 +1903,40 @@ impl Db {
             .await
     }
 
+    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
+    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
+    /// CouchDB reports neither `total_rows` nor `offset` for them.
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+        let opts = opts.clone();
+        let rows = self.shards[0]
+            .call(move |s| {
+                let mut docs: Vec<(String, Value)> = Vec::new();
+                let mut corrupt = None;
+                s.scan_range_while(b"l/", None, false, |key, value| {
+                    let Some(id) = key
+                        .strip_prefix(b"l/")
+                        .and_then(|id| std::str::from_utf8(id).ok())
+                    else {
+                        return true;
+                    };
+                    match serde_json::from_slice::<Value>(value) {
+                        Ok(doc) => docs.push((format!("_local/{id}"), doc)),
+                        Err(error) => {
+                            corrupt = Some(format!("corrupt local document {id}: {error}"));
+                            return false;
+                        }
+                    }
+                    true
+                })?;
+                if let Some(reason) = corrupt {
+                    return Err(ApiError::new(500, "internal_server_error", reason));
+                }
+                Ok(local_doc_rows(docs, &opts))
+            })
+            .await?;
+        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+    }
+
     // ----- maintenance -----------------------------------------------------
 
     pub async fn purge(&self, body: &Value) -> DbResult<Value> {
@@ -2012,6 +2048,13 @@ impl Db {
 // ---------------------------------------------------------------------------
 // document helpers
 
+/// The rejection for a write that carries attachments. CouchDB has no such
+/// error; its attachment failures are `bad_request`, so clients that branch on
+/// the error name see a familiar one.
+pub fn attachments_unsupported() -> ApiError {
+    ApiError::bad_request("douchdb does not support attachments")
+}
+
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
 /// whether they arrive through PUT, `_bulk_docs` or `new_edits=false`.
 pub fn validate_doc(doc: &Value) -> DbResult<()> {
@@ -2019,11 +2062,7 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
         return Err(ApiError::bad_request("Document must be a JSON object"));
     };
     if obj.contains_key("_attachments") {
-        return Err(ApiError::new(
-            400,
-            "attachments_not_supported",
-            "douchdb does not support attachments",
-        ));
+        return Err(attachments_unsupported());
     }
     for key in obj.keys() {
         if key.starts_with('_')
@@ -2036,6 +2075,86 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
                 format!("Bad special document member: {key}"),
             ));
         }
+    }
+    // CouchDB (couch_doc.erl) accepts only a boolean `_deleted`.
+    if obj.get("_deleted").is_some_and(|value| !value.is_boolean()) {
+        return Err(ApiError::new(
+            400,
+            "doc_validation",
+            "Bad special document member: _deleted",
+        ));
+    }
+    Ok(())
+}
+
+/// The structural checks CouchDB applies to a design document before storing
+/// it (couch_mrview_util and the design-doc validator): wrong member types are
+/// `invalid_design_doc`, not a stored document that fails later.
+pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
+    let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
+    let Some(obj) = doc.as_object() else {
+        return Ok(());
+    };
+    let is_design = matches!(obj.get("_id"), Some(Value::String(id)) if id.starts_with("_design/"));
+    if !is_design || obj.get("_deleted") == Some(&Value::Bool(true)) {
+        return Ok(());
+    }
+    let wrong = |field: &str, kind: &str| invalid(format!("`{field}` field must have {kind} type"));
+    for field in ["language", "validate_doc_update"] {
+        if obj.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(wrong(field, "string"));
+        }
+    }
+    if obj.get("options").is_some_and(|value| !value.is_object()) {
+        return Err(wrong("options", "object"));
+    }
+    if obj
+        .get("rewrites")
+        .is_some_and(|value| !value.is_array() && !value.is_string())
+    {
+        return Err(wrong("rewrites", "array or string"));
+    }
+    for field in ["filters", "updates", "lists", "shows"] {
+        match obj.get(field) {
+            None => {}
+            Some(Value::Object(members)) => {
+                for (name, value) in members {
+                    if !value.is_string() && !value.is_object() {
+                        return Err(wrong(&format!("{field}.{name}"), "string or object"));
+                    }
+                }
+            }
+            Some(_) => return Err(wrong(field, "object")),
+        }
+    }
+    match obj.get("views") {
+        None => {}
+        Some(Value::Object(views)) => {
+            for (name, view) in views {
+                let Value::Object(view) = view else {
+                    return Err(wrong(&format!("views.{name}"), "object"));
+                };
+                if !view.contains_key("map") {
+                    return Err(invalid(format!("View `{name}` must contain map function")));
+                }
+                for part in ["map", "reduce"] {
+                    if view.get(part).is_some_and(|value| !value.is_string()) {
+                        return Err(wrong(&format!("views.{name}.{part}"), "string"));
+                    }
+                }
+                if let Some(Value::String(reduce)) = view.get("reduce") {
+                    if reduce.starts_with('_')
+                        && !["_sum", "_count", "_stats", "_approx_count_distinct"]
+                            .contains(&reduce.as_str())
+                    {
+                        return Err(invalid(format!(
+                            "`{reduce}` is not a supported reduce function."
+                        )));
+                    }
+                }
+            }
+        }
+        Some(_) => return Err(wrong("views", "object")),
     }
     Ok(())
 }
@@ -2610,7 +2729,7 @@ pub struct AllDocsOpts {
     pub include_docs: bool,
     pub conflicts: bool,
     pub attachments: bool,
-    pub keys: Option<Vec<String>>,
+    pub keys: Option<Vec<Value>>,
     pub startkey: Option<String>,
     pub endkey: Option<String>,
     pub descending: bool,
@@ -3091,6 +3210,60 @@ fn all_docs_key_row(
         }
     }
     Ok(Some(row))
+}
+
+/// Select and render `_local_docs` rows from every local document, which
+/// arrive in id order.
+fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
+    let render = |id: &str, doc: &Value| {
+        let rev = doc.get("_rev").cloned().unwrap_or_else(|| json!("0-1"));
+        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
+        if opts.include_docs {
+            row["doc"] = doc.clone();
+        }
+        row
+    };
+    let rows: Vec<Value> = if let Some(keys) = &opts.keys {
+        let mut keys: Vec<&str> = keys
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|key| key.starts_with("_local/"))
+            .collect();
+        if opts.descending {
+            keys.reverse();
+        }
+        keys.into_iter()
+            .map(|key| match docs.iter().find(|(id, _)| id == key) {
+                Some((id, doc)) => render(id, doc),
+                None => json!({"key": key, "error": "not_found"}),
+            })
+            .collect()
+    } else {
+        let in_range = |id: &str| {
+            let (low, high) = if opts.descending {
+                (opts.endkey.as_deref(), opts.startkey.as_deref())
+            } else {
+                (opts.startkey.as_deref(), opts.endkey.as_deref())
+            };
+            let (low_inclusive, high_inclusive) = if opts.descending {
+                (opts.inclusive_end, true)
+            } else {
+                (true, opts.inclusive_end)
+            };
+            low.is_none_or(|low| id > low || (low_inclusive && id == low))
+                && high.is_none_or(|high| id < high || (high_inclusive && id == high))
+        };
+        let mut selected: Vec<&(String, Value)> =
+            docs.iter().filter(|(id, _)| in_range(id)).collect();
+        if opts.descending {
+            selected.reverse();
+        }
+        selected
+            .into_iter()
+            .map(|(id, doc)| render(id, doc))
+            .collect()
+    };
+    rows.into_iter().skip(opts.skip).take(opts.limit).collect()
 }
 
 /// One `_all_docs` row before it is rendered as JSON.

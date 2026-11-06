@@ -1605,7 +1605,7 @@ pub(crate) async fn docs_by_ids(
         return Ok(HashMap::new());
     }
     let opts = AllDocsOpts {
-        keys: Some(ids.to_vec()),
+        keys: Some(ids.iter().cloned().map(Value::String).collect()),
         include_docs: true,
         attachments,
         limit: usize::MAX,

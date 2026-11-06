@@ -37,12 +37,11 @@ pub(super) fn view_path(rest: &str) -> Option<(String, String)> {
 
 fn view_json_param(q: &HashMap<String, String>, name: &str) -> DbResult<Option<Value>> {
     match q.get(name) {
-        Some(raw) => match serde_json::from_str::<Value>(raw) {
-            Ok(value) => Ok(Some(value)),
-            // CouchDB wants JSON-encoded keys, but tolerating a bare string is
-            // friendlier to hand-written URLs.
-            Err(_) => Ok(Some(Value::String(raw.clone()))),
-        },
+        // CouchDB wants JSON-encoded keys: `key=abc` is a 400, `key="abc"` is
+        // not.
+        Some(raw) => serde_json::from_str::<Value>(raw)
+            .map(Some)
+            .map_err(|_| ApiError::bad_request("invalid UTF-8 JSON")),
         None => Ok(None),
     }
 }
@@ -336,6 +335,19 @@ pub(super) async fn view_request(
     }
 
     let build = || -> DbResult<crate::view::ViewQuery> {
+        validate_bool_params(
+            q,
+            &[
+                "descending",
+                "include_docs",
+                "inclusive_end",
+                "update_seq",
+                "conflicts",
+                "attachments",
+                "reduce",
+                "group",
+            ],
+        )?;
         let mut keys = match view_json_param(q, "keys")? {
             Some(Value::Array(keys)) => Some(keys),
             Some(_) => return Err(ApiError::bad_request("`keys` must be a JSON array")),
@@ -383,10 +395,9 @@ pub(super) async fn view_request(
                 .or_else(|| q.get("end_key_doc_id"))
                 .cloned(),
             descending: flag(q, "descending"),
-            inclusive_end: q
+            inclusive_end: !q
                 .get("inclusive_end")
-                .map(|value| value != "false")
-                .unwrap_or(true),
+                .is_some_and(|value| value.eq_ignore_ascii_case("false")),
             skip: skip.unwrap_or(0),
             limit: limit.unwrap_or(usize::MAX),
             reduce: q.get("reduce").map(|_| flag(q, "reduce")),

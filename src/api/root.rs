@@ -96,7 +96,18 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
 }
 
 pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
-    let count = num(&query(&uri), "count").unwrap_or(1).clamp(1, 1000);
+    let q = query(&uri);
+    // CouchDB's `uuids.max_count` defaults to 1000.
+    let count = match q.get("count") {
+        None => 1,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(count) if count > 1000 => {
+                return fail(ApiError::bad_request("count parameter too large"))
+            }
+            Ok(count) => count,
+            Err(_) => return fail(ApiError::bad_request("count must be a positive integer")),
+        },
+    };
     let ids: Vec<String> = (0..count).map(|_| crate::db::uuid()).collect();
     json(StatusCode::OK, json!({ "uuids": ids }))
 }
