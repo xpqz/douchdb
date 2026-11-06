@@ -187,7 +187,10 @@ fn percent_decode(s: &str) -> String {
 }
 
 pub(crate) fn flag(q: &HashMap<String, String>, key: &str) -> bool {
-    matches!(q.get(key).map(String::as_str), Some("true") | Some("1"))
+    match q.get(key) {
+        Some(raw) => raw == "1" || raw.eq_ignore_ascii_case("true"),
+        None => false,
+    }
 }
 
 pub(crate) fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
@@ -389,6 +392,37 @@ fn key_param(q: &HashMap<String, String>, key: &str) -> Option<String> {
         Ok(Value::Number(n)) => Some(n.to_string()),
         _ => Some(raw.clone()),
     }
+}
+
+/// Like `key_param`, but a value that is not JSON is a 400 as in CouchDB
+/// (`key=abc` must be written `key="abc"`).
+pub(crate) fn json_key_param(q: &HashMap<String, String>, key: &str) -> DbResult<Option<String>> {
+    let Some(raw) = q.get(key) else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::String(s)) => Ok(Some(s)),
+        Ok(Value::Number(n)) => Ok(Some(n.to_string())),
+        Ok(_) => Ok(Some(raw.clone())),
+        Err(_) => Err(ApiError::bad_request("invalid UTF-8 JSON")),
+    }
+}
+
+/// CouchDB accepts `true` and `false` (in any case) for its boolean query
+/// parameters and answers 400 `query_parse_error` for anything else.
+pub(crate) fn validate_bool_params(q: &HashMap<String, String>, names: &[&str]) -> DbResult<()> {
+    for name in names {
+        if let Some(raw) = q.get(*name) {
+            if !raw.eq_ignore_ascii_case("true") && !raw.eq_ignore_ascii_case("false") {
+                return Err(ApiError::new(
+                    400,
+                    "query_parse_error",
+                    format!("Invalid boolean parameter: \"{raw}\""),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn json_body(body: &[u8]) -> DbResult<Value> {

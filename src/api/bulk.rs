@@ -411,6 +411,16 @@ pub(super) async fn revs_diff(
     json(StatusCode::OK, Value::Object(out))
 }
 
+const ALL_DOCS_BOOL_PARAMS: &[&str] = &[
+    "descending",
+    "include_docs",
+    "inclusive_end",
+    "update_seq",
+    "conflicts",
+    "attachments",
+    "reduce",
+];
+
 pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> Response {
     let DbRequest {
         st,
@@ -437,6 +447,9 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
             return fail(error);
         }
     }
+    if let Err(error) = validate_bool_params(q, ALL_DOCS_BOOL_PARAMS) {
+        return fail(error);
+    }
     let query_limit = match uint_param(q, "limit") {
         Ok(limit) => limit,
         Err(error) => return fail(error),
@@ -445,23 +458,36 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(skip) => skip,
         Err(error) => return fail(error),
     };
+    let key_range = |name: &str, alias: &str| -> DbResult<Option<String>> {
+        match json_key_param(q, name)? {
+            Some(key) => Ok(Some(key)),
+            None => json_key_param(q, alias),
+        }
+    };
+    let (startkey, endkey, single_key) = match (
+        key_range("startkey", "start_key"),
+        key_range("endkey", "end_key"),
+        json_key_param(q, "key"),
+    ) {
+        (Ok(start), Ok(end), Ok(key)) => (start, end, key),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return fail(error),
+    };
     let mut opts = AllDocsOpts {
         partition: partition.clone(),
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
         attachments: flag(q, "attachments"),
-        startkey: key_param(q, "startkey").or_else(|| key_param(q, "start_key")),
-        endkey: key_param(q, "endkey").or_else(|| key_param(q, "end_key")),
+        startkey,
+        endkey,
         descending: flag(q, "descending"),
-        inclusive_end: q
+        inclusive_end: !q
             .get("inclusive_end")
-            .map(|value| value != "false")
-            .unwrap_or(true),
+            .is_some_and(|value| value.eq_ignore_ascii_case("false")),
         limit: query_limit.unwrap_or(usize::MAX),
         skip: query_skip.unwrap_or(0),
         ..Default::default()
     };
-    if let Some(key) = key_param(q, "key") {
+    if let Some(key) = single_key {
         if q.contains_key("keys") {
             return fail(ApiError::bad_request("`key` is incompatible with `keys`"));
         }
