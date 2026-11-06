@@ -323,7 +323,7 @@ Behaviour and limits:
   `--view-memory-mb` and `--view-timeout-ms`.
 - JavaScript runs in QuickJS. The default is in-process with heap, stack and
   wall-clock limits; `--js-sandbox process` uses a warmed worker pool with a
-  cleared environment, `/` cwd, rlimits, a seccomp denylist, a best-effort
+  cleared environment, `/` cwd, rlimits, a seccomp allowlist, a best-effort
   Landlock filesystem layer and a kill watchdog; `--js-sandbox wasm` runs the
   checked-in QuickJS WASM runner with linear-memory limits under `wasmi`
   (default) or the optional `wasmtime` Cranelift JIT. wasmtime is 4–7× faster

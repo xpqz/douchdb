@@ -28,13 +28,19 @@ No engine mode gives design-document JavaScript network or filesystem access:
 - **Native:** there are no host callbacks at all, so JS has no file or socket
   objects to call. This is still an in-process engine and not crash-safe.
 - **Process:** the worker starts with a cleared environment, `/` cwd and no
-  database/HTTP handles. A seccomp denylist rejects `open`, `openat`,
-  `socket`, `connect`, `execve` and related syscalls; a best-effort Landlock
-  layer denies filesystem access across all threads. `process_worker_installs_the_seccomp_filter`
-  checks the filter is active.
+  database/HTTP handles. A seccomp allowlist lets through only the
+  syscalls QuickJS and the frame loop need (everything else, including
+  `open`, `socket`, `execve`, signals to other processes, `clone`/`clone3`
+  and the link/rename/chmod/chown/mknod family, returns `EPERM`); a
+  best-effort Landlock layer denies filesystem access across all threads.
+  `process_worker_installs_the_seccomp_filter` checks the filter is active and
+  `seccomp_denies_signals_namespaces_and_filesystem_mutation` probes what it
+  denies.
 - **WASM:** the WASI context has no preopens, environment or args. The module's
   only host pipes are the request stdin and response stdout, plus WASI
-  clock/random; the store has fuel and a 128 MiB linear-memory cap.
+  clock/random; the host caps linear memory at the module's initial memory
+  plus `--view-memory-mb` plus twice the request size, and enforces the
+  deadline on the wall clock (see "WASM limits" below).
 
 The OS-level layers are defense in depth: even a memory-corruption bug in
 QuickJS should not turn into host file or network access. They are not a claim
@@ -168,9 +174,22 @@ What is implemented:
   cluster secret, data paths or CWD;
 - `RLIMIT_AS`, `RLIMIT_CORE`, `RLIMIT_FSIZE` and `RLIMIT_NOFILE`; the
   per-request watchdog is the CPU backstop for pooled workers;
-- `PR_SET_NO_NEW_PRIVS`, a Linux seccomp denylist for file, network, exec,
-  process-inspection and io_uring syscalls, and a best-effort Landlock layer
-  that denies filesystem access across all threads when the kernel supports it;
+- `PR_SET_NO_NEW_PRIVS`, a Linux seccomp allowlist (read/write on the request
+  pipes, memory management, futex, clocks, exit, and `tgkill` only against the
+  worker's own pid), and a best-effort Landlock layer that denies filesystem
+  access across all threads when the kernel supports it. Landlock is installed
+  first because its syscalls are not on the allowlist. The worker reports how
+  much of Landlock was enforced (fully, partially or not) in a hello frame and
+  the server logs it once, at `warn` when it is not full. The allowlist was
+  derived by tracing a worker through map, reduce, index, timeout,
+  out-of-memory and stack-overflow requests; the x86_64 and aarch64 lists are
+  identical (only syscalls present on both are used), but only aarch64 was
+  traced;
+- no `PR_SET_PDEATHSIG`: it is tied to the thread that forked the worker, and
+  pool workers are forked from blocking-pool threads that exit when idle, which
+  would kill an idle pooled worker. The server holds the only write end of the
+  worker's stdin, so if it dies the worker reads EOF and exits; a request in
+  flight ends at its own deadline;
 - a hidden `--js-worker` mode that runs the normal map/reduce/index code in the
   child; the parent's sandbox flag is false in the child, so there is no
   recursive spawning;
@@ -189,7 +208,39 @@ Platform note:
   there is no seccomp or Landlock layer. On other platforms, process mode still
   gets a cleared environment, process isolation and rlimits where available, but
   a hard portable boundary should use `--js-sandbox wasm` (optionally with the
-  Wasmtime JIT). A kernel without Landlock falls back to the seccomp denylist.
+  Wasmtime JIT). A kernel without Landlock falls back to the seccomp allowlist.
+
+Pooled workers serve every database, but they carry no JavaScript state from
+one request to the next: each map, reduce or index request builds a fresh
+QuickJS runtime and context, so a design document cannot leave globals or
+prototype changes that another database's code sees
+(`pooled_process_worker_keeps_no_js_state_between_databases`). CouchDB works
+differently. `couch_proc_manager` keeps `couchjs` processes alive and tags
+each with the database and design-doc keys it has been taught (`teach_ddoc`,
+`find_proc` prefer a process of the same database, else an untagged one), and
+`State.reset` in `share/server/state.js` clears the compiled functions and lib
+and runs `gc()` between uses; it does not rebuild the JS global object. The
+worker pool needs neither the tagging nor the reset.
+
+### WASM limits
+
+The runner ignores the `memory` and `timeout_ms` fields of the request (its
+sources and binary are not rebuilt here), so the host enforces both:
+
+- linear memory: the store limiter refuses growth beyond the module's initial
+  memory + `--view-memory-mb` + twice the request body. This bounds the
+  QuickJS heap indirectly: it is not an exact heap limit, and a view near the
+  limit can fail for allocator overhead.
+- deadline: wasmtime uses epoch interruption (wall clock). wasmi has no
+  interrupt, so the call runs in slices of fuel adapted to about 20 ms each
+  and the wall clock is checked between slices, giving a real wall-clock
+  deadline with a small overshoot.
+- Not enforced: the runner's own QuickJS memory limit and interrupt handler
+  (they stay at the runner's compiled-in defaults), and the 16 MiB output cap
+  applies after the run has produced its output. The runner's
+  reduce path passes `keys` and `values` to the user's function as given
+  (null when missing) without validating them; the worker-process path
+  rejects malformed ones.
 
 Run the mode tests:
 
@@ -379,7 +430,7 @@ Use a `JsEngine` boundary and migrate in stages:
    - Documented that in-process QuickJS is not a security boundary.
 2. **Done: worker process.**
    - Implemented `--js-sandbox process` with env clearing, cwd isolation,
-     rlimits, no database handles, a seccomp denylist, a best-effort Landlock
+     rlimits, no database handles, a seccomp allowlist, a best-effort Landlock
      layer, a parent-side kill watchdog and a warmed worker pool.
    - Recommended for Linux deployments that execute untrusted design docs.
 3. **Done: WASM engine.**
