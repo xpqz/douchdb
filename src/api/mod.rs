@@ -85,6 +85,8 @@ pub struct AppState {
     pub admission: Arc<crate::admission::Admission>,
     /// Bound concurrent `_compact` requests across databases on this node.
     pub compaction: Arc<tokio::sync::Semaphore>,
+    /// Recent result of the health check's blocking filesystem probe.
+    pub fs_health: crate::observability::FsHealthCache,
 }
 
 #[derive(Clone)]

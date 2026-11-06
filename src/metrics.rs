@@ -5,6 +5,7 @@
 
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,73 @@ pub(crate) const LATENCY_BOUNDS: [f64; 12] = [
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
 ];
 const HISTORY_SECS: u64 = 120;
+/// Window over which `/_health` judges the 5xx ratio. A node that recovers
+/// leaves the unhealthy state once the failures age out of this window.
+pub const HEALTH_WINDOW_SECS: u64 = 60;
+
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one in-flight HTTP request for as long as it is alive. Dropping it,
+/// including when a handler is cancelled by a client disconnect, decrements.
+pub struct InFlightGuard(&'static AtomicU64);
+
+impl InFlightGuard {
+    fn new(counter: &'static AtomicU64) -> InFlightGuard {
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard(counter)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+}
+
+/// Per-second request and 5xx counts over a bounded recent window.
+#[derive(Default)]
+struct RecentWindow {
+    /// `(second, requests, server_errors)`, oldest first, strictly increasing
+    /// in `second`, never longer than `HEALTH_WINDOW_SECS` entries.
+    buckets: VecDeque<(u64, u64, u64)>,
+}
+
+impl RecentWindow {
+    fn prune(&mut self, now: u64) {
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(second, _, _)| now.saturating_sub(*second) >= HEALTH_WINDOW_SECS)
+        {
+            self.buckets.pop_front();
+        }
+    }
+
+    fn record(&mut self, now: u64, server_error: bool) {
+        self.prune(now);
+        if self.buckets.back().map(|bucket| bucket.0) != Some(now) {
+            self.buckets.push_back((now, 0, 0));
+        }
+        if let Some(bucket) = self.buckets.back_mut() {
+            bucket.1 += 1;
+            bucket.2 += u64::from(server_error);
+        }
+    }
+
+    /// `(requests, server_errors)` over the window ending at `now`.
+    fn totals(&self, now: u64) -> (u64, u64) {
+        self.buckets
+            .iter()
+            .filter(|(second, _, _)| now.saturating_sub(*second) < HEALTH_WINDOW_SECS)
+            .fold((0, 0), |(requests, errors), (_, r, e)| {
+                (requests + r, errors + e)
+            })
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct RouteStat {
@@ -124,7 +192,6 @@ struct FabricStat {
 #[derive(Default)]
 struct State {
     requests: u64,
-    in_flight: u64,
     errors: u64,
     total_ms: f64,
     max_ms: f64,
@@ -133,6 +200,7 @@ struct State {
     methods: BTreeMap<String, u64>,
     routes: BTreeMap<String, RouteStat>,
     history: VecDeque<SecondBucket>,
+    recent: RecentWindow,
     fabric: FabricStat,
     views: EngineStat,
     search: EngineStat,
@@ -205,9 +273,16 @@ fn percentile(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64 {
     max_ms
 }
 
-/// Record the beginning of an HTTP request so `in_flight` is live.
-pub fn request_started() {
-    state().in_flight += 1;
+/// Record the beginning of an HTTP request so `in_flight` is live. Keep the
+/// guard until the request ends; dropping it decrements.
+pub fn request_started() -> InFlightGuard {
+    InFlightGuard::new(&IN_FLIGHT)
+}
+
+/// Requests and 5xx responses over the last `HEALTH_WINDOW_SECS`, excluding
+/// health and liveness probes so probing never feeds the ratio it reads.
+pub fn recent_http() -> (u64, u64) {
+    state().recent.totals(now_secs())
 }
 
 /// Record a completed HTTP request. `path` is only used for a low-cardinality
@@ -216,14 +291,19 @@ pub fn record_http(method: &str, status: u16, duration_ms: f64, path: &str) {
     let route = route_label(path);
     let error = status >= 400;
     let mut state = state();
-    state.in_flight = state.in_flight.saturating_sub(1);
+    if !is_probe(&route) {
+        state.recent.record(now_secs(), status >= 500);
+    }
     state.requests += 1;
     state.errors += u64::from(error);
     state.total_ms += duration_ms;
     state.max_ms = state.max_ms.max(duration_ms);
     state.buckets[bucket_of(duration_ms)] += 1;
     *state.status_codes.entry(status).or_default() += 1;
-    *state.methods.entry(method.to_string()).or_default() += 1;
+    *state
+        .methods
+        .entry(method_label(method).to_string())
+        .or_default() += 1;
     state
         .routes
         .entry(route)
@@ -294,32 +374,89 @@ pub fn corrupt_records_skipped() -> u64 {
     state().corrupt_records_skipped
 }
 
+const OTHER: &str = "other";
+
+/// Methods that may appear as a label; anything else is `other`.
+pub fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "COPY" => "COPY",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        _ => OTHER,
+    }
+}
+
+/// Routes that load balancers and peers poll. They say nothing about how
+/// clients are being served, so health excludes them from its error ratio.
+fn is_probe(route: &str) -> bool {
+    matches!(route, "/_up" | "/_health" | "/_node/*/_health")
+}
+
+/// Low-cardinality route template. Every label comes from a fixed set; a path
+/// segment chosen by the client is never copied into it.
 fn route_label(path: &str) -> String {
+    const TOP: [&str; 8] = [
+        "_up",
+        "_health",
+        "_all_dbs",
+        "_db_updates",
+        "_dbs_info",
+        "_uuids",
+        "_membership",
+        "_session",
+    ];
+    const NODE: [&str; 5] = ["_dbs", "_cluster", "_metrics", "_health", "_replication"];
+    const DB: [&str; 13] = [
+        "_all_docs",
+        "_bulk_docs",
+        "_bulk_get",
+        "_changes",
+        "_compact",
+        "_ensure_full_commit",
+        "_index_info",
+        "_purge",
+        "_revs_diff",
+        "_revs_limit",
+        "_search_cleanup",
+        "_security",
+        "_view_cleanup",
+    ];
     let segments: Vec<&str> = path
         .trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    if segments.is_empty() {
+    let Some(first) = segments.first().copied() else {
         return "/".to_string();
+    };
+    if first == "favicon.ico" {
+        return "/favicon.ico".to_string();
     }
-    if segments[0] == "_utils" {
+    if first == "_utils" {
         return "/_utils/*".to_string();
     }
-    if segments[0] == "_node" {
-        return match segments.get(2).copied().unwrap_or("") {
-            "" => "/_node".to_string(),
-            endpoint => format!("/_node/*/{endpoint}"),
+    if first == "_node" {
+        return match segments.get(2).copied() {
+            None => "/_node".to_string(),
+            Some(endpoint) if NODE.contains(&endpoint) => format!("/_node/*/{endpoint}"),
+            Some(_) => OTHER.to_string(),
         };
     }
-    if segments[0].starts_with('_') {
-        return format!("/{}", segments[0]);
+    if first.starts_with('_') {
+        return if TOP.contains(&first) {
+            format!("/{first}")
+        } else {
+            OTHER.to_string()
+        };
     }
-    if segments.len() == 1 {
+    let Some(endpoint) = segments.get(1).copied() else {
         return "/{db}".to_string();
-    }
-    let db = segments[0];
-    let endpoint = segments[1];
+    };
     if endpoint == "_design" {
         return match segments.get(2..).unwrap_or_default() {
             [_, "_view", _] => "/{db}/_design/*/_view/*".to_string(),
@@ -334,9 +471,12 @@ fn route_label(path: &str) -> String {
         return "/{db}/_local/*".to_string();
     }
     if endpoint.starts_with('_') {
-        return format!("/{{db}}/{endpoint}");
+        return if DB.contains(&endpoint) {
+            format!("/{{db}}/{endpoint}")
+        } else {
+            OTHER.to_string()
+        };
     }
-    let _ = db;
     "/{db}/doc".to_string()
 }
 
@@ -459,7 +599,7 @@ pub fn snapshot() -> Value {
         "process": process_json(),
         "http": {
             "total": state.requests,
-            "in_flight": state.in_flight,
+            "in_flight": IN_FLIGHT.load(Ordering::Relaxed),
             "errors": state.errors,
             "error_rate_pct": pct(state.errors, state.requests),
             "status_classes": status_classes,
@@ -544,6 +684,81 @@ mod tests {
             "{methods:?}"
         );
         assert!(routes.iter().any(|route| route == "other"), "{routes:?}");
-        assert!(methods.iter().any(|method| method == "other"), "{methods:?}");
+        assert!(
+            methods.iter().any(|method| method == "other"),
+            "{methods:?}"
+        );
+    }
+
+    #[test]
+    fn known_routes_keep_their_templates() {
+        assert_eq!(route_label("/"), "/");
+        assert_eq!(route_label("/_up"), "/_up");
+        assert_eq!(route_label("/db"), "/{db}");
+        assert_eq!(route_label("/db/doc1"), "/{db}/doc");
+        assert_eq!(route_label("/db/_changes"), "/{db}/_changes");
+        assert_eq!(
+            route_label("/db/_design/d/_view/v"),
+            "/{db}/_design/*/_view/*"
+        );
+        assert_eq!(route_label("/_node/_local/_metrics"), "/_node/*/_metrics");
+        assert_eq!(route_label("/_node/_local/_nope"), "other");
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("get"), "other");
+    }
+
+    #[test]
+    fn probes_are_recognised_by_route() {
+        for path in ["/_health", "/_up", "/_node/_local/_health"] {
+            assert!(is_probe(&route_label(path)), "{path}");
+        }
+        for path in ["/", "/db", "/_all_dbs", "/_node/_local/_metrics"] {
+            assert!(!is_probe(&route_label(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn recent_window_forgets_old_failures() {
+        let mut window = RecentWindow::default();
+        for _ in 0..30 {
+            window.record(1_000, true);
+        }
+        for _ in 0..10 {
+            window.record(1_001, false);
+        }
+        assert_eq!(window.totals(1_001), (40, 30));
+        // Just inside the window the failures still count.
+        assert_eq!(window.totals(1_000 + HEALTH_WINDOW_SECS - 1), (40, 30));
+        // Once the failing second ages out only the later traffic remains.
+        assert_eq!(window.totals(1_000 + HEALTH_WINDOW_SECS), (10, 0));
+        assert_eq!(window.totals(1_001 + HEALTH_WINDOW_SECS), (0, 0));
+    }
+
+    #[test]
+    fn recent_window_stays_bounded() {
+        let mut window = RecentWindow::default();
+        for second in 0..10 * HEALTH_WINDOW_SECS {
+            window.record(second, false);
+        }
+        assert!(window.buckets.len() as u64 <= HEALTH_WINDOW_SECS);
+        assert_eq!(
+            window.totals(10 * HEALTH_WINDOW_SECS - 1),
+            (HEALTH_WINDOW_SECS, 0)
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_decrements_when_the_request_future_is_dropped() {
+        use futures::FutureExt;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut request = Box::pin(async {
+            let _guard = InFlightGuard::new(&COUNTER);
+            std::future::pending::<()>().await;
+        });
+        assert!(request.as_mut().now_or_never().is_none());
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
+        // The client went away: the handler future is dropped mid-request.
+        drop(request);
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
     }
 }

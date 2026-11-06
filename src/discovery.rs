@@ -250,6 +250,7 @@ mod tests {
             root: std::env::temp_dir(),
             dbs: Default::default(),
             db_locks: Default::default(),
+            fs_health: Default::default(),
             config: Config {
                 q: 1,
                 revs_limit: 1000,
