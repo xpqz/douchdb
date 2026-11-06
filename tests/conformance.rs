@@ -1254,6 +1254,51 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
 }
 
 #[tokio::test]
+async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clvalbulk").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    // Only node 0 stores the design document, as if node 1 missed the write.
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/clvalbulk/_bulk_docs",
+            Some(json!({"docs": [{
+                "_id": "_design/validate",
+                "validate_doc_update": "function (doc) { \
+                    if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
+                }"
+            }]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A batch coordinated by node 1 must see the same validators as a
+    // single-document write does.
+    let (status, body) = nodes[1]
+        .post(
+            "/clvalbulk/_bulk_docs",
+            json!({"docs": [
+                {"_id": "accepted", "ok": true},
+                {"_id": "rejected", "ok": false}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["ok"], true, "{body}");
+    assert_eq!(body[1]["error"], "forbidden", "{body}");
+    assert_eq!(body[1]["reason"], "need ok", "{body}");
+    let (status, _) = nodes[0].get("/clvalbulk/rejected").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn cluster_validators_are_cached_until_a_design_doc_changes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
@@ -1347,6 +1392,30 @@ async fn cluster_validation_uses_the_newest_design_doc_revision() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["reason"], "new", "{body}");
     }
+}
+
+#[tokio::test]
+async fn validate_doc_update_skips_local_docs_in_bulk_docs() {
+    // CouchDB runs no validate_doc_update for _local documents, however they
+    // are written.
+    let s = Server::start(false);
+    s.fresh_db("validlocal").await;
+    let (status, body) = s
+        .put(
+            "/validlocal/_design/deny",
+            json!({"validate_doc_update": "function () { throw {forbidden: 'no'}; }"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .post(
+            "/validlocal/_bulk_docs",
+            json!({"docs": [{"_id": "_local/a", "x": 1}, {"_id": "b"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["ok"], true, "{body}");
+    assert_eq!(body[1]["error"], "forbidden", "{body}");
 }
 
 #[tokio::test]
