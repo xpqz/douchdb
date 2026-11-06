@@ -1168,10 +1168,8 @@ impl Shard {
     /// leaves (conflicts and tombstones included) always stay.
     fn drop_stale_bodies(&mut self) -> Result<()> {
         // Memory stays bounded: each round reads at most BODY_SWEEP_BATCH body
-        // keys, looks up the metadata once per run of keys of one document,
-        // deletes the stale ones and resumes after the last key seen.
+        // keys, deletes the stale ones and resumes after the last key seen.
         let mut start = b"d/".to_vec();
-        let mut cached: Option<(String, Option<BTreeSet<String>>)> = None;
         loop {
             let mut keys = Vec::new();
             self.scan_range_while(b"d/", Some(&start), false, |key, _| {
@@ -1184,27 +1182,36 @@ impl Shard {
             start = last.clone();
             start.push(0);
 
+            // Leaf sets by document id, for this batch only.
+            let mut leaves: std::collections::HashMap<String, Option<BTreeSet<String>>> =
+                std::collections::HashMap::new();
             let mut tx = Tx::new();
             for key in &keys {
-                // Revisions never contain '/', document ids may.
-                let parsed = key
-                    .get(2..)
-                    .and_then(|rest| std::str::from_utf8(rest).ok())
-                    .and_then(|rest| rest.rsplit_once('/'));
-                let Some((id, rev)) = parsed else {
-                    tx.delete(key);
+                let Some(rest) = key.get(2..).and_then(|rest| std::str::from_utf8(rest).ok())
+                else {
                     continue;
                 };
-                if cached.as_ref().map(|(cached_id, _)| cached_id.as_str()) != Some(id) {
-                    let leaves = self
-                        .get_meta(id)?
-                        .map(|meta| meta.tree.leaves().into_iter().collect());
-                    cached = Some((id.to_string(), leaves));
+                // Both the document id and the revision may contain '/', so
+                // d/{id}/{rev} is ambiguous. Keep the body if any split makes
+                // it a leaf; delete it only when none does.
+                let mut is_leaf = false;
+                for (at, _) in rest.match_indices('/') {
+                    let (id, rev) = (&rest[..at], &rest[at + 1..]);
+                    if !leaves.contains_key(id) {
+                        let found = self
+                            .get_meta(id)?
+                            .map(|meta| meta.tree.leaves().into_iter().collect());
+                        leaves.insert(id.to_string(), found);
+                    }
+                    if leaves
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|set| set.contains(rev))
+                    {
+                        is_leaf = true;
+                        break;
+                    }
                 }
-                let is_leaf = cached
-                    .as_ref()
-                    .and_then(|(_, leaves)| leaves.as_ref())
-                    .is_some_and(|leaves| leaves.contains(rev));
                 if !is_leaf {
                     tx.delete(key);
                 }
