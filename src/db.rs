@@ -526,10 +526,13 @@ impl Db {
             return Ok(false);
         }
         if shard_map.version == current.version {
-            if shard_map.replicas != current.replicas {
-                return Ok(false);
+            // Concurrent updates can share a version. Order the placements so
+            // every node keeps the same one regardless of arrival order.
+            match shard_map.replicas.cmp(&current.replicas) {
+                std::cmp::Ordering::Equal => return Ok(true),
+                std::cmp::Ordering::Less => return Ok(false),
+                std::cmp::Ordering::Greater => {}
             }
-            return Ok(true);
         }
         std::fs::write(
             self.path.join("shard-map.json"),

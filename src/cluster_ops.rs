@@ -5,7 +5,7 @@ use crate::api::{forward_client_auth, is_forwarded, AppState};
 use crate::cluster::ShardMap;
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -83,6 +83,14 @@ pub(crate) async fn set_security_everywhere(
     ))
 }
 
+fn shard_map_rejected() -> ApiError {
+    ApiError::new(
+        409,
+        "conflict",
+        "shard map was rejected in favour of a newer or competing map",
+    )
+}
+
 pub(crate) async fn apply_shard_map(
     st: &AppState,
     db: &Arc<Db>,
@@ -99,7 +107,9 @@ pub(crate) async fn apply_shard_map(
     if !internal {
         map.version = db.shard_map().version.saturating_add(1);
     }
-    db.set_shard_map(map.clone())?;
+    if !db.set_shard_map(map.clone())? {
+        return Err(shard_map_rejected());
+    }
     if internal {
         db.clear_pending_shard_map();
         return Ok((map, false));
@@ -126,19 +136,23 @@ pub(crate) async fn apply_shard_map(
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload);
             let request = forward_client_auth(request, headers);
-            request
-                .send()
-                .await
-                .map(|response| response.status().is_success())
-                .unwrap_or(false)
+            request.send().await.ok().map(|response| response.status())
         }
     }))
     .await;
     let mut acknowledgements = 1usize; // local write
-    for acknowledged in responses {
-        if acknowledged {
+    let mut rejected = false;
+    for status in responses.into_iter().flatten() {
+        if status.is_success() {
             acknowledgements += 1;
+        } else if status == StatusCode::CONFLICT {
+            rejected = true;
         }
+    }
+    if rejected {
+        // A peer holds a competing map. Leave the pending marker alone;
+        // anti-entropy converges every node on the tiebreak winner.
+        return Err(shard_map_rejected());
     }
     let quorum = st.cluster.nodes.len().max(1) / 2 + 1;
     let pending = acknowledgements < quorum;
