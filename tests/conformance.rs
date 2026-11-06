@@ -8461,6 +8461,35 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 }
 
 #[tokio::test]
+async fn sandboxed_reduce_rereduce_receives_null_keys() {
+    // CouchDB passes keys = null to a rereduce. More rows than fit one block
+    // (256) make the reduce combine stored partials with a rereduce.
+    for mode in ["process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        s.fresh_db("jsrereduce").await;
+        let (status, _) = s.put("/jsrereduce/doc", json!({"n": 300})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                "/jsrereduce/_design/v",
+                json!({"views": {"total": {
+                    "map": "function(doc){ for (var i = 0; i < doc.n; i++) emit(i, 1); }",
+                    "reduce": "function(keys, values, rereduce){ if (rereduce && keys !== null) return -1; return sum(values); }"
+                }}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = s.get("/jsrereduce/_design/v/_view/total").await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["rows"][0]["value"], 300, "{mode}: {body}");
+    }
+}
+
+#[tokio::test]
 #[allow(unused_mut, clippy::useless_vec)]
 async fn js_sandboxes_agree_on_view_rows() {
     if !sandbox_tested("process") || !sandbox_tested("wasm") {
