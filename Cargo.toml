@@ -7,9 +7,12 @@ license = "Apache-2.0"
 authors = ["Stefan Kruger"]
 
 [features]
-default = []
+default = ["wasm"]
+# The wasmi-based `--js-sandbox wasm`. Without it the build drops wasmi,
+# wasmi_wasi and their wasi-common/witx/wast dependency tree.
+wasm = ["dep:wasmi", "dep:wasmi_wasi"]
 # Optional Cranelift JIT backend for --js-sandbox wasm (much faster than wasmi).
-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+wasmtime = ["wasm", "dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 anyhow = "1"
@@ -18,7 +21,7 @@ axum = "0.8"
 hmac = "0.12"
 getrandom = "0.3"
 md-5 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 sha2 = "0.10"
 rusty-leveldb = "4"
 serde = { version = "1", features = ["derive", "rc"] }
@@ -34,8 +37,8 @@ icu_locale_core = "2.4"
 async-stream = "0.3"
 tantivy = "0.27"
 libc = "0.2"
-wasmi = "2.0"
-wasmi_wasi = "2.0"
+wasmi = { version = "2.0", optional = true }
+wasmi_wasi = { version = "2.0", optional = true }
 # Wasmtime 50 needs Rust 1.97+; the default wasmi build does not.
 wasmtime = { version = "50.0.1", optional = true }
 wasmtime-wasi = { version = "50.0.1", optional = true, features = ["p1"] }

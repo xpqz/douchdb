@@ -40,6 +40,9 @@ fn wait_for_listener(child: &mut Child, port: u16) -> bool {
 /// WASM sandboxes. Tests for an excluded mode return early and report as
 /// passed.
 fn sandbox_tested(mode: &str) -> bool {
+    if mode == "wasm" && cfg!(not(feature = "wasm")) {
+        return false;
+    }
     match std::env::var("DOUCHDB_TEST_JS_SANDBOXES") {
         Ok(modes) => modes.split(',').any(|listed| listed.trim() == mode),
         Err(_) => true,
@@ -10170,6 +10173,26 @@ async fn js_sandboxes_agree_on_view_rows() {
             Some(expected) => assert_eq!(&rows, expected, "server {index} disagreed"),
         }
     }
+}
+
+#[cfg(not(feature = "wasm"))]
+#[test]
+fn wasm_sandbox_without_the_wasm_feature_fails_at_startup() {
+    let _guard = SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let output = Command::new(env!("CARGO_BIN_EXE_douchdb"))
+        .args([
+            "--js-sandbox",
+            "wasm",
+            "--data",
+            "/tmp/douchdb-should-not-be-created",
+        ])
+        .output()
+        .expect("run douchdb");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`wasm` feature"), "{stderr}");
 }
 
 #[tokio::test]
