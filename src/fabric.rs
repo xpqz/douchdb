@@ -962,6 +962,9 @@ pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
     db.replicas_of_shard(shard)
 }
 
+/// Reassign the shards of failed nodes to live replicas. A shard with no live
+/// copy is CouchDB's `{error, {nodedown, <<"progress not possible">>}}`
+/// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
 fn fallback_shard_masks(
     db: &Db,
     owned_by_node: &[Vec<bool>],
@@ -982,9 +985,7 @@ fn fallback_shard_masks(
             let target = replicas_of_shard(db, shard)
                 .into_iter()
                 .find(|candidate| alive.contains(candidate))
-                .ok_or_else(|| {
-                    ApiError::new(502, "no_replica", "no live replica for failed shard")
-                })?;
+                .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
             groups
                 .entry(target)
                 .or_insert_with(|| vec![false; db.q as usize])[shard as usize] = true;
@@ -2061,8 +2062,7 @@ pub(crate) async fn cluster_update_vector(
     if failed.is_empty() {
         return Ok((vector, Vec::new()));
     }
-    let groups = fallback_shard_masks(db, &preferred_shard_masks(st, db), &failed, &alive)
-        .map_err(|_| ApiError::new(412, "nodedown", "progress not possible"))?;
+    let groups = fallback_shard_masks(db, &preferred_shard_masks(st, db), &failed, &alive)?;
     let marks = groups
         .into_iter()
         .map(|(node, mask)| FallbackMark {

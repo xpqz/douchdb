@@ -4082,6 +4082,64 @@ async fn cluster_changes_since_now_fails_when_a_shard_has_no_live_copy() {
 }
 
 #[tokio::test]
+async fn cluster_reads_fail_with_nodedown_when_a_shard_has_no_live_copy() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clreadgone").await;
+    }
+    // Pin placement: the design document's shard lives on node 0 (the
+    // coordinator), every other shard only on node 2, which is then killed.
+    let design = douchdb::db::shard_index("_design/v", 4);
+    let replicas: Vec<Vec<usize>> = (0..4)
+        .map(|shard| if shard == design { vec![0] } else { vec![2] })
+        .collect();
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/clreadgone",
+            json!({"q": 4, "node_count": 3, "replicas": replicas}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = nodes[0]
+        .put(
+            "/clreadgone/_design/v",
+            json!({"views": {"all": {"map": "function(doc) { emit(doc._id, 1); }", "reduce": "_count"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..8).map(|i| json!({"_id": format!("rg{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/clreadgone/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "{status}"
+    );
+    nodes[2].kill();
+    // CouchDB: fabric_streams (all_docs, views, reduce) and fabric_view
+    // (_changes) answer {error, {nodedown, <<"progress not possible">>}},
+    // which chttpd maps to 412.
+    let gets = [
+        "/clreadgone/_all_docs",
+        "/clreadgone/_design/v/_view/all?reduce=false",
+        "/clreadgone/_design/v/_view/all",
+        "/clreadgone/_changes",
+    ];
+    for path in gets {
+        let (status, body) = nodes[0].get(path).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{path}: {body}");
+        assert_eq!(body["error"], "nodedown", "{path}: {body}");
+        assert_eq!(body["reason"], "progress not possible", "{path}: {body}");
+    }
+    let (status, body) = nodes[0]
+        .post("/clreadgone/_all_docs", json!({"keys": ["rg1", "rg2"]}))
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
+#[tokio::test]
 async fn cluster_changes_forward_filter_query_args_to_every_shard() {
     let nodes = start_cluster_with(3, "3600", 1);
     for node in &nodes {
