@@ -9308,6 +9308,48 @@ async fn index_info_only_answers_get_and_head() {
 }
 
 #[tokio::test]
+async fn search_highlights_match_upper_case_non_ascii_query_terms() {
+    let s = Server::start(false);
+    s.fresh_db("searchunicode").await;
+    let (status, _) = s
+        .post(
+            "/searchunicode/_bulk_docs",
+            json!({"docs": [
+                {"_id": "a", "item": "ünï café"},
+                {"_id": "b", "item": "İstanbul trip"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put("/searchunicode/_design/inventory", search_ddoc())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for (query, id, expected) in [
+        ("item:Ünï", "a", "<em>ünï</em> café"),
+        ("item:CAFÉ", "a", "ünï <em>café</em>"),
+        ("item:\"CAFÉ\"", "a", "ünï <em>café</em>"),
+        ("item:İstanbul", "b", "<em>İstanbul</em> trip"),
+    ] {
+        let (status, body) = s
+            .post(
+                "/searchunicode/_design/inventory/_search/fruits",
+                json!({"q": query, "highlight_fields": ["item"]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{query}: {body}"));
+        assert_eq!(row["highlights"]["item"], json!([expected]), "{query}");
+    }
+}
+
+#[tokio::test]
 async fn couchdb_search_sort_highlight_timeout_and_index_info_ports() {
     let s = Server::start(false);
     seed_search_docs(&s, "couchsearchopts").await;

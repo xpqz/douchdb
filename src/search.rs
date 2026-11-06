@@ -1019,16 +1019,12 @@ pub(crate) fn parse_sort(value: &Value) -> Vec<(String, bool)> {
 }
 
 fn query_terms(query: &str) -> Vec<String> {
+    const PUNCTUATION: &[char] = &['+', '-', '"', '~', '*', '?', '[', ']', '{', '}', ':', '^'];
     query
         .split_whitespace()
         .flat_map(|token| token.split(['(', ')']))
         .filter_map(|token| {
-            let token = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '+' | '-' | '"' | '~' | '*' | '?' | '[' | ']' | '{' | '}' | ':' | '^'
-                )
-            });
+            let token = token.trim_matches(PUNCTUATION);
             if token.is_empty()
                 || token == "TO"
                 || token == "AND"
@@ -1037,8 +1033,15 @@ fn query_terms(query: &str) -> Vec<String> {
             {
                 return None;
             }
+            // A quoted phrase after a field name (field:"a b") keeps its
+            // opening quote once the field is split off.
             let token = token.rsplit(':').next().unwrap_or(token);
-            Some(token.to_ascii_lowercase())
+            let token = token.trim_matches(PUNCTUATION);
+            if token.is_empty() {
+                return None;
+            }
+            // Same per-character lowercasing as highlight_fragment applies to the text.
+            Some(token.chars().flat_map(char::to_lowercase).collect())
         })
         .collect()
 }
@@ -1502,6 +1505,37 @@ mod tests {
         let fragments = highlight_fragment("İİİİİİ foo İİİİİİ", &terms, "<b>", "</b>", 5, 1);
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].contains("<b>foo</b>"), "{fragments:?}");
+    }
+
+    #[test]
+    fn query_terms_lowercase_like_the_highlighted_text() {
+        assert_eq!(query_terms("Apple +BANANA"), ["apple", "banana"]);
+        assert_eq!(query_terms("item:Ünï"), ["ünï"]);
+        assert_eq!(query_terms("ẞ"), ["ß"]);
+        // "İ" lowercases to "i" plus a combining dot, as in the highlighted text.
+        assert_eq!(query_terms("İstanbul"), ["i\u{307}stanbul"]);
+    }
+
+    #[test]
+    fn query_terms_strip_quotes_from_field_qualified_phrases() {
+        assert_eq!(query_terms("item:\"CAFÉ\""), ["café"]);
+        assert_eq!(query_terms("item:\"café ünï\""), ["café", "ünï"]);
+        assert_eq!(query_terms("+item:\"Foo Bar\" baz"), ["foo", "bar", "baz"]);
+        assert_eq!(query_terms("\"foo bar\""), ["foo", "bar"]);
+    }
+
+    #[test]
+    fn highlights_find_upper_case_non_ascii_terms() {
+        for (text, query, expected) in [
+            ("ünï café", "Ünï", "<b>ünï</b> café"),
+            ("x İSTANBUL y", "İstanbul", "x <b>İSTANBUL</b> y"),
+            ("a ẞ b", "ẞ", "a <b>ẞ</b> b"),
+            ("Mixed Case", "mIxEd", "<b>Mixed</b> Case"),
+        ] {
+            let terms = query_terms(query);
+            let fragments = highlight_fragment(text, &terms, "<b>", "</b>", 100, 1);
+            assert_eq!(fragments, vec![expected.to_string()], "{text}");
+        }
     }
 
     #[test]
