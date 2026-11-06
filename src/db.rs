@@ -265,7 +265,7 @@ impl Db {
         for i in 0..file.q {
             let shard = ShardHandle::spawn(path.join(format!("shard-{i:04}")), config.revs_limit)?;
             committed_seq.push(shard.seq_tracker());
-            reserved_seq.push(Arc::new(AtomicU64::new(shard.initial_seq())));
+            reserved_seq.push(shard.reserved_seq());
             shards.push(shard);
         }
 

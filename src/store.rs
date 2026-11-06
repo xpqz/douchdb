@@ -290,6 +290,13 @@ fn seek_last(iter: &mut rusty_leveldb::DBIterator, prefix: &[u8]) -> Result<()> 
     Ok(())
 }
 
+struct JobMark {
+    pending: usize,
+    seq: u64,
+    docs: u64,
+    deleted: u64,
+}
+
 pub struct Shard {
     db: DB,
     seq: u64,
@@ -924,6 +931,35 @@ impl Shard {
         Ok(())
     }
 
+    /// Position to restore if the job that starts here panics.
+    fn job_mark(&self) -> JobMark {
+        JobMark {
+            pending: self.pending.len(),
+            seq: self.seq,
+            docs: self.docs,
+            deleted: self.deleted,
+        }
+    }
+
+    /// Undo whatever a panicked job staged. Operations queued by earlier jobs
+    /// in the same group commit are kept (their callers have not been told
+    /// anything yet); everything the panicked job queued is dropped, the
+    /// overlay is rebuilt from what remains, and the counters are restored.
+    /// The lazily built in-memory indexes may have been updated halfway, so
+    /// they are dropped and rebuild from disk plus the overlay on next use.
+    fn rollback_to(&mut self, mark: JobMark) {
+        self.pending.truncate(mark.pending);
+        self.overlay.clear();
+        for (key, value) in &self.pending {
+            self.overlay.insert(key.clone(), value.clone());
+        }
+        self.seq = mark.seq;
+        self.docs = mark.docs;
+        self.deleted = mark.deleted;
+        self.live = None;
+        self.latest = None;
+    }
+
     /// Write every queued operation as one synced `WriteBatch`.
     pub fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
@@ -1004,6 +1040,8 @@ pub struct ShardHandle {
     tx: mpsc::Sender<Job>,
     initial_seq: u64,
     seq_tracker: Arc<AtomicU64>,
+    /// Highest sequence allocated for a write on this shard, committed or not.
+    reserved_seq: Arc<AtomicU64>,
 }
 
 impl ShardHandle {
@@ -1037,6 +1075,7 @@ impl ShardHandle {
             tx,
             initial_seq,
             seq_tracker,
+            reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
         })
     }
 
@@ -1050,6 +1089,11 @@ impl ShardHandle {
         self.seq_tracker.clone()
     }
 
+    /// Shared highest allocated sequence for this shard.
+    pub fn reserved_seq(&self) -> Arc<AtomicU64> {
+        self.reserved_seq.clone()
+    }
+
     /// Run a job on the shard task, which owns the database handle.
     pub async fn call<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
     where
@@ -1057,8 +1101,33 @@ impl ShardHandle {
         F: FnOnce(&mut Shard) -> std::result::Result<R, ApiError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let seq_tracker = self.seq_tracker.clone();
+        let reserved_seq = self.reserved_seq.clone();
         let job: Job = Box::new(move |shard| {
-            let result = f(shard);
+            // A panic must fail only this job's caller, never kill the shard
+            // actor (every later call would then answer "shard task is gone").
+            let mark = shard.job_mark();
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard))) {
+                Ok(result) => result,
+                Err(payload) => {
+                    shard.rollback_to(mark);
+                    // The job may have reserved a sequence it will never
+                    // commit. Count it as committed so the changes watermark
+                    // does not wait on it forever; the write was discarded, so
+                    // this only leaves a gap in the sequence numbers.
+                    seq_tracker.fetch_max(reserved_seq.load(Ordering::SeqCst), Ordering::SeqCst);
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(ApiError::new(
+                        500,
+                        "internal_server_error",
+                        format!("shard job panicked: {reason}"),
+                    ))
+                }
+            };
             Box::new(move |flush_error: Option<String>| {
                 let result = match flush_error {
                     Some(message) => Err(ApiError::new(500, "internal_server_error", message)),
@@ -1145,6 +1214,21 @@ mod panic_tests {
         assert_eq!(error.status, 500);
         assert!(error.reason.contains("boom in job"), "{}", error.reason);
         handle.call(|_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panicked_reservation_does_not_hold_back_the_committed_sequence() {
+        let handle = handle();
+        let reserved = handle.reserved_seq();
+        let committed = handle.seq_tracker();
+        let result: std::result::Result<(), ApiError> = handle
+            .call(move |_| {
+                reserved.fetch_max(5, Ordering::SeqCst);
+                panic!("after reserving");
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(committed.load(Ordering::SeqCst) >= handle.reserved_seq().load(Ordering::SeqCst));
     }
 
     #[tokio::test]
