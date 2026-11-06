@@ -297,6 +297,10 @@ struct JobMark {
     deleted: u64,
 }
 
+/// Invariant: a `Shard` lives and dies on its actor thread (see
+/// `ShardHandle::spawn`) and must never leave it. rusty-leveldb's `DB` holds
+/// `Rc`s internally and is only `Send` through an upstream `unsafe impl`, so
+/// moving it between threads after use, or sharing it, is unsound.
 pub struct Shard {
     db: DB,
     seq: u64,
@@ -1027,10 +1031,9 @@ impl Shard {
     pub fn compact(&mut self) -> Result<()> {
         self.flush_pending()?;
         // Compaction is a long, blocking LevelDB call (tens of seconds on a
-        // large shard). Keep it on this shard actor, which owns the mutable
-        // handle, but let Tokio replace the worker thread while it runs so
-        // other shards and HTTP requests keep making progress.
-        tokio::task::block_in_place(|| self.db.compact_range(&[], &[]))?;
+        // large shard). It runs on this shard's dedicated actor thread, so it
+        // never ties up a Tokio worker.
+        self.db.compact_range(&[], &[])?;
         self.db.flush()?;
         Ok(())
     }
@@ -1039,10 +1042,15 @@ impl Shard {
 type Ack = Box<dyn FnOnce(Option<String>) + Send>;
 type Job = Box<dyn FnOnce(&mut Shard) -> Ack + Send>;
 
-/// Every shard is owned by exactly one task: rusty-leveldb takes `&mut self`
-/// even for reads, so serialised access is not a choice.
+/// Every shard is owned by exactly one dedicated OS thread: rusty-leveldb
+/// takes `&mut self` even for reads, so serialised access is not a choice, and
+/// its calls are synchronous file I/O that must not run on Tokio workers.
+/// Dropping the handle closes the queue, lets the thread finish the queued
+/// jobs, flush and close the database, and waits for it, so the LevelDB lock
+/// is released before `drop` returns.
 pub struct ShardHandle {
-    tx: mpsc::Sender<Job>,
+    tx: Option<mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     initial_seq: u64,
     seq_tracker: Arc<AtomicU64>,
     /// Highest sequence allocated for a write on this shard, committed or not.
@@ -1051,17 +1059,35 @@ pub struct ShardHandle {
 
 impl ShardHandle {
     pub fn spawn(dir: impl AsRef<Path>, revs_limit: u64) -> Result<ShardHandle> {
-        let mut shard = Shard::open(dir, revs_limit)?;
-        let initial_seq = shard.seq();
-        let seq_tracker = Arc::new(AtomicU64::new(initial_seq));
-        shard.set_seq_tracker(seq_tracker.clone());
+        let dir = dir.as_ref().to_path_buf();
+        let name = format!(
+            "shard-{}",
+            dir.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        );
+        let seq_tracker = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Job>(256);
-        tokio::spawn(async move {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u64>>();
+        let tracker = seq_tracker.clone();
+        let thread = std::thread::Builder::new().name(name).spawn(move || {
+            // Open on this thread so the database never crosses threads.
+            let mut shard = match Shard::open(&dir, revs_limit) {
+                Ok(shard) => shard,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let initial_seq = shard.seq();
+            tracker.store(initial_seq, Ordering::SeqCst);
+            shard.set_seq_tracker(tracker);
+            if ready_tx.send(Ok(initial_seq)).is_err() {
+                return;
+            }
             // Group commit: run a job, then everything already queued, and
             // acknowledge only after the merged batch has been flushed to the
             // OS. rusty-leveldb does not fsync, so this is not power-loss
             // durable.
-            while let Some(job) = rx.recv().await {
+            while let Some(job) = rx.blocking_recv() {
                 let mut acks = vec![job(&mut shard)];
                 for _ in 1..64 {
                     match rx.try_recv() {
@@ -1075,9 +1101,13 @@ impl ShardHandle {
                 }
             }
             let _ = shard.flush_pending();
-        });
+        })?;
+        let initial_seq = ready_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         Ok(ShardHandle {
-            tx,
+            tx: Some(tx),
+            thread: Some(thread),
             initial_seq,
             seq_tracker,
             reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
@@ -1141,13 +1171,29 @@ impl ShardHandle {
                 let _ = reply_tx.send(result);
             })
         });
-        self.tx
-            .send(job)
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
+        tx.send(job)
             .await
             .map_err(|_| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
         reply_rx
             .await
             .map_err(|_| ApiError::new(500, "internal_server_error", "shard task dropped reply"))?
+    }
+}
+
+impl Drop for ShardHandle {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            // A job that owns the last reference to its own database would be
+            // dropped on the actor thread; joining ourselves would deadlock.
+            if thread.thread().id() != std::thread::current().id() {
+                let _ = thread.join();
+            }
+        }
     }
 }
 
