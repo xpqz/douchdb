@@ -6704,6 +6704,41 @@ async fn couchdb_reduce_duplicate_keys_and_structured_values() {
 }
 
 #[tokio::test]
+async fn view_map_reads_proto_like_javascript() {
+    // CouchDB 3.5: with a document that has no own `__proto__`, both
+    // `doc.__proto__` and `doc["__proto__"]` are Object.prototype, which
+    // emits as {}; `doc["constructor"]` is a function, which emits as null.
+    let s = Server::start(false);
+    s.fresh_db("viewproto").await;
+    let (status, _) = s.put("/viewproto/p1", json!({"x": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/viewproto/_design/d",
+            json!({"views": {
+                "bracket": {"map": "function(doc){ emit(doc[\"__proto__\"], 1); }"},
+                "dot": {"map": "function(doc){ emit(doc.__proto__, 1); }"},
+                "ctor": {"map": "function(doc){ emit(doc[\"constructor\"], 1); }"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for (view, key) in [
+        ("bracket", json!({})),
+        ("dot", json!({})),
+        ("ctor", Value::Null),
+    ] {
+        let (status, body) = s.get(&format!("/viewproto/_design/d/_view/{view}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["rows"],
+            json!([{"id": "p1", "key": key, "value": 1}]),
+            "{view}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn couchdb_view_include_docs_and_utf8_ports() {
     let s = Server::start(false);
     s.fresh_db("couchviewdocs").await;
