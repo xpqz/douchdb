@@ -50,16 +50,56 @@ pub(crate) async fn validation_functions(
         dbname,
         headers,
     };
+    // The local read is the floor: this node's own design documents must
+    // load, or the write fails rather than run unvalidated. It also fails
+    // closed on a corrupt local design document.
+    db.validation_functions().await?;
     let responses = futures::future::join_all(
         (0..st.cluster.nodes.len())
             .map(|node| crate::fabric::fetch_all_docs(read, node, &opts, None)),
     )
     .await;
-    // Newest revision of each design document, by id. An unreachable node
-    // simply contributes nothing.
+    let (functions, complete) = merge_validators(responses, st.cluster.me)?;
+    // A set built while a peer was unreachable is used for this write only.
+    // Caching it would keep skipping that peer's newer validators.
+    if complete {
+        db.cache_cluster_validators(generation, functions.clone());
+    }
+    Ok(functions)
+}
+
+/// Merge the `_design/` ranges read from every node (indexed by node) into
+/// validator sources, keeping the newest revision of each design document.
+/// The result says whether every node answered.
+///
+/// Design documents are replicated to every node, so this node's own copy
+/// already covers them all unless it missed a write. A peer that fails to
+/// answer therefore does not fail the write: the local validators plus those
+/// of the reachable peers apply, which only misses a design-document write
+/// that reached just the unreachable peer. Failing instead would make every
+/// write depend on every node being up. A failed local read is different, and
+/// is an error: nothing is known to be validated.
+fn merge_validators(responses: Vec<DbResult<Value>>, me: usize) -> DbResult<(Vec<String>, bool)> {
+    let mut complete = true;
     let mut newest: BTreeMap<String, ((u64, Vec<u8>), Value)> = BTreeMap::new();
-    for value in responses.into_iter().flatten() {
+    for (node, response) in responses.into_iter().enumerate() {
+        let value = match response {
+            Ok(value) => value,
+            Err(error) if node == me => return Err(error),
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
         let Some(rows) = value.get("rows").and_then(Value::as_array) else {
+            if node == me {
+                return Err(ApiError::new(
+                    500,
+                    "unknown_error",
+                    "local design documents could not be read",
+                ));
+            }
+            complete = false;
             continue;
         };
         for row in rows {
@@ -78,7 +118,7 @@ pub(crate) async fn validation_functions(
             }
         }
     }
-    let functions: Vec<String> = newest
+    let functions = newest
         .into_values()
         .filter_map(|(_, doc)| {
             doc.get("validate_doc_update")
@@ -86,17 +126,7 @@ pub(crate) async fn validation_functions(
                 .map(str::to_string)
         })
         .collect();
-    db.cache_cluster_validators(generation, functions.clone());
-    Ok(functions)
-}
-
-pub(crate) async fn validate_docs(
-    db: &Db,
-    docs: &mut [Value],
-    principal: &Principal,
-) -> DbResult<Vec<Option<ApiError>>> {
-    let functions = db.validation_functions().await?;
-    validate_docs_with(&functions, db, docs, principal).await
+    Ok((functions, complete))
 }
 
 pub(crate) async fn validate_docs_with(
@@ -228,6 +258,66 @@ fn run_validator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn validate_docs(
+        db: &Db,
+        docs: &mut [Value],
+        principal: &Principal,
+    ) -> DbResult<Vec<Option<ApiError>>> {
+        let functions = db.validation_functions().await?;
+        validate_docs_with(&functions, db, docs, principal).await
+    }
+
+    fn design_rows(rows: &[(&str, &str, &str)]) -> DbResult<Value> {
+        let rows: Vec<Value> = rows
+            .iter()
+            .map(|(id, rev, source)| {
+                json!({
+                    "id": id,
+                    "value": {"rev": rev},
+                    "doc": {"_id": id, "validate_doc_update": source},
+                })
+            })
+            .collect();
+        Ok(json!({"total_rows": rows.len(), "offset": 0, "rows": rows}))
+    }
+
+    fn unreachable() -> DbResult<Value> {
+        Err(ApiError::new(500, "unknown_error", "node unreachable"))
+    }
+
+    #[test]
+    fn a_failed_local_read_fails_the_merge() {
+        let peer = design_rows(&[("_design/a", "1-aa", "peer")]);
+        let error = merge_validators(vec![unreachable(), peer], 0).unwrap_err();
+        assert_eq!(error.status, 500);
+
+        let malformed = Ok(json!({"error": "nope"}));
+        let peer = design_rows(&[("_design/a", "1-aa", "peer")]);
+        assert!(merge_validators(vec![peer, malformed], 1).is_err());
+    }
+
+    #[test]
+    fn an_unreachable_peer_leaves_the_local_floor_and_is_not_complete() {
+        let local = design_rows(&[("_design/a", "1-aa", "local")]);
+        let (functions, complete) = merge_validators(vec![local, unreachable()], 0).unwrap();
+        assert_eq!(functions, vec!["local".to_string()]);
+        assert!(!complete);
+
+        let local = design_rows(&[("_design/a", "1-aa", "local")]);
+        let peer = design_rows(&[("_design/b", "1-bb", "peer")]);
+        let (functions, complete) = merge_validators(vec![local, peer], 0).unwrap();
+        assert_eq!(functions, vec!["local".to_string(), "peer".to_string()]);
+        assert!(complete);
+    }
+
+    #[test]
+    fn the_newest_revision_of_a_design_doc_wins() {
+        let local = design_rows(&[("_design/a", "1-aa", "old")]);
+        let peer = design_rows(&[("_design/a", "2-bb", "new")]);
+        let (functions, _) = merge_validators(vec![local, peer], 0).unwrap();
+        assert_eq!(functions, vec!["new".to_string()]);
+    }
 
     fn principal() -> Principal {
         Principal {

@@ -87,7 +87,12 @@ pub(super) async fn bulk_docs(
     let validation = if is_forwarded(st, headers) {
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
-        match crate::validate::validate_docs(db, &mut docs, &principal).await {
+        // The same validators as a single-document write.
+        let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
+            Ok(functions) => functions,
+            Err(error) => return fail(error),
+        };
+        match crate::validate::validate_docs_with(&functions, db, &mut docs, &principal).await {
             Ok(errors) => errors,
             Err(error) => return fail(error),
         }

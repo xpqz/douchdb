@@ -1299,6 +1299,39 @@ async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
 }
 
 #[tokio::test]
+async fn cluster_validation_still_applies_with_a_peer_down() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clvaldown").await;
+    }
+    let (status, body) = nodes[0]
+        .put(
+            "/clvaldown/_design/validate",
+            json!({"validate_doc_update": "function (doc) { \
+                if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
+            }"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[2].kill();
+
+    // The local validators apply whether or not every peer answers, to
+    // single-document and batch writes alike.
+    let (status, body) = nodes[1]
+        .put("/clvaldown/rejected", json!({"ok": false}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = nodes[1]
+        .post(
+            "/clvaldown/_bulk_docs",
+            json!({"docs": [{"_id": "rejected2", "ok": false}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "forbidden", "{body}");
+}
+
+#[tokio::test]
 async fn cluster_validators_are_cached_until_a_design_doc_changes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
