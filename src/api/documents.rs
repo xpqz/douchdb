@@ -387,8 +387,10 @@ async fn put_doc(
         }
     }
     let new_edits = !q.contains_key("new_edits") || flag(q, "new_edits");
-    if !new_edits && doc.get("_rev").is_none() {
-        return fail(ApiError::bad_request("Document is missing _rev"));
+    if !new_edits && doc.get("_rev").is_none() && doc.get("_revisions").is_none() {
+        return fail(ApiError::bad_request(
+            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
+        ));
     }
     if let Some(response) = check_if_match(db, docid, headers).await {
         return response;

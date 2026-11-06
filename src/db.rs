@@ -2359,8 +2359,11 @@ impl Stage<'_> {
             body,
         } = doc;
         let body = Value::Object(body);
-        let rev = rev.ok_or_else(|| ApiError::bad_request("Document is missing _rev"))?;
-        let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
+        let (rev, path) = revisions_path(rev, revisions.as_ref())?;
+        let leaf = path
+            .last()
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
 
         let known = meta.tree.edges.contains_key(&rev);
         if known && meta.atts.contains_key(&rev) && attachments.is_none() {
@@ -2384,7 +2387,6 @@ impl Stage<'_> {
             }
         }
 
-        let path = revisions_path(&leaf, revisions.as_ref())?;
         let changed = !known;
         if changed {
             meta.tree.merge_path(&path, deleted);
@@ -2466,40 +2468,48 @@ impl Stage<'_> {
     }
 }
 
-/// Reconstruct the root-to-leaf path from a replicated document's `_revisions`.
-fn revisions_path(leaf: &Rev, revisions: Option<&Value>) -> DbResult<Vec<Rev>> {
-    let Some(revs) = revisions else {
-        return Ok(vec![leaf.clone()]);
-    };
-    let Some(start) = revs.get("start").and_then(Value::as_u64) else {
-        return Err(ApiError::bad_request("_revisions.start is not an integer"));
-    };
-    let Some(ids) = revs.get("ids").and_then(Value::as_array) else {
-        return Err(ApiError::bad_request("_revisions.ids is not an array"));
-    };
+/// Reconstruct the root-to-leaf path of a replicated document and the revision
+/// it writes. Like CouchDB (`couch_doc:transfer_fields/3`), `_revisions`
+/// defines the revision when present and non-empty, even without or against
+/// `_rev`; otherwise `_rev` alone does.
+fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(String, Vec<Rev>)> {
     let mut path = Vec::new();
-    for (i, id) in ids.iter().enumerate() {
-        let Some(id) = id.as_str() else {
-            return Err(ApiError::bad_request(
-                "_revisions.ids contains a non-string",
-            ));
+    if let Some(revs) = revisions {
+        let Some(start) = revs.get("start").and_then(Value::as_u64) else {
+            return Err(ApiError::bad_request("_revisions.start is not an integer"));
         };
-        let pos = start
-            .checked_sub(i as u64)
-            .ok_or_else(|| ApiError::bad_request("_revisions is malformed"))?;
-        if pos == 0 {
-            break;
+        let Some(ids) = revs.get("ids").and_then(Value::as_array) else {
+            return Err(ApiError::bad_request("_revisions.ids is not an array"));
+        };
+        for (i, id) in ids.iter().enumerate() {
+            let Some(id) = id.as_str() else {
+                return Err(ApiError::bad_request(
+                    "_revisions.ids contains a non-string",
+                ));
+            };
+            let pos = start
+                .checked_sub(i as u64)
+                .ok_or_else(|| ApiError::bad_request("_revisions is malformed"))?;
+            if pos == 0 {
+                break;
+            }
+            path.push(
+                Rev::parse(&format!("{pos}-{id}"))
+                    .ok_or_else(|| ApiError::bad_request("Invalid revision id"))?,
+            );
         }
-        path.push(
-            Rev::parse(&format!("{pos}-{id}"))
-                .ok_or_else(|| ApiError::bad_request("Invalid revision id"))?,
-        );
+        path.reverse();
+        if let Some(leaf) = path.last() {
+            return Ok((format!("{}-{}", leaf.pos, leaf.id_string()), path));
+        }
     }
-    path.reverse();
-    if path.is_empty() {
-        path.push(leaf.clone());
-    }
-    Ok(path)
+    let rev = rev.ok_or_else(|| {
+        ApiError::bad_request(
+            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
+        )
+    })?;
+    let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
+    Ok((rev, vec![leaf]))
 }
 
 fn all_atts(meta: &DocMeta) -> Vec<(String, AttMeta)> {
