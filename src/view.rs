@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewLimits {
@@ -1122,6 +1122,23 @@ fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
     Ok(handle)
 }
 
+/// Gate for a database's view index directories. A query holds the read side
+/// while it uses an index; `invalidate` and `cleanup` take the write side, so
+/// they never delete a directory under a live handle and a new open never
+/// races with the removal. One gate per database keeps other databases
+/// independent. The gate is taken once per call, in `ensure_rows` only, so no
+/// path re-acquires it while a writer waits.
+fn index_gate(db: &Db) -> Arc<RwLock<()>> {
+    static GATES: OnceLock<StdMutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
+    GATES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(db.path.clone())
+        .or_insert_with(|| Arc::new(RwLock::new(())))
+        .clone()
+}
+
 /// Drop cached index handles when a database is deleted or recreated. The
 /// LevelDB files live under the database directory.
 pub fn forget_db(db_path: &Path) {
@@ -1501,6 +1518,7 @@ async fn ensure_rows(
             spec.reduce.as_deref().unwrap_or_default()
         )
     };
+    let _gate = index_gate(db).read_owned().await;
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
     let mut index = handle.lock().await;
     index.set_placement((db.q, db.partitioned));
@@ -1612,6 +1630,7 @@ pub(crate) async fn docs_by_ids(
 /// Drop every index for a database. Used by `_purge`, which can remove a
 /// document without advancing the database sequence.
 pub async fn invalidate(db: &Db) -> DbResult<()> {
+    let _gate = index_gate(db).write_owned().await;
     let directory = db.path.join("_view_indexes");
     registry_lock().retain(|path, _| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
@@ -1627,6 +1646,9 @@ pub async fn invalidate(db: &Db) -> DbResult<()> {
 
 /// Remove index directories whose design document or view no longer exists.
 pub async fn cleanup(db: &Db) -> DbResult<()> {
+    // Before the live set is read, so a view queried meanwhile is not removed
+    // as stale, and so no query holds an index being removed.
+    let _gate = index_gate(db).write_owned().await;
     let mut live = std::collections::HashSet::new();
     let all = db
         .all_docs(&AllDocsOpts {
