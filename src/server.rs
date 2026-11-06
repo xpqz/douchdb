@@ -121,6 +121,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
+        db_locks: Default::default(),
         config,
         auth,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(

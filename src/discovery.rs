@@ -249,6 +249,7 @@ mod tests {
         Arc::new(AppState {
             root: std::env::temp_dir(),
             dbs: Default::default(),
+            db_locks: Default::default(),
             config: Config {
                 q: 1,
                 revs_limit: 1000,

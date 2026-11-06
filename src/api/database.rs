@@ -41,46 +41,44 @@ pub async fn db_root(
                 (Ok(shards), Ok(copies)) => (shards.map(|q| q as u32), copies),
                 (Err(e), _) | (_, Err(e)) => return fail(e),
             };
-            if let Err(e) = st.create_db(&name, partitioned, shards, copies).await {
-                return fail(e);
-            }
+            // A database that already exists here is not the end of a clustered
+            // create: the peers may have missed it, so they still get the call
+            // (CouchDB heals that by replicating the shard map) and the client
+            // is told 412 as before.
+            let existing = match st.create_db(&name, partitioned, shards, copies).await {
+                Ok(_) => None,
+                Err(e) if e.status == 412 && st.cluster.is_clustered() && !local_only => Some(e),
+                Err(e) => return fail(e),
+            };
+            let mut status = StatusCode::CREATED;
             if st.cluster.is_clustered() && !local_only {
-                for peer in st.cluster.nodes.iter() {
-                    if peer == &st.cluster.nodes[st.cluster.me] {
-                        continue;
-                    }
-                    // Peers build the same shard map from the same layout.
-                    let mut layout = vec![("partitioned", partitioned.to_string())];
-                    if let Some(shards) = shards {
-                        layout.push(("q", shards.to_string()));
-                    }
-                    if let Some(copies) = copies {
-                        layout.push(("n", copies.to_string()));
-                    }
-                    let request = st
-                        .client
-                        .put(peer_url(peer, &[&name]))
-                        .query(&layout)
-                        .header("x-douchdb-local-db", "1")
-                        .header("x-douchdb-secret", st.cluster.secret.as_str());
-                    let request = forward_client_auth(request, &headers);
-                    let response = match request.send().await {
-                        Ok(response) => response,
-                        Err(e) => {
-                            return fail(ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
-                        }
-                    };
-                    // 412 means another node already had it, which is fine.
-                    if !response.status().is_success()
-                        && response.status() != StatusCode::PRECONDITION_FAILED
-                    {
-                        let status = response.status().as_u16();
-                        let text = response.text().await.unwrap_or_default();
-                        return fail(ApiError::new(status, "db_create_failed", text));
-                    }
+                // Peers build the same shard map from the same layout.
+                let mut layout = vec![("partitioned", partitioned.to_string())];
+                if let Some(shards) = shards {
+                    layout.push(("q", shards.to_string()));
+                }
+                if let Some(copies) = copies {
+                    layout.push(("n", copies.to_string()));
+                }
+                let answers = fan_out_db(&st, &headers, Method::PUT, &name, &layout).await;
+                if let Some(e) = existing {
+                    return fail(e);
+                }
+                // As fabric_db_create: 201 once a majority of the nodes hold
+                // the database (a peer that already had it counts), otherwise
+                // 202. The local node is one of them.
+                let held = 1 + answers
+                    .iter()
+                    .flatten()
+                    .filter(|status| {
+                        status.is_success() || **status == StatusCode::PRECONDITION_FAILED
+                    })
+                    .count();
+                if held < st.cluster.nodes.len() / 2 + 1 {
+                    status = StatusCode::ACCEPTED;
                 }
             }
-            let mut response = json(StatusCode::CREATED, json!({"ok": true}));
+            let mut response = json(status, json!({"ok": true}));
             if let Ok(value) = format!("/{name}").parse() {
                 response.headers_mut().insert(header::LOCATION, value);
             }
@@ -91,23 +89,41 @@ pub async fn db_root(
                 return access_denied(&principal);
             }
             let local = st.drop_db(&name).await;
-            if st.cluster.is_clustered() && !local_only {
-                for (i, peer) in st.cluster.nodes.iter().enumerate() {
-                    if i == st.cluster.me {
-                        continue;
-                    }
-                    let request = st
-                        .client
-                        .delete(peer_url(peer, &[&name]))
-                        .header("x-douchdb-local-db", "1")
-                        .header("x-douchdb-secret", st.cluster.secret.as_str());
-                    let request = forward_client_auth(request, &headers);
-                    let _ = request.send().await;
+            if !st.cluster.is_clustered() || local_only {
+                return match local {
+                    Ok(()) => ok(),
+                    Err(e) => fail(e),
+                };
+            }
+            let answers = fan_out_db(&st, &headers, Method::DELETE, &name, &[]).await;
+            // As fabric_db_delete: 200 when every node answered (deleted or
+            // not found) and at least one deleted it, 404 when every node
+            // answered not found, 202 when some deleted it but a node did not
+            // answer, 500 when none did.
+            let mut deleted = usize::from(local.is_ok());
+            let mut missing = usize::from(matches!(&local, Err(e) if e.status == 404));
+            for status in answers.iter().flatten() {
+                if status.is_success() {
+                    deleted += 1;
+                } else if *status == StatusCode::NOT_FOUND {
+                    missing += 1;
                 }
             }
-            match local {
-                Ok(()) => ok(),
-                Err(e) => fail(e),
+            if deleted + missing == st.cluster.nodes.len() {
+                if deleted == 0 {
+                    return fail(local.err().unwrap_or_else(|| {
+                        ApiError::not_found(format!("Database does not exist: {name}"))
+                    }));
+                }
+                ok()
+            } else if deleted > 0 {
+                json(StatusCode::ACCEPTED, json!({"ok": true}))
+            } else {
+                fail(ApiError::new(
+                    500,
+                    "internal_server_error",
+                    "no node confirmed the delete",
+                ))
             }
         }
         Method::GET | Method::HEAD => match st.db(&name).await {
@@ -571,4 +587,26 @@ pub async fn db_rest(
     }
 
     doc_request(req, &raw_rest).await
+}
+
+/// Send a create or delete to every other node at once. Each answer is the
+/// peer's status, or `None` when it could not be reached.
+async fn fan_out_db(
+    st: &AppState,
+    headers: &HeaderMap,
+    method: Method,
+    name: &str,
+    layout: &[(&str, String)],
+) -> Vec<Option<StatusCode>> {
+    futures::future::join_all(st.cluster.peers().map(|peer| {
+        let request = st
+            .client
+            .request(method.clone(), peer_url(peer, &[name]))
+            .query(layout)
+            .header("x-douchdb-local-db", "1")
+            .header("x-douchdb-secret", st.cluster.secret.as_str());
+        let request = forward_client_auth(request, headers);
+        async move { request.send().await.ok().map(|response| response.status()) }
+    }))
+    .await
 }
