@@ -461,6 +461,7 @@ async fn changes_options(
         filter: resolve_changes_filter(db, q).await?,
         conflicts: flag(q, "conflicts"),
         owned,
+        until: None,
     };
     Ok((opts, progress))
 }

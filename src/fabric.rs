@@ -1936,6 +1936,7 @@ pub(crate) async fn fetch_node_changes(
                 filter: filter.cloned(),
                 conflicts: crate::api::flag(q, "conflicts"),
                 owned: Some(mask.to_vec()),
+                until: None,
             })
             .await;
     }

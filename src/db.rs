@@ -1313,7 +1313,9 @@ impl Db {
         &self,
         opts: &ChangesOpts,
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
-        let watermark = self.changes_watermark(opts.since, opts.owned.as_deref());
+        let watermark = opts
+            .until
+            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_deref()));
         let selected = self.selected_shards(opts.owned.as_deref());
         let until = if opts.descending {
             u64::MAX
@@ -2522,6 +2524,10 @@ pub struct ChangesOpts {
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
     pub owned: Option<Vec<bool>>,
+    /// Internal: a watermark the caller already read with `changes_watermark`.
+    /// Rows above it are withheld, and the feed does not take a newer one, so
+    /// a caller that records it as its position has seen every row up to it.
+    pub until: Option<u64>,
 }
 
 /// Server-side `_changes` filters. `_doc_ids` stays in `doc_ids` because it is
@@ -3706,6 +3712,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, last_seq, pending) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -3781,6 +3788,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, last_seq, _pending) = db.changes_rows(&opts).await.unwrap();
         assert!(rows.iter().all(|row| row.seq <= committed), "{rows:?}");
@@ -3853,6 +3861,7 @@ mod tests {
             filter: None,
             conflicts: false,
             owned: None,
+            until: None,
         };
         let (rows, _, pending) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(
