@@ -2588,6 +2588,8 @@ impl JsReducer {
         rereduce: bool,
     ) -> Result<Value, String> {
         if crate::js::sandboxed() {
+            // CouchDB passes null, not [], for keys during rereduce.
+            let keys = if rereduce { Value::Null } else { json!(keys) };
             return crate::js::sandbox_request(
                 "reduce",
                 json!({"source": self.source, "keys": keys, "values": values, "rereduce": rereduce}),
