@@ -72,6 +72,73 @@ impl User {
     }
 }
 
+const SECRET_FILE: &str = ".session-secret";
+
+/// The key that signs `AuthSession` cookies.
+///
+/// `--session-secret` wins when set. Otherwise a random key is generated once
+/// and kept in the data directory, readable by the owner only, so cookies
+/// survive restarts; CouchDB likewise persists a generated
+/// `couch_httpd_auth/secret`. The key is never derived from the admin
+/// credentials (a cookie holder could brute-force the password offline) or
+/// from the cluster secret (which is often a shared, documented default).
+pub fn session_secret(data: &Path, configured: &str) -> Result<Vec<u8>, String> {
+    if !configured.trim().is_empty() {
+        return Ok(configured.as_bytes().to_vec());
+    }
+    let path = data.join(SECRET_FILE);
+    let describe = |error: std::io::Error| format!("session secret {}: {error}", path.display());
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                return decode_secret(text.trim())
+                    .map_err(|error| format!("session secret {}: {error}", path.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(describe(error)),
+        }
+        let key = crate::db::random_bytes::<32>();
+        match create_private(&path, crate::db::hex(&key).as_bytes()) {
+            Ok(()) => return Ok(key.to_vec()),
+            // Another process created it first; read theirs.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(describe(error)),
+        }
+    }
+}
+
+fn decode_secret(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() != 64 {
+        return Err("expected 64 hex characters; delete the file to generate a new one".into());
+    }
+    let mut out = Vec::with_capacity(32);
+    for index in 0..32 {
+        let pair = text
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| "not hex; delete the file to generate a new one".to_string())?;
+        out.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| "not hex; delete the file to generate a new one".to_string())?,
+        );
+    }
+    Ok(out)
+}
+
+/// Create `path` exclusively with owner-only permissions from the start.
+fn create_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 pub struct Auth {
     pub user: String,
     pub pass: String,
@@ -81,9 +148,9 @@ pub struct Auth {
 
 impl Auth {
     /// A server-admin-only auth instance. Kept for callers that only have
-    /// `--admin`.
-    pub fn new(user: String, pass: String) -> Auth {
-        let secret = format!("{user}:{pass}:douchdb").into_bytes();
+    /// `--admin`. `secret` is the session cookie HMAC key; see
+    /// [`session_secret`].
+    pub fn new(user: String, pass: String, secret: Vec<u8>) -> Auth {
         Auth {
             user,
             pass,
@@ -97,7 +164,7 @@ impl Auth {
     pub fn from_users_file(
         admin: Option<(String, String)>,
         path: &Path,
-        secret: Option<String>,
+        secret: Vec<u8>,
     ) -> Result<Auth, String> {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("users file {}: {error}", path.display()))?;
@@ -152,13 +219,6 @@ impl Auth {
                 admin,
             });
         }
-        let secret = secret
-            .filter(|secret| !secret.is_empty())
-            .map(|secret| secret.into_bytes())
-            .unwrap_or_else(|| match &admin {
-                Some((user, pass)) => format!("{user}:{pass}:douchdb").into_bytes(),
-                None => format!("douchdb-session:{}", crate::db::uuid()).into_bytes(),
-            });
         let (user, pass) = admin.unwrap_or_default();
         Ok(Auth {
             user,
@@ -371,7 +431,7 @@ mod tests {
         Auth::from_users_file(
             Some(("admin".into(), "secret".into())),
             &std::env::temp_dir().join(name),
-            Some("session-secret".into()),
+            b"session-secret".to_vec(),
         )
         .expect("users")
     }
@@ -388,9 +448,80 @@ mod tests {
         .unwrap();
     }
 
+    fn data_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::db::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn configured_session_secret_is_used_verbatim() {
+        let dir = data_dir("auth-flag");
+        let key = session_secret(&dir, "from-the-flag").unwrap();
+        assert_eq!(key, b"from-the-flag");
+        // An explicit secret does not create the file.
+        assert!(!dir.join(SECRET_FILE).exists());
+        let auth = Auth::new("admin".into(), "pw".into(), key);
+        let other = Auth::new("admin".into(), "pw".into(), b"other".to_vec());
+        let cookie = auth.cookie_header();
+        let value = cookie.split(';').next().unwrap();
+        assert!(auth.check_cookies(Some(value)));
+        assert!(!other.check_cookies(Some(value)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_session_secret_persists_and_ignores_credentials() {
+        let dir = data_dir("auth-gen");
+        let first = session_secret(&dir, "").unwrap();
+        let second = session_secret(&dir, "  ").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, b"admin:secret:douchdb");
+        let auth = Auth::new("admin".into(), "secret".into(), first);
+        let again = Auth::new("admin".into(), "secret".into(), second);
+        // A cookie signed with the formerly derived key is rejected.
+        let legacy = Auth::new(
+            "admin".into(),
+            "secret".into(),
+            b"admin:secret:douchdb".to_vec(),
+        );
+        let legacy_cookie = legacy.cookie_header();
+        let legacy_value = legacy_cookie.split(';').next().unwrap();
+        assert!(!auth.check_cookies(Some(legacy_value)));
+        // A cookie from the first instance still works after "restart".
+        let cookie = auth.cookie_header();
+        assert!(again.check_cookies(Some(cookie.split(';').next().unwrap())));
+        // A different data directory gets a different key.
+        let elsewhere = data_dir("auth-gen2");
+        assert_ne!(
+            session_secret(&elsewhere, "").unwrap(),
+            session_secret(&dir, "").unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(SECRET_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn corrupt_session_secret_file_is_an_error() {
+        let dir = data_dir("auth-bad");
+        std::fs::write(dir.join(SECRET_FILE), "nonsense").unwrap();
+        assert!(session_secret(&dir, "").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn basic_auth() {
-        let auth = Auth::new("admin".into(), "secret".into());
+        let auth = Auth::new("admin".into(), "secret".into(), b"k".to_vec());
         let header = format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("admin:secret")
@@ -405,7 +536,7 @@ mod tests {
 
     #[test]
     fn cookie_roundtrip() {
-        let auth = Auth::new("admin".into(), "secret".into());
+        let auth = Auth::new("admin".into(), "secret".into(), b"k".to_vec());
         let header = auth.cookie_header();
         assert!(header.contains("SameSite=Strict"));
         let value = header.split(';').next().unwrap();

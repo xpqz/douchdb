@@ -40,18 +40,18 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut buf = [0u8; 32];
-    let mut seed = format!("{now}{:p}", &now as *const _);
-    for (i, slot) in buf.iter_mut().enumerate() {
-        *slot = seed.as_bytes()[i % seed.len()];
-        seed.push(((i as u8) ^ 0x5a) as char);
+    hex(&random_bytes::<16>())
+}
+
+/// Bytes from the operating system's CSPRNG. The generator failing means the
+/// platform cannot provide randomness at all, which nothing here can recover
+/// from; carrying on with predictable ids or keys would be worse.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    if let Err(error) = getrandom::fill(&mut buf) {
+        panic!("operating system random number generator failed: {error}");
     }
-    hex(&Md5::digest(buf))
+    buf
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

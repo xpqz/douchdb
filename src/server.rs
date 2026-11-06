@@ -78,26 +78,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     } else {
         format!("http://{}", args.listen)
     };
-    let session_secret = if !args.session_secret.trim().is_empty() {
-        Some(args.session_secret.clone())
-    } else if !args.cluster_secret.is_empty() {
-        Some(format!("{}:session", args.cluster_secret))
+    let auth = if args.users_file.is_some() || args.admin.is_some() {
+        if args.nodes.len() > 1 && args.session_secret.trim().is_empty() {
+            tracing::warn!(
+                "no --session-secret: each node signs session cookies with its own key, so a cookie only works on the node that issued it"
+            );
+        }
+        let secret = crate::auth::session_secret(&args.data, &args.session_secret)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(path) = &args.users_file {
+            Some(
+                Auth::from_users_file(args.admin.clone(), std::path::Path::new(path), secret)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            args.admin
+                .as_ref()
+                .map(|(user, pass)| Auth::new(user.clone(), pass.clone(), secret))
+        }
     } else {
         None
-    };
-    let auth = if let Some(path) = &args.users_file {
-        Some(
-            Auth::from_users_file(
-                args.admin.clone(),
-                std::path::Path::new(path),
-                session_secret,
-            )
-            .map_err(anyhow::Error::msg)?,
-        )
-    } else {
-        args.admin
-            .as_ref()
-            .map(|(user, pass)| Auth::new(user.clone(), pass.clone()))
     };
     let default_admin_only = match args.default_security.as_str() {
         "open" => false,

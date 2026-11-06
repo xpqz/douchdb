@@ -262,7 +262,7 @@ mod tests {
                 view_memory_mb: 1,
                 default_admin_only: true,
             },
-            auth: Some(Auth::new("admin".into(), "hunter2".into())),
+            auth: Some(Auth::new("admin".into(), "hunter2".into(), b"k".to_vec())),
             cluster: Cluster {
                 nodes,
                 me: 0,

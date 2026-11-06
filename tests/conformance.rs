@@ -397,6 +397,9 @@ fn start_cluster_full(
                 sync_secs.to_string(),
                 "--cluster-secret".to_string(),
                 "test-cluster-secret".to_string(),
+                // Cookies only verify across nodes with a shared session key.
+                "--session-secret".to_string(),
+                "test-session-secret".to_string(),
             ];
             match Server::spawn_on(port, &extra, admin, attempt) {
                 Some(server) => servers.push(server),
