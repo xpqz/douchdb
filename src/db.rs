@@ -1154,7 +1154,20 @@ impl Db {
                     for (id, rev, has_attachments) in metas {
                         if !has_attachments {
                             if let Some(body) = s.get_body(&id, &rev)? {
-                                docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
+                                // The body is spliced into the map input as
+                                // text, so check it decodes here or one bad
+                                // body would fail the whole build.
+                                let decoded = serde_json::from_slice::<serde::de::IgnoredAny>(
+                                    &body,
+                                )
+                                .map_err(|error| {
+                                    ApiError::corrupt(format!(
+                                        "corrupt body for {id} {rev}: {error}"
+                                    ))
+                                });
+                                if skip_corrupt(s, &id, decoded)?.is_some() {
+                                    docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
+                                }
                                 continue;
                             }
                         }
@@ -1164,8 +1177,10 @@ impl Db {
                             rev: Some(rev),
                             ..Default::default()
                         };
-                        let doc = read_doc(s, &id, &doc_opts)?;
-                        docs.push((id, serde_json::to_string(&doc)?));
+                        let doc = read_doc(s, &id, &doc_opts);
+                        if let Some(doc) = skip_corrupt(s, &id, doc)? {
+                            docs.push((id, serde_json::to_string(&doc)?));
+                        }
                     }
                     Ok(docs)
                 })
@@ -2524,6 +2539,25 @@ fn canonical_rev(rev: &str) -> String {
     Rev::parse(rev).map_or_else(|| rev.to_string(), |parsed| parsed.to_string())
 }
 
+/// In a listing, a document whose stored record cannot be decoded is skipped,
+/// logged and counted so one bad record does not fail the whole request.
+/// Only a decode failure (`ApiError::corrupt`) is skipped: an error from
+/// LevelDB itself, or any other failure, still fails the request.
+fn skip_corrupt<T>(
+    shard: &crate::store::Shard,
+    id: &str,
+    result: DbResult<T>,
+) -> DbResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.corrupt => {
+            shard.name().report_corrupt(id, &error);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
@@ -2615,9 +2649,11 @@ fn read_doc_rev(
         .get_body(id, rev)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
     let mut doc: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::new(500, "internal_server_error", "corrupt body"))?;
+        .map_err(|error| ApiError::corrupt(format!("corrupt body for {id} {rev}: {error}")))?;
     let Value::Object(body) = &mut doc else {
-        return Err(ApiError::new(500, "internal_server_error", "corrupt body"));
+        return Err(ApiError::corrupt(format!(
+            "corrupt body for {id} {rev}: not an object"
+        )));
     };
 
     // CouchDB serialises `_id` and `_rev` first, then the document body in the
@@ -2838,18 +2874,22 @@ fn collect_all_docs(
         before_start
     };
 
-    if opts.include_docs || opts.conflicts {
-        for row in rows.iter_mut() {
-            if opts.include_docs {
-                let doc_opts = DocOpts {
-                    rev: Some(row.rev.clone()),
-                    conflicts: opts.conflicts,
-                    attachments: opts.attachments,
-                    ..Default::default()
-                };
-                row.doc = Some(read_doc(shard, &row.id, &doc_opts)?);
+    if opts.include_docs {
+        let mut readable = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            let doc_opts = DocOpts {
+                rev: Some(row.rev.clone()),
+                conflicts: opts.conflicts,
+                attachments: opts.attachments,
+                ..Default::default()
+            };
+            let doc = read_doc(shard, &row.id, &doc_opts);
+            if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
+                row.doc = Some(doc);
+                readable.push(row);
             }
         }
+        rows = readable;
     }
 
     Ok((rows, before_start))
@@ -3003,7 +3043,8 @@ fn collect_changes(
 
     let mut rows = Vec::with_capacity(candidates.len());
     for (seq, id) in candidates {
-        let Some(meta) = shard.get_meta(&id)? else {
+        let meta = shard.get_meta(&id).map_err(ApiError::from);
+        let Some(Some(meta)) = skip_corrupt(shard, &id, meta)? else {
             continue;
         };
         if meta.seq != seq {
@@ -3046,7 +3087,7 @@ fn collect_changes(
                 .map(ChangeFilter::needs_doc)
                 .unwrap_or(false);
         let doc = if needs_doc {
-            match read_doc_rev(
+            let read = read_doc_rev(
                 shard,
                 &id,
                 &meta,
@@ -3057,7 +3098,8 @@ fn collect_changes(
                     conflicts: opts.conflicts,
                     ..Default::default()
                 },
-            ) {
+            );
+            match read {
                 Ok(doc) => Some(serde_json::to_string(&doc)?),
                 // A tombstone may have no stored body.
                 Err(error) if deleted && error.status == 404 => None,
@@ -3068,7 +3110,11 @@ fn collect_changes(
                         format!("document {id} has no stored body"),
                     ))
                 }
-                Err(error) => return Err(error),
+                // An undecodable body drops the row, as in `_all_docs`.
+                Err(error) => {
+                    skip_corrupt(shard, &id, Err::<(), _>(error))?;
+                    continue;
+                }
             }
         } else {
             None

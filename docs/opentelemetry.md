@@ -154,7 +154,11 @@ Two metrics are recorded for every HTTP response:
 
 The fabric counters and histograms (`fabric.local_reads`, `fabric.remote_reads`,
 `fabric.quorum_failures`, `fabric.degraded_reads`, `fabric.fanout`,
-`shard_map.updates`, `shard_map.pending`, `rebalance.*`) are also exported.
+`shard_map.updates`, `shard_map.pending`, `rebalance.*`) are also exported, as
+is `storage.corrupt_records_skipped`: stored records that listings, view and
+search builds skipped because they could not be decoded (also `integrity` in
+`/_node/_local/_metrics`). Each skip is logged at error level with the
+database, shard and document id.
 View/search latency, storage and process metrics remain local-only; read them
 from `/_node/_local/_metrics`.
 

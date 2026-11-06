@@ -7,6 +7,9 @@ pub struct ApiError {
     pub status: u16,
     pub error: &'static str,
     pub reason: String,
+    /// The error is a stored record that could not be decoded, as opposed to
+    /// an I/O failure. Listings skip such a record; everything else fails.
+    pub corrupt: bool,
 }
 
 impl ApiError {
@@ -15,6 +18,16 @@ impl ApiError {
             status,
             error,
             reason: reason.into(),
+            corrupt: false,
+        }
+    }
+
+    /// A stored record that cannot be decoded: a 500 for a point read, a
+    /// skipped row in a listing.
+    pub fn corrupt(reason: impl Into<String>) -> ApiError {
+        ApiError {
+            corrupt: true,
+            ..ApiError::new(500, "internal_server_error", reason)
         }
     }
 
@@ -51,6 +64,9 @@ impl From<serde_json::Error> for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::store::CorruptRecord>().is_some() {
+            return ApiError::corrupt(e.to_string());
+        }
         ApiError::new(500, "internal_server_error", e.to_string())
     }
 }
