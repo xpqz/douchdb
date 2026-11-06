@@ -506,3 +506,44 @@ pub fn snapshot() -> Value {
 pub fn uptime_secs() -> u64 {
     registry().started.elapsed().as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels() -> (Vec<String>, Vec<String>) {
+        let snap = snapshot();
+        let routes = snap["http"]["routes"]
+            .as_array()
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter_map(|route| route["route"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let methods = snap["http"]["methods"]
+            .as_object()
+            .map(|methods| methods.keys().cloned().collect())
+            .unwrap_or_default();
+        (routes, methods)
+    }
+
+    #[test]
+    fn user_supplied_paths_and_methods_never_become_labels() {
+        record_http("BREW-7f3a9c", 404, 1.0, "/_zz9-unique-top");
+        record_http("GET", 404, 1.0, "/_node/_local/_zz9-unique-node");
+        record_http("GET", 404, 1.0, "/somedb/_zz9-unique-endpoint");
+        let (routes, methods) = labels();
+        assert!(
+            routes.iter().all(|route| !route.contains("zz9")),
+            "{routes:?}"
+        );
+        assert!(
+            methods.iter().all(|method| !method.contains("BREW")),
+            "{methods:?}"
+        );
+        assert!(routes.iter().any(|route| route == "other"), "{routes:?}");
+        assert!(methods.iter().any(|method| method == "other"), "{methods:?}");
+    }
+}
