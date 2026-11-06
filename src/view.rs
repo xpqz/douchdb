@@ -2967,11 +2967,12 @@ pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
         }
         (Value::Object(a), Value::Object(b)) => {
             // CouchDB object collation follows the stored member order, not
-            // lexicographic key order.
+            // sorted key order, and compares member names like strings.
             let a: Vec<_> = a.iter().collect();
             let b: Vec<_> = b.iter().collect();
             for (left, right) in a.iter().zip(b.iter()) {
-                let order = left.0.cmp(right.0).then_with(|| cmp_json(left.1, right.1));
+                let order =
+                    compare_strings(left.0, right.0).then_with(|| cmp_json(left.1, right.1));
                 if order != Ordering::Equal {
                     return order;
                 }
