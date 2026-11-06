@@ -1776,27 +1776,23 @@ impl Db {
                     };
                     let mut tx = Tx::new();
                     let mut removed = Vec::new();
-                    for rev in &requested {
-                        if !meta.tree.edges.contains_key(rev) {
+                    // Like CouchDB, purge leaves only: each takes its unshared
+                    // ancestors with it, and a listed non-leaf revision is
+                    // ignored and not reported.
+                    let leaves: std::collections::BTreeSet<String> =
+                        meta.tree.leaves().into_iter().collect();
+                    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
+                        let gone = meta.tree.purge_leaf(rev);
+                        if gone.is_empty() {
                             continue;
                         }
-                        tx.delete(&body_key(&id2, rev));
-                        meta.tree.edges.remove(rev);
-                        meta.tree.deleted.remove(rev);
-                        meta.atts.remove(rev);
+                        for dead in &gone {
+                            tx.delete(&body_key(&id2, dead));
+                            meta.atts.remove(dead);
+                        }
                         removed.push(rev.clone());
                     }
                     if !removed.is_empty() {
-                        // Children of a purged revision become roots.
-                        let live: std::collections::BTreeSet<String> =
-                            meta.tree.edges.keys().cloned().collect();
-                        for parent in meta.tree.edges.values_mut() {
-                            if let Some(p) = parent {
-                                if !live.contains(p) {
-                                    *parent = None;
-                                }
-                            }
-                        }
                         if meta.tree.edges.is_empty() {
                             tx.delete(&meta_key(&id2));
                             if meta.seq != 0 {
@@ -2052,6 +2048,7 @@ fn put_many(
     let limit = shard.revs_limit();
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
+        meta.atts.retain(|rev, _| meta.tree.edges.contains_key(rev));
         if let Ok(bytes) = serde_json::to_vec(meta) {
             ops.push((meta_key(id), Some(bytes)));
         }
@@ -2188,7 +2185,6 @@ impl Stage<'_> {
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
-        meta.atts.retain(|r, _| meta.tree.edges.contains_key(r));
         meta.atts.insert(rev.clone(), atts);
 
         self.ops
@@ -2669,16 +2665,18 @@ fn read_doc_rev(
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
-        let info: Vec<Value> = path
-            .iter()
-            .rev()
-            .map(|r| {
-                json!({
-                    "rev": r,
-                    "status": if meta.tree.is_deleted(r) { "deleted" } else { "available" }
-                })
-            })
-            .collect();
+        // A body compaction has dropped reads as "missing", as in CouchDB.
+        let mut info: Vec<Value> = Vec::with_capacity(path.len());
+        for r in path.iter().rev() {
+            let status = if meta.tree.is_deleted(r) {
+                "deleted"
+            } else if shard.get_body(id, r)?.is_some() {
+                "available"
+            } else {
+                "missing"
+            };
+            info.push(json!({ "rev": r, "status": status }));
+        }
         map.insert("_revs_info".into(), Value::Array(info));
     }
     if opts.conflicts {

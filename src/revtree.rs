@@ -150,6 +150,26 @@ impl RevTree {
         path
     }
 
+    /// Remove the leaf `rev` and every ancestor no other branch shares, as
+    /// CouchDB's `remove_leafs` does. Returns the removed revisions, leaf
+    /// first; empty when `rev` is not a leaf.
+    pub fn purge_leaf(&mut self, rev: &str) -> Vec<String> {
+        let mut removed = Vec::new();
+        if !self.is_leaf(rev) {
+            return removed;
+        }
+        let mut current = rev.to_string();
+        loop {
+            let parent = self.edges.remove(&current).flatten();
+            self.deleted.remove(&current);
+            removed.push(current);
+            match parent {
+                Some(parent) if self.is_leaf(&parent) => current = parent,
+                _ => return removed,
+            }
+        }
+    }
+
     /// Keep the newest `limit` revisions on every root-to-leaf path. Leaves are
     /// never removed, even when another branch is much deeper. Shared ancestors
     /// are retained once; a revision whose parent was pruned becomes a root.

@@ -1156,8 +1156,51 @@ impl Shard {
         Ok(())
     }
 
+    /// Delete every revision body that is not a leaf of its document's tree:
+    /// superseded revisions, revisions stemmed by `revs_limit` and orphans.
+    /// CouchDB keeps them readable until compaction and then drops them;
+    /// leaves (conflicts and tombstones included) always stay.
+    fn drop_stale_bodies(&mut self) -> Result<()> {
+        let mut leaf_bodies: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut failure = None;
+        self.scan_range_while(b"m/", None, false, |key, value| {
+            match parse_meta(key, value) {
+                Ok((id, meta)) => {
+                    for leaf in meta.tree.leaves() {
+                        leaf_bodies.insert(body_key(&id, &leaf));
+                    }
+                    true
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            }
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let mut stale = Vec::new();
+        self.scan_range_while(b"d/", None, false, |key, _| {
+            if !leaf_bodies.contains(key) {
+                stale.push(key.to_vec());
+            }
+            true
+        })?;
+        for batch in stale.chunks(1000) {
+            let mut tx = Tx::new();
+            for key in batch {
+                tx.delete(key);
+            }
+            self.commit(tx)?;
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
     pub fn compact(&mut self) -> Result<()> {
         self.flush_pending()?;
+        self.drop_stale_bodies()?;
         // Compaction is a long, blocking LevelDB call (tens of seconds on a
         // large shard). It runs on this shard's dedicated actor thread, so it
         // never ties up a Tokio worker.
