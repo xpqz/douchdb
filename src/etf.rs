@@ -389,8 +389,8 @@ mod tests {
     fn lists_and_tuples() {
         assert_eq!(Term::List(vec![]).encode(), vec![131, NIL_EXT]);
         assert_eq!(
-            Term::List(vec![Term::Int(1)]).encode(),
-            vec![131, 108, 0, 0, 0, 1, 97, 1, 106]
+            Term::List(vec![Term::Atom("a")]).encode(),
+            vec![131, 108, 0, 0, 0, 1, 100, 0, 1, b'a', 106]
         );
         assert_eq!(
             Term::Tuple(vec![Term::Int(1), Term::Int(2)]).encode(),
