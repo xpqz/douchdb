@@ -1237,6 +1237,58 @@ mod panic_tests {
     }
 
     #[tokio::test]
+    async fn jobs_run_on_a_dedicated_thread_not_a_tokio_worker() {
+        let handle = handle();
+        let (in_runtime, name) = handle
+            .call(|_| {
+                Ok((
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    std::thread::current().name().map(str::to_string),
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(!in_runtime, "shard job ran inside a Tokio runtime");
+        assert!(
+            name.as_deref().is_some_and(|n| n.starts_with("shard-")),
+            "unexpected thread name {name:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_works_from_the_actor_outside_a_multi_thread_runtime() {
+        let handle = handle();
+        handle.call(put(b"x/a")).await.unwrap();
+        handle
+            .call(|shard| shard.compact().map_err(ApiError::from))
+            .await
+            .unwrap();
+        let value = handle.call(|shard| Ok(shard.get(b"x/a"))).await.unwrap();
+        assert_eq!(value.as_deref(), Some(b"v".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_releases_the_database_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let handle = ShardHandle::spawn(&dir, 1000).unwrap();
+        handle.call(put(b"x/kept")).await.unwrap();
+        drop(handle);
+        // No waiting: the LevelDB LOCK must already be released.
+        let mut reopened = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(reopened.get(b"x/kept").as_deref(), Some(b"v".as_slice()));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn data_written_before_a_panic_survives_and_the_partial_job_is_discarded() {
         let handle = handle();
         handle.call(put(b"x/before")).await.unwrap();
