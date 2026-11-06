@@ -81,9 +81,18 @@ pub fn parse_args() -> Args {
                 args.revs_limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(1000)
             }
             "--admin" => {
-                if let Some(value) = it.next() {
-                    if let Some((user, pass)) = value.split_once(':') {
+                // A malformed value must stop startup: ignoring it would leave
+                // the server running with authentication disabled.
+                let value = it.next().unwrap_or_default();
+                match value.split_once(':') {
+                    Some((user, pass)) if !user.is_empty() && !pass.is_empty() => {
                         args.admin = Some((user.to_string(), pass.to_string()));
+                    }
+                    _ => {
+                        eprintln!(
+                            "--admin expects user:password with a non-empty user and password"
+                        );
+                        std::process::exit(2);
                     }
                 }
             }

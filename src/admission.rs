@@ -7,6 +7,7 @@
 //! queued without bound.
 
 use crate::auth::Principal;
+use axum::http::Method;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -15,6 +16,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     Normal,
+    /// `POST /_session`. Accounted in its own bucket, not the caller's, so
+    /// unauthenticated traffic cannot starve logins.
+    Login,
     Heavy,
     Background,
 }
@@ -71,6 +75,27 @@ pub struct Permit {
     _heavy_user: Option<OwnedSemaphorePermit>,
 }
 
+/// Whose budget a request is charged to. An enum, so a user literally named
+/// "anonymous" cannot share the anonymous bucket.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    Anonymous,
+    User(String),
+    Login,
+}
+
+impl Key {
+    fn new(principal: &Principal, lane: Lane) -> Key {
+        if lane == Lane::Login {
+            return Key::Login;
+        }
+        match &principal.name {
+            Some(name) => Key::User(name.clone()),
+            None => Key::Anonymous,
+        }
+    }
+}
+
 struct UserState {
     normal: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
@@ -116,7 +141,7 @@ pub struct Admission {
     global: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
     background: Arc<Semaphore>,
-    users: Mutex<HashMap<String, Arc<UserState>>>,
+    users: Mutex<HashMap<Key, Arc<UserState>>>,
 }
 
 impl Admission {
@@ -130,13 +155,13 @@ impl Admission {
         }
     }
 
-    fn user(&self, principal: &Principal) -> Arc<UserState> {
+    fn user(&self, key: Key) -> Arc<UserState> {
         let mut users = self
             .users
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         users
-            .entry(principal.key().to_string())
+            .entry(key)
             .or_insert_with(|| {
                 Arc::new(UserState {
                     normal: semaphore(self.limits.per_user_in_flight),
@@ -153,7 +178,7 @@ impl Admission {
         if lane == Lane::Background {
             return self.try_background();
         }
-        let user = self.user(principal);
+        let user = self.user(Key::new(principal, lane));
         // A no-auth / internal service principal has no user identity to share
         // fairly; keep the global and heavy-global bounds, but not the per-user
         // ones. The server remains bounded by `max_in_flight`.
@@ -196,10 +221,12 @@ impl Admission {
         })
     }
 
-    /// Classify a request by path. Only view/search work gets a heavy permit;
-    /// everything else is interactive.
-    pub fn classify(path: &str) -> Lane {
-        if path.contains("/_view/") || path.contains("/_search/") {
+    /// Classify a request. Logins get their own lane, only view/search work
+    /// gets a heavy permit, and everything else is interactive.
+    pub fn classify(method: &Method, path: &str) -> Lane {
+        if *method == Method::POST && path.trim_end_matches('/') == "/_session" {
+            Lane::Login
+        } else if path.contains("/_view/") || path.contains("/_search/") {
             Lane::Heavy
         } else {
             Lane::Normal
@@ -305,12 +332,21 @@ mod tests {
 
     #[test]
     fn classification_and_exemptions() {
-        assert_eq!(Admission::classify("/db/_design/v/_view/rows"), Lane::Heavy);
         assert_eq!(
-            Admission::classify("/db/_design/v/_search/rows"),
+            Admission::classify(&Method::GET, "/db/_design/v/_view/rows"),
             Lane::Heavy
         );
-        assert_eq!(Admission::classify("/db/_all_docs"), Lane::Normal);
+        assert_eq!(
+            Admission::classify(&Method::GET, "/db/_design/v/_search/rows"),
+            Lane::Heavy
+        );
+        assert_eq!(
+            Admission::classify(&Method::GET, "/db/_all_docs"),
+            Lane::Normal
+        );
+        assert_eq!(Admission::classify(&Method::POST, "/_session"), Lane::Login);
+        assert_eq!(Admission::classify(&Method::GET, "/_session"), Lane::Normal);
+        assert_eq!(Admission::classify(&Method::POST, "/db"), Lane::Normal);
         assert!(Admission::exempt("/_up"));
         assert!(Admission::exempt("/_health"));
         assert!(Admission::exempt("/_utils/app.js"));
@@ -329,5 +365,43 @@ mod tests {
         assert!(bucket.try_take(start));
         assert!(!bucket.try_take(start));
         assert!(bucket.try_take(start + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn user_named_anonymous_does_not_share_the_anonymous_bucket() {
+        let admission = admission_with(8, 1, 1, 1);
+        let anonymous = Principal::default();
+        let named = principal("anonymous");
+        let held = admission.try_admit(&anonymous, Lane::Normal).unwrap();
+        assert_eq!(
+            admission.try_admit(&anonymous, Lane::Normal).unwrap_err(),
+            Denied::User
+        );
+        assert!(admission.try_admit(&named, Lane::Normal).is_ok());
+        drop(held);
+    }
+
+    #[test]
+    fn login_lane_has_its_own_bucket() {
+        let admission = admission_with(8, 1, 1, 1);
+        let anonymous = Principal::default();
+        let _held = admission.try_admit(&anonymous, Lane::Normal).unwrap();
+        assert_eq!(
+            admission.try_admit(&anonymous, Lane::Normal).unwrap_err(),
+            Denied::User
+        );
+        // A full anonymous bucket does not block a login...
+        let login = admission.try_admit(&anonymous, Lane::Login).unwrap();
+        // ...but logins are still bounded among themselves.
+        assert_eq!(
+            admission.try_admit(&anonymous, Lane::Login).unwrap_err(),
+            Denied::User
+        );
+        // Login traffic does not consume a named user's budget either.
+        assert!(admission
+            .try_admit(&principal("alice"), Lane::Normal)
+            .is_ok());
+        drop(login);
+        assert!(admission.try_admit(&anonymous, Lane::Login).is_ok());
     }
 }

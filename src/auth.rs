@@ -39,10 +39,6 @@ impl Principal {
         self.name.is_some() || self.admin
     }
 
-    pub fn key(&self) -> &str {
-        self.name.as_deref().unwrap_or("anonymous")
-    }
-
     pub fn has_role(&self, role: &str) -> bool {
         self.admin || self.roles.iter().any(|candidate| candidate == role)
     }
@@ -59,6 +55,10 @@ struct User {
 
 impl User {
     fn matches_token(&self, token: &str) -> bool {
+        // An empty credential never authenticates, whatever the entry holds.
+        if token.is_empty() {
+            return false;
+        }
         if let Some(expected) = &self.token {
             if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
                 return true;
@@ -71,6 +71,10 @@ impl User {
         false
     }
 }
+
+/// Shortest accepted plaintext user token. Tokens are the only credential, so
+/// a trivially guessable one is a startup error rather than a quiet hole.
+const MIN_TOKEN_LEN: usize = 8;
 
 const SECRET_FILE: &str = ".session-secret";
 
@@ -160,7 +164,9 @@ impl Auth {
     }
 
     /// Load a users file. `admin` is optional; when present, the config admin
-    /// continues to work alongside file users.
+    /// continues to work alongside file users. A file user may not share the
+    /// config admin's name: a session cookie carries only the name, so it
+    /// would resolve to the admin.
     pub fn from_users_file(
         admin: Option<(String, String)>,
         path: &Path,
@@ -185,6 +191,11 @@ impl Auth {
             if users.iter().any(|user| user.name == name) {
                 return Err(format!("duplicate user `{name}`"));
             }
+            if admin.as_ref().is_some_and(|(user, _)| *user == name) {
+                return Err(format!(
+                    "user `{name}` has the same name as the --admin user"
+                ));
+            }
             let token = entry
                 .get("token")
                 .and_then(Value::as_str)
@@ -197,6 +208,19 @@ impl Auth {
                 .map_err(|error| format!("user `{name}`: {error}"))?;
             if token.is_none() && token_sha256.is_none() {
                 return Err(format!("user `{name}` needs `token` or `token_sha256`"));
+            }
+            if token
+                .as_deref()
+                .is_some_and(|token| token.chars().count() < MIN_TOKEN_LEN)
+            {
+                return Err(format!(
+                    "user `{name}`: `token` must be at least {MIN_TOKEN_LEN} characters"
+                ));
+            }
+            if token_sha256 == Some(Sha256::digest(b"").into()) {
+                return Err(format!(
+                    "user `{name}`: `token_sha256` is the hash of an empty token"
+                ));
             }
             let roles: Vec<String> = entry
                 .get("roles")
@@ -262,6 +286,9 @@ impl Auth {
     }
 
     fn password_principal(&self, name: &str, password: &str) -> Option<Principal> {
+        if password.is_empty() {
+            return None;
+        }
         if !self.user.is_empty()
             && constant_time_eq(name.as_bytes(), self.user.as_bytes())
             && constant_time_eq(password.as_bytes(), self.pass.as_bytes())
@@ -407,7 +434,11 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     }
     let mut out = [0u8; 32];
     for (index, byte) in out.iter_mut().enumerate() {
-        let pair = &value[index * 2..index * 2 + 2];
+        // `get` rather than indexing: 64 bytes of non-ASCII text would put a
+        // slice boundary inside a character.
+        let pair = value
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| "`token_sha256` must be hex".to_string())?;
         *byte =
             u8::from_str_radix(pair, 16).map_err(|_| "`token_sha256` must be hex".to_string())?;
     }
@@ -582,5 +613,96 @@ mod tests {
         let principal = auth.principal(&headers);
         assert!(principal.admin);
         assert!(principal.has_role("_admin"));
+    }
+
+    fn load(contents: &str) -> Result<Auth, String> {
+        let file =
+            std::env::temp_dir().join(format!("douchdb-auth-load-{}.json", crate::db::uuid()));
+        std::fs::write(&file, contents).unwrap();
+        let result = Auth::from_users_file(
+            Some(("admin".into(), "secret".into())),
+            &file,
+            b"session-secret".to_vec(),
+        );
+        let _ = std::fs::remove_file(&file);
+        result
+    }
+
+    #[test]
+    fn users_file_name_colliding_with_admin_is_rejected() {
+        let error = load(r#"{"users":[{"name":"admin","token":"long-enough-token"}]}"#)
+            .err()
+            .expect("collision must be an error");
+        assert!(error.contains("admin"), "{error}");
+        // A different name is fine.
+        assert!(
+            load(r#"{"users":[{"name":"administrator","token":"long-enough-token"}]}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_and_short_tokens_are_rejected_at_load() {
+        for entry in [
+            r#"{"name":"a","token":""}"#,
+            r#"{"name":"a","token":"short"}"#,
+            // SHA-256 of the empty string.
+            r#"{"name":"a","token_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#,
+        ] {
+            let contents = format!(r#"{{"users":[{entry}]}}"#);
+            assert!(load(&contents).is_err(), "accepted {entry}");
+        }
+        assert!(load(r#"{"users":[{"name":"a","token":"long-enough-token"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn non_ascii_token_digest_is_an_error_not_a_panic() {
+        // 64 bytes, but 'é' is two bytes, so a byte slice would split it.
+        let digest = format!("a{}", "é".repeat(31) + "b");
+        assert_eq!(digest.len(), 64);
+        let contents = format!(r#"{{"users":[{{"name":"a","token_sha256":"{digest}"}}]}}"#);
+        assert!(load(&contents).is_err());
+    }
+
+    #[test]
+    fn empty_credentials_never_authenticate_even_if_an_entry_exists() {
+        let mut auth = Auth::new("admin".into(), String::new(), b"k".to_vec());
+        auth.users.push(User {
+            name: "empty".into(),
+            token: Some(String::new()),
+            token_sha256: Some(Sha256::digest(b"").into()),
+            roles: vec![],
+            admin: false,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(),
+        );
+        assert!(!auth.principal(&headers).is_authenticated());
+        let basic = |text: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(text)
+                )
+                .parse()
+                .unwrap(),
+            );
+            headers
+        };
+        for text in ["empty:", "admin:", ":", ""] {
+            assert!(
+                !auth.principal(&basic(text)).is_authenticated(),
+                "{text:?} authenticated"
+            );
+        }
+        assert!(auth.authenticate("empty", "").is_none());
+        assert!(auth.authenticate("admin", "").is_none());
+        assert!(auth.authenticate("", "").is_none());
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, "AuthSession=".parse().unwrap());
+        assert!(!auth.principal(&headers).is_authenticated());
     }
 }

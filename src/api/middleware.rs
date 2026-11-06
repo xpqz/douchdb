@@ -79,7 +79,7 @@ pub async fn admit(
         return next.run(req).await;
     }
     let principal = st.principal(req.headers());
-    let lane = crate::admission::Admission::classify(path);
+    let lane = crate::admission::Admission::classify(req.method(), path);
     match st.admission.try_admit(&principal, lane) {
         Ok(_permit) => next.run(req).await,
         Err(denied) => {

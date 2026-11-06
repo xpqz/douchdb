@@ -10803,6 +10803,192 @@ async fn global_admission_limit_protects_capacity_across_users() {
     }
 }
 
+/// Run the server with `extra` arguments and return its stderr if it exits
+/// with a failure within a few seconds, or `None` if it kept running (it is
+/// then killed).
+fn startup_failure(extra: &[String]) -> Option<String> {
+    use std::io::Read;
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("douchdb-startup-{}-{}", std::process::id(), port));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    cmd.arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&dir)
+        .args(extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut failed = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                let mut text = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut text);
+                }
+                failed = Some(text);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    failed
+}
+
+#[test]
+fn admin_without_colon_is_a_startup_error() {
+    for admin in ["adminsecret", "", ":", "admin:", ":secret"] {
+        let args = ["--admin".to_string(), admin.to_string()];
+        let stderr = startup_failure(&args);
+        assert!(
+            stderr.is_some_and(|text| text.contains("--admin")),
+            "--admin {admin:?} must fail at startup naming the flag"
+        );
+    }
+}
+
+#[test]
+fn users_file_name_colliding_with_admin_is_a_startup_error() {
+    let users = UsersFile::new(r#"{"users":[{"name":"admin","token":"long-enough-token"}]}"#);
+    let mut args = users_server_args(&users);
+    args.extend(["--admin".to_string(), "admin:douchdb".to_string()]);
+    let stderr = startup_failure(&args).expect("collision must stop startup");
+    assert!(stderr.contains("admin"), "{stderr}");
+}
+
+#[test]
+fn empty_or_short_user_tokens_are_a_startup_error() {
+    for entry in [
+        r#"{"name":"a","token":""}"#,
+        r#"{"name":"a","token":"short"}"#,
+        r#"{"name":"a","token_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#,
+    ] {
+        let users = UsersFile::new(&format!(r#"{{"users":[{entry}]}}"#));
+        assert!(
+            startup_failure(&users_server_args(&users)).is_some(),
+            "accepted {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_credentials_never_authenticate() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let cases: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+        (
+            "empty bearer",
+            vec![("Authorization", "Bearer ".to_string())],
+        ),
+        ("empty user token", basic("alice", "")),
+        ("empty admin password", basic("admin", "")),
+        ("empty basic", basic("", "")),
+        ("empty cookie", vec![("Cookie", "AuthSession=".to_string())]),
+    ];
+    for (label, headers) in cases {
+        let (status, body) = s
+            .req_with(Method::PUT, "/empty-cred-db", Some(json!({})), &headers)
+            .await;
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+            "{label}: {status} {body}"
+        );
+    }
+    for (name, password) in [("alice", ""), ("admin", ""), ("", "")] {
+        let (status, _, body) = s
+            .req_headers(
+                Method::POST,
+                "/_session",
+                Some(json!({"name": name, "password": password})),
+                &[],
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn login_succeeds_while_anonymous_bucket_is_full() {
+    let users = UsersFile::new(
+        r#"{"users":[
+            {"name":"alice","token":"alice-token","roles":[]},
+            {"name":"anonymous","token":"anonymous-token","roles":[]}
+        ]}"#,
+    );
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--default-security".to_string(),
+        "open".to_string(),
+        "--per-user-in-flight".to_string(),
+        "2".to_string(),
+        "--max-in-flight".to_string(),
+        "16".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+    let (status, body) = s
+        .req_with(Method::PUT, "/flood", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Hold every anonymous slot with long-poll changes requests. A holder
+    // that raced a probe for a slot is rejected and finishes at once, so it is
+    // restarted until the bucket is full.
+    let hold = || {
+        let client = s.client.clone();
+        let url = format!(
+            "{}/flood/_changes?feed=longpoll&timeout=20000&since=0",
+            s.base
+        );
+        tokio::spawn(async move { client.get(url).send().await.map(|r| r.status()) })
+    };
+    let mut held = vec![hold(), hold()];
+    // The bucket is full once an anonymous probe is rejected: only the two
+    // holders can be occupying its slots then.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, _) = s.req_with(Method::GET, "/flood", None, &[]).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "anonymous bucket never filled: {status}"
+        );
+        for task in held.iter_mut().filter(|task| task.is_finished()) {
+            *task = hold();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Logins have their own lane.
+    let (status, _, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-token"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "login starved: {body}");
+    // A user literally named "anonymous" does not share the bucket.
+    let (status, body) = s
+        .req_with(Method::GET, "/flood", None, &bearer("anonymous-token"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Anonymous traffic is still capped.
+    let (status, _) = s.req_with(Method::GET, "/flood", None, &[]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    for task in held {
+        task.abort();
+    }
+}
+
 fn assert_no_access(status: StatusCode, label: &str) {
     assert!(
         status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
