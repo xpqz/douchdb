@@ -3527,6 +3527,113 @@ async fn invalid_query_parameters_are_rejected() {
     assert_eq!(body, json!(12));
 }
 
+/// Query-parameter validation taken from CouchDB 3.5.3: `_changes` rejects bad
+/// `since`/`feed`/`heartbeat`/`timeout`, view and `_all_docs` queries reject
+/// bad booleans and non-JSON keys, and `_uuids` validates `count`.
+#[tokio::test]
+async fn query_parameters_are_validated_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("qp").await;
+    let (status, _) = s
+        .put(
+            "/qp/_design/v",
+            json!({"views": {"a": {"map": "function(d){emit(d._id,1)}"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.put("/qp/d1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    for (query, reason) in [
+        (
+            "since=abc",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "since=-1",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "since=",
+            "Malformed sequence supplied in 'since' parameter.",
+        ),
+        (
+            "feed=bogus",
+            "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
+        ),
+        (
+            "heartbeat=abc",
+            "Invalid heartbeat value. Expecting a positive integer value (in milliseconds).",
+        ),
+        (
+            "heartbeat=-1",
+            "The heartbeat value should be a positive integer (in milliseconds).",
+        ),
+        (
+            "heartbeat=0",
+            "The heartbeat value should be a positive integer (in milliseconds).",
+        ),
+        (
+            "timeout=abc",
+            "The timeout parameter should be a non-negative integer",
+        ),
+        (
+            "timeout=-1",
+            "The timeout value should be a non-negative integer",
+        ),
+    ] {
+        let (status, body) = s.get(&format!("/qp/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["error"], "bad_request", "{query}");
+        assert_eq!(body["reason"], reason, "{query}");
+    }
+    for query in ["since=0", "since=now", "timeout=0", "heartbeat=1000"] {
+        let (status, body) = s.get(&format!("/qp/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    }
+
+    for base in ["/qp/_all_docs", "/qp/_design/v/_view/a"] {
+        for name in ["descending", "include_docs", "inclusive_end", "update_seq"] {
+            let (status, body) = s.get(&format!("{base}?{name}=maybe")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{base}?{name}: {body}");
+            assert_eq!(body["error"], "query_parse_error", "{base}?{name}");
+            assert_eq!(
+                body["reason"], "Invalid boolean parameter: \"maybe\"",
+                "{base}?{name}"
+            );
+        }
+        for name in ["key", "startkey", "endkey"] {
+            let (status, body) = s.get(&format!("{base}?{name}=abc")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{base}?{name}: {body}");
+            assert_eq!(body["error"], "bad_request", "{base}?{name}");
+            assert_eq!(body["reason"], "invalid UTF-8 JSON", "{base}?{name}");
+            let (status, body) = s.get(&format!("{base}?{name}=%22abc%22")).await;
+            assert_eq!(status, StatusCode::OK, "{base}?{name}: {body}");
+        }
+        let (status, body) = s.get(&format!("{base}?descending=TRUE")).await;
+        assert_eq!(status, StatusCode::OK, "{base}: {body}");
+    }
+
+    for (query, reason) in [
+        ("count=abc", "count must be a positive integer"),
+        ("count=-1", "count must be a positive integer"),
+        ("count=", "count must be a positive integer"),
+        ("count=1001", "count parameter too large"),
+        ("count=100000", "count parameter too large"),
+    ] {
+        let (status, body) = s.get(&format!("/_uuids?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["error"], "bad_request", "{query}");
+        assert_eq!(body["reason"], reason, "{query}");
+    }
+    let (status, body) = s.get("/_uuids?count=0").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"uuids": []}));
+    let (status, body) = s.get("/_uuids?count=1000").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["uuids"].as_array().map(Vec::len), Some(1000));
+}
+
 /// `POST /db?batch=ok` answers 202 with no rev (CouchDB 3.5.3); a malformed
 /// `_rev` is a 400 `Invalid rev format` for POST and DELETE, not a 409.
 #[tokio::test]
