@@ -1678,11 +1678,9 @@ mod scan_tests {
         let dir = temp_shard_dir("sweep-slash");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let tree = |edges: &[(&str, Option<&str>)]| {
-            let mut tree = RevTree::default();
-            for (rev, parent) in edges {
-                tree.edges
-                    .insert(rev.to_string(), parent.map(str::to_string));
-            }
+            let edges: BTreeMap<&str, Option<&str>> = edges.iter().copied().collect();
+            let tree: RevTree =
+                serde_json::from_value(serde_json::json!({"edges": edges, "deleted": []})).unwrap();
             DocMeta {
                 tree,
                 seq: 1,
