@@ -434,7 +434,11 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     }
     let mut out = [0u8; 32];
     for (index, byte) in out.iter_mut().enumerate() {
-        let pair = &value[index * 2..index * 2 + 2];
+        // `get` rather than indexing: 64 bytes of non-ASCII text would put a
+        // slice boundary inside a character.
+        let pair = value
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| "`token_sha256` must be hex".to_string())?;
         *byte =
             u8::from_str_radix(pair, 16).map_err(|_| "`token_sha256` must be hex".to_string())?;
     }
@@ -648,6 +652,15 @@ mod tests {
             assert!(load(&contents).is_err(), "accepted {entry}");
         }
         assert!(load(r#"{"users":[{"name":"a","token":"long-enough-token"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn non_ascii_token_digest_is_an_error_not_a_panic() {
+        // 64 bytes, but 'é' is two bytes, so a byte slice would split it.
+        let digest = format!("a{}", "é".repeat(31) + "b");
+        assert_eq!(digest.len(), 64);
+        let contents = format!(r#"{{"users":[{{"name":"a","token_sha256":"{digest}"}}]}}"#);
+        assert!(load(&contents).is_err());
     }
 
     #[test]
