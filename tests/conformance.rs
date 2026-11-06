@@ -1371,6 +1371,74 @@ async fn latest_resolves_interior_revisions_to_the_branch_tip() {
 }
 
 #[tokio::test]
+async fn latest_returns_every_leaf_below_the_requested_revision() {
+    let s = Server::start(false);
+    s.fresh_db("latestfork").await;
+    let (_, root) = s.put("/latestfork/doc", json!({"v": "root"})).await;
+    let root_rev = root["rev"].as_str().unwrap().to_string();
+    let (_, left) = s
+        .put("/latestfork/doc", json!({"_rev": root_rev, "v": "left"}))
+        .await;
+    let left_rev = left["rev"].as_str().unwrap().to_string();
+    // A second branch off the same parent, written as a replicated edit.
+    let right_rev = format!("2-{}", "b".repeat(32));
+    let (status, _) = s
+        .post(
+            "/latestfork/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "doc", "_rev": right_rev, "v": "right",
+                "_revisions": {"start": 2, "ids": ["b".repeat(32), root_rev[2..]]}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let open = format!(
+        "/latestfork/doc?open_revs={}&latest=true",
+        urlencoding(&json!([root_rev]))
+    );
+    let (status, body) = s.get(&open).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut revs: Vec<String> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["ok"]["_rev"].as_str().unwrap().to_string())
+        .collect();
+    revs.sort();
+    let mut expected = vec![left_rev, right_rev];
+    expected.sort();
+    assert_eq!(revs, expected, "every leaf below the revision: {body}");
+}
+
+#[tokio::test]
+async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
+    let s = Server::start(false);
+    s.fresh_db("revcase").await;
+    let (_, put) = s.put("/revcase/doc", json!({"v": 1})).await;
+    let rev = put["rev"].as_str().unwrap().to_string();
+    let upper = rev.to_uppercase();
+    assert_ne!(rev, upper);
+
+    let (status, body) = s.get(&format!("/revcase/doc?rev={upper}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], rev);
+
+    let open = format!(
+        "/revcase/doc?open_revs={}",
+        urlencoding(&json!([upper]))
+    );
+    let (status, body) = s.get(&open).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["ok"]["_rev"], rev);
+
+    let (status, body) = s
+        .put("/revcase/doc", json!({"_rev": upper, "v": 2}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
 async fn all_docs_key_excludes_deleted_and_reports_update_seq() {
     let s = Server::start(false);
     s.fresh_db("allkey").await;
@@ -2509,6 +2577,20 @@ async fn local_docs_and_revs_limit() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["rev"], "0-2");
+    // CouchDB's update_local_docs answers 409 unless the supplied revision is
+    // the current one (or absent for a new document).
+    let (status, _) = s
+        .put("/local/_local/checkpoint", json!({"seq": 9, "_rev": "0-1"}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = s.put("/local/_local/checkpoint", json!({"seq": 9})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = s
+        .put("/local/_local/fresh", json!({"seq": 1, "_rev": "0-3"}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, body) = s.get("/local/_local/checkpoint").await;
+    assert_eq!(body["seq"], 8);
     let (status, _) = s.delete("/local/_local/checkpoint").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = s.get("/local/_local/checkpoint").await;

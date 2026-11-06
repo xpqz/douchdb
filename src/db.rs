@@ -3031,6 +3031,55 @@ mod tests {
             .expect("document id for shard")
     }
 
+    #[tokio::test]
+    async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
+        let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "valfail",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: ShardMap::balanced(2, 1, 1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let design_id = (0..10_000)
+            .map(|i| format!("_design/d{i}"))
+            .find(|id| db.shard_index(id) == 0)
+            .expect("design id on shard 0");
+        let plain_id = doc_id_for_shard(&db, 1);
+
+        // Warm the cache with the empty validator set.
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        let generation = db.design_generation();
+
+        db.shards[1]
+            .call(|shard| {
+                shard.inject_flush_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let result = db
+            .put_docs(
+                vec![
+                    json!({"_id": design_id, "validate_doc_update": "function(){}"}),
+                    json!({"_id": plain_id}),
+                ],
+                true,
+            )
+            .await;
+        assert!(result.is_err(), "the second shard's write fails");
+
+        // Shard 0 committed the design document before shard 1 failed.
+        assert_ne!(db.design_generation(), generation);
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn security_versions_order_updates_and_survive_reopen() {
         let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::db::uuid()));
