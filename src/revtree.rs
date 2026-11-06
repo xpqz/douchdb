@@ -474,6 +474,230 @@ mod tests {
         assert_eq!(tree.edges[&middle], Some(root));
     }
 
+    /// The tree as the previous implementation stored it, kept only as an
+    /// oracle for the equivalence property below.
+    mod reference {
+        use super::*;
+
+        #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+        pub struct OldTree {
+            pub edges: BTreeMap<String, Option<String>>,
+            pub deleted: BTreeSet<String>,
+        }
+
+        impl OldTree {
+            pub fn merge_path(&mut self, path: &[Rev], deleted: bool) {
+                let start = path
+                    .iter()
+                    .position(|rev| self.edges.contains_key(&rev.to_string()))
+                    .unwrap_or(0);
+                for i in start..path.len() {
+                    let parent = if i == 0 {
+                        None
+                    } else {
+                        Some(path[i - 1].to_string())
+                    };
+                    self.edges.entry(path[i].to_string()).or_insert(parent);
+                }
+                if let Some(leaf) = path.last() {
+                    if deleted {
+                        self.deleted.insert(leaf.to_string());
+                    }
+                }
+            }
+
+            pub fn leaves(&self) -> Vec<String> {
+                let parents: BTreeSet<&String> = self.edges.values().flatten().collect();
+                self.edges
+                    .keys()
+                    .filter(|rev| !parents.contains(rev))
+                    .cloned()
+                    .collect()
+            }
+
+            pub fn is_leaf(&self, rev: &str) -> bool {
+                self.edges.contains_key(rev) && !self.edges.values().flatten().any(|p| p == rev)
+            }
+
+            pub fn leaves_from(&self, rev: &str) -> Vec<String> {
+                if !self.edges.contains_key(rev) {
+                    return Vec::new();
+                }
+                let mut children: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+                for (child, parent) in &self.edges {
+                    if let Some(parent) = parent {
+                        children.entry(parent.as_str()).or_default().push(child);
+                    }
+                }
+                let mut leaves = Vec::new();
+                let mut pending = vec![rev];
+                while let Some(current) = pending.pop() {
+                    match children.get(current) {
+                        Some(kids) => pending.extend(kids.iter().map(|kid| kid.as_str())),
+                        None => leaves.push(current.to_string()),
+                    }
+                }
+                leaves.sort();
+                leaves
+            }
+
+            pub fn winner_among(&self, leaves: Vec<String>) -> Option<String> {
+                leaves
+                    .into_iter()
+                    .filter_map(|rev| {
+                        let parsed = Rev::parse(&rev)?;
+                        Some(((!self.deleted.contains(&rev), parsed.pos, parsed.id), rev))
+                    })
+                    .max_by(|a, b| a.0.cmp(&b.0))
+                    .map(|(_, rev)| rev)
+            }
+
+            pub fn winner(&self) -> Option<String> {
+                self.winner_among(self.leaves())
+            }
+
+            fn sorted(&self, mut out: Vec<String>) -> Vec<String> {
+                out.sort_by(|a, b| {
+                    let key = |s: &String| {
+                        Rev::parse(s)
+                            .map(|rev| (rev.pos, rev.id))
+                            .unwrap_or_default()
+                    };
+                    key(b).cmp(&key(a))
+                });
+                out
+            }
+
+            pub fn conflicts(&self, winner: &str) -> Vec<String> {
+                self.sorted(
+                    self.leaves()
+                        .into_iter()
+                        .filter(|rev| rev != winner && !self.deleted.contains(rev))
+                        .collect(),
+                )
+            }
+
+            pub fn deleted_conflicts(&self, winner: &str) -> Vec<String> {
+                self.sorted(
+                    self.leaves()
+                        .into_iter()
+                        .filter(|rev| rev != winner && self.deleted.contains(rev))
+                        .collect(),
+                )
+            }
+
+            pub fn path(&self, rev: &str) -> Vec<String> {
+                let mut path = Vec::new();
+                let mut cur = Some(rev.to_string());
+                while let Some(rev) = cur {
+                    path.push(rev.clone());
+                    cur = self.edges.get(&rev).cloned().flatten();
+                }
+                path.reverse();
+                path
+            }
+
+            pub fn purge_leaf(&mut self, rev: &str) -> Vec<String> {
+                let mut removed = Vec::new();
+                if !self.is_leaf(rev) {
+                    return removed;
+                }
+                let mut current = rev.to_string();
+                loop {
+                    let parent = self.edges.remove(&current).flatten();
+                    self.deleted.remove(&current);
+                    removed.push(current);
+                    match parent {
+                        Some(parent) if self.is_leaf(&parent) => current = parent,
+                        _ => return removed,
+                    }
+                }
+            }
+
+            pub fn prune(&mut self, limit: u64) {
+                let limit = limit.max(1) as usize;
+                let leaves = self.leaves();
+                if leaves.is_empty() {
+                    return;
+                }
+                let mut keep: BTreeSet<String> = BTreeSet::new();
+                for leaf in &leaves {
+                    let path = self.path(leaf);
+                    let start = path.len().saturating_sub(limit);
+                    for rev in &path[start..] {
+                        keep.insert(rev.clone());
+                    }
+                }
+                self.edges.retain(|rev, _| keep.contains(rev));
+                let known: BTreeSet<String> = self.edges.keys().cloned().collect();
+                for parent in self.edges.values_mut() {
+                    if parent.as_ref().is_some_and(|p| !known.contains(p)) {
+                        *parent = None;
+                    }
+                }
+                self.deleted.retain(|rev| keep.contains(rev));
+            }
+        }
+    }
+
+    /// Metas captured from the previous implementation. They must load and
+    /// re-serialize byte for byte, so documents already on disk keep working
+    /// and anything written stays readable by older builds.
+    const STORED_TREES: &[&str] = &[
+        // Empty.
+        r#"{"edges":{},"deleted":[]}"#,
+        // Linear.
+        r#"{"edges":{"1-aa":null,"2-bb":"1-aa","3-cc":"2-bb"},"deleted":[]}"#,
+        // Conflicts, two of them tombstones.
+        r#"{"edges":{"1-aa":null,"2-bb":"1-aa","2-cc":"1-aa","2-dd":"1-aa","3-ee":"2-dd"},"deleted":["2-cc","3-ee"]}"#,
+        // Stemmed: two roots, the older ancestors are gone.
+        r#"{"edges":{"3-cc":null,"4-dd":"3-cc","4-ee":"3-cc","6-ff":null},"deleted":["4-ee"]}"#,
+        // Unparsable revisions, including a dangling parent.
+        r#"{"edges":{"1-aa":null,"2-bb":"1-aa","9-zz":"8-missing","garbage":null},"deleted":["garbage"]}"#,
+    ];
+
+    #[test]
+    fn stored_trees_round_trip_byte_for_byte() {
+        for stored in STORED_TREES {
+            let tree: RevTree = serde_json::from_str(stored).unwrap();
+            assert_eq!(&serde_json::to_string(&tree).unwrap(), stored);
+            let old: reference::OldTree = serde_json::from_str(stored).unwrap();
+            assert_eq!(tree.leaves(), old.leaves(), "{stored}");
+            assert_eq!(tree.winner(), old.winner(), "{stored}");
+            for rev in old.edges.keys() {
+                assert_eq!(tree.is_leaf(rev), old.is_leaf(rev), "{stored} {rev}");
+                assert_eq!(tree.leaves_from(rev), old.leaves_from(rev), "{stored}");
+                assert_eq!(tree.path(rev), old.path(rev), "{stored}");
+            }
+        }
+    }
+
+    #[test]
+    fn edited_stored_trees_stay_consistent() {
+        // Merging into and pruning a loaded tree keeps every derived answer
+        // in step with the plain edge-map definition.
+        for stored in STORED_TREES {
+            let mut tree: RevTree = serde_json::from_str(stored).unwrap();
+            let mut old: reference::OldTree = serde_json::from_str(stored).unwrap();
+            let path = revs(&format!("1-aa,2-bb,3-{}", id(7)));
+            tree.merge_path(&path, false);
+            old.merge_path(&path, false);
+            let path = revs("8-missing,9-zz,10-yy");
+            tree.merge_path(&path, true);
+            old.merge_path(&path, true);
+            assert_eq!(tree.leaves(), old.leaves(), "{stored}");
+            assert_eq!(tree.winner(), old.winner(), "{stored}");
+            tree.prune(2);
+            old.prune(2);
+            assert_eq!(tree.leaves(), old.leaves(), "{stored}");
+            assert_eq!(
+                serde_json::to_value(&tree).unwrap(),
+                serde_json::to_value(&old).unwrap(),
+                "{stored}"
+            );
+        }
+    }
+
     use proptest::prelude::*;
 
     fn branch_strategy() -> impl Strategy<Value = (Vec<Rev>, bool)> {
@@ -499,7 +723,80 @@ mod tests {
             })
     }
 
+    #[derive(Clone, Debug)]
+    enum Op {
+        Merge(Vec<Rev>, bool),
+        Prune(u64),
+        Purge(usize),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            6 => branch_strategy().prop_map(|(path, deleted)| Op::Merge(path, deleted)),
+            1 => (1u64..6).prop_map(Op::Prune),
+            2 => any::<usize>().prop_map(Op::Purge),
+        ]
+    }
+
+    fn assert_same(tree: &RevTree, old: &reference::OldTree) -> Result<(), TestCaseError> {
+        prop_assert_eq!(
+            serde_json::to_value(tree).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+        prop_assert_eq!(tree.leaves(), old.leaves());
+        let winner = old.winner();
+        prop_assert_eq!(tree.winner(), winner.clone());
+        if let Some(winner) = winner {
+            prop_assert_eq!(tree.conflicts(&winner), old.conflicts(&winner));
+            prop_assert_eq!(
+                tree.deleted_conflicts(&winner),
+                old.deleted_conflicts(&winner)
+            );
+        }
+        for rev in old.edges.keys() {
+            prop_assert_eq!(tree.is_leaf(rev), old.is_leaf(rev));
+            prop_assert_eq!(tree.leaves_from(rev), old.leaves_from(rev));
+            prop_assert_eq!(tree.path(rev), old.path(rev));
+            prop_assert_eq!(tree.is_deleted(rev), old.deleted.contains(rev));
+        }
+        prop_assert!(!tree.is_leaf("0-unknown"));
+        Ok(())
+    }
+
     proptest! {
+        #[test]
+        fn matches_the_edge_map_reference(
+            ops in prop::collection::vec(op_strategy(), 1..30),
+        ) {
+            let mut tree = RevTree::default();
+            let mut old = reference::OldTree::default();
+            for op in ops {
+                match op {
+                    Op::Merge(path, deleted) => {
+                        tree.merge_path(&path, deleted);
+                        old.merge_path(&path, deleted);
+                    }
+                    Op::Prune(limit) => {
+                        tree.prune(limit);
+                        old.prune(limit);
+                    }
+                    Op::Purge(pick) => {
+                        let leaves = old.leaves();
+                        if !leaves.is_empty() {
+                            let leaf = &leaves[pick % leaves.len()];
+                            prop_assert_eq!(tree.purge_leaf(leaf), old.purge_leaf(leaf));
+                        }
+                    }
+                }
+                assert_same(&tree, &old)?;
+                // A stored copy loads back to the same tree.
+                let reloaded: RevTree =
+                    serde_json::from_str(&serde_json::to_string(&tree).unwrap()).unwrap();
+                prop_assert_eq!(&reloaded, &tree);
+                assert_same(&reloaded, &old)?;
+            }
+        }
+
         #[test]
         fn pruning_preserves_leaves_and_winner(
             branches in prop::collection::vec(branch_strategy(), 1..20),
