@@ -431,59 +431,38 @@ const ALL_DOCS_BOOL_PARAMS: &[&str] = &[
     "reduce",
 ];
 
-pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> Response {
-    let DbRequest {
-        st,
-        db,
-        name: dbname,
-        method,
-        q,
-        headers,
-        body,
-        ..
-    } = req;
-    let body: &[u8] = body;
-    if let Some(response) = require_method(method, &["GET", "HEAD", "POST"]) {
-        return response;
-    }
+/// The options of an `_all_docs`-shaped query, from the query string and (for
+/// POST) the body. `_design_docs` and `_local_docs` take the same ones.
+fn all_docs_opts(
+    db: &Db,
+    q: &HashMap<String, String>,
+    method: &Method,
+    body: &[u8],
+    partition: Option<String>,
+) -> DbResult<AllDocsOpts> {
     let partition = partition.or_else(|| q.get("partition").cloned());
     if let Some(partition) = &partition {
         if !db.partitioned {
-            return fail(ApiError::bad_request(
+            return Err(ApiError::bad_request(
                 "`partition` parameter is not supported on this db",
             ));
         }
-        if let Err(error) = crate::db::validate_partition(partition) {
-            return fail(error);
-        }
+        crate::db::validate_partition(partition)?;
     }
-    if let Err(error) = validate_bool_params(q, ALL_DOCS_BOOL_PARAMS) {
-        return fail(error);
-    }
-    let query_limit = match uint_param(q, "limit") {
-        Ok(limit) => limit,
-        Err(error) => return fail(error),
-    };
-    let query_skip = match uint_param(q, "skip") {
-        Ok(skip) => skip,
-        Err(error) => return fail(error),
-    };
+    validate_bool_params(q, ALL_DOCS_BOOL_PARAMS)?;
+    let query_limit = uint_param(q, "limit")?;
+    let query_skip = uint_param(q, "skip")?;
     let key_range = |name: &str, alias: &str| -> DbResult<Option<String>> {
         match json_key_param(q, name)? {
             Some(key) => Ok(Some(key)),
             None => json_key_param(q, alias),
         }
     };
-    let (startkey, endkey, single_key) = match (
-        key_range("startkey", "start_key"),
-        key_range("endkey", "end_key"),
-        json_key_param(q, "key"),
-    ) {
-        (Ok(start), Ok(end), Ok(key)) => (start, end, key),
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return fail(error),
-    };
+    let startkey = key_range("startkey", "start_key")?;
+    let endkey = key_range("endkey", "end_key")?;
+    let single_key = json_key_param(q, "key")?;
     let mut opts = AllDocsOpts {
-        partition: partition.clone(),
+        partition,
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
         attachments: flag(q, "attachments"),
@@ -499,7 +478,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
     };
     if let Some(key) = single_key {
         if q.contains_key("keys") {
-            return fail(ApiError::bad_request("`key` is incompatible with `keys`"));
+            return Err(ApiError::bad_request("`key` is incompatible with `keys`"));
         }
         // CouchDB treats `key` as a range query over live rows, not as a
         // `keys` lookup: a deleted document must not appear.
@@ -510,19 +489,16 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
             Ok(Value::Array(keys)) => {
                 opts.keys = Some(keys);
             }
-            Ok(_) => return fail(ApiError::bad_request("`keys` parameter must be an array.")),
-            Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+            Ok(_) => return Err(ApiError::bad_request("`keys` parameter must be an array.")),
+            Err(_) => return Err(ApiError::bad_request("invalid UTF-8 JSON")),
         }
     }
     if *method == Method::POST {
-        let value = match body_object(body) {
-            Ok(value) => value,
-            Err(error) => return fail(error),
-        };
+        let value = body_object(body)?;
         if opts.keys.is_none() {
             if let Some(keys_value) = value.get("keys") {
                 let Some(keys) = keys_value.as_array() else {
-                    return fail(ApiError::bad_request(
+                    return Err(ApiError::bad_request(
                         "`keys` body member must be an array.",
                     ));
                 };
@@ -543,14 +519,8 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         {
             opts.descending = true;
         }
-        let body_limit = match uint_member(&value, "limit") {
-            Ok(limit) => limit,
-            Err(error) => return fail(error),
-        };
-        let body_skip = match uint_member(&value, "skip") {
-            Ok(skip) => skip,
-            Err(error) => return fail(error),
-        };
+        let body_limit = uint_member(&value, "limit")?;
+        let body_skip = uint_member(&value, "skip")?;
         if query_limit.is_none() {
             if let Some(limit) = body_limit {
                 opts.limit = limit;
@@ -563,46 +533,145 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         }
     }
     if opts.keys.is_some() && (opts.startkey.is_some() || opts.endkey.is_some()) {
-        return fail(ApiError::bad_request(
+        return Err(ApiError::bad_request(
             "`keys` is incompatible with `startkey` and `endkey`",
         ));
     }
+    Ok(opts)
+}
+
+/// Run an `_all_docs` query on this node's shards or, for a cluster
+/// coordinator, on the whole cluster.
+async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
+    let (st, db, headers) = (req.st, req.db, req.headers);
     let shard_mask = if is_forwarded(st, headers) {
-        q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
+        req.q
+            .get("shards")
+            .and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
         None
     };
-    let result = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         cluster_all_docs(
             ClusterRead {
                 st,
                 db,
-                dbname,
+                dbname: req.name,
                 headers,
             },
-            &opts,
+            opts,
         )
         .await
     } else if let Some(mask) = shard_mask {
-        db.all_docs_owned(&opts, &mask).await
-    } else if flag(q, "owner_only") && is_forwarded(st, headers) {
+        db.all_docs_owned(opts, &mask).await
+    } else if flag(req.q, "owner_only") && is_forwarded(st, headers) {
         let owned: Vec<bool> = (0..db.q)
             .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
             .collect();
-        db.all_docs_owned(&opts, &owned).await
+        db.all_docs_owned(opts, &owned).await
     } else {
-        db.all_docs(&opts).await
-    };
-    if !still_allowed(st, db, headers) {
-        return access_denied(&st.principal(headers));
+        db.all_docs(opts).await
+    }
+}
+
+/// The reply once the rows are known: re-check access (a security change may
+/// have landed while the query ran) and add `update_seq` when asked for.
+fn all_docs_reply(req: &DbRequest<'_>, result: DbResult<Value>, update_seq: Value) -> Response {
+    if !still_allowed(req.st, req.db, req.headers) {
+        return access_denied(&req.st.principal(req.headers));
     }
     match result {
         Ok(mut value) => {
-            if flag(q, "update_seq") {
-                value["update_seq"] = json!(db.update_seq());
+            if flag(req.q, "update_seq") {
+                value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
         }
         Err(e) => fail(e),
     }
+}
+
+pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> Response {
+    if let Some(response) = require_method(req.method, &["GET", "HEAD", "POST"]) {
+        return response;
+    }
+    let opts = match all_docs_opts(req.db, req.q, req.method, req.body, partition) {
+        Ok(opts) => opts,
+        Err(error) => return fail(error),
+    };
+    let result = run_all_docs(&req, &opts).await;
+    all_docs_reply(&req, result, json!(req.db.update_seq()))
+}
+
+/// First and one-past-last id of the design documents.
+const DESIGN_FIRST: &str = "_design/";
+const DESIGN_END: &str = "_design0";
+
+/// `GET|POST /{db}/_design_docs`: `_all_docs` over the design documents.
+/// Like CouchDB, `total_rows` counts only design documents while `offset`
+/// still counts every document that sorts before the range.
+pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
+    if let Some(response) = require_method(req.method, &["GET", "HEAD", "POST"]) {
+        return response;
+    }
+    let mut opts = match all_docs_opts(req.db, req.q, req.method, req.body, None) {
+        Ok(opts) => opts,
+        Err(error) => return fail(error),
+    };
+    match &mut opts.keys {
+        // A key outside the range is not looked up, not even to report it
+        // missing.
+        Some(keys) => keys.retain(|key| {
+            key.as_str()
+                .is_some_and(|key| key.starts_with(DESIGN_FIRST))
+        }),
+        None => {
+            let (low, high) = if opts.descending {
+                (&mut opts.endkey, &mut opts.startkey)
+            } else {
+                (&mut opts.startkey, &mut opts.endkey)
+            };
+            if low.as_deref().is_none_or(|key| key < DESIGN_FIRST) {
+                *low = Some(DESIGN_FIRST.to_string());
+            }
+            if high.as_deref().is_none_or(|key| key > DESIGN_END) {
+                *high = Some(DESIGN_END.to_string());
+            }
+        }
+    }
+    let mut result = run_all_docs(&req, &opts).await;
+    if let Ok(value) = &mut result {
+        let everything = AllDocsOpts {
+            startkey: Some(DESIGN_FIRST.to_string()),
+            endkey: Some(DESIGN_END.to_string()),
+            ..Default::default()
+        };
+        match run_all_docs(&req, &everything).await {
+            Ok(all) => {
+                let total = all["rows"].as_array().map_or(0, Vec::len);
+                value["total_rows"] = json!(total);
+                if let Some(offset) = value["offset"].as_u64() {
+                    value["offset"] = json!(offset.min(total as u64));
+                }
+            }
+            Err(error) => result = Err(error),
+        }
+    }
+    all_docs_reply(&req, result, json!(req.db.update_seq()))
+}
+
+/// `GET|POST /{db}/_local_docs`: the `_local/` documents, which live outside
+/// the sharded document store. Like CouchDB, `total_rows` and `offset` are
+/// null. They belong to this node (replication checkpoints), so a cluster
+/// coordinator lists its own.
+pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
+    if let Some(response) = require_method(req.method, &["GET", "HEAD", "POST"]) {
+        return response;
+    }
+    let opts = match all_docs_opts(req.db, req.q, req.method, req.body, None) {
+        Ok(opts) => opts,
+        Err(error) => return fail(error),
+    };
+    let result = req.db.local_docs(&opts).await;
+    all_docs_reply(&req, result, Value::Null)
 }

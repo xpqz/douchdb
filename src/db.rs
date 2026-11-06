@@ -1903,6 +1903,40 @@ impl Db {
             .await
     }
 
+    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
+    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
+    /// CouchDB reports neither `total_rows` nor `offset` for them.
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+        let opts = opts.clone();
+        let rows = self.shards[0]
+            .call(move |s| {
+                let mut docs: Vec<(String, Value)> = Vec::new();
+                let mut corrupt = None;
+                s.scan_range_while(b"l/", None, false, |key, value| {
+                    let Some(id) = key
+                        .strip_prefix(b"l/")
+                        .and_then(|id| std::str::from_utf8(id).ok())
+                    else {
+                        return true;
+                    };
+                    match serde_json::from_slice::<Value>(value) {
+                        Ok(doc) => docs.push((format!("_local/{id}"), doc)),
+                        Err(error) => {
+                            corrupt = Some(format!("corrupt local document {id}: {error}"));
+                            return false;
+                        }
+                    }
+                    true
+                })?;
+                if let Some(reason) = corrupt {
+                    return Err(ApiError::new(500, "internal_server_error", reason));
+                }
+                Ok(local_doc_rows(docs, &opts))
+            })
+            .await?;
+        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+    }
+
     // ----- maintenance -----------------------------------------------------
 
     pub async fn purge(&self, body: &Value) -> DbResult<Value> {
@@ -3176,6 +3210,60 @@ fn all_docs_key_row(
         }
     }
     Ok(Some(row))
+}
+
+/// Select and render `_local_docs` rows from every local document, which
+/// arrive in id order.
+fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
+    let render = |id: &str, doc: &Value| {
+        let rev = doc.get("_rev").cloned().unwrap_or_else(|| json!("0-1"));
+        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
+        if opts.include_docs {
+            row["doc"] = doc.clone();
+        }
+        row
+    };
+    let rows: Vec<Value> = if let Some(keys) = &opts.keys {
+        let mut keys: Vec<&str> = keys
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|key| key.starts_with("_local/"))
+            .collect();
+        if opts.descending {
+            keys.reverse();
+        }
+        keys.into_iter()
+            .map(|key| match docs.iter().find(|(id, _)| id == key) {
+                Some((id, doc)) => render(id, doc),
+                None => json!({"key": key, "error": "not_found"}),
+            })
+            .collect()
+    } else {
+        let in_range = |id: &str| {
+            let (low, high) = if opts.descending {
+                (opts.endkey.as_deref(), opts.startkey.as_deref())
+            } else {
+                (opts.startkey.as_deref(), opts.endkey.as_deref())
+            };
+            let (low_inclusive, high_inclusive) = if opts.descending {
+                (opts.inclusive_end, true)
+            } else {
+                (true, opts.inclusive_end)
+            };
+            low.is_none_or(|low| id > low || (low_inclusive && id == low))
+                && high.is_none_or(|high| id < high || (high_inclusive && id == high))
+        };
+        let mut selected: Vec<&(String, Value)> =
+            docs.iter().filter(|(id, _)| in_range(id)).collect();
+        if opts.descending {
+            selected.reverse();
+        }
+        selected
+            .into_iter()
+            .map(|(id, doc)| render(id, doc))
+            .collect()
+    };
+    rows.into_iter().skip(opts.skip).take(opts.limit).collect()
 }
 
 /// One `_all_docs` row before it is rendered as JSON.

@@ -610,8 +610,8 @@ The cluster paths are covered by the integration tests, including
 `descending`), `_db_updates` (normal/longpoll/continuous, heartbeat),
 `_dbs_info`, `_uuids`, `_membership`, `_session`, `_security`, database
 create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
-`?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`, `_changes`
-(normal/longpoll/true continuous, `feed=eventsource` SSE, heartbeat,
+`?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
+`_design_docs`, `_local_docs`, `_changes` (normal/longpoll/true continuous, `feed=eventsource` SSE, heartbeat,
 `style=all_docs`, `filter=_doc_ids`), `_revs_diff`, `_local/*`, `_purge`,
 `_compact`,
 `_revs_limit`, `_design/{ddoc}/_view/{view}`, `_view_cleanup` and
@@ -879,7 +879,7 @@ all acknowledged documents or refuse to serve them.
 v0.2: the replication protocol, auth, views, search, multiuser admission, a
 Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
-containing `_attachments` are rejected with `attachments_not_supported`.
+containing `_attachments` are rejected with a 400 `bad_request`.
 
 JSON numbers use arbitrary precision: integers beyond `i64`/`u64` are stored
 exactly and hashed with CouchDB's bignum ETF encoding. Document parsing also

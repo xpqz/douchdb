@@ -150,7 +150,10 @@ fn is_write_request(method: &Method, rest: &str) -> bool {
         return false;
     }
     // POST is also used for read-only query shapes.
-    if rest == "_all_docs" || rest == "_bulk_get" || rest == "_revs_diff" {
+    if matches!(
+        rest,
+        "_all_docs" | "_design_docs" | "_local_docs" | "_bulk_get" | "_revs_diff"
+    ) {
         return false;
     }
     if rest.starts_with("_design/")

@@ -395,6 +395,8 @@ pub async fn db_rest(
         "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
         "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
         "_all_docs" => return all_docs(req, None).await,
+        "_design_docs" => return design_docs(req).await,
+        "_local_docs" => return local_docs(req).await,
         "_changes" => return changes(st.clone(), db.clone(), &name, &q, &body, &headers).await,
         "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
         "_purge" => {
