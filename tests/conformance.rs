@@ -10289,6 +10289,97 @@ async fn longpoll_changes_stops_after_security_revocation() {
     assert_no_access(status, "revoked alice");
 }
 
+/// Wait until `GET /{db}/_security` on `node` returns `expected`.
+async fn wait_for_security(node: &Server, db: &str, expected: &Value) {
+    let admin = admin_auth();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = node
+            .req_with(Method::GET, &format!("/{db}/_security"), None, &admin)
+            .await;
+        if status == StatusCode::OK && &body == expected {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "security did not reconcile on {}: {status} {body}",
+                node.base
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn create_db_on_every_node(nodes: &[Server], db: &str) {
+    let admin = admin_auth();
+    for node in nodes {
+        let (status, body) = node
+            .req_with(Method::PUT, &format!("/{db}"), Some(json!({})), &admin)
+            .await;
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::PRECONDITION_FAILED,
+            "create {db}: {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cluster_security_reconciles_to_peer_that_missed_the_update() {
+    let mut nodes = start_cluster_with_auth(3, "1", 3);
+    create_db_on_every_node(&nodes, "secsync").await;
+    let admin = admin_auth();
+
+    // A majority acknowledges, so the write succeeds even though one peer is down.
+    nodes[2].kill();
+    let security = json!({
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["alice"], "roles": []}
+    });
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/secsync/_security",
+            Some(security.clone()),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The returning peer converges through anti-entropy, and the client-visible
+    // body carries no internal version.
+    nodes[2].restart();
+    wait_for_security(&nodes[2], "secsync", &security).await;
+    wait_for_security(&nodes[1], "secsync", &security).await;
+}
+
+#[tokio::test]
+async fn cluster_security_without_quorum_is_accepted_and_converges() {
+    let mut nodes = start_cluster_with_auth(2, "1", 2);
+    create_db_on_every_node(&nodes, "secpend").await;
+    let admin = admin_auth();
+
+    nodes[1].kill();
+    let security = json!({
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["alice"], "roles": []}
+    });
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::PUT,
+            "/secpend/_security",
+            Some(security.clone()),
+            &admin,
+        )
+        .await;
+    // Not a failure: the change is kept and will reach the peer.
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["ok"], true);
+    wait_for_security(&nodes[0], "secpend", &security).await;
+
+    nodes[1].restart();
+    wait_for_security(&nodes[1], "secpend", &security).await;
+}
+
 #[tokio::test]
 async fn cluster_security_change_rolls_back_when_a_peer_is_down() {
     let mut nodes = start_cluster_with_auth(2, "3600", 2);
