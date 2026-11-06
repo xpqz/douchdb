@@ -3055,6 +3055,12 @@ async fn cluster_changes_since_now_fails_when_a_shard_has_no_live_copy() {
     for node in &nodes {
         node.fresh_db("clnowgone").await;
     }
+    // Placement is random, so pin every shard to the node that is killed;
+    // otherwise it may own nothing and losing it loses no shard range.
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/clnowgone", all_shards_on(2))
+        .await;
+    assert_eq!(status, StatusCode::OK);
     nodes[2].kill();
     // CouchDB: fabric_db_info answers {error, {nodedown, <<"progress not
     // possible">>}}, which chttpd maps to 412.
