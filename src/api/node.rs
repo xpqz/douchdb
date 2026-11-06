@@ -244,8 +244,31 @@ pub async fn db_migration_delete(
     }
 }
 
+/// Internal security inspection for anti-entropy: the object and its version.
+pub async fn db_security_get(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.cluster.is_internal(&headers) {
+        let principal = st.principal(&headers);
+        return access_denied(&principal);
+    }
+    match st.db(&name).await {
+        Ok(db) => {
+            let (version, security) = db.security_versioned();
+            json(
+                StatusCode::OK,
+                json!({"version": version, "security": security}),
+            )
+        }
+        Err(error) => fail(error),
+    }
+}
+
 /// Internal/replication-side security update. The public `PUT /db/_security`
-/// handler fans out here after checking database-admin access.
+/// handler fans out here after checking database-admin access. A version older
+/// than the stored one is rejected with 409.
 pub async fn db_security_put(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -260,15 +283,26 @@ pub async fn db_security_put(
         Ok(db) => db,
         Err(error) => return fail(error),
     };
-    let value: Value = match serde_json::from_slice(&body) {
+    let envelope: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return fail(ApiError::bad_request("invalid security object")),
     };
-    if let Err(error) = validate_security(&value) {
+    let (Some(version), Some(value)) = (
+        envelope.get("version").and_then(Value::as_u64),
+        envelope.get("security"),
+    ) else {
+        return fail(ApiError::bad_request("invalid security object"));
+    };
+    if let Err(error) = validate_security(value) {
         return fail(error);
     }
-    match db.set_security(value) {
-        Ok(()) => ok(),
+    match db.set_security_versioned(version, value.clone()) {
+        Ok(true) => ok(),
+        Ok(false) => fail(ApiError::new(
+            409,
+            "conflict",
+            "security object was rejected in favour of a newer or competing one",
+        )),
         Err(error) => fail(error),
     }
 }

@@ -98,14 +98,12 @@ where they are a member or admin. `GET /_dbs_info`, `_db_updates`, `_membership`
 `/_node/...`, cluster/replication management, detailed health and metrics remain
 server-admin operations.
 
-The security object is stored in `security.json` beside the database. A security
-change is applied locally and to **every configured peer** before the coordinator
-reports success. If any peer fails, the coordinator rolls back its local copy and
-the reachable peers, and returns `502 security_propagation_failed`. This prevents
-a healthy peer from keeping a newer security object than the coordinator. If a
-peer is offline, change security when the cluster is healthy; concurrent admin
-changes should go through one coordinator. Cluster-wide security consensus is
-outside this version.
+The security object is stored with a version in `security-versioned.json` beside
+the database (a legacy bare `security.json` is read as version 0). A change is
+stored locally at the next version and pushed to every configured peer; it
+returns 200 once a majority holds it and 202 otherwise. Peers reject older
+versions, equal versions settle on the same winner everywhere, and the
+anti-entropy pass delivers the current object to peers that missed it.
 
 Design documents are database-admin data even when written through
 `_bulk_docs` or `COPY`; a member cannot create or overwrite one through those
@@ -200,9 +198,13 @@ surface and avoids pretending that a local file edit propagates across a cluster
   `_security` for the forwarded principal.
 - Internal requests without user credentials are service admins, trusted by the
   shared cluster secret. Do not expose the cluster secret to clients.
-- `_security` changes are applied to every configured peer or rolled back. If a
-  peer is offline, the change fails; retry when the cluster is healthy. Use one
-  coordinator for concurrent admin changes.
+- `_security` objects are versioned (beside the object, never in the
+  `GET /db/_security` body). The coordinator stores the change and pushes it to
+  every peer; peers reject older versions, and concurrent updates with the same
+  version settle on one winner everywhere. The anti-entropy pass reconciles the
+  object, so a peer that was offline, restored or added later converges. The
+  write returns 200 once a majority holds it and 202 when it does not yet, in
+  which case it is still kept and delivered when the peers return.
 - Set the same `--session-secret` (or cluster secret) on every node if session
   cookies should work across nodes.
 - Admission is local to each node.
@@ -219,7 +221,8 @@ per_user_admission_caps_concurrency_and_preserves_other_users
 global_admission_limit_protects_capacity_across_users
 cross_user_isolation_is_watertight
 longpoll_changes_stops_after_security_revocation
-cluster_security_change_rolls_back_when_a_peer_is_down
+cluster_security_reconciles_to_peer_that_missed_the_update
+cluster_security_without_quorum_is_accepted_and_converges
 ```
 
 Unit tests in `src/admission.rs` cover per-user/global limits, the heavy lane,

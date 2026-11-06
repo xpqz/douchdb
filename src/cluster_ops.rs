@@ -6,82 +6,48 @@ use crate::cluster::ShardMap;
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
+use futures::future::join_all;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-async fn send_security(
-    st: &AppState,
-    peer: &str,
-    name: &str,
-    value: &Value,
-    headers: &HeaderMap,
-) -> Result<(), String> {
-    let request = internal_request(
-        st,
-        reqwest::Method::PUT,
-        peer,
-        &["_node", "_local", "_dbs", name, "security"],
-        Some(headers),
-    )
-    .json(value);
-    match request.send().await {
-        Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
-        Err(error) => Err(format!("{peer}: {error}")),
-    }
-}
-
-/// Apply a security object locally and, in a cluster, to every peer before
-/// reporting success. A partial fan-out is rolled back so a reachable peer does
-/// not keep a newer security object than the coordinator.
+/// Apply a security object locally and push it to every peer.
+///
+/// The object is versioned, so the local write is kept even when peers are
+/// unreachable: anti-entropy (`fabric::reconcile_security`) delivers it later
+/// and peers never move back to an older version. Returns whether a majority
+/// of the cluster, this node included, holds the object now.
 pub(crate) async fn set_security_everywhere(
     st: &AppState,
     db: &Db,
     name: &str,
     value: Value,
     headers: &HeaderMap,
-) -> DbResult<()> {
+) -> DbResult<bool> {
+    let version = db.set_security(value.clone())?;
     if !st.cluster.is_clustered() || is_forwarded(st, headers) {
-        return db.set_security(value);
+        return Ok(true);
     }
-    let old = db.security();
-    db.set_security(value.clone())?;
-    let peers: Vec<String> = st
-        .cluster
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
-        .map(|(_, peer)| peer.clone())
-        .collect();
-    let mut failures = Vec::new();
-    for peer in &peers {
-        if let Err(error) = send_security(st, peer, name, &value, headers).await {
-            failures.push(error);
+    let envelope = json!({"version": version, "security": value});
+    let responses = join_all(st.cluster.peers().map(|peer| {
+        let request = internal_request(
+            st,
+            reqwest::Method::PUT,
+            peer,
+            &["_node", "_local", "_dbs", name, "security"],
+            Some(headers),
+        )
+        .json(&envelope);
+        async move {
+            request
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
         }
-    }
-    if failures.is_empty() {
-        return Ok(());
-    }
-    let rollback_error = db.set_security(old.clone()).err();
-    for peer in &peers {
-        if let Err(error) = send_security(st, peer, name, &old, headers).await {
-            tracing::warn!("security rollback to {peer} failed: {error}");
-        }
-    }
-    let reason = failures.join("; ");
-    if let Some(error) = rollback_error {
-        return Err(ApiError::new(
-            500,
-            "security_rollback_failed",
-            format!("{reason}; local rollback failed: {}", error.reason),
-        ));
-    }
-    Err(ApiError::new(
-        502,
-        "security_propagation_failed",
-        format!("security change was not applied everywhere: {reason}"),
-    ))
+    }))
+    .await;
+    let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
+    Ok(acknowledgements > st.cluster.nodes.len().max(1) / 2)
 }
 
 fn shard_map_rejected() -> ApiError {

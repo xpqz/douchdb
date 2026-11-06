@@ -145,6 +145,85 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     }
 }
 
+/// Whether `(version, security)` supersedes `(current_version, current)`:
+/// newer wins, equal versions fall back to the canonical-form tiebreak that
+/// `Db::set_security_versioned` applies.
+fn security_supersedes(
+    version: u64,
+    security: &serde_json::Value,
+    current_version: u64,
+    current: &serde_json::Value,
+) -> bool {
+    version > current_version
+        || (version == current_version
+            && crate::db::canonical_json(security) > crate::db::canonical_json(current))
+}
+
+/// Reconcile the versioned `_security` object with peers: adopt the newest
+/// one any peer reports, then push it to the peers that hold something else.
+/// This is what brings a restored, new or rollback-missed node up to date.
+pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
+    if !st.cluster.is_clustered() {
+        return;
+    }
+    let fetched = join_all(st.cluster.peers().map(|peer| async move {
+        let request = internal_request(
+            st,
+            reqwest::Method::GET,
+            peer,
+            &["_node", "_local", "_dbs", &db.name, "security"],
+            None,
+        );
+        let envelope = request
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()?;
+        let version = envelope.get("version")?.as_u64()?;
+        let security = envelope.get("security")?.clone();
+        Some((peer.clone(), version, security))
+    }))
+    .await;
+    let fetched: Vec<(String, u64, serde_json::Value)> = fetched.into_iter().flatten().collect();
+
+    let (mut version, mut security) = db.security_versioned();
+    for (_, peer_version, peer_security) in &fetched {
+        if security_supersedes(*peer_version, peer_security, version, &security)
+            && db
+                .set_security_versioned(*peer_version, peer_security.clone())
+                .unwrap_or(false)
+        {
+            version = *peer_version;
+            security = peer_security.clone();
+        }
+    }
+
+    let envelope = serde_json::json!({"version": version, "security": security});
+    join_all(
+        fetched
+            .iter()
+            .filter(|(_, peer_version, peer_security)| {
+                *peer_version != version || *peer_security != security
+            })
+            .map(|(peer, _, _)| {
+                let request = internal_request(
+                    st,
+                    reqwest::Method::PUT,
+                    peer,
+                    &["_node", "_local", "_dbs", &db.name, "security"],
+                    None,
+                )
+                .json(&envelope);
+                async move {
+                    let _ = request.send().await;
+                }
+            }),
+    )
+    .await;
+}
+
 /// A client request to replay against a peer that owns the document.
 pub(crate) struct ForwardRequest<'a> {
     pub method: &'a Method,

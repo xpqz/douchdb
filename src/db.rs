@@ -160,6 +160,48 @@ pub fn validate_partition(partition: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// Read the stored security object. Databases written before security was
+/// versioned keep a bare object in `security.json`; that is version 0.
+fn load_security(path: &Path) -> (u64, Value) {
+    let read = |name: &str| {
+        std::fs::read(path.join(name))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    if let Some(stored) = read("security-versioned.json") {
+        if let (Some(version), Some(security)) = (
+            stored.get("version").and_then(Value::as_u64),
+            stored.get("security"),
+        ) {
+            return (version, security.clone());
+        }
+    }
+    (0, read("security.json").unwrap_or_else(|| json!({})))
+}
+
+/// JSON text with object keys sorted, for ordering values independently of
+/// the key order each node happened to receive.
+pub(crate) fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let body: Vec<String> = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!("{}:{}", Value::String(key.clone()), canonical_json(value))
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
 pub struct Db {
     pub name: String,
     pub path: PathBuf,
@@ -168,7 +210,7 @@ pub struct Db {
     pub uuid: String,
     pub instance_start_time: String,
     shard_map: Arc<std::sync::RwLock<ShardMap>>,
-    security: Arc<std::sync::RwLock<Value>>,
+    security: Arc<std::sync::RwLock<(u64, Value)>>,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
     compact_running: Arc<AtomicBool>,
@@ -278,10 +320,7 @@ impl Db {
             .map(ShardHandle::initial_seq)
             .max()
             .unwrap_or(0);
-        let security = std::fs::read(path.join("security.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .unwrap_or_else(|| json!({}));
+        let security = load_security(&path);
 
         Ok(Db {
             name: name.to_string(),
@@ -379,6 +418,12 @@ impl Db {
     }
 
     pub fn security(&self) -> Value {
+        self.security_versioned().1
+    }
+
+    /// The security object with its cluster version. The version lives beside
+    /// the object so `GET /db/_security` shows only what CouchDB shows.
+    pub fn security_versioned(&self) -> (u64, Value) {
         self.security
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -483,20 +528,64 @@ impl Db {
         }
     }
 
-    pub fn set_security(&self, value: Value) -> DbResult<()> {
-        let bytes = serde_json::to_vec(&value)
+    /// Replace the security object with a client-supplied one, one version
+    /// newer than the current one. Returns the version it was stored at.
+    pub fn set_security(&self, value: Value) -> DbResult<u64> {
+        // Pick the version under the lock: two concurrent writes on this node
+        // must not share a version, or the tiebreak could drop an acknowledged
+        // one.
+        let mut current = self
+            .security
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let version = current.0.saturating_add(1);
+        self.store_security(&mut current, version, value)?;
+        Ok(version)
+    }
+
+    /// Store a security object at `version` unless the current one is newer.
+    /// Equal versions are ordered by the canonical form of the object so that
+    /// concurrent updates settle on the same winner on every node. Returns
+    /// whether the object is now the stored one.
+    pub fn set_security_versioned(&self, version: u64, value: Value) -> DbResult<bool> {
+        let mut current = self
+            .security
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if version < current.0 {
+            return Ok(false);
+        }
+        if version == current.0 {
+            match canonical_json(&value).cmp(&canonical_json(&current.1)) {
+                std::cmp::Ordering::Equal => return Ok(true),
+                std::cmp::Ordering::Less => return Ok(false),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        self.store_security(&mut current, version, value)?;
+        Ok(true)
+    }
+
+    /// Persist and install a security object; the caller holds the lock.
+    fn store_security(
+        &self,
+        current: &mut (u64, Value),
+        version: u64,
+        value: Value,
+    ) -> DbResult<()> {
+        let bytes = serde_json::to_vec(&json!({"version": version, "security": value}))
             .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-        std::fs::write(self.path.join("security.json"), bytes).map_err(|error| {
+        let write_error = |error: std::io::Error| {
             ApiError::new(
                 500,
                 "internal_server_error",
-                format!("security.json: {error}"),
+                format!("security-versioned.json: {error}"),
             )
-        })?;
-        *self
-            .security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = value;
+        };
+        let tmp = self.path.join("security-versioned.json.tmp");
+        std::fs::write(&tmp, bytes).map_err(write_error)?;
+        std::fs::rename(&tmp, self.path.join("security-versioned.json")).map_err(write_error)?;
+        *current = (version, value);
         Ok(())
     }
 
@@ -2940,6 +3029,46 @@ mod tests {
             .map(|i| format!("shard{shard}-{i}"))
             .find(|id| db.shard_index(id) == shard)
             .expect("document id for shard")
+    }
+
+    #[test]
+    fn security_versions_order_updates_and_survive_reopen() {
+        let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::db::uuid()));
+        let config = || DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::balanced(1, 1, 1),
+            partitioned: false,
+        };
+        let db = Db::open(&root, "sec", config()).unwrap();
+        assert_eq!(db.security_versioned(), (0, json!({})));
+
+        // A legacy bare object is version 0.
+        std::fs::write(
+            db.path.join("security.json"),
+            br#"{"members":{"names":["old"]}}"#,
+        )
+        .unwrap();
+        drop(db);
+        let db = Db::open(&root, "sec", config()).unwrap();
+        assert_eq!(
+            db.security_versioned(),
+            (0, json!({"members": {"names": ["old"]}}))
+        );
+
+        assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
+        assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
+        // Older versions are rejected; equal ones are ordered by canonical form.
+        assert!(!db.set_security_versioned(2, json!({"a": 2})).unwrap());
+        assert!(!db.set_security_versioned(3, json!({"a": 2})).unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
+        assert_eq!(db.security(), json!({"a": 4}));
+        drop(db);
+
+        let db = Db::open(&root, "sec", config()).unwrap();
+        assert_eq!(db.security_versioned(), (3, json!({"a": 4})));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
