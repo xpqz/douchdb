@@ -14,6 +14,7 @@ const NEW_FLOAT_EXT: u8 = 70;
 const SMALL_TUPLE_EXT: u8 = 104;
 const LARGE_TUPLE_EXT: u8 = 105;
 const NIL_EXT: u8 = 106;
+const STRING_EXT: u8 = 107;
 const LIST_EXT: u8 = 108;
 const BINARY_EXT: u8 = 109;
 const ATOM_EXT: u8 = 100;
@@ -39,6 +40,15 @@ pub enum Term {
 }
 
 impl Term {
+    /// The value if this is an integer that fits STRING_EXT's byte range.
+    fn as_byte(&self) -> Option<u8> {
+        match self {
+            Term::Int(i) => u8::try_from(*i).ok(),
+            Term::UInt(u) => u8::try_from(*u).ok(),
+            _ => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![VERSION_MAGIC];
         self.encode_into(&mut out);
@@ -124,14 +134,21 @@ impl Term {
                 out.extend_from_slice(b);
             }
             Term::List(items) if items.is_empty() => out.push(NIL_EXT),
-            Term::List(items) => {
-                out.push(LIST_EXT);
-                out.extend((items.len() as u32).to_be_bytes());
-                for item in items {
-                    item.encode_into(out);
+            // term_to_binary packs a list of integers 0..=255 (at most 65535
+            // of them) as STRING_EXT (erts/emulator/beam/external.c, and the
+            // "External Term Format" docs). jiffy decodes [1,2,3] to exactly
+            // such a list.
+            Term::List(items) if items.len() <= u16::MAX as usize => {
+                match items.iter().map(Term::as_byte).collect::<Option<Vec<u8>>>() {
+                    Some(bytes) => {
+                        out.push(STRING_EXT);
+                        out.extend((bytes.len() as u16).to_be_bytes());
+                        out.extend_from_slice(&bytes);
+                    }
+                    None => encode_list(items, out),
                 }
-                out.push(NIL_EXT);
             }
+            Term::List(items) => encode_list(items, out),
             Term::Tuple(items) if items.len() < 256 => {
                 out.push(SMALL_TUPLE_EXT);
                 out.push(items.len() as u8);
@@ -148,6 +165,15 @@ impl Term {
             }
         }
     }
+}
+
+fn encode_list(items: &[Term], out: &mut Vec<u8>) {
+    out.push(LIST_EXT);
+    out.extend((items.len() as u32).to_be_bytes());
+    for item in items {
+        item.encode_into(out);
+    }
+    out.push(NIL_EXT);
 }
 
 fn is_integer(raw: &str) -> bool {
@@ -363,13 +389,56 @@ mod tests {
     fn lists_and_tuples() {
         assert_eq!(Term::List(vec![]).encode(), vec![131, NIL_EXT]);
         assert_eq!(
-            Term::List(vec![Term::Int(1)]).encode(),
-            vec![131, 108, 0, 0, 0, 1, 97, 1, 106]
+            Term::List(vec![Term::Atom("a")]).encode(),
+            vec![131, 108, 0, 0, 0, 1, 100, 0, 1, b'a', 106]
         );
         assert_eq!(
             Term::Tuple(vec![Term::Int(1), Term::Int(2)]).encode(),
             vec![131, 104, 2, 97, 1, 97, 2]
         );
+    }
+
+    #[test]
+    fn lists_of_bytes_use_string_ext() {
+        // Erlang's term_to_binary packs a list of integers 0..=255 as
+        // STRING_EXT (107, u16 length, raw bytes), which is what jiffy's
+        // [1,2,3] becomes.
+        let list = |items: &[i64]| Term::List(items.iter().map(|i| Term::Int(*i)).collect());
+        assert_eq!(list(&[1, 2, 3]).encode(), vec![131, 107, 0, 3, 1, 2, 3]);
+        assert_eq!(list(&[0, 255]).encode(), vec![131, 107, 0, 2, 0, 255]);
+        assert_eq!(
+            Term::List(vec![Term::UInt(7)]).encode(),
+            vec![131, 107, 0, 1, 7]
+        );
+        // One element outside 0..=255 keeps the whole list as LIST_EXT.
+        assert_eq!(list(&[1, 256]).encode()[1], LIST_EXT);
+        assert_eq!(list(&[1, -1]).encode()[1], LIST_EXT);
+        assert_eq!(list(&[1, i64::MAX]).encode()[1], LIST_EXT);
+        // Floats are not integers, even when integral.
+        assert_eq!(
+            Term::List(vec![Term::Int(1), Term::Float(1.0)]).encode()[1],
+            LIST_EXT
+        );
+        assert_eq!(
+            Term::List(vec![Term::Int(1), Term::Atom("null")]).encode()[1],
+            LIST_EXT
+        );
+        assert_eq!(Term::List(vec![]).encode(), vec![131, NIL_EXT]);
+        // From JSON: a float literal 2.0 is not a small integer.
+        let value: Value = serde_json::from_str("[1, 2.0]").unwrap();
+        assert_eq!(from_json(&value).encode()[1], LIST_EXT);
+        assert_eq!(from_json(&json!([1, 2, 3])).encode()[1], 107);
+    }
+
+    #[test]
+    fn string_ext_length_limit_is_65535() {
+        let at_limit = Term::List(vec![Term::Int(9); 65535]).encode();
+        assert_eq!(&at_limit[1..4], &[107, 255, 255]);
+        assert_eq!(at_limit.len(), 4 + 65535);
+
+        let over = Term::List(vec![Term::Int(9); 65536]).encode();
+        assert_eq!(over[1], LIST_EXT);
+        assert_eq!(&over[2..6], &[0, 1, 0, 0]);
     }
 
     /// Byte-for-byte agreement with OTP 27 and with CouchDB 3.5.3's rev ids.

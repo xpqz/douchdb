@@ -211,10 +211,32 @@ mod tests {
                 "41692bf1af92c4fee2f4783a50ceb756",
             ),
             (json!({"b": 1, "a": 2}), "afc27c384a7b497e8b717857527a0dc7"),
+            // Small-integer arrays hash as Erlang strings (STRING_EXT);
+            // both revs verified against live CouchDB 3.5.
+            (json!({"a": [1, 2, 3]}), "308048961a84beb0c9e99e07facf0f5f"),
+            (json!({"a": [0, 255]}), "ebdd13a7ecf6387443aa094a0d18b4d6"),
         ];
         for (body, expected) in cases {
             let got = hex16(new_revid(false, None, &body, &[]));
             assert_eq!(got, expected, "body {body}");
+        }
+    }
+
+    /// The request path parses bodies with `json::from_slice`, not `json!`;
+    /// the integers it yields must hash the same way.
+    #[test]
+    fn parsed_request_bodies_match_couchdb_3_5() {
+        // Revs recorded from a live Apache CouchDB 3.5 (`POST /db`).
+        let cases = [
+            (r#"{"a":[1,2,3]}"#, "308048961a84beb0c9e99e07facf0f5f"),
+            (r#"{"a":[0,255]}"#, "ebdd13a7ecf6387443aa094a0d18b4d6"),
+            (r#"{"a":[1,256]}"#, "d0259a7a9a59173bfe7d4da469ac3cb6"),
+            (r#"{"a":[1,2.0]}"#, "3b562cec9ddf9f74ee2f9b8a9de3f536"),
+        ];
+        for (raw, expected) in cases {
+            let body = crate::json::from_slice(raw.as_bytes()).unwrap();
+            let got = hex16(new_revid(false, None, &body, &[]));
+            assert_eq!(got, expected, "body {raw}");
         }
     }
 }
