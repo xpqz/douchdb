@@ -211,6 +211,10 @@ mod tests {
                 "41692bf1af92c4fee2f4783a50ceb756",
             ),
             (json!({"b": 1, "a": 2}), "afc27c384a7b497e8b717857527a0dc7"),
+            // Small-integer arrays hash as Erlang strings (STRING_EXT).
+            // Expected value computed from the term_to_binary spec, not
+            // recorded from a live CouchDB.
+            (json!({"a": [1, 2, 3]}), "308048961a84beb0c9e99e07facf0f5f"),
         ];
         for (body, expected) in cases {
             let got = hex16(new_revid(false, None, &body, &[]));

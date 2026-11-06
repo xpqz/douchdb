@@ -372,6 +372,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lists_of_bytes_use_string_ext() {
+        // Erlang's term_to_binary packs a list of integers 0..=255 as
+        // STRING_EXT (107, u16 length, raw bytes), which is what jiffy's
+        // [1,2,3] becomes.
+        let list = |items: &[i64]| Term::List(items.iter().map(|i| Term::Int(*i)).collect());
+        assert_eq!(list(&[1, 2, 3]).encode(), vec![131, 107, 0, 3, 1, 2, 3]);
+        assert_eq!(list(&[0, 255]).encode(), vec![131, 107, 0, 2, 0, 255]);
+        assert_eq!(
+            Term::List(vec![Term::UInt(7)]).encode(),
+            vec![131, 107, 0, 1, 7]
+        );
+        // One element outside 0..=255 keeps the whole list as LIST_EXT.
+        assert_eq!(list(&[1, 256]).encode()[1], LIST_EXT);
+        assert_eq!(list(&[1, -1]).encode()[1], LIST_EXT);
+        assert_eq!(list(&[1, i64::MAX]).encode()[1], LIST_EXT);
+        // Floats are not integers, even when integral.
+        assert_eq!(
+            Term::List(vec![Term::Int(1), Term::Float(1.0)]).encode()[1],
+            LIST_EXT
+        );
+        assert_eq!(
+            Term::List(vec![Term::Int(1), Term::Atom("null")]).encode()[1],
+            LIST_EXT
+        );
+        assert_eq!(Term::List(vec![]).encode(), vec![131, NIL_EXT]);
+        // From JSON: a float literal 2.0 is not a small integer.
+        let value: Value = serde_json::from_str("[1, 2.0]").unwrap();
+        assert_eq!(from_json(&value).encode()[1], LIST_EXT);
+        assert_eq!(from_json(&json!([1, 2, 3])).encode()[1], 107);
+    }
+
+    #[test]
+    fn string_ext_length_limit_is_65535() {
+        let at_limit = Term::List(vec![Term::Int(9); 65535]).encode();
+        assert_eq!(&at_limit[1..4], &[107, 255, 255]);
+        assert_eq!(at_limit.len(), 4 + 65535);
+
+        let over = Term::List(vec![Term::Int(9); 65536]).encode();
+        assert_eq!(over[1], LIST_EXT);
+        assert_eq!(&over[2..6], &[0, 1, 0, 0]);
+    }
+
     /// Byte-for-byte agreement with OTP 27 and with CouchDB 3.5.3's rev ids.
     #[test]
     fn matches_erlang_term_to_binary() {
