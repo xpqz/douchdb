@@ -1681,6 +1681,47 @@ async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB 3.5.3 answers a non-string entry in `keys` with a `not_found` row
+/// that echoes the key; douchdb used to drop it, shifting every later row.
+#[tokio::test]
+async fn all_docs_keys_with_non_string_entries_get_not_found_rows() {
+    let s = Server::start(false);
+    s.fresh_db("nonstr").await;
+    let (status, _) = s.put("/nonstr/d1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let keys = json!([1, "d1", null, {"a": 1}, "zz", true]);
+    let expected = |rows: &Value| {
+        assert_eq!(rows[0], json!({"key": 1, "error": "not_found"}));
+        assert_eq!(rows[1]["id"], "d1");
+        assert_eq!(rows[2], json!({"key": null, "error": "not_found"}));
+        assert_eq!(rows[3], json!({"key": {"a": 1}, "error": "not_found"}));
+        assert_eq!(rows[4], json!({"key": "zz", "error": "not_found"}));
+        assert_eq!(rows[5], json!({"key": true, "error": "not_found"}));
+        assert_eq!(rows.as_array().map(Vec::len), Some(6));
+    };
+    let (status, body) = s
+        .post("/nonstr/_all_docs", json!({ "keys": keys.clone() }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    expected(&body["rows"]);
+    let encoded = keys.to_string().replace('"', "%22");
+    let (status, body) = s.get(&format!("/nonstr/_all_docs?keys={encoded}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    expected(&body["rows"]);
+
+    // `skip` and `limit` count the error rows too.
+    let (status, body) = s
+        .post(
+            "/nonstr/_all_docs?skip=1&limit=2",
+            json!({"keys": [1, "d1", null]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "d1");
+    assert_eq!(body["rows"][1], json!({"key": null, "error": "not_found"}));
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(2));
+}
+
 #[tokio::test]
 async fn all_docs_key_excludes_deleted_and_reports_update_seq() {
     let s = Server::start(false);
@@ -10321,6 +10362,37 @@ async fn databases_take_couchdb_shard_defaults_and_per_database_overrides() {
         // A single copy satisfies the default read quorum.
         let (status, doc) = node.get("/qncluster/d07").await;
         assert_eq!(status, StatusCode::OK, "{}: {doc}", node.base);
+    }
+}
+
+#[tokio::test]
+async fn cluster_all_docs_keys_with_non_string_entries_get_not_found_rows() {
+    let nodes = start_cluster_with(2, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("cnonstr").await;
+    }
+    let (status, _) = nodes[0]
+        .post(
+            "/cnonstr/_bulk_docs",
+            json!({"docs": [{"_id": "a"}, {"_id": "b"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for node in &nodes {
+        let (status, body) = node
+            .post("/cnonstr/_all_docs", json!({"keys": [1, "a", null, "b"]}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = &body["rows"];
+        assert_eq!(rows[0], json!({"key": 1, "error": "not_found"}), "{body}");
+        assert_eq!(rows[1]["id"], "a", "{body}");
+        assert_eq!(
+            rows[2],
+            json!({"key": null, "error": "not_found"}),
+            "{body}"
+        );
+        assert_eq!(rows[3]["id"], "b", "{body}");
+        assert_eq!(rows.as_array().map(Vec::len), Some(4), "{body}");
     }
 }
 
