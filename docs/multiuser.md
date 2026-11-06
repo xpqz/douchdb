@@ -98,14 +98,12 @@ where they are a member or admin. `GET /_dbs_info`, `_db_updates`, `_membership`
 `/_node/...`, cluster/replication management, detailed health and metrics remain
 server-admin operations.
 
-The security object is stored in `security.json` beside the database. A security
-change is applied locally and to **every configured peer** before the coordinator
-reports success. If any peer fails, the coordinator rolls back its local copy and
-the reachable peers, and returns `502 security_propagation_failed`. This prevents
-a healthy peer from keeping a newer security object than the coordinator. If a
-peer is offline, change security when the cluster is healthy; concurrent admin
-changes should go through one coordinator. Cluster-wide security consensus is
-outside this version.
+The security object is stored with a version in `security-versioned.json` beside
+the database (a legacy bare `security.json` is read as version 0). A change is
+stored locally at the next version and pushed to every configured peer; it
+returns 200 once a majority holds it and 202 otherwise. Peers reject older
+versions, equal versions settle on the same winner everywhere, and the
+anti-entropy pass delivers the current object to peers that missed it.
 
 Design documents are database-admin data even when written through
 `_bulk_docs` or `COPY`; a member cannot create or overwrite one through those

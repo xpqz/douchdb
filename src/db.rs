@@ -531,8 +531,15 @@ impl Db {
     /// Replace the security object with a client-supplied one, one version
     /// newer than the current one. Returns the version it was stored at.
     pub fn set_security(&self, value: Value) -> DbResult<u64> {
-        let version = self.security_versioned().0.saturating_add(1);
-        self.set_security_versioned(version, value)?;
+        // Pick the version under the lock: two concurrent writes on this node
+        // must not share a version, or the tiebreak could drop an acknowledged
+        // one.
+        let mut current = self
+            .security
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let version = current.0.saturating_add(1);
+        self.store_security(&mut current, version, value)?;
         Ok(version)
     }
 
@@ -555,6 +562,17 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
+        self.store_security(&mut current, version, value)?;
+        Ok(true)
+    }
+
+    /// Persist and install a security object; the caller holds the lock.
+    fn store_security(
+        &self,
+        current: &mut (u64, Value),
+        version: u64,
+        value: Value,
+    ) -> DbResult<()> {
         let bytes = serde_json::to_vec(&json!({"version": version, "security": value}))
             .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
         let write_error = |error: std::io::Error| {
@@ -568,7 +586,7 @@ impl Db {
         std::fs::write(&tmp, bytes).map_err(write_error)?;
         std::fs::rename(&tmp, self.path.join("security-versioned.json")).map_err(write_error)?;
         *current = (version, value);
-        Ok(true)
+        Ok(())
     }
 
     pub fn shard_map(&self) -> ShardMap {
