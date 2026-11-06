@@ -1551,8 +1551,8 @@ async fn ensure_rows(
     }
 
     if index.last_seq < current_seq {
-        let mut changes = db
-            .changes(&ChangesOpts {
+        let (rows, _, _) = db
+            .changes_rows(&ChangesOpts {
                 since: index.last_seq,
                 include_docs: true,
                 until: Some(current_seq),
@@ -1561,19 +1561,13 @@ async fn ensure_rows(
             .await?;
         let mut changed = Vec::new();
         let mut docs = Vec::new();
-        for mut row in crate::json::take_array(&mut changes, "results").unwrap_or_default() {
-            let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-                continue;
-            };
-            changed.push(id.clone());
-            if id.starts_with("_design/")
-                || id.starts_with("_local/")
-                || row.get("deleted").and_then(Value::as_bool).unwrap_or(false)
-            {
+        for row in rows {
+            changed.push(row.id.clone());
+            if row.id.starts_with("_design/") || row.id.starts_with("_local/") || row.deleted {
                 continue;
             }
-            if let Some(doc) = row.get_mut("doc").map(Value::take) {
-                docs.push((id, doc));
+            if let Some(doc) = row.doc {
+                docs.push((row.id, serde_json::from_str::<Value>(&doc)?));
             }
         }
         let rows = run_map(&spec.map, &docs, limits).map_err(|reason| {

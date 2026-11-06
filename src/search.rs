@@ -492,8 +492,8 @@ async fn update_index(
     // committed before it was read, so a gap left by a write that never
     // finished does not keep the index behind.
     let last_seq = db.changes_watermark(since, None);
-    let mut changes = db
-        .changes(&crate::db::ChangesOpts {
+    let (rows, _, _) = db
+        .changes_rows(&crate::db::ChangesOpts {
             since,
             include_docs: true,
             until: Some(last_seq),
@@ -502,19 +502,18 @@ async fn update_index(
         .await?;
     let mut changed = std::collections::HashSet::new();
     let mut live = Vec::new();
-    for mut row in crate::json::take_array(&mut changes, "results").unwrap_or_default() {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
-            continue;
-        };
-        if id.starts_with("_design/") || id.starts_with("_local/") {
+    for row in rows {
+        if row.id.starts_with("_design/") || row.id.starts_with("_local/") {
             continue;
         }
-        changed.insert(id.clone());
-        if row.get("deleted").and_then(Value::as_bool) == Some(true) {
+        changed.insert(row.id.clone());
+        if row.deleted {
             continue;
         }
-        if let Some(doc) = row.get_mut("doc").map(Value::take) {
-            live.push((id, doc.to_string()));
+        // The row already carries the document as JSON text, which is what
+        // the index function takes.
+        if let Some(doc) = row.doc {
+            live.push((row.id, doc));
         }
     }
     let source = spec.source.clone();
