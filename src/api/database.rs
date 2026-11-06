@@ -191,6 +191,23 @@ pub async fn db_root(
             if let Err(e) = db.validate_doc_id(&id) {
                 return fail(e);
             }
+            if let Some(response) =
+                require_design_admin(&st, &db, &headers, std::slice::from_ref(&doc))
+            {
+                return response;
+            }
+            if id.starts_with("_local/") {
+                // Local documents bypass the shard path and validation, as
+                // with `PUT /{db}/_local/{id}`.
+                let local = id.strip_prefix("_local/").unwrap_or(&id);
+                return match db.local_put(local, doc).await {
+                    Ok(v) => json(StatusCode::CREATED, v),
+                    Err(e) => fail(e),
+                };
+            }
+            if let Some(response) = validate_write(&st, &db, &name, &mut doc, &headers).await {
+                return response;
+            }
             // `commit_docs` routes the generated id to every replica in its
             // shard set, so a dead primary does not lose the document.
             match commit_docs(
