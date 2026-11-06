@@ -1019,16 +1019,12 @@ pub(crate) fn parse_sort(value: &Value) -> Vec<(String, bool)> {
 }
 
 fn query_terms(query: &str) -> Vec<String> {
+    const PUNCTUATION: &[char] = &['+', '-', '"', '~', '*', '?', '[', ']', '{', '}', ':', '^'];
     query
         .split_whitespace()
         .flat_map(|token| token.split(['(', ')']))
         .filter_map(|token| {
-            let token = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '+' | '-' | '"' | '~' | '*' | '?' | '[' | ']' | '{' | '}' | ':' | '^'
-                )
-            });
+            let token = token.trim_matches(PUNCTUATION);
             if token.is_empty()
                 || token == "TO"
                 || token == "AND"
@@ -1037,7 +1033,13 @@ fn query_terms(query: &str) -> Vec<String> {
             {
                 return None;
             }
+            // A quoted phrase after a field name (field:"a b") keeps its
+            // opening quote once the field is split off.
             let token = token.rsplit(':').next().unwrap_or(token);
+            let token = token.trim_matches(PUNCTUATION);
+            if token.is_empty() {
+                return None;
+            }
             // Same per-character lowercasing as highlight_fragment applies to the text.
             Some(token.chars().flat_map(char::to_lowercase).collect())
         })
