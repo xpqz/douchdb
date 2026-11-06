@@ -3925,6 +3925,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn meta_config() -> DbConfig {
+        DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::balanced(1, 1, 1),
+            partitioned: false,
+        }
+    }
+
+    fn open_error(file: &str, contents: &[u8]) -> ApiError {
+        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::db::uuid()));
+        drop(Db::open(&root, "meta", meta_config()).unwrap());
+        std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
+        let error = match Db::open(&root, "meta", meta_config()) {
+            Ok(_) => panic!("{file} with {contents:?} opened"),
+            Err(error) => error,
+        };
+        // The corrupt file is left for the operator, not overwritten.
+        assert_eq!(
+            std::fs::read(db_path(&root, "meta").join(file)).unwrap(),
+            contents
+        );
+        std::fs::remove_dir_all(root).ok();
+        error
+    }
+
+    #[test]
+    fn corrupt_metadata_fails_open_with_a_server_error() {
+        for (file, contents) in [
+            ("db.json", &b"{ not json"[..]),
+            ("shard-map.json", b"{ not json"),
+            ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
+            ("security-versioned.json", b"{ not json"),
+            ("security-versioned.json", br#"{"version":1}"#),
+            ("security.json", b"{ not json"),
+        ] {
+            let error = open_error(file, contents);
+            assert_eq!(error.status, 500, "{file}: {}", error.reason);
+            assert!(error.reason.contains(file), "{file}: {}", error.reason);
+        }
+    }
+
+    #[test]
+    fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
+        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::db::uuid()));
+        let config = || DbConfig {
+            q: 2,
+            revs_limit: 100,
+            shard_map: ShardMap::balanced(2, 3, 1),
+            partitioned: false,
+        };
+        for round in 0..40 {
+            let db = Db::open(&root, &format!("race{round}"), config()).unwrap();
+            let maps: Vec<ShardMap> = (0..3)
+                .map(|node| ShardMap {
+                    q: 2,
+                    node_count: 3,
+                    replicas: vec![vec![node], vec![node]],
+                    version: 9,
+                })
+                .collect();
+            let barrier = std::sync::Barrier::new(maps.len());
+            std::thread::scope(|scope| {
+                for map in &maps {
+                    let (db, barrier) = (&db, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        db.set_shard_map(map.clone()).unwrap();
+                    });
+                }
+            });
+            // The tiebreak winner is the greatest placement, and the file on
+            // disk is the one in memory.
+            let stored: ShardMap =
+                serde_json::from_slice(&std::fs::read(db.path.join("shard-map.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                db.shard_map().replicas,
+                vec![vec![2], vec![2]],
+                "round {round}"
+            );
+            assert_eq!(stored, db.shard_map(), "round {round}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn equal_version_shard_maps_converge_on_one_winner() {
         let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::db::uuid()));
