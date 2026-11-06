@@ -1551,7 +1551,7 @@ async fn ensure_rows(
     }
 
     if index.last_seq < current_seq {
-        let changes = db
+        let mut changes = db
             .changes(&ChangesOpts {
                 since: index.last_seq,
                 include_docs: true,
@@ -1561,7 +1561,7 @@ async fn ensure_rows(
             .await?;
         let mut changed = Vec::new();
         let mut docs = Vec::new();
-        for row in changes["results"].as_array().cloned().unwrap_or_default() {
+        for mut row in crate::json::take_array(&mut changes, "results").unwrap_or_default() {
             let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
                 continue;
             };
@@ -1572,7 +1572,7 @@ async fn ensure_rows(
             {
                 continue;
             }
-            if let Some(doc) = row.get("doc").cloned() {
+            if let Some(doc) = row.get_mut("doc").map(Value::take) {
                 docs.push((id, doc));
             }
         }
@@ -1618,16 +1618,16 @@ pub(crate) async fn docs_by_ids(
         limit: usize::MAX,
         ..Default::default()
     };
-    let all = db.all_docs(&opts).await?;
+    let mut all = db.all_docs(&opts).await?;
     let mut docs = HashMap::new();
-    for row in all["rows"].as_array().cloned().unwrap_or_default() {
+    for mut row in crate::json::take_array(&mut all, "rows").unwrap_or_default() {
         let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
         if id.starts_with("_design/") || id.starts_with("_local/") {
             continue;
         }
-        if let Some(doc) = row.get("doc").cloned() {
+        if let Some(doc) = row.get_mut("doc").map(Value::take) {
             docs.insert(id, doc);
         }
     }
@@ -1657,7 +1657,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     // as stale, and so no query holds an index being removed.
     let _gate = index_gate(db).write_owned().await;
     let mut live = std::collections::HashSet::new();
-    let all = db
+    let mut all = db
         .all_docs(&AllDocsOpts {
             include_docs: true,
             startkey: Some("_design/".to_string()),
@@ -1666,7 +1666,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
             ..Default::default()
         })
         .await?;
-    for row in all["rows"].as_array().cloned().unwrap_or_default() {
+    for row in crate::json::take_array(&mut all, "rows").unwrap_or_default() {
         let Some(ddoc) = row.get("doc") else {
             continue;
         };

@@ -492,7 +492,7 @@ async fn update_index(
     // committed before it was read, so a gap left by a write that never
     // finished does not keep the index behind.
     let last_seq = db.changes_watermark(since, None);
-    let changes = db
+    let mut changes = db
         .changes(&crate::db::ChangesOpts {
             since,
             include_docs: true,
@@ -502,19 +502,19 @@ async fn update_index(
         .await?;
     let mut changed = std::collections::HashSet::new();
     let mut live = Vec::new();
-    for row in changes["results"].as_array().into_iter().flatten() {
-        let Some(id) = row.get("id").and_then(Value::as_str) else {
+    for mut row in crate::json::take_array(&mut changes, "results").unwrap_or_default() {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
         if id.starts_with("_design/") || id.starts_with("_local/") {
             continue;
         }
-        changed.insert(id.to_string());
+        changed.insert(id.clone());
         if row.get("deleted").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        if let Some(doc) = row.get("doc") {
-            live.push((id.to_string(), doc.to_string()));
+        if let Some(doc) = row.get_mut("doc").map(Value::take) {
+            live.push((id, doc.to_string()));
         }
     }
     let source = spec.source.clone();
