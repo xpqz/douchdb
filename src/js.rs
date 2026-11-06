@@ -973,16 +973,17 @@ mod tests {
     #[test]
     fn wasmi_enforces_the_view_memory_limit() {
         let limits = crate::view::ViewLimits {
-            timeout: Duration::from_secs(20),
-            memory: 16 * 1024 * 1024,
+            timeout: Duration::from_secs(60),
+            memory: 4 * 1024 * 1024,
         };
-        // Within the limit.
-        let small = "function(doc){ emit('x'.repeat(2 * 1024 * 1024).length, null); }";
+        // Within the limit. Sizes stay small: building strings in a debug
+        // build of the interpreter costs seconds per megabyte.
+        let small = "function(doc){ emit('x'.repeat(256 * 1024).length, null); }";
         wasmi_map(small, limits).expect("a small allocation fits");
         // Far over the limit, but under the 128 MiB cap the host used to apply
         // whatever the configured limit was.
-        let large = "function(doc){ emit('x'.repeat(48 * 1024 * 1024).length, null); }";
-        let error = wasmi_map(large, limits).expect_err("48 MiB must exceed a 16 MiB limit");
+        let large = "function(doc){ emit('x'.repeat(12 * 1024 * 1024).length, null); }";
+        let error = wasmi_map(large, limits).expect_err("12 MiB must exceed a 4 MiB limit");
         assert!(!error.is_empty());
     }
 
