@@ -2939,6 +2939,44 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn expired_migration_map_does_not_affect_placement() {
+        let root = std::env::temp_dir().join(format!("douchdb-stale-mig-{}", crate::db::uuid()));
+        let active = ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas: vec![vec![0], vec![0]],
+            version: 1,
+        };
+        let target = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            ..active.clone()
+        };
+        let db = Db::open(
+            &root,
+            "stale-mig",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: active.clone(),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.set_migration_map(target.clone()).unwrap();
+        db.set_rebalance_in_progress(true);
+        assert!(db.is_replica_of("doc", 1) && !db.is_replica_of("doc", 0));
+        assert_eq!(db.replication_map().replicas, target.replicas);
+
+        // The freeze window ends without the coordinator clearing the map.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.rebalance_until.store(1, Ordering::SeqCst);
+        assert!(!db.rebalance_in_progress());
+        assert!(db.is_replica_of("doc", 0) && !db.is_replica_of("doc", 1));
+        assert_eq!(db.replication_map().replicas, active.replicas);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn design_documents_replicate_to_every_node() {
         let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::db::uuid()));
