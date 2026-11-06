@@ -448,8 +448,14 @@ impl Worker {
     fn spawn() -> Result<Worker, String> {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let mut command = Command::new(exe);
+        command.arg("--js-worker");
+        Worker::spawn_command(command)
+    }
+
+    /// Start `command` as a worker: cleared environment, `/` cwd, piped
+    /// stdin/stdout and the resource limits.
+    fn spawn_command(mut command: Command) -> Result<Worker, String> {
         command
-            .arg("--js-worker")
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
@@ -789,7 +795,217 @@ fn handle_worker_request(request: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use sha2::{Digest, Sha256};
+
+    fn wasmi_map(source: &str, limits: crate::view::ViewLimits) -> Result<Value, String> {
+        let body = serde_json::to_vec(&json!({
+            "kind": "map",
+            "source": source,
+            "docs": [["d0", "{\"_id\":\"d0\"}"]],
+            "timeout_ms": limits.timeout.as_millis() as u64,
+            "memory": limits.memory,
+        }))
+        .expect("body");
+        wasmi_request(&body, limits)
+    }
+
+    #[test]
+    fn wasmi_enforces_the_view_memory_limit() {
+        let limits = crate::view::ViewLimits {
+            timeout: Duration::from_secs(20),
+            memory: 16 * 1024 * 1024,
+        };
+        // Within the limit.
+        let small = "function(doc){ emit('x'.repeat(2 * 1024 * 1024).length, null); }";
+        wasmi_map(small, limits).expect("a small allocation fits");
+        // Far over the limit, but under the 128 MiB cap the host used to apply
+        // whatever the configured limit was.
+        let large = "function(doc){ emit('x'.repeat(48 * 1024 * 1024).length, null); }";
+        let error = wasmi_map(large, limits).expect_err("48 MiB must exceed a 16 MiB limit");
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn wasmi_timeout_is_wall_clock() {
+        let limits = crate::view::ViewLimits {
+            timeout: Duration::from_millis(150),
+            memory: 64 * 1024 * 1024,
+        };
+        let started = Instant::now();
+        let error = wasmi_map("function(doc){ while (true) {} }", limits)
+            .expect_err("an endless loop must be stopped");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "deadline overshoot: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_worker_outlives_the_thread_that_spawned_it() {
+        // Pool workers are spawned from whichever thread needs one, which may
+        // be a blocking-pool thread that exits when idle. `cat` stands in for
+        // the worker: it only ends when its stdin closes.
+        let mut worker = std::thread::spawn(|| Worker::spawn_command(Command::new("cat")))
+            .join()
+            .expect("spawning thread")
+            .expect("spawn");
+        std::thread::sleep(Duration::from_millis(300));
+        let exited = worker.child.try_wait().expect("try_wait");
+        worker.kill();
+        assert!(
+            exited.is_none(),
+            "the worker died with its spawning thread: {exited:?}"
+        );
+    }
+
+    #[test]
+    fn worker_reduce_rejects_malformed_keys_and_values() {
+        let reduce = |keys: Value, values: Value, rereduce: bool| {
+            handle_worker_request(json!({
+                "kind": "reduce",
+                "source": "function(keys, values, rereduce){ return sum(values); }",
+                "keys": keys,
+                "values": values,
+                "rereduce": rereduce,
+            }))
+        };
+        let ok = reduce(json!([[1, "a"]]), json!([3]), false);
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["value"], 3);
+        // A rereduce carries null keys.
+        let ok = reduce(Value::Null, json!([1, 2]), true);
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["value"], 3);
+
+        for (keys, values) in [
+            (json!("nope"), json!([1])),
+            (json!({"a": 1}), json!([1])),
+            (json!([]), json!("nope")),
+            (json!([]), Value::Null),
+            (json!([[1, "a"]]), json!({"a": 1})),
+        ] {
+            let bad = reduce(keys.clone(), values.clone(), false);
+            assert_eq!(bad["ok"], false, "keys {keys} values {values}: {bad}");
+            assert!(bad["error"].is_string(), "{bad}");
+        }
+        let missing = handle_worker_request(
+            json!({"kind": "reduce", "source": "function(k, v, r){ return 1; }"}),
+        );
+        assert_eq!(missing["ok"], false, "{missing}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn errno_after(result: libc::c_long) -> i32 {
+        if result == -1 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Runs in a child process (see the test below): installs the filter and
+    /// prints the errno of each probe. Every probe is harmless when allowed:
+    /// signal 0, nonexistent paths, an invalid fd or a zero-sized argument.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_probe_child() {
+        if std::env::var_os("DOUCHDB_SECCOMP_PROBE").is_none() {
+            return;
+        }
+        install_seccomp().expect("install seccomp");
+        let parent = unsafe { libc::getppid() } as libc::c_long;
+        let me = unsafe { libc::getpid() } as libc::c_long;
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let path = c"/nonexistent-douchdb/a".as_ptr();
+        let other = c"/nonexistent-douchdb/b".as_ptr();
+        let at = libc::AT_FDCWD as libc::c_long;
+        let probes: Vec<(&str, i32)> = unsafe {
+            vec![
+                (
+                    "tgkill_parent",
+                    errno_after(libc::syscall(libc::SYS_tgkill, parent, parent, 0)),
+                ),
+                (
+                    "tkill_parent",
+                    errno_after(libc::syscall(libc::SYS_tkill, parent, 0)),
+                ),
+                (
+                    "pidfd_send_signal",
+                    errno_after(libc::syscall(libc::SYS_pidfd_send_signal, -1, 0, 0, 0)),
+                ),
+                ("clone3", errno_after(libc::syscall(libc::SYS_clone3, 0, 0))),
+                (
+                    "linkat",
+                    errno_after(libc::syscall(libc::SYS_linkat, at, path, at, other, 0)),
+                ),
+                (
+                    "renameat2",
+                    errno_after(libc::syscall(libc::SYS_renameat2, at, path, at, other, 0)),
+                ),
+                (
+                    "symlinkat",
+                    errno_after(libc::syscall(libc::SYS_symlinkat, path, at, other)),
+                ),
+                (
+                    "fchmodat",
+                    errno_after(libc::syscall(libc::SYS_fchmodat, at, path, 0o600)),
+                ),
+                (
+                    "fchownat",
+                    errno_after(libc::syscall(libc::SYS_fchownat, at, path, 0, 0, 0)),
+                ),
+                (
+                    "mknodat",
+                    errno_after(libc::syscall(libc::SYS_mknodat, at, path, 0o600, 0)),
+                ),
+                (
+                    "openat",
+                    errno_after(libc::syscall(libc::SYS_openat, at, path, 0, 0)),
+                ),
+                // Control: the worker may signal itself (abort).
+                (
+                    "tgkill_self",
+                    errno_after(libc::syscall(libc::SYS_tgkill, me, tid, 0)),
+                ),
+            ]
+        };
+        for (name, errno) in probes {
+            println!("\nprobe:{name}={errno}");
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denies_signals_namespaces_and_filesystem_mutation() {
+        let output = Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "js::tests::seccomp_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("DOUCHDB_SECCOMP_PROBE", "1")
+            .output()
+            .expect("run probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let probes: std::collections::BTreeMap<&str, i32> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("probe:")?.split_once('='))
+            .filter_map(|(name, errno)| Some((name, errno.parse().ok()?)))
+            .collect();
+        assert!(!probes.is_empty(), "probe child failed: {output:?}");
+        for (name, errno) in &probes {
+            if *name == "tgkill_self" {
+                assert_eq!(*errno, 0, "the worker must be able to signal itself");
+            } else {
+                assert_eq!(*errno, libc::EPERM, "{name} is not denied: {probes:?}");
+            }
+        }
+    }
 
     #[test]
     fn wasm_runner_matches_the_checked_in_checksum() {
