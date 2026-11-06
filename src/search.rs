@@ -1467,6 +1467,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn highlights_follow_the_original_text_when_lowercasing_changes_its_length() {
+        // "İ" (2 bytes) lowercases to "i" plus a combining dot (3 bytes), and
+        // "ẞ" (3 bytes) to "ß" (2 bytes), so offsets found in the lowercased
+        // text do not apply to the original.
+        for (text, term, expected) in [
+            ("İstanbul foo bar", "foo", "İstanbul <b>foo</b> bar"),
+            ("ẞ foo bar", "foo", "ẞ <b>foo</b> bar"),
+            ("İİİİ foo", "foo", "İİİİ <b>foo</b>"),
+            ("Straße FOO", "foo", "Straße <b>FOO</b>"),
+            ("İ", "i", "<b>İ</b>"),
+        ] {
+            let terms = vec![term.to_string()];
+            let fragments = highlight_fragment(text, &terms, "<b>", "</b>", 100, 1);
+            assert_eq!(fragments, vec![expected.to_string()], "{text}");
+        }
+        // Small fragments must still cut on character boundaries.
+        let terms = vec!["foo".to_string()];
+        let fragments = highlight_fragment("İİİİİİ foo İİİİİİ", &terms, "<b>", "</b>", 5, 1);
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].contains("<b>foo</b>"), "{fragments:?}");
+    }
+
+    #[test]
     fn value_in_range_ignores_multibyte_bracket_positions() {
         let value = serde_json::json!("a");
         assert!(!value_in_range(&value, "é"));
