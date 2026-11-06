@@ -104,7 +104,7 @@ fn metrics() -> &'static HttpMetrics {
 pub fn record_http(method: &str, status: u16, duration_ms: f64) {
     let metrics = metrics();
     let attributes = [
-        KeyValue::new("http.method", method.to_string()),
+        KeyValue::new("http.method", crate::metrics::method_label(method)),
         KeyValue::new("http.status_code", status as i64),
     ];
     metrics.requests.add(1, &attributes);

@@ -50,7 +50,9 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     let uri = req.uri().clone();
     let path = uri.path().to_string();
     let started = std::time::Instant::now();
-    crate::metrics::request_started();
+    // Held across the handler so a dropped request (client disconnect) still
+    // decrements the in-flight count.
+    let _in_flight = crate::metrics::request_started();
     let span = tracing::info_span!(
         "http.request",
         "http.method" = %method,

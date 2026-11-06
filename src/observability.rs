@@ -37,6 +37,86 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
+/// How long the filesystem part of the health check is reused. `/_health` is
+/// unauthenticated, so it must not touch the disk on every request.
+const FS_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Result of the blocking filesystem checks.
+#[derive(Clone, Copy)]
+struct FsHealth {
+    readable: bool,
+    writable: bool,
+    unreadable: u64,
+}
+
+/// Short-lived cache of [`FsHealth`].
+#[derive(Default)]
+pub struct FsHealthCache(std::sync::Mutex<Option<(std::time::Instant, FsHealth)>>);
+
+impl FsHealthCache {
+    fn fresh(&self, now: std::time::Instant) -> Option<FsHealth> {
+        let slot = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        match *slot {
+            Some((at, value)) if now.saturating_duration_since(at) < FS_HEALTH_TTL => Some(value),
+            _ => None,
+        }
+    }
+
+    fn store(&self, now: std::time::Instant, value: FsHealth) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((now, value));
+    }
+}
+
+/// Probe the data root: list it, write and remove a scratch file, and check
+/// that every database directory still carries a parseable `db.json`. Opening
+/// every database would be far more expensive. Blocking; call it from
+/// `spawn_blocking`.
+fn probe_fs(root: &std::path::Path) -> FsHealth {
+    let readable = std::fs::read_dir(root).is_ok();
+    let probe = root.join(format!(".health-{}", crate::db::uuid()));
+    let writable = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    let mut unreadable = 0u64;
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let db_file = entry.path().join("db.json");
+            if db_file.is_file()
+                && std::fs::read(&db_file)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_none()
+            {
+                unreadable += 1;
+            }
+        }
+    }
+    FsHealth {
+        readable,
+        writable,
+        unreadable,
+    }
+}
+
+async fn fs_health(st: &AppState) -> FsHealth {
+    let now = std::time::Instant::now();
+    if let Some(cached) = st.fs_health.fresh(now) {
+        return cached;
+    }
+    let root = st.root.clone();
+    match tokio::task::spawn_blocking(move || probe_fs(&root)).await {
+        Ok(value) => {
+            st.fs_health.store(now, value);
+            value
+        }
+        // The probe itself failed; report storage as unusable but retry next time.
+        Err(_) => FsHealth {
+            readable: false,
+            writable: false,
+            unreadable: 0,
+        },
+    }
+}
+
 fn node_json(st: &AppState) -> Value {
     json!({
         "index": st.cluster.me,
@@ -169,10 +249,11 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
     }));
 
     let root = &st.root;
-    let readable = std::fs::read_dir(root).is_ok();
-    let probe = root.join(format!(".health-{}", crate::db::uuid()));
-    let writable = std::fs::write(&probe, b"ok").is_ok();
-    let _ = std::fs::remove_file(&probe);
+    let FsHealth {
+        readable,
+        writable,
+        unreadable,
+    } = fs_health(st).await;
     let databases = st.db_names().await.len();
     checks.push(json!({
         "name": "storage",
@@ -204,22 +285,6 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "pending_databases": pending,
     }));
 
-    // Cheap structural check: every database directory must still carry a
-    // readable db.json. Opening every database would be far more expensive.
-    let mut unreadable = 0u64;
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let db_file = entry.path().join("db.json");
-            if db_file.is_file()
-                && std::fs::read(&db_file)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .is_none()
-            {
-                unreadable += 1;
-            }
-        }
-    }
     checks.push(json!({
         "name": "databases",
         "status": if unreadable == 0 { "ok" } else { "critical" },
@@ -295,33 +360,37 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "docs": replication["docs"],
     }));
 
-    let http = &snapshot["http"];
-    let total = http["total"].as_u64().unwrap_or(0);
     // Authorization denials and other 4xx responses are expected client
     // behaviour, not evidence that the server is unhealthy. Only 5xx responses
-    // contribute to the readiness signal.
-    let errors = http["status_classes"]["5xx"].as_u64().unwrap_or(0);
+    // contribute to the readiness signal. The ratio covers a recent window and
+    // leaves out probe requests, so a node that has recovered reports healthy
+    // again even while a load balancer keeps polling it.
+    let (total, errors) = crate::metrics::recent_http();
+    let window = crate::metrics::HEALTH_WINDOW_SECS;
     let rate = if total == 0 {
         0.0
     } else {
         errors as f64 / total as f64 * 100.0
     };
     let (status, detail) = if total < 20 {
-        ("ok", format!("{total} requests sampled"))
+        (
+            "ok",
+            format!("{total} requests sampled in the last {window}s"),
+        )
     } else if rate >= 25.0 {
         (
             "critical",
-            format!("{rate:.1}% of {total} requests failed with 5xx"),
+            format!("{rate:.1}% of {total} requests in the last {window}s failed with 5xx"),
         )
     } else if rate >= 10.0 {
         (
             "degraded",
-            format!("{rate:.1}% of {total} requests failed with 5xx"),
+            format!("{rate:.1}% of {total} requests in the last {window}s failed with 5xx"),
         )
     } else {
         (
             "ok",
-            format!("{rate:.1}% of {total} requests failed with 5xx"),
+            format!("{rate:.1}% of {total} requests in the last {window}s failed with 5xx"),
         )
     };
     checks.push(json!({
@@ -913,10 +982,10 @@ pub async fn metrics_status(
                 failing.push(json!({
                     "index": node["index"],
                     "url": node["url"],
-                    "status": "critical",
+                    "status": "degraded",
                     "checks": [{
                         "name": "reachability",
-                        "status": "critical",
+                        "status": "degraded",
                         "detail": node["error"],
                     }],
                 }));
@@ -996,12 +1065,14 @@ pub async fn health_status(
                 }));
             }
             Err(error) => {
-                worst = 2;
+                // Same severity as the metrics view: a peer that cannot answer
+                // degrades the cluster, it does not take it down.
+                worst = worst.max(1);
                 nodes.push(json!({
                     "index": index,
                     "url": url,
                     "reachable": false,
-                    "status": "critical",
+                    "status": "degraded",
                     "error": error,
                 }));
             }
@@ -1053,4 +1124,43 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
             "generated_at": health["generated_at"],
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fs_health_cache_serves_within_the_ttl_only() {
+        let cache = FsHealthCache::default();
+        let start = Instant::now();
+        assert!(cache.fresh(start).is_none());
+        cache.store(
+            start,
+            FsHealth {
+                readable: true,
+                writable: true,
+                unreadable: 3,
+            },
+        );
+        let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
+        assert_eq!(hit.map(|value| value.unreadable), Some(3));
+        assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
+    }
+
+    #[test]
+    fn probe_fs_counts_unreadable_db_json() {
+        let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::db::uuid()));
+        let good = dir.join("good");
+        let bad = dir.join("bad");
+        assert!(std::fs::create_dir_all(&good).is_ok());
+        assert!(std::fs::create_dir_all(&bad).is_ok());
+        assert!(std::fs::write(good.join("db.json"), b"{}").is_ok());
+        assert!(std::fs::write(bad.join("db.json"), b"not json").is_ok());
+        let health = probe_fs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(health.readable && health.writable);
+        assert_eq!(health.unreadable, 1);
+    }
 }

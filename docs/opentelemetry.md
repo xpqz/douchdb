@@ -19,6 +19,14 @@ Everything below is available on every node:
 only status, check names and short details. The authenticated endpoint adds
 data-root paths and the full check detail.
 
+The `http` check judges the share of 5xx responses over the last 60 seconds,
+not over the node's lifetime, and leaves out `/_health`, `/_up` and
+`/_node/*/_health` requests. A node that stops failing therefore returns to
+`ok` about a minute later, even while a load balancer keeps probing it. Below
+20 requests in the window the check is `ok`. The storage and database-file
+checks touch the disk on a blocking thread and are reused for 2 seconds, so
+frequent probing does not add disk work.
+
 A health response looks like:
 
 ```json
@@ -32,7 +40,7 @@ A health response looks like:
     {"name": "databases", "status": "ok", "detail": "4 databases · 0 unreadable"},
     {"name": "cluster", "status": "ok", "detail": "3/3 placement nodes reachable"},
     {"name": "replication", "status": "ok", "detail": "12 runs · 340 docs"},
-    {"name": "http", "status": "ok", "detail": "0.1% of 1200 requests failed with 5xx"}
+    {"name": "http", "status": "ok", "detail": "0.1% of 1200 requests in the last 60s failed with 5xx"}
   ]
 }
 ```
@@ -47,7 +55,7 @@ semantics. Process-crash recovery is covered by tests, not by health.
 
 The local registry records:
 
-- **HTTP**: total requests, in-flight requests, errors, 5xx-based health error rate, status
+- **HTTP**: total requests, in-flight requests, errors, 5xx-based health error rate (last 60 seconds, probes excluded), status
   classes and exact codes, methods, average/p50/p95/p99/max latency, a
   12-bucket latency histogram, and a 120-second per-second rate/error/latency
   history for live sparklines.
@@ -55,7 +63,10 @@ The local registry records:
   `/{db}/doc`, `/{db}/_all_docs`, `/{db}/_changes`,
   `/{db}/_design/*/_view/*`, `/{db}/_design/*/_search/*` and
   `/_node/*/_metrics`. Document ids, view names and partition names never become
-  label values.
+  label values. Route labels come from a fixed list; any other path is
+  labelled `other`. Methods are limited to `GET`, `HEAD`, `POST`, `PUT`,
+  `DELETE`, `COPY`, `OPTIONS` and `PATCH`, with anything else as `other`. The
+  OpenTelemetry `http.method` attribute uses the same list.
 - **Views and search**: client-facing query count, errors, total/average/max
   latency. Internal shard requests are not counted again, so a cluster merge
   reflects one measurement per user query.
@@ -103,8 +114,10 @@ because it is real storage on each node. `local` is the coordinator's own
 snapshot, unchanged.
 
 A peer that cannot answer the fan-out is listed with `reachable: false` and
-forces cluster health to `degraded`. If every peer succeeds, the worst node
-health wins.
+forces cluster health to `degraded`, in both the metrics view and
+`/_node/_local/_health?cluster=true` (the peer's own entry is `degraded` too,
+never `critical`: the cluster still serves requests). If every peer succeeds,
+the worst node health wins.
 
 The console page at `/_utils/#/metrics` refreshes every five seconds and shows
 health, request/latency/error sparklines, route and database tables, replication

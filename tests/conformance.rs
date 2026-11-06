@@ -10022,8 +10022,20 @@ async fn cluster_metrics_and_health_aggregate_across_nodes() {
     let (status, health) = nodes[0].get("/_node/_local/_health?cluster=true").await;
     assert_eq!(status, StatusCode::OK, "{health}");
     assert_eq!(health["scope"], "cluster");
-    assert_eq!(health["status"], "critical", "{health}");
+    // An unreachable peer has one severity everywhere: degraded, as in the
+    // metrics view above and docs/opentelemetry.md.
+    assert_eq!(health["status"], "degraded", "{health}");
     assert_eq!(health["nodes"].as_array().unwrap().len(), 3);
+    let dead = health["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["index"] == 2)
+        .expect("dead node listed");
+    assert_eq!(dead["status"], "degraded", "{health}");
+    for failing in cluster["health"]["failing"].as_array().unwrap() {
+        assert_eq!(failing["status"], "degraded", "{cluster}");
+    }
 }
 
 // ---------------------------------------------------------------------------

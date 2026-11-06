@@ -122,6 +122,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
+        fs_health: Default::default(),
         config,
         auth,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
