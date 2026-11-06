@@ -2668,8 +2668,11 @@ async fn attachments_are_rejected() {
     assert_eq!(body["error"], "attachments_not_supported");
 }
 
+// CouchDB's `_purge` acts on leaf revisions only: a leaf and the ancestors no
+// other branch shares go, and a listed non-leaf revision is ignored and not
+// reported. Verified against CouchDB 3.5.
 #[tokio::test]
-async fn purge_removes_only_the_requested_revisions() {
+async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     let s = Server::start(false);
     s.fresh_db("purge").await;
     let (_, r1) = s.put("/purge/a", json!({"v": 1})).await;
@@ -2681,17 +2684,150 @@ async fn purge_removes_only_the_requested_revisions() {
 
     let (status, body) = s.post("/purge/_purge", json!({"a": [rev2]})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["purged"]["a"], json!([rev2]));
-    let (status, _) = s.get(&format!("/purge/a?rev={rev2}")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["purged"]["a"], json!([]), "interior revs are ignored");
+    let (status, body) = s.get(&format!("/purge/a?rev={rev2}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = s.get("/purge/a").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["_rev"], rev3);
 
+    // Only the leaf is reported, but its whole unshared branch goes.
     let (_, body) = s.post("/purge/_purge", json!({"a": [rev1, rev3]})).await;
-    assert_eq!(body["purged"]["a"].as_array().unwrap().len(), 2);
+    assert_eq!(body["purged"]["a"], json!([rev3]));
     let (status, _) = s.get("/purge/a").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = s.get(&format!("/purge/a?rev={rev2}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = s.get(&format!("/purge/a?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn purging_one_conflict_leaf_keeps_the_shared_ancestor_and_other_leaf() {
+    let s = Server::start(false);
+    s.fresh_db("purgeconf").await;
+    let root = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mid = "11111111111111111111111111111111";
+    let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let c = "cccccccccccccccccccccccccccccccc";
+    let (status, _) = s
+        .post(
+            "/purgeconf/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "a", "_rev": format!("3-{b}"),
+                 "_revisions": {"start": 3, "ids": [b, mid, root]}, "v": "b"},
+                {"_id": "a", "_rev": format!("2-{c}"),
+                 "_revisions": {"start": 2, "ids": [c, root]}, "v": "c"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 3-b wins; purging it removes its unshared parent too and reports only
+    // the leaf that was named.
+    let (_, body) = s
+        .post("/purgeconf/_purge", json!({"a": [format!("3-{b}")]}))
+        .await;
+    assert_eq!(body["purged"]["a"], json!([format!("3-{b}")]));
+    let (status, body) = s.get("/purgeconf/a?conflicts=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["_rev"], format!("2-{c}"));
+    assert!(body.get("_conflicts").is_none(), "{body}");
+    let (status, _) = s.get(&format!("/purgeconf/a?rev=2-{mid}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Purging the last leaf removes the document.
+    let (_, body) = s
+        .post("/purgeconf/_purge", json!({"a": [format!("2-{c}")]}))
+        .await;
+    assert_eq!(body["purged"]["a"], json!([format!("2-{c}")]));
+    let (status, _) = s.get("/purgeconf/a").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// Revision ids that are not hex are stored verbatim and may contain '/'
+// (CouchDB 3.5 accepts them under new_edits=false). Compaction must not
+// mistake such a leaf body for a stale one.
+#[tokio::test]
+async fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
+    let s = Server::start(false);
+    s.fresh_db("compactslash").await;
+    let (status, _) = s
+        .post(
+            "/compactslash/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "doc", "_rev": "1-x/y", "v": 1},
+                {"_id": "p", "_rev": "2-r/s",
+                 "_revisions": {"start": 2, "ids": ["r/s", "p/q"]}, "v": 2},
+                {"_id": "p", "_rev": "1-p/q", "v": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.post("/compactslash/_compact", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, body) = s.get("/compactslash/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "1-x/y");
+    let (status, body) = s.get("/compactslash/p").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "2-r/s");
+    let (status, _) = s.get("/compactslash/p?rev=1-p/q").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stale parent is dropped");
+}
+
+// CouchDB keeps non-leaf bodies readable by `?rev=` until compaction drops
+// them (checked live: 200 before `_compact`, 404 `missing` after, and
+// `_revs_info` then reports the old rev as "missing"). Leaves of every kind
+// stay.
+#[tokio::test]
+async fn compaction_drops_non_leaf_bodies_but_keeps_every_leaf() {
+    let s = Server::start(false);
+    s.fresh_db("compactbodies").await;
+    let (_, r1) = s.put("/compactbodies/a", json!({"v": 1})).await;
+    let rev1 = r1["rev"].as_str().unwrap().to_string();
+    let (_, r2) = s
+        .put("/compactbodies/a", json!({"v": 2, "_rev": rev1}))
+        .await;
+    let rev2 = r2["rev"].as_str().unwrap().to_string();
+
+    // A conflict leaf and a deleted leaf must survive compaction.
+    let root = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (status, _) = s
+        .post(
+            "/compactbodies/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "c", "_rev": format!("2-{b}"),
+                 "_revisions": {"start": 2, "ids": [b, root]}, "v": "b"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, d1) = s.put("/compactbodies/d", json!({"v": 1})).await;
+    let drev1 = d1["rev"].as_str().unwrap().to_string();
+    let (_, dd) = s.delete(&format!("/compactbodies/d?rev={drev1}")).await;
+    let drev2 = dd["rev"].as_str().unwrap().to_string();
+
+    let (status, _) = s.get(&format!("/compactbodies/a?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::OK, "old bodies stay until compaction");
+
+    let (status, _) = s.post("/compactbodies/_compact", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, body) = s.get(&format!("/compactbodies/a?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "not_found");
+    let (status, body) = s.get("/compactbodies/a?revs_info=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["_rev"], rev2);
+    assert_eq!(body["_revs_info"][0]["status"], "available");
+    assert_eq!(body["_revs_info"][1]["status"], "missing");
+    let (status, body) = s.get(&format!("/compactbodies/c?rev=2-{b}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.get(&format!("/compactbodies/d?rev={drev2}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

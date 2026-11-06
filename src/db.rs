@@ -1776,27 +1776,23 @@ impl Db {
                     };
                     let mut tx = Tx::new();
                     let mut removed = Vec::new();
-                    for rev in &requested {
-                        if !meta.tree.edges.contains_key(rev) {
+                    // Like CouchDB, purge leaves only: each takes its unshared
+                    // ancestors with it, and a listed non-leaf revision is
+                    // ignored and not reported.
+                    let leaves: std::collections::BTreeSet<String> =
+                        meta.tree.leaves().into_iter().collect();
+                    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
+                        let gone = meta.tree.purge_leaf(rev);
+                        if gone.is_empty() {
                             continue;
                         }
-                        tx.delete(&body_key(&id2, rev));
-                        meta.tree.edges.remove(rev);
-                        meta.tree.deleted.remove(rev);
-                        meta.atts.remove(rev);
+                        for dead in &gone {
+                            tx.delete(&body_key(&id2, dead));
+                            meta.atts.remove(dead);
+                        }
                         removed.push(rev.clone());
                     }
                     if !removed.is_empty() {
-                        // Children of a purged revision become roots.
-                        let live: std::collections::BTreeSet<String> =
-                            meta.tree.edges.keys().cloned().collect();
-                        for parent in meta.tree.edges.values_mut() {
-                            if let Some(p) = parent {
-                                if !live.contains(p) {
-                                    *parent = None;
-                                }
-                            }
-                        }
                         if meta.tree.edges.is_empty() {
                             tx.delete(&meta_key(&id2));
                             if meta.seq != 0 {
@@ -2052,6 +2048,7 @@ fn put_many(
     let limit = shard.revs_limit();
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
+        meta.atts.retain(|rev, _| meta.tree.edges.contains_key(rev));
         if let Ok(bytes) = serde_json::to_vec(meta) {
             ops.push((meta_key(id), Some(bytes)));
         }
@@ -2188,7 +2185,6 @@ impl Stage<'_> {
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
-        meta.atts.retain(|r, _| meta.tree.edges.contains_key(r));
         meta.atts.insert(rev.clone(), atts);
 
         self.ops
@@ -2669,16 +2665,18 @@ fn read_doc_rev(
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
-        let info: Vec<Value> = path
-            .iter()
-            .rev()
-            .map(|r| {
-                json!({
-                    "rev": r,
-                    "status": if meta.tree.is_deleted(r) { "deleted" } else { "available" }
-                })
-            })
-            .collect();
+        // A body compaction has dropped reads as "missing", as in CouchDB.
+        let mut info: Vec<Value> = Vec::with_capacity(path.len());
+        for r in path.iter().rev() {
+            let status = if meta.tree.is_deleted(r) {
+                "deleted"
+            } else if shard.get_body(id, r)?.is_some() {
+                "available"
+            } else {
+                "missing"
+            };
+            info.push(json!({ "rev": r, "status": status }));
+        }
         map.insert("_revs_info".into(), Value::Array(info));
     }
     if opts.conflicts {
@@ -3111,6 +3109,112 @@ mod tests {
         )
         .unwrap();
         (db, root)
+    }
+
+    async fn stored_bodies(db: &Db, revs: Vec<String>) -> Vec<bool> {
+        db.shards[0]
+            .call(move |shard| {
+                let mut out = Vec::new();
+                for rev in &revs {
+                    out.push(shard.get_body("a", rev)?.is_some());
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
+        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "stem",
+            DbConfig {
+                q: 1,
+                revs_limit: 2,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut revs = Vec::new();
+        for n in 0..4 {
+            let mut doc = json!({"_id": "a", "n": n});
+            if let Some(rev) = revs.last() {
+                doc["_rev"] = json!(rev);
+            }
+            let put = db.put_docs(vec![doc], true).await.unwrap();
+            revs.push(put[0]["rev"].as_str().unwrap().to_string());
+        }
+        assert_eq!(stored_bodies(&db, revs.clone()).await, [true; 4]);
+        db.compact().await.unwrap();
+        assert_eq!(
+            stored_bodies(&db, revs).await,
+            [false, false, false, true],
+            "stemmed and superseded bodies go, the leaf stays"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn replicated_writes_do_not_keep_attachments_for_stemmed_revisions() {
+        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "stematts",
+            DbConfig {
+                q: 1,
+                revs_limit: 2,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (1..=5).map(|n| format!("{n:032x}")).collect();
+        for n in 1..=5usize {
+            let chain: Vec<&String> = ids[..n].iter().rev().collect();
+            let rev = format!("{n}-{}", ids[n - 1]);
+            let doc = json!({
+                "_id": "a",
+                "_rev": rev,
+                "_revisions": {"start": n, "ids": chain},
+            });
+            db.put_docs(vec![doc], false).await.unwrap();
+            // The public write path rejects attachments, so plant one on each
+            // revision the way older data may carry them.
+            db.shards[0]
+                .call(move |shard| {
+                    let mut meta = shard.get_meta("a")?.unwrap();
+                    meta.atts.insert(
+                        rev,
+                        vec![(
+                            "f".to_string(),
+                            AttMeta {
+                                content_type: "text/plain".into(),
+                                digest: "5d41402abc4b2a76b9719d911017c592".into(),
+                                length: 5,
+                                revpos: n as u64,
+                            },
+                        )],
+                    );
+                    shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let meta = db.shards[0]
+            .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(meta.tree.edges.len(), 2);
+        let kept: Vec<&String> = meta.atts.keys().collect();
+        let tree: Vec<&String> = meta.tree.edges.keys().collect();
+        assert_eq!(kept, tree, "atts only for revisions still in the tree");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

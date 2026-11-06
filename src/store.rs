@@ -18,6 +18,12 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const ATTEST_CHUNK: usize = 64 * 1024;
 
+/// Body keys examined per round of the compaction sweep.
+#[cfg(not(test))]
+const BODY_SWEEP_BATCH: usize = 1000;
+#[cfg(test)]
+const BODY_SWEEP_BATCH: usize = 3;
+
 pub fn meta_key(docid: &str) -> Vec<u8> {
     key(b"m/", docid)
 }
@@ -1156,8 +1162,68 @@ impl Shard {
         Ok(())
     }
 
+    /// Delete every revision body that is not a leaf of its document's tree:
+    /// superseded revisions, revisions stemmed by `revs_limit` and orphans.
+    /// CouchDB keeps them readable until compaction and then drops them;
+    /// leaves (conflicts and tombstones included) always stay.
+    fn drop_stale_bodies(&mut self) -> Result<()> {
+        // Memory stays bounded: each round reads at most BODY_SWEEP_BATCH body
+        // keys, deletes the stale ones and resumes after the last key seen.
+        let mut start = b"d/".to_vec();
+        loop {
+            let mut keys = Vec::new();
+            self.scan_range_while(b"d/", Some(&start), false, |key, _| {
+                keys.push(key.to_vec());
+                keys.len() < BODY_SWEEP_BATCH
+            })?;
+            let Some(last) = keys.last() else {
+                return Ok(());
+            };
+            start = last.clone();
+            start.push(0);
+
+            // Leaf sets by document id, for this batch only.
+            let mut leaves: std::collections::HashMap<String, Option<BTreeSet<String>>> =
+                std::collections::HashMap::new();
+            let mut tx = Tx::new();
+            for key in &keys {
+                let Some(rest) = key.get(2..).and_then(|rest| std::str::from_utf8(rest).ok())
+                else {
+                    continue;
+                };
+                // Both the document id and the revision may contain '/', so
+                // d/{id}/{rev} is ambiguous. Keep the body if any split makes
+                // it a leaf; delete it only when none does.
+                let mut is_leaf = false;
+                for (at, _) in rest.match_indices('/') {
+                    let (id, rev) = (&rest[..at], &rest[at + 1..]);
+                    if !leaves.contains_key(id) {
+                        let found = self
+                            .get_meta(id)?
+                            .map(|meta| meta.tree.leaves().into_iter().collect());
+                        leaves.insert(id.to_string(), found);
+                    }
+                    if leaves
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|set| set.contains(rev))
+                    {
+                        is_leaf = true;
+                        break;
+                    }
+                }
+                if !is_leaf {
+                    tx.delete(key);
+                }
+            }
+            self.commit(tx)?;
+            self.flush_pending()?;
+        }
+    }
+
     pub fn compact(&mut self) -> Result<()> {
         self.flush_pending()?;
+        self.drop_stale_bodies()?;
         // Compaction is a long, blocking LevelDB call (tens of seconds on a
         // large shard). It runs on this shard's dedicated actor thread, so it
         // never ties up a Tokio worker.
@@ -1543,6 +1609,111 @@ mod scan_tests {
             seq,
             atts: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
+        let dir = temp_shard_dir("sweep-slash");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let tree = |edges: &[(&str, Option<&str>)]| {
+            let mut tree = RevTree::default();
+            for (rev, parent) in edges {
+                tree.edges
+                    .insert(rev.to_string(), parent.map(str::to_string));
+            }
+            DocMeta {
+                tree,
+                seq: 1,
+                atts: BTreeMap::new(),
+            }
+        };
+        let mut tx = Tx::new();
+        // The only leaf of "doc" has a '/' in its revision id.
+        tx.put_json(&meta_key("doc"), &tree(&[("1-x/y", None)]))
+            .unwrap();
+        tx.put(&body_key("doc", "1-x/y"), b"{}");
+        // "p" has a stale parent and a leaf, both with '/'.
+        tx.put_json(
+            &meta_key("p"),
+            &tree(&[("1-p/q", None), ("2-r/s", Some("1-p/q"))]),
+        )
+        .unwrap();
+        tx.put(&body_key("p", "1-p/q"), b"{}");
+        tx.put(&body_key("p", "2-r/s"), b"{}");
+        // d/a/1-b/c is "a" with leaf "1-b/c" or "a/1-b" with rev "c": it
+        // stays because one reading makes it a leaf.
+        tx.put_json(&meta_key("a"), &tree(&[("1-b/c", None)]))
+            .unwrap();
+        tx.put_json(&meta_key("a/1-b"), &tree(&[("2-z", None)]))
+            .unwrap();
+        tx.put(&body_key("a", "1-b/c"), b"{}");
+        tx.put(&body_key("a/1-b", "2-z"), b"{}");
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+
+        shard.compact().unwrap();
+
+        let mut left = Vec::new();
+        shard
+            .scan_range_while(b"d/", None, false, |key, _| {
+                left.push(key.to_vec());
+                true
+            })
+            .unwrap();
+        let mut expected = vec![
+            body_key("doc", "1-x/y"),
+            body_key("p", "2-r/s"),
+            body_key("a", "1-b/c"),
+            body_key("a/1-b", "2-z"),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_sweeps_stale_bodies_in_several_batches() {
+        let dir = temp_shard_dir("sweep");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let old = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let new = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let mut tree = RevTree::default();
+        tree.merge_path(&[old.clone(), new.clone()], false);
+        let doc_meta = DocMeta {
+            tree,
+            seq: 1,
+            atts: BTreeMap::new(),
+        };
+        // Ids with '/' sort between and around each other's keys.
+        let ids = ["a", "a/b", "a/b/c", "a0", "b", "b/", "c", "d/e", "e", "f"];
+        let mut tx = Tx::new();
+        for id in ids {
+            tx.put_json(&meta_key(id), &doc_meta).unwrap();
+            tx.put(&body_key(id, &old.to_string()), b"{}");
+            tx.put(&body_key(id, &new.to_string()), b"{}");
+        }
+        tx.put(&body_key("ghost/x", &old.to_string()), b"{}");
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+
+        shard.compact().unwrap();
+
+        let mut left = Vec::new();
+        shard
+            .scan_range_while(b"d/", None, false, |key, _| {
+                left.push(key.to_vec());
+                true
+            })
+            .unwrap();
+        let mut expected: Vec<Vec<u8>> = ids
+            .iter()
+            .map(|id| body_key(id, &new.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(left, expected, "only leaf bodies survive");
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
