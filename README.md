@@ -452,7 +452,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--revs-limit` | `1000` | Revision history kept per document |
 | `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` |
 | `--users-file` | none | JSON users file with token/roles entries (see [docs/multiuser.md](docs/multiuser.md)) |
-| `--session-secret` | derived | HMAC key for `AuthSession` cookies; share it across nodes for cross-node sessions |
+| `--session-secret` | random, kept in `<data>/.session-secret` | HMAC key for `AuthSession` cookies (or `DOUCHDB_SESSION_SECRET`); set the same value on every node for cross-node sessions |
 | `--default-security` | `admin-only` when auth is configured | Empty `_security` databases are `admin-only` or `open` |
 | `--max-in-flight` | `64` | Global concurrent HTTP requests |
 | `--per-user-in-flight` | `16` | Concurrent requests per principal |
