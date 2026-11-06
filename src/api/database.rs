@@ -129,7 +129,7 @@ pub async fn db_root(
                         // the changes feed returns, so clients that use it as
                         // `since` do not skip another node's changes.
                         if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
-                            if let Ok(vector) = cluster_update_vector(ClusterRead {
+                            let (vector, marks) = match cluster_update_vector(ClusterRead {
                                 st: &st,
                                 db: &db,
                                 dbname: &name,
@@ -137,10 +137,12 @@ pub async fn db_root(
                             })
                             .await
                             {
-                                let seq = encode_since(&vector);
-                                info["update_seq"] = json!(seq);
-                                info["committed_update_seq"] = json!(seq);
-                            }
+                                Ok(token) => token,
+                                Err(e) => return fail(e),
+                            };
+                            let seq = encode_token(&vector, &marks);
+                            info["update_seq"] = json!(seq);
+                            info["committed_update_seq"] = json!(seq);
                         }
                         json(StatusCode::OK, info)
                     }

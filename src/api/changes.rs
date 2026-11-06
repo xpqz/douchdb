@@ -38,22 +38,32 @@ pub(super) async fn changes(
             let started = std::time::Instant::now();
             let mut sent = 0usize;
             let mut last_heartbeat = std::time::Instant::now();
+            // Where the feed stopped, for the closing line CouchDB sends when
+            // a continuous feed times out or reaches its limit.
+            let mut trailer: Option<(Value, u64)> = None;
             loop {
-                if limit.map(|limit| sent >= limit).unwrap_or(false)
-                    || !still_allowed(&st, &db, &headers)
-                {
+                if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                    break;
+                }
+                if !still_allowed(&st, &db, &headers) {
+                    trailer = None;
                     break;
                 }
                 match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                     Ok(value) => {
                         if !still_allowed(&st, &db, &headers) {
+                            trailer = None;
                             break;
                         }
                         let rows = value["results"].as_array().cloned().unwrap_or_default();
-                        for row in rows {
+                        let mut sent_here = 0usize;
+                        let mut last_sent = None;
+                        for row in &rows {
                             if limit.map(|limit| sent >= limit).unwrap_or(false) {
                                 break;
                             }
+                            last_sent = row.get("seq").cloned();
+                            sent_here += 1;
                             let json = serde_json::to_vec(&row).unwrap_or_default();
                             let line = if eventsource {
                                 [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
@@ -63,6 +73,11 @@ pub(super) async fn changes(
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                             sent += 1;
                         }
+                        let unsent = (rows.len() - sent_here) as u64;
+                        let reported = value.get("last_seq").cloned();
+                        let end_seq = if unsent > 0 { last_sent.or(reported) } else { reported };
+                        let behind = value.get("pending").and_then(Value::as_u64).unwrap_or(0);
+                        trailer = end_seq.map(|seq| (seq, behind + unsent));
                         if let Some(seq) = value.get("last_seq") {
                             let since = seq
                                 .as_str()
@@ -72,6 +87,7 @@ pub(super) async fn changes(
                         }
                     }
                     Err(error) => {
+                        trailer = None;
                         let json = serde_json::to_vec(&json!({
                             "error": error.error,
                             "reason": error.reason,
@@ -100,6 +116,16 @@ pub(super) async fn changes(
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // CouchDB's eventsource feed ends without this line.
+            if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
+                let mut line = serde_json::to_vec(&json!({
+                    "last_seq": last_seq,
+                    "pending": pending,
+                }))
+                .unwrap_or_default();
+                line.push(b'\n');
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
             }
         };
         return Response::builder()
@@ -401,6 +427,7 @@ async fn changes_options(
                 headers,
             })
             .await?
+            .0
         } else {
             let mut vector = vec![0; n];
             vector[st.cluster.me] = db.update_seq();

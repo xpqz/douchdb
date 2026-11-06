@@ -1632,6 +1632,35 @@ fn last_seq_for_node(value: &Value, node: usize, nodes: usize) -> Option<u64> {
     decoded.get(node).copied()
 }
 
+/// Where a feed stands on shards read from a replica because their preferred
+/// owner failed: `node` served `shards` and had returned changes up to its own
+/// `seq`. The owner's vector slot is in another node's sequence space, so it
+/// cannot carry this progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FallbackMark {
+    node: usize,
+    shards: Vec<usize>,
+    seq: u64,
+}
+
+fn mask_shards(mask: &[bool]) -> Vec<usize> {
+    mask.iter()
+        .enumerate()
+        .filter(|(_, owned)| **owned)
+        .map(|(shard, _)| shard)
+        .collect()
+}
+
+/// One stream of changes with its own sequence space: a node reading its
+/// preferred shards, or a node reading shards reassigned from a failed owner.
+struct ChangeLane {
+    node: usize,
+    /// Index into the marks of a fallback lane; `None` for an owner lane.
+    mark: Option<usize>,
+    rows: std::collections::VecDeque<Value>,
+    last: Option<u64>,
+}
+
 pub(crate) async fn cluster_changes(
     read: ClusterRead<'_>,
     q: &HashMap<String, String>,
@@ -1639,19 +1668,17 @@ pub(crate) async fn cluster_changes(
 ) -> DbResult<Value> {
     let ClusterRead { st, db, .. } = read;
     let n = st.cluster.nodes.len();
-    let now = q.get("since").map(String::as_str) == Some("now");
-    let mut since = if now {
+    let raw_since = q.get("since").map(String::as_str);
+    let (mut since, marks) = if raw_since == Some("now") {
         cluster_update_vector(read).await?
-    } else if let Some(raw) = q.get("since").map(String::as_str) {
-        match decode_since(raw, n) {
-            Some(mut vector) => {
-                vector.resize(n.max(vector.len()), 0);
-                vector
-            }
+    } else if let Some(raw) = raw_since {
+        let vector = match decode_since(raw, n) {
+            Some(vector) => vector,
             None => vec![since_component(Some(raw), st.cluster.me, n); n],
-        }
+        };
+        (vector, decode_fallbacks(raw, n))
     } else {
-        vec![0; n]
+        (vec![0; n], Vec::new())
     };
     since.resize(n, 0);
     let owned_by_node = preferred_shard_masks(st, db);
@@ -1666,122 +1693,110 @@ pub(crate) async fn cluster_changes(
         q,
     };
     let limit = num(q, "limit");
-
-    if let Some(limit) = limit {
-        if limit == 0 {
-            return Ok(json!({
-                "results": [],
-                "last_seq": encode_since(&since),
-                "pending": 0,
-            }));
-        }
-
-        let node_limit = if change_filter.is_some() {
-            None
-        } else {
-            Some(limit)
-        };
-        let since_ref = &since;
-        let responses = scatter(
-            read,
-            &owned_by_node,
-            "changes",
-            |node, mask, round| async move {
-                // The failed owner's sequence is not meaningful for the survivor's
-                // reassigned shards, so a fallback starts at 0; preferred masks are
-                // disjoint, so ids do not overlap.
-                let since = match round {
-                    Round::Owner => since_ref[node],
-                    Round::Fallback => 0,
-                };
-                fetch_node_changes(read, changes, node, &mask, since, node_limit).await
-            },
-        )
-        .await?;
-        let mut node_rows: Vec<std::collections::VecDeque<Value>> =
-            (0..n).map(|_| std::collections::VecDeque::new()).collect();
-        let mut node_last: Vec<Option<u64>> = vec![None; n];
-        let mut pending = 0;
-        for (node, round, mut value) in responses {
-            pending += node_pending(&value);
-            if let Some(seq) = last_seq_for_node(&value, node, n) {
-                node_last[node] = Some(match (round, node_last[node]) {
-                    (Round::Fallback, Some(previous)) => previous.min(seq),
-                    _ => seq,
-                });
-            }
-            if let Some(Value::Array(rows)) = value.get_mut("results").map(std::mem::take) {
-                node_rows[node].extend(rows);
-            }
-        }
-
-        for rows in &mut node_rows {
-            rows.make_contiguous()
-                .sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
-        }
-        let mut progress = since.clone();
-        let mut out = Vec::new();
-        loop {
-            let mut progressed = false;
-            for node in 0..n {
-                let Some(mut row) = node_rows[node].pop_front() else {
-                    continue;
-                };
-                progressed = true;
-                let shard_seq = row["seq"].as_u64().unwrap_or(0);
-                let safe = node_last[node]
-                    .map(|seq| shard_seq.min(seq))
-                    .unwrap_or(shard_seq);
-                progress[node] = progress[node].max(safe);
-                row["seq"] = json!(encode_since(&progress));
-                out.push(row);
-                if out.len() >= limit {
-                    break;
-                }
-            }
-            if out.len() >= limit || !progressed {
-                break;
-            }
-        }
-        // Rows fetched but not returned are still to come.
-        pending += node_rows.iter().map(|rows| rows.len() as u64).sum::<u64>();
-
+    if limit == Some(0) {
         return Ok(json!({
-            "results": out,
-            "last_seq": encode_since(&progress),
-            "pending": pending,
+            "results": [],
+            "last_seq": encode_token(&since, &marks),
+            "pending": 0,
         }));
     }
 
+    let node_limit = if change_filter.is_some() { None } else { limit };
     let since_ref = &since;
+    let marks_ref = &marks;
     let responses = scatter(
         read,
         &owned_by_node,
         "changes",
         |node, mask, round| async move {
-            // Reassigned shards have no useful checkpoint on the survivor.
+            // Shards reassigned from a failed owner resume from the mark this
+            // node left for exactly this set of shards, else from the start;
+            // preferred masks are disjoint, so ids do not overlap.
+            let shards = mask_shards(&mask);
             let since = match round {
                 Round::Owner => since_ref[node],
-                Round::Fallback => 0,
+                Round::Fallback => marks_ref
+                    .iter()
+                    .find(|mark| mark.node == node && mark.shards == shards)
+                    .map_or(0, |mark| mark.seq),
             };
-            fetch_node_changes(read, changes, node, &mask, since, None).await
+            let value = fetch_node_changes(read, changes, node, &mask, since, node_limit).await?;
+            Ok((shards, since, value))
         },
     )
     .await?;
-    let mut rows = Vec::new();
+
     let mut progress = since.clone();
+    let mut fallbacks: Vec<FallbackMark> = Vec::new();
+    let mut lanes: Vec<ChangeLane> = Vec::new();
     let mut pending = 0;
-    for (node, _, value) in responses {
+    for (node, round, (shards, lane_since, mut value)) in responses {
         pending += node_pending(&value);
-        absorb_node_changes(value, node, &mut progress, &mut rows);
+        let mark = match round {
+            Round::Owner => None,
+            Round::Fallback => {
+                fallbacks.push(FallbackMark {
+                    node,
+                    shards,
+                    seq: lane_since,
+                });
+                Some(fallbacks.len() - 1)
+            }
+        };
+        let mut rows: Vec<Value> = match value.get_mut("results").map(std::mem::take) {
+            Some(Value::Array(rows)) => rows,
+            _ => Vec::new(),
+        };
+        rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
+        lanes.push(ChangeLane {
+            node,
+            mark,
+            rows: rows.into(),
+            last: last_seq_for_node(&value, node, n),
+        });
     }
 
+    let limit = limit.unwrap_or(usize::MAX);
+    let mut out = Vec::new();
+    loop {
+        let mut progressed = false;
+        for lane in &mut lanes {
+            let Some(mut row) = lane.rows.pop_front() else {
+                continue;
+            };
+            progressed = true;
+            let shard_seq = row["seq"].as_u64().unwrap_or(0);
+            let safe = lane.last.map_or(shard_seq, |seq| shard_seq.min(seq));
+            match lane.mark {
+                None => {
+                    if let Some(slot) = progress.get_mut(lane.node) {
+                        *slot = (*slot).max(safe);
+                    }
+                }
+                Some(mark) => {
+                    if let Some(mark) = fallbacks.get_mut(mark) {
+                        mark.seq = mark.seq.max(safe);
+                    }
+                }
+            }
+            row["seq"] = json!(encode_token(&progress, &fallbacks));
+            out.push(row);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        if out.len() >= limit || !progressed {
+            break;
+        }
+    }
+    // Rows fetched but not returned are still to come.
+    pending += lanes.iter().map(|lane| lane.rows.len() as u64).sum::<u64>();
+
     // Shard masks are disjoint, so each document's change is produced by
-    // exactly one node. The old all-node fan-out needed a per-row dedup pass;
-    // local-first masks make that redundant.
+    // exactly one lane.
     Ok(json!({
-        "results": rows,
-        "last_seq": encode_since(&progress),
+        "results": out,
+        "last_seq": encode_token(&progress, &fallbacks),
         "pending": pending,
     }))
 }
@@ -1856,6 +1871,31 @@ pub(crate) async fn fetch_node_changes(
     if crate::api::flag(q, "conflicts") {
         params.push(("conflicts", "true".to_string()));
     }
+    // A filter function reads its own arguments from `req.query`, so the peer
+    // must see every argument the client sent. reqwest percent-encodes them.
+    const OWN_PARAMS: [&str; 14] = [
+        "since",
+        "limit",
+        "shards",
+        "feed",
+        "timeout",
+        "heartbeat",
+        "descending",
+        "doc_ids",
+        "style",
+        "include_docs",
+        "filter",
+        "view",
+        "conflicts",
+        "last-event-id",
+    ];
+    let mut extra: Vec<(&str, String)> = q
+        .iter()
+        .filter(|(key, _)| !OWN_PARAMS.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect();
+    extra.sort();
+    params.extend(extra);
     let request = internal_request(
         st,
         reqwest::Method::GET,
@@ -1886,59 +1926,69 @@ pub(crate) async fn fetch_node_changes(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
-pub(crate) fn absorb_node_changes(
-    mut response: Value,
-    node: usize,
-    progress: &mut [u64],
-    rows: &mut Vec<Value>,
-) {
-    let node_last = last_seq_for_node(&response, node, progress.len());
-    let Some(Value::Array(values)) = response.get_mut("results").map(std::mem::take) else {
-        return;
-    };
-    for mut row in values {
-        let shard_seq = row["seq"].as_u64().unwrap_or(0);
-        let safe = node_last.map(|seq| shard_seq.min(seq)).unwrap_or(shard_seq);
-        progress[node] = progress[node].max(safe);
-        row["seq"] = json!(encode_since(progress));
-        rows.push(row);
-    }
-}
-
-/// Current per-node update_seq vector. Used for `since=now` and for the
-/// `update_seq` reported in `GET /db`.
-pub(crate) async fn cluster_update_vector(read: ClusterRead<'_>) -> DbResult<Vec<u64>> {
+/// Current per-node update_seq vector, plus fallback marks for the shards of
+/// any node that did not answer. Used for `since=now` and for the `update_seq`
+/// reported in `GET /db`.
+///
+/// Like CouchDB's `fabric_db_info`, an unreachable node is fine while another
+/// replica holds each of its shards; the feed then reads those shards from the
+/// replica, so the mark starts at that replica's current sequence. When some
+/// shard has no live copy the answer is 412 `nodedown` / `progress not
+/// possible`. The unreachable node's own slot stays 0, so after it returns its
+/// changes are replayed rather than skipped.
+pub(crate) async fn cluster_update_vector(
+    read: ClusterRead<'_>,
+) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
     let ClusterRead {
         st,
         db,
         dbname,
         headers,
     } = read;
-    let out = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
+    let seqs = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
         if node == st.cluster.me {
-            return Ok(db.update_seq());
+            return Some(db.update_seq());
         }
         let peer = &st.cluster.nodes[node];
         let request = internal_request(st, reqwest::Method::GET, peer, &[dbname], Some(headers))
             .header("x-douchdb-update-seq", "1");
-        let seq = match request.send().await {
-            Ok(response) if response.status().is_success() => response
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|info| info["update_seq"].as_u64())
-                .unwrap_or(0),
-            _ => 0,
-        };
-        Ok(seq)
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<Value>().await.ok()?["update_seq"].as_u64()
     }))
-    .await
-    .into_iter()
-    .collect::<DbResult<Vec<u64>>>()?;
-    Ok(out)
+    .await;
+    let failed: Vec<usize> = (0..seqs.len())
+        .filter(|node| seqs[*node].is_none())
+        .collect();
+    let alive: Vec<usize> = (0..seqs.len())
+        .filter(|node| seqs[*node].is_some())
+        .collect();
+    let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
+    if failed.is_empty() {
+        return Ok((vector, Vec::new()));
+    }
+    let groups = fallback_shard_masks(db, &preferred_shard_masks(st, db), &failed, &alive)
+        .map_err(|_| ApiError::new(412, "nodedown", "progress not possible"))?;
+    let marks = groups
+        .into_iter()
+        .map(|(node, mask)| FallbackMark {
+            node,
+            shards: mask_shards(&mask),
+            seq: vector.get(node).copied().unwrap_or(0),
+        })
+        .collect();
+    Ok((vector, marks))
 }
 
 pub(crate) fn encode_since(vector: &[u64]) -> String {
+    encode_token(vector, &[])
+}
+
+/// A since token: the per-node vector, then `~node:shard.shard:seq` for each
+/// fallback mark.
+pub(crate) fn encode_token(vector: &[u64], marks: &[FallbackMark]) -> String {
     use std::fmt::Write as _;
 
     // This runs once per change row in a cluster feed. The old form was
@@ -1952,7 +2002,43 @@ pub(crate) fn encode_since(vector: &[u64]) -> String {
         }
         let _ = write!(out, "{seq}");
     }
+    for mark in marks {
+        let _ = write!(out, "~{}:", mark.node);
+        for (index, shard) in mark.shards.iter().enumerate() {
+            if index > 0 {
+                out.push('.');
+            }
+            let _ = write!(out, "{shard}");
+        }
+        let _ = write!(out, ":{}", mark.seq);
+    }
     out
+}
+
+/// The fallback marks of a `v1:` since token; malformed or out-of-cluster
+/// marks are dropped, which only makes that fallback start from the beginning.
+pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
+    let Some(rest) = raw.trim_matches('"').strip_prefix("v1:") else {
+        return Vec::new();
+    };
+    rest.split('~')
+        .skip(1)
+        .filter_map(|part| {
+            let mut fields = part.split(':');
+            let node: usize = fields.next()?.parse().ok()?;
+            let shards: Option<Vec<usize>> = fields
+                .next()?
+                .split('.')
+                .map(|shard| shard.parse().ok())
+                .collect();
+            let seq: u64 = fields.next()?.parse().ok()?;
+            (node < nodes && fields.next().is_none()).then_some(FallbackMark {
+                node,
+                shards: shards?,
+                seq,
+            })
+        })
+        .collect()
 }
 
 /// Decodes a since token for a cluster of `nodes` nodes. A legacy token naming
@@ -1961,6 +2047,7 @@ pub(crate) fn decode_since(raw: &str, nodes: usize) -> Option<Vec<u64>> {
     let raw = raw.trim_matches('"');
     if let Some(rest) = raw.strip_prefix("v1:") {
         let mut out = Vec::new();
+        let rest = rest.split('~').next().unwrap_or(rest);
         for part in rest.split(',') {
             out.push(part.parse().ok()?);
         }
@@ -2277,6 +2364,22 @@ mod tests {
         assert!(adoptable_peer_map(&ours, 1, 3));
         assert!(adoptable_peer_map(&ours, 5, 3));
         assert!(!adoptable_peer_map(&ours, 6, 3));
+    }
+
+    #[test]
+    fn since_token_round_trips_fallback_marks() {
+        let marks = vec![FallbackMark {
+            node: 1,
+            shards: vec![0, 3],
+            seq: 42,
+        }];
+        let token = encode_token(&[5, 0, 7], &marks);
+        assert_eq!(token, "v1:5,0,7~1:0.3:42");
+        assert_eq!(decode_since(&token, 3), Some(vec![5, 0, 7]));
+        assert_eq!(decode_fallbacks(&token, 3), marks);
+        assert!(decode_fallbacks(&token, 1).is_empty());
+        assert!(decode_fallbacks("v1:5,0,7~x:1:2", 3).is_empty());
+        assert!(decode_fallbacks("7", 3).is_empty());
     }
 
     #[test]
