@@ -9,14 +9,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tantivy::collector::DocSetCollector;
+use tantivy::directory::error::{
+    DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
+};
+use tantivy::directory::{
+    AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, TerminatingWrite,
+    WatchCallback, WatchHandle, WritePtr,
+};
 use tantivy::query::{AllQuery, QueryParser};
 use tantivy::schema::{
     Field, FieldType, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
-use tantivy::{Index, IndexReader, ReloadPolicy, Searcher, Term};
+use tantivy::{Index, IndexReader, IndexSettings, ReloadPolicy, Searcher, Term};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
-const SEARCH_VERSION: u8 = 2;
+const SEARCH_VERSION: u8 = 3;
 const PAGE_LIMIT: usize = 2000;
 
 #[derive(Clone, Debug)]
@@ -31,15 +38,21 @@ struct SearchDoc {
     fields: Map<String, Value>,
 }
 
+/// An index's description. Only the identifying fields are written to the
+/// metadata file; `last_seq` is the payload of the index's last commit and
+/// each document's fields are stored with it, so both always match the
+/// committed index.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SearchMeta {
     version: u8,
+    #[serde(skip)]
     last_seq: u64,
     design: String,
     #[serde(default)]
     ddoc: String,
     #[serde(default)]
     name: String,
+    #[serde(skip)]
     docs: Vec<SearchDoc>,
 }
 
@@ -221,6 +234,12 @@ pub(crate) fn run_index_json(
     })
 }
 
+/// The schema field holding each document's id.
+const ID_FIELD: &str = "_id";
+/// The stored-only schema field holding each document's indexed fields as
+/// JSON, read back when the index is opened.
+const FIELDS_FIELD: &str = "_fields";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FieldKind {
     Text,
@@ -234,6 +253,10 @@ fn infer_kinds<'a>(
     let mut kinds: BTreeMap<String, FieldKind> = BTreeMap::new();
     for fields in docs {
         for (name, value) in fields {
+            // The schema's own fields cannot also be index fields.
+            if name == ID_FIELD || name == FIELDS_FIELD {
+                continue;
+            }
             let kind = match value {
                 Value::Number(_) => FieldKind::Number,
                 Value::Bool(_) => FieldKind::Bool,
@@ -347,7 +370,8 @@ fn build_index_files(
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let mut builder = Schema::builder();
-    let id_field = builder.add_text_field("_id", STRING | STORED | FAST);
+    let id_field = builder.add_text_field(ID_FIELD, STRING | STORED | FAST);
+    let fields_field = builder.add_text_field(FIELDS_FIELD, STORED);
     let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
     for (name, kind) in &kinds {
         let field = match kind {
@@ -358,7 +382,9 @@ fn build_index_files(
         fields.insert(name.clone(), (field, *kind));
     }
     let schema = builder.build();
-    let tantivy_index = Index::create_in_dir(&path, schema.clone())
+    let tantivy_index = UnsyncedDirectory::open(&path)
+        .map_err(tantivy::TantivyError::from)
+        .and_then(|directory| Index::create(directory, schema.clone(), IndexSettings::default()))
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     let writer = tantivy_index
         .writer(50_000_000)
@@ -366,10 +392,15 @@ fn build_index_files(
 
     for doc in &indexed {
         writer
-            .add_document(tantivy_doc(&doc.id, &doc.fields, id_field, &fields))
+            .add_document(tantivy_doc(
+                &doc.id,
+                &doc.fields,
+                (id_field, fields_field),
+                &fields,
+            ))
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     }
-    finish_writer(writer)?;
+    finish_writer(writer, meta.last_seq)?;
 
     meta.docs = indexed
         .into_iter()
@@ -382,14 +413,17 @@ fn build_index_files(
     Ok((tantivy_index, meta))
 }
 
+/// A document for the index, with its id and its fields as JSON in the
+/// schema's own two fields.
 fn tantivy_doc(
     id: &str,
     values: &Map<String, Value>,
-    id_field: Field,
+    (id_field, fields_field): (Field, Field),
     fields: &HashMap<String, (Field, FieldKind)>,
 ) -> TantivyDocument {
     let mut tantivy_doc = TantivyDocument::default();
     tantivy_doc.add_text(id_field, id);
+    tantivy_doc.add_text(fields_field, Value::Object(values.clone()).to_string());
     for (name, value) in values {
         let Some((field, kind)) = fields.get(name) else {
             continue;
@@ -417,8 +451,14 @@ fn tantivy_doc(
     tantivy_doc
 }
 
-fn finish_writer(mut writer: tantivy::IndexWriter) -> DbResult<()> {
-    writer
+/// Commit with `last_seq` as the payload, so the sequence an index is up to
+/// date with is saved with the documents it covers.
+fn finish_writer(mut writer: tantivy::IndexWriter, last_seq: u64) -> DbResult<()> {
+    let mut commit = writer
+        .prepare_commit()
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    commit.set_payload(&last_seq.to_string());
+    commit
         .commit()
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     // Dropping the writer leaves its merge threads running, and they can still
@@ -437,11 +477,10 @@ enum Update {
     Rebuild(OwnedRwLockReadGuard<()>, OwnedMutexGuard<Option<Cached>>),
 }
 
-/// Bring the cached index at `path` up to date with the changes since its
+/// Bring the cached index up to date with the changes since its
 /// `last_seq`, re-indexing only the documents that changed.
 async fn update_index(
     db: &Db,
-    path: PathBuf,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
     gate: OwnedRwLockReadGuard<()>,
@@ -511,11 +550,15 @@ async fn update_index(
         let kinds = infer_kinds(meta.docs.iter().map(|doc| &doc.fields));
         let schema = tantivy_index.schema();
         let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
-        let mut id_field = None;
+        let (mut id_field, mut fields_field) = (None, None);
         for (field, field_entry) in schema.fields() {
             let kind = match field_entry.field_type() {
-                FieldType::Str(_) if field_entry.name() == "_id" => {
+                FieldType::Str(_) if field_entry.name() == ID_FIELD => {
                     id_field = Some(field);
+                    continue;
+                }
+                FieldType::Str(_) if field_entry.name() == FIELDS_FIELD => {
+                    fields_field = Some(field);
                     continue;
                 }
                 FieldType::Str(_) => FieldKind::Text,
@@ -525,7 +568,7 @@ async fn update_index(
             };
             fields.insert(field_entry.name().to_string(), (field, kind));
         }
-        let Some(id_field) = id_field else {
+        let (Some(id_field), Some(fields_field)) = (id_field, fields_field) else {
             return Ok(Update::Rebuild(gate, entry));
         };
         let schema_kinds: BTreeMap<String, FieldKind> = fields
@@ -544,13 +587,16 @@ async fn update_index(
         }
         for doc in meta.docs.iter().filter(|doc| changed.contains(&doc.id)) {
             writer
-                .add_document(tantivy_doc(&doc.id, &doc.fields, id_field, &fields))
+                .add_document(tantivy_doc(
+                    &doc.id,
+                    &doc.fields,
+                    (id_field, fields_field),
+                    &fields,
+                ))
                 .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
         }
-        finish_writer(writer)?;
-
+        finish_writer(writer, last_seq)?;
         meta.last_seq = last_seq;
-        write_meta(&path, &meta)?;
         reader
             .reload()
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
@@ -563,6 +609,103 @@ async fn update_index(
     })
     .await
     .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?
+}
+
+/// An index's files, written without fsync. A search index is derived from
+/// the database: one a crash damages fails its checksums when it is next
+/// opened and is rebuilt, so a commit does not wait for the disk. (The
+/// database's own storage does not sync either.)
+#[derive(Clone, Debug)]
+struct UnsyncedDirectory {
+    inner: MmapDirectory,
+    root: PathBuf,
+}
+
+impl UnsyncedDirectory {
+    fn open(root: &Path) -> Result<Self, OpenDirectoryError> {
+        Ok(UnsyncedDirectory {
+            inner: MmapDirectory::open(root)?,
+            root: root.to_path_buf(),
+        })
+    }
+}
+
+struct UnsyncedFile(std::fs::File);
+
+impl std::io::Write for UnsyncedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.0, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
+    }
+}
+
+impl TerminatingWrite for UnsyncedFile {
+    fn terminate_ref(&mut self, _: AntiCallToken) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
+    }
+}
+
+impl Directory for UnsyncedDirectory {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        self.inner.get_file_handle(path)
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        self.inner.delete(path)
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        self.inner.exists(path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.root.join(path))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    OpenWriteError::FileAlreadyExists(path.to_path_buf())
+                } else {
+                    OpenWriteError::wrap_io_error(error, path.to_path_buf())
+                }
+            })?;
+        Ok(std::io::BufWriter::new(Box::new(UnsyncedFile(file))))
+    }
+
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        // Replace by rename, so a reader sees the old or the new file whole.
+        // A crash can leave the temporary file behind; a rebuild or cleanup
+        // removes the whole directory.
+        static TEMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let target = self.root.join(path);
+        let temp = self.root.join(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            TEMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&temp, data)?;
+        std::fs::rename(&temp, target)
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.inner.acquire_lock(lock)
+    }
+
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.watch(watch_callback)
+    }
 }
 
 fn build_gate(db: &Db) -> Arc<RwLock<()>> {
@@ -623,9 +766,45 @@ impl Cached {
         Ok(Cached { reader, snapshot })
     }
 
+    /// Open an index from disk, or `None` if it has to be rebuilt.
     fn load(path: &Path) -> Option<Self> {
-        let meta = read_meta(path)?;
-        let index = Index::open_in_dir(path).ok()?;
+        let mut meta = read_meta(path)?;
+        let index = Index::open(UnsyncedDirectory::open(path).ok()?).ok()?;
+        // Files a crash left incomplete fail their checksums. Every file of
+        // the committed segments is checked, not only those `.managed.json`
+        // lists: it is written before the commit and may have been lost.
+        let metas = index.load_metas().ok()?;
+        let directory = index.directory();
+        for file in metas.list_segment_files() {
+            if directory.exists(&file).ok()? && !directory.validate_checksum(&file).ok()? {
+                return None;
+            }
+        }
+        meta.last_seq = metas.payload?.parse().ok()?;
+        let schema = index.schema();
+        let id_field = schema.get_field(ID_FIELD).ok()?;
+        let fields_field = schema.get_field(FIELDS_FIELD).ok()?;
+        let reader: IndexReader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .ok()?;
+        let searcher = reader.searcher();
+        let text = |document: &TantivyDocument, field: Field| match document
+            .get_first(field)
+            .map(|value| owned_value_to_json(value.into()))
+        {
+            Some(Value::String(text)) => Some(text),
+            _ => None,
+        };
+        for address in searcher.search(&AllQuery, &DocSetCollector).ok()? {
+            let document: TantivyDocument = searcher.doc(address).ok()?;
+            let fields = serde_json::from_str(&text(&document, fields_field)?).ok()?;
+            meta.docs.push(SearchDoc {
+                id: text(&document, id_field)?,
+                fields,
+            });
+        }
         Cached::open(index, meta).ok()
     }
 }
@@ -669,7 +848,11 @@ async fn ensure_index(
     // Check after acquiring the per-index lock: another request may have
     // completed an update or rebuild while this one waited.
     if entry.is_none() {
-        *entry = Cached::load(&path);
+        // Opening reads every segment file and stored document.
+        let load = path.clone();
+        *entry = tokio::task::spawn_blocking(move || Cached::load(&load))
+            .await
+            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     }
     if let Some(cached) = entry.as_ref() {
         let meta = &cached.snapshot.meta;
@@ -679,7 +862,7 @@ async fn ensure_index(
                 return Ok((cached.snapshot.clone(), gate));
             }
             if meta.last_seq < current {
-                return match update_index(db, path, spec, limits, gate, entry).await? {
+                return match update_index(db, spec, limits, gate, entry).await? {
                     Update::Done(snapshot, gate) => Ok((snapshot, gate)),
                     Update::Rebuild(gate, entry) => {
                         build_index(db, ddoc, index_name, spec, limits, gate, entry).await
@@ -976,7 +1159,7 @@ pub async fn query(
     let searcher = &snapshot.searcher;
     let schema = snapshot.index.schema();
     let id_field = schema
-        .get_field("_id")
+        .get_field(ID_FIELD)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let query_text = request.query.trim();
@@ -985,7 +1168,7 @@ pub async fn query(
     } else {
         let default_fields: Vec<Field> = schema
             .fields()
-            .filter(|(_, field)| field.name() != "_id")
+            .filter(|(_, field)| field.name() != ID_FIELD && field.name() != FIELDS_FIELD)
             .map(|(field, _)| field)
             .collect();
         let parser = QueryParser::for_index(&snapshot.index, default_fields);
@@ -1232,12 +1415,25 @@ pub fn all_indexes(db: &Db) -> Vec<Value> {
         if meta.ddoc.is_empty() || meta.name.is_empty() {
             continue;
         }
+        let Some(doc_count) = UnsyncedDirectory::open(&path)
+            .ok()
+            .and_then(|directory| Index::open(directory).ok())
+            .and_then(|index| index.searchable_segment_metas().ok())
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|segment| segment.num_docs())
+                    .sum::<u32>()
+            })
+        else {
+            continue;
+        };
         out.push(json!({
             "ddoc": meta.ddoc,
             "name": meta.name,
             "ok": true,
             "info": {
-                "doc_count": meta.docs.len(),
+                "doc_count": doc_count,
                 "signature": meta.design,
                 "updates_pending": {
                     "copies": db.replicas_of_shard(0).len().max(1),
@@ -1355,6 +1551,11 @@ mod tests {
             let rebuilt = index_dir(&db, "_design/b", "idx");
             registry().remove(&rebuilt);
             std::fs::remove_dir_all(rebuilt).ok();
+            // Every other step, `a` is read back from disk as after a
+            // restart: its sequence and fields come from its last commit.
+            if step % 2 == 1 {
+                registry().remove(&index_dir(&db, "_design/a", "idx"));
+            }
             for q in [
                 "*:*",
                 "name:pear",
@@ -1370,6 +1571,65 @@ mod tests {
                 assert_eq!(!marker.exists(), rebuilds, "step {step} rebuilt");
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_index_is_rebuilt_when_opened() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-damaged-{}-{}",
+            std::process::id(),
+            crate::db::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchdamaged",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let docs: Vec<Value> = (0..20)
+            .map(|i| json!({"_id": format!("d{i:02}"), "name": format!("apple{i}")}))
+            .chain([json!({"_id": "_design/a", "indexes": {"idx": {"index":
+                "function(doc){ if (doc.name) index('name', doc.name); }"}}})])
+            .collect();
+        db.put_docs(docs, true).await.unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:apple7".to_string(),
+            ..SearchRequest::default()
+        };
+        let first = query(&db, "_design/a", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(first["total_rows"], 1, "{first}");
+
+        // Flip a byte in the term and postings files, as an interrupted write
+        // might leave them, then open the index afresh.
+        let path = index_dir(&db, "_design/a", "idx");
+        registry().remove(&path);
+        let marker = path.join("douchdb-test-marker");
+        std::fs::write(&marker, b"").unwrap();
+        // The file list a crash may also have lost.
+        std::fs::remove_file(path.join(".managed.json")).unwrap();
+        for entry in std::fs::read_dir(&path).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Not the document store, which opening the index reads anyway.
+            if name.ends_with(".idx") || name.ends_with(".term") {
+                let mut bytes = std::fs::read(entry.path()).unwrap();
+                bytes[0] ^= 0xff;
+                std::fs::write(entry.path(), bytes).unwrap();
+            }
+        }
+        let again = query(&db, "_design/a", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert!(!marker.exists(), "the damaged index was not rebuilt");
         let _ = std::fs::remove_dir_all(root);
     }
 
