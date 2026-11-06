@@ -363,11 +363,11 @@ impl Shard {
             ..Options::default()
         };
         let mut db = DB::open(path, opts)?;
-        let seq = db_get_checked(&mut db, b"z/seq")?
-            .filter(|b| b.len() == 8)
-            .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
-            .unwrap_or(0);
-        if had_tables && seq == 0 {
+        // A shard that has only seen `_local` writes, or was cleared, legitimately
+        // has sequence 0; what marks corruption is the key being absent.
+        let stored_seq = read_counter(&mut db, b"z/seq")?;
+        let seq = stored_seq.unwrap_or(0);
+        if had_tables && stored_seq.is_none() {
             anyhow::bail!(
                 "corrupt shard {}: table files are present but no sequence state",
                 path.display()
@@ -969,8 +969,13 @@ impl Shard {
         for key in keys {
             batch.delete(&key);
         }
+        // Keep the sequence (so numbers never go backwards and `open` still
+        // finds sequence state next to the table files) and persist the
+        // emptied counters.
+        batch.put(b"z/seq", &self.seq.to_be_bytes());
+        batch.put(b"z/doc_count", &0u64.to_be_bytes());
+        batch.put(b"z/doc_deleted_count", &0u64.to_be_bytes());
         self.db.write(batch, true)?;
-        self.seq = 0;
         self.docs = 0;
         self.deleted = 0;
         self.live = None;
