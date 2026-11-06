@@ -200,9 +200,13 @@ surface and avoids pretending that a local file edit propagates across a cluster
   `_security` for the forwarded principal.
 - Internal requests without user credentials are service admins, trusted by the
   shared cluster secret. Do not expose the cluster secret to clients.
-- `_security` changes are applied to every configured peer or rolled back. If a
-  peer is offline, the change fails; retry when the cluster is healthy. Use one
-  coordinator for concurrent admin changes.
+- `_security` objects are versioned (beside the object, never in the
+  `GET /db/_security` body). The coordinator stores the change and pushes it to
+  every peer; peers reject older versions, and concurrent updates with the same
+  version settle on one winner everywhere. The anti-entropy pass reconciles the
+  object, so a peer that was offline, restored or added later converges. The
+  write returns 200 once a majority holds it and 202 when it does not yet, in
+  which case it is still kept and delivered when the peers return.
 - Set the same `--session-secret` (or cluster secret) on every node if session
   cookies should work across nodes.
 - Admission is local to each node.
@@ -219,7 +223,8 @@ per_user_admission_caps_concurrency_and_preserves_other_users
 global_admission_limit_protects_capacity_across_users
 cross_user_isolation_is_watertight
 longpoll_changes_stops_after_security_revocation
-cluster_security_change_rolls_back_when_a_peer_is_down
+cluster_security_reconciles_to_peer_that_missed_the_update
+cluster_security_without_quorum_is_accepted_and_converges
 ```
 
 Unit tests in `src/admission.rs` cover per-user/global limits, the heavy lane,

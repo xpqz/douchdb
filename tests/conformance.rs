@@ -10381,38 +10381,6 @@ async fn cluster_security_without_quorum_is_accepted_and_converges() {
 }
 
 #[tokio::test]
-async fn cluster_security_change_rolls_back_when_a_peer_is_down() {
-    let mut nodes = start_cluster_with_auth(2, "3600", 2);
-    let admin = admin_auth();
-    let (status, body) = nodes[0]
-        .req_with(Method::PUT, "/secfail", Some(json!({})), &admin)
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-
-    nodes[1].kill();
-    let (status, body) = nodes[0]
-        .req_with(
-            Method::PUT,
-            "/secfail/_security",
-            Some(json!({
-                "admins": {"names": [], "roles": []},
-                "members": {"names": ["alice"], "roles": []}
-            })),
-            &admin,
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["error"], "security_propagation_failed");
-
-    // The coordinator rolled back its local security object.
-    let (status, body) = nodes[0]
-        .req_with(Method::GET, "/secfail/_security", None, &admin)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({}));
-}
-
-#[tokio::test]
 async fn cluster_rebalance_requires_explicit_cleanup() {
     let nodes = start_cluster_with(3, "1", 1);
     for node in &nodes {

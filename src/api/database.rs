@@ -432,7 +432,10 @@ pub async fn db_rest(
                     )
                     .await
                     {
-                        Ok(()) => ok(),
+                        Ok(true) => ok(),
+                        // Stored here and queued for the peers that did not
+                        // acknowledge it; anti-entropy delivers it.
+                        Ok(false) => json(StatusCode::ACCEPTED, json!({"ok": true})),
                         Err(error) => fail(error),
                     }
                 }
@@ -441,7 +444,7 @@ pub async fn db_rest(
                     "method_not_allowed",
                     "method not allowed",
                 )),
-            }
+            };
         }
         "_view_cleanup" => {
             return match crate::view::cleanup(&db).await {

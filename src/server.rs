@@ -192,7 +192,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         )
         .route(
             "/_node/_local/_dbs/{db}/security",
-            axum::routing::put(api::db_security_put),
+            axum::routing::get(api::db_security_get).put(api::db_security_put),
         )
         .route(
             "/_node/_local/_dbs/{db}/migration",
