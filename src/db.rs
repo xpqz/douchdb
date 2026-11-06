@@ -3066,6 +3066,129 @@ mod tests {
             .expect("document id for shard")
     }
 
+    async fn single_shard_db(name: &str) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            name,
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        (db, root)
+    }
+
+    #[tokio::test]
+    async fn a_missing_attachment_chunk_fails_the_read() {
+        let (db, root) = single_shard_db("att-chunk").await;
+        // Uploads are rejected at the API, so plant the attachment directly.
+        let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        db.shards[0]
+            .call(move |shard| {
+                let mut meta = shard.get_meta("a")?.unwrap();
+                meta.atts.insert(
+                    rev,
+                    vec![(
+                        "f.txt".to_string(),
+                        AttMeta {
+                            content_type: "text/plain".into(),
+                            digest: "5d41402abc4b2a76b9719d911017c592".into(),
+                            length: 5,
+                            revpos: 1,
+                        },
+                    )],
+                );
+                shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
+                shard.put_raw(
+                    &blob_prefix("5d41402abc4b2a76b9719d911017c592", 0),
+                    b"hello",
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let opts = DocOpts {
+            attachments: true,
+            ..Default::default()
+        };
+        let doc = db.get_doc("a", &opts).await.unwrap();
+        assert_eq!(doc["_attachments"]["f.txt"]["data"], "aGVsbG8=");
+
+        db.shards[0]
+            .call(|shard| {
+                shard.delete_raw(&blob_prefix("5d41402abc4b2a76b9719d911017c592", 0));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.get_doc("a", &opts).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_local_document_is_an_error_not_missing() {
+        let (db, root) = single_shard_db("local-corrupt").await;
+        db.shards[0]
+            .call(|shard| {
+                shard.put_raw(&local_key("bad"), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.local_get("bad").await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_body_is_an_error_in_listings_and_open_revs() {
+        let (db, root) = single_shard_db("body-corrupt").await;
+        let put = db
+            .put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        let corrupt_rev = rev.clone();
+        db.shards[0]
+            .call(move |shard| {
+                shard.put_raw(&body_key("a", &corrupt_rev), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let all = AllDocsOpts {
+            include_docs: true,
+            ..Default::default()
+        };
+        let error = db.all_docs(&all).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+
+        let changes = ChangesOpts {
+            include_docs: true,
+            ..Default::default()
+        };
+        let error = db.changes(&changes).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+
+        let open_revs = DocOpts {
+            open_revs: Some(vec![rev]),
+            ..Default::default()
+        };
+        let error = db.get_doc("a", &open_revs).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
         let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::db::uuid()));

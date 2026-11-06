@@ -454,6 +454,20 @@ impl Shard {
         self.fail_next_flush = true;
     }
 
+    /// Write a record straight to disk, bypassing the overlay, counters and
+    /// indexes, so tests can plant corrupt or missing data.
+    #[cfg(test)]
+    pub(crate) fn put_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.db.put(key, value).unwrap();
+        self.db.flush().unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_raw(&mut self, key: &[u8]) {
+        self.db.delete(key).unwrap();
+        self.db.flush().unwrap();
+    }
+
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -1622,6 +1636,50 @@ mod scan_tests {
         let shard = Shard::open(&dir, 1000).unwrap();
         assert_eq!(shard.seq, 0);
         drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_metadata_is_an_error_not_a_missing_document() {
+        let dir = temp_shard_dir("corrupt-meta");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.put_raw(&meta_key("p:bad"), b"{not json");
+
+        assert!(shard.live_docs().is_err(), "live index skipped the record");
+        assert!(
+            shard.latest_changes().is_err(),
+            "changes skipped the record"
+        );
+        assert!(shard.partition_counts("p").is_err());
+        assert!(shard.fingerprint().is_err());
+
+        // Overwriting a record that cannot be parsed would make the counters
+        // guess what it used to be.
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("p:bad"), &meta(false, 2)).unwrap();
+        assert!(shard.commit_at(tx, Some(2)).is_err());
+        assert_eq!(shard.counts(), (1, 0));
+        assert_eq!(shard.seq(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counter_backfill_fails_on_corrupt_metadata() {
+        let dir = temp_shard_dir("corrupt-backfill");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.put_raw(&meta_key("p:bad"), b"{not json");
+        shard.delete_raw(b"z/doc_count");
+        shard.delete_raw(b"z/doc_deleted_count");
+        drop(shard);
+        assert!(Shard::open(&dir, 1000).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
