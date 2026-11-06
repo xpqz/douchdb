@@ -205,7 +205,12 @@ async fn put_local_bulk(db: &Db, doc: Value) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let result = if deleted {
-        db.local_delete(&name).await
+        // Unlike DELETE /db/_local/id, CouchDB's _bulk_docs reports a delete
+        // of a missing local doc as a success at rev 0-0.
+        match db.local_delete(&name).await {
+            Err(error) if error.status == 404 => Ok(json!({"ok": true, "id": id, "rev": "0-0"})),
+            other => other,
+        }
     } else {
         db.local_put(&name, doc).await
     };
