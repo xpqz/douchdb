@@ -8505,31 +8505,45 @@ async fn quickjs_wasm_sandbox_runs_views_reduce_and_search() {
 
 #[tokio::test]
 async fn sandboxed_reduce_rereduce_receives_null_keys() {
-    // CouchDB passes keys = null to a rereduce. More rows than fit one block
-    // (256) make the reduce combine stored partials with a rereduce.
-    for mode in ["process", "wasm"] {
-        if !sandbox_tested(mode) {
-            continue;
-        }
-        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
-        let s = Server::start_with(&args, false);
-        s.fresh_db("jsrereduce").await;
-        let (status, _) = s.put("/jsrereduce/doc", json!({"n": 300})).await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, _) = s
-            .put(
-                "/jsrereduce/_design/v",
-                json!({"views": {"total": {
-                    "map": "function(doc){ for (var i = 0; i < doc.n; i++) emit(i, 1); }",
-                    "reduce": "function(keys, values, rereduce){ if (rereduce && keys !== null) return -1; return sum(values); }"
-                }}}),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (status, body) = s.get("/jsrereduce/_design/v/_view/total").await;
-        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
-        assert_eq!(body["rows"][0]["value"], 300, "{mode}: {body}");
+    // The sandboxes run side by side: the wasm one is slow to start.
+    tokio::join!(
+        assert_rereduce_keys_are_null("process"),
+        assert_rereduce_keys_are_null("wasm")
+    );
+}
+
+async fn assert_rereduce_keys_are_null(mode: &str) {
+    // CouchDB passes keys = null to a rereduce. With two shards, the
+    // partial reductions of the shards are combined with a rereduce.
+    if !sandbox_tested(mode) {
+        return;
     }
+    let args = vec![
+        "--js-sandbox".to_string(),
+        mode.to_string(),
+        "--q".to_string(),
+        "2".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsrereduce").await;
+    let docs: Vec<Value> = (0..8).map(|i| json!({"_id": format!("d{i}")})).collect();
+    let (status, _) = s
+        .post("/jsrereduce/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsrereduce/_design/v",
+            json!({"views": {"total": {
+                "map": "function(doc){ emit(null, 1); }",
+                "reduce": "function(keys, values, rereduce){ if (rereduce && keys !== null) return -1; return sum(values); }"
+            }}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/jsrereduce/_design/v/_view/total").await;
+    assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+    assert_eq!(body["rows"][0]["value"], 8, "{mode}: {body}");
 }
 
 #[tokio::test]
