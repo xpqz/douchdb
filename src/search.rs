@@ -929,12 +929,20 @@ fn parse_number(text: &str) -> Option<f64> {
 
 fn value_in_range(value: &Value, range: &str) -> bool {
     let range = range.trim();
-    if range.len() < 2 {
+    let (lower_inclusive, rest) = if let Some(rest) = range.strip_prefix('[') {
+        (true, rest)
+    } else if let Some(rest) = range.strip_prefix('{') {
+        (false, rest)
+    } else {
         return false;
-    }
-    let lower_inclusive = range.starts_with('[');
-    let upper_inclusive = range.ends_with(']');
-    let inner = &range[1..range.len() - 1];
+    };
+    let (upper_inclusive, inner) = if let Some(inner) = rest.strip_suffix(']') {
+        (true, inner)
+    } else if let Some(inner) = rest.strip_suffix('}') {
+        (false, inner)
+    } else {
+        return false;
+    };
     let Some((lower, upper)) = inner.split_once(" TO ") else {
         return false;
     };

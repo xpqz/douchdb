@@ -407,12 +407,12 @@ async fn changes_options(
             vector
         }
     } else if let Some(raw) = raw_since {
-        match decode_since(raw) {
+        match decode_since(raw, n) {
             Some(mut vector) => {
                 vector.resize(n.max(vector.len()), 0);
                 vector
             }
-            None => vec![since_component(Some(raw), st.cluster.me); n],
+            None => vec![since_component(Some(raw), st.cluster.me, n); n],
         }
     } else {
         vec![0; n]
