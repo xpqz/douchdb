@@ -14,6 +14,7 @@ const NEW_FLOAT_EXT: u8 = 70;
 const SMALL_TUPLE_EXT: u8 = 104;
 const LARGE_TUPLE_EXT: u8 = 105;
 const NIL_EXT: u8 = 106;
+const STRING_EXT: u8 = 107;
 const LIST_EXT: u8 = 108;
 const BINARY_EXT: u8 = 109;
 const ATOM_EXT: u8 = 100;
@@ -39,6 +40,15 @@ pub enum Term {
 }
 
 impl Term {
+    /// The value if this is an integer that fits STRING_EXT's byte range.
+    fn as_byte(&self) -> Option<u8> {
+        match self {
+            Term::Int(i) => u8::try_from(*i).ok(),
+            Term::UInt(u) => u8::try_from(*u).ok(),
+            _ => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![VERSION_MAGIC];
         self.encode_into(&mut out);
@@ -124,14 +134,21 @@ impl Term {
                 out.extend_from_slice(b);
             }
             Term::List(items) if items.is_empty() => out.push(NIL_EXT),
-            Term::List(items) => {
-                out.push(LIST_EXT);
-                out.extend((items.len() as u32).to_be_bytes());
-                for item in items {
-                    item.encode_into(out);
+            // term_to_binary packs a list of integers 0..=255 (at most 65535
+            // of them) as STRING_EXT (erts/emulator/beam/external.c, and the
+            // "External Term Format" docs). jiffy decodes [1,2,3] to exactly
+            // such a list.
+            Term::List(items) if items.len() <= u16::MAX as usize => {
+                match items.iter().map(Term::as_byte).collect::<Option<Vec<u8>>>() {
+                    Some(bytes) => {
+                        out.push(STRING_EXT);
+                        out.extend((bytes.len() as u16).to_be_bytes());
+                        out.extend_from_slice(&bytes);
+                    }
+                    None => encode_list(items, out),
                 }
-                out.push(NIL_EXT);
             }
+            Term::List(items) => encode_list(items, out),
             Term::Tuple(items) if items.len() < 256 => {
                 out.push(SMALL_TUPLE_EXT);
                 out.push(items.len() as u8);
@@ -148,6 +165,15 @@ impl Term {
             }
         }
     }
+}
+
+fn encode_list(items: &[Term], out: &mut Vec<u8>) {
+    out.push(LIST_EXT);
+    out.extend((items.len() as u32).to_be_bytes());
+    for item in items {
+        item.encode_into(out);
+    }
+    out.push(NIL_EXT);
 }
 
 fn is_integer(raw: &str) -> bool {
