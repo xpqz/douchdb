@@ -32,11 +32,8 @@ impl InFlightGuard {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            });
+        // Every guard incremented the counter in `new`, so this cannot wrap.
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
