@@ -3283,42 +3283,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn row_ids(value: &Value, rows: &str) -> Vec<String> {
+        value[rows]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_corrupt_body_is_an_error_in_listings_and_open_revs() {
-        let (db, root) = single_shard_db("body-corrupt").await;
-        let put = db
-            .put_docs(vec![json!({"_id": "a", "n": 1})], true)
+    async fn listings_skip_corrupt_records_and_point_reads_fail() {
+        let (db, root) = single_shard_db("listing-corrupt").await;
+        // Plant the corrupt metadata before anything builds the shard's
+        // indexes, so the first scan meets it.
+        db.shards[0]
+            .call(|shard| {
+                shard.put_raw(&meta_key("bad-meta"), b"{not json");
+                Ok(())
+            })
             .await
             .unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
-        let corrupt_rev = rev.clone();
+        let put = db
+            .put_docs(
+                vec![
+                    json!({"_id": "a", "n": 1}),
+                    json!({"_id": "bad-body", "n": 2}),
+                    json!({"_id": "c", "n": 3}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let bad_rev = put[1]["rev"].as_str().unwrap().to_string();
+        let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
-                shard.put_raw(&body_key("a", &corrupt_rev), b"{not json");
+                shard.put_raw(&body_key("bad-body", &corrupt_rev), b"{not json");
                 Ok(())
             })
             .await
             .unwrap();
 
-        let all = AllDocsOpts {
-            include_docs: true,
-            ..Default::default()
-        };
-        let error = db.all_docs(&all).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
+        let before = crate::metrics::corrupt_records_skipped();
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(row_ids(&all, "rows"), ["a", "bad-body", "c"]);
+        assert!(crate::metrics::corrupt_records_skipped() > before);
 
-        let changes = ChangesOpts {
-            include_docs: true,
-            ..Default::default()
-        };
-        let error = db.changes(&changes).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
+        let before = crate::metrics::corrupt_records_skipped();
+        let all = db
+            .all_docs(&AllDocsOpts {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&all, "rows"), ["a", "c"]);
+        assert!(
+            crate::metrics::corrupt_records_skipped() > before,
+            "the skipped body was not counted"
+        );
 
+        let changes = db.changes(&ChangesOpts::default()).await.unwrap();
+        assert_eq!(row_ids(&changes, "results"), ["a", "bad-body", "c"]);
+        let before = crate::metrics::corrupt_records_skipped();
+        let changes = db
+            .changes(&ChangesOpts {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&changes, "results"), ["a", "c"]);
+        assert!(crate::metrics::corrupt_records_skipped() > before);
+
+        // View and search builds index every readable document.
+        let docs = db.map_docs(None).await.unwrap();
+        let ids: Vec<&str> = docs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+
+        // A point read of either document still fails.
+        for id in ["bad-meta", "bad-body"] {
+            let error = db.get_doc(id, &DocOpts::default()).await.unwrap_err();
+            assert_eq!(error.status, 500, "{id}: {error}");
+        }
         let open_revs = DocOpts {
-            open_revs: Some(vec![rev]),
+            open_revs: Some(vec![bad_rev.clone()]),
             ..Default::default()
         };
-        let error = db.get_doc("a", &open_revs).await.unwrap_err();
+        let error = db.get_doc("bad-body", &open_revs).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        let rev = DocOpts {
+            rev: Some(bad_rev),
+            ..Default::default()
+        };
+        let error = db.get_doc("bad-body", &rev).await.unwrap_err();
         assert_eq!(error.status, 500, "{error}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);

@@ -1878,7 +1878,7 @@ mod scan_tests {
     }
 
     #[test]
-    fn corrupt_metadata_is_an_error_not_a_missing_document() {
+    fn corrupt_metadata_is_skipped_by_scans_and_fails_closed_elsewhere() {
         let dir = temp_shard_dir("corrupt-meta");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
@@ -1887,12 +1887,13 @@ mod scan_tests {
         shard.flush_pending().unwrap();
         shard.put_raw(&meta_key("p:bad"), b"{not json");
 
-        assert!(shard.live_docs().is_err(), "live index skipped the record");
-        assert!(
-            shard.latest_changes().is_err(),
-            "changes skipped the record"
-        );
-        assert!(shard.partition_counts("p").is_err());
+        // Scans that serve many documents skip the record and count it.
+        let before = crate::metrics::corrupt_records_skipped();
+        assert_eq!(live_ids(&mut shard), ["a"]);
+        assert_eq!(shard.latest_changes().unwrap().all().count(), 1);
+        assert_eq!(shard.partition_counts("p").unwrap(), (0, 0));
+        assert!(crate::metrics::corrupt_records_skipped() >= before + 3);
+        // The anti-entropy fingerprint must not paper over it.
         assert!(shard.fingerprint().is_err());
 
         // Overwriting a record that cannot be parsed would make the counters
@@ -1918,6 +1919,19 @@ mod scan_tests {
         shard.delete_raw(b"z/doc_deleted_count");
         drop(shard);
         assert!(Shard::open(&dir, 1000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_deletes_nothing_for_a_corrupt_metadata_record() {
+        let dir = temp_shard_dir("corrupt-compact");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        // A stale-looking body next to an unreadable metadata record: the
+        // sweep cannot know it is stale, so it must keep it and fail.
+        shard.put_raw(&meta_key("bad"), b"{not json");
+        shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
+        assert!(shard.compact().is_err());
+        assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

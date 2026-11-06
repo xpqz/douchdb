@@ -136,6 +136,7 @@ struct State {
     fabric: FabricStat,
     views: EngineStat,
     search: EngineStat,
+    corrupt_records_skipped: u64,
 }
 
 struct Registry {
@@ -281,6 +282,16 @@ pub fn record_fabric(kind: &str, value: u64) {
         "cleaned_shards" => fabric.cleaned_shards += value,
         _ => {}
     }
+}
+
+/// Count one corrupt stored record that a listing or scan skipped.
+pub fn record_corrupt_record_skipped() {
+    state().corrupt_records_skipped += 1;
+}
+
+/// Corrupt stored records skipped so far by listings and scans.
+pub fn corrupt_records_skipped() -> u64 {
+    state().corrupt_records_skipped
 }
 
 fn route_label(path: &str) -> String {
@@ -470,6 +481,9 @@ pub fn snapshot() -> Value {
         },
         "views": state.views.json(),
         "search": state.search.json(),
+        "integrity": {
+            "corrupt_records_skipped": state.corrupt_records_skipped,
+        },
         "fabric": {
             "local_reads": state.fabric.local_reads,
             "remote_reads": state.fabric.remote_reads,
