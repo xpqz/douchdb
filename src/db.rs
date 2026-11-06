@@ -345,6 +345,18 @@ impl Db {
         })
     }
 
+    /// Open a database that is already on disk. Unlike `open`, a missing
+    /// database is an error and nothing is created, so a request that races a
+    /// drop cannot bring the database back.
+    pub fn open_existing(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
+        if !Db::exists(root, name) {
+            return Err(ApiError::not_found(format!(
+                "Database does not exist: {name}"
+            )));
+        }
+        Db::open(root, name, config)
+    }
+
     pub fn exists(root: &Path, name: &str) -> bool {
         root.join(name).join("db.json").is_file()
     }

@@ -459,6 +459,133 @@ async fn welcome_and_database_lifecycle() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// Status of `GET /{db}` answered from `node`'s own copy only, as a peer
+/// would: the coordinator's cluster-wide `update_seq` would also need every
+/// other node to have the database.
+async fn local_db_status(node: &Server, db: &str) -> StatusCode {
+    let headers = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    node.req_with(Method::GET, &format!("/{db}"), None, &headers)
+        .await
+        .0
+}
+
+/// Concurrent creates of one name: CouchDB answers exactly one `201` and
+/// `412 file_exists` to the rest (couch_server serialises creation per name).
+#[tokio::test]
+async fn concurrent_create_of_one_database_gives_one_201() {
+    let s = Server::start(false);
+    let results = futures::future::join_all((0..16).map(|_| s.put("/racy", json!({})))).await;
+    let created = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CREATED)
+        .count();
+    let exists = results
+        .iter()
+        .filter(|(status, body)| {
+            *status == StatusCode::PRECONDITION_FAILED && body["error"] == "file_exists"
+        })
+        .count();
+    assert_eq!((created, exists), (1, 15), "{results:?}");
+    let (status, _) = s.get("/racy").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A database that exists on disk but is not open yet is opened once, however
+/// many first requests arrive together; a second open would hit the LevelDB
+/// LOCK and answer 500.
+#[tokio::test]
+async fn concurrent_first_requests_share_one_open() {
+    let mut s = Server::start(false);
+    s.fresh_db("cold").await;
+    s.restart();
+    let results = futures::future::join_all((0..32).map(|_| s.get("/cold"))).await;
+    let statuses: Vec<StatusCode> = results.iter().map(|(status, _)| *status).collect();
+    assert_eq!(statuses, vec![StatusCode::OK; 32], "{results:?}");
+}
+
+/// A request that raced a DELETE must not reopen the database and recreate it
+/// on disk: after the delete the database is gone for good.
+#[tokio::test]
+async fn delete_is_not_undone_by_concurrent_requests() {
+    let mut s = Server::start(false);
+    for round in 0..5 {
+        let name = format!("gone{round}");
+        s.fresh_db(&name).await;
+        s.restart();
+        let path = format!("/{name}");
+        let doc = format!("/{name}/d");
+        let mut calls = Vec::new();
+        for i in 0..24 {
+            let (method, target) = match i {
+                12 => (Method::DELETE, &path),
+                _ if i % 2 == 0 => (Method::GET, &path),
+                _ => (Method::GET, &doc),
+            };
+            calls.push(s.req(method, target, None));
+        }
+        let results = futures::future::join_all(calls).await;
+        assert_eq!(results[12].0, StatusCode::OK, "{results:?}");
+        let (status, _) = s.get(&path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name} was resurrected");
+        assert!(!s.dir.join(&name).exists(), "{name} is back on disk");
+    }
+}
+
+/// CouchDB's fabric_db_create answers 202 when fewer than a quorum of nodes
+/// recorded the database, and a retry does not stop at the existing database:
+/// the node that missed it is brought up to date (CouchDB heals it by
+/// replicating the shard map).
+#[tokio::test]
+async fn create_reports_missing_peers_and_a_retry_completes_them() {
+    let mut nodes = start_cluster_with(2, "3600", 1);
+    nodes[1].kill();
+    let (status, body) = nodes[0].put("/partial", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["ok"], true);
+    nodes[1].restart();
+    let status = local_db_status(&nodes[1], "partial").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = nodes[0].put("/partial", json!({})).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let status = local_db_status(&nodes[1], "partial").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// With a quorum of nodes up (2 of 3) the create is a plain 201.
+#[tokio::test]
+async fn create_with_a_quorum_of_nodes_answers_201() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    nodes[2].kill();
+    let (status, body) = nodes[0].put("/quorum", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let status = local_db_status(&nodes[1], "quorum").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// CouchDB's fabric_db_delete answers 202, not 200, when a node did not
+/// confirm the delete; a later delete removes the copy that was missed.
+#[tokio::test]
+async fn delete_does_not_report_ok_when_a_peer_failed() {
+    let mut nodes = start_cluster_with(2, "3600", 1);
+    let (status, body) = nodes[0].put("/shared", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[1].kill();
+    let (status, body) = nodes[0].delete("/shared").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let status = local_db_status(&nodes[0], "shared").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    nodes[1].restart();
+    let status = local_db_status(&nodes[1], "shared").await;
+    assert_eq!(status, StatusCode::OK, "the missed peer still has it");
+    let (status, body) = nodes[0].delete("/shared").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let status = local_db_status(&nodes[1], "shared").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn cors_is_opt_in_and_answers_preflight() {
     let options = |server: &Server, origin: &str| {

@@ -72,6 +72,10 @@ impl DbUpdates {
 pub struct AppState {
     pub root: PathBuf,
     pub dbs: RwLock<HashMap<String, Arc<Db>>>,
+    /// One lock per database name. Open, create and drop of a name run one at
+    /// a time, so a name is never opened twice (the second open would fail on
+    /// the LevelDB lock) and a drop cannot interleave with a create or open.
+    pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub config: Config,
     pub auth: Option<Auth>,
     pub cluster: Cluster,
@@ -303,6 +307,14 @@ fn valid_db_name(name: &str) -> bool {
 // state
 
 impl AppState {
+    fn name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .db_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        locks.entry(name.to_string()).or_default().clone()
+    }
+
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
             return Err(ApiError::bad_request("invalid database name"));
@@ -315,7 +327,14 @@ impl AppState {
                 "Database does not exist: {name}"
             )));
         }
-        let db = Arc::new(Db::open(
+        // Concurrent first requests for one name share a single open, and a
+        // drop that won the race leaves nothing to open.
+        let lock = self.name_lock(name);
+        let _guard = lock.lock().await;
+        if let Some(db) = self.dbs.read().await.get(name) {
+            return Ok(db.clone());
+        }
+        let db = Arc::new(Db::open_existing(
             &self.root,
             name,
             DbConfig {
@@ -341,6 +360,8 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(ApiError::bad_request("invalid database name"));
         }
+        let lock = self.name_lock(name);
+        let _guard = lock.lock().await;
         crate::view::forget_db(&self.root.join(name));
         crate::search::forget_db(&self.root.join(name));
         if Db::exists(&self.root, name) {
@@ -371,6 +392,8 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(ApiError::bad_request("invalid database name"));
         }
+        let lock = self.name_lock(name);
+        let _guard = lock.lock().await;
         self.dbs.write().await.remove(name);
         crate::view::forget_db(&self.root.join(name));
         crate::search::forget_db(&self.root.join(name));
