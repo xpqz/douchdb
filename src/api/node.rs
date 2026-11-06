@@ -209,14 +209,20 @@ pub async fn db_migration_put(
             "migration shard map does not match database q or cluster node count",
         ));
     }
-    match db.set_migration_map(map) {
-        Ok(()) => {
-            // Freeze client writes on this peer for the verification window.
-            db.set_rebalance_in_progress(true);
-            ok()
-        }
-        Err(error) => fail(error),
+    // Freezes client writes on this peer for the verification window.
+    if let Err(error) = db.begin_migration(map) {
+        return fail(error);
     }
+    // Writes accepted before the freeze may still be fanning out to replicas.
+    // Do not report the freeze until they have landed.
+    if !db.drain_writes(crate::cluster_ops::WRITE_DRAIN).await {
+        return fail(ApiError::new(
+            503,
+            "rebalance_in_progress",
+            "in-flight writes did not finish before the freeze",
+        ));
+    }
+    ok()
 }
 
 pub async fn db_migration_delete(

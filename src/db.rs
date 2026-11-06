@@ -176,6 +176,10 @@ pub struct Db {
     /// continue to use the active `shard_map`; anti-entropy uses this map to
     /// seed the target replicas.
     migration_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    /// Held shared by every cluster write for its full duration, including
+    /// detached replica fan-out, and taken exclusively to drain them when a
+    /// rebalance freezes the database.
+    write_gate: Arc<tokio::sync::RwLock<()>>,
     /// Unix-millisecond deadline for the cluster-wide write freeze, or zero
     /// when writes are allowed. A deadline lets peers recover if the
     /// coordinating node disappears mid-rebalance.
@@ -290,6 +294,7 @@ impl Db {
             security: Arc::new(std::sync::RwLock::new(security)),
             compact_running: Arc::new(AtomicBool::new(false)),
             migration_map: Arc::new(std::sync::RwLock::new(None)),
+            write_gate: Arc::new(tokio::sync::RwLock::new(())),
             rebalance_until: Arc::new(AtomicU64::new(0)),
             shards,
             committed_seq,
@@ -547,14 +552,23 @@ impl Db {
         Ok(true)
     }
 
-    /// Placement targeted by an in-progress rebalance. Falls back to the
-    /// active map outside a migration.
-    pub fn replication_map(&self) -> ShardMap {
+    /// The migration target while a rebalance freeze is running. A map left
+    /// behind after the freeze expired (a coordinator that vanished) is stale
+    /// and must not steer placement or anti-entropy.
+    fn migration_target(&self) -> Option<ShardMap> {
+        if !self.rebalance_in_progress() {
+            return None;
+        }
         self.migration_map
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
-            .unwrap_or_else(|| self.shard_map())
+    }
+
+    /// Placement targeted by an in-progress rebalance. Falls back to the
+    /// active map outside a migration.
+    pub fn replication_map(&self) -> ShardMap {
+        self.migration_target().unwrap_or_else(|| self.shard_map())
     }
 
     /// Whether `node` replicates the shard that contains `docid` under the
@@ -567,19 +581,7 @@ impl Db {
             return true;
         }
         let shard = self.shard_index(docid) as u32;
-        let migration = self
-            .migration_map
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(map) = migration.as_ref() {
-            return map.replicas_of(shard).contains(&node);
-        }
-        drop(migration);
-        self.shard_map
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .replicas_of(shard)
-            .contains(&node)
+        self.replication_map().replicas_of(shard).contains(&node)
     }
 
     pub fn set_migration_map(&self, map: ShardMap) -> DbResult<()> {
@@ -591,6 +593,45 @@ impl Db {
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(map);
         Ok(())
+    }
+
+    /// Accept a migration announced by a coordinator and freeze writes. A
+    /// different migration while one is in progress is refused, so two
+    /// coordinators cannot run at once and one cannot unfreeze the other;
+    /// repeating the same one is harmless.
+    pub fn begin_migration(&self, map: ShardMap) -> DbResult<()> {
+        if !map.is_valid(self.q, map.node_count) {
+            return Err(ApiError::bad_request("invalid migration shard map"));
+        }
+        let mut current = self
+            .migration_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.rebalance_in_progress() && current.as_ref() != Some(&map) {
+            return Err(ApiError::new(
+                409,
+                "rebalance_in_progress",
+                "another migration is already in progress for this database",
+            ));
+        }
+        *current = Some(map);
+        self.set_rebalance_in_progress(true);
+        Ok(())
+    }
+
+    /// Shared guard held by a cluster write until it, and every replica write
+    /// it started, has finished.
+    pub async fn write_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.write_gate.clone().read_owned().await
+    }
+
+    /// Wait for every write holding the gate to finish. Returns false if they
+    /// did not within `timeout`. Call after the freeze is set: writes that
+    /// start later see the freeze and are refused.
+    pub async fn drain_writes(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, self.write_gate.write())
+            .await
+            .is_ok()
     }
 
     pub fn clear_migration_map(&self) {
