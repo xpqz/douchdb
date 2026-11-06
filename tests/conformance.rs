@@ -1740,6 +1740,42 @@ async fn percent_encoded_slash_in_database_names() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// CouchDB (mochiweb) decodes '+' as a space in URL paths as well as in query
+/// strings, so `a+b` names the document "a b" and only `a%2Bb` names "a+b".
+/// Verified against couchdb:3.5; a literal plus in a path would diverge.
+#[tokio::test]
+async fn plus_in_paths_and_query_strings_decodes_as_space() {
+    let s = Server::start(false);
+    let (status, body) = s.put("/plusdb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = s.put("/plusdb/a+b", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "a b");
+    let (status, body) = s.put("/plusdb/c%2Bd", json!({"v": 2})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "c+d");
+
+    let (status, body) = s.get("/plusdb/a+b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_id"], "a b");
+    let (status, body) = s.get("/plusdb/a%20b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.get("/plusdb/a%2Bb").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = s.get("/plusdb/c%2Bd").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.get("/plusdb/c+d").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = s.get("/plusdb/_all_docs?key=%22a+b%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], "a b");
+    let (status, body) = s.get("/plusdb/_all_docs?key=%22a%2Bb%22").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(0));
+}
+
 /// Stop the server for good, then start it again on the same data directory.
 /// `restart` alone leaves the old process running, and the pooled HTTP
 /// connections point at it, so a test of what a fresh process reads from disk
