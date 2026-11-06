@@ -222,8 +222,10 @@ Add `reduce` to a view to collapse its rows. Built-ins are `_count`, `_sum`,
 The built-in reducers run entirely in Rust. `_count`, `_sum` and `_stats` are
 also combined natively on the coordinator in a cluster; custom JavaScript
 reducers are the only reduce path that uses QuickJS, including their
-`rereduce=true` pass. `_approx_count_distinct` is currently exact: it uses a
-Rust `HashSet` of serialized values and is not partially combined across nodes.
+`rereduce=true` pass. `_approx_count_distinct` counts distinct emitted keys
+with CouchDB's HyperLogLog (precision 11, SHA-1 of the key's
+`term_to_binary`), so it returns CouchDB's estimates, not exact counts; its
+sketches union exactly across blocks, shards and nodes.
 
 ```sh
 curl 'localhost:5984/shop/_design/shop/_view/totals?group=true'

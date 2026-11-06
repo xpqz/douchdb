@@ -104,12 +104,12 @@ The cluster pass made fan-out owner-aware and concurrent.
   `total_rows` from the owner row counts.
 - **Map queries push `skip + limit` down.** A map-only view query now asks each
   owner for only the needed window. Reduce queries still need the full range.
-- **Distributed reduces.** Global and grouped `_count`, `_sum` and `_stats`
-  are reduced per owner in Rust and combined by the coordinator in Rust.
-  Custom JavaScript reducers are the only reduce path that uses QuickJS; they
-  are recombined with `rereduce=true`. `_approx_count_distinct` is exact,
-  implemented with a Rust `HashSet`, and still falls back to the map-row merge
-  path because per-owner distinct counts cannot be unioned exactly.
+- **Distributed reduces.** Global and grouped `_count`, `_sum`, `_stats` and
+  `_approx_count_distinct` are reduced per owner in Rust and combined by the
+  coordinator in Rust. Custom JavaScript reducers are the only reduce path that
+  uses QuickJS; they are recombined with `rereduce=true`.
+  `_approx_count_distinct` is CouchDB's HyperLogLog over the emitted keys:
+  owners return sketches and the coordinator unions them, which is exact.
 - **Single-replica write fast path.** When every document in a batch has one
   replica, the coordinator returns after the primary write instead of doing an
   unnecessary `_bulk_get` and secondary-copy pass. Design documents still copy
@@ -211,8 +211,9 @@ Grouped tests cover both `_count` and `_sum`.
 Custom JavaScript reducers are now distributed too. Each owner reduces its own
 rows, and the coordinator calls the reducer again with `rereduce=true` over the
 partials. Grouped custom reducers merge by group key and then rereduce the
-partial values. `_approx_count_distinct` is intentionally excluded because
-per-owner distinct counts cannot be combined exactly.
+partial values. `_approx_count_distinct` was excluded at first because
+per-owner distinct counts cannot be combined; it now returns HyperLogLog
+sketches, which union exactly.
 
 ### View index locality (#39, revised #45)
 
@@ -747,8 +748,6 @@ replicates and the pending file disappears.
   mid-write is healed by the background replicator when it returns.
 - The coordinator and all peers run on the same host, so loopback and shared CPU
   are part of the measurement.
-- `_approx_count_distinct` still uses the map-row merge path because partial
-  distinct counts cannot be combined.
 - Every node keeps its live `_all_docs` map in memory after the first range
   query. That is what removes the offset scan, but large databases should budget
   for it.
