@@ -1505,6 +1505,29 @@ mod tests {
     }
 
     #[test]
+    fn query_terms_lowercase_like_the_highlighted_text() {
+        assert_eq!(query_terms("Apple +BANANA"), ["apple", "banana"]);
+        assert_eq!(query_terms("item:Ünï"), ["ünï"]);
+        assert_eq!(query_terms("ẞ"), ["ß"]);
+        // "İ" lowercases to "i" plus a combining dot, as in the highlighted text.
+        assert_eq!(query_terms("İstanbul"), ["i\u{307}stanbul"]);
+    }
+
+    #[test]
+    fn highlights_find_upper_case_non_ascii_terms() {
+        for (text, query, expected) in [
+            ("ünï café", "Ünï", "<b>ünï</b> café"),
+            ("x İSTANBUL y", "İstanbul", "x <b>İSTANBUL</b> y"),
+            ("a ẞ b", "ẞ", "a <b>ẞ</b> b"),
+            ("Mixed Case", "mIxEd", "<b>Mixed</b> Case"),
+        ] {
+            let terms = query_terms(query);
+            let fragments = highlight_fragment(text, &terms, "<b>", "</b>", 100, 1);
+            assert_eq!(fragments, vec![expected.to_string()], "{text}");
+        }
+    }
+
+    #[test]
     fn value_in_range_ignores_multibyte_bracket_positions() {
         let value = serde_json::json!("a");
         assert!(!value_in_range(&value, "é"));
