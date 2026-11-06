@@ -59,7 +59,7 @@ pub async fn db_root(
                     }
                     let request = st
                         .client
-                        .put(format!("{peer}/{name}"))
+                        .put(peer_url(peer, &[&name]))
                         .query(&layout)
                         .header("x-douchdb-local-db", "1")
                         .header("x-douchdb-secret", st.cluster.secret.as_str());
@@ -98,7 +98,7 @@ pub async fn db_root(
                     }
                     let request = st
                         .client
-                        .delete(format!("{peer}/{name}"))
+                        .delete(peer_url(peer, &[&name]))
                         .header("x-douchdb-local-db", "1")
                         .header("x-douchdb-secret", st.cluster.secret.as_str());
                     let request = forward_client_auth(request, &headers);
@@ -268,17 +268,13 @@ async fn partition_info(
         let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
         if !replicas.contains(&st.cluster.me) {
             if let Some(node) = replicas.first() {
-                let url = format!(
-                    "{}/{name}/_partition/{}",
-                    st.cluster.nodes[*node],
-                    percent_encode(partition)
+                let request = internal_request(
+                    st,
+                    reqwest::Method::GET,
+                    &st.cluster.nodes[*node],
+                    &[name, "_partition", partition],
+                    Some(headers),
                 );
-                let request = st
-                    .client
-                    .get(url)
-                    .header("x-douchdb-forwarded", "1")
-                    .header("x-douchdb-secret", st.cluster.secret.as_str());
-                let request = forward_client_auth(request, headers);
                 return match request.send().await {
                     Ok(response) => {
                         let status = response.status();
@@ -479,10 +475,13 @@ pub async fn db_rest(
     // in a document id (`a%2Fb`) into a path separator (`a`, attachment `b`).
     // Keep the raw remainder for document routing and decode each segment only
     // after splitting.
+    // The database name is one raw segment too: `a%2Fb` arrives decoded as
+    // `a/b`, so strip the first raw segment rather than the decoded name.
     let raw_rest = uri
         .path()
-        .strip_prefix(&format!("/{name}/"))
-        .unwrap_or(rest.as_str())
+        .strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .map_or(rest.as_str(), |(_, raw)| raw)
         .to_string();
 
     if let Some(id) = raw_rest.strip_prefix("_local/") {

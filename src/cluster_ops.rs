@@ -1,7 +1,7 @@
 //! Cluster-wide metadata changes coordinated from one node: shard-map
 //! updates, rebalance and security-object propagation.
 
-use crate::api::{forward_client_auth, is_forwarded, AppState};
+use crate::api::{internal_request, is_forwarded, AppState};
 use crate::cluster::ShardMap;
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
@@ -16,13 +16,14 @@ async fn send_security(
     value: &Value,
     headers: &HeaderMap,
 ) -> Result<(), String> {
-    let request = st
-        .client
-        .put(format!("{peer}/_node/_local/_dbs/{name}/security"))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str())
-        .json(value);
-    let request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::PUT,
+        peer,
+        &["_node", "_local", "_dbs", name, "security"],
+        Some(headers),
+    )
+    .json(value);
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
@@ -128,14 +129,15 @@ pub(crate) async fn apply_shard_map(
     let responses = futures::future::join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
-            let request = st
-                .client
-                .put(format!("{peer}/_node/_local/_dbs/{name}"))
-                .header("x-douchdb-forwarded", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str())
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(payload);
-            let request = forward_client_auth(request, headers);
+            let request = internal_request(
+                st,
+                reqwest::Method::PUT,
+                &peer,
+                &["_node", "_local", "_dbs", name],
+                Some(headers),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(payload);
             request.send().await.ok().map(|response| response.status())
         }
     }))
@@ -175,16 +177,18 @@ async fn fetch_shard_states(
     if node == st.cluster.me {
         return db.shard_states(with_digest).await.ok();
     }
-    let suffix = if with_digest { "?digest=1" } else { "" };
-    let request = st
-        .client
-        .get(format!(
-            "{}/_node/_local/_dbs/{}/shards{suffix}",
-            st.cluster.nodes[node], db.name
-        ))
-        .header("x-douchdb-forwarded", "1")
-        .header("x-douchdb-secret", st.cluster.secret.as_str());
-    let request = forward_client_auth(request, headers);
+    let request = internal_request(
+        st,
+        reqwest::Method::GET,
+        &st.cluster.nodes[node],
+        &["_node", "_local", "_dbs", &db.name, "shards"],
+        Some(headers),
+    );
+    let request = if with_digest {
+        request.query(&[("digest", "1")])
+    } else {
+        request
+    };
     let value = request.send().await.ok()?.json::<Value>().await.ok()?;
     let mut out = Vec::new();
     for row in value["shards"].as_array()? {
@@ -356,12 +360,13 @@ async fn cleanup_all_replicas(
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
     let responses = futures::future::join_all(st.cluster.nodes.iter().map(|peer| {
-        let request = st
-            .client
-            .post(format!("{peer}/_node/_local/_dbs/{}/cleanup", db.name))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str());
-        let request = forward_client_auth(request, headers);
+        let request = internal_request(
+            st,
+            reqwest::Method::POST,
+            peer,
+            &["_node", "_local", "_dbs", &db.name, "cleanup"],
+            Some(headers),
+        );
         async move {
             let response = request
                 .send()
@@ -395,21 +400,13 @@ async fn send_migration(
     map: Option<&ShardMap>,
     headers: &HeaderMap,
 ) -> Result<(), String> {
-    let url = format!("{peer}/_node/_local/_dbs/{name}/migration");
+    let segments = ["_node", "_local", "_dbs", name, "migration"];
     let request = match map {
-        Some(map) => st
-            .client
-            .put(url)
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str())
-            .json(map),
-        None => st
-            .client
-            .delete(url)
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str()),
+        Some(map) => {
+            internal_request(st, reqwest::Method::PUT, peer, &segments, Some(headers)).json(map)
+        }
+        None => internal_request(st, reqwest::Method::DELETE, peer, &segments, Some(headers)),
     };
-    let request = forward_client_auth(request, headers);
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
@@ -470,13 +467,14 @@ async fn activate_map_everywhere(
     let peers: Vec<String> = st.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
-        let request = st
-            .client
-            .put(format!("{peer}/_node/_local/_dbs/{name}"))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str())
-            .json(map);
-        let request = forward_client_auth(request, headers);
+        let request = internal_request(
+            st,
+            reqwest::Method::PUT,
+            peer,
+            &["_node", "_local", "_dbs", name],
+            Some(headers),
+        )
+        .json(map);
         match request.send().await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => failures.push(format!("{peer}: HTTP {}", response.status())),
@@ -493,13 +491,14 @@ async fn activate_map_everywhere(
     rollback.version = map.version.saturating_add(1);
     let _ = db.set_shard_map(rollback.clone());
     for peer in &peers {
-        let request = st
-            .client
-            .put(format!("{peer}/_node/_local/_dbs/{name}"))
-            .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str())
-            .json(&rollback);
-        let request = forward_client_auth(request, headers);
+        let request = internal_request(
+            st,
+            reqwest::Method::PUT,
+            peer,
+            &["_node", "_local", "_dbs", name],
+            Some(headers),
+        )
+        .json(&rollback);
         if let Err(error) = request.send().await {
             tracing::warn!("rebalance rollback on {peer} failed: {error}");
         }

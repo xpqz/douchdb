@@ -216,6 +216,51 @@ pub(crate) fn forward_client_auth(
     }
 }
 
+/// A peer URL with every path segment percent-encoded. Database names may hold
+/// `/` (CouchDB clients send `a%2Fb`) and document ids may hold `?`, `#` or
+/// `%`, so a segment is never interpolated raw: the receiving node decodes
+/// each one exactly once.
+pub(crate) fn peer_url(peer: &str, segments: &[&str]) -> String {
+    let mut url = peer.to_string();
+    for segment in segments {
+        url.push('/');
+        url.push_str(&percent_encode(segment));
+    }
+    url
+}
+
+/// An internal cluster request: encoded URL plus the forwarded marker and the
+/// cluster secret that make the peer serve it from its local shards.
+pub(crate) fn internal_request_raw(
+    client: &reqwest::Client,
+    secret: &str,
+    method: reqwest::Method,
+    peer: &str,
+    segments: &[&str],
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, peer_url(peer, segments))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", secret)
+}
+
+/// `internal_request_raw` plus credentials: the calling client's own when the request
+/// was made on its behalf (`Some(headers)`), otherwise this node's.
+pub(crate) fn internal_request(
+    st: &AppState,
+    method: reqwest::Method,
+    peer: &str,
+    segments: &[&str],
+    client_headers: Option<&HeaderMap>,
+) -> reqwest::RequestBuilder {
+    let request = internal_request_raw(&st.client, &st.cluster.secret, method, peer, segments);
+    match (client_headers, &st.auth) {
+        (Some(headers), _) => forward_client_auth(request, headers),
+        (None, Some(auth)) => request.basic_auth(&auth.user, Some(&auth.pass)),
+        (None, None) => request,
+    }
+}
+
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.
 fn key_param(q: &HashMap<String, String>, key: &str) -> Option<String> {
     let raw = q.get(key)?;
@@ -453,6 +498,32 @@ mod tests {
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("%2"), "%2");
         assert_eq!(percent_decode("%C3%A9"), "é");
+    }
+
+    #[test]
+    fn peer_url_encodes_every_segment() {
+        assert_eq!(
+            peer_url("http://n1:5984", &["a/b", "x?y#z%", "_design", "p+q"]),
+            "http://n1:5984/a%2Fb/x%3Fy%23z%25/_design/p%2Bq"
+        );
+        assert_eq!(peer_url("http://n1:5984", &[]), "http://n1:5984");
+    }
+
+    #[test]
+    fn internal_requests_carry_the_marker_and_secret() {
+        let client = reqwest::Client::new();
+        let request = internal_request_raw(
+            &client,
+            "s3cret",
+            reqwest::Method::GET,
+            "http://n1",
+            &["a/b", "doc"],
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.url().path(), "/a%2Fb/doc");
+        assert_eq!(request.headers()["x-douchdb-forwarded"], "1");
+        assert_eq!(request.headers()["x-douchdb-secret"], "s3cret");
     }
 
     #[test]

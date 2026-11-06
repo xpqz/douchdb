@@ -32,7 +32,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
             }
             let request = st
                 .client
-                .get(format!("{peer}/_all_dbs"))
+                .get(peer_url(peer, &["_all_dbs"]))
                 .header("x-douchdb-local-db", "1")
                 .header("x-douchdb-secret", st.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
