@@ -929,12 +929,20 @@ fn parse_number(text: &str) -> Option<f64> {
 
 fn value_in_range(value: &Value, range: &str) -> bool {
     let range = range.trim();
-    if range.len() < 2 {
+    let (lower_inclusive, rest) = if let Some(rest) = range.strip_prefix('[') {
+        (true, rest)
+    } else if let Some(rest) = range.strip_prefix('{') {
+        (false, rest)
+    } else {
         return false;
-    }
-    let lower_inclusive = range.starts_with('[');
-    let upper_inclusive = range.ends_with(']');
-    let inner = &range[1..range.len() - 1];
+    };
+    let (upper_inclusive, inner) = if let Some(inner) = rest.strip_suffix(']') {
+        (true, inner)
+    } else if let Some(inner) = rest.strip_suffix('}') {
+        (false, inner)
+    } else {
+        return false;
+    };
     let Some((lower, upper)) = inner.split_once(" TO ") else {
         return false;
     };
@@ -1452,6 +1460,14 @@ pub fn all_indexes(db: &Db) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_in_range_ignores_multibyte_bracket_positions() {
+        let value = serde_json::json!("a");
+        assert!(!value_in_range(&value, "é"));
+        assert!(!value_in_range(&value, "[é TO z]é"));
+        assert!(!value_in_range(&value, "é[a TO z]"));
+    }
 
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_after_each_write() {
