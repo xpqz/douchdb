@@ -1582,6 +1582,30 @@ async fn large_integers_round_trip_and_match_couchdb_rev_ids() {
 }
 
 #[tokio::test]
+async fn small_integer_arrays_match_couchdb_rev_ids() {
+    let s = Server::start(false);
+    s.fresh_db("smallarrays").await;
+
+    // Revs recorded from a live Apache CouchDB 3.5. Arrays of integers 0..=255
+    // hash as Erlang strings (STRING_EXT); anything else stays a list.
+    for (id, literal, rev) in [
+        ("bytes", "[1,2,3]", "1-308048961a84beb0c9e99e07facf0f5f"),
+        ("edges", "[0,255]", "1-ebdd13a7ecf6387443aa094a0d18b4d6"),
+        ("over", "[1,256]", "1-d0259a7a9a59173bfe7d4da469ac3cb6"),
+        ("float", "[1,2.0]", "1-3b562cec9ddf9f74ee2f9b8a9de3f536"),
+    ] {
+        let (status, body) = s
+            .put_raw(
+                &format!("/smallarrays/{id}"),
+                &format!(r#"{{"a":{literal}}}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{id}: {body}");
+        assert_eq!(body["rev"], rev, "{id}");
+    }
+}
+
+#[tokio::test]
 async fn duplicate_object_keys_use_last_position_like_couchdb() {
     let s = Server::start(false);
     s.fresh_db("dups").await;
