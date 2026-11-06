@@ -89,6 +89,8 @@ pub enum WasmRuntime {
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
+/// A debug-build worker needs a moment to start; a hung one is killed after this.
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn configure(sandbox: Sandbox, workers: usize) {
@@ -544,14 +546,7 @@ impl Worker {
         command.arg("--js-worker");
         let mut worker = Worker::spawn_command(command)?;
         // The worker announces its confinement before it serves requests.
-        let hello = read_frame(&mut worker.stdout)
-            .ok()
-            .flatten()
-            .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
-        let Some(hello) = hello else {
-            worker.kill();
-            return Err("worker exited during startup".to_string());
-        };
+        let hello = worker.await_hello(WORKER_STARTUP_TIMEOUT)?;
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             let landlock = hello
@@ -643,6 +638,32 @@ impl Worker {
             stdout: BufReader::new(stdout),
             pid,
         })
+    }
+
+    /// Read the hello frame, killing the worker if it does not arrive within
+    /// `timeout`.
+    fn await_hello(&mut self, timeout: Duration) -> Result<Value, String> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let pid = self.pid;
+        let watchdog = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        });
+        let hello = read_frame(&mut self.stdout);
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
+        match hello {
+            Ok(Some(body)) => serde_json::from_slice(&body)
+                .map_err(|error| format!("worker hello: {error}"))
+                .inspect_err(|_| self.kill()),
+            _ => {
+                self.kill();
+                Err("worker did not start".to_string())
+            }
+        }
     }
 
     fn request(&mut self, body: &[u8], timeout: Duration) -> Result<WorkerOutcome, WorkerError> {
@@ -998,6 +1019,19 @@ mod tests {
             exited.is_none(),
             "the worker died with its spawning thread: {exited:?}"
         );
+    }
+
+    #[test]
+    fn a_worker_that_never_announces_itself_is_killed() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut worker = Worker::spawn_command(command).expect("spawn");
+        let started = Instant::now();
+        let error = worker
+            .await_hello(Duration::from_millis(300))
+            .expect_err("no hello was sent");
+        assert!(error.contains("did not start"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

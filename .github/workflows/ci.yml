@@ -5,11 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# CI runs only the native QuickJS sandbox. The process and WASM sandbox tests
-# (including the wasmtime backend) are not run here; run them locally with
+# CI runs the native and process (seccomp/Landlock, x86_64) QuickJS sandboxes.
+# The WASM sandbox tests (including the wasmtime backend) are not run here; run them locally with
 # `cargo test` and `cargo test --features wasmtime`.
 env:
-  DOUCHDB_TEST_JS_SANDBOXES: native
+  DOUCHDB_TEST_JS_SANDBOXES: native,process
 
 jobs:
   test:
