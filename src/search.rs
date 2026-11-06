@@ -1051,20 +1051,35 @@ fn highlight_fragment(
     size: usize,
     number: usize,
 ) -> Vec<String> {
-    let lower = text.to_lowercase();
+    // Lowercasing can change a character's length ("İ" grows, "ẞ" shrinks),
+    // so each byte of the lowercase text remembers the span of the original
+    // character it came from.
+    let mut lower = String::with_capacity(text.len());
+    let mut origin: Vec<(usize, usize)> = Vec::with_capacity(text.len());
+    for (at, ch) in text.char_indices() {
+        let span = (at, at + ch.len_utf8());
+        for lowered in ch.to_lowercase() {
+            lower.push(lowered);
+            origin.extend(std::iter::repeat_n(span, lowered.len_utf8()));
+        }
+    }
     let mut fragments = Vec::new();
     for term in terms {
         if term.is_empty() || fragments.len() >= number {
             continue;
         }
-        let Some(index) = lower.find(term) else {
+        let Some(found) = lower.find(term) else {
             continue;
         };
-        if !text.is_char_boundary(index) || !text.is_char_boundary(index + term.len()) {
+        let (Some(first), Some(last)) = (
+            origin.get(found),
+            origin.get((found + term.len()).saturating_sub(1)),
+        ) else {
             continue;
-        }
+        };
+        let (index, term_end) = (first.0, last.1);
         let start = index.saturating_sub(size / 2);
-        let end = (index + term.len() + size / 2).min(text.len());
+        let end = (term_end + size / 2).min(text.len());
         let start = text
             .char_indices()
             .map(|(i, _)| i)
@@ -1078,9 +1093,9 @@ fn highlight_fragment(
         let mut fragment = String::new();
         fragment.push_str(&text[start..index]);
         fragment.push_str(pre);
-        fragment.push_str(&text[index..index + term.len()]);
+        fragment.push_str(&text[index..term_end]);
         fragment.push_str(post);
-        fragment.push_str(&text[index + term.len()..end]);
+        fragment.push_str(&text[term_end..end]);
         fragments.push(fragment);
     }
     fragments
