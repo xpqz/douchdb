@@ -137,12 +137,12 @@ pub(super) async fn changes(
                     break;
                 }
                 match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                    Ok(value) => {
+                    Ok(mut value) => {
                         if !still_allowed(&st, &db, &headers) {
                             trailer = None;
                             break;
                         }
-                        let rows = value["results"].as_array().cloned().unwrap_or_default();
+                        let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
                         let mut sent_here = 0usize;
                         let mut last_sent = None;
                         for row in &rows {

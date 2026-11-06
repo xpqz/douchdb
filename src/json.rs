@@ -29,6 +29,17 @@ pub fn from_slice(body: &[u8]) -> Result<Value, serde_json::Error> {
     Ok(value.0)
 }
 
+/// Move the array under `key` out of `value`, leaving an empty array behind.
+/// `None` when the member is absent or not an array. Callers that own a
+/// response value use this instead of `as_array().cloned()`, which deep-copies
+/// every row.
+pub fn take_array(value: &mut Value, key: &str) -> Option<Vec<Value>> {
+    match value.get_mut(key) {
+        Some(Value::Array(items)) => Some(std::mem::take(items)),
+        _ => None,
+    }
+}
+
 /// serde_json's arbitrary-precision representation uses a private object key
 /// internally. User documents cannot use it, because the deserializer cannot
 /// distinguish the two once parsing starts.

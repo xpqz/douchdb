@@ -218,11 +218,14 @@ pub async fn dbs_info(
     let keys = if method == Method::POST {
         serde_json::from_slice::<Value>(&body)
             .ok()
-            .and_then(|value| value.get("keys").and_then(Value::as_array).cloned())
+            .and_then(|mut value| crate::json::take_array(&mut value, "keys"))
     } else {
         q.get("keys")
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| value.as_array().cloned())
+            .and_then(|value| match value {
+                Value::Array(keys) => Some(keys),
+                _ => None,
+            })
     };
     let Some(keys) = keys else {
         return fail(ApiError::bad_request("`keys` must be a JSON array"));
