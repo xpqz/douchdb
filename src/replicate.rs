@@ -260,7 +260,15 @@ pub async fn pull(
         if last == since {
             break;
         }
-        db.local_put(&checkpoint_id, json!({ "seq": last }))
+        let mut checkpoint = json!({ "seq": last });
+        let stored = db
+            .local_get(&checkpoint_id)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        if let Some(rev) = stored.as_ref().and_then(|doc| doc.get("_rev")) {
+            checkpoint["_rev"] = rev.clone();
+        }
+        db.local_put(&checkpoint_id, checkpoint)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         since = last;

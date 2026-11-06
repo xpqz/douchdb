@@ -57,23 +57,29 @@ impl RevTree {
         self.edges.contains_key(rev) && !self.edges.values().flatten().any(|p| p == rev)
     }
 
-    /// Follow a revision to the tip of its branch. CouchDB's `latest=true`
-    /// returns that tip even when the caller names an interior revision.
-    pub fn latest_leaf(&self, rev: &str) -> Option<String> {
+    /// Every leaf at or below a revision. CouchDB's `latest=true` returns all
+    /// of them when the caller names an interior revision of a forked branch.
+    /// Empty when the revision is unknown.
+    pub fn leaves_from(&self, rev: &str) -> Vec<String> {
         if !self.edges.contains_key(rev) {
-            return None;
+            return Vec::new();
         }
-        let mut current = rev.to_string();
-        loop {
-            match self
-                .edges
-                .iter()
-                .find(|(_, parent)| parent.as_deref() == Some(current.as_str()))
-            {
-                Some((child, _)) => current = child.clone(),
-                None => return Some(current),
+        let mut children: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+        for (child, parent) in &self.edges {
+            if let Some(parent) = parent {
+                children.entry(parent.as_str()).or_default().push(child);
             }
         }
+        let mut leaves = Vec::new();
+        let mut pending = vec![rev];
+        while let Some(current) = pending.pop() {
+            match children.get(current) {
+                Some(kids) => pending.extend(kids.iter().map(|kid| kid.as_str())),
+                None => leaves.push(current.to_string()),
+            }
+        }
+        leaves.sort();
+        leaves
     }
 
     pub fn is_deleted(&self, rev: &str) -> bool {

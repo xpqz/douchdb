@@ -978,15 +978,25 @@ impl Db {
             }
         }
 
+        // A shard error is held back until the validator cache is dropped:
+        // earlier shards may already have committed design documents.
+        let mut shard_error = None;
         for (shard_idx, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
             let seq = self.seq.clone();
             let reserved = self.reserved_seq[shard_idx].clone();
-            let results = self.shards[shard_idx]
+            let results = match self.shards[shard_idx]
                 .call(move |s| Ok(put_many(s, batch, new_edits, &seq, &reserved)))
-                .await?;
+                .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    shard_error = Some(error);
+                    break;
+                }
+            };
             for (i, result) in results {
                 out[i] = Some(match result {
                     Ok(doc) => doc,
@@ -1005,6 +1015,9 @@ impl Db {
                 .unwrap_or_else(|poison| poison.into_inner()) = None;
         }
 
+        if let Some(error) = shard_error {
+            return Err(error);
+        }
         Ok(out.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
     }
 
@@ -1697,13 +1710,26 @@ impl Db {
                 let existing = s
                     .get(&key)
                     .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-                let next = existing
+                let current = existing
                     .as_ref()
                     .and_then(|v| v.get("_rev").and_then(Value::as_str))
                     .and_then(|r| r.strip_prefix("0-"))
                     .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    + 1;
+                    .unwrap_or(0);
+                // couch_db_updater:update_local_docs/2 only accepts a write
+                // whose revision is the stored one (0 for a new document).
+                let supplied = match body.get("_rev") {
+                    None => 0,
+                    Some(rev) => rev
+                        .as_str()
+                        .and_then(|r| r.strip_prefix("0-"))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
+                };
+                if supplied != current {
+                    return Err(ApiError::conflict());
+                }
+                let next = current + 1;
                 let rev = format!("0-{next}");
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert("_id".into(), json!(format!("_local/{id}")));
@@ -2105,6 +2131,7 @@ impl Stage<'_> {
             revisions: _,
             body,
         } = doc;
+        let parent_rev = parent_rev.map(|rev| canonical_rev(&rev));
         let body = Value::Object(body);
 
         let parent = match parent_rev {
@@ -2498,6 +2525,14 @@ pub(crate) struct ChangeRow {
     pub(crate) doc: Option<String>,
 }
 
+/// A revision as CouchDB stores and renders it: `couch_doc:parse_rev/1` decodes
+/// a 32-character id as hex, so upper-case digits name the same revision as
+/// their lower-case form. Anything that does not parse is left for the caller
+/// to reject or report missing.
+fn canonical_rev(rev: &str) -> String {
+    Rev::parse(rev).map_or_else(|| rev.to_string(), |parsed| parsed.to_string())
+}
+
 fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
@@ -2507,7 +2542,7 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
         let mut wanted: Vec<String> = if open_revs.iter().any(|r| r == "all") {
             meta.tree.leaves()
         } else {
-            open_revs.clone()
+            open_revs.iter().map(|r| canonical_rev(r)).collect()
         };
         if !open_revs.iter().any(|r| r == "all")
             && open_revs.iter().any(|rev| Rev::parse(rev).is_none())
@@ -2518,10 +2553,15 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
             let mut seen = std::collections::HashSet::new();
             wanted = wanted
                 .into_iter()
-                .filter_map(|rev| {
-                    let leaf = meta.tree.latest_leaf(&rev).unwrap_or(rev);
-                    seen.insert(leaf.clone()).then_some(leaf)
+                .flat_map(|rev| {
+                    let leaves = meta.tree.leaves_from(&rev);
+                    if leaves.is_empty() {
+                        vec![rev]
+                    } else {
+                        leaves
+                    }
                 })
+                .filter(|leaf| seen.insert(leaf.clone()))
                 .collect();
         }
         let mut docs = Vec::new();
@@ -2536,10 +2576,11 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
 
     let rev = match &opts.rev {
         Some(r) => {
+            let r = canonical_rev(r);
             if opts.latest {
-                meta.tree.latest_leaf(r).unwrap_or_else(|| r.clone())
+                meta.tree.leaves_from(&r).into_iter().next().unwrap_or(r)
             } else {
-                r.clone()
+                r
             }
         }
         None => {

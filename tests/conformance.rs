@@ -1424,17 +1424,12 @@ async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["_rev"], rev);
 
-    let open = format!(
-        "/revcase/doc?open_revs={}",
-        urlencoding(&json!([upper]))
-    );
+    let open = format!("/revcase/doc?open_revs={}", urlencoding(&json!([upper])));
     let (status, body) = s.get(&open).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body[0]["ok"]["_rev"], rev);
 
-    let (status, body) = s
-        .put("/revcase/doc", json!({"_rev": upper, "v": 2}))
-        .await;
+    let (status, body) = s.put("/revcase/doc", json!({"_rev": upper, "v": 2})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
