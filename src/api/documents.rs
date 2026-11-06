@@ -111,11 +111,15 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
     }
 
     if attachment.is_some() {
-        return fail(ApiError::new(
-            400,
-            "attachments_not_supported",
-            "douchdb does not support attachments",
-        ));
+        // No document has attachments, so a read finds none: 404 for the
+        // attachment (or for the document, as CouchDB reports a missing one).
+        if method == Method::GET || method == Method::HEAD {
+            return match db.get_doc(&docid, &DocOpts::default()).await {
+                Ok(_) => fail(ApiError::not_found("Document is missing attachment")),
+                Err(error) => fail(error),
+            };
+        }
+        return fail(attachments_unsupported());
     }
 
     match method {
@@ -354,13 +358,16 @@ async fn put_doc(
 ) -> Response {
     let mut doc = match crate::json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return fail(ApiError::bad_request(format!("invalid JSON: {e}"))),
+        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
     };
     if let Err(e) = validate_doc(&doc) {
         return fail(e);
     }
     // The URL owns the id: CouchDB ignores a conflicting `_id` in the body.
     doc["_id"] = json!(docid);
+    if let Err(e) = validate_design_doc(&doc) {
+        return fail(e);
+    }
     if let Err(error) = db.validate_doc_id(docid) {
         return fail(error);
     }
@@ -421,6 +428,10 @@ async fn put_doc(
                     obj.remove("id");
                 }
                 return json(doc_error_status(&result), result);
+            }
+            // `batch=ok` answers 202 without a rev, as for `POST /{db}`.
+            if q.get("batch").map(String::as_str) == Some("ok") {
+                return json(StatusCode::ACCEPTED, json!({"ok": true, "id": docid}));
             }
             // CouchDB answers 200, not 201, when a PUT lands as a tombstone.
             let status = if tombstone {

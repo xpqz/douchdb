@@ -181,10 +181,15 @@ pub async fn db_root(
             if let Some(response) = reject_during_rebalance(&st, &db, &Method::POST, "", &headers) {
                 return response;
             }
-            let Ok(mut doc) = json_body(&body) else {
-                return fail(ApiError::bad_request("Document must be a JSON object"));
+            // CouchDB reads the body as JSON first; an empty one is as
+            // invalid as garbage.
+            let Ok(mut doc) = crate::json::from_slice(&body) else {
+                return fail(ApiError::bad_request("invalid UTF-8 JSON"));
             };
             if let Err(e) = validate_doc(&doc) {
+                return fail(e);
+            }
+            if let Err(e) = validate_design_doc(&doc) {
                 return fail(e);
             }
             if doc.get("_id").is_none() {

@@ -4,7 +4,8 @@
 use crate::auth::{Auth, Principal};
 use crate::cluster::{Cluster, ShardMap};
 use crate::db::{
-    validate_doc, AllDocsOpts, ApiError, ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
+    attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError,
+    ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
 };
 use crate::fabric::*;
 pub use crate::observability::{health_public, health_status, metrics_status};
@@ -423,13 +424,6 @@ pub(crate) fn validate_bool_params(q: &HashMap<String, String>, names: &[&str]) 
         }
     }
     Ok(())
-}
-
-fn json_body(body: &[u8]) -> DbResult<Value> {
-    if body.is_empty() {
-        return Ok(json!({}));
-    }
-    crate::json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))
 }
 
 /// A database name taken from the URL path. The segment is decoded the way

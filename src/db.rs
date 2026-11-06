@@ -1079,11 +1079,7 @@ impl Db {
 
     pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<Value>> {
         if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
-            return Err(ApiError::new(
-                400,
-                "attachments_not_supported",
-                "douchdb does not support attachments",
-            ));
+            return Err(attachments_unsupported());
         }
         let touches_design = docs.iter().any(|doc| {
             doc.get("_id")
@@ -2012,6 +2008,13 @@ impl Db {
 // ---------------------------------------------------------------------------
 // document helpers
 
+/// The rejection for a write that carries attachments. CouchDB has no such
+/// error; its attachment failures are `bad_request`, so clients that branch on
+/// the error name see a familiar one.
+pub fn attachments_unsupported() -> ApiError {
+    ApiError::bad_request("douchdb does not support attachments")
+}
+
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
 /// whether they arrive through PUT, `_bulk_docs` or `new_edits=false`.
 pub fn validate_doc(doc: &Value) -> DbResult<()> {
@@ -2019,11 +2022,7 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
         return Err(ApiError::bad_request("Document must be a JSON object"));
     };
     if obj.contains_key("_attachments") {
-        return Err(ApiError::new(
-            400,
-            "attachments_not_supported",
-            "douchdb does not support attachments",
-        ));
+        return Err(attachments_unsupported());
     }
     for key in obj.keys() {
         if key.starts_with('_')
@@ -2036,6 +2035,86 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
                 format!("Bad special document member: {key}"),
             ));
         }
+    }
+    // CouchDB (couch_doc.erl) accepts only a boolean `_deleted`.
+    if obj.get("_deleted").is_some_and(|value| !value.is_boolean()) {
+        return Err(ApiError::new(
+            400,
+            "doc_validation",
+            "Bad special document member: _deleted",
+        ));
+    }
+    Ok(())
+}
+
+/// The structural checks CouchDB applies to a design document before storing
+/// it (couch_mrview_util and the design-doc validator): wrong member types are
+/// `invalid_design_doc`, not a stored document that fails later.
+pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
+    let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
+    let Some(obj) = doc.as_object() else {
+        return Ok(());
+    };
+    let is_design = matches!(obj.get("_id"), Some(Value::String(id)) if id.starts_with("_design/"));
+    if !is_design || obj.get("_deleted") == Some(&Value::Bool(true)) {
+        return Ok(());
+    }
+    let wrong = |field: &str, kind: &str| invalid(format!("`{field}` field must have {kind} type"));
+    for field in ["language", "validate_doc_update"] {
+        if obj.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(wrong(field, "string"));
+        }
+    }
+    if obj.get("options").is_some_and(|value| !value.is_object()) {
+        return Err(wrong("options", "object"));
+    }
+    if obj
+        .get("rewrites")
+        .is_some_and(|value| !value.is_array() && !value.is_string())
+    {
+        return Err(wrong("rewrites", "array or string"));
+    }
+    for field in ["filters", "updates", "lists", "shows"] {
+        match obj.get(field) {
+            None => {}
+            Some(Value::Object(members)) => {
+                for (name, value) in members {
+                    if !value.is_string() && !value.is_object() {
+                        return Err(wrong(&format!("{field}.{name}"), "string or object"));
+                    }
+                }
+            }
+            Some(_) => return Err(wrong(field, "object")),
+        }
+    }
+    match obj.get("views") {
+        None => {}
+        Some(Value::Object(views)) => {
+            for (name, view) in views {
+                let Value::Object(view) = view else {
+                    return Err(wrong(&format!("views.{name}"), "object"));
+                };
+                if !view.contains_key("map") {
+                    return Err(invalid(format!("View `{name}` must contain map function")));
+                }
+                for part in ["map", "reduce"] {
+                    if view.get(part).is_some_and(|value| !value.is_string()) {
+                        return Err(wrong(&format!("views.{name}.{part}"), "string"));
+                    }
+                }
+                if let Some(Value::String(reduce)) = view.get("reduce") {
+                    if reduce.starts_with('_')
+                        && !["_sum", "_count", "_stats", "_approx_count_distinct"]
+                            .contains(&reduce.as_str())
+                    {
+                        return Err(invalid(format!(
+                            "`{reduce}` is not a supported reduce function."
+                        )));
+                    }
+                }
+            }
+        }
+        Some(_) => return Err(wrong("views", "object")),
     }
     Ok(())
 }

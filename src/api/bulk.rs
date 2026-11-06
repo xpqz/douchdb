@@ -12,7 +12,7 @@ pub(super) async fn bulk_docs(
     headers: &HeaderMap,
 ) -> Response {
     let Ok(value) = crate::json::from_slice(body) else {
-        return fail(ApiError::bad_request("invalid JSON"));
+        return fail(ApiError::bad_request("invalid UTF-8 JSON"));
     };
     let new_edits = match value.get("new_edits") {
         Some(Value::Bool(new_edits)) => *new_edits,
@@ -84,7 +84,7 @@ pub(super) async fn bulk_docs(
     }
 
     let principal = st.principal(headers);
-    let validation = if is_forwarded(st, headers) {
+    let mut validation: Vec<Option<ApiError>> = if is_forwarded(st, headers) {
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
@@ -97,6 +97,16 @@ pub(super) async fn bulk_docs(
             Err(error) => return fail(error),
         }
     };
+
+    // A malformed design document fails its own row, not the request; a
+    // replicated batch (`new_edits: false`) is stored as sent.
+    if new_edits && !is_forwarded(st, headers) {
+        for (slot, doc) in validation.iter_mut().zip(&docs) {
+            if slot.is_none() {
+                *slot = validate_design_doc(doc).err();
+            }
+        }
+    }
 
     // `_local` documents live outside the shard/replica machinery. Split them
     // out so a mixed bulk request still writes ordinary documents through the
