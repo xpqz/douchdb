@@ -13,7 +13,7 @@ use tantivy::query::{AllQuery, QueryParser};
 use tantivy::schema::{
     Field, FieldType, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
-use tantivy::{Index, Term};
+use tantivy::{Index, IndexReader, ReloadPolicy, Searcher, Term};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
 const SEARCH_VERSION: u8 = 2;
@@ -281,8 +281,8 @@ async fn build_index(
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
     gate: OwnedRwLockReadGuard<()>,
-    index_guard: OwnedMutexGuard<()>,
-) -> DbResult<(PathBuf, SearchMeta, OwnedRwLockReadGuard<()>)> {
+    mut entry: OwnedMutexGuard<Option<Cached>>,
+) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
     // Capture the sequence before reading the snapshot. A write that lands
     // while the index is being built then leaves the database ahead of the
     // recorded sequence, so the next query rebuilds instead of trusting a
@@ -306,14 +306,20 @@ async fn build_index(
         // Keep both permits in the blocking task, not the request future. A
         // cancelled request must not let cleanup race a live rebuild. The read
         // permit is returned so a query can keep it for its whole lifetime.
-        let _index_guard = index_guard;
-        let result = build_index_files(path, docs, &source, meta, limits);
+        // The old index's files are about to be removed, so forget it first.
+        *entry = None;
+        let result = build_index_files(path, docs, &source, meta, limits)
+            .and_then(|(index, meta)| Cached::open(index, meta))
+            .map(|cached| {
+                let snapshot = cached.snapshot.clone();
+                *entry = Some(cached);
+                snapshot
+            });
         (result, gate)
     })
     .await
     .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-    let (path, meta) = result?;
-    Ok((path, meta, gate))
+    Ok((result?, gate))
 }
 
 /// Build the index at `path` and write `meta` with the indexed documents.
@@ -323,7 +329,7 @@ fn build_index_files(
     source: &str,
     mut meta: SearchMeta,
     limits: crate::view::ViewLimits,
-) -> DbResult<(PathBuf, SearchMeta)> {
+) -> DbResult<(Index, SearchMeta)> {
     let indexed = run_index_json(source, &docs, limits).map_err(|reason| {
         ApiError::new(
             500,
@@ -373,7 +379,7 @@ fn build_index_files(
         })
         .collect();
     write_meta(&path, &meta)?;
-    Ok((path, meta))
+    Ok((tantivy_index, meta))
 }
 
 fn tantivy_doc(
@@ -425,26 +431,28 @@ fn finish_writer(mut writer: tantivy::IndexWriter) -> DbResult<()> {
 
 /// The result of bringing an index up to date from its changes.
 enum Update {
-    Done(SearchMeta, OwnedRwLockReadGuard<()>),
+    Done(Snapshot, OwnedRwLockReadGuard<()>),
     /// Field types inferred over the updated documents differ from the
     /// index's schema, which only a rebuild can change.
-    Rebuild(OwnedRwLockReadGuard<()>, OwnedMutexGuard<()>),
+    Rebuild(OwnedRwLockReadGuard<()>, OwnedMutexGuard<Option<Cached>>),
 }
 
-/// Bring the index at `path` up to date with the changes since
-/// `meta.last_seq`, re-indexing only the documents that changed.
+/// Bring the cached index at `path` up to date with the changes since its
+/// `last_seq`, re-indexing only the documents that changed.
 async fn update_index(
     db: &Db,
     path: PathBuf,
-    mut meta: SearchMeta,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
     gate: OwnedRwLockReadGuard<()>,
-    index_guard: OwnedMutexGuard<()>,
+    mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<Update> {
+    let since = entry
+        .as_ref()
+        .map_or(0, |cached| cached.snapshot.meta.last_seq);
     let changes = db
         .changes(&crate::db::ChangesOpts {
-            since: meta.last_seq,
+            since,
             include_docs: true,
             ..Default::default()
         })
@@ -466,15 +474,19 @@ async fn update_index(
             live.push((id.to_string(), doc.to_string()));
         }
     }
-    let last_seq = changes["last_seq"]
-        .as_u64()
-        .unwrap_or(meta.last_seq)
-        .max(meta.last_seq);
+    let last_seq = changes["last_seq"].as_u64().unwrap_or(since).max(since);
     let source = spec.source.clone();
     let placement = (db.q, db.partitioned);
     // As in a rebuild, the permits travel with the blocking work so a
     // cancelled request cannot let cleanup or another update race it.
     tokio::task::spawn_blocking(move || {
+        // Taken out while it changes: if anything below fails, the next query
+        // finds no cached index and reloads it from disk.
+        let Some(Cached { reader, snapshot }) = entry.take() else {
+            return Ok(Update::Rebuild(gate, entry));
+        };
+        let tantivy_index = snapshot.index;
+        let mut meta = Arc::unwrap_or_clone(snapshot.meta);
         let indexed = run_index_json(&source, &live, limits).map_err(|reason| {
             ApiError::new(
                 500,
@@ -497,33 +509,31 @@ async fn update_index(
             )
         });
         let kinds = infer_kinds(meta.docs.iter().map(|doc| &doc.fields));
-        let tantivy_index = Index::open_in_dir(&path)
-            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
         let schema = tantivy_index.schema();
         let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
         let mut id_field = None;
-        for (field, entry) in schema.fields() {
-            let kind = match entry.field_type() {
-                FieldType::Str(_) if entry.name() == "_id" => {
+        for (field, field_entry) in schema.fields() {
+            let kind = match field_entry.field_type() {
+                FieldType::Str(_) if field_entry.name() == "_id" => {
                     id_field = Some(field);
                     continue;
                 }
                 FieldType::Str(_) => FieldKind::Text,
                 FieldType::F64(_) => FieldKind::Number,
                 FieldType::Bool(_) => FieldKind::Bool,
-                _ => return Ok(Update::Rebuild(gate, index_guard)),
+                _ => return Ok(Update::Rebuild(gate, entry)),
             };
-            fields.insert(entry.name().to_string(), (field, kind));
+            fields.insert(field_entry.name().to_string(), (field, kind));
         }
         let Some(id_field) = id_field else {
-            return Ok(Update::Rebuild(gate, index_guard));
+            return Ok(Update::Rebuild(gate, entry));
         };
         let schema_kinds: BTreeMap<String, FieldKind> = fields
             .iter()
             .map(|(name, (_, kind))| (name.clone(), *kind))
             .collect();
         if kinds != schema_kinds {
-            return Ok(Update::Rebuild(gate, index_guard));
+            return Ok(Update::Rebuild(gate, entry));
         }
 
         let writer: tantivy::IndexWriter = tantivy_index
@@ -541,8 +551,15 @@ async fn update_index(
 
         meta.last_seq = last_seq;
         write_meta(&path, &meta)?;
-        drop(index_guard);
-        Ok(Update::Done(meta, gate))
+        reader
+            .reload()
+            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+        let snapshot = Snapshot::new(meta, tantivy_index, reader.searcher());
+        *entry = Some(Cached {
+            reader,
+            snapshot: snapshot.clone(),
+        });
+        Ok(Update::Done(snapshot, gate))
     })
     .await
     .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?
@@ -558,14 +575,84 @@ fn build_gate(db: &Db) -> Arc<RwLock<()>> {
         .clone()
 }
 
-fn build_lock(path: &Path) -> Arc<AsyncMutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|poison| poison.into_inner());
-    locks
+/// What a query reads from an index: replaced as a whole when the index
+/// changes, so a query keeps a consistent view while an update runs.
+#[derive(Clone)]
+struct Snapshot {
+    meta: Arc<SearchMeta>,
+    /// Each document's position in `meta.docs`.
+    positions: Arc<HashMap<String, usize>>,
+    index: Index,
+    searcher: Searcher,
+}
+
+impl Snapshot {
+    fn new(meta: SearchMeta, index: Index, searcher: Searcher) -> Self {
+        let positions = meta
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(position, doc)| (doc.id.clone(), position))
+            .collect();
+        Snapshot {
+            meta: Arc::new(meta),
+            positions: Arc::new(positions),
+            index,
+            searcher,
+        }
+    }
+}
+
+/// An index kept open between queries, so a query neither re-reads the
+/// metadata file nor reopens the index.
+struct Cached {
+    reader: IndexReader,
+    snapshot: Snapshot,
+}
+
+impl Cached {
+    fn open(index: Index, meta: SearchMeta) -> DbResult<Self> {
+        // Reloaded by hand after each commit, which also avoids the thread
+        // that watches the index's meta file for an automatic reload.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+        let snapshot = Snapshot::new(meta, index, reader.searcher());
+        Ok(Cached { reader, snapshot })
+    }
+
+    fn load(path: &Path) -> Option<Self> {
+        let meta = read_meta(path)?;
+        let index = Index::open_in_dir(path).ok()?;
+        Cached::open(index, meta).ok()
+    }
+}
+
+type Entry = Arc<AsyncMutex<Option<Cached>>>;
+
+fn registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Entry>> {
+    static ENTRIES: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
+    ENTRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// The per-index entry. Its lock serialises updates and rebuilds of the index.
+fn index_entry(path: &Path) -> Entry {
+    registry()
         .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
         .clone()
+}
+
+/// Drop cached indexes when a database is deleted or recreated, or its index
+/// files are removed.
+pub fn forget_db(db_path: &Path) {
+    let prefix = db_path.join("_search_indexes");
+    registry().retain(|path, _| !path.starts_with(&prefix));
 }
 
 async fn ensure_index(
@@ -575,32 +662,33 @@ async fn ensure_index(
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
     gate: OwnedRwLockReadGuard<()>,
-) -> DbResult<(PathBuf, SearchMeta, OwnedRwLockReadGuard<()>)> {
+) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
     let path = index_dir(db, ddoc, index_name);
     let signature = design_signature(spec);
-    let lock = build_lock(&path);
-    let index_guard = lock.lock_owned().await;
-    // Re-check after acquiring the per-index lock: another request may have
-    // completed the rebuild while this one waited.
-    if let Some(meta) = read_meta(&path) {
+    let mut entry = index_entry(&path).lock_owned().await;
+    // Check after acquiring the per-index lock: another request may have
+    // completed an update or rebuild while this one waited.
+    if entry.is_none() {
+        *entry = Cached::load(&path);
+    }
+    if let Some(cached) = entry.as_ref() {
+        let meta = &cached.snapshot.meta;
         if meta.version == SEARCH_VERSION && meta.design == signature {
             let current = db.update_seq();
             if meta.last_seq == current {
-                return Ok((path, meta, gate));
+                return Ok((cached.snapshot.clone(), gate));
             }
             if meta.last_seq < current {
-                let update =
-                    update_index(db, path.clone(), meta, spec, limits, gate, index_guard).await?;
-                return match update {
-                    Update::Done(meta, gate) => Ok((path, meta, gate)),
-                    Update::Rebuild(gate, index_guard) => {
-                        build_index(db, ddoc, index_name, spec, limits, gate, index_guard).await
+                return match update_index(db, path, spec, limits, gate, entry).await? {
+                    Update::Done(snapshot, gate) => Ok((snapshot, gate)),
+                    Update::Rebuild(gate, entry) => {
+                        build_index(db, ddoc, index_name, spec, limits, gate, entry).await
                     }
                 };
             }
         }
     }
-    build_index(db, ddoc, index_name, spec, limits, gate, index_guard).await
+    build_index(db, ddoc, index_name, spec, limits, gate, entry).await
 }
 
 fn owned_value_to_json(value: OwnedValue) -> Value {
@@ -876,7 +964,7 @@ pub async fn query(
     // concurrent `_search_cleanup` cannot remove the index under an open
     // searcher.
     let gate = build_gate(db).read_owned().await;
-    let (path, meta, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
+    let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(ApiError::new(
             500,
@@ -884,16 +972,12 @@ pub async fn query(
             "The request could not be processed in a reasonable amount of time.",
         ));
     }
-    let tantivy_index = Index::open_in_dir(&path)
-        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-    let schema = tantivy_index.schema();
+    let meta = &snapshot.meta;
+    let searcher = &snapshot.searcher;
+    let schema = snapshot.index.schema();
     let id_field = schema
         .get_field("_id")
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-    let reader = tantivy_index
-        .reader()
-        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-    let searcher = reader.searcher();
 
     let query_text = request.query.trim();
     let query: Box<dyn tantivy::query::Query> = if query_text == "*:*" || query_text.is_empty() {
@@ -904,7 +988,7 @@ pub async fn query(
             .filter(|(_, field)| field.name() != "_id")
             .map(|(field, _)| field)
             .collect();
-        let parser = QueryParser::for_index(&tantivy_index, default_fields);
+        let parser = QueryParser::for_index(&snapshot.index, default_fields);
         match parser.parse_query(query_text) {
             Ok(query) => query,
             // A node may hold no local documents with an indexed field even
@@ -924,9 +1008,7 @@ pub async fn query(
         .search(&*query, &DocSetCollector)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
-    let by_id: HashMap<&str, &SearchDoc> =
-        meta.docs.iter().map(|doc| (doc.id.as_str(), doc)).collect();
-    let mut matched: Vec<SearchDoc> = Vec::new();
+    let mut matched: Vec<&SearchDoc> = Vec::new();
     for address in addresses {
         let document: TantivyDocument = searcher
             .doc(address)
@@ -938,7 +1020,7 @@ pub async fn query(
             Value::String(id) => id,
             _ => continue,
         };
-        let Some(doc) = by_id.get(id.as_str()) else {
+        let Some(doc) = snapshot.positions.get(&id).map(|&at| &meta.docs[at]) else {
             continue;
         };
         if let Some(partition) = &request.partition {
@@ -958,7 +1040,7 @@ pub async fn query(
         if !matches_drilldown(doc, &request.drilldown) {
             continue;
         }
-        matched.push((*doc).clone());
+        matched.push(doc);
     }
     if request.sort.is_empty() {
         matched.sort_by(|a, b| a.id.cmp(&b.id));
@@ -973,7 +1055,7 @@ pub async fn query(
     } else {
         request.limit.min(PAGE_LIMIT)
     };
-    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).collect();
+    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
     let docs = if request.include_docs {
         let ids: Vec<String> = page.iter().map(|doc| doc.id.clone()).collect();
         crate::view::docs_by_ids(db, false, &ids).await?
@@ -1104,7 +1186,8 @@ pub async fn info(
 ) -> DbResult<Value> {
     let spec = load_spec(db, ddoc, index_name).await?;
     let gate = build_gate(db).read_owned().await;
-    let (_path, meta, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
+    let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
+    let meta = &snapshot.meta;
     let copies = db.replicas_of_shard(0).len().max(1);
     Ok(json!({
         "search_index": {
@@ -1126,6 +1209,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Wait for in-flight builds (including builds whose request was cancelled)
     // before removing their directories.
     let _gate = build_gate(db).write_owned().await;
+    forget_db(&db.path);
     let directory = db.path.join("_search_indexes");
     if directory.exists() {
         std::fs::remove_dir_all(&directory)
@@ -1268,7 +1352,9 @@ mod tests {
             if step > 0 {
                 std::fs::write(&marker, b"").unwrap();
             }
-            std::fs::remove_dir_all(index_dir(&db, "_design/b", "idx")).ok();
+            let rebuilt = index_dir(&db, "_design/b", "idx");
+            registry().remove(&rebuilt);
+            std::fs::remove_dir_all(rebuilt).ok();
             for q in [
                 "*:*",
                 "name:pear",
@@ -1288,12 +1374,12 @@ mod tests {
     }
 
     #[test]
-    fn build_locks_are_per_index() {
-        let first = build_lock(Path::new("/tmp/douchdb-search-lock-a"));
-        let second = build_lock(Path::new("/tmp/douchdb-search-lock-b"));
+    fn index_entries_are_per_index() {
+        let first = index_entry(Path::new("/tmp/douchdb-search-lock-a"));
+        let second = index_entry(Path::new("/tmp/douchdb-search-lock-b"));
         assert!(Arc::ptr_eq(
             &first,
-            &build_lock(Path::new("/tmp/douchdb-search-lock-a"))
+            &index_entry(Path::new("/tmp/douchdb-search-lock-a"))
         ));
         assert!(!Arc::ptr_eq(&first, &second));
     }
