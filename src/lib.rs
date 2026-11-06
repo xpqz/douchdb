@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod error;
 pub mod etf;
 pub mod fabric;
+pub mod hll;
 pub mod js;
 #[cfg(feature = "wasmtime")]
 pub mod js_wasmtime;

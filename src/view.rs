@@ -15,7 +15,7 @@ use rusty_leveldb::{LdbIterator, Options as LdbOptions, WriteBatch, DB as Ldb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -945,7 +945,7 @@ fn reduce_rows<'a>(
         "_count" => Ok(json!(rows.count())),
         "_sum" => reduce_sum(rows.map(|row| &row.value)),
         "_stats" => reduce_stats(rows.map(|row| &row.value)),
-        "_approx_count_distinct" => reduce_approx_count_distinct(rows.map(|row| &row.value)),
+        "_approx_count_distinct" => Ok(crate::hll::partial(rows.map(|row| &row.key))),
         _ => {
             let keys: Vec<Value> = rows.clone().map(|row| json!([row.id, row.key])).collect();
             let values: Vec<Value> = rows.map(|row| row.value.clone()).collect();
@@ -1018,11 +1018,16 @@ pub(crate) fn assemble_reduce(
 
     let mut rows = Vec::new();
     for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {
-        let value = if values.len() == 1 {
+        let mut value = if values.len() == 1 {
             values.pop().unwrap_or(Value::Null)
         } else {
             combine_partials(reducer, &values)?
         };
+        // Owners hand their sketches to the coordinator, which reports the
+        // estimate of the union.
+        if reducer.source() == "_approx_count_distinct" && query.owner_shards.is_none() {
+            value = crate::hll::finish(&value)?;
+        }
         rows.push(json!({"key": key, "value": value}));
     }
     Ok(json!({ "rows": rows }))
@@ -1046,6 +1051,7 @@ pub(crate) fn combine_partials(
             None => reduce_sum(partials),
         },
         "_stats" => reduce_stats(partials),
+        "_approx_count_distinct" => crate::hll::combine(partials),
         _ => reducer.call(&[], partials, true),
     }
 }
@@ -1366,11 +1372,12 @@ pub async fn query_with_spec(
 ) -> DbResult<Value> {
     validate_view_partition(db, spec, query.partition.as_deref())?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-    // `_approx_count_distinct` partials are finished estimates and cannot be
-    // combined; a partition's rows are not contiguous within its shard.
-    if let Some(reducer) = spec.reduce.as_deref().filter(|reducer| {
-        reduce && *reducer != "_approx_count_distinct" && query.partition.is_none()
-    }) {
+    // A partition's rows are not contiguous within its shard.
+    if let Some(reducer) = spec
+        .reduce
+        .as_deref()
+        .filter(|_| reduce && query.partition.is_none())
+    {
         check_query(spec, query)?;
         let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
         let mut js = JsReducer::new(reducer, query.limits);
@@ -2406,7 +2413,12 @@ fn render(
                 "_sum" => reduce_sum(members.iter().map(|row| &row.value)),
                 "_stats" => reduce_stats(members.iter().map(|row| &row.value)),
                 "_approx_count_distinct" => {
-                    reduce_approx_count_distinct(members.iter().map(|row| &row.value))
+                    let partial = crate::hll::partial(members.iter().map(|row| &row.key));
+                    if query.owner_shards.is_some() {
+                        Ok(partial)
+                    } else {
+                        crate::hll::finish(&partial)
+                    }
                 }
                 _ => {
                     let keys: Vec<Value> =
@@ -2543,7 +2555,6 @@ fn reduce_with(reducer: &mut JsReducer, keys: &[Value], values: &[Value]) -> Res
         "_count" => return Ok(json!(values.len())),
         "_sum" => return reduce_sum(values.iter()),
         "_stats" => return reduce_stats(values.iter()),
-        "_approx_count_distinct" => return reduce_approx_count_distinct(values.iter()),
         _ => {}
     }
 
@@ -2936,16 +2947,6 @@ fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value
     ))
 }
 
-fn reduce_approx_count_distinct<'a>(
-    values: impl IntoIterator<Item = &'a Value>,
-) -> Result<Value, String> {
-    let mut distinct = HashSet::new();
-    for value in values {
-        distinct.insert(serde_json::to_string(value).map_err(|error| error.to_string())?);
-    }
-    Ok(json!(distinct.len()))
-}
-
 pub(crate) fn number_value(value: f64) -> Value {
     if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
         json!(value as i64)
@@ -3063,6 +3064,7 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn reduce_value(
         source: &str,
@@ -3525,7 +3527,12 @@ mod tests {
                 ..base.clone()
             },
         ];
-        for reducer in ["_sum", "_stats", "function(k, v, re){ return sum(v); }"] {
+        for reducer in [
+            "_sum",
+            "_stats",
+            "_approx_count_distinct",
+            "function(k, v, re){ return sum(v); }",
+        ] {
             let spec = ViewSpec {
                 map: String::new(),
                 reduce: Some(reducer.to_string()),
@@ -3892,6 +3899,7 @@ mod tests {
             "_count",
             "_sum",
             "_stats",
+            "_approx_count_distinct",
             "function(k, v, re){ return sum(v); }",
         ];
         let check = |view: &ViewRows, rows: &[Row], reducers: &[&str]| {
@@ -4352,15 +4360,5 @@ mod tests {
         assert_eq!(stats["count"], 2);
         assert_eq!(stats["min"], 1);
         assert_eq!(stats["max"], 3);
-        assert_eq!(
-            reduce_value(
-                "_approx_count_distinct",
-                &[],
-                &[json!(1), json!(2), json!(1)],
-                ViewLimits::default()
-            )
-            .unwrap(),
-            json!(2)
-        );
     }
 }

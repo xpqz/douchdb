@@ -438,19 +438,12 @@ pub(super) async fn view_request(
     }
 
     // Owners reduce their own shards and the coordinator combines the
-    // partials, instead of shipping every map row. `_approx_count_distinct`
-    // returns a finished estimate, which cannot be combined.
+    // partials, instead of shipping every map row.
     let combine_reduce = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
         match crate::view::load_spec(db, ddoc, view_name).await {
             Ok(spec) => {
                 let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
-                if reduce
-                    && spec
-                        .reduce
-                        .as_deref()
-                        .map(|reducer| reducer != "_approx_count_distinct")
-                        .unwrap_or(false)
-                {
+                if reduce {
                     spec.reduce
                 } else {
                     None

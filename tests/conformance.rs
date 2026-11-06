@@ -7907,7 +7907,7 @@ async fn couchdb_builtin_reduce_ports() {
                 "count": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_count"},
                 "sum": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_sum"},
                 "stats": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_stats"},
-                "distinct": {"map": "function(doc){ emit(null, doc.value); }", "reduce": "_approx_count_distinct"}
+                "distinct": {"map": "function(doc){ emit(doc.value, null); }", "reduce": "_approx_count_distinct"}
             }}),
         )
         .await;
@@ -10566,7 +10566,7 @@ async fn assert_cluster_views_match_single_node(q: u32, replication: usize) {
         "stats": {"map": "function(doc){ emit(doc.n % 5, doc.n); }", "reduce": "_stats"},
         "js": {"map": "function(doc){ emit(doc.n % 5, doc.n); }",
                "reduce": "function(keys, values, rereduce){ return sum(values); }"},
-        "acd": {"map": "function(doc){ emit(doc.n % 5, doc.n % 7); }",
+        "acd": {"map": "function(doc){ emit([doc.n % 5, doc.n % 7], doc.n % 2); }",
                 "reduce": "_approx_count_distinct"}
     }});
     let docs: Vec<Value> = (0..60)
@@ -10636,7 +10636,10 @@ async fn assert_cluster_views_match_single_node(q: u32, replication: usize) {
         "js?key=4",
         "js?keys=[1,2]&group=true",
         "acd",
-        "acd?startkey=1&endkey=3",
+        "acd?startkey=[1]&endkey=[3,{}]",
+        "acd?group_level=1",
+        "acd?group=true&limit=7&skip=2",
+        "acd?keys=[[1,1],[2,2]]&group=true",
         "sum?keys=[1,2]",
         "sum?startkey=3&endkey=1",
     ];
