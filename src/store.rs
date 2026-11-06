@@ -1605,6 +1605,67 @@ mod scan_tests {
     }
 
     #[test]
+    fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
+        let dir = temp_shard_dir("sweep-slash");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let tree = |edges: &[(&str, Option<&str>)]| {
+            let mut tree = RevTree::default();
+            for (rev, parent) in edges {
+                tree.edges
+                    .insert(rev.to_string(), parent.map(str::to_string));
+            }
+            DocMeta {
+                tree,
+                seq: 1,
+                atts: BTreeMap::new(),
+            }
+        };
+        let mut tx = Tx::new();
+        // The only leaf of "doc" has a '/' in its revision id.
+        tx.put_json(&meta_key("doc"), &tree(&[("1-x/y", None)]))
+            .unwrap();
+        tx.put(&body_key("doc", "1-x/y"), b"{}");
+        // "p" has a stale parent and a leaf, both with '/'.
+        tx.put_json(
+            &meta_key("p"),
+            &tree(&[("1-p/q", None), ("2-r/s", Some("1-p/q"))]),
+        )
+        .unwrap();
+        tx.put(&body_key("p", "1-p/q"), b"{}");
+        tx.put(&body_key("p", "2-r/s"), b"{}");
+        // d/a/1-b/c is "a" with leaf "1-b/c" or "a/1-b" with rev "c": it
+        // stays because one reading makes it a leaf.
+        tx.put_json(&meta_key("a"), &tree(&[("1-b/c", None)]))
+            .unwrap();
+        tx.put_json(&meta_key("a/1-b"), &tree(&[("2-z", None)]))
+            .unwrap();
+        tx.put(&body_key("a", "1-b/c"), b"{}");
+        tx.put(&body_key("a/1-b", "2-z"), b"{}");
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+
+        shard.compact().unwrap();
+
+        let mut left = Vec::new();
+        shard
+            .scan_range_while(b"d/", None, false, |key, _| {
+                left.push(key.to_vec());
+                true
+            })
+            .unwrap();
+        let mut expected = vec![
+            body_key("doc", "1-x/y"),
+            body_key("p", "2-r/s"),
+            body_key("a", "1-b/c"),
+            body_key("a/1-b", "2-z"),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn compaction_sweeps_stale_bodies_in_several_batches() {
         let dir = temp_shard_dir("sweep");
         let mut shard = Shard::open(&dir, 1000).unwrap();

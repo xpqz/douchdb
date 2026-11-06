@@ -2745,6 +2745,38 @@ async fn purging_one_conflict_leaf_keeps_the_shared_ancestor_and_other_leaf() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// Revision ids that are not hex are stored verbatim and may contain '/'
+// (CouchDB 3.5 accepts them under new_edits=false). Compaction must not
+// mistake such a leaf body for a stale one.
+#[tokio::test]
+async fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
+    let s = Server::start(false);
+    s.fresh_db("compactslash").await;
+    let (status, _) = s
+        .post(
+            "/compactslash/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "doc", "_rev": "1-x/y", "v": 1},
+                {"_id": "p", "_rev": "2-r/s",
+                 "_revisions": {"start": 2, "ids": ["r/s", "p/q"]}, "v": 2},
+                {"_id": "p", "_rev": "1-p/q", "v": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.post("/compactslash/_compact", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, body) = s.get("/compactslash/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "1-x/y");
+    let (status, body) = s.get("/compactslash/p").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "2-r/s");
+    let (status, _) = s.get("/compactslash/p?rev=1-p/q").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stale parent is dropped");
+}
+
 // CouchDB keeps non-leaf bodies readable by `?rev=` until compaction drops
 // them (checked live: 200 before `_compact`, 404 `missing` after, and
 // `_revs_info` then reports the old rev as "missing"). Leaves of every kind
