@@ -18,10 +18,11 @@ use tokio::sync::RwLock;
 /// shutdown.
 pub async fn run(args: Args) -> anyhow::Result<()> {
     if args.worker {
-        if let Err(error) = js::install_seccomp()
-            .and_then(|_| js::install_landlock())
-            .and_then(|_| js::run_worker_stdio())
-        {
+        // Landlock first: its syscalls are not on the seccomp allowlist.
+        if let Err(error) = js::install_landlock().and_then(|landlock| {
+            js::install_seccomp()?;
+            js::run_worker_stdio(landlock)
+        }) {
             eprintln!("js worker: {error}");
             std::process::exit(1);
         }

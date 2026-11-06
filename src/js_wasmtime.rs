@@ -5,7 +5,8 @@
 //! build time with `--features wasmtime` and selected at runtime with
 //! `--wasm-runtime wasmtime`.
 
-use crate::js::{check_output, MAX_OUTPUT_BYTES};
+use crate::js::{check_output, wasm_memory_cap, MAX_OUTPUT_BYTES};
+use crate::view::ViewLimits;
 use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -15,7 +16,6 @@ use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::WasiCtxBuilder;
 
 const WASM_RUNNER: &[u8] = include_bytes!("../wasm/qjs-runner.wasm");
-const MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 struct WasmtimeData {
@@ -25,6 +25,7 @@ struct WasmtimeData {
 
 struct WasmtimeState {
     engine: Engine,
+    baseline_memory: usize,
     pre: InstancePre<WasmtimeData>,
 }
 
@@ -54,6 +55,17 @@ fn engine() -> Result<&'static WasmtimeState, String> {
         let mut linker: Linker<WasmtimeData> = Linker::new(&engine);
         p1::add_to_linker_sync(&mut linker, |data: &mut WasmtimeData| &mut data.wasi)
             .map_err(|error| format!("wasm wasi: {error}"))?;
+        // Linear memory the module declares up front; the view memory limit
+        // applies on top of it.
+        let baseline_memory = module
+            .exports()
+            .find_map(|export| match export.ty() {
+                wasmtime::ExternType::Memory(memory) if export.name() == "memory" => {
+                    Some(memory.minimum().saturating_mul(65536) as usize)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
         let pre = linker
             .instantiate_pre(&module)
             .map_err(|error| format!("wasm instantiate: {error}"))?;
@@ -67,7 +79,11 @@ fn engine() -> Result<&'static WasmtimeState, String> {
                 ticker.increment_epoch();
             })
             .map_err(|error| format!("wasmtime epoch thread: {error}"))?;
-        Ok(WasmtimeState { engine, pre })
+        Ok(WasmtimeState {
+            engine,
+            baseline_memory,
+            pre,
+        })
     });
     match state {
         Ok(state) => Ok(state),
@@ -75,23 +91,23 @@ fn engine() -> Result<&'static WasmtimeState, String> {
     }
 }
 
-pub fn request(body: &[u8], timeout: Duration) -> Result<Value, String> {
+pub fn request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     // The synchronous WASI shim calls `Handle::current().block_on()`, which
     // panics when invoked from inside the server's Tokio runtime. The wasm call
     // is CPU-bound anyway, so hop to a plain thread and block the caller.
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::scope(|scope| {
             scope
-                .spawn(|| request_inner(body, timeout))
+                .spawn(|| request_inner(body, limits))
                 .join()
                 .unwrap_or_else(|payload| Err(format!("wasmtime worker panicked: {payload:?}")))
         })
     } else {
-        request_inner(body, timeout)
+        request_inner(body, limits)
     }
 }
 
-fn request_inner(body: &[u8], timeout: Duration) -> Result<Value, String> {
+fn request_inner(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     let state = engine()?;
     let stdout = MemoryOutputPipe::new(MAX_OUTPUT_BYTES + 1);
     let wasi = WasiCtxBuilder::new()
@@ -103,14 +119,16 @@ fn request_inner(body: &[u8], timeout: Duration) -> Result<Value, String> {
         WasmtimeData {
             wasi,
             limits: wasmtime::StoreLimitsBuilder::new()
-                .memory_size(MEMORY_LIMIT)
+                .memory_size(wasm_memory_cap(state.baseline_memory, limits, body.len()))
                 .trap_on_grow_failure(true)
                 .build(),
         },
     );
     store.limiter(|data| &mut data.limits);
     let tick_ms = EPOCH_TICK.as_millis() as u64;
-    let ticks = (timeout.as_millis() as u64).div_ceil(tick_ms.max(1)).max(1);
+    let ticks = (limits.timeout.as_millis() as u64)
+        .div_ceil(tick_ms.max(1))
+        .max(1);
     store.set_epoch_deadline(ticks);
 
     let instance = state
@@ -146,6 +164,13 @@ mod tests {
     use serde_json::json;
     use std::time::Instant;
 
+    fn limits(timeout: Duration) -> ViewLimits {
+        ViewLimits {
+            timeout,
+            memory: 64 * 1024 * 1024,
+        }
+    }
+
     #[test]
     fn maps_documents_and_enforces_the_epoch_deadline() {
         let docs = json!([
@@ -160,7 +185,7 @@ mod tests {
             "memory": 64 * 1024 * 1024
         }))
         .unwrap();
-        let value = request(&body, Duration::from_secs(5)).unwrap();
+        let value = request(&body, limits(Duration::from_secs(5))).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 2);
         assert_eq!(value[0]["key"], 2);
 
@@ -173,7 +198,7 @@ mod tests {
         }))
         .unwrap();
         let started = Instant::now();
-        let error = request(&body, Duration::from_millis(150)).unwrap_err();
+        let error = request(&body, limits(Duration::from_millis(150))).unwrap_err();
         assert!(
             error.contains("interrupt") || error.contains("epoch"),
             "{error}"

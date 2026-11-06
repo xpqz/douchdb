@@ -89,6 +89,8 @@ pub enum WasmRuntime {
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
+/// A debug-build worker needs a moment to start; a hung one is killed after this.
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn configure(sandbox: Sandbox, workers: usize) {
@@ -146,78 +148,79 @@ pub fn sandbox_request(
     }
 }
 
-/// Install a Linux seccomp denylist in the worker. The worker runs after this
-/// point, so file/network/exec syscalls are no longer needed.
+/// Syscalls the worker may make once it is serving requests: reading and
+/// writing the request pipes, memory management for QuickJS, futexes, clocks
+/// and exiting. Derived by tracing a worker through map, reduce, index,
+/// timeout, out-of-memory and stack-overflow requests, plus the calls a
+/// panic or abort needs. Everything else (files, sockets, exec, signals to
+/// other processes, namespaces, links, renames, chmod/chown, mknod, ...) fails
+/// with EPERM. Only syscalls present on both x86_64 and aarch64 are listed.
+#[cfg(target_os = "linux")]
+const WORKER_SYSCALLS: &[i64] = &[
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_readv,
+    libc::SYS_writev,
+    libc::SYS_pread64,
+    libc::SYS_close,
+    libc::SYS_lseek,
+    libc::SYS_fstat,
+    libc::SYS_fcntl,
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    libc::SYS_futex,
+    libc::SYS_sched_yield,
+    libc::SYS_clock_gettime,
+    libc::SYS_clock_nanosleep,
+    libc::SYS_nanosleep,
+    libc::SYS_gettimeofday,
+    libc::SYS_getrandom,
+    libc::SYS_getpid,
+    libc::SYS_gettid,
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// Install a Linux seccomp allowlist in the worker: only the syscalls in
+/// [`WORKER_SYSCALLS`] succeed, everything else returns EPERM. `tgkill` is
+/// allowed only against the worker's own pid (that is how `abort` raises
+/// SIGABRT); `kill`, `tkill` and `pidfd_send_signal` are not allowed, so a
+/// compromised worker cannot signal the server that spawned it.
+///
+/// Install Landlock first: its syscalls are not on the list.
 #[cfg(target_os = "linux")]
 pub fn install_seccomp() -> Result<(), String> {
     use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter, SeccompRule,
+        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+        SeccompCondition, SeccompFilter, SeccompRule,
     };
     use std::collections::BTreeMap;
 
-    // The legacy syscall numbers do not exist on aarch64 (it uses openat,
-    // unlinkat, clone and friends). Keep the common set portable and add the
-    // x86_64-only legacy calls where the constants exist.
-    #[allow(unused_mut)]
-    let mut denied: Vec<i64> = vec![
-        libc::SYS_openat,
-        libc::SYS_unlinkat,
-        libc::SYS_renameat,
-        libc::SYS_mkdirat,
-        libc::SYS_openat2,
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_sendmsg,
-        libc::SYS_recvmsg,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_sendto,
-        libc::SYS_recvfrom,
-        libc::SYS_execve,
-        libc::SYS_execveat,
-        libc::SYS_ptrace,
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        libc::SYS_chroot,
-        libc::SYS_kill,
-        libc::SYS_bpf,
-        libc::SYS_perf_event_open,
-        libc::SYS_userfaultfd,
-        libc::SYS_memfd_create,
-        libc::SYS_process_vm_readv,
-        libc::SYS_process_vm_writev,
-        libc::SYS_unshare,
-        libc::SYS_setns,
-        libc::SYS_pivot_root,
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-    ];
-    #[cfg(target_arch = "x86_64")]
-    denied.extend([
-        libc::SYS_open,
-        libc::SYS_creat,
-        libc::SYS_unlink,
-        libc::SYS_rename,
-        libc::SYS_mkdir,
-        libc::SYS_rmdir,
-        libc::SYS_fork,
-        libc::SYS_vfork,
-    ]);
-    let rules: BTreeMap<i64, Vec<SeccompRule>> = denied
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = WORKER_SYSCALLS
         .iter()
         .map(|syscall| (*syscall, Vec::new()))
         .collect();
+    let own_pid = std::process::id() as u64;
+    let own_process = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, own_pid)
+        .and_then(|condition| SeccompRule::new(vec![condition]))
+        .map_err(|error| format!("seccomp tgkill rule: {error}"))?;
+    rules.insert(libc::SYS_tgkill, vec![own_process]);
     let arch = std::env::consts::ARCH
         .try_into()
         .map_err(|error| format!("seccomp arch: {error:?}"))?;
     let filter: BpfProgram = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
         arch,
     )
     .map_err(|error| format!("seccomp filter: {error}"))?
@@ -232,13 +235,15 @@ pub fn install_seccomp() -> Result<(), String> {
 }
 
 /// Add a Landlock layer that denies filesystem access. Best effort: kernels
-/// without Landlock still retain the seccomp denylist.
+/// without Landlock (or with an older ABI) still retain the seccomp
+/// allowlist. Returns how much was enforced so the server can log it.
 #[cfg(target_os = "linux")]
-pub fn install_landlock() -> Result<(), String> {
+pub fn install_landlock() -> Result<&'static str, String> {
     use landlock::{
-        Access, AccessFs, CompatLevel, Compatible, RestrictSelfAttr, Ruleset, RulesetAttr, ABI,
+        Access, AccessFs, CompatLevel, Compatible, RestrictSelfAttr, Ruleset, RulesetAttr,
+        RulesetStatus, ABI,
     };
-    let _status = Ruleset::default()
+    let status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V9))
         .map_err(|error| format!("landlock access: {error}"))?
@@ -248,12 +253,16 @@ pub fn install_landlock() -> Result<(), String> {
         .map_err(|error| format!("landlock threads: {error}"))?
         .restrict_self()
         .map_err(|error| format!("landlock restrict: {error}"))?;
-    Ok(())
+    Ok(match status.ruleset {
+        RulesetStatus::FullyEnforced => "fully enforced",
+        RulesetStatus::PartiallyEnforced => "partially enforced",
+        RulesetStatus::NotEnforced => "not enforced",
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install_landlock() -> Result<(), String> {
-    Ok(())
+pub fn install_landlock() -> Result<&'static str, String> {
+    Ok("unavailable on this platform")
 }
 
 // ---------------------------------------------------------------------------
@@ -261,9 +270,38 @@ pub fn install_landlock() -> Result<(), String> {
 
 const WASM_RUNNER: &[u8] = include_bytes!("../wasm/qjs-runner.wasm");
 
+/// Linear memory the module declares up front (runtime, data segments and
+/// stack), in bytes. The view memory limit applies on top of it.
+fn wasmi_baseline_memory(module: &wasmi::Module) -> usize {
+    module
+        .exports()
+        .find_map(|export| match export.ty() {
+            wasmi::ExternType::Memory(memory) if export.name() == "memory" => {
+                Some(memory.minimum().saturating_mul(65536) as usize)
+            }
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// Cap on the wasm linear memory for one request: what the module needs to
+/// start, the configured view memory limit for the QuickJS heap, and room for
+/// the request and its parsed copy. The runner ignores the `memory` field in
+/// the request, so the host enforces the limit by refusing to grow past this.
+pub(crate) fn wasm_memory_cap(
+    baseline: usize,
+    limits: crate::view::ViewLimits,
+    body_len: usize,
+) -> usize {
+    baseline
+        .saturating_add(limits.memory)
+        .saturating_add(body_len.saturating_mul(2))
+}
+
 struct WasmEngineState {
     engine: wasmi::Engine,
     module: wasmi::Module,
+    baseline_memory: usize,
     linker: OnceLock<Result<wasmi::Linker<WasmData>, String>>,
 }
 
@@ -277,11 +315,22 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
     let state = ENGINE.get_or_init(|| {
         let mut config = wasmi::Config::default();
         config.consume_fuel(true);
+        // Fuel is only a way to regain control (see `run_with_deadline`). A
+        // lazily translated function or a bulk memory operation that needs
+        // more fuel than is left fails the call instead of pausing it, so
+        // translate everything up front and make copies effectively free.
+        config.compilation_mode(wasmi::CompilationMode::Eager);
+        config.fuel_cost(wasmi::CustomFuelCosts {
+            bytes_copied_per_fuel: u32::MAX,
+            fuel_per_bytes_translated: 0,
+            fuel_per_bytes_validated: 0,
+        });
         let engine = wasmi::Engine::new(&config);
         let module = wasmi::Module::new(&engine, WASM_RUNNER)
             .map_err(|error| format!("wasm module: {error}"))?;
         Ok(WasmEngineState {
             engine,
+            baseline_memory: wasmi_baseline_memory(&module),
             module,
             linker: OnceLock::new(),
         })
@@ -329,7 +378,7 @@ fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, Strin
     if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
         #[cfg(feature = "wasmtime")]
         {
-            return crate::js_wasmtime::request(body, limits.timeout);
+            return crate::js_wasmtime::request(body, limits);
         }
         #[cfg(not(feature = "wasmtime"))]
         {
@@ -357,27 +406,19 @@ fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, 
     let data = WasmData {
         wasi,
         limits: wasmi::StoreLimitsBuilder::new()
-            .memory_size(128 * 1024 * 1024)
+            .memory_size(wasm_memory_cap(state.baseline_memory, limits, body.len()))
             .trap_on_grow_failure(true)
             .build(),
     };
     let mut store = wasmi::Store::new(&state.engine, data);
     store.limiter(|data| &mut data.limits);
-    let fuel = (limits.timeout.as_millis() as u64)
-        .saturating_mul(2_000_000)
-        .max(500_000_000);
-    store
-        .set_fuel(fuel)
-        .map_err(|error| format!("wasm fuel: {error}"))?;
     let instance = linker
         .instantiate_and_start(&mut store, &state.module)
         .map_err(|error| format!("wasm instantiate: {error}"))?;
     let start = instance
         .get_typed_func::<(), ()>(&store, "_start")
         .map_err(|error| format!("wasm start: {error}"))?;
-    start
-        .call(&mut store, ())
-        .map_err(|error| format!("wasm run: {error}"))?;
+    run_with_deadline(&mut store, &start, limits.timeout)?;
     drop(store);
     let output = stdout
         .try_into_inner()
@@ -394,6 +435,60 @@ fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, 
             .and_then(Value::as_str)
             .unwrap_or("wasm worker failed")
             .to_string())
+    }
+}
+
+/// Run `start` in slices of fuel and check the wall clock between slices.
+/// wasmi has no interrupt, so fuel is the only way to regain control; the
+/// slice adapts so a check happens roughly every `SLICE_TARGET` whatever the
+/// interpreter's speed (debug builds are orders of magnitude slower).
+fn run_with_deadline(
+    store: &mut wasmi::Store<WasmData>,
+    start: &wasmi::TypedFunc<(), ()>,
+    timeout: Duration,
+) -> Result<(), String> {
+    const SLICE_TARGET: Duration = Duration::from_millis(20);
+    let started = Instant::now();
+    let deadline = started + timeout;
+    const MIN_SLICE: u64 = 10_000;
+    let mut slice: u64 = 1_000_000;
+    let mut slice_started = started;
+    store
+        .set_fuel(slice)
+        .map_err(|error| format!("wasm fuel: {error}"))?;
+    let mut call = start
+        .call_resumable(&mut *store, ())
+        .map_err(|error| format!("wasm run: {error}"))?;
+    loop {
+        match call {
+            wasmi::TypedResumableCall::Finished(()) => return Ok(()),
+            wasmi::TypedResumableCall::HostTrap(trap) => {
+                return Err(format!("wasm run: {}", trap.host_error()))
+            }
+            wasmi::TypedResumableCall::OutOfFuel(pending) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "timed out after {} ms: wasm run exceeded its deadline",
+                        timeout.as_millis()
+                    ));
+                }
+                let took = now
+                    .saturating_duration_since(slice_started)
+                    .as_nanos()
+                    .max(1);
+                let scaled = u128::from(slice) * SLICE_TARGET.as_nanos() / took;
+                slice = (scaled.clamp(u128::from(slice / 4), u128::from(slice) * 4) as u64)
+                    .clamp(MIN_SLICE, 4_000_000_000);
+                store
+                    .set_fuel(slice.max(pending.required_fuel()))
+                    .map_err(|error| format!("wasm fuel: {error}"))?;
+                slice_started = Instant::now();
+                call = pending
+                    .resume(&mut *store)
+                    .map_err(|error| format!("wasm run: {error}"))?;
+            }
+        }
     }
 }
 
@@ -448,8 +543,31 @@ impl Worker {
     fn spawn() -> Result<Worker, String> {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let mut command = Command::new(exe);
+        command.arg("--js-worker");
+        let mut worker = Worker::spawn_command(command)?;
+        // The worker announces its confinement before it serves requests.
+        let hello = worker.await_hello(WORKER_STARTUP_TIMEOUT)?;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            let landlock = hello
+                .get("landlock")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if landlock == "fully enforced" || cfg!(not(target_os = "linux")) {
+                tracing::info!("js worker confinement: landlock {landlock}");
+            } else {
+                tracing::warn!(
+                    "js worker confinement: landlock {landlock}; relying on seccomp and rlimits"
+                );
+            }
+        });
+        Ok(worker)
+    }
+
+    /// Start `command` as a worker: cleared environment, `/` cwd, piped
+    /// stdin/stdout and the resource limits.
+    fn spawn_command(mut command: Command) -> Result<Worker, String> {
         command
-            .arg("--js-worker")
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::piped())
@@ -491,8 +609,14 @@ impl Worker {
                     let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &files);
                     #[cfg(target_os = "linux")]
                     {
+                        // No PR_SET_PDEATHSIG: it fires when the *thread*
+                        // that forked exits, and pool workers are forked from
+                        // blocking-pool threads that exit when idle. The
+                        // parent holds the only write end of the worker's
+                        // stdin, so its death closes the pipe and the worker
+                        // exits on EOF (a request in flight ends at its own
+                        // deadline, then hits EOF or a closed stdout).
                         let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                        let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                     }
                     Ok(())
                 });
@@ -514,6 +638,32 @@ impl Worker {
             stdout: BufReader::new(stdout),
             pid,
         })
+    }
+
+    /// Read the hello frame, killing the worker if it does not arrive within
+    /// `timeout`.
+    fn await_hello(&mut self, timeout: Duration) -> Result<Value, String> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let pid = self.pid;
+        let watchdog = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        });
+        let hello = read_frame(&mut self.stdout);
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
+        match hello {
+            Ok(Some(body)) => serde_json::from_slice(&body)
+                .map_err(|error| format!("worker hello: {error}"))
+                .inspect_err(|_| self.kill()),
+            _ => {
+                self.kill();
+                Err("worker did not start".to_string())
+            }
+        }
     }
 
     fn request(&mut self, body: &[u8], timeout: Duration) -> Result<WorkerOutcome, WorkerError> {
@@ -701,11 +851,14 @@ pub fn process_request(
 }
 
 /// Entry point for the hidden `--js-worker` mode. Frames on stdin/stdout.
-pub fn run_worker_stdio() -> Result<(), String> {
+pub fn run_worker_stdio(landlock: &str) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
+    let hello =
+        serde_json::to_vec(&json!({"landlock": landlock})).map_err(|error| error.to_string())?;
+    write_frame(&mut output, &hello)?;
     loop {
         let Some(body) = read_frame(&mut input)? else {
             return Ok(());
@@ -752,12 +905,25 @@ fn handle_worker_request(request: Value) -> Value {
             crate::view::run_map_json(source, &docs, limits).map(|rows| json!(rows))
         }
         Some("reduce") => {
-            let keys: Vec<Value> =
-                serde_json::from_value(request.get("keys").cloned().unwrap_or_default())
-                    .unwrap_or_default();
-            let values: Vec<Value> =
-                serde_json::from_value(request.get("values").cloned().unwrap_or_default())
-                    .unwrap_or_default();
+            // A rereduce carries null keys (CouchDB passes null, not []).
+            let keys: Vec<Value> = match request.get("keys") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(keys) => match serde_json::from_value(keys.clone()) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        return json!({"ok": false, "error": format!("reduce keys: {error}")})
+                    }
+                },
+            };
+            let values: Vec<Value> = match request.get("values") {
+                Some(values) => match serde_json::from_value(values.clone()) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        return json!({"ok": false, "error": format!("reduce values: {error}")})
+                    }
+                },
+                None => return json!({"ok": false, "error": "reduce values are missing"}),
+            };
             let rereduce = request
                 .get("rereduce")
                 .and_then(Value::as_bool)
@@ -789,7 +955,230 @@ fn handle_worker_request(request: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use sha2::{Digest, Sha256};
+
+    fn wasmi_map(source: &str, limits: crate::view::ViewLimits) -> Result<Value, String> {
+        let body = serde_json::to_vec(&json!({
+            "kind": "map",
+            "source": source,
+            "docs": [["d0", "{\"_id\":\"d0\"}"]],
+            "timeout_ms": limits.timeout.as_millis() as u64,
+            "memory": limits.memory,
+        }))
+        .expect("body");
+        wasmi_request(&body, limits)
+    }
+
+    #[test]
+    fn wasmi_enforces_the_view_memory_limit() {
+        let limits = crate::view::ViewLimits {
+            timeout: Duration::from_secs(20),
+            memory: 16 * 1024 * 1024,
+        };
+        // Within the limit.
+        let small = "function(doc){ emit('x'.repeat(2 * 1024 * 1024).length, null); }";
+        wasmi_map(small, limits).expect("a small allocation fits");
+        // Far over the limit, but under the 128 MiB cap the host used to apply
+        // whatever the configured limit was.
+        let large = "function(doc){ emit('x'.repeat(48 * 1024 * 1024).length, null); }";
+        let error = wasmi_map(large, limits).expect_err("48 MiB must exceed a 16 MiB limit");
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn wasmi_timeout_is_wall_clock() {
+        let limits = crate::view::ViewLimits {
+            timeout: Duration::from_millis(150),
+            memory: 64 * 1024 * 1024,
+        };
+        let started = Instant::now();
+        let error = wasmi_map("function(doc){ while (true) {} }", limits)
+            .expect_err("an endless loop must be stopped");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "deadline overshoot: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_worker_outlives_the_thread_that_spawned_it() {
+        // Pool workers are spawned from whichever thread needs one, which may
+        // be a blocking-pool thread that exits when idle. `cat` stands in for
+        // the worker: it only ends when its stdin closes.
+        let mut worker = std::thread::spawn(|| Worker::spawn_command(Command::new("cat")))
+            .join()
+            .expect("spawning thread")
+            .expect("spawn");
+        std::thread::sleep(Duration::from_millis(300));
+        let exited = worker.child.try_wait().expect("try_wait");
+        worker.kill();
+        assert!(
+            exited.is_none(),
+            "the worker died with its spawning thread: {exited:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_never_announces_itself_is_killed() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut worker = Worker::spawn_command(command).expect("spawn");
+        let started = Instant::now();
+        let error = worker
+            .await_hello(Duration::from_millis(300))
+            .expect_err("no hello was sent");
+        assert!(error.contains("did not start"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn worker_reduce_rejects_malformed_keys_and_values() {
+        let reduce = |keys: Value, values: Value, rereduce: bool| {
+            handle_worker_request(json!({
+                "kind": "reduce",
+                "source": "function(keys, values, rereduce){ return sum(values); }",
+                "keys": keys,
+                "values": values,
+                "rereduce": rereduce,
+            }))
+        };
+        let ok = reduce(json!([[1, "a"]]), json!([3]), false);
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["value"], 3);
+        // A rereduce carries null keys.
+        let ok = reduce(Value::Null, json!([1, 2]), true);
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["value"], 3);
+
+        for (keys, values) in [
+            (json!("nope"), json!([1])),
+            (json!({"a": 1}), json!([1])),
+            (json!([]), json!("nope")),
+            (json!([]), Value::Null),
+            (json!([[1, "a"]]), json!({"a": 1})),
+        ] {
+            let bad = reduce(keys.clone(), values.clone(), false);
+            assert_eq!(bad["ok"], false, "keys {keys} values {values}: {bad}");
+            assert!(bad["error"].is_string(), "{bad}");
+        }
+        let missing = handle_worker_request(
+            json!({"kind": "reduce", "source": "function(k, v, r){ return 1; }"}),
+        );
+        assert_eq!(missing["ok"], false, "{missing}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn errno_after(result: libc::c_long) -> i32 {
+        if result == -1 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Runs in a child process (see the test below): installs the filter and
+    /// prints the errno of each probe. Every probe is harmless when allowed:
+    /// signal 0, nonexistent paths, an invalid fd or a zero-sized argument.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_probe_child() {
+        if std::env::var_os("DOUCHDB_SECCOMP_PROBE").is_none() {
+            return;
+        }
+        install_seccomp().expect("install seccomp");
+        let parent = unsafe { libc::getppid() } as libc::c_long;
+        let me = unsafe { libc::getpid() } as libc::c_long;
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let path = c"/nonexistent-douchdb/a".as_ptr();
+        let other = c"/nonexistent-douchdb/b".as_ptr();
+        let at = libc::AT_FDCWD as libc::c_long;
+        let probes: Vec<(&str, i32)> = unsafe {
+            vec![
+                (
+                    "tgkill_parent",
+                    errno_after(libc::syscall(libc::SYS_tgkill, parent, parent, 0)),
+                ),
+                (
+                    "tkill_parent",
+                    errno_after(libc::syscall(libc::SYS_tkill, parent, 0)),
+                ),
+                (
+                    "pidfd_send_signal",
+                    errno_after(libc::syscall(libc::SYS_pidfd_send_signal, -1, 0, 0, 0)),
+                ),
+                ("clone3", errno_after(libc::syscall(libc::SYS_clone3, 0, 0))),
+                (
+                    "linkat",
+                    errno_after(libc::syscall(libc::SYS_linkat, at, path, at, other, 0)),
+                ),
+                (
+                    "renameat2",
+                    errno_after(libc::syscall(libc::SYS_renameat2, at, path, at, other, 0)),
+                ),
+                (
+                    "symlinkat",
+                    errno_after(libc::syscall(libc::SYS_symlinkat, path, at, other)),
+                ),
+                (
+                    "fchmodat",
+                    errno_after(libc::syscall(libc::SYS_fchmodat, at, path, 0o600)),
+                ),
+                (
+                    "fchownat",
+                    errno_after(libc::syscall(libc::SYS_fchownat, at, path, 0, 0, 0)),
+                ),
+                (
+                    "mknodat",
+                    errno_after(libc::syscall(libc::SYS_mknodat, at, path, 0o600, 0)),
+                ),
+                (
+                    "openat",
+                    errno_after(libc::syscall(libc::SYS_openat, at, path, 0, 0)),
+                ),
+                // Control: the worker may signal itself (abort).
+                (
+                    "tgkill_self",
+                    errno_after(libc::syscall(libc::SYS_tgkill, me, tid, 0)),
+                ),
+            ]
+        };
+        for (name, errno) in probes {
+            println!("\nprobe:{name}={errno}");
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denies_signals_namespaces_and_filesystem_mutation() {
+        let output = Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--exact",
+                "js::tests::seccomp_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("DOUCHDB_SECCOMP_PROBE", "1")
+            .output()
+            .expect("run probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let probes: std::collections::BTreeMap<&str, i32> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("probe:")?.split_once('='))
+            .filter_map(|(name, errno)| Some((name, errno.parse().ok()?)))
+            .collect();
+        assert!(!probes.is_empty(), "probe child failed: {output:?}");
+        for (name, errno) in &probes {
+            if *name == "tgkill_self" {
+                assert_eq!(*errno, 0, "the worker must be able to signal itself");
+            } else {
+                assert_eq!(*errno, libc::EPERM, "{name} is not denied: {probes:?}");
+            }
+        }
+    }
 
     #[test]
     fn wasm_runner_matches_the_checked_in_checksum() {
