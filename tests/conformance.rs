@@ -10299,6 +10299,45 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
 }
 
 #[tokio::test]
+async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
+    // CouchDB takes the row id from the stored document, not from the object
+    // the map function was handed (couch_mrview_updater).
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsmutid{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/p1"), json!({"v": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/v"),
+                json!({"views": {
+                    "changed": {"map": "function(doc){ doc._id = 'other'; emit(doc.v, null); }"},
+                    "deleted": {"map": "function(doc){ delete doc._id; emit(doc.v, null); }"}
+                }}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        for view in ["changed", "deleted"] {
+            let (status, body) = s
+                .get(&format!("/{db}/_design/v/_view/{view}?reduce=false"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{mode} {view}: {body}");
+            assert_eq!(
+                body["rows"].as_array().map(Vec::len),
+                Some(1),
+                "{mode} {view}: {body}"
+            );
+            assert_eq!(body["rows"][0]["id"], "p1", "{mode} {view}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn pooled_process_worker_keeps_no_js_state_between_databases() {
     // One worker serves both databases. CouchDB keeps JS processes alive
     // between requests and tags them per database (couch_proc_manager); here

@@ -1071,6 +1071,54 @@ mod tests {
         assert_eq!(missing["ok"], false, "{missing}");
     }
 
+    #[test]
+    fn wasm_reduce_rejects_malformed_keys_and_values() {
+        let limits = crate::view::ViewLimits {
+            timeout: Duration::from_secs(60),
+            memory: 64 * 1024 * 1024,
+        };
+        let reduce = |keys: Option<Value>, values: Option<Value>, rereduce: bool| {
+            let mut request = serde_json::Map::new();
+            request.insert(
+                "source".into(),
+                json!("function(k, v, r){ return sum(v); }"),
+            );
+            request.insert("rereduce".into(), json!(rereduce));
+            if let Some(keys) = keys {
+                request.insert("keys".into(), keys);
+            }
+            if let Some(values) = values {
+                request.insert("values".into(), values);
+            }
+            wasm_request("reduce", Value::Object(request), limits)
+        };
+        assert_eq!(
+            reduce(Some(json!([[1, "a"]])), Some(json!([3])), false).expect("valid reduce"),
+            json!(3)
+        );
+        // A rereduce carries null keys.
+        assert_eq!(
+            reduce(Some(Value::Null), Some(json!([1, 2])), true).expect("rereduce"),
+            json!(3)
+        );
+        for (keys, values) in [
+            (json!("nope"), json!([1])),
+            (json!({"a": 1}), json!([1])),
+            (json!([]), json!("nope")),
+            (json!([]), Value::Null),
+            (json!([[1, "a"]]), json!({"a": 1})),
+        ] {
+            let error = reduce(Some(keys.clone()), Some(values.clone()), false)
+                .expect_err(&format!("keys {keys} values {values} must be rejected"));
+            assert!(
+                error.contains("reduce keys") || error.contains("reduce values"),
+                "{error}"
+            );
+        }
+        let error = reduce(None, None, false).expect_err("missing values");
+        assert!(error.contains("reduce values are missing"), "{error}");
+    }
+
     #[cfg(target_os = "linux")]
     fn errno_after(result: libc::c_long) -> i32 {
         if result == -1 {
