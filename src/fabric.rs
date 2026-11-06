@@ -1105,6 +1105,8 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
 
     if let Some(keys) = &opts.keys {
         let mut key_opts = opts.clone();
+        // Only string keys name a document; the rest answer `not_found` here.
+        key_opts.keys = Some(keys.iter().filter(|key| key.is_string()).cloned().collect());
         key_opts.skip = 0;
         key_opts.limit = usize::MAX;
         key_opts.startkey = None;
@@ -1139,20 +1141,20 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
             }
         }
 
-        let ordered_keys: Vec<&String> = if opts.descending {
+        let ordered_keys: Vec<&Value> = if opts.descending {
             keys.iter().rev().collect()
         } else {
             keys.iter().collect()
         };
         let mut rows = Vec::new();
         for key in ordered_keys.into_iter().skip(opts.skip).take(opts.limit) {
-            if let Some(row) = found.get(key).cloned() {
-                rows.push(row);
-            } else if let Some(row) = errors.get(key).cloned() {
-                rows.push(row);
-            } else {
-                rows.push(json!({"key": key, "error": "not_found"}));
-            }
+            let row = key
+                .as_str()
+                .and_then(|name| found.get(name).or_else(|| errors.get(name)));
+            rows.push(
+                row.cloned()
+                    .unwrap_or_else(|| json!({"key": key, "error": "not_found"})),
+            );
         }
         return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
     }

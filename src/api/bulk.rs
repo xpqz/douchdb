@@ -508,11 +508,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
     } else if let Some(raw) = q.get("keys") {
         match serde_json::from_str::<Value>(raw) {
             Ok(Value::Array(keys)) => {
-                opts.keys = Some(
-                    keys.into_iter()
-                        .filter_map(|key| key.as_str().map(str::to_string))
-                        .collect(),
-                );
+                opts.keys = Some(keys);
             }
             Ok(_) => return fail(ApiError::bad_request("`keys` parameter must be an array.")),
             Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
@@ -530,11 +526,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
                         "`keys` body member must be an array.",
                     ));
                 };
-                opts.keys = Some(
-                    keys.iter()
-                        .filter_map(|k| k.as_str().map(str::to_string))
-                        .collect(),
-                );
+                opts.keys = Some(keys.clone());
             }
         }
         if value

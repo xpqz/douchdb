@@ -1323,7 +1323,7 @@ impl Db {
     async fn all_docs_by_keys(
         &self,
         opts: &AllDocsOpts,
-        keys: &[String],
+        keys: &[Value],
         owned: Option<&[bool]>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
@@ -1352,12 +1352,12 @@ impl Db {
             }
         }
 
-        let ordered_keys: Vec<String> = if opts.descending {
+        let ordered_keys: Vec<Value> = if opts.descending {
             keys.iter().rev().cloned().collect()
         } else {
             keys.to_vec()
         };
-        let page: Vec<String> = ordered_keys
+        let page: Vec<Value> = ordered_keys
             .iter()
             .skip(opts.skip)
             .take(opts.limit)
@@ -1369,6 +1369,12 @@ impl Db {
             included.fill(true);
         }
         for (slot, key) in page.iter().enumerate() {
+            // CouchDB answers a key that is not a string with a `not_found`
+            // row; it names no document on any shard.
+            let Some(key) = key.as_str() else {
+                included[slot] = true;
+                continue;
+            };
             if let Some(partition) = &opts.partition {
                 if !key.starts_with(&format!("{partition}:")) {
                     continue;
@@ -1382,7 +1388,7 @@ impl Db {
                 continue;
             }
             included[slot] = true;
-            grouped[shard].push((slot, key.clone()));
+            grouped[shard].push((slot, key.to_string()));
         }
 
         let mut results: Vec<Option<Value>> = vec![None; page.len()];
@@ -2689,7 +2695,7 @@ pub struct AllDocsOpts {
     pub include_docs: bool,
     pub conflicts: bool,
     pub attachments: bool,
-    pub keys: Option<Vec<String>>,
+    pub keys: Option<Vec<Value>>,
     pub startkey: Option<String>,
     pub endkey: Option<String>,
     pub descending: bool,
