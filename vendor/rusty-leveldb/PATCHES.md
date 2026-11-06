@@ -29,6 +29,16 @@ that are exposed by large bulk imports and changes-feed reads:
    their blocks are not checksummed; a corrupt filter could otherwise hide a
    present key. The filter reader also validates offsets defensively.
 
+4. **Neighbouring tombstone read as a deletion.** `Version::get` looks a key up
+   in each table that covers its range and receives the next entry at or after
+   it. Upstream treated any `TypeDeletion` entry as proof that the looked-up
+   key was deleted without comparing user keys, so a table that covered the key
+   but did not contain it, followed by a tombstone for a different key, made
+   the key read as missing even though an older table held it. The deletion
+   branch now requires the found user key to equal the looked-up one, as the
+   value branch already did. Regression test:
+   `db_impl::tests::test_db_impl_get_ignores_neighbouring_tombstone`.
+
 `src/cache.rs` also has regression tests for duplicate-key replacement, list/
 map/forward-chain/back-link invariants under random LRU operations, and dropping
 a 100,000-node cache on a 64 KiB stack. The cache tests pass in debug and

@@ -1379,4 +1379,55 @@ mod scan_tests {
             ["_design/v"]
         );
     }
+
+    /// Updates delete the previous sequence entry. Once memtables have rolled
+    /// over, a newer table can hold a sequence tombstone right after a
+    /// metadata key range that does not contain a given document; that must
+    /// not make the document disappear from point reads.
+    #[test]
+    fn point_reads_survive_updates_across_memtable_rollovers() {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-rollover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let ids: Vec<String> = (0..40).map(|n| format!("doc{n:02}")).collect();
+        let mut seqs = vec![0u64; ids.len()];
+        let mut seq = 0u64;
+
+        for round in 0..8usize {
+            let mut tx = Tx::new();
+            for (n, id) in ids.iter().enumerate() {
+                // Round 0 creates everything; later rounds update a rotating
+                // subset of the low ids, so newer tables cover the range of
+                // the untouched high ids without containing them.
+                if round > 0 && (n >= 20 || (n + round) % 3 != 0) {
+                    continue;
+                }
+                seq += 1;
+                if seqs[n] != 0 {
+                    tx.delete(&seq_key(seqs[n]));
+                }
+                tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
+                tx.put(&seq_key(seq), id.as_bytes());
+                seqs[n] = seq;
+            }
+            shard.commit_at(tx, Some(seq)).unwrap();
+            shard.flush_pending().unwrap();
+            // Roll the memtable over into a table without compacting the
+            // existing ones (the range lies beyond every key in the shard).
+            shard.db.compact_range(b"\xfe", b"\xff").unwrap();
+        }
+
+        for (n, id) in ids.iter().enumerate() {
+            let found = shard.get_meta(id).unwrap();
+            assert_eq!(found.map(|m| m.seq), Some(seqs[n]), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
