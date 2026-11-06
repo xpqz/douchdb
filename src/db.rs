@@ -3113,6 +3113,112 @@ mod tests {
         (db, root)
     }
 
+    async fn stored_bodies(db: &Db, revs: Vec<String>) -> Vec<bool> {
+        db.shards[0]
+            .call(move |shard| {
+                let mut out = Vec::new();
+                for rev in &revs {
+                    out.push(shard.get_body("a", rev)?.is_some());
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
+        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "stem",
+            DbConfig {
+                q: 1,
+                revs_limit: 2,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut revs = Vec::new();
+        for n in 0..4 {
+            let mut doc = json!({"_id": "a", "n": n});
+            if let Some(rev) = revs.last() {
+                doc["_rev"] = json!(rev);
+            }
+            let put = db.put_docs(vec![doc], true).await.unwrap();
+            revs.push(put[0]["rev"].as_str().unwrap().to_string());
+        }
+        assert_eq!(stored_bodies(&db, revs.clone()).await, [true; 4]);
+        db.compact().await.unwrap();
+        assert_eq!(
+            stored_bodies(&db, revs).await,
+            [false, false, false, true],
+            "stemmed and superseded bodies go, the leaf stays"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn replicated_writes_do_not_keep_attachments_for_stemmed_revisions() {
+        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "stematts",
+            DbConfig {
+                q: 1,
+                revs_limit: 2,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (1..=5).map(|n| format!("{n:032x}")).collect();
+        for n in 1..=5usize {
+            let chain: Vec<&String> = ids[..n].iter().rev().collect();
+            let rev = format!("{n}-{}", ids[n - 1]);
+            let doc = json!({
+                "_id": "a",
+                "_rev": rev,
+                "_revisions": {"start": n, "ids": chain},
+            });
+            db.put_docs(vec![doc], false).await.unwrap();
+            // The public write path rejects attachments, so plant one on each
+            // revision the way older data may carry them.
+            db.shards[0]
+                .call(move |shard| {
+                    let mut meta = shard.get_meta("a")?.unwrap();
+                    meta.atts.insert(
+                        rev,
+                        vec![(
+                            "f".to_string(),
+                            AttMeta {
+                                content_type: "text/plain".into(),
+                                digest: "5d41402abc4b2a76b9719d911017c592".into(),
+                                length: 5,
+                                revpos: n as u64,
+                            },
+                        )],
+                    );
+                    shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let meta = db.shards[0]
+            .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(meta.tree.edges.len(), 2);
+        let kept: Vec<&String> = meta.atts.keys().collect();
+        let tree: Vec<&String> = meta.tree.edges.keys().collect();
+        assert_eq!(kept, tree, "atts only for revisions still in the tree");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_missing_attachment_chunk_fails_the_read() {
         let (db, root) = single_shard_db("att-chunk").await;
