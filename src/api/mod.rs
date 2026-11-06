@@ -123,6 +123,14 @@ pub(crate) fn json(status: StatusCode, value: Value) -> Response {
 }
 
 pub(crate) fn fail(e: ApiError) -> Response {
+    if e.status >= 500 {
+        tracing::error!(
+            status = e.status,
+            "request failed: {}: {}",
+            e.error,
+            e.reason
+        );
+    }
     json(
         StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         e.body(),
