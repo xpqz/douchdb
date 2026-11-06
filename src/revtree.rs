@@ -89,9 +89,14 @@ impl RevTree {
     /// CouchDB's rule: non-deleted beats deleted, then higher position, then
     /// greater revision id.
     pub fn winner(&self) -> Option<String> {
+        self.winner_among(self.leaves())
+    }
+
+    /// The winner of a set of leaves under the same rule.
+    pub fn winner_among(&self, leaves: Vec<String>) -> Option<String> {
         // A leaf that does not parse (a corrupt on-disk tree) cannot win; it
         // is skipped rather than allowed to crash the caller.
-        self.leaves()
+        leaves
             .into_iter()
             .filter_map(|rev| {
                 let parsed = Rev::parse(&rev)?;

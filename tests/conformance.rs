@@ -1409,6 +1409,14 @@ async fn latest_returns_every_leaf_below_the_requested_revision() {
     let mut expected = vec![left_rev, right_rev];
     expected.sort();
     assert_eq!(revs, expected, "every leaf below the revision: {body}");
+
+    // A single `rev` resolves to the winning leaf among the descendants.
+    let winner = expected.iter().max().cloned().unwrap();
+    let (status, body) = s
+        .get(&format!("/latestfork/doc?rev={root_rev}&latest=true"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], winner);
 }
 
 #[tokio::test]
@@ -2572,20 +2580,30 @@ async fn local_docs_and_revs_limit() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["rev"], "0-2");
-    // CouchDB's update_local_docs answers 409 unless the supplied revision is
-    // the current one (or absent for a new document).
-    let (status, _) = s
-        .put("/local/_local/checkpoint", json!({"seq": 9, "_rev": "0-1"}))
-        .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let (status, _) = s.put("/local/_local/checkpoint", json!({"seq": 9})).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let (status, _) = s
-        .put("/local/_local/fresh", json!({"seq": 1, "_rev": "0-3"}))
-        .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let (_, body) = s.get("/local/_local/checkpoint").await;
-    assert_eq!(body["seq"], 8);
+    // Local writes never conflict (CouchDB 3.5): the new revision is the
+    // supplied `_rev` number plus one, whatever is stored.
+    let (status, body) = s.put("/local/_local/loose", json!({})).await;
+    assert_eq!((status, &body["rev"]), (StatusCode::CREATED, &json!("0-1")));
+    let (status, body) = s.put("/local/_local/loose", json!({})).await;
+    assert_eq!((status, &body["rev"]), (StatusCode::CREATED, &json!("0-1")));
+    let (status, body) = s.put("/local/_local/loose", json!({"_rev": "0-1"})).await;
+    assert_eq!((status, &body["rev"]), (StatusCode::CREATED, &json!("0-2")));
+    let (status, body) = s.put("/local/_local/loose", json!({"_rev": "0-1"})).await;
+    assert_eq!((status, &body["rev"]), (StatusCode::CREATED, &json!("0-2")));
+    let (status, body) = s.put("/local/_local/loose", json!({"_rev": "abc"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(body["reason"], "Invalid rev format");
+
+    let (status, body) = s.delete("/local/_local/loose").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({"ok": true, "id": "_local/loose", "rev": "0-0"})
+    );
+    let (status, body) = s.delete("/local/_local/loose").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["reason"], "missing");
     let (status, _) = s.delete("/local/_local/checkpoint").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = s.get("/local/_local/checkpoint").await;

@@ -1707,17 +1707,9 @@ impl Db {
         self.shards[0]
             .call(move |s| {
                 let key = local_key(&id);
-                let existing = s
-                    .get(&key)
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-                let current = existing
-                    .as_ref()
-                    .and_then(|v| v.get("_rev").and_then(Value::as_str))
-                    .and_then(|r| r.strip_prefix("0-"))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(0);
-                // couch_db_updater:update_local_docs/2 only accepts a write
-                // whose revision is the stored one (0 for a new document).
+                // CouchDB (couch_db_updater:update_local_docs/2) numbers a
+                // local write from the supplied `_rev`, absent meaning 0, and
+                // never conflicts: the stored revision is not consulted.
                 let supplied = match body.get("_rev") {
                     None => 0,
                     Some(rev) => rev
@@ -1726,10 +1718,7 @@ impl Db {
                         .and_then(|n| n.parse::<u64>().ok())
                         .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
                 };
-                if supplied != current {
-                    return Err(ApiError::conflict());
-                }
-                let next = current + 1;
+                let next = supplied.saturating_add(1);
                 let rev = format!("0-{next}");
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert("_id".into(), json!(format!("_local/{id}")));
@@ -1747,6 +1736,9 @@ impl Db {
         let id = id.to_string();
         self.shards[0]
             .call(move |s| {
+                if s.get(&local_key(&id)).is_none() {
+                    return Err(ApiError::not_found("missing"));
+                }
                 let mut tx = Tx::new();
                 tx.delete(&local_key(&id));
                 s.commit(tx)?;
@@ -2578,7 +2570,9 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
         Some(r) => {
             let r = canonical_rev(r);
             if opts.latest {
-                meta.tree.leaves_from(&r).into_iter().next().unwrap_or(r)
+                meta.tree
+                    .winner_among(meta.tree.leaves_from(&r))
+                    .unwrap_or(r)
             } else {
                 r
             }
