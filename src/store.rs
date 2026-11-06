@@ -327,6 +327,11 @@ pub struct Shard {
     /// would, after the queued operations have been drained.
     #[cfg(test)]
     fail_next_flush: bool,
+    /// Set when a flush failed and the shard was reset to its on-disk state.
+    /// A flush can run inside a job (`flush`, `compact`), where the error
+    /// reaches only that job's caller; the group commit still has to fail
+    /// every other job whose queued writes were discarded with it.
+    flush_failure: Option<String>,
 }
 
 fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
@@ -440,6 +445,7 @@ impl Shard {
             overlay: std::collections::HashMap::new(),
             #[cfg(test)]
             fail_next_flush: false,
+            flush_failure: None,
         })
     }
 
@@ -988,11 +994,51 @@ impl Shard {
             }
         }
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_flush) {
-            anyhow::bail!("injected write failure");
+        let injected = std::mem::take(&mut self.fail_next_flush);
+        #[cfg(not(test))]
+        let injected = false;
+        let written = if injected {
+            Err(anyhow::anyhow!("injected write failure"))
+        } else {
+            self.db
+                .write(batch, true)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        };
+        if let Err(error) = written {
+            // The queued operations are gone, so nothing in memory may still
+            // reflect them.
+            let message = match self.restore_from_disk() {
+                Ok(()) => error.to_string(),
+                Err(restore) => format!("{error}; could not restore shard state: {restore}"),
+            };
+            self.flush_failure = Some(message.clone());
+            anyhow::bail!(message);
         }
-        self.db.write(batch, true)?;
         self.overlay.clear();
+        Ok(())
+    }
+
+    /// Error from a flush that failed since the last call, if any.
+    fn take_flush_failure(&mut self) -> Option<String> {
+        self.flush_failure.take()
+    }
+
+    /// Reset the in-memory state to what is on disk after a failed write: the
+    /// overlay and counters described operations that never happened, and the
+    /// lazily built indexes were updated alongside them.
+    ///
+    /// The shared committed-sequence tracker is left alone. It only moves
+    /// forward and readers may already have passed the lost sequences; those
+    /// are now gaps, which `_changes` tolerates (every update already leaves
+    /// one) and which keep `reserved == committed`, so no watermark stalls.
+    fn restore_from_disk(&mut self) -> Result<()> {
+        self.pending.clear();
+        self.overlay.clear();
+        self.live = None;
+        self.latest = None;
+        self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
+        self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
+        self.deleted = read_counter(&mut self.db, b"z/doc_deleted_count")?.unwrap_or(0);
         Ok(())
     }
 
@@ -1110,7 +1156,8 @@ impl ShardHandle {
                         Err(_) => break,
                     }
                 }
-                let flush_error = shard.flush_pending().err().map(|e| e.to_string());
+                let _ = shard.flush_pending();
+                let flush_error = shard.take_flush_failure();
                 for ack in acks {
                     ack(flush_error.clone());
                 }
@@ -1161,11 +1208,6 @@ impl ShardHandle {
                 Ok(result) => result,
                 Err(payload) => {
                     shard.rollback_to(mark);
-                    // The job may have reserved a sequence it will never
-                    // commit. Count it as committed so the changes watermark
-                    // does not wait on it forever; the write was discarded, so
-                    // this only leaves a gap in the sequence numbers.
-                    seq_tracker.fetch_max(reserved_seq.load(Ordering::SeqCst), Ordering::SeqCst);
                     let reason = payload
                         .downcast_ref::<&str>()
                         .map(|s| s.to_string())
@@ -1178,6 +1220,12 @@ impl ShardHandle {
                     ))
                 }
             };
+            // The job is over, so any sequence it reserved but did not commit
+            // (it panicked, or returned an error after allocating) never
+            // will be. Count it as committed so the changes watermark does not
+            // wait on it forever; this only leaves a gap in the sequence
+            // numbers.
+            seq_tracker.fetch_max(reserved_seq.load(Ordering::SeqCst), Ordering::SeqCst);
             Box::new(move |flush_error: Option<String>| {
                 let result = match flush_error {
                     Some(message) => Err(ApiError::new(500, "internal_server_error", message)),
