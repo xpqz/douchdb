@@ -127,7 +127,15 @@ impl Server {
     }
 
     /// Restart this node on the same port and data directory.
+    /// Stop this node (if it is still running) and start a fresh process on
+    /// the same port and data dir, with a new client so no pooled connection
+    /// to the old process is reused.
     fn restart(&mut self) {
+        self.kill();
+        self.client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{}", self.port))
@@ -1730,6 +1738,125 @@ async fn percent_encoded_slash_in_database_names() {
 
     let (status, _) = s.delete("/encoded%2Fdb").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// Stop the server for good, then start it again on the same data directory.
+/// `restart` alone leaves the old process running, and the pooled HTTP
+/// connections point at it, so a test of what a fresh process reads from disk
+/// needs both the kill and a new client.
+/// A name containing '/' is a database like any other: it is listed in
+/// `_all_dbs` (sorted by name as CouchDB does) and is reopened after a restart.
+#[tokio::test]
+async fn slash_database_is_listed_and_survives_restart() {
+    let mut s = Server::start(false);
+    for name in [
+        "slash%2Fplain",
+        "slash%2Fa%2Fb",
+        "slash%2B%24%28%29",
+        "slashz",
+    ] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+    }
+    let (status, body) = s.put("/slash%2Fa%2Fb/doc", json!({"v": 7})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let listed = |body: &Value| -> Vec<String> {
+        body.as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|n| n.as_str())
+            .filter(|n| n.starts_with("slash"))
+            .map(str::to_string)
+            .collect()
+    };
+    let expected = ["slash+$()", "slash/a/b", "slash/plain", "slashz"];
+    let (_, body) = s.get("/_all_dbs").await;
+    assert_eq!(listed(&body), expected, "{body}");
+
+    s.restart();
+    let (_, body) = s.get("/_all_dbs").await;
+    assert_eq!(listed(&body), expected, "after restart: {body}");
+    let (status, body) = s.get("/slash%2Fa%2Fb/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 7);
+    let (status, body) = s.get("/slash%2B%24%28%29").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["db_name"], "slash+$()");
+}
+
+/// Databases "a" and "a/b" are independent: neither shares a directory with
+/// the other, and each can be deleted and recreated without touching the other.
+#[tokio::test]
+async fn slash_database_and_parent_name_coexist() {
+    let mut s = Server::start(false);
+    let (status, body) = s.put("/coex%2Fb", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    s.put("/coex%2Fb/doc", json!({"v": "child"})).await;
+    let (status, body) = s.put("/coex", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    s.put("/coex/doc", json!({"v": "parent"})).await;
+
+    let (status, _) = s.delete("/coex").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s.get("/coex%2Fb/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], "child");
+    let (status, _) = s.get("/coex").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = s.put("/coex", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    s.put("/coex/doc", json!({"v": "parent2"})).await;
+    let (status, _) = s.delete("/coex%2Fb").await;
+    assert_eq!(status, StatusCode::OK);
+    s.restart();
+    let (status, body) = s.get("/coex/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], "parent2");
+    let (status, _) = s.get("/coex%2Fb").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A data directory written by an older version keeps "a/b" at `a/b/`. On
+/// startup it is moved to its flat directory, once, and the parent database
+/// "a" that shared the tree is left intact.
+#[tokio::test]
+async fn nested_slash_database_directories_are_migrated_on_startup() {
+    let mut s = Server::start(false);
+    // The database name is not stored in the directory, so flat databases can
+    // be moved into the old nested layout while the server is stopped.
+    for name in ["mig", "migb", "migc"] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        s.put(&format!("/{name}/doc"), json!({"v": name})).await;
+    }
+    s.kill();
+    std::fs::rename(s.dir.join("migb"), s.dir.join("mig").join("b")).expect("nest b");
+    std::fs::rename(s.dir.join("migc"), s.dir.join("mig/b/c")).expect("nest c");
+
+    s.restart();
+    let (_, body) = s.get("/_all_dbs").await;
+    let listed: Vec<&str> = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|n| n.as_str())
+        .filter(|n| n.starts_with("mig"))
+        .collect();
+    assert_eq!(listed, ["mig", "mig/b", "mig/b/c"], "{body}");
+    for (name, value) in [("mig", "mig"), ("mig%2Fb", "migb"), ("mig%2Fb%2Fc", "migc")] {
+        let (status, body) = s.get(&format!("/{name}/doc")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["v"], value);
+    }
+    assert!(!s.dir.join("mig/b").exists(), "old nested dir left behind");
+    assert!(s.dir.join("mig%2Fb").join("db.json").is_file());
+
+    // A second startup has nothing left to move.
+    s.restart();
+    let (status, body) = s.get("/mig%2Fb%2Fc/doc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -5927,6 +6054,8 @@ async fn cluster_internal_requests_encode_db_names_and_doc_ids() {
             node.base
         );
         assert_eq!(body["db_name"], "a/b");
+        let (_, listed) = node.get("/_all_dbs").await;
+        assert!(listed.to_string().contains("\"a/b\""), "{listed}");
     }
 
     let ids = ["q?x=1", "h#frag", "100%", "a%2Fb", "p/q", "plain"];
