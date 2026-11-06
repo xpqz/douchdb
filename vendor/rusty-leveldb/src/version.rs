@@ -93,8 +93,11 @@ impl Version {
                             && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
                         {
                             return Ok(Some((v, stats)));
-                        } else if typ == ValueType::TypeDeletion {
-                            // Skip looking once we have found a deletion.
+                        } else if typ == ValueType::TypeDeletion
+                            && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
+                        {
+                            // Skip looking once we have found a deletion of this key. A
+                            // tombstone for a neighbouring key says nothing about it.
                             return Ok(None);
                         }
                     }
