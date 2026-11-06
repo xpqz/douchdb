@@ -45,7 +45,7 @@ pub fn parse_args() -> Args {
         revs_limit: 1000,
         admin: None,
         users_file: None,
-        session_secret: String::new(),
+        session_secret: std::env::var("DOUCHDB_SESSION_SECRET").unwrap_or_default(),
         default_security: String::new(),
         max_in_flight: 64,
         per_user_in_flight: 16,

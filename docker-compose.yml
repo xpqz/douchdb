@@ -6,6 +6,11 @@ x-douchdb: &douchdb
   restart: unless-stopped
   environment:
     DOUCHDB_CLUSTER_SECRET: ${DOUCHDB_CLUSTER_SECRET:-dev-cluster-secret-please-change}
+    # Session cookies must verify on every node behind the proxy, so all nodes
+    # share one key. Like the admin password this default is public: override
+    # it for anything beyond a local demo. It is deliberately not derived from
+    # the cluster secret.
+    DOUCHDB_SESSION_SECRET: ${DOUCHDB_SESSION_SECRET:-dev-session-secret-please-change}
     # Keep the demo responsive; production defaults are 60s/5s.
     OTEL_METRIC_EXPORT_INTERVAL: "5000"
     OTEL_BSP_SCHEDULE_DELAY: "1000"

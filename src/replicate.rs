@@ -537,7 +537,7 @@ mod tests {
             n: 1,
             secret: "test-secret".to_string(),
         };
-        let auth = Auth::new("node".to_string(), "pw".to_string());
+        let auth = Auth::new("node".to_string(), "pw".to_string(), b"k".to_vec());
         pull(&db, &peer, &reqwest::Client::new(), &cluster, Some(&auth))
             .await
             .expect("pull");

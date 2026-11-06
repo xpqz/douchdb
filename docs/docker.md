@@ -48,6 +48,10 @@ anything beyond a local demo:
 DOUCHDB_CLUSTER_SECRET='replace-with-a-long-random-secret' docker compose up --build -d
 ```
 
+Session cookies are signed with `DOUCHDB_SESSION_SECRET` (default
+`dev-session-secret-please-change`, shared by all three nodes so a login works
+behind the proxy); override it the same way as the cluster secret.
+
 The admin password is set in the compose commands. Change it in
 `docker-compose.yml` before exposing the stack.
 

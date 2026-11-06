@@ -40,18 +40,18 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut buf = [0u8; 32];
-    let mut seed = format!("{now}{:p}", &now as *const _);
-    for (i, slot) in buf.iter_mut().enumerate() {
-        *slot = seed.as_bytes()[i % seed.len()];
-        seed.push(((i as u8) ^ 0x5a) as char);
+    hex(&random_bytes::<16>())
+}
+
+/// Bytes from the operating system's CSPRNG. The generator failing means the
+/// platform cannot provide randomness at all, which nothing here can recover
+/// from; carrying on with predictable ids or keys would be worse.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    if let Err(error) = getrandom::fill(&mut buf) {
+        panic!("operating system random number generator failed: {error}");
     }
-    hex(&Md5::digest(buf))
+    buf
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3170,6 +3170,17 @@ fn collect_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uuids_do_not_repeat_in_a_tight_loop() {
+        let ids: std::collections::HashSet<String> = (0..100_000).map(|_| uuid()).collect();
+        assert_eq!(ids.len(), 100_000);
+        assert!(
+            ids.iter()
+                .all(|id| id.len() == 32
+                    && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        );
+    }
 
     fn doc_id_for_shard(db: &Db, shard: usize) -> String {
         (0..10_000)

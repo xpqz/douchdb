@@ -56,14 +56,18 @@ TLS in front of DouchDB because tokens are bearer secrets.
 
 Session cookies are signed with, in order:
 
-1. `--session-secret`, if set;
-2. the cluster secret plus a `:session` suffix, if clustered;
-3. the admin credentials, if only `--admin` is used;
-4. a random per-process secret.
+1. `--session-secret` (or `DOUCHDB_SESSION_SECRET`), if set;
+2. a random secret generated on first start and kept in
+   `<data>/.session-secret` (owner-readable only), reused across restarts, as
+   CouchDB keeps `couch_httpd_auth/secret`.
 
-Set `--session-secret` explicitly when running multiple nodes or restarting a
-node and expecting existing cookies to remain valid. Logout is client-side only;
-the cookie is stateless, as in CouchDB.
+The key is never derived from the admin credentials, which would let anyone
+holding a cookie brute-force the password offline, and never from the cluster
+secret, which is often a shared or documented default. Nodes therefore do not
+share a key unless you set the same `--session-secret` on every node; a cookie
+only works on the node that issued it otherwise (a warning is logged at start
+for clustered nodes). Logout is client-side only; the cookie is stateless, as in
+CouchDB.
 
 ## `_security`
 
@@ -205,8 +209,8 @@ surface and avoids pretending that a local file edit propagates across a cluster
   object, so a peer that was offline, restored or added later converges. The
   write returns 200 once a majority holds it and 202 when it does not yet, in
   which case it is still kept and delivered when the peers return.
-- Set the same `--session-secret` (or cluster secret) on every node if session
-  cookies should work across nodes.
+- Set the same `--session-secret` on every node if session cookies should work
+  across nodes. The cluster secret is not used for sessions.
 - Admission is local to each node.
 
 ## Contract tests
