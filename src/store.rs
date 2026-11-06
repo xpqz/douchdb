@@ -354,6 +354,16 @@ fn db_get_checked(db: &mut DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(value.map(|bytes| bytes.to_vec()))
 }
 
+/// Decode a stored metadata record. A record that does not parse is
+/// corruption and must fail the caller, not vanish from the result.
+fn parse_meta(key: &[u8], value: &[u8]) -> Result<(String, DocMeta)> {
+    let id = key.get(2..).and_then(|id| std::str::from_utf8(id).ok());
+    let id = id.ok_or_else(|| anyhow::anyhow!("corrupt metadata key {key:?}: not UTF-8"))?;
+    let meta = serde_json::from_slice(value)
+        .map_err(|error| anyhow::anyhow!("corrupt metadata for {id}: {error}"))?;
+    Ok((id.to_string(), meta))
+}
+
 fn read_counter(db: &mut DB, key: &[u8]) -> Result<Option<u64>> {
     Ok(db_get_checked(db, key)?
         .filter(|bytes| bytes.len() == 8)
@@ -414,12 +424,11 @@ impl Shard {
                     if !key.starts_with(b"m/") {
                         break;
                     }
-                    if let Ok(meta) = serde_json::from_slice::<DocMeta>(&value) {
-                        match meta_state(&meta) {
-                            Some((_, true, _)) => docs += 1,
-                            Some((_, false, _)) => deleted += 1,
-                            None => {}
-                        }
+                    let (_, meta) = parse_meta(&key, &value)?;
+                    match meta_state(&meta) {
+                        Some((_, true, _)) => docs += 1,
+                        Some((_, false, _)) => deleted += 1,
+                        None => {}
                     }
                     if !iter.advance() {
                         break;
@@ -452,6 +461,20 @@ impl Shard {
     #[cfg(test)]
     pub(crate) fn inject_flush_failure(&mut self) {
         self.fail_next_flush = true;
+    }
+
+    /// Write a record straight to disk, bypassing the overlay, counters and
+    /// indexes, so tests can plant corrupt or missing data.
+    #[cfg(test)]
+    pub(crate) fn put_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.db.put(key, value).unwrap();
+        self.db.flush().unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_raw(&mut self, key: &[u8]) {
+        self.db.delete(key).unwrap();
+        self.db.flush().unwrap();
     }
 
     pub fn seq(&self) -> u64 {
@@ -560,19 +583,32 @@ impl Shard {
         let prefix = format!("m/{partition}:");
         let mut docs = 0u64;
         let mut deleted = 0u64;
-        self.scan_range_while(prefix.as_bytes(), None, false, |_, value| {
-            if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
-                if let Some((_, live, _)) = meta_state(&meta) {
-                    if live {
-                        docs += 1;
-                    } else {
-                        deleted += 1;
+        let mut failure = None;
+        self.scan_range_while(
+            prefix.as_bytes(),
+            None,
+            false,
+            |key, value| match parse_meta(key, value) {
+                Ok((_, meta)) => {
+                    if let Some((_, live, _)) = meta_state(&meta) {
+                        if live {
+                            docs += 1;
+                        } else {
+                            deleted += 1;
+                        }
                     }
+                    true
                 }
-            }
-            true
-        })?;
-        Ok((docs, deleted))
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            },
+        )?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok((docs, deleted)),
+        }
     }
 
     /// Sorted live document ids and their winning revisions. The index is
@@ -580,24 +616,32 @@ impl Shard {
     pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {
         if self.live.is_none() {
             let mut live = BTreeMap::new();
+            let mut failure = None;
             // `scan_range_while` merges the uncommitted overlay, so a read in
             // the same group commit sees writes queued before it.
             self.scan_range_while(b"m/", None, false, |key, value| {
-                if let Ok(id) = std::str::from_utf8(&key[2..]) {
-                    if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
+                match parse_meta(key, value) {
+                    Ok((id, meta)) => {
                         if let Some((rev, true, has_attachments)) = meta_state(&meta) {
                             live.insert(
-                                id.to_string(),
+                                id,
                                 LiveDoc {
                                     rev,
                                     has_attachments,
                                 },
                             );
                         }
+                        true
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        false
                     }
                 }
-                true
             })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
             self.live = Some(live);
         }
         Ok(self.live.as_ref().expect("live index initialized"))
@@ -608,14 +652,22 @@ impl Shard {
     pub fn latest_changes(&mut self) -> Result<&LatestChanges> {
         if self.latest.is_none() {
             let mut latest = LatestChanges::default();
+            let mut failure = None;
             self.scan_range_while(b"m/", None, false, |key, value| {
-                if let Ok(id) = std::str::from_utf8(&key[2..]) {
-                    if let Ok(meta) = serde_json::from_slice::<DocMeta>(value) {
-                        latest.insert(id.to_string(), meta.seq);
+                match parse_meta(key, value) {
+                    Ok((id, meta)) => {
+                        latest.insert(id, meta.seq);
+                        true
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        false
                     }
                 }
-                true
             })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
             self.latest = Some(latest);
         }
         Ok(self.latest.as_ref().expect("latest changes initialized"))
@@ -660,16 +712,9 @@ impl Shard {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(value) = self.overlay.get(key) {
-            return value.clone();
-        }
-        self.db.get(key).map(|b| b.to_vec())
-    }
-
-    /// Like `get`, but surfaces LevelDB I/O and checksum errors instead of
-    /// turning them into `None`. Document reads use this so corruption is a
-    /// 500, never a silent 404.
+    /// Read a key, merging the uncommitted overlay. LevelDB I/O and checksum
+    /// errors surface as errors instead of turning into `None`, so corruption
+    /// is a 500, never a silent 404. Every read goes through here.
     pub fn get_checked(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(value) = self.overlay.get(key) {
             return Ok(value.clone());
@@ -880,6 +925,38 @@ impl Shard {
     /// The operations are queued rather than written: the shard actor merges
     /// everything queued while it drains its mailbox into one synced batch.
     pub fn commit_at(&mut self, mut tx: Tx, seq: Option<u64>) -> Result<()> {
+        // Read every old record before changing anything, so a read or decode
+        // error leaves the shard exactly as it was. Earlier operations in this
+        // same transaction count as the old value, so batched updates to one
+        // document still produce one final delta.
+        let mut written: std::collections::HashMap<&[u8], &Option<Vec<u8>>> =
+            std::collections::HashMap::new();
+        let mut states = Vec::with_capacity(tx.ops.len() + 1);
+        for (key, value) in &tx.ops {
+            if key.starts_with(b"m/") {
+                let old = match written.get(key.as_slice()) {
+                    Some(earlier) => (*earlier).clone(),
+                    None => self.get_checked(key)?,
+                };
+                let old = match old {
+                    Some(bytes) => Some(parse_meta(key, &bytes)?.1),
+                    None => None,
+                };
+                let new = match value {
+                    Some(bytes) => Some(parse_meta(key, bytes)?.1),
+                    None => None,
+                };
+                states.push(Some((
+                    old.as_ref().and_then(meta_state),
+                    new.as_ref().and_then(meta_state),
+                )));
+            } else {
+                states.push(None);
+            }
+            written.insert(key.as_slice(), value);
+        }
+        drop(written);
+
         if let Some(seq) = seq {
             self.seq = seq;
         }
@@ -888,22 +965,12 @@ impl Shard {
         }
         tx.ops
             .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
+        states.push(None);
 
         let mut docs = self.docs as i64;
         let mut deleted = self.deleted as i64;
-        for (key, value) in tx.ops {
-            if key.starts_with(b"m/") {
-                // `get` includes earlier operations in this same transaction,
-                // so batched updates to one document still produce one final
-                // delta.
-                let old = self
-                    .get(&key)
-                    .and_then(|bytes| serde_json::from_slice::<DocMeta>(&bytes).ok());
-                let new = value
-                    .as_ref()
-                    .and_then(|bytes| serde_json::from_slice::<DocMeta>(bytes).ok());
-                let old_state = old.as_ref().and_then(meta_state);
-                let new_state = new.as_ref().and_then(meta_state);
+        for ((key, value), state) in tx.ops.into_iter().zip(states) {
+            if let Some((old_state, new_state)) = state {
                 match old_state.as_ref().map(|(_, live, _)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
@@ -1372,7 +1439,7 @@ mod panic_tests {
             .unwrap();
         assert!(handle.call(put(b"k/two")).await.is_err());
         let seen = handle
-            .call(|shard| Ok((shard.get(b"k/one"), shard.get(b"k/two"))))
+            .call(|shard| Ok((shard.get_checked(b"k/one")?, shard.get_checked(b"k/two")?)))
             .await
             .unwrap();
         assert_eq!(seen, (Some(b"v".to_vec()), None));
@@ -1406,7 +1473,10 @@ mod panic_tests {
             .call(|shard| shard.compact().map_err(ApiError::from))
             .await
             .unwrap();
-        let value = handle.call(|shard| Ok(shard.get(b"x/a"))).await.unwrap();
+        let value = handle
+            .call(|shard| Ok(shard.get_checked(b"x/a")?))
+            .await
+            .unwrap();
         assert_eq!(value.as_deref(), Some(b"v".as_slice()));
     }
 
@@ -1426,7 +1496,10 @@ mod panic_tests {
         drop(handle);
         // No waiting: the LevelDB LOCK must already be released.
         let mut reopened = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(reopened.get(b"x/kept").as_deref(), Some(b"v".as_slice()));
+        assert_eq!(
+            reopened.get_checked(b"x/kept").unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
         drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1443,7 +1516,12 @@ mod panic_tests {
             .await;
         assert!(result.is_err());
         let (before, partial) = handle
-            .call(|shard| Ok((shard.get(b"x/before"), shard.get(b"x/partial"))))
+            .call(|shard| {
+                Ok((
+                    shard.get_checked(b"x/before")?,
+                    shard.get_checked(b"x/partial")?,
+                ))
+            })
             .await
             .unwrap();
         assert_eq!(before.as_deref(), Some(b"v".as_slice()));
@@ -1529,7 +1607,10 @@ mod scan_tests {
         shard.inject_flush_failure();
         assert!(shard.flush_pending().is_err());
 
-        assert!(shard.get(&meta_key("b")).is_none(), "unwritten doc visible");
+        assert!(
+            shard.get_checked(&meta_key("b")).unwrap().is_none(),
+            "unwritten doc visible"
+        );
         assert_eq!(shard.counts(), (1, 0));
         assert_eq!(shard.seq(), 1);
         assert_eq!(live_ids(&mut shard), vec!["a"]);
@@ -1625,6 +1706,50 @@ mod scan_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn corrupt_metadata_is_an_error_not_a_missing_document() {
+        let dir = temp_shard_dir("corrupt-meta");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.put_raw(&meta_key("p:bad"), b"{not json");
+
+        assert!(shard.live_docs().is_err(), "live index skipped the record");
+        assert!(
+            shard.latest_changes().is_err(),
+            "changes skipped the record"
+        );
+        assert!(shard.partition_counts("p").is_err());
+        assert!(shard.fingerprint().is_err());
+
+        // Overwriting a record that cannot be parsed would make the counters
+        // guess what it used to be.
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("p:bad"), &meta(false, 2)).unwrap();
+        assert!(shard.commit_at(tx, Some(2)).is_err());
+        assert_eq!(shard.counts(), (1, 0));
+        assert_eq!(shard.seq(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counter_backfill_fails_on_corrupt_metadata() {
+        let dir = temp_shard_dir("corrupt-backfill");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.put_raw(&meta_key("p:bad"), b"{not json");
+        shard.delete_raw(b"z/doc_count");
+        shard.delete_raw(b"z/doc_deleted_count");
+        drop(shard);
+        assert!(Shard::open(&dir, 1000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn live_ids(shard: &mut Shard) -> Vec<String> {
         shard.live_docs().unwrap().keys().cloned().collect()
     }
@@ -1684,13 +1809,13 @@ mod scan_tests {
         // every scan below has to interleave the two sources.
         let mut tx = Tx::new();
         for id in ["a", "c", "e"] {
-            tx.put(&meta_key(id), id.as_bytes());
+            tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
         }
         shard.commit_at(tx, Some(1)).unwrap();
         shard.flush_pending().unwrap();
         let mut tx = Tx::new();
         for id in ["b", "d"] {
-            tx.put(&meta_key(id), id.as_bytes());
+            tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
         }
         shard.commit_at(tx, Some(2)).unwrap();
 
