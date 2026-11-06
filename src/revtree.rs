@@ -4,17 +4,77 @@
 //! `child -> parent` edges plus a set of tombstones. Leaves are revisions with
 //! no children, and everything the API needs (conflicts, `_revisions`,
 //! `_revs_info`, winner) is derived from that.
+//!
+//! The leaf set is kept alongside the edges and updated as revisions are
+//! merged, pruned or purged, so asking for leaves, the winner or whether a
+//! revision is a leaf does not rescan every edge. Only the edges and the
+//! tombstones are stored; the leaf set is rebuilt when a tree is loaded, so
+//! the on-disk shape is the one older builds wrote and can read.
 
 use crate::rev::Rev;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(from = "StoredTree")]
 pub struct RevTree {
     /// Every known revision maps to its parent, or `None` for a root.
-    pub edges: BTreeMap<String, Option<String>>,
+    edges: BTreeMap<String, Option<String>>,
     /// Leaf revisions written as tombstones.
-    pub deleted: BTreeSet<String>,
+    deleted: BTreeSet<String>,
+    /// Revisions with no children: the keys of `edges` that are nobody's
+    /// parent. Always derivable from `edges`.
+    leaves: BTreeSet<String>,
+    /// Parent references to revisions that are not in `edges`. A well-formed
+    /// tree has none; a damaged stored one may, and merging such a revision
+    /// back in must not make it look like a leaf. May hold stale entries,
+    /// which are re-checked before use.
+    dangling: BTreeSet<String>,
+}
+
+/// The stored shape of a tree, unchanged from when the fields were public.
+#[derive(Deserialize)]
+struct StoredTree {
+    edges: BTreeMap<String, Option<String>>,
+    deleted: BTreeSet<String>,
+}
+
+impl From<StoredTree> for RevTree {
+    fn from(stored: StoredTree) -> Self {
+        let parents: HashSet<&str> = stored
+            .edges
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let leaves = stored
+            .edges
+            .keys()
+            .filter(|rev| !parents.contains(rev.as_str()))
+            .cloned()
+            .collect();
+        let dangling = parents
+            .into_iter()
+            .filter(|parent| !stored.edges.contains_key(*parent))
+            .map(|parent| parent.to_string())
+            .collect();
+        RevTree {
+            edges: stored.edges,
+            deleted: stored.deleted,
+            leaves,
+            dangling,
+        }
+    }
+}
+
+impl Serialize for RevTree {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("RevTree", 2)?;
+        out.serialize_field("edges", &self.edges)?;
+        out.serialize_field("deleted", &self.deleted)?;
+        out.end()
+    }
 }
 
 impl RevTree {
@@ -29,13 +89,22 @@ impl RevTree {
             .position(|rev| self.edges.contains_key(&rev.to_string()))
             .unwrap_or(0);
         for i in start..path.len() {
-            let rev = &path[i];
+            let rev = path[i].to_string();
+            if self.edges.contains_key(&rev) {
+                continue;
+            }
             let parent = if i == 0 {
                 None
             } else {
                 Some(path[i - 1].to_string())
             };
-            self.edges.entry(rev.to_string()).or_insert(parent);
+            if let Some(parent) = &parent {
+                self.leaves.remove(parent);
+            }
+            if !self.has_child(&rev) {
+                self.leaves.insert(rev.clone());
+            }
+            self.edges.insert(rev, parent);
         }
         if let Some(leaf) = path.last() {
             if deleted {
@@ -44,17 +113,43 @@ impl RevTree {
         }
     }
 
+    /// Whether some revision already names `rev` as its parent. Only a
+    /// damaged tree can have such a revision before `rev` is known, so the
+    /// scan runs only then.
+    fn has_child(&self, rev: &str) -> bool {
+        self.dangling.contains(rev) && self.edges.values().flatten().any(|parent| parent == rev)
+    }
+
+    /// Whether the revision is known to the tree.
+    pub fn contains(&self, rev: &str) -> bool {
+        self.edges.contains_key(rev)
+    }
+
+    /// The number of revisions in the tree.
+    pub fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    /// Every known revision, in string order.
+    pub fn revs(&self) -> impl Iterator<Item = &String> {
+        self.edges.keys()
+    }
+
+    /// The parent of a revision; `None` for a root or an unknown revision.
+    pub fn parent(&self, rev: &str) -> Option<&str> {
+        self.edges.get(rev)?.as_deref()
+    }
+
     pub fn leaves(&self) -> Vec<String> {
-        let parents: BTreeSet<&String> = self.edges.values().flatten().collect();
-        self.edges
-            .keys()
-            .filter(|rev| !parents.contains(rev))
-            .cloned()
-            .collect()
+        self.leaves.iter().cloned().collect()
     }
 
     pub fn is_leaf(&self, rev: &str) -> bool {
-        self.edges.contains_key(rev) && !self.edges.values().flatten().any(|p| p == rev)
+        self.leaves.contains(rev)
     }
 
     /// Every leaf at or below a revision. CouchDB's `latest=true` returns all
@@ -64,22 +159,36 @@ impl RevTree {
         if !self.edges.contains_key(rev) {
             return Vec::new();
         }
-        let mut children: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
-        for (child, parent) in &self.edges {
-            if let Some(parent) = parent {
-                children.entry(parent.as_str()).or_default().push(child);
+        // Walk each leaf up towards the root, remembering what every revision
+        // on the way led to so shared ancestors are visited once. The length
+        // bound only matters for a damaged tree whose parent links loop.
+        let mut reaches: HashMap<&str, bool> = HashMap::from([(rev, true)]);
+        let mut chain: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for leaf in &self.leaves {
+            chain.clear();
+            let mut current = Some(leaf.as_str());
+            let found = loop {
+                match current {
+                    Some(node) => match reaches.get(node) {
+                        Some(&known) => break known,
+                        None if chain.len() > self.edges.len() => break false,
+                        None => {
+                            chain.push(node);
+                            current = self.parent(node);
+                        }
+                    },
+                    None => break false,
+                }
+            };
+            for node in chain.drain(..) {
+                reaches.insert(node, found);
+            }
+            if found {
+                out.push(leaf.clone());
             }
         }
-        let mut leaves = Vec::new();
-        let mut pending = vec![rev];
-        while let Some(current) = pending.pop() {
-            match children.get(current) {
-                Some(kids) => pending.extend(kids.iter().map(|kid| kid.as_str())),
-                None => leaves.push(current.to_string()),
-            }
-        }
-        leaves.sort();
-        leaves
+        out
     }
 
     pub fn is_deleted(&self, rev: &str) -> bool {
@@ -89,18 +198,23 @@ impl RevTree {
     /// CouchDB's rule: non-deleted beats deleted, then higher position, then
     /// greater revision id.
     pub fn winner(&self) -> Option<String> {
-        self.winner_among(self.leaves())
+        self.best(self.leaves.iter().map(String::as_str))
+            .map(str::to_string)
     }
 
     /// The winner of a set of leaves under the same rule.
     pub fn winner_among(&self, leaves: Vec<String>) -> Option<String> {
+        self.best(leaves.iter().map(String::as_str))
+            .map(str::to_string)
+    }
+
+    fn best<'a>(&self, leaves: impl Iterator<Item = &'a str>) -> Option<&'a str> {
         // A leaf that does not parse (a corrupt on-disk tree) cannot win; it
         // is skipped rather than allowed to crash the caller.
         leaves
-            .into_iter()
             .filter_map(|rev| {
-                let parsed = Rev::parse(&rev)?;
-                Some(((!self.is_deleted(&rev), parsed.pos, parsed.id), rev))
+                let parsed = Rev::parse(rev)?;
+                Some(((!self.is_deleted(rev), parsed.pos, parsed.id), rev))
             })
             .max_by(|a, b| a.0.cmp(&b.0))
             .map(|(_, rev)| rev)
@@ -108,9 +222,10 @@ impl RevTree {
 
     pub fn conflicts(&self, winner: &str) -> Vec<String> {
         let mut out: Vec<String> = self
-            .leaves()
-            .into_iter()
-            .filter(|rev| rev != winner && !self.is_deleted(rev))
+            .leaves
+            .iter()
+            .filter(|rev| *rev != winner && !self.is_deleted(rev))
+            .cloned()
             .collect();
         self.sort_leaves_descending(&mut out);
         out
@@ -118,9 +233,10 @@ impl RevTree {
 
     pub fn deleted_conflicts(&self, winner: &str) -> Vec<String> {
         let mut out: Vec<String> = self
-            .leaves()
-            .into_iter()
-            .filter(|rev| rev != winner && self.is_deleted(rev))
+            .leaves
+            .iter()
+            .filter(|rev| *rev != winner && self.is_deleted(rev))
+            .cloned()
             .collect();
         self.sort_leaves_descending(&mut out);
         out
@@ -161,10 +277,18 @@ impl RevTree {
         let mut current = rev.to_string();
         loop {
             let parent = self.edges.remove(&current).flatten();
+            self.leaves.remove(&current);
             self.deleted.remove(&current);
             removed.push(current);
             match parent {
-                Some(parent) if self.is_leaf(&parent) => current = parent,
+                // The parent becomes a leaf when this was its last child.
+                Some(parent)
+                    if self.edges.contains_key(&parent)
+                        && !self.edges.values().flatten().any(|p| *p == parent) =>
+                {
+                    self.leaves.insert(parent.clone());
+                    current = parent;
+                }
                 _ => return removed,
             }
         }
@@ -175,12 +299,11 @@ impl RevTree {
     /// are retained once; a revision whose parent was pruned becomes a root.
     pub fn prune(&mut self, limit: u64) {
         let limit = limit.max(1) as usize;
-        let leaves = self.leaves();
-        if leaves.is_empty() {
+        if self.leaves.is_empty() {
             return;
         }
         let mut keep: BTreeSet<String> = BTreeSet::new();
-        for leaf in &leaves {
+        for leaf in &self.leaves {
             let path = self.path(leaf);
             let start = path.len().saturating_sub(limit);
             for rev in &path[start..] {
@@ -188,16 +311,8 @@ impl RevTree {
             }
         }
 
-        let dead: Vec<String> = self
-            .edges
-            .keys()
-            .filter(|rev| !keep.contains(*rev))
-            .cloned()
-            .collect();
-        for rev in &dead {
-            self.edges.remove(rev);
-        }
-        let known: BTreeSet<String> = self.edges.keys().cloned().collect();
+        self.edges.retain(|rev, _| keep.contains(rev));
+        let known = &self.edges.keys().cloned().collect::<BTreeSet<String>>();
         for parent in self.edges.values_mut() {
             let missing = parent
                 .as_ref()
@@ -208,6 +323,9 @@ impl RevTree {
             }
         }
         self.deleted.retain(|rev| keep.contains(rev));
+        // Every kept revision keeps the child on its way to a kept leaf, so
+        // the leaves are unchanged, and no parent link dangles any more.
+        self.dangling.clear();
     }
 }
 
@@ -227,11 +345,14 @@ mod tests {
     fn winner_ignores_an_unparsable_leaf() {
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("1-{}", id(1))), false);
-        tree.edges.insert("garbage".to_string(), None);
+        let stored = serde_json::to_string(&tree).unwrap();
+        let stored = stored.replace("\"edges\":{", "\"edges\":{\"garbage\":null,");
+        let tree: RevTree = serde_json::from_str(&stored).unwrap();
+        assert_eq!(tree.leaves().len(), 2);
         assert_eq!(tree.winner().unwrap(), format!("1-{}", id(1)));
 
-        let mut only_bad = RevTree::default();
-        only_bad.edges.insert("garbage".to_string(), None);
+        let only_bad: RevTree =
+            serde_json::from_str(r#"{"edges":{"garbage":null},"deleted":[]}"#).unwrap();
         assert_eq!(only_bad.winner(), None);
     }
 

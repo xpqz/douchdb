@@ -31,8 +31,8 @@ MUTATIONS = [
     (
         "winner prefers deleted revisions",
         "src/revtree.rs",
-        "                Some(((!self.is_deleted(&rev), parsed.pos, parsed.id), rev))",
-        "                Some(((self.is_deleted(&rev), parsed.pos, parsed.id), rev))",
+        "                Some(((!self.is_deleted(rev), parsed.pos, parsed.id), rev))",
+        "                Some(((self.is_deleted(rev), parsed.pos, parsed.id), rev))",
         ["cargo", "test", "--locked", "--lib", "conflicting_branches_both_remain"],
     ),
     (

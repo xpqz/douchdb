@@ -1875,7 +1875,7 @@ impl Db {
                     let mut missing = Vec::new();
                     let mut ancestors: Vec<String> = Vec::new();
                     for rev in &wanted {
-                        if !tree.edges.contains_key(rev) {
+                        if !tree.contains(rev) {
                             missing.push(rev.clone());
                             if let Some(parsed) = Rev::parse(rev) {
                                 for leaf in tree.leaves() {
@@ -2121,7 +2121,7 @@ impl Db {
                         removed.push(rev.clone());
                     }
                     if !removed.is_empty() {
-                        if meta.tree.edges.is_empty() {
+                        if meta.tree.is_empty() {
                             tx.delete(&meta_key(&id2));
                             if meta.seq != 0 {
                                 tx.delete(&seq_key(meta.seq));
@@ -2459,7 +2459,7 @@ fn put_many(
     let limit = shard.revs_limit();
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
-        meta.atts.retain(|rev, _| meta.tree.edges.contains_key(rev));
+        meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = serde_json::to_vec(meta) {
             ops.push((meta_key(id), Some(bytes)));
         }
@@ -2542,7 +2542,7 @@ impl Stage<'_> {
                 if Rev::parse(&rev).is_none() {
                     return Err(ApiError::bad_request("Invalid rev format"));
                 }
-                if !meta.tree.edges.contains_key(&rev) || !meta.tree.is_leaf(&rev) {
+                if !meta.tree.contains(&rev) || !meta.tree.is_leaf(&rev) {
                     return Err(ApiError::conflict());
                 }
                 if meta.tree.is_deleted(&rev) {
@@ -2625,18 +2625,15 @@ impl Stage<'_> {
             .cloned()
             .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
 
-        let known = meta.tree.edges.contains_key(&rev);
+        let known = meta.tree.contains(&rev);
         if known && meta.atts.contains_key(&rev) && attachments.is_none() {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
 
         let parent = meta
             .tree
-            .edges
-            .get(&rev)
-            .cloned()
-            .flatten()
-            .and_then(|p| meta.atts.get(&p).cloned())
+            .parent(&rev)
+            .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
         let fallback = all_atts(&meta);
         let mut atts =
@@ -3052,7 +3049,7 @@ fn read_doc_rev(
     rev: &str,
     opts: &DocOpts,
 ) -> DbResult<Value> {
-    if !meta.tree.edges.contains_key(rev) {
+    if !meta.tree.contains(rev) {
         return Err(ApiError::not_found("missing"));
     }
     let body = shard
@@ -3774,9 +3771,9 @@ mod tests {
             .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
             .await
             .unwrap();
-        assert_eq!(meta.tree.edges.len(), 2);
+        assert_eq!(meta.tree.len(), 2);
         let kept: Vec<&String> = meta.atts.keys().collect();
-        let tree: Vec<&String> = meta.tree.edges.keys().collect();
+        let tree: Vec<&String> = meta.tree.revs().collect();
         assert_eq!(kept, tree, "atts only for revisions still in the tree");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
