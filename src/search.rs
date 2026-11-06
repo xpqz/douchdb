@@ -283,12 +283,10 @@ fn infer_kinds<'a>(
 }
 
 fn write_meta(path: &Path, meta: &SearchMeta) -> DbResult<()> {
-    std::fs::write(
-        path.join("douchdb-search-meta.json"),
-        serde_json::to_vec(meta)
-            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?,
-    )
-    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))
+    let bytes = serde_json::to_vec(meta)
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    crate::db::write_atomic(&path.join("douchdb-search-meta.json"), &bytes)
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))
 }
 
 fn read_meta(path: &Path) -> Option<SearchMeta> {

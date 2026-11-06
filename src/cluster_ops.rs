@@ -71,11 +71,12 @@ pub(crate) async fn apply_shard_map(
         ));
     }
     let internal = is_forwarded(st, headers);
-    if !internal {
-        map.version = db.shard_map().version.saturating_add(1);
-    }
-    if !db.set_shard_map(map.clone())? {
-        return Err(shard_map_rejected());
+    if internal {
+        if !db.set_shard_map(map.clone())? {
+            return Err(shard_map_rejected());
+        }
+    } else {
+        map = db.set_next_shard_map(map)?;
     }
     if internal {
         db.clear_pending_shard_map();

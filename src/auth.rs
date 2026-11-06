@@ -102,7 +102,7 @@ pub fn session_secret(data: &Path, configured: &str) -> Result<Vec<u8>, String> 
             Err(error) => return Err(describe(error)),
         }
         let key = crate::db::random_bytes::<32>();
-        match create_private(&path, crate::db::hex(&key).as_bytes()) {
+        match crate::db::create_private_atomic(&path, crate::db::hex(&key).as_bytes()) {
             Ok(()) => return Ok(key.to_vec()),
             // Another process created it first; read theirs.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -126,21 +126,6 @@ fn decode_secret(text: &str) -> Result<Vec<u8>, String> {
         );
     }
     Ok(out)
-}
-
-/// Create `path` exclusively with owner-only permissions from the start.
-fn create_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
 }
 
 pub struct Auth {
