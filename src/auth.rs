@@ -583,4 +583,86 @@ mod tests {
         assert!(principal.admin);
         assert!(principal.has_role("_admin"));
     }
+
+    fn load(contents: &str) -> Result<Auth, String> {
+        let file =
+            std::env::temp_dir().join(format!("douchdb-auth-load-{}.json", crate::db::uuid()));
+        std::fs::write(&file, contents).unwrap();
+        let result = Auth::from_users_file(
+            Some(("admin".into(), "secret".into())),
+            &file,
+            b"session-secret".to_vec(),
+        );
+        let _ = std::fs::remove_file(&file);
+        result
+    }
+
+    #[test]
+    fn users_file_name_colliding_with_admin_is_rejected() {
+        let error = load(r#"{"users":[{"name":"admin","token":"long-enough-token"}]}"#)
+            .err()
+            .expect("collision must be an error");
+        assert!(error.contains("admin"), "{error}");
+        // A different name is fine.
+        assert!(
+            load(r#"{"users":[{"name":"administrator","token":"long-enough-token"}]}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_and_short_tokens_are_rejected_at_load() {
+        for entry in [
+            r#"{"name":"a","token":""}"#,
+            r#"{"name":"a","token":"short"}"#,
+            // SHA-256 of the empty string.
+            r#"{"name":"a","token_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#,
+        ] {
+            let contents = format!(r#"{{"users":[{entry}]}}"#);
+            assert!(load(&contents).is_err(), "accepted {entry}");
+        }
+        assert!(load(r#"{"users":[{"name":"a","token":"long-enough-token"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn empty_credentials_never_authenticate_even_if_an_entry_exists() {
+        let mut auth = Auth::new("admin".into(), String::new(), b"k".to_vec());
+        auth.users.push(User {
+            name: "empty".into(),
+            token: Some(String::new()),
+            token_sha256: Some(Sha256::digest(b"").into()),
+            roles: vec![],
+            admin: false,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(),
+        );
+        assert!(!auth.principal(&headers).is_authenticated());
+        let basic = |text: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(text)
+                )
+                .parse()
+                .unwrap(),
+            );
+            headers
+        };
+        for text in ["empty:", "admin:", ":", ""] {
+            assert!(
+                !auth.principal(&basic(text)).is_authenticated(),
+                "{text:?} authenticated"
+            );
+        }
+        assert!(auth.authenticate("empty", "").is_none());
+        assert!(auth.authenticate("admin", "").is_none());
+        assert!(auth.authenticate("", "").is_none());
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, "AuthSession=".parse().unwrap());
+        assert!(!auth.principal(&headers).is_authenticated());
+    }
 }

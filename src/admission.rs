@@ -330,4 +330,18 @@ mod tests {
         assert!(!bucket.try_take(start));
         assert!(bucket.try_take(start + std::time::Duration::from_secs(1)));
     }
+
+    #[test]
+    fn user_named_anonymous_does_not_share_the_anonymous_bucket() {
+        let admission = admission_with(8, 1, 1, 1);
+        let anonymous = Principal::default();
+        let named = principal("anonymous");
+        let held = admission.try_admit(&anonymous, Lane::Normal).unwrap();
+        assert_eq!(
+            admission.try_admit(&anonymous, Lane::Normal).unwrap_err(),
+            Denied::User
+        );
+        assert!(admission.try_admit(&named, Lane::Normal).is_ok());
+        drop(held);
+    }
 }
