@@ -123,10 +123,7 @@ impl Sketch {
         let mut sketch = Sketch::new();
         match bytes.split_first() {
             Some((&SPARSE, triples)) if triples.len() % 3 == 0 => {
-                for triple in triples.chunks_exact(3) {
-                    let &[high, low, rank] = triple else {
-                        return Err(bad());
-                    };
+                for &[high, low, rank] in triples.as_chunks::<3>().0 {
                     let index = usize::from(u16::from_be_bytes([high, low]));
                     *sketch.registers.get_mut(index).ok_or_else(bad)? = rank;
                 }
@@ -193,10 +190,10 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         message.push(0);
     }
     message.extend(((data.len() as u64) * 8).to_be_bytes());
-    for block in message.chunks_exact(64) {
+    for block in message.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
-        for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
-            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -222,8 +219,8 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         }
     }
     let mut digest = [0u8; 20];
-    for (out, word) in digest.chunks_exact_mut(4).zip(state) {
-        out.copy_from_slice(&word.to_be_bytes());
+    for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        *out = word.to_be_bytes();
     }
     digest
 }
