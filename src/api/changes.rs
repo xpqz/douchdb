@@ -2,16 +2,34 @@
 
 use super::*;
 
+/// `limit` for `_changes`, with CouchDB's own messages for a bad value.
+fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
+    let Some(raw) = q.get("limit") else {
+        return Ok(None);
+    };
+    match raw.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+        Ok(_) => Err(ApiError::bad_request(
+            "The limit value should be a non-negative integer",
+        )),
+        Err(_) => Err(ApiError::bad_request(
+            "The limit parameter should be a non-negative integer",
+        )),
+    }
+}
+
 pub(super) async fn changes(
     st: Arc<AppState>,
     db: Arc<Db>,
     dbname: &str,
     q: &HashMap<String, String>,
-    method: &Method,
     body: &[u8],
     headers: &HeaderMap,
 ) -> Response {
-    let _ = method;
+    let limit = match changes_limit(q) {
+        Ok(limit) => limit,
+        Err(error) => return fail(error),
+    };
     let local_only = is_forwarded(&st, headers);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
     // Resolve filters before a longpoll/continuous stream starts. A stream
@@ -33,7 +51,6 @@ pub(super) async fn changes(
         let mut query = q.clone();
         let body = Bytes::copy_from_slice(body);
         let headers = headers.clone();
-        let limit = num(q, "limit");
         let stream = async_stream::stream! {
             let started = std::time::Instant::now();
             let mut sent = 0usize;
@@ -453,7 +470,7 @@ async fn changes_options(
     };
     let opts = ChangesOpts {
         since,
-        limit: num(q, "limit"),
+        limit: changes_limit(q)?,
         include_docs: flag(q, "include_docs"),
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
         descending: flag(q, "descending"),

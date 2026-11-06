@@ -2974,6 +2974,202 @@ async fn compact_and_ensure_full_commit() {
     assert!(body["instance_start_time"].is_string());
 }
 
+/// CouchDB answers 405 with `Allow` and `{"error":"method_not_allowed",
+/// "reason":"Only POST allowed"}` for a wrong method on the POST-only
+/// endpoints (checked against CouchDB 3.5.3), instead of running the handler.
+#[tokio::test]
+async fn special_endpoints_reject_the_wrong_method() {
+    let s = Server::start(false);
+    s.fresh_db("methods").await;
+    let post_only = [
+        "_bulk_docs",
+        "_bulk_get",
+        "_revs_diff",
+        "_purge",
+        "_compact",
+        "_ensure_full_commit",
+        "_view_cleanup",
+        "_search_cleanup",
+    ];
+    for endpoint in post_only {
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let path = format!("/methods/{endpoint}");
+            let (status, headers, body) = s.req_headers(method.clone(), &path, None, &[]).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+            assert_eq!(headers.get("allow").map(String::as_str), Some("POST"));
+            assert_eq!(
+                body,
+                json!({"error": "method_not_allowed", "reason": "Only POST allowed"}),
+                "{method} {path}"
+            );
+        }
+    }
+    let (status, headers, _) = s
+        .req_headers(Method::HEAD, "/methods/_compact", None, &[])
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(headers.get("allow").map(String::as_str), Some("POST"));
+
+    // A PUT of a `_bulk_docs` body must not write anything.
+    let (status, _) = s
+        .put("/methods/_bulk_docs", json!({"docs": [{"_id": "x"}]}))
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, _) = s.get("/methods/x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for (method, path, allow) in [
+        (Method::PUT, "/methods/_changes", "GET,POST,HEAD"),
+        (Method::DELETE, "/methods/_all_docs", "GET,HEAD,POST"),
+        (Method::DELETE, "/methods/_revs_limit", "PUT,GET"),
+        (Method::DELETE, "/methods/_security", "PUT,GET"),
+    ] {
+        let (status, headers, body) = s.req_headers(method.clone(), path, None, &[]).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+        assert_eq!(headers.get("allow").map(String::as_str), Some(allow));
+        assert_eq!(
+            body,
+            json!({"error": "method_not_allowed", "reason": format!("Only {allow} allowed")})
+        );
+    }
+
+    // The methods CouchDB allows keep working.
+    let (status, _) = s.get("/methods/_changes").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.post("/methods/_changes", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.get("/methods/_all_docs").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.post("/methods/_all_docs", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Invalid parameters are 400s, not silently widened to "everything". The
+/// statuses and bodies below were taken from CouchDB 3.5.3.
+#[tokio::test]
+async fn invalid_query_parameters_are_rejected() {
+    let s = Server::start(false);
+    s.fresh_db("params").await;
+    let (status, _) = s
+        .put(
+            "/params/_design/v",
+            json!({"views": {"a": {"map": "function(d){emit(d._id,1)}"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s.put("/params/d1", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let int = |raw: &str| json!(format!("Invalid value for integer: \"{raw}\""));
+    let positive = |raw: &str| json!(format!("Invalid value for positive integer: \"{raw}\""));
+    for base in [
+        "/params/_all_docs",
+        "/params/_design/v/_view/a",
+        "/_all_dbs",
+    ] {
+        for (query, reason) in [
+            ("limit=abc", int("abc")),
+            ("limit=-1", positive("-1")),
+            ("skip=abc", int("abc")),
+            ("skip=-1", positive("-1")),
+        ] {
+            let (status, body) = s.get(&format!("{base}?{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{base}?{query}: {body}");
+            assert_eq!(body["error"], "query_parse_error", "{base}?{query}");
+            assert_eq!(body["reason"], reason, "{base}?{query}");
+        }
+        let (status, _) = s.get(&format!("{base}?limit=0")).await;
+        assert_eq!(status, StatusCode::OK, "{base}?limit=0");
+    }
+
+    // `_changes` uses its own messages.
+    let (status, body) = s.get("/params/_changes?limit=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(
+        body["reason"],
+        "The limit parameter should be a non-negative integer"
+    );
+    let (status, body) = s.get("/params/_changes?limit=-1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["reason"],
+        "The limit value should be a non-negative integer"
+    );
+
+    // Keys that are not a JSON array must not return the whole database.
+    let (status, body) = s.get("/params/_all_docs?keys=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "invalid UTF-8 JSON");
+    let (status, body) = s.get("/params/_all_docs?keys=%7B%22a%22%3A1%7D").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "`keys` parameter must be an array.");
+    let (status, body) = s.get("/params/_all_docs?keys=%5B%22d1%22%5D").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(1));
+
+    // Bad POST bodies.
+    for path in ["/params/_all_docs", "/params/_design/v/_view/a"] {
+        let (status, body) = s.post_raw(path, "not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "bad_request");
+        assert_eq!(body["reason"], "invalid UTF-8 JSON");
+        let (status, body) = s.post_raw(path, "[1]").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["reason"], "Request body must be a JSON object");
+        let (status, body) = s.post_raw(path, r#"{"limit":-1}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "query_parse_error");
+        assert_eq!(body["reason"], "Invalid value for positive integer: -1");
+        let (status, body) = s.post_raw(path, r#"{"keys":"a"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+    }
+    let (status, body) = s.post_raw("/params/_all_docs", r#"{"keys":"a"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["reason"], "`keys` body member must be an array.");
+
+    // `_revs_limit` takes a JSON integer; garbage must not reset it.
+    let (status, _) = s.put_raw("/params/_revs_limit", "12").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s.put_raw("/params/_revs_limit", "garbage").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "invalid UTF-8 JSON");
+    let (status, body) = s.put_raw("/params/_revs_limit", "0").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = s.get("/params/_revs_limit").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!(12));
+}
+
+/// `POST /db?batch=ok` answers 202 with no rev (CouchDB 3.5.3); a malformed
+/// `_rev` is a 400 `Invalid rev format` for POST and DELETE, not a 409.
+#[tokio::test]
+async fn doc_writes_map_errors_to_their_status() {
+    let s = Server::start(false);
+    s.fresh_db("results").await;
+    let (status, body) = s.post("/results?batch=ok", json!({"_id": "b1"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "b1"}));
+
+    let (status, body) = s.put("/results/d1", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .post("/results", json!({"_id": "d1", "_rev": "garbage"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(body["reason"], "Invalid rev format");
+    let (status, body) = s.delete("/results/d1?rev=garbage").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "Invalid rev format");
+
+    // A real conflict stays a 409.
+    let (status, body) = s.post("/results", json!({"_id": "d1"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = s.delete("/results/d1?rev=1-abc").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
 #[tokio::test]
 async fn rejects_unknown_special_members_like_couchdb() {
     let s = Server::start(false);
@@ -3065,6 +3261,17 @@ async fn auth_basic_session_cookie_and_unauthorized_shape() {
         .post("/_session", json!({"name": "admin", "password": "wrong"}))
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// CouchDB 3.5.3 reports an anonymous session as `"name": null` (JSON null,
+/// not the string "null").
+#[tokio::test]
+async fn anonymous_session_user_name_is_null() {
+    let s = Server::start(true);
+    let (status, body) = s.get("/_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["userCtx"]["name"], Value::Null, "{body}");
+    assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
 #[tokio::test]

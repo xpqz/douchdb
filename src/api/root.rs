@@ -24,6 +24,10 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
         return unauthorized();
     }
     let q = query(&uri);
+    let (skip, limit) = match (uint_param(&q, "skip"), uint_param(&q, "limit")) {
+        (Ok(skip), Ok(limit)) => (skip.unwrap_or(0), limit.unwrap_or(usize::MAX)),
+        (Err(error), _) | (_, Err(error)) => return fail(error),
+    };
     let mut names = st.db_names().await;
     if st.cluster.is_clustered() && !st.cluster.is_internal_db(&headers) {
         for (i, peer) in st.cluster.nodes.iter().enumerate() {
@@ -87,8 +91,6 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
             }
         });
     }
-    let skip = num(&q, "skip").unwrap_or(0);
-    let limit = num(&q, "limit").unwrap_or(usize::MAX);
     names = names.into_iter().skip(skip).take(limit).collect();
     json(StatusCode::OK, json!(names))
 }
@@ -112,7 +114,11 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri
     let heartbeat = num(&q, "heartbeat")
         .filter(|value| *value > 0)
         .map(|value| std::time::Duration::from_millis(value as u64));
-    let limit = num(&q, "limit");
+    let limit = match q.get("limit").map(|raw| raw.parse::<usize>()) {
+        None => None,
+        Some(Ok(limit)) => Some(limit),
+        Some(Err(_)) => return fail(ApiError::bad_request("invalid_integer")),
+    };
     let mut since = match q.get("since").map(String::as_str) {
         Some("now") => st.db_updates.current(),
         Some(raw) => raw.trim_matches('"').parse::<u64>().unwrap_or(0),
