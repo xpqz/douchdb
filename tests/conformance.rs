@@ -10980,6 +10980,113 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     }
 }
 
+const INTERNAL_HEADERS: [(&str, &str); 2] = [
+    ("x-douchdb-forwarded", "1"),
+    ("x-douchdb-secret", "test-cluster-secret"),
+];
+
+fn internal_headers() -> Vec<(&'static str, String)> {
+    INTERNAL_HEADERS
+        .iter()
+        .map(|(name, value)| (*name, value.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn migration_put_rejects_a_conflicting_migration() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    nodes[0].fresh_db("migconflict").await;
+    let path = "/_node/_local/_dbs/migconflict/migration";
+    let internal = internal_headers();
+
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(1)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The same migration may be announced again.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(1)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "idempotent re-PUT: {body}");
+    // A different migration must not replace the one in progress.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+
+    // Once the migration is cleared another one may start.
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, path, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn migration_freeze_waits_for_detached_replica_writes() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("migdrain").await;
+    }
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/migdrain",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![0, 1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Warm the validator cache: the first write consults every node.
+    let (status, _) = nodes[0].put("/migdrain/warm", json!({"v": 0})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A stopped node never answers, so its replica write stays in flight as a
+    // detached task after the write has been acknowledged by a quorum.
+    let pid = nodes[2].child.id().to_string();
+    let signal = |name: &str| {
+        let status = std::process::Command::new("kill")
+            .args([name, &pid])
+            .status()
+            .expect("kill");
+        assert!(status.success());
+    };
+    signal("-STOP");
+    let (status, body) = nodes[0]
+        .put("/migdrain/inflight?w=2", json!({"v": 1}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Freezing writes must wait until that write has landed everywhere,
+    // otherwise it can arrive after the final digest check.
+    let freeze = tokio::spawn({
+        let client = nodes[0].client.clone();
+        let url = format!("{}/_node/_local/_dbs/migdrain/migration", nodes[0].base);
+        async move {
+            client
+                .put(url)
+                .header("x-douchdb-forwarded", "1")
+                .header("x-douchdb-secret", "test-cluster-secret")
+                .json(&all_shards_on(1))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let finished_early = freeze.is_finished();
+    signal("-CONT");
+    assert!(
+        !finished_early,
+        "freeze completed while a replica write was still in flight"
+    );
+    assert_eq!(freeze.await.unwrap(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn revs_limit_pruning_preserves_short_conflict_leaves() {
     let s = Server::start(false);

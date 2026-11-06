@@ -393,13 +393,23 @@ async fn cleanup_all_replicas(
     Ok(out)
 }
 
+/// Time to wait for in-flight writes to finish once writes are frozen.
+pub(crate) const WRITE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A peer's refusal of a migration. `conflict` marks a different migration
+/// already owning the peer, which must be left alone.
+struct MigrationRefused {
+    conflict: bool,
+    message: String,
+}
+
 async fn send_migration(
     st: &AppState,
     peer: &str,
     name: &str,
     map: Option<&ShardMap>,
     headers: &HeaderMap,
-) -> Result<(), String> {
+) -> Result<(), MigrationRefused> {
     let segments = ["_node", "_local", "_dbs", name, "migration"];
     let request = match map {
         Some(map) => {
@@ -409,8 +419,14 @@ async fn send_migration(
     };
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => Err(format!("{peer}: HTTP {}", response.status())),
-        Err(error) => Err(format!("{peer}: {error}")),
+        Ok(response) => Err(MigrationRefused {
+            conflict: response.status() == reqwest::StatusCode::CONFLICT,
+            message: format!("{peer}: HTTP {}", response.status()),
+        }),
+        Err(error) => Err(MigrationRefused {
+            conflict: false,
+            message: format!("{peer}: {error}"),
+        }),
     }
 }
 
@@ -424,16 +440,27 @@ async fn set_migration_everywhere(
     db.set_migration_map(map.clone())?;
     let peers: Vec<String> = st.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
-    for peer in &peers {
-        if let Err(error) = send_migration(st, peer, name, Some(map), headers).await {
-            failures.push(error);
+    // Peers that refused because another migration owns them keep that
+    // migration; clearing them would unfreeze the other coordinator.
+    let mut foreign = Vec::new();
+    if !db.drain_writes(WRITE_DRAIN).await {
+        failures.push("local writes did not finish before the freeze".to_string());
+    }
+    if failures.is_empty() {
+        for peer in &peers {
+            if let Err(refused) = send_migration(st, peer, name, Some(map), headers).await {
+                if refused.conflict {
+                    foreign.push(peer.clone());
+                }
+                failures.push(refused.message);
+            }
         }
     }
     if failures.is_empty() {
         return Ok(());
     }
     db.clear_migration_map();
-    for peer in &peers {
+    for peer in peers.iter().filter(|peer| !foreign.contains(peer)) {
         let _ = send_migration(st, peer, name, None, headers).await;
     }
     Err(ApiError::new(
@@ -450,7 +477,7 @@ async fn clear_migration_everywhere(st: &AppState, db: &Db, name: &str, headers:
     db.clear_migration_map();
     for peer in st.cluster.peers() {
         if let Err(error) = send_migration(st, peer, name, None, headers).await {
-            tracing::warn!("migration map clear on {peer} failed: {error}");
+            tracing::warn!("migration map clear on {}", error.message);
         }
     }
 }

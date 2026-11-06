@@ -565,6 +565,19 @@ pub(crate) async fn commit_docs(
         return Ok((results, true));
     }
 
+    // Hold the write gate until this write and its detached replica writes
+    // finish, so a rebalance freeze can drain them. Checking the freeze again
+    // under the gate closes the window between the request-entry check and
+    // acquiring it.
+    let gate = Arc::new(db.write_guard().await);
+    if db.rebalance_in_progress() && !crate::api::is_forwarded(st, headers) {
+        return Err(ApiError::new(
+            503,
+            "rebalance_in_progress",
+            "writes are paused while this database changes shard placement",
+        ));
+    }
+
     // Routing needs ids, so generate them before grouping. `Db::put_docs`
     // would otherwise assign them per replica and the copies would diverge.
     for doc in &mut docs {
@@ -629,7 +642,9 @@ pub(crate) async fn commit_docs(
                 let subdocs: Vec<Value> =
                     group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
                 let db = db_handle.clone();
+                let gate = gate.clone();
                 pending.push(tokio::spawn(async move {
+                    let _gate = gate;
                     (node, slots, db.put_docs(subdocs, true).await)
                 }));
             } else {
@@ -639,7 +654,9 @@ pub(crate) async fn commit_docs(
                 let peer = st.cluster.nodes[node].clone();
                 let dbname = dbname.to_string();
                 let headers = headers.clone();
+                let gate = gate.clone();
                 pending.push(tokio::spawn(async move {
+                    let _gate = gate;
                     (
                         node,
                         slots,
