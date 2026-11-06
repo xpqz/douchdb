@@ -1038,7 +1038,8 @@ fn query_terms(query: &str) -> Vec<String> {
                 return None;
             }
             let token = token.rsplit(':').next().unwrap_or(token);
-            Some(token.to_ascii_lowercase())
+            // Same per-character lowercasing as highlight_fragment applies to the text.
+            Some(token.chars().flat_map(char::to_lowercase).collect())
         })
         .collect()
 }
