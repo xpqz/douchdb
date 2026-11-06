@@ -11083,3 +11083,102 @@ async fn changes_since_with_huge_node_index_does_not_abort() {
     let (status, _) = s.get("/hugesince").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// couch_httpd_db:db_req(#httpd{method='POST'}) and chttpd_db:db_req(POST) feed
+// the document through the same update path as PUT: design docs need db admin
+// (couch_db:check_is_admin / chttpd_db:db_doc_req), validate_doc_update runs,
+// and `_local/` ids are stored as local documents.
+#[tokio::test]
+async fn post_db_enforces_design_admin_vdu_and_local_routing() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let alice = bearer("alice-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/postgate", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let members = json!({
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["alice"], "roles": []}
+    });
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/postgate/_security",
+            Some(members),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A member may not create a design document through POST.
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/postgate",
+            Some(json!({"_id": "_design/evil", "views": {}})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = s
+        .req_with(Method::GET, "/postgate/_design/evil", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // validate_doc_update applies to POSTed documents.
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/postgate/_design/v",
+            Some(json!({
+                "validate_doc_update": "function (newDoc) { \
+                    if (newDoc.bad) { throw {forbidden: 'bad doc'}; } }"
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/postgate",
+            Some(json!({"_id": "x", "bad": true})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], "bad doc");
+    let (status, _) = s
+        .req_with(Method::GET, "/postgate/x", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/postgate",
+            Some(json!({"_id": "y", "bad": false})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A `_local/` id is stored as a local document, not a shard document.
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/postgate",
+            Some(json!({"_id": "_local/note", "v": 1})),
+            &alice,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], "_local/note");
+    assert_eq!(body["rev"], "0-1");
+    let (status, body) = s
+        .req_with(Method::GET, "/postgate/_local/note", None, &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 1);
+}

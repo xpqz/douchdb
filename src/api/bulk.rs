@@ -35,19 +35,8 @@ pub(super) async fn bulk_docs(
             "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
         ));
     }
-    // `_bulk_docs` is a member operation for ordinary documents, but design
-    // documents are database-admin data. Check the batch, not just the route.
-    let writes_design = docs.iter().any(|doc| {
-        doc.get("_id")
-            .and_then(Value::as_str)
-            .map(|id| id.starts_with("_design/"))
-            .unwrap_or(false)
-    });
-    if writes_design {
-        let principal = st.principal(headers);
-        if let Some(response) = require_db_access(st, &principal, db, true) {
-            return response;
-        }
+    if let Some(response) = require_design_admin(st, db, headers, &docs) {
+        return response;
     }
     for doc in &docs {
         if let Err(e) = validate_doc(doc) {
@@ -161,6 +150,27 @@ pub(super) async fn bulk_docs(
         *response.status_mut() = StatusCode::ACCEPTED;
     }
     response
+}
+
+/// Design documents are database-admin data even on member-writable
+/// endpoints (`_bulk_docs`, `POST /{db}`). Check the whole batch.
+pub(super) fn require_design_admin(
+    st: &AppState,
+    db: &Db,
+    headers: &HeaderMap,
+    docs: &[Value],
+) -> Option<Response> {
+    let writes_design = docs.iter().any(|doc| {
+        doc.get("_id")
+            .and_then(Value::as_str)
+            .map(|id| id.starts_with("_design/"))
+            .unwrap_or(false)
+    });
+    if !writes_design {
+        return None;
+    }
+    let principal = st.principal(headers);
+    require_db_access(st, &principal, db, true)
 }
 
 pub(super) async fn validate_write(
