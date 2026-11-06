@@ -1515,6 +1515,14 @@ mod tests {
     }
 
     #[test]
+    fn query_terms_strip_quotes_from_field_qualified_phrases() {
+        assert_eq!(query_terms("item:\"CAFÉ\""), ["café"]);
+        assert_eq!(query_terms("item:\"café ünï\""), ["café", "ünï"]);
+        assert_eq!(query_terms("+item:\"Foo Bar\" baz"), ["foo", "bar", "baz"]);
+        assert_eq!(query_terms("\"foo bar\""), ["foo", "bar"]);
+    }
+
+    #[test]
     fn highlights_find_upper_case_non_ascii_terms() {
         for (text, query, expected) in [
             ("ünï café", "Ünï", "<b>ünï</b> café"),

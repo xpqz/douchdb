@@ -9329,6 +9329,7 @@ async fn search_highlights_match_upper_case_non_ascii_query_terms() {
     for (query, id, expected) in [
         ("item:Ünï", "a", "<em>ünï</em> café"),
         ("item:CAFÉ", "a", "ünï <em>café</em>"),
+        ("item:\"CAFÉ\"", "a", "ünï <em>café</em>"),
         ("item:İstanbul", "b", "<em>İstanbul</em> trip"),
     ] {
         let (status, body) = s
