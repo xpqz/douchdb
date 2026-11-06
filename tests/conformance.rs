@@ -6569,6 +6569,141 @@ async fn couchdb_builtin_reduce_ports() {
 }
 
 #[tokio::test]
+async fn couchdb_reduce_duplicate_keys_and_structured_values() {
+    // Expected bodies were captured from CouchDB 3.5. Each requested key
+    // gets its own row, so a repeated key repeats its reduced value rather
+    // than adding it twice; `_sum` adds arrays and objects member by member
+    // and `_stats` accepts stats objects.
+    let s = Server::start(false);
+    s.fresh_db("reducestruct").await;
+    let (status, _) = s
+        .post(
+            "/reducestruct/_bulk_docs",
+            json!({"docs": [
+                {"_id": "d1", "k": "a", "v": 1},
+                {"_id": "d2", "k": "b", "v": 2},
+                {"_id": "d3", "k": "a", "v": 5}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/reducestruct/_design/d",
+            json!({"views": {
+                "sum": {"map": "function(d){ emit(d.k, d.v); }", "reduce": "_sum"},
+                "byv": {"map": "function(d){ emit(d.v, d.v); }", "reduce": "_sum"},
+                "arr": {"map": "function(d){ emit(d.k, [d.v, 1]); }", "reduce": "_sum"},
+                "obj": {"map": "function(d){ emit(d.k, {x: d.v}); }", "reduce": "_sum"},
+                "mixed": {"map": "function(d){ emit(d.k, d._id == 'd1' ? 1 : [1]); }", "reduce": "_sum"},
+                "bad": {"map": "function(d){ emit(d.k, 'x'); }", "reduce": "_sum"},
+                "stobj": {
+                    "map": "function(d){ emit(d.k, {sum: d.v, count: 1, min: d.v, max: d.v, sumsqr: d.v * d.v}); }",
+                    "reduce": "_stats"
+                },
+                "starr": {"map": "function(d){ emit(d.k, [d.v]); }", "reduce": "_stats"},
+                "stbad": {"map": "function(d){ emit(d.k, 'x'); }", "reduce": "_stats"}
+            }}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows = |body: &Value| body["rows"].clone();
+    let view = |path: &str| format!("/reducestruct/_design/d/_view/{path}");
+
+    let (status, body) = s.get(&view("sum?keys=[\"a\",\"a\"]&group=true")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&body),
+        json!([{"key": "a", "value": 6}, {"key": "a", "value": 6}])
+    );
+    let (_, body) = s
+        .get(&view("sum?keys=[\"a\",\"b\",\"a\"]&group=true"))
+        .await;
+    assert_eq!(
+        rows(&body),
+        json!([
+            {"key": "a", "value": 6},
+            {"key": "b", "value": 2},
+            {"key": "a", "value": 6}
+        ])
+    );
+    let (_, body) = s
+        .get(&view("sum?keys=[\"a\",\"a\"]&group=true&descending=true"))
+        .await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": "a", "value": 6}, {"key": "a", "value": 6}])
+    );
+    let (_, body) = s.get(&view("sum?keys=[\"zz\",\"a\"]&group=true")).await;
+    assert_eq!(rows(&body), json!([{"key": "a", "value": 6}]));
+    let (_, body) = s.get(&view("byv?keys=[1,1]&group=true&skip=1")).await;
+    assert_eq!(rows(&body), json!([{"key": 1, "value": 1}]));
+    let (_, body) = s
+        .get(&view("byv?keys=[1,1,5]&group=true&skip=1&limit=2"))
+        .await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": 1, "value": 1}, {"key": 5, "value": 5}])
+    );
+
+    let (_, body) = s.get(&view("arr")).await;
+    assert_eq!(rows(&body), json!([{"key": null, "value": [8, 3]}]));
+    let (_, body) = s.get(&view("arr?group=true")).await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": "a", "value": [6, 2]}, {"key": "b", "value": [2, 1]}])
+    );
+    let (_, body) = s.get(&view("obj")).await;
+    assert_eq!(rows(&body), json!([{"key": null, "value": {"x": 8}}]));
+    let (_, body) = s.get(&view("obj?group=true")).await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": "a", "value": {"x": 6}}, {"key": "b", "value": {"x": 2}}])
+    );
+    // A number added to an array is added to its first element.
+    let (_, body) = s.get(&view("mixed")).await;
+    assert_eq!(rows(&body), json!([{"key": null, "value": [3]}]));
+    let (_, body) = s.get(&view("mixed?group=true")).await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": "a", "value": [2]}, {"key": "b", "value": [1]}])
+    );
+
+    // An invalid value is an error row, not a failed request.
+    let (status, body) = s.get(&view("bad")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value = &body["rows"][0]["value"];
+    assert_eq!(value["error"], "builtin_reduce_error", "{body}");
+    assert_eq!(value["caused_by"], "x");
+    assert_eq!(
+        value["reason"],
+        "The _sum function requires that map values be numbers, arrays of numbers, or objects. Objects cannot be mixed with other data structures. Objects can be arbitrarily nested, provided that the values for all fields are themselves numbers, arrays of numbers, or objects."
+    );
+
+    let (_, body) = s.get(&view("stobj")).await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": null, "value": {"sum": 8, "count": 3, "min": 1, "max": 5, "sumsqr": 30}}])
+    );
+    let (_, body) = s.get(&view("stobj?group=true")).await;
+    assert_eq!(
+        rows(&body),
+        json!([
+            {"key": "a", "value": {"sum": 6, "count": 2, "min": 1, "max": 5, "sumsqr": 26}},
+            {"key": "b", "value": {"sum": 2, "count": 1, "min": 2, "max": 2, "sumsqr": 4}}
+        ])
+    );
+    let (_, body) = s.get(&view("starr")).await;
+    assert_eq!(
+        rows(&body),
+        json!([{"key": null, "value": [{"sum": 8, "count": 3, "min": 1, "max": 5, "sumsqr": 30}]}])
+    );
+    let (status, body) = s.get(&view("stbad")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+}
+
+#[tokio::test]
 async fn couchdb_view_include_docs_and_utf8_ports() {
     let s = Server::start(false);
     s.fresh_db("couchviewdocs").await;
