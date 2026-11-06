@@ -2954,6 +2954,61 @@ async fn bulk_get_preserves_order_for_a_large_batch() {
     }
 }
 
+// CouchDB 3.5 derives the revision of a new_edits=false document from
+// `_revisions` when `_rev` is absent, and `_revisions` wins when the two
+// disagree (couch_doc:transfer_fields/3). With neither field the request is
+// refused with 400.
+#[tokio::test]
+async fn new_edits_false_derives_rev_from_revisions() {
+    let s = Server::start(false);
+    s.fresh_db("revsonly").await;
+    let (status, body) = s
+        .post(
+            "/revsonly/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "t", "_revisions": {"start": 2, "ids": ["bbbb", "aaaa"]}},
+                {"_id": "d1", "_rev": "3-cccc",
+                 "_revisions": {"start": 2, "ids": ["bbbb", "aaaa"]}},
+                {"_id": "d2", "_rev": "2-bbbb",
+                 "_revisions": {"start": 3, "ids": ["bbbb", "aaaa"]}},
+                {"_id": "g", "_deleted": true,
+                 "_revisions": {"start": 2, "ids": ["bbbb", "aaaa"]}}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body, json!([]));
+    for (id, rev, start) in [("t", "2-bbbb", 2), ("d1", "2-bbbb", 2), ("d2", "3-bbbb", 3)] {
+        let (status, body) = s.get(&format!("/revsonly/{id}?revs=true")).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        assert_eq!(body["_rev"], rev, "{id}");
+        assert_eq!(
+            body["_revisions"],
+            json!({"start": start, "ids": ["bbbb", "aaaa"]}),
+            "{id}"
+        );
+    }
+    let (status, _) = s.get("/revsonly/g").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = s
+        .put(
+            "/revsonly/p?new_edits=false",
+            json!({"_revisions": {"start": 2, "ids": ["bbbb", "aaaa"]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "p", "rev": "2-bbbb"}));
+
+    let (status, body) = s.put("/revsonly/q?new_edits=false", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "bad_request", "reason":
+            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified"})
+    );
+}
+
 #[tokio::test]
 async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     let s = Server::start(false);
