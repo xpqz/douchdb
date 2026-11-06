@@ -6194,6 +6194,49 @@ async fn seed_search_docs(s: &Server, db: &str) {
 }
 
 #[tokio::test]
+async fn a_recreated_database_does_not_search_the_old_index() {
+    let s = Server::start(false);
+    seed_search_docs(&s, "searchrecreate").await;
+    let url = "/searchrecreate/_design/inventory/_search/fruits?q=*:*";
+    let (status, body) = s.get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 4, "{body}");
+
+    // The same design and the same number of writes, so only the documents
+    // tell the new index from the old one.
+    let (status, _) = s.delete("/searchrecreate").await;
+    assert_eq!(status, StatusCode::OK);
+    s.fresh_db("searchrecreate").await;
+    let (status, _) = s
+        .post(
+            "/searchrecreate/_bulk_docs",
+            json!({"docs": [
+                {"_id": "fig", "item": "fig"},
+                {"_id": "grape", "item": "grape"},
+                {"_id": "kiwi", "item": "kiwi"},
+                {"_id": "lime", "item": "lime"}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put("/searchrecreate/_design/inventory", search_ddoc())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = s.get(url).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ids: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["fig", "grape", "kiwi", "lime"], "{body}");
+}
+
+#[tokio::test]
 async fn purged_documents_leave_search_results() {
     let s = Server::start(false);
     seed_search_docs(&s, "searchpurge").await;

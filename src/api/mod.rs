@@ -289,6 +289,7 @@ impl AppState {
             return Err(ApiError::bad_request("invalid database name"));
         }
         crate::view::forget_db(&self.root.join(name));
+        crate::search::forget_db(&self.root.join(name));
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
                 412,
@@ -319,6 +320,7 @@ impl AppState {
         }
         self.dbs.write().await.remove(name);
         crate::view::forget_db(&self.root.join(name));
+        crate::search::forget_db(&self.root.join(name));
         Db::destroy(&self.root, name)?;
         self.db_updates.record(name, "deleted");
         Ok(())
