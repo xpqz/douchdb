@@ -1171,6 +1171,85 @@ mod scan_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn temp_shard_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "douchdb-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn has_tables(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
+            matches!(
+                entry.path().extension().and_then(|ext| ext.to_str()),
+                Some("ldb" | "sst")
+            )
+        })
+    }
+
+    #[test]
+    fn cleared_shard_reopens_and_keeps_its_sequence() {
+        let dir = temp_shard_dir("clear-reopen");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
+        shard.commit_at(tx, Some(7)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.db.compact_range(&[], &[]).unwrap();
+        assert!(has_tables(&dir));
+        shard.clear().unwrap();
+        assert_eq!(shard.counts(), (0, 0));
+        drop(shard);
+
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.seq, 7, "sequence numbers never go backwards");
+        assert_eq!(shard.counts(), (0, 0));
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shard_with_tables_but_no_sequence_key_is_corrupt() {
+        let dir = temp_shard_dir("no-seq");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        shard.commit_at(tx, Some(1)).unwrap();
+        shard.flush_pending().unwrap();
+        shard.db.compact_range(&[], &[]).unwrap();
+        shard.db.delete(b"z/seq").unwrap();
+        shard.db.flush().unwrap();
+        drop(shard);
+        assert!(has_tables(&dir));
+        let error = Shard::open(&dir, 1000).err().expect("must refuse to open");
+        assert!(error.to_string().contains("corrupt shard"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_only_shard_reopens() {
+        let dir = temp_shard_dir("local-only");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put(&local_key("x"), b"{}");
+        shard.commit_at(tx, None).unwrap();
+        shard.flush_pending().unwrap();
+        shard.db.compact_range(&[], &[]).unwrap();
+        drop(shard);
+        assert!(has_tables(&dir));
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.seq, 0);
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn live_ids(shard: &mut Shard) -> Vec<String> {
         shard.live_docs().unwrap().keys().cloned().collect()
     }
