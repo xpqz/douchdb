@@ -1827,4 +1827,36 @@ mod tests {
             cnt += entries_per_batch;
         }
     }
+
+    /// A point read must not treat a tombstone for a neighbouring key as a
+    /// deletion of the key being read. A newer table can cover the key's
+    /// range, miss the key itself and hold a tombstone for the next key.
+    #[test]
+    fn test_db_impl_get_ignores_neighbouring_tombstone() {
+        let mut opt = options::for_test();
+        opt.filter_policy = Rc::new(Box::new(crate::filter::NoFilterPolicy::new()));
+        let mut db = DB::open("db", opt).unwrap();
+
+        let mut wb = WriteBatch::default();
+        wb.put(b"m/A", b"a1");
+        wb.put(b"m/B", b"b1");
+        wb.put(b"s/1", b"A");
+        wb.put(b"s/2", b"B");
+        db.write(wb, true).unwrap();
+        db.compact_range(b"a", b"zz").unwrap();
+
+        let mut wb = WriteBatch::default();
+        wb.put(b"m/A", b"a2");
+        wb.put(b"s/3", b"A");
+        wb.delete(b"s/1");
+        db.write(wb, true).unwrap();
+        // Flush the memtable into a newer level-0 table.
+        db.compact_range(b"zzz", b"zzzz").unwrap();
+
+        let snap = db.get_snapshot();
+        assert_eq!(db.get_at(&snap, b"m/B").unwrap().as_deref(), Some(&b"b1"[..]));
+        assert_eq!(db.get_at(&snap, b"m/A").unwrap().as_deref(), Some(&b"a2"[..]));
+        assert_eq!(db.get_at(&snap, b"s/1").unwrap(), None);
+        assert_eq!(db.get_at(&snap, b"s/2").unwrap().as_deref(), Some(&b"B"[..]));
+    }
 }
