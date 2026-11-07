@@ -1597,6 +1597,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The deadline used to be checked only before and after the index was
+    /// made current, so a scan over a large result ran to the end.
+    #[tokio::test]
+    async fn a_query_deadline_stops_the_scan_of_a_large_result() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-deadline-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchdeadline",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut docs = vec![json!({"_id": "_design/a", "indexes": {"idx": {
+            "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}})];
+        docs.extend((0..20_000).map(|i| json!({"_id": format!("d{i:05}"), "name": "apple"})));
+        db.put_docs(docs, true).await.unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = |timeout_ms| SearchRequest {
+            query: "*:*".to_string(),
+            limit: 10,
+            timeout_ms,
+            ..SearchRequest::default()
+        };
+        // The first query builds the index; a later one finds it current.
+        let built = query(&db, "_design/a", "idx", &request(60_000), limits)
+            .await
+            .unwrap();
+        assert_eq!(built["total_rows"], 20_000);
+        let error = query(&db, "_design/a", "idx", &request(1), limits)
+            .await
+            .expect_err("a one millisecond deadline cannot cover 20000 hits");
+        assert_eq!(error.error, "timeout");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_after_each_write() {
         let root = std::env::temp_dir().join(format!(
