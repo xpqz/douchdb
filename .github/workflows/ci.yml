@@ -27,6 +27,13 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit and integration tests
         run: cargo test
+      # Servers started by the test suites must not outlive them (issue #119).
+      - name: No stray test servers
+        run: |
+          if pgrep -fa 'target/debug/douchdb'; then
+            echo "test servers still running after cargo test" >&2
+            exit 1
+          fi
       - name: Storage corruption and fail-closed checks
         run: |
           cargo build --release --locked

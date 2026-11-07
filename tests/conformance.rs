@@ -80,7 +80,7 @@ impl Server {
             attempt
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+        let mut cmd = server_command();
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--data")
@@ -93,12 +93,13 @@ impl Server {
         if admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
-        let base = format!("http://127.0.0.1:{port}");
+        // Built first: nothing may panic while the bare `Child` is unowned.
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
+        let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+        let base = format!("http://127.0.0.1:{port}");
         if wait_for_listener(&mut child, port) {
             // A colliding process can win the port after `free_port` checked
             // it; the child then exits while our connect succeeds against the
@@ -136,7 +137,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("client");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+        let mut cmd = server_command();
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{}", self.port))
             .arg("--data")
@@ -300,6 +301,18 @@ impl Drop for Server {
 /// the probe listener and keeps the port. The real server then fails to bind,
 /// and the test talks to the stray socket ("Connection reset by peer").
 static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A douchdb server command that exits when this process goes away. Dropping
+/// a `Server` kills its child, but a run killed by a timeout or Ctrl-C never
+/// drops anything. The child holds the read end of a pipe whose write end is
+/// `Child::stdin`, so the kernel closes it with this process on Linux and
+/// macOS alike, and the server exits on EOF (`DOUCHDB_EXIT_ON_STDIN_EOF`).
+fn server_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    cmd.env("DOUCHDB_EXIT_ON_STDIN_EOF", "1")
+        .stdin(std::process::Stdio::piped());
+    cmd
+}
 
 fn spawn_locked(cmd: &mut Command) -> std::io::Result<Child> {
     let _guard = SPAWN_LOCK
@@ -11999,7 +12012,7 @@ fn startup_failure(extra: &[String]) -> Option<String> {
     let port = free_port();
     let dir = std::env::temp_dir().join(format!("douchdb-startup-{}-{}", std::process::id(), port));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    let mut cmd = server_command();
     cmd.arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--data")
@@ -12046,7 +12059,7 @@ fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
     use std::io::Read;
     let port = free_port();
     let dir = std::env::temp_dir().join(format!("douchdb-badq-{}-{}", std::process::id(), port));
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    let mut cmd = server_command();
     cmd.arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--data")

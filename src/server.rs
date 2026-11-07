@@ -14,6 +14,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Exit when stdin reaches EOF. Test harnesses set `DOUCHDB_EXIT_ON_STDIN_EOF`
+/// and hold the write end of a stdin pipe, so a server dies with its parent even
+/// when the parent is killed and cannot clean up. Off unless the variable is set.
+fn exit_on_stdin_eof() {
+    std::thread::spawn(|| {
+        use std::io::Read;
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin().lock();
+        while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+        std::process::exit(0);
+    });
+}
+
 /// Run the server (or, with `--js-worker`, a sandboxed JS worker) until
 /// shutdown.
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -27,6 +40,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+    if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
+        exit_on_stdin_eof();
     }
     match args.js_sandbox.as_str() {
         "native" => js::configure(js::Sandbox::Native, args.js_workers),
