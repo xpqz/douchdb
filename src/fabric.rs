@@ -540,9 +540,9 @@ fn spawn_quorum_writes(
             let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
             let db = db.clone();
             let gate = gate.clone();
-            pending.push(tokio::spawn(async move {
+            pending.push(spawn_node_write(node, slots, async move {
                 let _gate = gate;
-                (node, slots, db.put_docs(subdocs, true).await)
+                db.put_docs(subdocs, true).await
             }));
         } else {
             let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
@@ -552,17 +552,23 @@ fn spawn_quorum_writes(
             let dbname = dbname.to_string();
             let headers = headers.clone();
             let gate = gate.clone();
-            pending.push(tokio::spawn(async move {
+            pending.push(spawn_node_write(node, slots, async move {
                 let _gate = gate;
-                (
-                    node,
-                    slots,
-                    forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await,
-                )
+                forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await
             }));
         }
     }
     pending
+}
+
+/// Run one node's write as a detached task that reports which node and slots
+/// it answered for.
+fn spawn_node_write(
+    node: usize,
+    slots: Vec<usize>,
+    write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
+) -> tokio::task::JoinHandle<NodeReply> {
+    tokio::spawn(async move { (node, slots, write.await) })
 }
 
 /// Return as soon as the tally is settled. The remaining replica writes keep
@@ -2351,6 +2357,44 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A fan-out task that panics must still count as that node's reply.
+    /// Slot 0 is a design document on nodes 0 and 1, so it is owed a reply
+    /// from each; slot 1 sits on nodes 0 and 2 and node 2 never answers. Node 0
+    /// acknowledges both, node 1 panics. Counting the panic settles the write
+    /// (slot 1 already has its quorum); skipping it leaves slot 0 owed a reply
+    /// and the request waits on node 2 forever.
+    #[tokio::test]
+    async fn panicked_fan_out_task_counts_as_answered() {
+        let ids = vec!["_design/a".to_string(), "plain".to_string()];
+        let primaries = vec![0, 0];
+        let replicas = vec![vec![0, 1], vec![0, 2]];
+        let tally = QuorumTally::new(&ids, &primaries, &replicas, 1);
+        let ack = |id: &str| json!({ "id": id, "ok": true, "rev": "1-a" });
+
+        let pending = FuturesUnordered::new();
+        pending.push(spawn_node_write(0, vec![0, 1], {
+            let results = vec![ack("_design/a"), ack("plain")];
+            async move { Ok(results) }
+        }));
+        pending.push(spawn_node_write(1, vec![0], async {
+            panic!("replica task exploded")
+        }));
+        pending.push(spawn_node_write(2, vec![1], async {
+            std::future::pending::<DbResult<Vec<Value>>>().await
+        }));
+
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_quorum(pending, tally),
+        )
+        .await
+        .expect("a panicked task left the request waiting for a replica that never answers");
+        let (out, met) = settled;
+        assert!(met);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|result| result.get("ok").is_some()));
+    }
 
     #[test]
     fn peer_map_with_foreign_node_count_is_not_adoptable() {
