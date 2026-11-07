@@ -5,10 +5,11 @@ use crate::auth::Principal;
 use crate::cluster::ShardMap;
 use crate::cluster_http::{forward_client_auth, internal_request, peer_url};
 use crate::db::{
-    attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError,
-    ChangeFilter, ChangesOpts, Db, DbResult, DocOpts,
+    attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError, ChangesOpts,
+    Db, DbResult, DocOpts,
 };
 use crate::fabric::*;
+pub(crate) use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::{illegal_db_name, valid_db_name};
 pub use crate::state::{AppState, Config, DbUpdates};
 use axum::body::{Body, Bytes};
@@ -98,17 +99,6 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-pub(crate) fn flag(q: &HashMap<String, String>, key: &str) -> bool {
-    match q.get(key) {
-        Some(raw) => raw == "1" || raw.eq_ignore_ascii_case("true"),
-        None => false,
-    }
-}
-
-pub(crate) fn num(q: &HashMap<String, String>, key: &str) -> Option<usize> {
-    q.get(key).and_then(|v| v.parse().ok())
 }
 
 /// CouchDB answers a request with the wrong method with 405, an `Allow`
@@ -307,6 +297,7 @@ mod bulk;
 mod changes;
 mod database;
 mod documents;
+mod forward;
 mod middleware;
 mod node;
 mod observability;
@@ -316,9 +307,10 @@ mod views;
 
 pub(crate) use access::*;
 use bulk::*;
-pub(crate) use changes::*;
+use changes::*;
 pub(crate) use database::*;
 pub(crate) use documents::*;
+pub(crate) use forward::*;
 pub(crate) use middleware::*;
 pub(crate) use node::*;
 pub(crate) use root::*;

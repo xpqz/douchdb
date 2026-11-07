@@ -160,23 +160,6 @@ fn split_doc_path(rest: &str) -> (String, Option<String>) {
     (segments[0].clone(), attachment)
 }
 
-pub(crate) fn doc_opts(q: &HashMap<String, String>) -> DocOpts {
-    DocOpts {
-        rev: q.get("rev").cloned(),
-        revs: flag(q, "revs"),
-        revs_info: flag(q, "revs_info"),
-        local_seq: flag(q, "local_seq"),
-        conflicts: flag(q, "conflicts"),
-        deleted_conflicts: flag(q, "deleted_conflicts"),
-        attachments: flag(q, "attachments"),
-        open_revs: q
-            .get("open_revs")
-            .map(|v| serde_json::from_str::<Vec<String>>(v).unwrap_or_else(|_| vec![v.clone()])),
-        latest: flag(q, "latest"),
-        ..Default::default()
-    }
-}
-
 pub(crate) fn doc_response(doc: Value) -> Response {
     let etag = doc
         .get("_rev")

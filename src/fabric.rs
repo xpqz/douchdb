@@ -1,15 +1,13 @@
 //! Cluster coordination: shard-map routing, replica selection, quorum
 //! reads/writes and internal node calls.
 
-use crate::api::{doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, num};
 use crate::cluster_http::{
-    forward_client_auth, internal_request, internal_request_raw, peer_url, percent_encode,
-    ClusterCtx,
+    forward_client_auth, internal_request, internal_request_raw, ClusterCtx,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::AppState;
-use axum::http::{header, HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -226,214 +224,11 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
     .await;
 }
 
-/// A client request to replay against a peer that owns the document.
-pub(crate) struct ForwardRequest<'a> {
-    pub method: &'a Method,
-    pub dbname: &'a str,
-    /// The path after `/{dbname}/`.
-    pub rest: &'a str,
-    pub q: &'a HashMap<String, String>,
-    pub headers: &'a HeaderMap,
-    pub body: &'a [u8],
-}
-
-pub(crate) async fn proxy(ctx: &ClusterCtx, request: &ForwardRequest<'_>, peer: &str) -> Response {
-    let ForwardRequest {
-        method,
-        dbname,
-        rest,
-        q,
-        headers,
-        body,
-    } = *request;
-    // `rest` is the caller's still-encoded remainder; only the name is encoded.
-    let mut url = format!("{}/{rest}", peer_url(peer, &[dbname]));
-    if !q.is_empty() {
-        let encoded: Vec<String> = q
-            .iter()
-            .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-            .collect();
-        url.push('?');
-        url.push_str(&encoded.join("&"));
-    }
-    let request = ctx.client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        &url,
-    );
-    let request = forward_client_auth(request, headers);
-    let mut request = match headers.get(header::CONTENT_TYPE) {
-        Some(value) => request.header("content-type", value),
-        None => request,
-    };
-    for name in ["destination", "if-match", "if-none-match"] {
-        if let Some(value) = headers.get(name) {
-            request = request.header(name, value);
-        }
-    }
-    if !body.is_empty() {
-        request = request.body(body.to_vec());
-    }
-    match request.send().await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let content_type = resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let etag = resp.headers().get(header::ETAG).cloned();
-            let location = resp.headers().get(header::LOCATION).cloned();
-            let bytes = resp.bytes().await.unwrap_or_default().to_vec();
-            let mut response =
-                (status, [(header::CONTENT_TYPE, content_type)], bytes).into_response();
-            if let Some(value) = etag {
-                response.headers_mut().insert(header::ETAG, value);
-            }
-            if let Some(value) = location {
-                response.headers_mut().insert(header::LOCATION, value);
-            }
-            response
-        }
-        Err(e) => fail(ApiError::new(502, "bad_gateway", e.to_string())),
-    }
-}
-
-/// True when a proxied request failed to reach the peer, rather than the peer
-/// answering on behalf of the cluster.
-pub(crate) fn unavailable(response: &Response) -> bool {
-    matches!(
-        response.status(),
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
-}
-
-/// `?r=N` reads from several replicas and returns the winning revision.
-pub(crate) async fn quorum_read(
-    ctx: &ClusterCtx,
-    db: &Db,
-    dbname: &str,
-    docid: &str,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    r: usize,
-) -> Response {
-    // Without an explicit `rev`, ask every replica for *all* leaves with their
-    // revision histories. A conflict branch that never wins locally can still
-    // be the correct global winner, so top-level winners alone are not enough.
-    let requested_rev = q.get("rev").cloned();
-    let open_all = requested_rev.is_none();
-    let (reachable, docs) = replica_docs(ctx, db, dbname, docid, q, headers, open_all).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        return fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        ));
-    }
-    if docs.is_empty() {
-        return fail(ApiError::not_found("missing"));
-    }
-
-    let Some(reconciled) = reconcile_leaves(&docs, requested_rev.as_deref()) else {
-        return fail(ApiError::not_found("missing"));
-    };
-    let winner_rev = reconciled
-        .winner
-        .get("_rev")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let mut winner = reconciled.winner;
-    let conflicts = reconciled.conflicts;
-    let deleted_conflicts = reconciled.deleted_conflicts;
-    let history = reconciled.history;
-
-    if let Some(object) = winner.as_object_mut() {
-        if flag(q, "conflicts") {
-            object.insert("_conflicts".to_string(), json!(conflicts));
-        } else {
-            object.remove("_conflicts");
-        }
-        if flag(q, "deleted_conflicts") {
-            object.insert("_deleted_conflicts".to_string(), json!(deleted_conflicts));
-        } else {
-            object.remove("_deleted_conflicts");
-        }
-        if flag(q, "revs") {
-            // Return a deterministic history: the longest one supplied for
-            // this revision, not whichever replica answered first.
-            if let Some(start) = history
-                .first()
-                .and_then(|rev| crate::rev::Rev::parse(rev))
-                .map(|rev| rev.pos)
-            {
-                let ids: Vec<String> = history
-                    .iter()
-                    .filter_map(|rev| rev.split_once('-').map(|(_, id)| id.to_string()))
-                    .collect();
-                object.insert(
-                    "_revisions".to_string(),
-                    json!({"start": start, "ids": ids}),
-                );
-            }
-        } else {
-            object.remove("_revisions");
-        }
-    }
-
-    let explicitly_requested = requested_rev.is_some();
-    let deleted = winner
-        .get("_deleted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if deleted && !explicitly_requested {
-        return fail(ApiError::not_found("deleted"));
-    }
-    let etag = format!("\"{winner_rev}\"");
-    if etag_matches(headers, header::IF_NONE_MATCH, &etag) {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        if let Ok(value) = etag.parse() {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        return response;
-    }
-    doc_response(winner)
-}
-
-/// Count reachable replicas for revision-shaped responses (`open_revs`,
-/// `revs_info`) without silently downgrading the requested `r`.
-pub(crate) async fn quorum_reachable(
-    ctx: &ClusterCtx,
-    db: &Db,
-    dbname: &str,
-    docid: &str,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    r: usize,
-) -> Option<Response> {
-    let (reachable, _) = replica_docs(ctx, db, dbname, docid, q, headers, false).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        Some(fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        )))
-    } else {
-        None
-    }
-}
-
 /// Ask every replica for a document. With `open_all`, each peer returns all
 /// leaves (`open_revs=all`) and their histories; otherwise the single winner
 /// (or the client's explicit `rev`) is returned. Explicit not-found answers
 /// count as reachable, but a transport or server failure does not.
-async fn replica_docs(
+pub(crate) async fn replica_docs(
     ctx: &ClusterCtx,
     db: &Db,
     dbname: &str,
@@ -520,18 +315,18 @@ async fn replica_docs(
     (reachable, docs)
 }
 
-struct Reconciled {
-    winner: Value,
-    conflicts: Vec<String>,
-    deleted_conflicts: Vec<String>,
-    history: Vec<String>,
+pub(crate) struct Reconciled {
+    pub(crate) winner: Value,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) deleted_conflicts: Vec<String>,
+    pub(crate) history: Vec<String>,
 }
 
 /// Pure merged-tree reconciliation. `docs` may contain duplicate revision ids
 /// with different retained history lengths; ancestry is merged from every
 /// response before bodies are deduplicated, and the longest history wins
 /// deterministically. The result must not depend on input order.
-fn reconcile_leaves(docs: &[Value], requested_rev: Option<&str>) -> Option<Reconciled> {
+pub(crate) fn reconcile_leaves(docs: &[Value], requested_rev: Option<&str>) -> Option<Reconciled> {
     let mut bodies: BTreeMap<String, Value> = BTreeMap::new();
     let mut histories: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
@@ -1781,7 +1576,7 @@ pub(crate) async fn cluster_changes(
     let owned_by_node = preferred_shard_masks(ctx, db);
 
     let doc_ids = doc_ids_from(q, body);
-    let change_filter = crate::api::resolve_changes_filter(db, q).await?;
+    let change_filter = resolve_changes_filter(db, q).await?;
     let changes = ChangesFetch {
         include_docs: flag(q, "include_docs"),
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
@@ -1935,7 +1730,7 @@ pub(crate) async fn fetch_node_changes(
                 descending: false,
                 doc_ids: doc_ids.map(|ids| ids.to_vec()),
                 filter: filter.cloned(),
-                conflicts: crate::api::flag(q, "conflicts"),
+                conflicts: flag(q, "conflicts"),
                 owned: Some(mask.to_vec()),
                 until: None,
             })
@@ -1966,7 +1761,7 @@ pub(crate) async fn fetch_node_changes(
     if let Some(view) = q.get("view") {
         params.push(("view", view.clone()));
     }
-    if crate::api::flag(q, "conflicts") {
+    if flag(q, "conflicts") {
         params.push(("conflicts", "true".to_string()));
     }
     // A filter function reads its own arguments from `req.query`, so the peer
