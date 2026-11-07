@@ -28,6 +28,35 @@ pub fn set_max_open(max: usize) {
     MAX_OPEN.store(max.max(1), Ordering::SeqCst);
 }
 
+/// Lowers the shared cap for the length of a test, then restores the default.
+/// Tests that lower it run one at a time, since they would otherwise reset
+/// each other's cap.
+#[cfg(test)]
+pub struct CapGuard {
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(test)]
+impl CapGuard {
+    pub async fn new(max: usize) -> Self {
+        static SERIAL: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> =
+            std::sync::OnceLock::new();
+        let serial = SERIAL.get_or_init(Default::default).clone();
+        let guard = CapGuard {
+            _serial: serial.lock_owned().await,
+        };
+        set_max_open(max);
+        guard
+    }
+}
+
+#[cfg(test)]
+impl Drop for CapGuard {
+    fn drop(&mut self) {
+        set_max_open(DEFAULT_MAX_OPEN);
+    }
+}
+
 /// What a registry stores.
 pub trait Slot: Default {
     /// Whether anyone but the registry holds this entry. The registry's own

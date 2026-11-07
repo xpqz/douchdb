@@ -491,7 +491,7 @@ pub(super) async fn view_request(
             Ok(merged) => {
                 query.total_rows_override = Some(merged.total_rows);
                 query.offset_override = Some(merged.offset);
-                crate::view::finish(&merged.spec, merged.rows, merged.docs, &query)
+                crate::view::finish(&merged.spec, merged.rows, merged.docs, &query).await
             }
             Err(error) => Err(error),
         }

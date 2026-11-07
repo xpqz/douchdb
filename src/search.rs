@@ -1568,7 +1568,7 @@ mod tests {
     /// documents, until the database was deleted.
     #[tokio::test]
     async fn open_search_indexes_stay_within_the_cap() {
-        crate::index_cache::set_max_open(8);
+        let _cap = crate::index_cache::CapGuard::new(8).await;
         let root = std::env::temp_dir().join(format!("douchdb-search-cap-{}", crate::util::uuid()));
         let db = Db::open(
             &root,

@@ -1406,7 +1406,7 @@ pub async fn query_with_spec(
     } else {
         HashMap::new()
     };
-    finish(spec, rows, docs, &query)
+    finish(spec, rows, docs, &query).await
 }
 
 /// Partitioned design docs may only be queried through `_partition`, and
@@ -1446,14 +1446,19 @@ pub async fn local_select(
     Ok(rows.select(query, query.owner_shards.as_deref(), reduce))
 }
 
-pub fn finish(
+pub async fn finish(
     spec: &ViewSpec,
     rows: Arc<Vec<Row>>,
     docs: HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
     check_query(spec, query)?;
-    render(spec, &rows, &docs, query)
+    if spec.reduce.is_none() || !query.reduce.unwrap_or(true) {
+        return render(spec, &rows, &docs, query);
+    }
+    // A reduce runs user JavaScript.
+    let (spec, query) = (spec.clone(), query.clone());
+    blocking(move || render(&spec, &rows, &docs, &query)).await
 }
 
 /// Reject parameter combinations CouchDB refuses, before any rows are read.
@@ -4384,11 +4389,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The same for a reduce function, which also runs user JavaScript.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_reduce_does_not_block_the_runtime() {
+        let root = std::env::temp_dir().join(format!("douchdb-slowred-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "slow",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc._id, 1); }".to_string(),
+            reduce: Some(
+                "function(k, v, re) { var t = Date.now(); while (Date.now() - t < 600) {} return 1; }"
+                    .to_string(),
+            ),
+            partitioned: false,
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let ticker = tokio::spawn(async move {
+            let mut longest = Duration::ZERO;
+            let mut last = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+                let now = std::time::Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+        tokio::task::yield_now().await;
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let longest = ticker.await.unwrap();
+        assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
+        assert!(
+            longest < Duration::from_millis(300),
+            "the reduce blocked the runtime for {longest:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Every view ever queried used to keep its LevelDB handle and cached rows
     /// until the database was deleted. The registry must stay at the cap.
     #[tokio::test]
     async fn open_view_indexes_stay_within_the_cap() {
-        crate::index_cache::set_max_open(8);
+        let _cap = crate::index_cache::CapGuard::new(8).await;
         let root = std::env::temp_dir().join(format!("douchdb-cap-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
