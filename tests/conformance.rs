@@ -11170,6 +11170,7 @@ fn server_exits_when_its_test_process_is_killed() {
     // SIGKILL: the helper gets no chance to run any Drop.
     drop(helper);
 
+    // SAFETY: kill(2) with signal 0 only probes whether the pid exists.
     let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while alive(pid) && std::time::Instant::now() < deadline {
@@ -11177,6 +11178,7 @@ fn server_exits_when_its_test_process_is_killed() {
     }
     let leaked = alive(pid);
     if leaked {
+        // SAFETY: kill(2) takes plain integers and touches no memory.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let prefix = format!("douchdb-test-{helper_pid}-");

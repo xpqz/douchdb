@@ -603,6 +603,10 @@ impl Worker {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // SAFETY: the closure runs in the forked child before exec, where
+            // only async-signal-safe calls are allowed. It makes nothing but
+            // setrlimit and prctl syscalls on stack values: no allocation,
+            // no locks and no access to parent state.
             unsafe {
                 command.pre_exec(move || {
                     // The debug binary maps ~1 GB of virtual address space
@@ -791,6 +795,10 @@ impl Reaper {
             }
             if let Some((pid, fired)) = state.watched.remove(&key) {
                 fired.store(true, Ordering::SeqCst);
+                // SAFETY: kill(2) takes plain integers and touches no memory.
+                // The entry is still in `watched`, so the worker has not been
+                // reaped and its pid cannot have been reused; the guard that
+                // reaps it removes the entry first.
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }
@@ -1144,12 +1152,20 @@ mod tests {
             return;
         }
         install_seccomp().expect("install seccomp");
+        // SAFETY: getppid and getpid take no arguments and cannot fail.
         let parent = unsafe { libc::getppid() } as libc::c_long;
+        // SAFETY: as above.
         let me = unsafe { libc::getpid() } as libc::c_long;
+        // SAFETY: gettid takes no arguments and cannot fail.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         let path = c"/nonexistent-douchdb/a".as_ptr();
         let other = c"/nonexistent-douchdb/b".as_ptr();
         let at = libc::AT_FDCWD as libc::c_long;
+        // SAFETY: each probe is a raw syscall that is harmless whether the
+        // filter allows or denies it (see the doc comment above). The path
+        // pointers are NUL-terminated literals that outlive the calls, and
+        // the other arguments are zero, -1 or process ids that name nothing
+        // dangerous.
         let probes: Vec<(&str, i32)> = unsafe {
             vec![
                 (
