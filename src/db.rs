@@ -2656,7 +2656,7 @@ fn put_many(
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
         meta.atts.retain(|rev, _| meta.tree.contains(rev));
-        if let Ok(bytes) = serde_json::to_vec(meta) {
+        if let Ok(bytes) = meta_bytes(meta) {
             ops.push((meta_key(id), Some(bytes)));
         }
     }
@@ -2710,7 +2710,7 @@ impl Stage<'_> {
     }
 
     fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = serde_json::to_vec(meta).map_err(ApiError::internal)?;
+        let bytes = meta_bytes(meta).map_err(ApiError::internal)?;
         self.ops.push((meta_key(id), Some(bytes)));
         self.staged.insert(id.to_string(), meta.clone());
         Ok(())
@@ -2898,6 +2898,18 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
     })?;
     let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
     Ok((rev, vec![leaf]))
+}
+
+#[cfg(test)]
+thread_local! {
+    static META_SERIALISES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A document's metadata record as stored.
+fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
+    #[cfg(test)]
+    META_SERIALISES.with(|count| count.set(count.get() + 1));
+    serde_json::to_vec(meta)
 }
 
 fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
@@ -3723,6 +3735,44 @@ fn collect_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Metadata decodes and encodes for one `put_many` call.
+    fn write_costs(shard: &mut crate::store::Shard, docs: Vec<Value>) -> (usize, usize) {
+        let parses = crate::store::meta_parses();
+        let serialises = META_SERIALISES.with(std::cell::Cell::get);
+        let seq = Arc::new(AtomicU64::new(shard.seq()));
+        let reserved = Arc::new(AtomicU64::new(0));
+        let docs = docs.into_iter().enumerate().collect();
+        for (_, result) in put_many(shard, docs, true, &seq, &reserved) {
+            result.unwrap();
+        }
+        (
+            crate::store::meta_parses() - parses,
+            META_SERIALISES.with(std::cell::Cell::get) - serialises,
+        )
+    }
+
+    /// A write reads the document's metadata once (to stage it) and writes it
+    /// once. Staging, pruning and the commit's counter bookkeeping used to
+    /// each decode or encode it again: five decodes and two encodes per update.
+    #[test]
+    fn a_write_decodes_the_metadata_once_and_encodes_it_once() {
+        let dir = std::env::temp_dir().join(format!("douchdb-write-cost-{}", uuid()));
+        let mut shard = crate::store::Shard::open(&dir, 1000).unwrap();
+
+        // A new document has no stored metadata to decode.
+        let costs = write_costs(&mut shard, vec![json!({"_id": "a", "n": 1})]);
+        assert_eq!(costs, (0, 1), "create");
+
+        let rev = shard.get_meta("a").unwrap().unwrap().tree.winner().unwrap();
+        let update = vec![json!({"_id": "a", "_rev": rev, "n": 2})];
+        assert_eq!(write_costs(&mut shard, update), (1, 1), "update");
+
+        // Each document in a batch costs the same.
+        let batch = vec![json!({"_id": "b"}), json!({"_id": "c"})];
+        assert_eq!(write_costs(&mut shard, batch), (0, 2), "batch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_owned_mask_selects_only_the_shards_it_covers() {

@@ -397,10 +397,24 @@ impl ShardName {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static META_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many metadata records this thread has decoded, for tests that pin the
+/// cost of a write.
+#[cfg(test)]
+pub(crate) fn meta_parses() -> usize {
+    META_PARSES.with(std::cell::Cell::get)
+}
+
 /// Decode a stored metadata record. A record that does not parse is
 /// corruption: point reads and writes fail on it, and listings skip it
 /// through `ShardName::report_corrupt`.
 fn parse_meta(key: &[u8], value: &[u8]) -> std::result::Result<(String, DocMeta), CorruptRecord> {
+    #[cfg(test)]
+    META_PARSES.with(|count| count.set(count.get() + 1));
     let id = key
         .get(2..)
         .and_then(|id| std::str::from_utf8(id).ok())
