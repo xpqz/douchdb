@@ -350,8 +350,13 @@ pub struct Db {
     cluster_validation: Arc<std::sync::RwLock<Option<ClusterValidators>>>,
 }
 
-/// Design generation, load time and sources of cluster-merged validators.
-type ClusterValidators = (u64, std::time::Instant, Vec<String>);
+/// Cluster-merged validators with the design generation and time they were
+/// loaded.
+struct ClusterValidators {
+    generation: u64,
+    loaded: std::time::Instant,
+    functions: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct DbConfig {
@@ -775,9 +780,9 @@ impl Db {
             .cluster_validation
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (generation, loaded, functions) = cached.as_ref()?;
-        (*generation == self.design_generation() && loaded.elapsed() < ttl)
-            .then(|| functions.clone())
+        let cached = cached.as_ref()?;
+        (cached.generation == self.design_generation() && cached.loaded.elapsed() < ttl)
+            .then(|| cached.functions.clone())
     }
 
     /// Cache cluster-merged validators read since `generation` was taken,
@@ -788,7 +793,11 @@ impl Db {
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
         if self.design_generation() == generation {
-            *cached = Some((generation, std::time::Instant::now(), functions));
+            *cached = Some(ClusterValidators {
+                generation,
+                loaded: std::time::Instant::now(),
+                functions,
+            });
         }
     }
 
