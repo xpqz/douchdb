@@ -637,6 +637,7 @@ async fn cors_is_opt_in_and_answers_preflight() {
         &[
             "--cors-origins".to_string(),
             "http://example.test,https://*.trusted.test".to_string(),
+            "--cors-credentials".to_string(),
         ],
         false,
     );

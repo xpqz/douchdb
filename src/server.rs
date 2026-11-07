@@ -157,6 +157,12 @@ fn build_state(
         seeds: args.seed_nodes.clone(),
         advertise,
         cors_origins: args.cors_origins.clone(),
+        cors_credentials: args.cors_credentials,
+        cors_headers: args
+            .cors_headers
+            .iter()
+            .map(|header| header.to_ascii_lowercase())
+            .collect(),
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
         default_admin_only,
@@ -298,7 +304,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     crate::index_cache::set_max_open(args.max_open_indexes);
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     check_cluster_args(&args);
-    if args.cors_origins.iter().any(|origin| origin == "*") {
+    if args.cors_credentials && args.cors_origins.iter().any(|origin| origin == "*") {
         tracing::warn!(
             "CORS allows any origin and sends credentials; any website can act as a logged-in user"
         );

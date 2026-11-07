@@ -151,9 +151,17 @@ pub async fn cors(
                 "CORS origin is not allowed",
             ));
         }
+        if let Some(refused) = preflight_header_refused(&st.config, req.headers()) {
+            return fail(ApiError::new(
+                403,
+                "forbidden",
+                format!("CORS header `{refused}` is not allowed"),
+            ));
+        }
         let mut response = StatusCode::NO_CONTENT.into_response();
         add_cors_headers(
             response.headers_mut(),
+            &st.config,
             origin.as_deref().unwrap_or_default(),
             Some(req.headers()),
         );
@@ -164,6 +172,7 @@ pub async fn cors(
     if allowed {
         add_cors_headers(
             response.headers_mut(),
+            &st.config,
             origin.as_deref().unwrap_or_default(),
             None,
         );
@@ -197,7 +206,54 @@ fn cors_origin_allowed(rules: &[String], origin: &str) -> bool {
     })
 }
 
-fn add_cors_headers(headers: &mut HeaderMap, origin: &str, preflight: Option<&HeaderMap>) {
+/// Request headers a preflight may ask for: CouchDB's supported set plus
+/// `authorization` and the browser-set `referer`, `x-csrf-token`, extended by
+/// `--cors-headers` (CouchDB `[cors] headers`).
+const CORS_DEFAULT_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "authorization",
+    "content-length",
+    "content-range",
+    "content-type",
+    "destination",
+    "expires",
+    "if-match",
+    "last-modified",
+    "origin",
+    "pragma",
+    "referer",
+    "x-csrf-token",
+    "x-http-method-override",
+    "x-requested-with",
+];
+
+fn cors_allowed_headers(config: &Config) -> Vec<&str> {
+    CORS_DEFAULT_HEADERS
+        .iter()
+        .copied()
+        .chain(config.cors_headers.iter().map(String::as_str))
+        .collect()
+}
+
+/// The first header a preflight requests that is not allowed, if any.
+fn preflight_header_refused(config: &Config, headers: &HeaderMap) -> Option<String> {
+    let allowed = cors_allowed_headers(config);
+    headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .find(|name| !name.is_empty() && !allowed.contains(&name.as_str()))
+}
+
+fn add_cors_headers(
+    headers: &mut HeaderMap,
+    config: &Config,
+    origin: &str,
+    preflight: Option<&HeaderMap>,
+) {
     let put = |headers: &mut HeaderMap, name, value: &str| {
         if let Ok(value) = HeaderValue::from_str(value) {
             headers.insert(name, value);
@@ -206,7 +262,10 @@ fn add_cors_headers(headers: &mut HeaderMap, origin: &str, preflight: Option<&He
     // Echo the origin rather than using `*`, so cookie credentials work even
     // when the rule is `*`.
     put(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    put(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+    // CouchDB's `[cors] credentials` defaults to false.
+    if config.cors_credentials {
+        put(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+    }
     put(
         headers,
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -214,17 +273,17 @@ fn add_cors_headers(headers: &mut HeaderMap, origin: &str, preflight: Option<&He
     );
     headers.append(header::VARY, HeaderValue::from_static("Origin"));
 
-    if let Some(request_headers) = preflight {
+    if preflight.is_some() {
         put(
             headers,
             header::ACCESS_CONTROL_ALLOW_METHODS,
             "GET, PUT, POST, HEAD, DELETE, OPTIONS",
         );
-        let requested = request_headers
-            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("accept, authorization, content-type, origin, referer, x-csrf-token");
-        put(headers, header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
+        put(
+            headers,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            &cors_allowed_headers(config).join(", "),
+        );
         put(headers, header::ACCESS_CONTROL_MAX_AGE, "3600");
         headers.append(
             header::VARY,

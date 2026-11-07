@@ -29,6 +29,8 @@ pub struct Args {
     pub js_workers: usize,
     pub worker: bool,
     pub cors_origins: Vec<String>,
+    pub cors_credentials: bool,
+    pub cors_headers: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     pub max_request_mb: usize,
@@ -48,7 +50,8 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
                      \x20       [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]\n\
                      \x20       [--js-workers N]\n\
-                     \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
+                     \x20       [--cors-origins ORIGIN,ORIGIN] [--cors-credentials]\n\
+                     \x20       [--cors-headers HEADER,HEADER] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -152,6 +155,8 @@ pub fn parse_from(
         js_workers: 2,
         worker: false,
         cors_origins: Vec::new(),
+        cors_credentials: false,
+        cors_headers: Vec::new(),
         view_timeout_ms: 5000,
         view_memory_mb: 64,
         max_request_mb: 64,
@@ -247,6 +252,8 @@ pub fn parse_from(
             "--cluster-secret" => args.cluster_secret = value(&mut it, flag)?,
             "--otel-endpoint" => args.otel_endpoint = Some(value(&mut it, flag)?),
             "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
+            "--cors-credentials" => args.cors_credentials = true,
+            "--cors-headers" => args.cors_headers = list(&value(&mut it, flag)?),
             "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -320,6 +327,7 @@ mod tests {
         "--cluster-secret",
         "--otel-endpoint",
         "--cors-origins",
+        "--cors-headers",
     ];
 
     #[test]

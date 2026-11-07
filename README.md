@@ -443,6 +443,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]
         [--js-workers N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
+        [--cors-credentials] [--cors-headers HEADER,HEADER]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--max-open-indexes N] [--max-open-dbs N]
         [--otel-endpoint URL]
@@ -476,6 +477,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
+| `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
+| `--cors-headers` | empty | Extra request headers a preflight may ask for, beyond the built-in CouchDB list (CouchDB `[cors] headers`) |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
@@ -494,16 +497,20 @@ Cross-origin access is **off by default**. Enable it for browser clients
 ./target/release/douchdb --cors-origins 'http://localhost:5173,https://*.example.com'
 ```
 
-`*` allows any origin. Origins are echoed back in
-`Access-Control-Allow-Origin` rather than literally sending `*`, so
-`Access-Control-Allow-Credentials: true` works with `_session` cookies. `OPTIONS`
-preflights return `204` with the requested headers and a one-hour max-age;
-preflights from origins not on the list return `403` and get no CORS headers.
-Wildcards match subdomains (`https://*.example.com`), and ports must match
-exactly.
+`*` allows any origin. Origins are echoed back in `Access-Control-Allow-Origin`
+rather than literally sending `*`. Credentials are off, as in CouchDB's
+`[cors] credentials = false`: add `--cors-credentials` to send
+`Access-Control-Allow-Credentials: true` so cross-origin pages can use
+`_session` cookies. `OPTIONS` preflights return `204` with the allowed
+request headers (`Accept`, `Authorization`, `Content-Type`, `Origin`,
+`Referer` and the other CouchDB defaults, plus any `--cors-headers`) and a
+one-hour max-age. A preflight from an origin not on the list, or asking for a
+header that is not allowed, returns `403` and gets no CORS headers. Wildcards
+match subdomains (`https://*.example.com`), and ports must match exactly.
 
-`--cors-origins '*'` lets any website make credentialed requests against a
-logged-in session, so prefer an explicit list outside local development. The
+`--cors-origins '*' --cors-credentials` lets any website make credentialed
+requests against a logged-in session, so prefer an explicit list outside local
+development. The
 embedded `/_utils/` console is same-origin and needs no CORS flag.
 
 ## Cluster
@@ -717,8 +724,8 @@ semantics, admission lanes, cluster caveats and deliberate non-goals.
   an unreachable or black-holed node cannot stall anti-entropy forever.
 - Request bodies default to 64 MiB (`--max-request-mb`); view JS is bounded by
   `--view-memory-mb` and `--view-timeout-ms`.
-- `--cors-origins '*'` allows any website to make credentialed requests against
-  a logged-in session. Prefer an explicit origin list.
+- `--cors-origins '*' --cors-credentials` allows any website to make credentialed
+  requests against a logged-in session. Prefer an explicit origin list.
 
 ## Search
 
