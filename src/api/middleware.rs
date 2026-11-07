@@ -124,9 +124,16 @@ fn hold_for_body(permit: crate::admission::Permit, response: Response) -> Respon
     Response::from_parts(parts, Body::from_stream(held))
 }
 
-/// Opt-in CORS, matching CouchDB's `[cors]` configuration. The embedded
-/// console is served from the same origin and needs none of this; it exists for
-/// browser apps (PouchDB, Fauxton, a separate frontend) on another origin.
+/// Opt-in CORS, matching CouchDB's `[cors]` configuration and its
+/// `chttpd_cors` module (apache/couchdb src/chttpd/src/chttpd_cors.erl). The
+/// embedded console is served from the same origin and needs none of this; it
+/// exists for browser apps (PouchDB, Fauxton, a separate frontend) on another
+/// origin.
+///
+/// Like CouchDB, only a request that passes every preflight check gets the
+/// preflight answer (204). One that does not (unknown method, a requested
+/// header outside the allowed list, no `Access-Control-Request-Method`) is not
+/// treated as a preflight and is handled as the plain request it is.
 pub async fn cors(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -139,46 +146,25 @@ pub async fn cors(
         .headers()
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let allowed = origin
-        .as_deref()
-        .map(|origin| cors_origin_allowed(&st.config.cors_origins, origin))
-        .unwrap_or(false);
+        .map(str::to_string)
+        .filter(|origin| cors_origin_allowed(&st.config.cors_origins, origin));
+    let Some(origin) = origin else {
+        return next.run(req).await;
+    };
 
     if req.method() == Method::OPTIONS {
-        if !allowed {
-            return fail(ApiError::new(
-                403,
-                "forbidden",
-                "CORS origin is not allowed",
-            ));
+        if let Some(mut response) = preflight_response(&st.config, req.headers()) {
+            let out = response.headers_mut();
+            put_cors_header(out, header::ACCESS_CONTROL_ALLOW_ORIGIN, &origin);
+            if st.config.cors_credentials && origin != "*" {
+                put_cors_header(out, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+            }
+            return response;
         }
-        if let Some(refused) = preflight_header_refused(&st.config, req.headers()) {
-            return fail(ApiError::new(
-                403,
-                "forbidden",
-                format!("CORS header `{refused}` is not allowed"),
-            ));
-        }
-        let mut response = StatusCode::NO_CONTENT.into_response();
-        add_cors_headers(
-            response.headers_mut(),
-            &st.config,
-            origin.as_deref().unwrap_or_default(),
-            Some(req.headers()),
-        );
-        return response;
     }
 
     let mut response = next.run(req).await;
-    if allowed {
-        add_cors_headers(
-            response.headers_mut(),
-            &st.config,
-            origin.as_deref().unwrap_or_default(),
-            None,
-        );
-    }
+    add_cors_headers(response.headers_mut(), &st.config, &origin);
     response
 }
 
@@ -208,9 +194,9 @@ fn cors_origin_allowed(rules: &[String], origin: &str) -> bool {
     })
 }
 
-/// Request headers a preflight may ask for: CouchDB's supported set plus
-/// `authorization` and the browser-set `referer`, `x-csrf-token`, extended by
-/// `--cors-headers` (CouchDB `[cors] headers`).
+/// CouchDB's `?SUPPORTED_HEADERS` (chttpd_cors.hrl): the request headers a
+/// preflight may ask for unless `[cors] headers` (`--cors-headers`) replaces
+/// the list.
 const CORS_DEFAULT_HEADERS: &[&str] = &[
     "accept",
     "accept-language",
@@ -224,76 +210,109 @@ const CORS_DEFAULT_HEADERS: &[&str] = &[
     "last-modified",
     "origin",
     "pragma",
-    "referer",
-    "x-csrf-token",
+    "x-couch-full-commit",
+    "x-couch-id",
+    "x-couch-persist",
+    "x-couchdb-www-authenticate",
     "x-http-method-override",
     "x-requested-with",
+    "x-couchdb-vhost-path",
 ];
 
-fn cors_allowed_headers(config: &Config) -> Vec<&str> {
-    CORS_DEFAULT_HEADERS
-        .iter()
-        .copied()
-        .chain(config.cors_headers.iter().map(String::as_str))
-        .collect()
-}
+/// CouchDB's `?SUPPORTED_METHODS`, the default of `[cors] methods`.
+const CORS_METHODS: &str = "CONNECT, COPY, DELETE, GET, HEAD, OPTIONS, POST, PUT, TRACE";
 
-/// The first header a preflight requests that is not allowed, if any.
-fn preflight_header_refused(config: &Config, headers: &HeaderMap) -> Option<String> {
-    let allowed = cors_allowed_headers(config);
-    headers
-        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .split(',')
-        .map(|name| name.trim().to_ascii_lowercase())
-        .find(|name| !name.is_empty() && !allowed.contains(&name.as_str()))
-}
+/// CouchDB's `?CORS_DEFAULT_MAX_AGE`.
+const CORS_MAX_AGE: &str = "600";
 
-fn add_cors_headers(
-    headers: &mut HeaderMap,
-    config: &Config,
-    origin: &str,
-    preflight: Option<&HeaderMap>,
-) {
-    let put = |headers: &mut HeaderMap, name, value: &str| {
-        if let Ok(value) = HeaderValue::from_str(value) {
-            headers.insert(name, value);
-        }
-    };
-    // Echo the origin rather than using `*`, so cookie credentials work even
-    // when the rule is `*`.
-    put(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    // CouchDB's `[cors] credentials` defaults to false.
-    if config.cors_credentials {
-        put(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+/// CouchDB's `?SIMPLE_HEADERS` other than `content-type`, which is always
+/// listed: response headers worth naming in `Access-Control-Expose-Headers`.
+const CORS_SIMPLE_HEADERS: &[&str] = &[
+    "cache-control",
+    "content-language",
+    "expires",
+    "last-modified",
+    "pragma",
+];
+
+/// CouchDB's `?COUCH_HEADERS`, always exposed.
+const CORS_COUCH_HEADERS: &str =
+    "accept-ranges, etag, server, x-couch-request-id, x-couch-update-newrev, x-couchdb-body-time";
+
+/// Whether a preflight may ask for this (lowercase) header: CouchDB's list, or
+/// exactly `--cors-headers` when set (`[cors] headers` replaces the default).
+fn cors_header_allowed(config: &Config, name: &str) -> bool {
+    if config.cors_headers.is_empty() {
+        CORS_DEFAULT_HEADERS.contains(&name)
+    } else {
+        config.cors_headers.iter().any(|allowed| allowed == name)
     }
-    put(
+}
+
+/// `chttpd_cors:handle_preflight_request/3`: the 204 answer, or `None` when the
+/// request is not an acceptable preflight (no request method, a method outside
+/// the supported list, or an unsupported requested header). The origin headers
+/// are added by the caller.
+fn preflight_response(config: &Config, headers: &HeaderMap) -> Option<Response> {
+    let method = headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)?
+        .to_str()
+        .ok()?;
+    if !CORS_METHODS
+        .split(", ")
+        .any(|supported| supported == method)
+    {
+        return None;
+    }
+    let requested = match headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+        Some(value) => value.to_str().ok()?,
+        None => "",
+    };
+    // `re:split(H, ",\\s*", [trim])`: split on commas, drop trailing empties.
+    let mut names: Vec<&str> = requested.split(',').map(str::trim_start).collect();
+    while names.last().is_some_and(|name| name.is_empty()) {
+        names.pop();
+    }
+    if !names
+        .iter()
+        .all(|name| cors_header_allowed(config, &name.to_ascii_lowercase()))
+    {
+        return None;
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let out = response.headers_mut();
+    put_cors_header(out, header::ACCESS_CONTROL_MAX_AGE, CORS_MAX_AGE);
+    put_cors_header(out, header::ACCESS_CONTROL_ALLOW_METHODS, CORS_METHODS);
+    put_cors_header(out, header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
+    Some(response)
+}
+
+fn put_cors_header(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+/// `chttpd_cors:headers/4` for a non-preflight response: the request origin
+/// (also for `*`; CouchDB echoes it), credentials if configured, and the expose
+/// list: `content-type`, the simple response headers present, then CouchDB's
+/// own headers.
+fn add_cors_headers(headers: &mut HeaderMap, config: &Config, origin: &str) {
+    let mut exposed = vec!["content-type".to_string()];
+    for name in headers.keys() {
+        let name = name.as_str().to_ascii_lowercase();
+        if CORS_SIMPLE_HEADERS.contains(&name.as_str()) && !exposed.contains(&name) {
+            exposed.push(name);
+        }
+    }
+    exposed.push(CORS_COUCH_HEADERS.to_string());
+    put_cors_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    if config.cors_credentials && origin != "*" {
+        put_cors_header(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
+    }
+    put_cors_header(
         headers,
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        "ETag, Location, Server, X-Couch-Request-ID, Content-Type, Content-Length",
+        &exposed.join(", "),
     );
-    headers.append(header::VARY, HeaderValue::from_static("Origin"));
-
-    if preflight.is_some() {
-        put(
-            headers,
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            "GET, PUT, POST, HEAD, DELETE, OPTIONS",
-        );
-        put(
-            headers,
-            header::ACCESS_CONTROL_ALLOW_HEADERS,
-            &cors_allowed_headers(config).join(", "),
-        );
-        put(headers, header::ACCESS_CONTROL_MAX_AGE, "3600");
-        headers.append(
-            header::VARY,
-            HeaderValue::from_static("Access-Control-Request-Method"),
-        );
-        headers.append(
-            header::VARY,
-            HeaderValue::from_static("Access-Control-Request-Headers"),
-        );
-    }
 }

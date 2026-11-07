@@ -698,16 +698,18 @@ async fn cors_is_opt_in_and_answers_preflight() {
         Some("http://example.test")
     );
 
+    // CouchDB answers an unlisted origin as the plain request it is.
     let response = options(&s, "http://evil.test").await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
     assert!(response
         .headers()
         .get("access-control-allow-origin")
         .is_none());
 }
 
-/// CouchDB's `[cors]` defaults: `credentials = false`, and preflight only
-/// allows the configured headers rather than echoing whatever was asked for.
+/// CouchDB's `[cors]` defaults: `credentials = false`, and a preflight is only
+/// answered when every requested header is in the allowed list.
 #[tokio::test]
 async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     let preflight = |server: &Server, requested: &'static str| {
@@ -727,7 +729,8 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
             .map(str::to_string)
     };
 
-    // Default: no credentials, and a header outside the allowed list is refused.
+    // Default: no credentials, and a header outside the allowed list is not a
+    // preflight (see cors_preflight_matches_chttpd_cors for the details).
     let s = Server::start_with(
         &[
             "--cors-origins".to_string(),
@@ -739,11 +742,10 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(header(&response, "access-control-allow-credentials"), None);
     let allowed = header(&response, "access-control-allow-headers").unwrap_or_default();
-    assert!(allowed.contains("content-type"), "{allowed}");
-    assert_ne!(allowed, "content-type, authorization", "must not echo");
+    assert_eq!(allowed, "content-type, authorization", "echoed");
     let response = preflight(&s, "x-evil-header").await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-headers"), None);
     let response = s
         .client
         .get(format!("{}/_all_dbs", s.base))
@@ -764,7 +766,7 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
             "http://example.test".to_string(),
             "--cors-credentials".to_string(),
             "--cors-headers".to_string(),
-            "X-Custom-Header".to_string(),
+            "X-Custom-Header,Content-Type".to_string(),
         ],
         false,
     );
@@ -786,6 +788,210 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     assert_eq!(
         header(&response, "access-control-allow-credentials").as_deref(),
         Some("true")
+    );
+}
+
+/// Preflights exactly as CouchDB's `chttpd_cors` (3.5.3) answers them: a
+/// preflight that passes gets 204 with the request origin, `Max-Age: 600`, the
+/// full method list and the requested headers echoed back; anything else
+/// (header not in `[cors] headers`, unknown method, no request method) is not
+/// treated as a preflight at all, so it gets no preflight headers.
+#[tokio::test]
+async fn cors_preflight_matches_chttpd_cors() {
+    const METHODS: &str = "CONNECT, COPY, DELETE, GET, HEAD, OPTIONS, POST, PUT, TRACE";
+    let preflight = |server: &Server,
+                     origin: &'static str,
+                     method: Option<&'static str>,
+                     requested: Option<&'static str>| {
+        let mut request = server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", origin);
+        if let Some(method) = method {
+            request = request.header("Access-Control-Request-Method", method);
+        }
+        if let Some(requested) = requested {
+            request = request.header("Access-Control-Request-Headers", requested);
+        }
+        request.send()
+    };
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+
+    // Any origin, credentials off (CouchDB's default).
+    let any = Server::start_with(&["--cors-origins".to_string(), "*".to_string()], false);
+    // The preflights browser PouchDB 9 sends for replication, captured from
+    // Chromium (clients/pouchdb/browser.js): _changes, _revs_diff, _bulk_get,
+    // _bulk_docs, _local checkpoints and the database itself all ask for
+    // exactly these, with Basic auth in `authorization`.
+    for (method, requested) in [
+        ("GET", "authorization"),
+        ("GET", "authorization,content-type"),
+        ("POST", "authorization,content-type"),
+        ("PUT", "authorization,content-type"),
+    ] {
+        let response = preflight(&any, "http://app.test", Some(method), Some(requested))
+            .await
+            .unwrap();
+        let context = format!("{method} {requested}");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{context}");
+        assert_eq!(
+            header(&response, "access-control-allow-origin").as_deref(),
+            Some("http://app.test"),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-headers").as_deref(),
+            Some(requested),
+            "{context}: the requested headers are echoed verbatim"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-methods").as_deref(),
+            Some(METHODS),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-max-age").as_deref(),
+            Some("600"),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-credentials"),
+            None,
+            "{context}"
+        );
+        assert_eq!(header(&response, "access-control-expose-headers"), None);
+        assert!(!header(&response, "vary")
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("origin"));
+    }
+    // No requested headers: Allow-Headers is present and empty.
+    let response = preflight(&any, "http://app.test", Some("PUT"), None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-headers").as_deref(),
+        Some("")
+    );
+
+    // Not a preflight: a header outside the supported list, an unknown method,
+    // no request method. No preflight headers and no 403; the request is
+    // handled as the plain OPTIONS it is.
+    for (method, requested) in [
+        (Some("PUT"), Some("x-evil")),
+        (Some("PUT"), Some("content-type, x-evil")),
+        (Some("PUT"), Some("referer")),
+        (Some("FOO"), Some("content-type")),
+        (None, Some("content-type")),
+    ] {
+        let response = preflight(&any, "http://app.test", method, requested)
+            .await
+            .unwrap();
+        let context = format!("{method:?} {requested:?}");
+        assert_ne!(response.status(), StatusCode::NO_CONTENT, "{context}");
+        assert_ne!(response.status(), StatusCode::FORBIDDEN, "{context}");
+        for name in [
+            "access-control-allow-headers",
+            "access-control-allow-methods",
+            "access-control-max-age",
+        ] {
+            assert_eq!(header(&response, name), None, "{context}: {name}");
+        }
+    }
+
+    // A specific origin with credentials on: credentials are advertised; an
+    // origin that is not listed gets no CORS headers at all.
+    let credentialed = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://app.test".to_string(),
+            "--cors-credentials".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(
+        &credentialed,
+        "http://app.test",
+        Some("PUT"),
+        Some("authorization,content-type"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+    let response = preflight(
+        &credentialed,
+        "http://other.test",
+        Some("PUT"),
+        Some("content-type"),
+    )
+    .await
+    .unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
+
+    // `--cors-headers` is CouchDB's `[cors] headers`: it replaces the default
+    // list rather than extending it.
+    let custom = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://app.test".to_string(),
+            "--cors-headers".to_string(),
+            "X-Foo".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&custom, "http://app.test", Some("PUT"), Some("x-foo"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = preflight(
+        &custom,
+        "http://app.test",
+        Some("PUT"),
+        Some("content-type"),
+    )
+    .await
+    .unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-headers"), None);
+
+    // Actual responses: the origin (also for `*`), and an expose list that
+    // starts with content-type and ends with CouchDB's own headers.
+    let response = any
+        .client
+        .get(format!("{}/", any.base))
+        .header("Origin", "http://app.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-origin").as_deref(),
+        Some("http://app.test")
+    );
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+    assert!(!header(&response, "vary")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("origin"));
+    let exposed = header(&response, "access-control-expose-headers").unwrap_or_default();
+    assert!(exposed.starts_with("content-type"), "{exposed}");
+    assert!(
+        exposed.ends_with(
+            "accept-ranges, etag, server, x-couch-request-id, x-couch-update-newrev, x-couchdb-body-time"
+        ),
+        "{exposed}"
     );
 }
 

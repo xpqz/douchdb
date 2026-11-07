@@ -142,14 +142,14 @@ pub struct Config {
     pub seeds: Vec<String>,
     /// The URL this node advertises in cluster management views.
     pub advertise: String,
-    /// Empty disables CORS. `*` allows any origin (echoed back, so it also
-    /// works with credentials); entries may be exact origins or `https://*.example.com`.
+    /// Empty disables CORS. `*` allows any origin (the request origin is
+    /// echoed back, as CouchDB does); entries may be exact origins or `https://*.example.com`.
     pub cors_origins: Vec<String>,
     /// Send `Access-Control-Allow-Credentials: true` (CouchDB `[cors]
     /// credentials`, default false).
     pub cors_credentials: bool,
-    /// Request headers allowed beyond the built-in list (CouchDB `[cors]
-    /// headers`), lowercase.
+    /// Request headers a preflight may ask for, replacing CouchDB's default
+    /// list when non-empty (CouchDB `[cors] headers`), lowercase.
     pub cors_headers: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
