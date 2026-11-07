@@ -2,6 +2,7 @@
 
 use crate::db::{ApiError, Db, DbResult};
 use crate::index_cache::Registry;
+use crate::js::JsError;
 use crate::util::hex;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -149,7 +150,7 @@ pub async fn load_spec(db: &Db, ddoc_id: &str, index_name: &str) -> DbResult<Sea
 
 const INDEX_WRAPPER: &str = include_str!("../wasm/js/index.js");
 
-fn engine(limits: crate::view::ViewLimits) -> Result<rquickjs::Runtime, String> {
+fn engine(limits: crate::view::ViewLimits) -> Result<rquickjs::Runtime, JsError> {
     crate::js::runtime(limits.timeout, limits.memory)
 }
 
@@ -157,7 +158,7 @@ pub(crate) fn run_index_json(
     source: &str,
     docs: &[(String, String)],
     limits: crate::view::ViewLimits,
-) -> Result<Vec<IndexedDoc>, String> {
+) -> Result<Vec<IndexedDoc>, JsError> {
     if docs.is_empty() {
         return Ok(Vec::new());
     }
@@ -169,20 +170,21 @@ pub(crate) fn run_index_json(
                 json!({"source": source, "docs": chunk}),
                 limits,
             )?;
-            let mut chunk: Vec<IndexedDoc> =
-                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            let mut chunk: Vec<IndexedDoc> = serde_json::from_value(value)
+                .map_err(|error| JsError::Runtime(error.to_string()))?;
             out.append(&mut chunk);
         }
         return Ok(out);
     }
     let runtime = engine(limits)?;
-    let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
+    let context =
+        rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
     crate::js::guard("index function", || {
         context.with(|ctx| {
             let wrapped = INDEX_WRAPPER.replace(crate::view::WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
-                .map_err(|error| format!("compile: {error}"))?;
+                .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
             let mut out = Vec::with_capacity(docs.len());
             const BATCH: usize = 128;
             for chunk in docs.chunks(BATCH) {
@@ -196,17 +198,17 @@ pub(crate) fn run_index_json(
                 batch.push(']');
                 let output: String = func
                     .call((batch,))
-                    .map_err(|error| format!("{}: {error}", chunk[0].0))?;
+                    .map_err(|error| JsError::Runtime(format!("{}: {error}", chunk[0].0)))?;
                 crate::js::check_output("index function", &output)?;
-                let emitted: Vec<Vec<(String, Value)>> =
-                    serde_json::from_str(&output).map_err(|error| error.to_string())?;
+                let emitted: Vec<Vec<(String, Value)>> = serde_json::from_str(&output)
+                    .map_err(|error| JsError::Runtime(error.to_string()))?;
                 if emitted.len() != chunk.len() {
-                    return Err(format!(
+                    return Err(JsError::Runtime(format!(
                         "{}: index returned {} results for {} documents",
                         chunk[0].0,
                         emitted.len(),
                         chunk.len()
-                    ));
+                    )));
                 }
                 // The id comes from the stored document, not from the object
                 // the index function was handed.

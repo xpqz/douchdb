@@ -8,6 +8,7 @@
 
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use crate::index_cache::{Registry, Slot};
+use crate::js::JsError;
 use crate::util::hex;
 use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
@@ -390,7 +391,7 @@ struct Spans {
 }
 
 impl BlockTree {
-    fn build(rows: &ShardRows, reducer: &mut JsReducer) -> Result<BlockTree, String> {
+    fn build(rows: &ShardRows, reducer: &mut JsReducer) -> Result<BlockTree, JsError> {
         let len = rows.len();
         let mut starts: Vec<usize> = (0..len).step_by(REDUCE_FANOUT).collect();
         starts.push(len);
@@ -486,7 +487,7 @@ impl BlockTree {
     }
 
     /// Recompute what writes invalidated.
-    fn refresh(&mut self, rows: &ShardRows, reducer: &mut JsReducer) -> Result<(), String> {
+    fn refresh(&mut self, rows: &ShardRows, reducer: &mut JsReducer) -> Result<(), JsError> {
         let stale_upper =
             self.spans.levels.len() == 1 && self.spans.levels[0].len() > REDUCE_FANOUT;
         if self.dirty.is_empty() && !stale_upper {
@@ -524,7 +525,7 @@ impl BlockTree {
 
 impl Spans {
     /// Add levels above the top one until a level fits in one parent.
-    fn build_upper(&mut self, reducer: &mut JsReducer) -> Result<(), String> {
+    fn build_upper(&mut self, reducer: &mut JsReducer) -> Result<(), JsError> {
         while let Some(below) = self
             .levels
             .last()
@@ -542,7 +543,7 @@ impl Spans {
 
 /// One parent's partial. A lone child is kept as it is, so a reducer that is
 /// not rereduce-safe sees the same values as a single pass.
-fn combine_children(reducer: &mut JsReducer, children: &[Value]) -> Result<Value, String> {
+fn combine_children(reducer: &mut JsReducer, children: &[Value]) -> Result<Value, JsError> {
     match children {
         [single] => Ok(single.clone()),
         _ => combine_partials(reducer, children),
@@ -634,7 +635,7 @@ impl ViewRows {
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, JsError> {
         let mut partials = Partials::new();
         for (index, rows) in self.shards.iter().enumerate() {
             if mask.is_some_and(|mask| !mask.covers(index)) {
@@ -685,7 +686,7 @@ impl ViewRows {
         assemble_reduce(partials, query, reducer)
     }
 
-    fn block_partials(&self, shard: usize, reducer: &mut JsReducer) -> Result<Arc<Spans>, String> {
+    fn block_partials(&self, shard: usize, reducer: &mut JsReducer) -> Result<Arc<Spans>, JsError> {
         let Some(slot) = self.blocks.get(shard) else {
             return Ok(Arc::default());
         };
@@ -870,7 +871,7 @@ fn reduce_span(
     first: usize,
     end: usize,
     reducer: &mut JsReducer,
-) -> Result<Value, String> {
+) -> Result<Value, JsError> {
     let starts = &spans.starts;
     let count = starts.len().saturating_sub(1);
     // The whole blocks in the span: from the first block starting at or after
@@ -929,7 +930,7 @@ fn block_parts(levels: &[Vec<Value>], lo: usize, hi: usize) -> Vec<Value> {
 fn reduce_rows<'a>(
     rows: impl Iterator<Item = &'a Row> + Clone,
     reducer: &mut JsReducer,
-) -> Result<Value, String> {
+) -> Result<Value, JsError> {
     match reducer.source() {
         "_count" => Ok(json!(rows.count())),
         "_sum" => reduce_sum(rows.map(|row| &row.value)),
@@ -971,7 +972,7 @@ pub(crate) fn assemble_reduce(
     partials: Partials,
     query: &ViewQuery,
     reducer: &mut JsReducer,
-) -> Result<Value, String> {
+) -> Result<Value, JsError> {
     let grouped = query.group || query.group_level > 0;
     let groups: Vec<(Value, Vec<Value>)> = if let Some(keys) = &query.keys {
         // Walk the requested keys in request order (reversed when
@@ -1026,7 +1027,7 @@ pub(crate) fn assemble_reduce(
 pub(crate) fn combine_partials(
     reducer: &mut JsReducer,
     partials: &[Value],
-) -> Result<Value, String> {
+) -> Result<Value, JsError> {
     match reducer.source() {
         "_count" => Ok(json!(partials
             .iter()
@@ -1131,7 +1132,7 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
                     }
                     ViewIndex::open(&path)
                         .map(|index| Arc::new(AsyncMutex::new(index)))
-                        .map_err(|error| ApiError::new(500, "view_index_error", error))
+                        .map_err(ApiError::from)
                 })
             })
             .await
@@ -1160,12 +1161,12 @@ pub fn forget_db(db_path: &Path) {
 }
 
 impl ViewIndex {
-    fn open(path: &Path) -> Result<Self, String> {
+    fn open(path: &Path) -> Result<Self, JsError> {
         let options = LdbOptions {
             create_if_missing: true,
             ..LdbOptions::default()
         };
-        let mut db = Ldb::open(path, options).map_err(|error| error.to_string())?;
+        let mut db = Ldb::open(path, options).map_err(|error| JsError::Index(error.to_string()))?;
         let meta = db
             .get(b"m")
             .and_then(|bytes| serde_json::from_slice::<IndexMeta>(&bytes).ok());
@@ -1181,7 +1182,7 @@ impl ViewIndex {
         })
     }
 
-    fn load_rows(&mut self) -> Result<Vec<Row>, String> {
+    fn load_rows(&mut self) -> Result<Vec<Row>, JsError> {
         // Keys are `r/<base64(docid)>/<ordinal>`; the id is recovered from the
         // key rather than duplicated in every stored row.
         let mut rows = Vec::new();
@@ -1213,7 +1214,7 @@ impl ViewIndex {
     /// Sorted rows for the current index state. The first query after a
     /// rebuild or incremental update pays for loading/sorting; later queries
     /// reuse the same immutable snapshot.
-    fn sorted_rows(&mut self) -> Result<Arc<ViewRows>, String> {
+    fn sorted_rows(&mut self) -> Result<Arc<ViewRows>, JsError> {
         if let Some(rows) = &self.cached {
             return Ok(rows.clone());
         }
@@ -1230,8 +1231,11 @@ impl ViewIndex {
         }
     }
 
-    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<KeyValue>, String> {
-        let mut iterator = self.db.new_iter().map_err(|error| error.to_string())?;
+    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<KeyValue>, JsError> {
+        let mut iterator = self
+            .db
+            .new_iter()
+            .map_err(|error| JsError::Index(error.to_string()))?;
         iterator.seek(prefix);
         let mut out = Vec::new();
         while let Some((key, value)) = iterator.current() {
@@ -1257,7 +1261,7 @@ impl ViewIndex {
         by_doc: HashMap<String, Vec<Row>>,
         last_seq: u64,
         design: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), JsError> {
         let mut batch = WriteBatch::default();
         // The keys of the rows being replaced locate them in the snapshot.
         let mut removed = Vec::new();
@@ -1265,8 +1269,8 @@ impl ViewIndex {
             for (key, stored) in self.scan(&Self::doc_prefix(id))? {
                 batch.delete(&key);
                 if self.cached.is_some() {
-                    let stored: StoredRow =
-                        serde_json::from_slice(&stored).map_err(|error| error.to_string())?;
+                    let stored: StoredRow = serde_json::from_slice(&stored)
+                        .map_err(|error| JsError::Index(error.to_string()))?;
                     removed.push((id.clone(), stored.key));
                 }
             }
@@ -1283,7 +1287,7 @@ impl ViewIndex {
                         key: &row.key,
                         value: &row.value,
                     })
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| JsError::Index(error.to_string()))?,
                 );
                 added.push(row.clone());
             }
@@ -1310,16 +1314,16 @@ impl ViewIndex {
                 last_seq,
                 design: design.to_string(),
             })
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| JsError::Index(error.to_string()))?,
         );
         self.db
             .write(batch, true)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| JsError::Index(error.to_string()))?;
         self.cached = next_cached;
         Ok(())
     }
 
-    fn rebuild(&mut self, mut rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), String> {
+    fn rebuild(&mut self, mut rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), JsError> {
         sort_rows(&mut rows);
         let mut batch = WriteBatch::default();
         for (key, _) in self.scan(b"r/")? {
@@ -1340,7 +1344,7 @@ impl ViewIndex {
                             key: &row.key,
                             value: &row.value,
                         })
-                        .map_err(|error| error.to_string())?,
+                        .map_err(|error| JsError::Index(error.to_string()))?,
                     );
                 }
             }
@@ -1353,11 +1357,11 @@ impl ViewIndex {
                 last_seq,
                 design: design.to_string(),
             })
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| JsError::Index(error.to_string()))?,
         );
         self.db
             .write(batch, true)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| JsError::Index(error.to_string()))?;
         self.cached = Some(Arc::new(ViewRows::from_rows(rows, self.placement)));
         Ok(())
     }
@@ -1571,7 +1575,7 @@ async fn ensure_rows(
             index
                 .rebuild(rows, bound, &design)
                 .and_then(|()| index.sorted_rows())
-                .map_err(|error| ApiError::new(500, "view_index_error", error))
+                .map_err(ApiError::from)
         })
         .await;
     }
@@ -1614,7 +1618,7 @@ async fn ensure_rows(
             index
                 .apply(changed, by_doc, current_seq, &design)
                 .and_then(|()| index.sorted_rows())
-                .map_err(|error| ApiError::new(500, "view_index_error", error))
+                .map_err(ApiError::from)
         })
         .await;
     }
@@ -1625,9 +1629,7 @@ async fn ensure_rows(
     }
     blocking(move || {
         let _gate = gate;
-        index
-            .sorted_rows()
-            .map_err(|error| ApiError::new(500, "view_index_error", error))
+        index.sorted_rows().map_err(ApiError::from)
     })
     .await
 }
@@ -1932,7 +1934,7 @@ impl NativeMap {
         }
     }
 
-    fn run_json(&self, docs: &[(String, String)]) -> Result<Vec<Row>, String> {
+    fn run_json(&self, docs: &[(String, String)]) -> Result<Vec<Row>, JsError> {
         let mut rows = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
             match (
@@ -1945,8 +1947,8 @@ impl NativeMap {
                     value,
                 }),
                 _ => {
-                    let doc: Value =
-                        serde_json::from_str(raw).map_err(|error| format!("{id}: {error}"))?;
+                    let doc: Value = serde_json::from_str(raw)
+                        .map_err(|error| JsError::Runtime(format!("{id}: {error}")))?;
                     rows.push(self.row(id, &doc));
                 }
             }
@@ -2090,25 +2092,30 @@ fn is_js_ident(value: &str) -> bool {
     chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
-fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, String> {
+fn engine(limits: ViewLimits) -> Result<rquickjs::Runtime, JsError> {
     crate::js::runtime(limits.timeout, limits.memory)
 }
 
-fn run_map(source: &str, docs: &[(String, Value)], limits: ViewLimits) -> Result<Vec<Row>, String> {
+fn run_map(
+    source: &str,
+    docs: &[(String, Value)],
+    limits: ViewLimits,
+) -> Result<Vec<Row>, JsError> {
     if let Some(native) = NativeMap::parse(source) {
         let rows = native.run_values(docs);
         return finish_native(rows, source, limits, |index| {
             let (id, doc) = &docs[index];
             serde_json::to_string(doc)
                 .map(|doc| (id.clone(), doc))
-                .map_err(|error| format!("{id}: {error}"))
+                .map_err(|error| JsError::Runtime(format!("{id}: {error}")))
         });
     }
     let mut serialized = Vec::with_capacity(docs.len());
     for (id, doc) in docs {
         serialized.push((
             id.clone(),
-            serde_json::to_string(doc).map_err(|error| format!("{id}: {error}"))?,
+            serde_json::to_string(doc)
+                .map_err(|error| JsError::Runtime(format!("{id}: {error}")))?,
         ));
     }
     run_map_json(source, &serialized, limits)
@@ -2123,7 +2130,7 @@ pub(crate) fn run_filter_json(
     query: &str,
     docs: &[(String, String)],
     limits: ViewLimits,
-) -> Result<std::collections::HashSet<String>, String> {
+) -> Result<std::collections::HashSet<String>, JsError> {
     let wrapped = format!(
         "function (doc) {{ if (({source})(doc, {{\"query\":{query}}})) {{ emit(doc._id, null); }} }}"
     );
@@ -2138,7 +2145,7 @@ pub(crate) fn run_map_json(
     source: &str,
     docs: &[(String, String)],
     limits: ViewLimits,
-) -> Result<Vec<Row>, String> {
+) -> Result<Vec<Row>, JsError> {
     if docs.is_empty() {
         return Ok(Vec::new());
     }
@@ -2158,8 +2165,8 @@ fn finish_native(
     mut rows: Vec<Row>,
     source: &str,
     limits: ViewLimits,
-    doc_json: impl Fn(usize) -> Result<(String, String), String>,
-) -> Result<Vec<Row>, String> {
+    doc_json: impl Fn(usize) -> Result<(String, String), JsError>,
+) -> Result<Vec<Row>, JsError> {
     let pending: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -2175,11 +2182,11 @@ fn finish_native(
         .collect::<Result<Vec<_>, _>>()?;
     let javascript = run_map_js(source, &docs, limits)?;
     if javascript.len() != pending.len() {
-        return Err(format!(
+        return Err(JsError::Runtime(format!(
             "map function emitted {} rows for {} documents",
             javascript.len(),
             pending.len()
-        ));
+        )));
     }
     for (index, row) in pending.into_iter().zip(javascript) {
         rows[index] = row;
@@ -2207,7 +2214,7 @@ fn run_map_js(
     source: &str,
     docs: &[(String, String)],
     limits: ViewLimits,
-) -> Result<Vec<Row>, String> {
+) -> Result<Vec<Row>, JsError> {
     const MAX_DOCS: usize = 256;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
     // Sandbox calls pay a process/wasm boundary per batch. Use a larger batch
@@ -2236,8 +2243,8 @@ fn run_map_js(
                 json!({"source": source, "docs": &docs[start..end]}),
                 limits,
             )?;
-            let chunk: Vec<Row> =
-                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            let chunk: Vec<Row> = serde_json::from_value(value)
+                .map_err(|error| JsError::Runtime(error.to_string()))?;
             rows.extend(chunk);
             start = end;
         }
@@ -2245,14 +2252,15 @@ fn run_map_js(
     }
 
     let runtime = engine(limits)?;
-    let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
+    let context =
+        rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
 
     crate::js::guard("map function", || {
         context.with(|ctx| {
             let wrapped = MAP_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
-                .map_err(|error| format!("compile: {error}"))?;
+                .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
 
             let mut rows = Vec::new();
             let mut start = 0;
@@ -2280,16 +2288,16 @@ fn run_map_js(
                 let first_id = &docs[start].0;
                 let output: String = func
                     .call((batch,))
-                    .map_err(|error| format!("{first_id}: {error}"))?;
+                    .map_err(|error| JsError::Runtime(format!("{first_id}: {error}")))?;
                 crate::js::check_output("map function", &output)?;
                 let emitted: Vec<Vec<(Value, Value)>> = serde_json::from_str(&output)
-                    .map_err(|error| format!("{first_id}: {error}"))?;
+                    .map_err(|error| JsError::Runtime(format!("{first_id}: {error}")))?;
                 if emitted.len() != end - start {
-                    return Err(format!(
+                    return Err(JsError::Runtime(format!(
                         "{first_id}: map returned {} results for {} documents",
                         emitted.len(),
                         end - start
-                    ));
+                    )));
                 }
                 for (offset, pairs) in emitted.into_iter().enumerate() {
                     let id = &docs[start + offset].0;
@@ -2541,7 +2549,11 @@ pub(crate) fn group_key(key: &Value, level: usize) -> Value {
     }
 }
 
-fn reduce_with(reducer: &mut JsReducer, keys: &[Value], values: &[Value]) -> Result<Value, String> {
+fn reduce_with(
+    reducer: &mut JsReducer,
+    keys: &[Value],
+    values: &[Value],
+) -> Result<Value, JsError> {
     match reducer.source() {
         "_count" => return Ok(json!(values.len())),
         "_sum" => return reduce_sum(values.iter()),
@@ -2571,7 +2583,7 @@ pub(crate) fn run_reduce(
     values: &[Value],
     rereduce: bool,
     limits: ViewLimits,
-) -> Result<Value, String> {
+) -> Result<Value, JsError> {
     JsReducer::new(source, limits).call(keys, values, rereduce)
 }
 
@@ -2617,7 +2629,7 @@ impl JsReducer {
         keys: &[Value],
         values: &[Value],
         rereduce: bool,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, JsError> {
         if crate::js::sandboxed() {
             // CouchDB passes null, not [], for keys during rereduce.
             let keys = if rereduce { Value::Null } else { json!(keys) };
@@ -2640,13 +2652,13 @@ impl JsReducer {
         keys: &[Value],
         values: &[Value],
         rereduce: bool,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, JsError> {
         let timeout = self.limits.timeout;
         if self.engine.is_none() {
             self.engine = Some(compile_reducer(&self.source, self.limits)?);
         }
         let Some(engine) = &self.engine else {
-            return Err("reduce engine unavailable".to_string());
+            return Err(JsError::Runtime("reduce engine unavailable".to_string()));
         };
         *engine
             .deadline
@@ -2657,38 +2669,41 @@ impl JsReducer {
                 let func: rquickjs::Function = ctx
                     .globals()
                     .get(REDUCE_GLOBAL)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| JsError::Runtime(error.to_string()))?;
                 // CouchDB passes null, not [], for keys during rereduce.
                 let keys = if rereduce {
                     "null".to_string()
                 } else {
-                    serde_json::to_string(keys).map_err(|error| error.to_string())?
+                    serde_json::to_string(keys)
+                        .map_err(|error| JsError::Runtime(error.to_string()))?
                 };
-                let values = serde_json::to_string(values).map_err(|error| error.to_string())?;
+                let values = serde_json::to_string(values)
+                    .map_err(|error| JsError::Runtime(error.to_string()))?;
                 let output: String = func
                     .call((keys, values, rereduce))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| JsError::Runtime(error.to_string()))?;
                 crate::js::check_output("reduce function", &output)?;
-                serde_json::from_str(&output).map_err(|error| error.to_string())
+                serde_json::from_str(&output).map_err(|error| JsError::Runtime(error.to_string()))
             })
         })
     }
 }
 
-fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, String> {
+fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, JsError> {
     let (runtime, deadline) = crate::js::reusable_runtime(limits.memory)?;
     *deadline.lock().unwrap_or_else(|poison| poison.into_inner()) =
         std::time::Instant::now() + limits.timeout;
-    let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
+    let context =
+        rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
     crate::js::guard("reduce function", || {
         context.with(|ctx| {
             let wrapped = REDUCE_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
-                .map_err(|error| format!("compile: {error}"))?;
+                .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
             ctx.globals()
                 .set(REDUCE_GLOBAL, func)
-                .map_err(|error| error.to_string())
+                .map_err(|error| JsError::Runtime(error.to_string()))
         })
     })?;
     Ok(ReduceEngine {
@@ -2700,17 +2715,14 @@ fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, Str
 
 const SUM_ERROR_REASON: &str = "The _sum function requires that map values be numbers, arrays of numbers, or objects. Objects cannot be mixed with other data structures. Objects can be arbitrarily nested, provided that the values for all fields are themselves numbers, arrays of numbers, or objects.";
 
-/// Prefix that marks a reduce failure CouchDB reports as `invalid_value`.
-const INVALID_VALUE: &str = "invalid_value: ";
-
 /// The HTTP error for a failed reduce.
-pub(crate) fn reduce_failure(reason: &str) -> ApiError {
-    match reason.strip_prefix(INVALID_VALUE) {
-        Some(reason) => ApiError::new(500, "invalid_value", reason),
-        None => ApiError::new(
+pub(crate) fn reduce_failure(error: &JsError) -> ApiError {
+    match error {
+        JsError::InvalidValue(reason) => ApiError::new(500, "invalid_value", reason.as_str()),
+        other => ApiError::new(
             500,
             "view_error",
-            format!("reduce function failed: {reason}"),
+            format!("reduce function failed: {other}"),
         ),
     }
 }
@@ -2719,7 +2731,7 @@ pub(crate) fn reduce_failure(reason: &str) -> ApiError {
 /// arrays add element by element (a number counts as a one-element array),
 /// and objects add member by member. Invalid input is not a failed request
 /// but an error object in place of the reduced value.
-fn reduce_sum<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+fn reduce_sum<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, JsError> {
     let mut acc = json!(0);
     for value in values {
         match sum_values(value, &acc) {
@@ -2819,13 +2831,13 @@ enum StatsValue {
     Many(Vec<StatsValue>),
 }
 
-fn invalid_value(reason: impl std::fmt::Display) -> String {
-    format!("{INVALID_VALUE}{reason}")
+fn invalid_value(reason: impl std::fmt::Display) -> JsError {
+    JsError::InvalidValue(reason.to_string())
 }
 
 /// Read a map value or partial for `_stats`: a number, a stats object, or an
 /// array of those.
-fn stats_input(value: &Value) -> Result<StatsValue, String> {
+fn stats_input(value: &Value) -> Result<StatsValue, JsError> {
     match value {
         Value::Number(number) => {
             let n = number.as_f64().unwrap_or(0.0);
@@ -2843,7 +2855,7 @@ fn stats_input(value: &Value) -> Result<StatsValue, String> {
             .collect::<Result<_, _>>()
             .map(StatsValue::Many),
         Value::Object(members) => {
-            let field = |name: &str| -> Result<f64, String> {
+            let field = |name: &str| -> Result<f64, JsError> {
                 match members.get(name) {
                     None => Err(invalid_value(format!(
                         "user _stats input missing required field {name} ({value})"
@@ -2866,7 +2878,7 @@ fn stats_input(value: &Value) -> Result<StatsValue, String> {
     }
 }
 
-fn merge_stats(acc: StatsValue, next: StatsValue) -> Result<StatsValue, String> {
+fn merge_stats(acc: StatsValue, next: StatsValue) -> Result<StatsValue, JsError> {
     match (acc, next) {
         (StatsValue::One(a), StatsValue::One(b)) => Ok(StatsValue::One(Stats {
             sum: a.sum + b.sum,
@@ -2905,7 +2917,7 @@ fn stats_json(value: &StatsValue) -> Value {
 
 /// Built-in `_stats`: numbers, stats objects (as produced by an earlier
 /// `_stats`) and arrays of either, combined element by element.
-fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, String> {
+fn reduce_stats<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<Value, JsError> {
     let mut acc: Option<StatsValue> = None;
     for value in values {
         let next = stats_input(value)?;
@@ -3049,7 +3061,7 @@ mod tests {
         keys: &[Value],
         values: &[Value],
         limits: ViewLimits,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, JsError> {
         reduce_with(&mut JsReducer::new(source, limits), keys, values)
     }
 
@@ -3057,7 +3069,7 @@ mod tests {
         reduce_value("_sum", &[], values, ViewLimits::default()).unwrap()
     }
 
-    fn stats_of(values: &[Value]) -> Result<Value, String> {
+    fn stats_of(values: &[Value]) -> Result<Value, JsError> {
         reduce_value("_stats", &[], values, ViewLimits::default())
     }
 
