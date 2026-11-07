@@ -81,7 +81,7 @@ pub async fn admit(
     let principal = st.principal(req.headers());
     let lane = crate::admission::Admission::classify(req.method(), path);
     match st.admission.try_admit(&principal, lane) {
-        Ok(_permit) => next.run(req).await,
+        Ok(permit) => hold_for_body(permit, next.run(req).await),
         Err(denied) => {
             let mut response = json(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -96,6 +96,30 @@ pub async fn admit(
             response
         }
     }
+}
+
+/// A response whose body is still being produced (a streamed feed) keeps its
+/// admission permit until the body ends or the client disconnects and the body
+/// is dropped; releasing it when the head returns would let any number of
+/// feeds escape the limits. A body of known size is complete already, so its
+/// permit goes at once and the response is untouched.
+///
+/// Long-lived feeds count against the normal per-user and global limits, with
+/// no lane of their own: see docs/multiuser.md.
+fn hold_for_body(permit: crate::admission::Permit, response: Response) -> Response {
+    use axum::body::HttpBody;
+    let (parts, body) = response.into_parts();
+    if body.size_hint().exact().is_some() {
+        return Response::from_parts(parts, body);
+    }
+    let held = async_stream::stream! {
+        let _permit = permit;
+        let mut data = body.into_data_stream();
+        while let Some(chunk) = data.next().await {
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(held))
 }
 
 /// Opt-in CORS, matching CouchDB's `[cors]` configuration. The embedded

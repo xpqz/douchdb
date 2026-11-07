@@ -339,6 +339,9 @@ pub struct Db {
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
     seq: Arc<AtomicU64>,
+    /// Pinged by the shard actors after a flushed batch that committed a new
+    /// sequence; feeds wait on it instead of polling.
+    commits: Arc<tokio::sync::watch::Sender<()>>,
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
     validation: std::sync::RwLock<Option<Vec<String>>>,
@@ -536,8 +539,13 @@ impl Db {
         let mut shards = Vec::new();
         let mut committed_seq = Vec::with_capacity(file.q as usize);
         let mut reserved_seq = Vec::with_capacity(file.q as usize);
+        let commits = Arc::new(tokio::sync::watch::Sender::new(()));
         for i in 0..file.q {
-            let shard = ShardHandle::spawn(path.join(format!("shard-{i:04}")), config.revs_limit)?;
+            let shard = ShardHandle::spawn(
+                path.join(format!("shard-{i:04}")),
+                config.revs_limit,
+                commits.clone(),
+            )?;
             committed_seq.push(shard.seq_tracker());
             reserved_seq.push(shard.reserved_seq());
             shards.push(shard);
@@ -567,6 +575,7 @@ impl Db {
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
+            commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
             cluster_validation: std::sync::RwLock::new(None),
@@ -1164,6 +1173,13 @@ impl Db {
     /// `changes_watermark` instead.
     pub fn update_seq(&self) -> u64 {
         self.seq.load(Ordering::SeqCst)
+    }
+
+    /// A receiver that changes whenever a write commits on this node. Mark it
+    /// seen (`borrow_and_update`) before reading, so a commit that lands
+    /// during the read is not missed.
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<()> {
+        self.commits.subscribe()
     }
 
     /// Allocate a sequence on `shard` as a write still in flight would: the

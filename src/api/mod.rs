@@ -89,6 +89,12 @@ impl Heartbeat {
         }
     }
 
+    /// Time until the next heartbeat is due; `None` when there is none.
+    pub(crate) fn next_in(&self) -> Option<std::time::Duration> {
+        self.every
+            .map(|every| every.saturating_sub(self.last.elapsed()))
+    }
+
     pub(crate) fn due(&mut self) -> bool {
         let due = self.every.is_some_and(|every| self.last.elapsed() >= every);
         if due {
