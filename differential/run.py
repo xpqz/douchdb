@@ -34,7 +34,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 HERE = Path(__file__).resolve().parent
 DEFAULT_DOUCHDB_IMAGE = "douchdb:differential"
-DEFAULT_COUCHDB_IMAGE = "couchdb:3.5"
+DEFAULT_COUCHDB_IMAGE = (
+    "couchdb:3.5.3@sha256:907eab5b7e55ab7cfd241d39b90b2a335ea40bef82acee5a37388c08bf201dda"
+)
 DB = "diff"
 LARGE_INTEGERS = [2**64, 2**63, -(2**63) - 1, 10**30, 10**40]
 

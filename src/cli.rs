@@ -41,7 +41,8 @@ pub struct Args {
 }
 
 const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
-                     \x20       [--admin user:pass] [--users-file FILE] [--session-secret SECRET]\n\
+                     \x20       [--admin user:pass]         (or DOUCHDB_ADMIN)\n\
+                     \x20       [--users-file FILE] [--session-secret SECRET]\n\
                      \x20       [--default-security open|admin-only]\n\
                      \x20       [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]\n\
                      \x20       [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]\n\
@@ -114,6 +115,19 @@ fn environment(
     }
 }
 
+/// Parse `user:password`. A malformed value must stop startup: ignoring it
+/// would leave the server running with authentication disabled.
+fn admin(value: &str, source: &str) -> Result<(String, String), String> {
+    match value.split_once(':') {
+        Some((user, pass)) if !user.is_empty() && !pass.is_empty() => {
+            Ok((user.to_string(), pass.to_string()))
+        }
+        _ => Err(format!(
+            "{source} expects user:password with a non-empty user and password"
+        )),
+    }
+}
+
 fn list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -134,7 +148,9 @@ pub fn parse_from(
         q: 2,
         n: 3,
         revs_limit: 1000,
-        admin: None,
+        admin: environment(&env, "DOUCHDB_ADMIN")?
+            .map(|value| admin(&value, "DOUCHDB_ADMIN"))
+            .transpose()?,
         users_file: None,
         session_secret: environment(&env, "DOUCHDB_SESSION_SECRET")?.unwrap_or_default(),
         default_security: String::new(),
@@ -186,22 +202,7 @@ pub fn parse_from(
             "--q" => args.q = number(&mut it, flag, 1, u32::MAX.into())?,
             "--n" => args.n = number(&mut it, flag, 1, u32::MAX.into())?,
             "--revs-limit" => args.revs_limit = number(&mut it, flag, 1, u64::MAX)?,
-            "--admin" => {
-                // A malformed value must stop startup: ignoring it would leave
-                // the server running with authentication disabled.
-                let value = it.next().unwrap_or_default();
-                match value.split_once(':') {
-                    Some((user, pass)) if !user.is_empty() && !pass.is_empty() => {
-                        args.admin = Some((user.to_string(), pass.to_string()));
-                    }
-                    _ => {
-                        return Err(
-                            "--admin expects user:password with a non-empty user and password"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
+            "--admin" => args.admin = Some(admin(&it.next().unwrap_or_default(), "--admin")?),
             "--users-file" => args.users_file = Some(value(&mut it, flag)?),
             "--session-secret" => args.session_secret = value(&mut it, flag)?,
             "--default-security" => args.default_security = value(&mut it, flag)?,
@@ -469,6 +470,7 @@ mod tests {
     fn non_utf8_environment_values_are_rejected() {
         use std::os::unix::ffi::OsStringExt;
         for name in [
+            "DOUCHDB_ADMIN",
             "DOUCHDB_CLUSTER_SECRET",
             "DOUCHDB_SESSION_SECRET",
             "OTEL_EXPORTER_OTLP_ENDPOINT",

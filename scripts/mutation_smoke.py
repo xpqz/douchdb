@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """Manual mutation smoke tests for critical correctness paths.
 
-Each mutation is applied in place, the named test is run, and the file is
-restored. A mutation is KILLED when the test fails; SURVIVED is a test gap.
+Each mutation is applied to a throwaway copy of the source tree (the real
+checkout is never modified, so an interrupted run cannot leave it mutated).
+The copy is first built with `--no-run`: a mutation that does not compile is
+an ERROR, not a kill. Then the named test is run. A mutation is KILLED when the
+test fails; SURVIVED is a test gap.
+
+Cargo's target directory is shared with the checkout (`CARGO_TARGET_DIR`, or
+`<repo>/target`) so registry dependencies are not rebuilt. An optional argument
+selects the mutations whose name contains it.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -59,27 +69,58 @@ MUTATIONS = [
 ]
 
 
+BUILD_TIMEOUT = 900
+TEST_TIMEOUT = 600
+IGNORED = shutil.ignore_patterns("target", ".git", ".skis", ".claude", "node_modules", "data", "store")
+
+
+def run(command: list[str], cwd: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def main() -> int:
+    selected = sys.argv[1] if len(sys.argv) > 1 else ""
+    env = dict(os.environ)
+    env.setdefault("CARGO_TARGET_DIR", str(ROOT / "target"))
     failures = 0
-    for name, relative, old, new, test in MUTATIONS:
-        path = ROOT / relative
-        original = path.read_text()
-        if original.count(old) != 1:
-            print(f"ERROR {name}: expected one match in {relative}, found {original.count(old)}")
-            failures += 1
-            continue
-        path.write_text(original.replace(old, new))
-        try:
-            result = subprocess.run(test, cwd=ROOT, capture_output=True, text=True)
-        finally:
-            path.write_text(original)
-        if result.returncode == 0:
-            print(f"SURVIVED {name} ({relative})")
-            failures += 1
-        else:
-            print(f"KILLED   {name} ({relative})")
+    with tempfile.TemporaryDirectory(prefix="mutation-smoke-") as scratch:
+        work = Path(scratch) / "tree"
+        shutil.copytree(ROOT, work, ignore=IGNORED)
+        for name, relative, old, new, test in MUTATIONS:
+            if selected not in name:
+                continue
+            path = work / relative
+            original = (ROOT / relative).read_text()
+            if original.count(old) != 1:
+                print(f"ERROR    {name}: expected one match in {relative}, found {original.count(old)}")
+                failures += 1
+                continue
+            path.write_text(original.replace(old, new))
+            try:
+                build = run([*test, "--no-run"], work, env, BUILD_TIMEOUT)
+                if build is None or build.returncode != 0:
+                    reason = "timed out" if build is None else "does not compile"
+                    print(f"ERROR    {name} ({relative}): mutant {reason}")
+                    if build is not None:
+                        print(build.stderr[-2000:])
+                    failures += 1
+                    continue
+                result = run(test, work, env, TEST_TIMEOUT)
+            finally:
+                path.write_text(original)
+            if result is None:
+                print(f"ERROR    {name} ({relative}): test timed out")
+                failures += 1
+            elif result.returncode == 0:
+                print(f"SURVIVED {name} ({relative})")
+                failures += 1
+            else:
+                print(f"KILLED   {name} ({relative})")
     if failures:
-        print(f"FAIL: {failures} mutation(s) survived or could not be applied")
+        print(f"FAIL: {failures} mutation(s) survived or could not be checked")
         return 1
     print("PASS: every critical mutation was caught")
     return 0
