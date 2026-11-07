@@ -1311,6 +1311,63 @@ async fn changes_filters_support_design_named_view_and_shorthand() {
 }
 
 #[tokio::test]
+async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
+    // A filter that rarely matches forces the scan to refill past several
+    // internal pages before the limit is met.
+    let s = Server::start(false);
+    s.fresh_db("chsparse").await;
+    let mut docs: Vec<Value> = (0..3000)
+        .map(|i| json!({"_id": format!("d{i:05}"), "hit": i % 700 == 699}))
+        .collect();
+    docs.push(json!({"_id": "_design/f",
+        "filters": {"hit": "function (doc) { return doc.hit === true; }"}}));
+    let (status, body) = s
+        .post("/chsparse/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, all) = s.get("/chsparse/_changes").await;
+    let all = all["results"].as_array().unwrap();
+    let expected: Vec<(&Value, &str)> = all
+        .iter()
+        .filter(|row| {
+            row["id"]
+                .as_str()
+                .map(|id| id.starts_with('d') && id[1..].parse::<u32>().map(|i| i % 700 == 699) == Ok(true))
+                .unwrap_or(false)
+        })
+        .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(expected.len(), 4);
+
+    for limit in [1usize, 2, 3, 10] {
+        let (status, body) = s
+            .get(&format!("/chsparse/_changes?filter=f/hit&limit={limit}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["results"].as_array().unwrap();
+        let want = &expected[..limit.min(expected.len())];
+        let got: Vec<(&Value, &str)> = rows
+            .iter()
+            .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, want, "limit {limit}");
+        assert_eq!(
+            body["last_seq"],
+            **got.last().map(|(seq, _)| seq).unwrap(),
+            "limit {limit}"
+        );
+    }
+
+    // Starting after the second match leaves the other two.
+    let since = expected[1].0.clone();
+    let (_, body) = s
+        .get(&format!("/chsparse/_changes?filter=f/hit&limit=1&since={since}"))
+        .await;
+    assert_eq!(body["results"][0]["id"], json!(expected[2].1));
+}
+
+#[tokio::test]
 async fn bulk_docs_handles_local_docs_and_rejects_replicated_docs_without_rev() {
     let s = Server::start(false);
     s.fresh_db("bulkedge").await;
