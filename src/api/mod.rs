@@ -30,7 +30,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 pub(crate) struct DbRequest<'a> {
     pub st: &'a AppState,
-    pub db: &'a Db,
+    pub db: &'a Arc<Db>,
     pub name: &'a str,
     pub method: &'a Method,
     pub uri: &'a Uri,
