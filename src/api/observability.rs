@@ -194,12 +194,8 @@ fn health_status_name(rank: u8) -> &'static str {
     }
 }
 
-/// Health is deliberately explicit about what is checked. It says nothing
-/// about power-loss durability: rusty-leveldb does not fsync.
-async fn local_health(st: &AppState, detailed: bool) -> Value {
-    let mut checks = Vec::new();
-    let snapshot = crate::metrics::snapshot();
-    let process = &snapshot["process"];
+/// The process check: pid, uptime, threads and resident memory.
+fn check_process(process: &Value) -> Value {
     let threads = process["threads"]
         .as_u64()
         .map(|threads| threads.to_string())
@@ -208,7 +204,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         .as_f64()
         .map(|rss| format!("{rss:.1} MB"))
         .unwrap_or_else(|| "unavailable".to_string());
-    checks.push(json!({
+    json!({
         "name": "process",
         "status": "ok",
         "detail": format!(
@@ -217,8 +213,11 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         ),
         "uptime_secs": process["uptime_secs"],
         "rss_mb": process["rss_mb"],
-    }));
+    })
+}
 
+/// Whether the data directory is readable and writable.
+async fn check_storage(st: &AppState, detailed: bool) -> (Value, usize, u64) {
     let root = &st.root;
     let FsHealth {
         readable,
@@ -226,7 +225,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         unreadable,
     } = fs_health(st).await;
     let databases = st.db_names().await.len();
-    checks.push(json!({
+    let check = json!({
         "name": "storage",
         "status": if readable && writable { "ok" } else { "critical" },
         "detail": if detailed {
@@ -241,28 +240,38 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "databases": databases,
         "readable": readable,
         "writable": writable,
-    }));
+    });
+    (check, databases, unreadable)
+}
 
+/// Databases whose shard map a peer has not acknowledged.
+async fn check_placement(st: &AppState) -> Value {
     let pending = {
         let dbs = st.dbs.read().await;
         dbs.values()
             .filter(|db| db.pending_shard_map().is_some())
             .count()
     };
-    checks.push(json!({
+    json!({
         "name": "placement",
         "status": if pending == 0 { "ok" } else { "degraded" },
         "detail": format!("{pending} database(s) with an unacknowledged shard map"),
         "pending_databases": pending,
-    }));
+    })
+}
 
-    checks.push(json!({
+/// Databases whose files could not be read.
+fn check_databases(databases: usize, unreadable: u64) -> Value {
+    json!({
         "name": "databases",
         "status": if unreadable == 0 { "ok" } else { "critical" },
         "detail": format!("{databases} databases · {unreadable} unreadable"),
         "unreadable": unreadable,
-    }));
+    })
+}
 
+/// Whether the placement nodes answer the discovery probes.
+fn check_cluster(st: &AppState) -> Value {
     if st.ctx.cluster.is_clustered() {
         let mut discovery = st
             .cluster_state
@@ -293,17 +302,20 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
                 format!("{reachable}/{total} placement nodes reachable"),
             )
         };
-        checks.push(json!({
+        json!({
             "name": "cluster",
             "status": status,
             "detail": detail,
             "reachable": reachable,
             "nodes": total,
-        }));
+        })
     } else {
-        checks.push(json!({"name": "cluster", "status": "ok", "detail": "single node"}));
+        json!({"name": "cluster", "status": "ok", "detail": "single node"})
     }
+}
 
+/// Whether background replication is running.
+fn check_replication(st: &AppState) -> Value {
     let replication = st.cluster_state.replication_json();
     let (status, detail) = if replication["paused"] == true {
         ("degraded", "background replication paused".to_string())
@@ -322,7 +334,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
             ),
         )
     };
-    checks.push(json!({
+    json!({
         "name": "replication",
         "status": status,
         "detail": detail,
@@ -331,8 +343,11 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "last_finished": replication["last_finished"],
         "runs": replication["runs"],
         "docs": replication["docs"],
-    }));
+    })
+}
 
+/// The recent 5xx rate.
+fn check_http() -> Value {
     // Authorization denials and other 4xx responses are expected client
     // behaviour, not evidence that the server is unhealthy. Only 5xx responses
     // contribute to the readiness signal. The ratio covers a recent window and
@@ -366,14 +381,31 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
             format!("{rate:.1}% of {total} requests in the last {window}s failed with 5xx"),
         )
     };
-    checks.push(json!({
+    json!({
         "name": "http",
         "status": status,
         "detail": detail,
         "errors": errors,
         "total": total,
         "error_rate_pct": rate,
-    }));
+    })
+}
+
+/// Health is deliberately explicit about what is checked. It says nothing
+/// about power-loss durability: rusty-leveldb does not fsync.
+async fn local_health(st: &AppState, detailed: bool) -> Value {
+    let snapshot = crate::metrics::snapshot();
+    let process = &snapshot["process"];
+    let (storage, databases, unreadable) = check_storage(st, detailed).await;
+    let checks = vec![
+        check_process(process),
+        storage,
+        check_placement(st).await,
+        check_databases(databases, unreadable),
+        check_cluster(st),
+        check_replication(st),
+        check_http(),
+    ];
 
     let worst = checks
         .iter()
