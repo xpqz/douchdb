@@ -1590,7 +1590,7 @@ async fn ensure_rows(
                     continue;
                 }
                 if let Some(doc) = row.doc {
-                    docs.push((row.id, serde_json::from_str::<Value>(&doc)?));
+                    docs.push((row.id, serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?));
                 }
             }
             let rows = run_map(&map, &docs, limits).map_err(|reason| {

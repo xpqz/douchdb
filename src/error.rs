@@ -31,6 +31,13 @@ impl ApiError {
         }
     }
 
+    /// A failure that is the server's fault. Conversions from `serde_json`
+    /// errors are deliberately absent: `?` on a user's JSON would turn a 400
+    /// into this 500, so callers who serialise their own data opt in here.
+    pub fn internal(reason: impl std::fmt::Display) -> ApiError {
+        ApiError::new(500, "internal_server_error", reason.to_string())
+    }
+
     pub fn not_found(reason: impl Into<String>) -> ApiError {
         ApiError::new(404, "not_found", reason)
     }
@@ -56,18 +63,12 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-impl From<serde_json::Error> for ApiError {
-    fn from(e: serde_json::Error) -> Self {
-        ApiError::new(500, "internal_server_error", e.to_string())
-    }
-}
-
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         if e.downcast_ref::<crate::store::CorruptRecord>().is_some() {
-            return ApiError::corrupt(e.to_string());
+            return ApiError::corrupt(format!("{e:#}"));
         }
-        ApiError::new(500, "internal_server_error", e.to_string())
+        ApiError::internal(format!("{e:#}"))
     }
 }
 

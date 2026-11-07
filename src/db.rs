@@ -1447,7 +1447,7 @@ impl Db {
                         };
                         let doc = read_doc(s, &id, &doc_opts);
                         if let Some(doc) = skip_corrupt(s, &id, doc)? {
-                            docs.push((id, serde_json::to_string(&doc)?));
+                            docs.push((id, serde_json::to_string(&doc).map_err(ApiError::internal)?));
                         }
                     }
                     Ok(docs)
@@ -1672,7 +1672,7 @@ impl Db {
                 entry["deleted"] = json!(true);
             }
             if let Some(doc) = row.doc {
-                entry["doc"] = serde_json::from_str::<Value>(&doc)?;
+                entry["doc"] = serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?;
             }
             results.push(entry);
         }
@@ -2459,7 +2459,7 @@ impl Stage<'_> {
     }
 
     fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = serde_json::to_vec(meta)?;
+        let bytes = serde_json::to_vec(meta).map_err(ApiError::internal)?;
         self.ops.push((meta_key(id), Some(bytes)));
         self.staged.insert(id.to_string(), meta.clone());
         Ok(())
@@ -2546,7 +2546,7 @@ impl Stage<'_> {
         meta.atts.insert(rev.clone(), atts);
 
         self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body).map_err(ApiError::internal)?)));
         self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
@@ -2584,7 +2584,7 @@ impl Stage<'_> {
         }
 
         self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body).map_err(ApiError::internal)?)));
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
@@ -3418,7 +3418,7 @@ fn collect_changes(
                 },
             );
             match read {
-                Ok(doc) => Some(serde_json::to_string(&doc)?),
+                Ok(doc) => Some(serde_json::to_string(&doc).map_err(ApiError::internal)?),
                 // A tombstone may have no stored body.
                 Err(error) if deleted && error.status == 404 => None,
                 Err(error) if error.status == 404 => {
