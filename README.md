@@ -483,7 +483,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
-| `--cors-headers` | empty | Extra request headers a preflight may ask for, beyond the built-in CouchDB list (CouchDB `[cors] headers`) |
+| `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
@@ -502,16 +502,21 @@ Cross-origin access is **off by default**. Enable it for browser clients
 ./target/release/douchdb --cors-origins 'http://localhost:5173,https://*.example.com'
 ```
 
-`*` allows any origin. Origins are echoed back in `Access-Control-Allow-Origin`
-rather than literally sending `*`. Credentials are off, as in CouchDB's
-`[cors] credentials = false`: add `--cors-credentials` to send
-`Access-Control-Allow-Credentials: true` so cross-origin pages can use
-`_session` cookies. `OPTIONS` preflights return `204` with the allowed
-request headers (`Accept`, `Authorization`, `Content-Type`, `Origin`,
-`Referer` and the other CouchDB defaults, plus any `--cors-headers`) and a
-one-hour max-age. A preflight from an origin not on the list, or asking for a
-header that is not allowed, returns `403` and gets no CORS headers. Wildcards
-match subdomains (`https://*.example.com`), and ports must match exactly.
+`*` allows any origin. As in CouchDB, `Access-Control-Allow-Origin` always
+carries the request's own origin, also for `*`. Credentials are off, as in
+CouchDB's `[cors] credentials = false`: add `--cors-credentials` to send
+`Access-Control-Allow-Credentials: true`, which a browser PouchDB needs (it
+sends requests with credentials). Preflights follow CouchDB's `chttpd_cors`: a
+preflight whose method and requested headers are supported gets `204` with
+`Access-Control-Max-Age: 600`, CouchDB's full method list and the requested
+headers echoed back. The supported request headers are CouchDB's default list
+(`Accept`, `Authorization`, `Content-Type`, `Origin` and so on), or exactly
+the headers given in `--cors-headers` (CouchDB `[cors] headers` replaces the
+default list). Anything else, including a header outside that list, is not
+treated as a preflight: it gets no preflight headers and is handled as a
+plain `OPTIONS` request, so the browser rejects it. Wildcards match
+subdomains (`https://*.example.com`, a douchdb extension), and ports must
+match exactly.
 
 `--cors-origins '*' --cors-credentials` lets any website make credentialed
 requests against a logged-in session, so prefer an explicit list outside local

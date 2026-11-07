@@ -698,16 +698,18 @@ async fn cors_is_opt_in_and_answers_preflight() {
         Some("http://example.test")
     );
 
+    // CouchDB answers an unlisted origin as the plain request it is.
     let response = options(&s, "http://evil.test").await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
     assert!(response
         .headers()
         .get("access-control-allow-origin")
         .is_none());
 }
 
-/// CouchDB's `[cors]` defaults: `credentials = false`, and preflight only
-/// allows the configured headers rather than echoing whatever was asked for.
+/// CouchDB's `[cors]` defaults: `credentials = false`, and a preflight is only
+/// answered when every requested header is in the allowed list.
 #[tokio::test]
 async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     let preflight = |server: &Server, requested: &'static str| {
@@ -727,7 +729,8 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
             .map(str::to_string)
     };
 
-    // Default: no credentials, and a header outside the allowed list is refused.
+    // Default: no credentials, and a header outside the allowed list is not a
+    // preflight (see cors_preflight_matches_chttpd_cors for the details).
     let s = Server::start_with(
         &[
             "--cors-origins".to_string(),
@@ -739,11 +742,10 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(header(&response, "access-control-allow-credentials"), None);
     let allowed = header(&response, "access-control-allow-headers").unwrap_or_default();
-    assert!(allowed.contains("content-type"), "{allowed}");
-    assert_ne!(allowed, "content-type, authorization", "must not echo");
+    assert_eq!(allowed, "content-type, authorization", "echoed");
     let response = preflight(&s, "x-evil-header").await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-headers"), None);
     let response = s
         .client
         .get(format!("{}/_all_dbs", s.base))
@@ -764,7 +766,7 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
             "http://example.test".to_string(),
             "--cors-credentials".to_string(),
             "--cors-headers".to_string(),
-            "X-Custom-Header".to_string(),
+            "X-Custom-Header,Content-Type".to_string(),
         ],
         false,
     );
