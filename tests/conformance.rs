@@ -351,10 +351,7 @@ async fn fallback_pair(nodes: &[Server], db: &str, ids: &[String]) -> (usize, us
     assert_eq!(status, StatusCode::OK, "{map}");
     let q = map["q"].as_u64().unwrap() as u32;
     for (shard, replicas) in map["replicas"].as_array().unwrap().iter().enumerate() {
-        if !ids
-            .iter()
-            .any(|id| douchdb::db::shard_index(id, q) == shard)
-        {
+        if !ids.iter().any(|id| douchdb::shard_index(id, q) == shard) {
             continue;
         }
         let replicas: Vec<usize> = replicas
@@ -4628,7 +4625,7 @@ async fn cluster_reads_fail_with_nodedown_when_a_shard_has_no_live_copy() {
     }
     // Pin placement: the design document's shard lives on node 0 (the
     // coordinator), every other shard only on node 2, which is then killed.
-    let design = douchdb::db::shard_index("_design/v", 4);
+    let design = douchdb::shard_index("_design/v", 4);
     let replicas: Vec<Vec<usize>> = (0..4)
         .map(|shard| if shard == design { vec![0] } else { vec![2] })
         .collect();
@@ -4687,7 +4684,7 @@ async fn cluster_changes_forward_filter_query_args_to_every_shard() {
     // Node 0 holds only the design document's shard and one more; node 1
     // holds every shard. Reads from node 0 therefore fetch the rest from node
     // 1, which must evaluate the filter with the same `req.query`.
-    let design = douchdb::db::shard_index("_design/f", 4);
+    let design = douchdb::shard_index("_design/f", 4);
     let replicas: Vec<Vec<usize>> = (0..4)
         .map(|shard| {
             if shard == design || shard == (design + 1) % 4 {
@@ -5411,7 +5408,7 @@ async fn cluster_post_creates_the_document_on_its_owner() {
             assert_eq!(doc["x"], 1);
         }
         // The owner itself stores it, not just a node that can proxy to it.
-        let shard = douchdb::db::shard_index(&id, map["q"].as_u64().unwrap() as u32);
+        let shard = douchdb::shard_index(&id, map["q"].as_u64().unwrap() as u32);
         let owner = map["replicas"][shard][0].as_u64().unwrap() as usize;
         let (status, _) = nodes[owner]
             .req_with(Method::GET, &format!("/clpost/{id}"), None, &internal)
@@ -5916,7 +5913,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     let (id, owner, writer) = (0..)
         .map(|i| format!("ae{i}"))
         .find_map(|id| {
-            let shard = douchdb::db::shard_index(&id, 4);
+            let shard = douchdb::shard_index(&id, 4);
             let owners: Vec<usize> = map["replicas"][shard]
                 .as_array()
                 .unwrap()
@@ -13178,9 +13175,9 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     // (shard s goes to node s % 3).
     let id = (0..)
         .map(|i| format!("x{i}"))
-        .find(|id| !douchdb::db::shard_index(id, 4).is_multiple_of(3))
+        .find(|id| !douchdb::shard_index(id, 4).is_multiple_of(3))
         .unwrap();
-    let target = douchdb::db::shard_index(&id, 4) % 3;
+    let target = douchdb::shard_index(&id, 4) % 3;
 
     let root = "00000000000000000000000000000000";
     let branch = |rev: &str, v: &str| {

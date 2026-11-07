@@ -15,16 +15,6 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-// Replica-set selection is deliberately centralized here so the shard map is
-// the single source of placement truth for routing, quorum and anti-entropy.
-pub(crate) fn replicas_of_doc(db: &Db, docid: &str) -> Vec<usize> {
-    db.replicas_of_doc(docid)
-}
-
-pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
-    db.owner_of_shard(shard)
-}
-
 /// Assign each shard to exactly one node for a fan-out read. Prefer the
 /// coordinator's local replica when it holds one: for n=3 on three nodes every
 /// node holds every shard, so the whole query can be answered locally instead
@@ -255,7 +245,7 @@ pub(crate) async fn replica_docs(
         opts.open_revs = Some(vec!["all".to_string()]);
     }
 
-    let mut replicas = replicas_of_doc(db, docid);
+    let mut replicas = db.replicas_of_doc(docid);
     if let Some(index) = replicas.iter().position(|node| *node == ctx.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);
@@ -870,10 +860,6 @@ pub(crate) async fn forward_json(
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
-pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
-    db.replicas_of_shard(shard)
-}
-
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
 /// copy is CouchDB's `{error, {nodedown, <<"progress not possible">>}}`
 /// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
@@ -894,7 +880,8 @@ fn fallback_shard_masks(
             {
                 continue;
             }
-            let target = replicas_of_shard(db, shard)
+            let target = db
+                .replicas_of_shard(shard)
                 .into_iter()
                 .find(|candidate| alive.contains(candidate))
                 .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
@@ -1611,7 +1598,7 @@ pub(crate) async fn fetch_ddoc_from_replica(
     ddoc: &str,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
-    for node in replicas_of_doc(db, ddoc) {
+    for node in db.replicas_of_doc(ddoc) {
         if node == ctx.cluster.me {
             continue;
         }

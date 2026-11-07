@@ -886,7 +886,9 @@ all acknowledged documents or refuse to serve them.
 v0.2: the replication protocol, auth, views, search, multiuser admission, a
 Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
-containing `_attachments` are rejected with a 400 `bad_request`.
+containing `_attachments` are rejected with a 400 `bad_request`. Attachments
+that a database written before v0.2 may still hold stay readable (stubs and
+`attachments=true`, with checked chunk reads) but no attachment can be added or changed.
 
 JSON numbers use arbitrary precision: integers beyond `i64`/`u64` are stored
 exactly and hashed with CouchDB's bignum ETF encoding. Document parsing also

@@ -413,9 +413,7 @@ pub(super) async fn view_request(
                 memory: st.config.view_memory_mb.saturating_mul(1024 * 1024),
             },
             owner_shards: None,
-            shard_count: db.q,
             partition: partition.clone().or_else(|| q.get("partition").cloned()),
-            partitioned: db.partitioned,
             total_rows_override: None,
             offset_override: None,
         })
@@ -431,7 +429,7 @@ pub(super) async fn view_request(
         } else if flag(q, "owner_only") {
             query.owner_shards = Some(
                 (0..db.q)
-                    .map(|shard| owner_of_shard(db, shard) == st.ctx.cluster.me)
+                    .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
                     .collect(),
             );
         }

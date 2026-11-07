@@ -4,7 +4,7 @@
 use super::{doc_response, etag_matches, fail};
 use crate::cluster_http::{forward_client_auth, peer_url, percent_encode, ClusterCtx};
 use crate::db::{ApiError, Db};
-use crate::fabric::{reconcile_leaves, replica_docs, replicas_of_doc};
+use crate::fabric::{reconcile_leaves, replica_docs};
 use crate::params::flag;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -110,7 +110,7 @@ pub(crate) async fn quorum_read(
     let requested_rev = q.get("rev").cloned();
     let open_all = requested_rev.is_none();
     let (reachable, docs) = replica_docs(ctx, db, dbname, docid, q, headers, open_all).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
+    let r = r.min(db.replicas_of_doc(docid).len()).max(1);
     if reachable < r {
         crate::telemetry::record_quorum_failure();
         return fail(ApiError::new(
@@ -201,7 +201,7 @@ pub(crate) async fn quorum_reachable(
     r: usize,
 ) -> Option<Response> {
     let (reachable, _) = replica_docs(ctx, db, dbname, docid, q, headers, false).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
+    let r = r.min(db.replicas_of_doc(docid).len()).max(1);
     if reachable < r {
         crate::telemetry::record_quorum_failure();
         Some(fail(ApiError::new(

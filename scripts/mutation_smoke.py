@@ -17,8 +17,8 @@ MUTATIONS = [
     (
         "default write quorum",
         "src/fabric.rs",
-        "        replication / 2 + 1",
-        "        replication",
+        "        copies / 2 + 1",
+        "        copies",
         ["cargo", "test", "--locked", "--test", "conformance", "cluster_default_write_quorum_is_a_majority"],
     ),
     (

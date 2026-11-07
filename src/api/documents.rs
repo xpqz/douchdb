@@ -78,7 +78,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
 
     // Serve locally if this node holds a replica; otherwise try every replica
     // in preference order so a dead primary does not break reads or writes.
-    let replicas = replicas_of_doc(db, &docid);
+    let replicas = db.replicas_of_doc(&docid);
     if st.ctx.cluster.is_clustered() && !replicas.contains(&st.ctx.cluster.me) {
         let mut forward_q = q.clone();
         // The peer is a replica; answer locally instead of starting another

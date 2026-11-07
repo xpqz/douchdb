@@ -16,8 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-pub const ATTEST_CHUNK: usize = 64 * 1024;
-
 /// Body keys examined per round of the compaction sweep.
 #[cfg(not(test))]
 const BODY_SWEEP_BATCH: usize = 1000;
@@ -148,13 +146,6 @@ impl LatestChanges {
             .map(|(seq, id)| (*seq, id.as_str()))
     }
 
-    /// Documents whose latest sequence is below `before`, in sequence order.
-    pub fn before(&self, before: u64) -> impl DoubleEndedIterator<Item = (u64, &str)> {
-        self.by_seq
-            .range(..(before, String::new()))
-            .map(|(seq, id)| (*seq, id.as_str()))
-    }
-
     /// Every document, in sequence order.
     pub fn all(&self) -> impl DoubleEndedIterator<Item = (u64, &str)> {
         self.by_seq.iter().map(|(seq, id)| (*seq, id.as_str()))
@@ -162,17 +153,6 @@ impl LatestChanges {
 
     pub fn seq_of(&self, id: &str) -> Option<u64> {
         self.by_id.get(id).copied()
-    }
-
-    /// Ids starting with `prefix`, in id order.
-    pub fn ids_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> {
-        self.by_id
-            .range::<str, _>((
-                std::ops::Bound::Included(prefix),
-                std::ops::Bound::Unbounded,
-            ))
-            .map(|(id, _)| id)
-            .take_while(move |id| id.starts_with(prefix))
     }
 }
 
@@ -2116,13 +2096,19 @@ mod scan_tests {
             if seq % 97 == 0 {
                 for cursor in [0, 1, seq / 3, seq / 2, seq - 1, seq, seq + 1, u64::MAX] {
                     assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
-                    assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+                    assert_eq!(
+                        latest.count_before(cursor),
+                        latest.all().take_while(|(seq, _)| *seq < cursor).count()
+                    );
                 }
             }
         }
         for cursor in 0..=seq + 1 {
             assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
-            assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+            assert_eq!(
+                latest.count_before(cursor),
+                latest.all().take_while(|(seq, _)| *seq < cursor).count()
+            );
         }
     }
 
@@ -2147,18 +2133,10 @@ mod scan_tests {
         assert!(after(4).is_empty());
         assert!(after(u64::MAX).is_empty());
         assert_eq!(
-            latest.before(3).map(|(seq, _)| seq).collect::<Vec<_>>(),
-            [2]
-        );
-        assert_eq!(
             latest.all().rev().map(|(seq, _)| seq).collect::<Vec<_>>(),
             [4, 3, 2]
         );
         assert_eq!(latest.seq_of("a"), Some(4));
-        assert_eq!(
-            latest.ids_with_prefix("_design/").collect::<Vec<_>>(),
-            ["_design/v"]
-        );
     }
 
     /// Updates delete the previous sequence entry. Once memtables have rolled
