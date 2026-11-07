@@ -5095,6 +5095,18 @@ fn all_shards_on(node: usize) -> Value {
     })
 }
 
+/// A node to pin a database on so that a rebalance has to move it: node 0
+/// unless the planned placement already keeps every shard there. Default
+/// placement depends on the random ports.
+fn node_to_pin_away_from(planned: &Value) -> usize {
+    let all_on_zero = planned["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|replicas| replicas[0] == 0);
+    usize::from(all_on_zero)
+}
+
 #[tokio::test]
 async fn cluster_shard_map_moves_data_between_nodes() {
     let mut nodes = start_cluster_with(3, "1", 1);
@@ -13788,8 +13800,9 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     // The default placement is the one a rebalance moves the database to.
     let (status, planned) = nodes[0].get("/_node/_local/_dbs/confreb").await;
     assert_eq!(status, StatusCode::OK, "{planned}");
+    let pinned = node_to_pin_away_from(&planned);
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/confreb", all_shards_on(0))
+        .put("/_node/_local/_dbs/confreb", all_shards_on(pinned))
         .await;
     assert_eq!(status, StatusCode::OK);
     let internal = [
@@ -13797,7 +13810,8 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
 
-    // A document whose shard moves away from node 0 in the planned map.
+    // A document whose shard moves away from the pinned node in the planned
+    // map. Some shard does: the pin is chosen so the plan is not all on it.
     let owner_of = |id: &str| {
         planned["replicas"][douchdb::shard_index(id, 4)][0]
             .as_u64()
@@ -13805,8 +13819,8 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     };
     let id = (0..1000)
         .map(|i| format!("x{i}"))
-        .find(|id| owner_of(id) != 0)
-        .expect("the planned map keeps every shard on node 0");
+        .find(|id| owner_of(id) != pinned)
+        .expect("the pin was chosen so that some shard moves");
     let target = owner_of(&id);
 
     let root = "00000000000000000000000000000000";
@@ -14163,8 +14177,12 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     for node in &nodes {
         node.fresh_db("rebread").await;
     }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/rebread").await;
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/rebread", all_shards_on(0))
+        .put(
+            "/_node/_local/_dbs/rebread",
+            all_shards_on(node_to_pin_away_from(&planned)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)
