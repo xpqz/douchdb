@@ -13,6 +13,7 @@ use crate::store::{
     blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
     ATTEST_CHUNK,
 };
+use crate::util::{hex, uuid};
 use base64::Engine;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -34,25 +35,6 @@ pub const META_FIELDS: [&str; 9] = [
     "_revs_info",
     "_local_seq",
 ];
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn uuid() -> String {
-    hex(&random_bytes::<16>())
-}
-
-/// Bytes from the operating system's CSPRNG. The generator failing means the
-/// platform cannot provide randomness at all, which nothing here can recover
-/// from; carrying on with predictable ids or keys would be worse.
-pub fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    if let Err(error) = getrandom::fill(&mut buf) {
-        panic!("operating system random number generator failed: {error}");
-    }
-    buf
-}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DbFile {
@@ -3658,7 +3640,7 @@ mod tests {
     }
 
     async fn single_shard_db(name: &str) -> (Db, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             name,
@@ -3688,7 +3670,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
-        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "stem",
@@ -3722,7 +3704,7 @@ mod tests {
 
     #[tokio::test]
     async fn replicated_writes_do_not_keep_attachments_for_stemmed_revisions() {
-        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "stematts",
@@ -3976,7 +3958,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
-        let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "valfail",
@@ -4025,7 +4007,7 @@ mod tests {
 
     #[test]
     fn security_versions_order_updates_and_survive_reopen() {
-        let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
@@ -4073,7 +4055,7 @@ mod tests {
     }
 
     fn open_error(file: &str, contents: &[u8]) -> ApiError {
-        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::util::uuid()));
         drop(Db::open(&root, "meta", meta_config()).unwrap());
         std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
         let error = match Db::open(&root, "meta", meta_config()) {
@@ -4107,7 +4089,7 @@ mod tests {
 
     #[test]
     fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
-        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 2,
             revs_limit: 100,
@@ -4160,7 +4142,7 @@ mod tests {
 
     #[test]
     fn write_atomic_replaces_whole_and_leaves_no_temporary_file() {
-        let dir = std::env::temp_dir().join(format!("douchdb-atomic-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-atomic-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("meta.json");
         write_atomic(&target, b"first").unwrap();
@@ -4172,7 +4154,7 @@ mod tests {
 
     #[test]
     fn failed_atomic_write_shows_no_partial_file() {
-        let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // A directory that is not there.
@@ -4208,7 +4190,7 @@ mod tests {
 
     #[test]
     fn create_private_atomic_is_exclusive_and_owner_only() {
-        let dir = std::env::temp_dir().join(format!("douchdb-private-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-private-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("secret");
         create_private_atomic(&target, b"one").unwrap();
@@ -4227,7 +4209,7 @@ mod tests {
 
     #[test]
     fn concurrent_client_shard_maps_get_distinct_versions() {
-        let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "next",
@@ -4267,7 +4249,7 @@ mod tests {
 
     #[test]
     fn equal_version_shard_maps_converge_on_one_winner() {
-        let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::util::uuid()));
         let open = |name: &str| {
             Db::open(
                 &root,
@@ -4305,7 +4287,7 @@ mod tests {
 
     #[test]
     fn expired_migration_map_does_not_affect_placement() {
-        let root = std::env::temp_dir().join(format!("douchdb-stale-mig-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stale-mig-{}", crate::util::uuid()));
         let active = ShardMap {
             q: 2,
             node_count: 2,
@@ -4343,7 +4325,7 @@ mod tests {
 
     #[tokio::test]
     async fn design_documents_replicate_to_every_node() {
-        let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "placement",
@@ -4378,7 +4360,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_limit_reports_pending_documents() {
-        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "pending",
@@ -4430,7 +4412,7 @@ mod tests {
     #[tokio::test]
     async fn changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence() {
         let q = 4u32;
-        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "watermark",
@@ -4505,7 +4487,7 @@ mod tests {
     #[tokio::test]
     async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
-        let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "flushfail",

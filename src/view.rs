@@ -6,7 +6,8 @@
 //! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
-use crate::db::{hex, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::util::hex;
 use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
 use icu_collator::Collator;
@@ -3201,7 +3202,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewseq-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3262,7 +3263,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgate-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3347,7 +3348,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewflight-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -3439,7 +3440,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgap-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,

@@ -193,7 +193,7 @@ pub async fn db_root(
                 return fail(e);
             }
             if doc.get("_id").is_none() {
-                doc["_id"] = json!(crate::db::uuid());
+                doc["_id"] = json!(crate::util::uuid());
             }
             let id = match doc.get("_id") {
                 Some(Value::String(id)) if !id.is_empty() => id.clone(),

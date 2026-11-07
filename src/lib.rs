@@ -27,6 +27,7 @@ pub mod server;
 pub mod store;
 pub mod telemetry;
 pub mod ui;
+pub mod util;
 pub mod validate;
 pub mod view;
 

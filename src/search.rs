@@ -1,6 +1,7 @@
 //! Tantivy-backed CouchDB search indexes.
 
-use crate::db::{hex, ApiError, Db, DbResult};
+use crate::db::{ApiError, Db, DbResult};
+use crate::util::hex;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1548,7 +1549,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-update-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1669,7 +1670,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-flight-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1766,7 +1767,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-gap-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1840,7 +1841,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-damaged-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,

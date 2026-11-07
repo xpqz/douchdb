@@ -73,7 +73,7 @@ impl FsHealthCache {
 /// `spawn_blocking`.
 fn probe_fs(root: &std::path::Path) -> FsHealth {
     let readable = std::fs::read_dir(root).is_ok();
-    let probe = root.join(format!(".health-{}", crate::db::uuid()));
+    let probe = root.join(format!(".health-{}", crate::util::uuid()));
     let writable = std::fs::write(&probe, b"ok").is_ok();
     let _ = std::fs::remove_file(&probe);
     let mut unreadable = 0u64;
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn probe_fs_counts_unreadable_db_json() {
-        let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::util::uuid()));
         let good = dir.join("good");
         let bad = dir.join("bad");
         assert!(std::fs::create_dir_all(&good).is_ok());
