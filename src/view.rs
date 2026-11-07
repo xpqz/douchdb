@@ -4343,4 +4343,60 @@ mod tests {
         assert_eq!(stats["min"], 1);
         assert_eq!(stats["max"], 3);
     }
+    /// A slow map function must run off the async workers: on a one-thread
+    /// runtime a task that only yields has to keep running while the map spins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_map_does_not_block_the_runtime() {
+        let root = std::env::temp_dir().join(format!("douchdb-slowmap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "slow",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { var t = Date.now(); while (Date.now() - t < 600) {} emit(doc._id, 1); }"
+                .to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let ticker = tokio::spawn(async move {
+            let mut longest = Duration::ZERO;
+            let mut last = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+                let now = std::time::Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+        tokio::task::yield_now().await;
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let longest = ticker.await.unwrap();
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
+        assert!(
+            longest < Duration::from_millis(300),
+            "the map blocked the runtime for {longest:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
