@@ -1367,10 +1367,14 @@ pub async fn query_with_spec(
     {
         check_query(spec, query)?;
         let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-        let mut js = JsReducer::new(reducer, query.limits);
-        return rows
-            .reduce(query, query.owner_shards.as_deref(), &mut js)
-            .map_err(|reason| reduce_failure(&reason));
+        let reducer = reducer.to_string();
+        let query = query.clone();
+        return blocking(move || {
+            let mut js = JsReducer::new(&reducer, query.limits);
+            rows.reduce(&query, query.owner_shards.as_deref(), &mut js)
+                .map_err(|reason| reduce_failure(&reason))
+        })
+        .await;
     }
     let selection = local_select(db, ddoc_id, view_name, spec, query, reduce).await?;
     let mut query = query.clone();
@@ -1512,9 +1516,9 @@ async fn ensure_rows(
             spec.reduce.as_deref().unwrap_or_default()
         )
     };
-    let _gate = index_gate(db).read_owned().await;
+    let gate = index_gate(db).read_owned().await;
     let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
-    let mut index = handle.lock().await;
+    let mut index = handle.lock_owned().await;
     index.set_placement((db.q, db.partitioned));
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
@@ -1523,18 +1527,28 @@ async fn ensure_rows(
     // in flight has taken its sequence but is not readable yet, and an index
     // that recorded a sequence past it would never see that write.
     let current_seq = db.changes_watermark(index.last_seq, None);
+    let map = spec.map.clone();
 
+    // The map functions and the index writes run on the blocking pool, with
+    // the gate and the index lock moved in: they stay held until the work is
+    // done even if the request is dropped meanwhile, and the async workers
+    // never wait on user JavaScript or on LevelDB.
     if index.design != design || index.last_seq > current_seq {
         // Read the bound before scanning, so a write that lands during the
         // scan stays above it and is picked up by the next update.
         let bound = db.changes_watermark(0, None);
-        let rows = map_all(db, &spec.map, limits).await?;
-        index
-            .rebuild(rows, bound, &design)
-            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
-        return index
-            .sorted_rows()
-            .map_err(|error| ApiError::new(500, "view_index_error", error));
+        let docs = db.map_docs(None).await?;
+        return blocking(move || {
+            let _gate = gate;
+            let rows = run_map_json(&map, &docs, limits).map_err(|reason| {
+                ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+            })?;
+            index
+                .rebuild(rows, bound, &design)
+                .and_then(|()| index.sorted_rows())
+                .map_err(|error| ApiError::new(500, "view_index_error", error))
+        })
+        .await;
     }
 
     if index.last_seq < current_seq {
@@ -1546,42 +1560,58 @@ async fn ensure_rows(
                 ..Default::default()
             })
             .await?;
-        let mut changed = Vec::new();
-        let mut docs = Vec::new();
-        for row in rows {
-            changed.push(row.id.clone());
-            if row.id.starts_with("_design/") || row.id.starts_with("_local/") || row.deleted {
-                continue;
+        return blocking(move || {
+            let _gate = gate;
+            let mut changed = Vec::new();
+            let mut docs = Vec::new();
+            for row in rows {
+                changed.push(row.id.clone());
+                if row.id.starts_with("_design/") || row.id.starts_with("_local/") || row.deleted {
+                    continue;
+                }
+                if let Some(doc) = row.doc {
+                    docs.push((row.id, serde_json::from_str::<Value>(&doc)?));
+                }
             }
-            if let Some(doc) = row.doc {
-                docs.push((row.id, serde_json::from_str::<Value>(&doc)?));
+            let rows = run_map(&map, &docs, limits).map_err(|reason| {
+                ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+            })?;
+            let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+            for row in rows {
+                by_doc.entry(row.id.clone()).or_default().push(row);
             }
-        }
-        let rows = run_map(&spec.map, &docs, limits).map_err(|reason| {
-            ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-        })?;
-        let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
-        for row in rows {
-            by_doc.entry(row.id.clone()).or_default().push(row);
-        }
-        // Every sequence up to the bound was committed before it was read and
-        // the changes above covered them all, so a gap left by a write that
-        // never finished does not keep the index behind.
-        index
-            .apply(changed, by_doc, current_seq, &design)
-            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
+            // Every sequence up to the bound was committed before it was read
+            // and the changes above covered them all, so a gap left by a
+            // write that never finished does not keep the index behind.
+            index
+                .apply(changed, by_doc, current_seq, &design)
+                .and_then(|()| index.sorted_rows())
+                .map_err(|error| ApiError::new(500, "view_index_error", error))
+        })
+        .await;
     }
 
-    index
-        .sorted_rows()
-        .map_err(|error| ApiError::new(500, "view_index_error", error))
+    // Warm: the snapshot is an Arc clone. Only a cold one reads LevelDB.
+    if let Some(rows) = &index.cached {
+        return Ok(rows.clone());
+    }
+    blocking(move || {
+        let _gate = gate;
+        index
+            .sorted_rows()
+            .map_err(|error| ApiError::new(500, "view_index_error", error))
+    })
+    .await
 }
 
-async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<Row>> {
-    let docs = db.map_docs(None).await?;
-    run_map_json(map_source, &docs, limits).map_err(|reason| {
-        ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-    })
+/// Run `work` on the blocking pool. User JavaScript, LevelDB and the worker
+/// pipes all block their thread, which must not be an async worker.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> DbResult<T> + Send + 'static,
+) -> DbResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::new(500, "view_error", format!("view task failed: {error}")))?
 }
 
 pub(crate) async fn docs_by_ids(

@@ -670,18 +670,9 @@ impl Worker {
     /// Read the hello frame, killing the worker if it does not arrive within
     /// `timeout`.
     fn await_hello(&mut self, timeout: Duration) -> Result<Value, String> {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let pid = self.pid;
-        let watchdog = std::thread::spawn(move || {
-            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        });
+        let deadline = reaper().watch(self.pid, timeout);
         let hello = read_frame(&mut self.stdout);
-        let _ = done_tx.send(());
-        let _ = watchdog.join();
+        drop(deadline);
         match hello {
             Ok(Some(body)) => serde_json::from_slice(&body)
                 .map_err(|error| format!("worker hello: {error}"))
@@ -694,29 +685,13 @@ impl Worker {
     }
 
     fn request(&mut self, body: &[u8], timeout: Duration) -> Result<WorkerOutcome, WorkerError> {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let pid = self.pid;
-        let deadline = timeout + Duration::from_secs(2);
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let flag = timed_out.clone();
-        let watchdog = std::thread::spawn(move || match done_rx.recv_timeout(deadline) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                flag.store(true, Ordering::SeqCst);
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        });
+        let deadline = reaper().watch(self.pid, timeout + Duration::from_secs(2));
         let result = write_frame(&mut self.stdin, body).and_then(|_| {
             read_frame(&mut self.stdout)?.ok_or_else(|| "worker closed the connection".to_string())
         });
-        let _ = done_tx.send(());
-        let _ = watchdog.join();
-        let response = result.map_err(|message| WorkerError {
-            message,
-            timed_out: timed_out.load(Ordering::SeqCst),
-        })?;
+        let timed_out = deadline.expired();
+        drop(deadline);
+        let response = result.map_err(|message| WorkerError { message, timed_out })?;
         let response: Value = serde_json::from_slice(&response).map_err(|error| WorkerError {
             message: error.to_string(),
             timed_out: false,
@@ -740,6 +715,104 @@ impl Worker {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// One thread kills every worker that outlives its deadline, instead of an OS
+/// thread per request. A request registers its worker's pid and deadline and
+/// drops the returned [`Deadline`] when the exchange ends, which removes the
+/// entry. The kill happens under the lock that removal takes, and the worker
+/// is reaped only after the entry is gone, so a pid is never signalled after
+/// it could have been reused.
+struct Reaper {
+    state: Mutex<ReaperState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct ReaperState {
+    next: u64,
+    /// By deadline, then registration order: the pid and whether it fired.
+    watched: std::collections::BTreeMap<(Instant, u64), (i32, Arc<AtomicBool>)>,
+}
+
+struct Deadline {
+    key: (Instant, u64),
+    fired: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn expired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        reaper().lock().watched.remove(&self.key);
+    }
+}
+
+impl Reaper {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReaperState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn watch(&self, pid: i32, timeout: Duration) -> Deadline {
+        let fired = Arc::new(AtomicBool::new(false));
+        let mut state = self.lock();
+        state.next += 1;
+        let key = (Instant::now() + timeout, state.next);
+        state.watched.insert(key, (pid, fired.clone()));
+        drop(state);
+        self.wake.notify_one();
+        Deadline { key, fired }
+    }
+
+    fn run(&self) {
+        let mut state = self.lock();
+        loop {
+            let Some(key) = state.watched.keys().next().copied() else {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poison| poison.into_inner());
+                continue;
+            };
+            let now = Instant::now();
+            if key.0 > now {
+                state = self
+                    .wake
+                    .wait_timeout(state, key.0 - now)
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .0;
+                continue;
+            }
+            if let Some((pid, fired)) = state.watched.remove(&key) {
+                fired.store(true, Ordering::SeqCst);
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+fn reaper() -> &'static Reaper {
+    static REAPER: OnceLock<&'static Reaper> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let reaper: &'static Reaper = Box::leak(Box::new(Reaper {
+            state: Mutex::new(ReaperState::default()),
+            wake: Condvar::new(),
+        }));
+        // If the thread cannot start no deadline fires, and a hung worker
+        // holds its request until the worker itself exits.
+        let _ = std::thread::Builder::new()
+            .name("js-reaper".to_string())
+            .spawn(move || reaper.run());
+        reaper
+    })
 }
 
 struct PoolState {
@@ -985,6 +1058,22 @@ mod tests {
             .expect_err("no hello was sent");
         assert!(error.contains("did not start"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_finished_request_cancels_its_deadline() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut worker = Worker::spawn_command(command).expect("spawn");
+        let deadline = reaper().watch(worker.pid, Duration::from_millis(200));
+        let other = reaper().watch(worker.pid, Duration::from_secs(60));
+        drop(deadline);
+        std::thread::sleep(Duration::from_millis(500));
+        let exited = worker.child.try_wait().expect("try_wait");
+        assert!(!other.expired());
+        drop(other);
+        worker.kill();
+        assert!(exited.is_none(), "a cancelled deadline still killed it");
     }
 
     #[test]
