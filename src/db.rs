@@ -10,7 +10,8 @@ use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, LiveDoc, ShardHandle, Tx,
+    blob_prefix, body_key, local_key, meta_key, meta_state, seq_key, AttMeta, DocMeta, LiveDoc,
+    MetaState, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -1214,13 +1215,15 @@ impl Db {
         let mut doc_count = 0;
         let mut deleted_count = 0;
         let mut update_seq = 0;
-        for shard in &self.shards {
-            let (docs, deleted, seq) = shard
-                .call(|s| {
-                    let (docs, deleted) = s.counts();
-                    Ok((docs, deleted, s.seq()))
-                })
-                .await?;
+        let counts = futures::future::join_all(self.shards.iter().map(|shard| {
+            shard.call(|s| {
+                let (docs, deleted) = s.counts();
+                Ok((docs, deleted, s.seq()))
+            })
+        }))
+        .await;
+        for counted in counts {
+            let (docs, deleted, seq) = counted?;
             doc_count += docs;
             deleted_count += deleted;
             update_seq = update_seq.max(seq);
@@ -1282,6 +1285,9 @@ impl Db {
 
         // A shard error is held back until the validator cache is dropped:
         // earlier shards may already have committed design documents.
+        // The shards are written one after another: each document takes the
+        // next global sequence when its shard stages it, so the order the
+        // shards run in is the order of `_changes` for this batch.
         let mut shard_error = None;
         for (shard_idx, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
@@ -1329,6 +1335,46 @@ impl Db {
         self.shard(id.as_str())
             .call(move |s| read_doc(s, &id, &opts))
             .await
+    }
+
+    /// Read several documents with one round trip per shard, the shards in
+    /// parallel. Each document has its own result, in the order of `ids`; the
+    /// outer error is a shard that could not answer at all.
+    pub(crate) async fn get_docs(
+        &self,
+        ids: &[String],
+        opts: &DocOpts,
+    ) -> DbResult<Vec<DbResult<Value>>> {
+        let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
+        for (slot, id) in ids.iter().enumerate() {
+            grouped[self.shard_index(id)].push((slot, id.clone()));
+        }
+        let read = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| {
+                        Ok(batch
+                            .into_iter()
+                            .map(|(slot, id)| (slot, read_doc(s, &id, &opts)))
+                            .collect::<Vec<_>>())
+                    })
+                }),
+        )
+        .await;
+        let mut out: Vec<Option<DbResult<Value>>> = ids.iter().map(|_| None).collect();
+        for batch in read {
+            for (slot, result) in batch? {
+                out[slot] = Some(result);
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|| Err(ApiError::not_found("missing"))))
+            .collect())
     }
 
     pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
@@ -1395,27 +1441,29 @@ impl Db {
         let mut rows = Vec::new();
         let mut total_rows = 0u64;
         let mut before_start = 0usize;
-        for (index, shard) in self.shards.iter().enumerate() {
-            if partition_shard
-                .map(|partition| partition != index)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if !shard_owned(owned, index) {
-                continue;
-            }
-            let opts = opts.clone();
-            let (mut shard_rows, shard_offset, shard_docs) = shard
-                .call(move |s| {
-                    let docs = match &opts.partition {
-                        Some(partition) => s.partition_live_count(partition)?,
-                        None => s.counts().0,
-                    };
-                    let (rows, offset) = collect_all_docs(s, &opts, take)?;
-                    Ok((rows, offset, docs))
+        let collected = futures::future::join_all(
+            self.shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    partition_shard.is_none_or(|partition| partition == *index)
+                        && shard_owned(owned, *index)
                 })
-                .await?;
+                .map(|(_, shard)| {
+                    let opts = opts.clone();
+                    shard.call(move |s| {
+                        let docs = match &opts.partition {
+                            Some(partition) => s.partition_live_count(partition)?,
+                            None => s.counts().0,
+                        };
+                        let (rows, offset) = collect_all_docs(s, &opts, take)?;
+                        Ok((rows, offset, docs))
+                    })
+                }),
+        )
+        .await;
+        for collected in collected {
+            let (mut shard_rows, shard_offset, shard_docs) = collected?;
             rows.append(&mut shard_rows);
             before_start += shard_offset;
             total_rows += shard_docs;
@@ -1635,8 +1683,14 @@ impl Db {
                     .await?;
             }
         } else {
-            for index in self.selected_shards(owned) {
-                total_rows += self.shards[index].call(|s| Ok(s.counts().0)).await?;
+            let counts = futures::future::join_all(
+                self.selected_shards(owned)
+                    .into_iter()
+                    .map(|index| self.shards[index].call(|s| Ok(s.counts().0))),
+            )
+            .await;
+            for count in counts {
+                total_rows += count?;
             }
         }
 
@@ -1677,21 +1731,27 @@ impl Db {
         }
 
         let mut results: Vec<Option<Value>> = vec![None; page.len()];
-        for (index, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let opts = opts.clone();
-            let rows = self.shards[index]
-                .call(move |s| {
-                    let rows = batch
-                        .into_iter()
-                        .map(|(slot, key)| all_docs_key_row(s, &key, &opts).map(|row| (slot, row)))
-                        .collect::<DbResult<Vec<_>>>()?;
-                    Ok(rows)
-                })
-                .await?;
-            for (slot, row) in rows {
+        let fetched = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| {
+                        let rows = batch
+                            .into_iter()
+                            .map(|(slot, key)| {
+                                all_docs_key_row(s, &key, &opts).map(|row| (slot, row))
+                            })
+                            .collect::<DbResult<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                }),
+        )
+        .await;
+        for rows in fetched {
+            for (slot, row) in rows? {
                 results[slot] =
                     Some(row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"})));
             }
@@ -1897,13 +1957,13 @@ impl Db {
         descending: bool,
         owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
-        let mut pending = 0usize;
-        for index in self.selected_shards(owned) {
-            pending += self.shards[index]
+        futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
+            self.shards[index]
                 .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
-                .await?;
-        }
-        Ok(pending)
+        }))
+        .await
+        .into_iter()
+        .sum::<DbResult<usize>>()
     }
 
     pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
@@ -2088,7 +2148,11 @@ impl Db {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
-        let mut out = Map::new();
+        // One round trip per shard, the shards in parallel, instead of one
+        // per document.
+        let mut ids = Vec::new();
+        let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
+            (0..self.q).map(|_| Vec::new()).collect();
         for (id, revs) in map {
             let Some(list) = revs.as_array() else {
                 continue;
@@ -2097,34 +2161,37 @@ impl Db {
                 .iter()
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
-            let id2 = id.clone();
-            let (missing, ancestors) = self
-                .shard(id)
-                .call(move |s| {
-                    let tree = s.get_meta(&id2)?.map(|m| m.tree).unwrap_or_default();
-                    let mut missing = Vec::new();
-                    let mut ancestors: Vec<String> = Vec::new();
-                    for rev in &wanted {
-                        if !tree.contains(rev) {
-                            missing.push(rev.clone());
-                            if let Some(parsed) = Rev::parse(rev) {
-                                for leaf in tree.leaves() {
-                                    if Rev::parse(&leaf)
-                                        .map(|l| l.pos < parsed.pos)
-                                        .unwrap_or(false)
-                                    {
-                                        ancestors.push(leaf);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ancestors.sort();
-                    ancestors.dedup();
-                    ancestors.truncate(10);
-                    Ok((missing, ancestors))
-                })
-                .await?;
+            grouped[self.shard_index(id)].push((ids.len(), id.clone(), wanted));
+            ids.push(id);
+        }
+        let diffs = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    self.shards[index].call(move |s| {
+                        batch
+                            .into_iter()
+                            .map(|(slot, id, wanted)| {
+                                revs_diff_one(s, &id, &wanted).map(|diff| (slot, diff))
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    })
+                }),
+        )
+        .await;
+        let mut found: Vec<Option<(Vec<String>, Vec<String>)>> = ids.iter().map(|_| None).collect();
+        for batch in diffs {
+            for (slot, diff) in batch? {
+                found[slot] = Some(diff);
+            }
+        }
+        let mut out = Map::new();
+        for (id, diff) in ids.into_iter().zip(found) {
+            let Some((missing, ancestors)) = diff else {
+                continue;
+            };
             if !missing.is_empty() {
                 let mut entry = json!({ "missing": missing });
                 if !ancestors.is_empty() {
@@ -2174,22 +2241,26 @@ impl Db {
         }
 
         let mut out: Vec<Option<Value>> = vec![None; reqs.len()];
-        for (index, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let results = self.shards[index]
-                .call(move |shard| {
-                    let mut out = Vec::with_capacity(batch.len());
-                    for (slot, id, opts) in batch {
-                        let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
-                        let result = read_doc(shard, &id, &opts);
-                        out.push((slot, id, rev, result));
-                    }
-                    Ok(out)
-                })
-                .await?;
-            for (slot, id, rev, result) in results {
+        let read = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    self.shards[index].call(move |shard| {
+                        let mut out = Vec::with_capacity(batch.len());
+                        for (slot, id, opts) in batch {
+                            let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
+                            let result = read_doc(shard, &id, &opts);
+                            out.push((slot, id, rev, result));
+                        }
+                        Ok(out)
+                    })
+                }),
+        )
+        .await;
+        for results in read {
+            for (slot, id, rev, result) in results? {
                 out[slot] = Some(match result {
                     Ok(doc) => json!({ "id": id, "docs": [{"ok": doc}] }),
                     Err(error) => json!({
@@ -2314,7 +2385,11 @@ impl Db {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
-        let mut purged = Map::new();
+        // One round trip per shard, the shards in parallel, instead of one
+        // per document.
+        let mut ids = Vec::new();
+        let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
+            (0..self.q).map(|_| Vec::new()).collect();
         for (id, revs) in map {
             let Some(list) = revs.as_array() else {
                 continue;
@@ -2323,61 +2398,41 @@ impl Db {
                 .iter()
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
-            let id2 = id.clone();
+            grouped[self.shard_index(id)].push((ids.len(), id.clone(), requested));
+            ids.push(id);
+        }
+        // Purging a document that survives takes a new sequence, so the
+        // shards run one after another to keep that order deterministic.
+        let mut done = Vec::new();
+        for (index, batch) in grouped.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
             let seq_counter = self.seq.clone();
-            let reserved = self.reserved_seq[self.shard_index(id)].clone();
-            let done = self
-                .shard(id)
-                .call(move |s| {
-                    let Some(mut meta) = s.get_meta(&id2)? else {
-                        return Ok(Vec::new());
-                    };
-                    let mut tx = Tx::new();
-                    let mut removed = Vec::new();
-                    // Like CouchDB, purge leaves only: each takes its unshared
-                    // ancestors with it, and a listed non-leaf revision is
-                    // ignored and not reported.
-                    let leaves: std::collections::BTreeSet<String> =
-                        meta.tree.leaves().into_iter().collect();
-                    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
-                        let gone = meta.tree.purge_leaf(rev);
-                        if gone.is_empty() {
-                            continue;
-                        }
-                        for dead in &gone {
-                            tx.delete(&body_key(&id2, dead));
-                            meta.atts.remove(dead);
-                        }
-                        removed.push(rev.clone());
-                    }
-                    if !removed.is_empty() {
-                        if meta.tree.is_empty() {
-                            tx.delete(&meta_key(&id2));
-                            if meta.seq != 0 {
-                                tx.delete(&seq_key(meta.seq));
-                            }
-                            s.commit(tx)?;
-                        } else {
-                            let old_seq = meta.seq;
-                            // Purging the winner changes what a normal read sees,
-                            // so it is a change as far as `_changes` is concerned.
-                            let seq = allocate_seq(&seq_counter, &reserved);
-                            meta.seq = seq;
-                            tx.delete(&seq_key(old_seq));
-                            tx.put(&seq_key(seq), id2.as_bytes());
-                            tx.put_json(&meta_key(&id2), &meta)?;
-                            s.commit_at(tx, Some(seq))?;
-                        }
-                    } else {
-                        s.commit(tx)?;
-                    }
-                    if !removed.is_empty() {
-                        s.invalidate_latest();
-                    }
-                    Ok(removed)
-                })
-                .await?;
-            purged.insert(id.clone(), json!(done));
+            let reserved = self.reserved_seq[index].clone();
+            done.push(
+                self.shards[index]
+                    .call(move |s| {
+                        batch
+                            .into_iter()
+                            .map(|(slot, id, requested)| {
+                                purge_one(s, &id, &requested, &seq_counter, &reserved)
+                                    .map(|removed| (slot, removed))
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    })
+                    .await,
+            );
+        }
+        let mut removed: Vec<Vec<String>> = ids.iter().map(|_| Vec::new()).collect();
+        for batch in done {
+            for (slot, revs) in batch? {
+                removed[slot] = revs;
+            }
+        }
+        let mut purged = Map::new();
+        for (id, revs) in ids.into_iter().zip(removed) {
+            purged.insert(id.clone(), json!(revs));
         }
         Ok(json!({ "purge_seq": 0, "purged": purged }))
     }
@@ -2424,6 +2479,92 @@ impl Db {
 /// the error name see a familiar one.
 pub fn attachments_unsupported() -> ApiError {
     ApiError::bad_request("douchdb does not support attachments")
+}
+
+/// The requested revisions of one document the shard does not have, and the
+/// leaves that could be their ancestors.
+fn revs_diff_one(
+    s: &mut crate::store::Shard,
+    id: &str,
+    wanted: &[String],
+) -> DbResult<(Vec<String>, Vec<String>)> {
+    let tree = s.get_meta(id)?.map(|m| m.tree).unwrap_or_default();
+    let mut missing = Vec::new();
+    let mut ancestors: Vec<String> = Vec::new();
+    for rev in wanted {
+        if !tree.contains(rev) {
+            missing.push(rev.clone());
+            if let Some(parsed) = Rev::parse(rev) {
+                for leaf in tree.leaves() {
+                    if Rev::parse(&leaf)
+                        .map(|l| l.pos < parsed.pos)
+                        .unwrap_or(false)
+                    {
+                        ancestors.push(leaf);
+                    }
+                }
+            }
+        }
+    }
+    ancestors.sort();
+    ancestors.dedup();
+    ancestors.truncate(10);
+    Ok((missing, ancestors))
+}
+
+/// Purge the requested leaf revisions of one document; the revisions removed.
+fn purge_one(
+    s: &mut crate::store::Shard,
+    id: &str,
+    requested: &[String],
+    seq_counter: &AtomicU64,
+    reserved: &AtomicU64,
+) -> DbResult<Vec<String>> {
+    let Some(mut meta) = s.get_meta(id)? else {
+        return Ok(Vec::new());
+    };
+    let mut tx = Tx::new();
+    let mut removed = Vec::new();
+    // Like CouchDB, purge leaves only: each takes its unshared
+    // ancestors with it, and a listed non-leaf revision is
+    // ignored and not reported.
+    let leaves: std::collections::BTreeSet<String> = meta.tree.leaves().into_iter().collect();
+    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
+        let gone = meta.tree.purge_leaf(rev);
+        if gone.is_empty() {
+            continue;
+        }
+        for dead in &gone {
+            tx.delete(&body_key(id, dead));
+            meta.atts.remove(dead);
+        }
+        removed.push(rev.clone());
+    }
+    if !removed.is_empty() {
+        if meta.tree.is_empty() {
+            tx.delete(&meta_key(id));
+            if meta.seq != 0 {
+                tx.delete(&seq_key(meta.seq));
+            }
+            s.commit(tx)?;
+        } else {
+            let old_seq = meta.seq;
+            // Purging the winner changes what a normal read sees,
+            // so it is a change as far as `_changes` is concerned.
+            let seq = allocate_seq(seq_counter, reserved);
+            meta.seq = seq;
+            tx.delete(&seq_key(old_seq));
+            tx.put(&seq_key(seq), id.as_bytes());
+            tx.put_json(&meta_key(id), &meta)?;
+            s.commit_at(tx, Some(seq))?;
+        }
+    } else {
+        s.commit(tx)?;
+    }
+    if !removed.is_empty() {
+        s.invalidate_latest();
+    }
+    Ok(removed)
 }
 
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
@@ -2629,6 +2770,8 @@ fn put_many(
 ) -> Vec<(usize, DbResult<Value>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
+    // What each staged document's record held in the shard before this batch.
+    let mut origin: HashMap<String, Option<MetaState>> = HashMap::new();
     let mut results = Vec::new();
 
     for (i, doc) in docs {
@@ -2637,6 +2780,7 @@ fn put_many(
             shard,
             ops: &mut ops,
             staged: &mut staged,
+            origin: &mut origin,
             seq,
             reserved,
         };
@@ -2653,15 +2797,23 @@ fn put_many(
     // Prune once here so a later branch cannot resurrect a previously pruned
     // ancestor as an orphan root.
     let limit = shard.revs_limit();
+    // Each document's record is written once, here, in its final form.
+    let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
         meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = meta_bytes(meta) {
-            ops.push((meta_key(id), Some(bytes)));
+            let old = origin.get(id).cloned().flatten();
+            metas.push(MetaWrite {
+                key: meta_key(id),
+                bytes,
+                old,
+                new: meta_state(meta),
+            });
         }
     }
 
-    if let Err(e) = commit_ops(shard, ops) {
+    if let Err(e) = commit_ops(shard, ops, metas) {
         shard.invalidate_latest();
         let message = e.to_string();
         return results
@@ -2693,6 +2845,7 @@ struct Stage<'a> {
     shard: &'a mut crate::store::Shard,
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
+    origin: &'a mut HashMap<String, Option<MetaState>>,
     seq: &'a Arc<AtomicU64>,
     reserved: &'a Arc<AtomicU64>,
 }
@@ -2706,14 +2859,17 @@ impl Stage<'_> {
         if let Some(m) = self.staged.get(id) {
             return Ok(Some(m.clone()));
         }
-        Ok(self.shard.get_meta(id)?)
+        let meta = self.shard.get_meta(id)?;
+        self.origin
+            .entry(id.to_string())
+            .or_insert_with(|| meta.as_ref().and_then(meta_state));
+        Ok(meta)
     }
 
-    fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = meta_bytes(meta).map_err(ApiError::internal)?;
-        self.ops.push((meta_key(id), Some(bytes)));
+    /// Record the document's new metadata. `put_many` writes it, once, after
+    /// the whole batch is staged and pruned.
+    fn flush_meta(&mut self, id: &str, meta: &DocMeta) {
         self.staged.insert(id.to_string(), meta.clone());
-        Ok(())
     }
 
     fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
@@ -2804,7 +2960,7 @@ impl Stage<'_> {
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
         }
-        self.flush_meta(&id, &meta)?;
+        self.flush_meta(&id, &meta);
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
     }
@@ -2849,7 +3005,7 @@ impl Stage<'_> {
             if old_seq != 0 {
                 self.ops.push((seq_key(old_seq), None));
             }
-            self.flush_meta(&id, &meta)?;
+            self.flush_meta(&id, &meta);
         }
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
@@ -2912,7 +3068,21 @@ fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(meta)
 }
 
-fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
+/// A document's metadata record, with the state it replaces and the state it
+/// leaves.
+struct MetaWrite {
+    key: Vec<u8>,
+    bytes: Vec<u8>,
+    old: Option<MetaState>,
+    new: Option<MetaState>,
+}
+
+/// Commit a batch's operations and its documents' metadata records.
+fn commit_ops(
+    shard: &mut crate::store::Shard,
+    ops: Ops,
+    metas: Vec<MetaWrite>,
+) -> anyhow::Result<()> {
     let mut last_seq = None;
     let mut tx = Tx::new();
     for (key, value) in ops {
@@ -2928,6 +3098,9 @@ fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
             Some(v) => tx.put(&key, &v),
             None => tx.delete(&key),
         }
+    }
+    for meta in metas {
+        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new);
     }
     shard.commit_at(tx, last_seq)
 }
@@ -4881,6 +5054,77 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(last_seq, 4);
         assert_eq!(pending, 3, "three older documents remain descending");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Requests that touch many documents fan out one call per shard; the
+    /// answers must still come back per document, in the order asked.
+    #[tokio::test]
+    async fn per_document_answers_survive_the_per_shard_fan_out() {
+        let q = 4u32;
+        let root = std::env::temp_dir().join(format!("douchdb-fan-out-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "fanout",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..12).map(|n| format!("doc-{n:02}")).collect();
+        let shards: std::collections::HashSet<usize> =
+            ids.iter().map(|id| db.shard_index(id)).collect();
+        assert!(shards.len() > 1, "the ids must spread over shards");
+        let docs = ids.iter().map(|id| json!({"_id": id, "n": id})).collect();
+        let written = db.put_docs(docs, true).await.unwrap();
+        assert!(written.iter().all(|row| row["ok"] == json!(true)));
+        let info = db.info().await.unwrap();
+        assert_eq!(info["doc_count"], json!(12));
+        assert_eq!(info["update_seq"], json!(12));
+
+        let got = db.get_docs(&ids, &DocOpts::default()).await.unwrap();
+        for (id, doc) in ids.iter().zip(&got) {
+            assert_eq!(doc.as_ref().unwrap()["n"], json!(id));
+        }
+        let mut asked = ids.clone();
+        asked.push("absent".to_string());
+        let got = db.get_docs(&asked, &DocOpts::default()).await.unwrap();
+        assert_eq!(got.last().unwrap().as_ref().unwrap_err().status, 404);
+
+        // Every document is missing one revision it was not told about, and
+        // lists the leaf it has as a possible ancestor.
+        let mut diff = Map::new();
+        for id in &ids {
+            let rev = written[ids.iter().position(|other| other == id).unwrap()]["rev"].clone();
+            diff.insert(id.clone(), json!([rev, "2-ffff"]));
+        }
+        let diff = db.revs_diff(&Value::Object(diff)).await.unwrap();
+        let rows = diff.as_object().unwrap();
+        assert_eq!(rows.len(), 12);
+        for (position, id) in ids.iter().enumerate() {
+            assert_eq!(rows[id]["missing"], json!(["2-ffff"]));
+            assert_eq!(
+                rows[id]["possible_ancestors"],
+                json!([written[position]["rev"]])
+            );
+        }
+
+        // Purging by document answers for each document, and only for the
+        // revisions it removed.
+        let mut purge = Map::new();
+        for (position, id) in ids.iter().enumerate().take(6) {
+            purge.insert(id.clone(), json!([written[position]["rev"], "9-nope"]));
+        }
+        let purged = db.purge(&Value::Object(purge)).await.unwrap();
+        for (position, id) in ids.iter().enumerate().take(6) {
+            assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
+        }
+        assert_eq!(db.info().await.unwrap()["doc_count"], json!(6));
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);

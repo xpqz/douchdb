@@ -204,6 +204,10 @@ impl Fenwick {
 #[derive(Default)]
 pub struct Tx {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Metadata writes whose before and after states the caller already
+    /// knows, by index into `ops`. `commit_at` would otherwise read and decode
+    /// both records to learn them.
+    known: std::collections::HashMap<usize, (Option<MetaState>, Option<MetaState>)>,
 }
 
 impl Tx {
@@ -223,6 +227,21 @@ impl Tx {
 
     pub fn delete(&mut self, key: &[u8]) {
         self.ops.push((key.to_vec(), None));
+    }
+
+    /// Write a document's metadata record, saying what the document's state
+    /// was in the shard before (`old`) and is after the write (`new`), so the
+    /// commit need not decode either. `old` must be the state of the record
+    /// the shard holds when the transaction commits.
+    pub fn put_meta(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        old: Option<MetaState>,
+        new: Option<MetaState>,
+    ) {
+        self.known.insert(self.ops.len(), (old, new));
+        self.put(key, value);
     }
 }
 
@@ -326,7 +345,11 @@ pub struct Shard {
     flush_failure: Option<String>,
 }
 
-fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
+/// What a document's metadata says about it: the winning revision, whether it
+/// is live, and whether that revision has attachments.
+pub(crate) type MetaState = (String, bool, bool);
+
+pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
         let has_attachments = meta
@@ -986,8 +1009,10 @@ impl Shard {
         let mut written: std::collections::HashMap<&[u8], &Option<Vec<u8>>> =
             std::collections::HashMap::new();
         let mut states = Vec::with_capacity(tx.ops.len() + 1);
-        for (key, value) in &tx.ops {
-            if key.starts_with(b"m/") {
+        for (index, (key, value)) in tx.ops.iter().enumerate() {
+            if let Some(known) = tx.known.remove(&index) {
+                states.push(Some(known));
+            } else if key.starts_with(b"m/") {
                 let old = match written.get(key.as_slice()) {
                     Some(earlier) => (*earlier).clone(),
                     None => self.get_checked(key)?,
