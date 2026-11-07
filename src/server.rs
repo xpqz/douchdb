@@ -49,15 +49,9 @@ pub fn run_worker() -> ! {
     }
 }
 
-/// Run the server until shutdown. `--js-worker` is dispatched by the binary to
-/// [`run_worker`] before any runtime exists.
-pub async fn run(args: Args) -> anyhow::Result<()> {
-    if args.worker {
-        anyhow::bail!("--js-worker must be started through run_worker, outside an async runtime");
-    }
-    if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
-        exit_on_stdin_eof();
-    }
+/// Choose the JS sandbox from `--js-sandbox` and `--wasm-runtime`, exiting with
+/// status 2 on a value the CLI does not know.
+fn configure_js_sandbox(args: &Args) {
     match args.js_sandbox.as_str() {
         "native" => js::configure(js::Sandbox::Native, args.js_workers),
         "process" => js::configure(js::Sandbox::Process, args.js_workers),
@@ -81,7 +75,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
-    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
+}
+
+/// Refuse a cluster configuration that cannot work or is not safe, exiting with
+/// status 2.
+fn check_cluster_args(args: &Args) {
     if args.nodes.len() > 1 {
         if args.me >= args.nodes.len() {
             eprintln!("--me must be smaller than the number of --nodes");
@@ -94,22 +92,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
-    if args.cors_origins.iter().any(|origin| origin == "*") {
-        tracing::warn!(
-            "CORS allows any origin and sends credentials; any website can act as a logged-in user"
-        );
-    }
-    std::fs::create_dir_all(&args.data)?;
-    crate::db::migrate_nested_dbs(&args.data).map_err(anyhow::Error::msg)?;
+}
 
-    let advertise = if !args.advertise.trim().is_empty() {
+/// The URL peers and clients are told to reach this node on.
+fn advertise_url(args: &Args) -> String {
+    if !args.advertise.trim().is_empty() {
         args.advertise.trim().trim_end_matches('/').to_string()
     } else if let Some(url) = args.nodes.get(args.me) {
         url.trim_end_matches('/').to_string()
     } else {
         format!("http://{}", args.listen)
-    };
-    let auth = if args.users_file.is_some() || args.admin.is_some() {
+    }
+}
+
+/// Credentials from `--users-file` or `--admin`, if either is configured.
+fn build_auth(args: &Args) -> anyhow::Result<Option<Auth>> {
+    Ok(if args.users_file.is_some() || args.admin.is_some() {
         if args.nodes.len() > 1 && args.session_secret.trim().is_empty() {
             tracing::warn!(
                 "no --session-secret: each node signs session cookies with its own key, so a cookie only works on the node that issued it"
@@ -129,8 +127,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     } else {
         None
-    };
-    let default_admin_only = match args.default_security.as_str() {
+    })
+}
+
+/// Whether new databases start admin-only, from `--default-security`.
+fn default_admin_only(args: &Args, auth: &Option<Auth>) -> bool {
+    match args.default_security.as_str() {
         "open" => false,
         "admin-only" => true,
         "" => auth.is_some(),
@@ -138,19 +140,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             eprintln!("unknown --default-security value: {other} (expected open or admin-only)");
             std::process::exit(2);
         }
-    };
+    }
+}
+
+/// The shared application state for this node.
+fn build_state(
+    args: &Args,
+    auth: Option<Auth>,
+    advertise: String,
+) -> anyhow::Result<Arc<AppState>> {
+    let default_admin_only = default_admin_only(args, &auth);
     let config = Config {
         q: args.q.max(1),
         revs_limit: args.revs_limit.max(1),
         sync_secs: args.sync_secs,
         seeds: args.seed_nodes.clone(),
-        advertise: advertise.clone(),
+        advertise,
         cors_origins: args.cors_origins.clone(),
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
         default_admin_only,
     };
-    let state = Arc::new(AppState {
+    Ok(Arc::new(AppState {
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
@@ -182,17 +193,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         },
         db_updates: api::DbUpdates::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
-    });
+    }))
+}
 
-    if state.ctx.cluster.is_clustered() {
-        replicate::spawn_anti_entropy(state.clone());
-        tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
-    }
-    if state.ctx.cluster.is_clustered() || !state.config.seeds.is_empty() {
-        discovery::spawn(state.clone());
-    }
-
-    let app = Router::new()
+/// The HTTP routes and middleware.
+fn build_router(args: &Args, state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(api::welcome))
         .route("/_up", get(api::up))
         .route("/_health", get(api::health_public))
@@ -275,7 +281,41 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(api::request_id))
         .layer(axum::middleware::from_fn(api::head_only))
         .layer(tower_http::compression::CompressionLayer::new())
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Run the server until shutdown. `--js-worker` is dispatched by the binary to
+/// [`run_worker`] before any runtime exists.
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    if args.worker {
+        anyhow::bail!("--js-worker must be started through run_worker, outside an async runtime");
+    }
+    if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
+        exit_on_stdin_eof();
+    }
+    configure_js_sandbox(&args);
+    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
+    check_cluster_args(&args);
+    if args.cors_origins.iter().any(|origin| origin == "*") {
+        tracing::warn!(
+            "CORS allows any origin and sends credentials; any website can act as a logged-in user"
+        );
+    }
+    std::fs::create_dir_all(&args.data)?;
+    crate::db::migrate_nested_dbs(&args.data).map_err(anyhow::Error::msg)?;
+
+    let advertise = advertise_url(&args);
+    let auth = build_auth(&args)?;
+    let state = build_state(&args, auth, advertise)?;
+    if state.ctx.cluster.is_clustered() {
+        replicate::spawn_anti_entropy(state.clone());
+        tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
+    }
+    if state.ctx.cluster.is_clustered() || !state.config.seeds.is_empty() {
+        discovery::spawn(state.clone());
+    }
+
+    let app = build_router(&args, state);
 
     // Streamed responses are written in several pieces. With Nagle's algorithm
     // a later piece waits for the client's delayed ACK of the first, adding
