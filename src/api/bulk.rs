@@ -3,14 +3,16 @@
 
 use super::*;
 
-pub(super) async fn bulk_docs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
     let Ok(mut value) = crate::json::from_slice(body) else {
         return fail(ApiError::bad_request("invalid UTF-8 JSON"));
     };
@@ -88,10 +90,11 @@ pub(super) async fn bulk_docs(
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
-        let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
-            Ok(functions) => functions,
-            Err(error) => return fail(error),
-        };
+        let functions =
+            match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await {
+                Ok(functions) => functions,
+                Err(error) => return fail(error),
+            };
         match crate::validate::validate_docs_with(&functions, db, &mut docs, &principal).await {
             Ok(errors) => errors,
             Err(error) => return fail(error),
@@ -137,7 +140,7 @@ pub(super) async fn bulk_docs(
 
     let (ordinary_results, accepted) = if ordinary_docs.is_empty() {
         (Vec::new(), false)
-    } else if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+    } else if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
         // A forwarded batch has already been placed by its coordinator; write
         // it to this node's shards and let the coordinator count the ack.
         match db.put_docs(ordinary_docs, new_edits).await {
@@ -196,7 +199,8 @@ pub(super) async fn validate_write(
     headers: &HeaderMap,
 ) -> Option<Response> {
     let principal = st.principal(headers);
-    let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
+    let functions = match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await
+    {
         Ok(functions) => functions,
         Err(error) => return Some(fail(error)),
     };
@@ -264,21 +268,24 @@ fn bulk_read_candidates(db: &Db, id: &str, me: usize) -> Vec<usize> {
     replicas
 }
 
-pub(super) async fn bulk_get(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return fail(ApiError::bad_request("invalid JSON"));
+pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
+    let mut value = match json_body(body, "invalid JSON") {
+        Ok(value) => value,
+        Err(error) => return fail(error),
     };
     let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
     let latest = flag(q, "latest");
-    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
         return match db.bulk_get(&value, attachments, revs, latest).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -291,7 +298,7 @@ pub(super) async fn bulk_get(
         .iter()
         .map(|req| {
             let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
-            bulk_read_candidates(db, id, st.cluster.me)
+            bulk_read_candidates(db, id, st.ctx.cluster.me)
         })
         .collect();
     let mut out = vec![Value::Null; reqs.len()];
@@ -305,10 +312,10 @@ pub(super) async fn bulk_get(
             let subdocs: Vec<Value> = slots.iter().map(|slot| reqs[*slot].clone()).collect();
             async move {
                 let sub = json!({"docs": subdocs});
-                let result = if node == st.cluster.me {
+                let result = if node == st.ctx.cluster.me {
                     db.bulk_get(&sub, attachments, revs, latest).await
                 } else {
-                    let peer = st.cluster.nodes[node].clone();
+                    let peer = st.ctx.cluster.nodes[node].clone();
                     let mut query = format!("revs={revs}");
                     if attachments {
                         query.push_str("&attachments=true");
@@ -316,7 +323,7 @@ pub(super) async fn bulk_get(
                     if latest {
                         query.push_str("&latest=true");
                     }
-                    forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers).await
                 };
                 (slots, result)
             }
@@ -345,17 +352,20 @@ pub(super) async fn bulk_get(
     json(StatusCode::OK, json!({"results": out}))
 }
 
-pub(super) async fn revs_diff(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return fail(ApiError::bad_request("invalid JSON"));
+pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        body,
+        headers,
+        ..
+    } = req;
+    let value = match json_body(body, "invalid JSON") {
+        Ok(value) => value,
+        Err(error) => return fail(error),
     };
-    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
         return match db.revs_diff(&value).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -370,7 +380,7 @@ pub(super) async fn revs_diff(
         .collect();
     let mut candidates: Vec<Vec<usize>> = entries
         .iter()
-        .map(|(id, _)| bulk_read_candidates(db, id, st.cluster.me))
+        .map(|(id, _)| bulk_read_candidates(db, id, st.ctx.cluster.me))
         .collect();
     let mut out = Map::new();
     let mut pending: Vec<usize> = (0..entries.len()).collect();
@@ -387,11 +397,11 @@ pub(super) async fn revs_diff(
                     .collect(),
             );
             async move {
-                let result = if node == st.cluster.me {
+                let result = if node == st.ctx.cluster.me {
                     db.revs_diff(&sub).await
                 } else {
-                    let peer = st.cluster.nodes[node].clone();
-                    forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await
+                    let peer = st.ctx.cluster.nodes[node].clone();
+                    forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers).await
                 };
                 (slots, result)
             }
@@ -484,13 +494,10 @@ fn all_docs_opts(
         // `keys` lookup: a deleted document must not appear.
         opts.startkey = opts.startkey.or(Some(key.clone()));
         opts.endkey = opts.endkey.or(Some(key));
-    } else if let Some(raw) = q.get("keys") {
-        match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Array(keys)) => {
-                opts.keys = Some(keys);
-            }
-            Ok(_) => return Err(ApiError::bad_request("`keys` parameter must be an array.")),
-            Err(_) => return Err(ApiError::bad_request("invalid UTF-8 JSON")),
+    } else if let Some(keys) = json_param(q, "keys")? {
+        match keys {
+            Value::Array(keys) => opts.keys = Some(keys),
+            _ => return Err(ApiError::bad_request("`keys` parameter must be an array.")),
         }
     }
     if *method == Method::POST {
@@ -551,10 +558,10 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     } else {
         None
     };
-    if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         cluster_all_docs(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname: req.name,
                 headers,
@@ -565,8 +572,8 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     } else if let Some(mask) = shard_mask {
         db.all_docs_owned(opts, &mask).await
     } else if flag(req.q, "owner_only") && is_forwarded(st, headers) {
-        let owned: Vec<bool> = (0..db.q)
-            .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
+        let owned: ShardMask = (0..db.q)
+            .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
             .collect();
         db.all_docs_owned(opts, &owned).await
     } else {

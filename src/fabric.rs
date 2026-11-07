@@ -1,13 +1,14 @@
 //! Cluster coordination: shard-map routing, replica selection, quorum
 //! reads/writes and internal node calls.
 
-use crate::api::{
-    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, forward_client_auth,
-    internal_request, internal_request_raw, num, peer_url, percent_encode, AppState,
+use crate::cluster::ShardMask;
+use crate::cluster_http::{
+    forward_client_auth, internal_request, internal_request_raw, ClusterCtx,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
-use axum::http::{header, HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
+use crate::state::AppState;
+use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -15,34 +16,24 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-// Replica-set selection is deliberately centralized here so the shard map is
-// the single source of placement truth for routing, quorum and anti-entropy.
-pub(crate) fn replicas_of_doc(db: &Db, docid: &str) -> Vec<usize> {
-    db.replicas_of_doc(docid)
-}
-
-pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
-    db.owner_of_shard(shard)
-}
-
 /// Assign each shard to exactly one node for a fan-out read. Prefer the
 /// coordinator's local replica when it holds one: for n=3 on three nodes every
 /// node holds every shard, so the whole query can be answered locally instead
 /// of issuing one HTTP request per owner. Shards without a local replica stay
 /// with their primary owner and can still fall back to other replicas.
-pub(crate) fn preferred_shard_masks(st: &AppState, db: &Db) -> Vec<Vec<bool>> {
-    let node_count = st.cluster.nodes.len().max(1);
-    let mut masks = vec![vec![false; db.q as usize]; node_count];
+pub(crate) fn preferred_shard_masks(ctx: &ClusterCtx, db: &Db) -> Vec<ShardMask> {
+    let node_count = ctx.cluster.nodes.len().max(1);
+    let mut masks = vec![ShardMask::none(db.q); node_count];
     let map = db.shard_map();
     for shard in 0..db.q {
         let replicas = map.replicas_of(shard);
-        let target = if replicas.contains(&st.cluster.me) {
-            st.cluster.me
+        let target = if replicas.contains(&ctx.cluster.me) {
+            ctx.cluster.me
         } else {
             replicas.first().copied().unwrap_or(0)
         };
         if let Some(mask) = masks.get_mut(target) {
-            mask[shard as usize] = true;
+            mask.select(shard as usize);
         }
     }
     masks
@@ -64,8 +55,8 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
 /// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
 /// older peers receive the local or pending map. This runs from anti-entropy,
 /// so a metadata update that missed a peer is repaired after that peer returns.
-pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
-    if !st.cluster.is_clustered() {
+pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
+    if !ctx.cluster.is_clustered() {
         return;
     }
     let local = db.shard_map();
@@ -74,9 +65,9 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let maps = join_all(st.cluster.peers().map(|peer| async move {
+    let maps = join_all(ctx.cluster.peers().map(|peer| async move {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::GET,
             peer,
             &["_node", "_local", "_dbs", &db.name],
@@ -93,7 +84,7 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     .await;
 
     for map in maps.into_iter().flatten() {
-        if adoptable_peer_map(&map, desired.version, st.cluster.nodes.len())
+        if adoptable_peer_map(&map, desired.version, ctx.cluster.nodes.len())
             && db.set_shard_map(map.clone()).unwrap_or(false)
         {
             if db
@@ -111,19 +102,19 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
         Ok(payload) => payload,
         Err(_) => return,
     };
-    let peers: Vec<String> = st
+    let peers: Vec<String> = ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != ctx.cluster.me)
         .map(|(_, peer)| peer.clone())
         .collect();
     let responses = join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
             let request = internal_request(
-                st,
+                ctx,
                 reqwest::Method::PUT,
                 &peer,
                 &["_node", "_local", "_dbs", &db.name],
@@ -140,7 +131,7 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     }))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
-    if acknowledgements > st.cluster.nodes.len().max(1) / 2 {
+    if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
         db.clear_pending_shard_map();
     }
 }
@@ -162,13 +153,13 @@ fn security_supersedes(
 /// Reconcile the versioned `_security` object with peers: adopt the newest
 /// one any peer reports, then push it to the peers that hold something else.
 /// This is what brings a restored, new or rollback-missed node up to date.
-pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
-    if !st.cluster.is_clustered() {
+pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
+    if !ctx.cluster.is_clustered() {
         return;
     }
-    let fetched = join_all(st.cluster.peers().map(|peer| async move {
+    let fetched = join_all(ctx.cluster.peers().map(|peer| async move {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::GET,
             peer,
             &["_node", "_local", "_dbs", &db.name, "security"],
@@ -209,7 +200,7 @@ pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
             })
             .map(|(peer, _, _)| {
                 let request = internal_request(
-                    st,
+                    ctx,
                     reqwest::Method::PUT,
                     peer,
                     &["_node", "_local", "_dbs", &db.name, "security"],
@@ -224,215 +215,12 @@ pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
     .await;
 }
 
-/// A client request to replay against a peer that owns the document.
-pub(crate) struct ForwardRequest<'a> {
-    pub method: &'a Method,
-    pub dbname: &'a str,
-    /// The path after `/{dbname}/`.
-    pub rest: &'a str,
-    pub q: &'a HashMap<String, String>,
-    pub headers: &'a HeaderMap,
-    pub body: &'a [u8],
-}
-
-pub(crate) async fn proxy(st: &AppState, request: &ForwardRequest<'_>, peer: &str) -> Response {
-    let ForwardRequest {
-        method,
-        dbname,
-        rest,
-        q,
-        headers,
-        body,
-    } = *request;
-    // `rest` is the caller's still-encoded remainder; only the name is encoded.
-    let mut url = format!("{}/{rest}", peer_url(peer, &[dbname]));
-    if !q.is_empty() {
-        let encoded: Vec<String> = q
-            .iter()
-            .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-            .collect();
-        url.push('?');
-        url.push_str(&encoded.join("&"));
-    }
-    let request = st.client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        &url,
-    );
-    let request = forward_client_auth(request, headers);
-    let mut request = match headers.get(header::CONTENT_TYPE) {
-        Some(value) => request.header("content-type", value),
-        None => request,
-    };
-    for name in ["destination", "if-match", "if-none-match"] {
-        if let Some(value) = headers.get(name) {
-            request = request.header(name, value);
-        }
-    }
-    if !body.is_empty() {
-        request = request.body(body.to_vec());
-    }
-    match request.send().await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let content_type = resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let etag = resp.headers().get(header::ETAG).cloned();
-            let location = resp.headers().get(header::LOCATION).cloned();
-            let bytes = resp.bytes().await.unwrap_or_default().to_vec();
-            let mut response =
-                (status, [(header::CONTENT_TYPE, content_type)], bytes).into_response();
-            if let Some(value) = etag {
-                response.headers_mut().insert(header::ETAG, value);
-            }
-            if let Some(value) = location {
-                response.headers_mut().insert(header::LOCATION, value);
-            }
-            response
-        }
-        Err(e) => fail(ApiError::new(502, "bad_gateway", e.to_string())),
-    }
-}
-
-/// True when a proxied request failed to reach the peer, rather than the peer
-/// answering on behalf of the cluster.
-pub(crate) fn unavailable(response: &Response) -> bool {
-    matches!(
-        response.status(),
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
-}
-
-/// `?r=N` reads from several replicas and returns the winning revision.
-pub(crate) async fn quorum_read(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    docid: &str,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    r: usize,
-) -> Response {
-    // Without an explicit `rev`, ask every replica for *all* leaves with their
-    // revision histories. A conflict branch that never wins locally can still
-    // be the correct global winner, so top-level winners alone are not enough.
-    let requested_rev = q.get("rev").cloned();
-    let open_all = requested_rev.is_none();
-    let (reachable, docs) = replica_docs(st, db, dbname, docid, q, headers, open_all).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        return fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        ));
-    }
-    if docs.is_empty() {
-        return fail(ApiError::not_found("missing"));
-    }
-
-    let Some(reconciled) = reconcile_leaves(&docs, requested_rev.as_deref()) else {
-        return fail(ApiError::not_found("missing"));
-    };
-    let winner_rev = reconciled
-        .winner
-        .get("_rev")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let mut winner = reconciled.winner;
-    let conflicts = reconciled.conflicts;
-    let deleted_conflicts = reconciled.deleted_conflicts;
-    let history = reconciled.history;
-
-    if let Some(object) = winner.as_object_mut() {
-        if flag(q, "conflicts") {
-            object.insert("_conflicts".to_string(), json!(conflicts));
-        } else {
-            object.remove("_conflicts");
-        }
-        if flag(q, "deleted_conflicts") {
-            object.insert("_deleted_conflicts".to_string(), json!(deleted_conflicts));
-        } else {
-            object.remove("_deleted_conflicts");
-        }
-        if flag(q, "revs") {
-            // Return a deterministic history: the longest one supplied for
-            // this revision, not whichever replica answered first.
-            if let Some(start) = history
-                .first()
-                .and_then(|rev| crate::rev::Rev::parse(rev))
-                .map(|rev| rev.pos)
-            {
-                let ids: Vec<String> = history
-                    .iter()
-                    .filter_map(|rev| rev.split_once('-').map(|(_, id)| id.to_string()))
-                    .collect();
-                object.insert(
-                    "_revisions".to_string(),
-                    json!({"start": start, "ids": ids}),
-                );
-            }
-        } else {
-            object.remove("_revisions");
-        }
-    }
-
-    let explicitly_requested = requested_rev.is_some();
-    let deleted = winner
-        .get("_deleted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if deleted && !explicitly_requested {
-        return fail(ApiError::not_found("deleted"));
-    }
-    let etag = format!("\"{winner_rev}\"");
-    if etag_matches(headers, header::IF_NONE_MATCH, &etag) {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        if let Ok(value) = etag.parse() {
-            response.headers_mut().insert(header::ETAG, value);
-        }
-        return response;
-    }
-    doc_response(winner)
-}
-
-/// Count reachable replicas for revision-shaped responses (`open_revs`,
-/// `revs_info`) without silently downgrading the requested `r`.
-pub(crate) async fn quorum_reachable(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    docid: &str,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-    r: usize,
-) -> Option<Response> {
-    let (reachable, _) = replica_docs(st, db, dbname, docid, q, headers, false).await;
-    let r = r.min(replicas_of_doc(db, docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        Some(fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        )))
-    } else {
-        None
-    }
-}
-
 /// Ask every replica for a document. With `open_all`, each peer returns all
 /// leaves (`open_revs=all`) and their histories; otherwise the single winner
 /// (or the client's explicit `rev`) is returned. Explicit not-found answers
 /// count as reachable, but a transport or server failure does not.
-async fn replica_docs(
-    st: &AppState,
+pub(crate) async fn replica_docs(
+    ctx: &ClusterCtx,
     db: &Db,
     dbname: &str,
     docid: &str,
@@ -458,8 +246,8 @@ async fn replica_docs(
         opts.open_revs = Some(vec!["all".to_string()]);
     }
 
-    let mut replicas = replicas_of_doc(db, docid);
-    if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
+    let mut replicas = db.replicas_of_doc(docid);
+    if let Some(index) = replicas.iter().position(|node| *node == ctx.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
@@ -467,7 +255,7 @@ async fn replica_docs(
         let inner = inner.clone();
         let opts = opts.clone();
         async move {
-            if node == st.cluster.me {
+            if node == ctx.cluster.me {
                 crate::telemetry::record_local_read();
                 return match db.get_doc(docid, &opts).await {
                     Ok(doc) => (true, Some(doc)),
@@ -475,9 +263,9 @@ async fn replica_docs(
                 };
             }
             crate::telemetry::record_remote_read();
-            let peer = st.cluster.nodes[node].clone();
+            let peer = ctx.cluster.nodes[node].clone();
             let request = internal_request(
-                st,
+                ctx,
                 reqwest::Method::GET,
                 &peer,
                 &[dbname, docid],
@@ -518,18 +306,18 @@ async fn replica_docs(
     (reachable, docs)
 }
 
-struct Reconciled {
-    winner: Value,
-    conflicts: Vec<String>,
-    deleted_conflicts: Vec<String>,
-    history: Vec<String>,
+pub(crate) struct Reconciled {
+    pub(crate) winner: Value,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) deleted_conflicts: Vec<String>,
+    pub(crate) history: Vec<String>,
 }
 
 /// Pure merged-tree reconciliation. `docs` may contain duplicate revision ids
 /// with different retained history lengths; ancestry is merged from every
 /// response before bodies are deduplicated, and the longest history wins
 /// deterministically. The result must not depend on input order.
-fn reconcile_leaves(docs: &[Value], requested_rev: Option<&str>) -> Option<Reconciled> {
+pub(crate) fn reconcile_leaves(docs: &[Value], requested_rev: Option<&str>) -> Option<Reconciled> {
     let mut bodies: BTreeMap<String, Value> = BTreeMap::new();
     let mut histories: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut leaves: BTreeMap<String, bool> = BTreeMap::new();
@@ -622,9 +410,9 @@ struct BulkBody<'a, T: serde::Serialize> {
     new_edits: bool,
 }
 
-/// `new_edits=true` writes to each document's primary (the coordinating
-/// replica), then copies the resulting full revision to the other replicas with
-/// `new_edits=false`, so every replica ends with byte-identical history.
+/// `new_edits=true` sends each document to every replica in its shard set and
+/// returns once `w` of them acknowledge (CouchDB-style; revision ids are
+/// deterministic, so no primary re-fetch/copy pass is needed).
 /// `new_edits=false` (the replication path) sends the given revision to every
 /// replica directly. The bool is whether the default write quorum was met.
 pub(crate) async fn commit_docs(
@@ -636,7 +424,8 @@ pub(crate) async fn commit_docs(
     w: usize,
     headers: &HeaderMap,
 ) -> DbResult<(Vec<Value>, bool)> {
-    if !st.cluster.is_clustered() {
+    let ctx = &st.ctx;
+    if !ctx.cluster.is_clustered() {
         let results = db.put_docs(docs, new_edits).await?;
         if results.iter().any(|result| result.get("ok").is_some()) {
             st.db_updates.record(dbname, "updated");
@@ -649,7 +438,7 @@ pub(crate) async fn commit_docs(
     // under the gate closes the window between the request-entry check and
     // acquiring it.
     let gate = Arc::new(db.write_guard().await);
-    if db.rebalance_in_progress() && !crate::api::is_forwarded(st, headers) {
+    if db.rebalance_in_progress() && !ctx.cluster.is_internal(headers) {
         return Err(ApiError::new(
             503,
             "rebalance_in_progress",
@@ -657,224 +446,355 @@ pub(crate) async fn commit_docs(
         ));
     }
 
-    // Routing needs ids, so generate them before grouping. `Db::put_docs`
-    // would otherwise assign them per replica and the copies would diverge.
-    for doc in &mut docs {
+    let ids = assign_ids(&mut docs);
+    let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
+        ids.iter().map(|id| db.placement_of_doc(id)).unzip();
+    let docs: Vec<Arc<Value>> = docs.into_iter().map(Arc::new).collect();
+    let groups = group_by_node(&docs, &replicas);
+    crate::telemetry::record_fanout(groups.len() as u64);
+
+    let (out, met) = if new_edits {
+        let tally = QuorumTally::new(&ids, &primaries, &replicas, write_quorum(w, db.copies()));
+        let db_handle = st.db(dbname).await?;
+        let pending = spawn_quorum_writes(st, &db_handle, dbname, groups, headers, &gate);
+        collect_quorum(pending, tally).await
+    } else {
+        let responses = replicate_to_all(st, db, dbname, groups, headers).await;
+        merge_replicated(&ids, &primaries, responses)
+    };
+    if !met {
+        crate::telemetry::record_quorum_failure();
+    }
+    if out.iter().any(|result| result.get("ok").is_some()) {
+        st.db_updates.record(dbname, "updated");
+    }
+    Ok((out, met))
+}
+
+/// Routing needs ids, so generate them before grouping. `Db::put_docs` would
+/// otherwise assign them per replica and the copies would diverge.
+fn assign_ids(docs: &mut [Value]) -> Vec<String> {
+    for doc in docs.iter_mut() {
         if doc.get("_id").is_none() {
-            doc["_id"] = json!(crate::db::uuid());
+            doc["_id"] = json!(crate::util::uuid());
         }
     }
-    let ids: Vec<String> = docs
-        .iter()
+    docs.iter()
         .map(|doc| {
             doc.get("_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string()
         })
-        .collect();
-    let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
-        ids.iter().map(|id| db.placement_of_doc(id)).unzip();
-    let replication = db.copies();
-    // CouchDB defaults to a write quorum and lets `?w=` override it.
-    let quorum = if w == 0 {
-        replication / 2 + 1
+        .collect()
+}
+
+/// CouchDB defaults to a write quorum and lets `?w=` override it.
+fn write_quorum(w: usize, copies: usize) -> usize {
+    if w == 0 {
+        copies / 2 + 1
     } else {
-        w.min(replication)
-    };
-    let total = docs.len();
-    let docs: Vec<Arc<Value>> = docs.into_iter().map(Arc::new).collect();
-    let mut out = vec![Value::Null; total];
-    let mut acks = vec![0usize; total];
+        w.min(copies)
+    }
+}
 
-    if new_edits {
-        // CouchDB-style: send the original document to every replica in its
-        // shard set and wait for `w` acknowledgements. Revision ids are
-        // deterministic, so no primary re-fetch/copy pass is needed.
-        let db_handle = st.db(dbname).await?;
-        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
-        for (slot, doc) in docs.into_iter().enumerate() {
-            for node in &replicas[slot] {
-                groups.entry(*node).or_default().push((slot, doc.clone()));
-            }
+type SlotDocs = Vec<(usize, Arc<Value>)>;
+/// One node's answer: the node, the document slots it was sent, and the
+/// per-document results or the failure to reach it.
+type NodeReply = (usize, Vec<usize>, DbResult<Vec<Value>>);
+
+/// The documents each node is to receive, with each document's slot in the
+/// request.
+fn group_by_node(docs: &[Arc<Value>], replicas: &[Vec<usize>]) -> HashMap<usize, SlotDocs> {
+    let mut groups: HashMap<usize, SlotDocs> = HashMap::new();
+    for (slot, doc) in docs.iter().enumerate() {
+        for node in replicas.get(slot).into_iter().flatten() {
+            groups.entry(*node).or_default().push((slot, doc.clone()));
         }
+    }
+    groups
+}
 
-        crate::telemetry::record_fanout(groups.len() as u64);
-        let mut successes: Vec<Option<Value>> = vec![None; total];
-        let mut failures: Vec<Option<Value>> = vec![None; total];
-        // Design documents go to every node, and any node may coordinate a
-        // query against them, so their write waits for every replica to answer
-        // rather than only the quorum.
-        let mut unanswered: Vec<usize> = (0..total)
-            .map(|slot| {
-                if ids[slot].starts_with("_design/") {
-                    replicas[slot].len()
+fn replica_unavailable(id: &str) -> Value {
+    json!({
+        "id": id,
+        "error": "replica_unavailable",
+        "reason": "no replica in the shard set is reachable",
+    })
+}
+
+/// Start one detached write per node. Each task holds the write gate, so a
+/// slow or unreachable replica keeps running after the request returns.
+fn spawn_quorum_writes(
+    st: &AppState,
+    db: &Arc<Db>,
+    dbname: &str,
+    groups: HashMap<usize, SlotDocs>,
+    headers: &HeaderMap,
+    gate: &Arc<impl Send + Sync + 'static>,
+) -> FuturesUnordered<tokio::task::JoinHandle<NodeReply>> {
+    let ctx = &st.ctx;
+    let pending = FuturesUnordered::new();
+    for (node, group) in groups {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        if node == ctx.cluster.me {
+            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
+            let db = db.clone();
+            let gate = gate.clone();
+            pending.push(spawn_node_write(node, slots, async move {
+                let _gate = gate;
+                db.put_docs(subdocs, true).await
+            }));
+        } else {
+            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+            let client = ctx.client.clone();
+            let secret = ctx.cluster.secret.clone();
+            let peer = ctx.cluster.nodes[node].clone();
+            let dbname = dbname.to_string();
+            let headers = headers.clone();
+            let gate = gate.clone();
+            pending.push(spawn_node_write(node, slots, async move {
+                let _gate = gate;
+                forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await
+            }));
+        }
+    }
+    pending
+}
+
+/// Run one node's write as a detached task that reports which node and slots
+/// it answered for. A panic is caught and reported as that node's failure: the
+/// join handle would otherwise lose the node and slots, and the tally would
+/// keep waiting for a reply that is never coming.
+fn spawn_node_write(
+    node: usize,
+    slots: Vec<usize>,
+    write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
+) -> tokio::task::JoinHandle<NodeReply> {
+    use futures::FutureExt;
+    tokio::spawn(async move {
+        let result = std::panic::AssertUnwindSafe(write)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(ApiError::internal("replica write task panicked")));
+        (node, slots, result)
+    })
+}
+
+/// Return as soon as the tally is settled. The remaining replica writes keep
+/// running as detached tasks, so a slow or unreachable replica no longer sets
+/// write tail latency.
+async fn collect_quorum(
+    mut pending: FuturesUnordered<tokio::task::JoinHandle<NodeReply>>,
+    mut tally: QuorumTally<'_>,
+) -> (Vec<Value>, bool) {
+    while let Some(joined) = pending.next().await {
+        // Panics are caught in the task, so only a cancelled task (runtime
+        // shutdown) fails to join.
+        let Ok((node, slots, response)) = joined else {
+            continue;
+        };
+        tally.record(node, slots, response.ok());
+        if tally.settled() {
+            break;
+        }
+    }
+    let met = tally.met();
+    (tally.finish(), met)
+}
+
+/// Pure bookkeeping for a quorum write: per-document acknowledgement counts
+/// and the result to report for each document.
+struct QuorumTally<'a> {
+    ids: &'a [String],
+    primaries: &'a [usize],
+    quorum: usize,
+    acks: Vec<usize>,
+    successes: Vec<Option<Value>>,
+    failures: Vec<Option<Value>>,
+    /// Replies still owed per document. Design documents go to every node, and
+    /// any node may coordinate a query against them, so their write waits for
+    /// every replica to answer rather than only the quorum.
+    unanswered: Vec<usize>,
+}
+
+impl<'a> QuorumTally<'a> {
+    fn new(
+        ids: &'a [String],
+        primaries: &'a [usize],
+        replicas: &[Vec<usize>],
+        quorum: usize,
+    ) -> Self {
+        let total = ids.len();
+        let unanswered = ids
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| {
+                if id.starts_with("_design/") {
+                    replicas.get(slot).map_or(0, Vec::len)
                 } else {
                     0
                 }
             })
             .collect();
-        let mut pending = FuturesUnordered::new();
-        for (node, group) in groups {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            if node == st.cluster.me {
-                let subdocs: Vec<Value> =
-                    group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-                let db = db_handle.clone();
-                let gate = gate.clone();
-                pending.push(tokio::spawn(async move {
-                    let _gate = gate;
-                    (node, slots, db.put_docs(subdocs, true).await)
-                }));
-            } else {
-                let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-                let client = st.client.clone();
-                let secret = st.cluster.secret.clone();
-                let peer = st.cluster.nodes[node].clone();
-                let dbname = dbname.to_string();
-                let headers = headers.clone();
-                let gate = gate.clone();
-                pending.push(tokio::spawn(async move {
-                    let _gate = gate;
-                    (
-                        node,
-                        slots,
-                        forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers)
-                            .await,
-                    )
-                }));
-            }
+        QuorumTally {
+            ids,
+            primaries,
+            quorum,
+            acks: vec![0; total],
+            successes: vec![None; total],
+            failures: vec![None; total],
+            unanswered,
         }
-
-        // Return as soon as every document has `w` acknowledgements. The
-        // remaining replica writes keep running as detached tasks, so a slow
-        // or unreachable replica no longer sets write tail latency.
-        while let Some(joined) = pending.next().await {
-            let Ok((node, slots, response)) = joined else {
-                continue;
-            };
-            for slot in &slots {
-                unanswered[*slot] = unanswered[*slot].saturating_sub(1);
-            }
-            match response {
-                Ok(results) => {
-                    for (slot, result) in slots.into_iter().zip(results) {
-                        if result.get("error").is_none() {
-                            acks[slot] += 1;
-                            if successes[slot].is_none() || node == primaries[slot] {
-                                successes[slot] = Some(result);
-                            }
-                        } else if failures[slot].is_none() || node == primaries[slot] {
-                            failures[slot] = Some(result);
-                        }
-                    }
-                }
-                Err(_) => {
-                    for slot in slots {
-                        if failures[slot].is_none() {
-                            failures[slot] = Some(json!({
-                                "id": ids[slot],
-                                "error": "replica_unavailable",
-                                "reason": "no replica in the shard set is reachable",
-                            }));
-                        }
-                    }
-                }
-            }
-            if acks.iter().all(|ack| *ack >= quorum) && unanswered.iter().all(|left| *left == 0) {
-                break;
-            }
-        }
-
-        for slot in 0..total {
-            out[slot] = successes[slot]
-                .take()
-                .or_else(|| failures[slot].take())
-                .unwrap_or_else(|| {
-                    json!({
-                        "id": ids[slot],
-                        "error": "replica_unavailable",
-                        "reason": "no replica in the shard set is reachable",
-                    })
-                });
-        }
-        let met = acks.iter().all(|ack| *ack >= quorum);
-        if !met {
-            crate::telemetry::record_quorum_failure();
-        }
-        if out.iter().any(|result| result.get("ok").is_some()) {
-            st.db_updates.record(dbname, "updated");
-        }
-        Ok((out, met))
-    } else {
-        // Replication writes carry their own history and must reach every
-        // replica, including ones that are not the primary. A down replica is
-        // not fatal: anti-entropy will heal it when it returns.
-        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
-        for (slot, doc) in docs.into_iter().enumerate() {
-            for node in &replicas[slot] {
-                groups.entry(*node).or_default().push((slot, doc.clone()));
-            }
-        }
-        crate::telemetry::record_fanout(groups.len() as u64);
-        let mut reached = vec![false; total];
-        let mut responses = Vec::new();
-        if let Some(group) = groups.remove(&st.cluster.me) {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-            responses.push((st.cluster.me, slots, db.put_docs(subdocs, false).await));
-        }
-        let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-            let client = st.client.clone();
-            let secret = st.cluster.secret.clone();
-            let peer = st.cluster.nodes[node].clone();
-            let dbname = dbname.to_string();
-            let headers = headers.clone();
-            async move {
-                (
-                    node,
-                    slots,
-                    forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
-                )
-            }
-        }))
-        .await;
-        responses.extend(remote);
-        for (node, slots, response) in responses {
-            match response {
-                Ok(results) => {
-                    for (slot, result) in slots.into_iter().zip(results) {
-                        reached[slot] = true;
-                        // Prefer the primary's verdict.
-                        if node == primaries[slot] || out[slot].is_null() {
-                            out[slot] = result;
-                        }
-                    }
-                }
-                Err(_) => {
-                    for slot in slots {
-                        if out[slot].is_null() {
-                            out[slot] = json!({
-                                "id": ids[slot],
-                                "error": "replica_unavailable",
-                                "reason": "no replica in the shard set is reachable",
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        let met = reached.iter().all(|ok| *ok);
-        if !met {
-            crate::telemetry::record_quorum_failure();
-        }
-        if out.iter().any(|result| result.get("ok").is_some()) {
-            st.db_updates.record(dbname, "updated");
-        }
-        Ok((out, met))
     }
+
+    /// Record one node's reply for the given slots; `None` means the node
+    /// could not be reached.
+    fn record(&mut self, node: usize, slots: Vec<usize>, response: Option<Vec<Value>>) {
+        for slot in &slots {
+            if let Some(left) = self.unanswered.get_mut(*slot) {
+                *left = left.saturating_sub(1);
+            }
+        }
+        match response {
+            Some(results) => {
+                for (slot, result) in slots.into_iter().zip(results) {
+                    let is_primary = self.primaries.get(slot) == Some(&node);
+                    let (Some(ack), Some(success), Some(failure)) = (
+                        self.acks.get_mut(slot),
+                        self.successes.get_mut(slot),
+                        self.failures.get_mut(slot),
+                    ) else {
+                        continue;
+                    };
+                    if result.get("error").is_none() {
+                        *ack += 1;
+                        if success.is_none() || is_primary {
+                            *success = Some(result);
+                        }
+                    } else if failure.is_none() || is_primary {
+                        *failure = Some(result);
+                    }
+                }
+            }
+            None => {
+                for slot in slots {
+                    if let (Some(failure), Some(id)) =
+                        (self.failures.get_mut(slot), self.ids.get(slot))
+                    {
+                        if failure.is_none() {
+                            *failure = Some(replica_unavailable(id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every document has its quorum and no design document is still owed a
+    /// reply.
+    fn settled(&self) -> bool {
+        self.met() && self.unanswered.iter().all(|left| *left == 0)
+    }
+
+    /// Every document has at least `quorum` acknowledgements.
+    fn met(&self) -> bool {
+        self.acks.iter().all(|ack| *ack >= self.quorum)
+    }
+
+    /// The result per document: a success if any replica acknowledged (the
+    /// primary's if it did), else a failure (the primary's if it reported one),
+    /// else `replica_unavailable`.
+    fn finish(self) -> Vec<Value> {
+        let ids = self.ids;
+        self.successes
+            .into_iter()
+            .zip(self.failures)
+            .enumerate()
+            .map(|(slot, (success, failure))| {
+                success.or(failure).unwrap_or_else(|| {
+                    replica_unavailable(ids.get(slot).map_or("", String::as_str))
+                })
+            })
+            .collect()
+    }
+}
+
+/// Replication writes carry their own history and must reach every replica,
+/// including ones that are not the primary. A down replica is not fatal:
+/// anti-entropy will heal it when it returns.
+async fn replicate_to_all(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    mut groups: HashMap<usize, SlotDocs>,
+    headers: &HeaderMap,
+) -> Vec<NodeReply> {
+    let ctx = &st.ctx;
+    let mut responses = Vec::new();
+    if let Some(group) = groups.remove(&ctx.cluster.me) {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
+        responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
+    }
+    let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+        let client = ctx.client.clone();
+        let secret = ctx.cluster.secret.clone();
+        let peer = ctx.cluster.nodes[node].clone();
+        let dbname = dbname.to_string();
+        let headers = headers.clone();
+        async move {
+            (
+                node,
+                slots,
+                forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
+            )
+        }
+    }))
+    .await;
+    responses.extend(remote);
+    responses
+}
+
+/// Merge the replies of a replication write: the primary's verdict wins, and
+/// the write is complete only if every document reached some replica.
+fn merge_replicated(
+    ids: &[String],
+    primaries: &[usize],
+    responses: Vec<NodeReply>,
+) -> (Vec<Value>, bool) {
+    let total = ids.len();
+    let mut out = vec![Value::Null; total];
+    let mut reached = vec![false; total];
+    for (node, slots, response) in responses {
+        match response {
+            Ok(results) => {
+                for (slot, result) in slots.into_iter().zip(results) {
+                    let (Some(reached), Some(out)) = (reached.get_mut(slot), out.get_mut(slot))
+                    else {
+                        continue;
+                    };
+                    *reached = true;
+                    if primaries.get(slot) == Some(&node) || out.is_null() {
+                        *out = result;
+                    }
+                }
+            }
+            Err(_) => {
+                for slot in slots {
+                    if let (Some(out), Some(id)) = (out.get_mut(slot), ids.get(slot)) {
+                        if out.is_null() {
+                            *out = replica_unavailable(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let met = reached.iter().all(|ok| *ok);
+    (out, met)
 }
 
 async fn forward_bulk_owned<T>(
@@ -922,7 +842,7 @@ where
 }
 
 pub(crate) async fn forward_json(
-    st: &AppState,
+    ctx: &ClusterCtx,
     peer: &str,
     dbname: &str,
     endpoint: &str,
@@ -935,7 +855,7 @@ pub(crate) async fn forward_json(
         .filter_map(|pair| pair.split_once('='))
         .collect();
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::POST,
         peer,
         &[dbname, endpoint],
@@ -958,37 +878,33 @@ pub(crate) async fn forward_json(
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
-pub(crate) fn replicas_of_shard(db: &Db, shard: u32) -> Vec<usize> {
-    db.replicas_of_shard(shard)
-}
-
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
 /// copy is CouchDB's `{error, {nodedown, <<"progress not possible">>}}`
 /// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
 fn fallback_shard_masks(
     db: &Db,
-    owned_by_node: &[Vec<bool>],
+    owned_by_node: &[ShardMask],
     failed: &[usize],
     alive: &[usize],
-) -> DbResult<Vec<(usize, Vec<bool>)>> {
-    let mut groups: HashMap<usize, Vec<bool>> = HashMap::new();
+) -> DbResult<Vec<(usize, ShardMask)>> {
+    let mut groups: HashMap<usize, ShardMask> = HashMap::new();
     for &node in failed {
         for shard in 0..db.q {
             if !owned_by_node
                 .get(node)
-                .and_then(|owned| owned.get(shard as usize))
-                .copied()
-                .unwrap_or(false)
+                .is_some_and(|owned| owned.covers(shard as usize))
             {
                 continue;
             }
-            let target = replicas_of_shard(db, shard)
+            let target = db
+                .replicas_of_shard(shard)
                 .into_iter()
                 .find(|candidate| alive.contains(candidate))
                 .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
             groups
                 .entry(target)
-                .or_insert_with(|| vec![false; db.q as usize])[shard as usize] = true;
+                .or_insert_with(|| ShardMask::none(db.q))
+                .select(shard as usize);
         }
     }
     Ok(groups.into_iter().collect())
@@ -998,7 +914,7 @@ fn fallback_shard_masks(
 /// headers to forward to peers.
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterRead<'a> {
-    pub st: &'a AppState,
+    pub ctx: &'a ClusterCtx,
     pub db: &'a Db,
     pub dbname: &'a str,
     pub headers: &'a HeaderMap,
@@ -1037,20 +953,20 @@ enum Round {
 /// when no request succeeds.
 async fn scatter<T, F, Fut>(
     read: ClusterRead<'_>,
-    owned_by_node: &[Vec<bool>],
+    owned_by_node: &[ShardMask],
     what: &str,
     fetch: F,
 ) -> DbResult<Vec<(usize, Round, T)>>
 where
-    F: Fn(usize, Vec<bool>, Round) -> Fut,
+    F: Fn(usize, ShardMask, Round) -> Fut,
     Fut: std::future::Future<Output = DbResult<T>>,
 {
-    let ClusterRead { st, db, .. } = read;
-    let requests: Vec<(usize, Vec<bool>)> = owned_by_node
+    let ClusterRead { ctx, db, .. } = read;
+    let requests: Vec<(usize, ShardMask)> = owned_by_node
         .iter()
         .cloned()
         .enumerate()
-        .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+        .filter(|(_, mask)| !mask.is_empty())
         .collect();
     crate::telemetry::record_fanout(requests.len() as u64);
     let responses = join_all(requests.into_iter().map(|(node, mask)| {
@@ -1076,7 +992,7 @@ where
     }
     if !failed.is_empty() {
         crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..st.cluster.nodes.len())
+        let alive: Vec<usize> = (0..ctx.cluster.nodes.len())
             .filter(|node| !failed.contains(node))
             .collect();
         let groups = fallback_shard_masks(db, owned_by_node, &failed, &alive)?;
@@ -1100,8 +1016,8 @@ where
 }
 
 pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
-    let ClusterRead { st, db, .. } = read;
-    let owned_by_node = preferred_shard_masks(st, db);
+    let ClusterRead { ctx, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(ctx, db);
 
     if let Some(keys) = &opts.keys {
         let mut key_opts = opts.clone();
@@ -1203,30 +1119,24 @@ pub(crate) async fn fetch_all_docs(
     read: ClusterRead<'_>,
     node: usize,
     opts: &AllDocsOpts,
-    shards: Option<&[bool]>,
+    shards: Option<&ShardMask>,
 ) -> DbResult<Value> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
     } = read;
-    if node == st.cluster.me {
+    if node == ctx.cluster.me {
         if let Some(shards) = shards {
             return db.all_docs_owned(opts, shards).await;
         }
         return db.all_docs(opts).await;
     }
-    let peer = &st.cluster.nodes[node];
+    let peer = &ctx.cluster.nodes[node];
     let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(shards) = shards {
-        let selected: Vec<String> = shards
-            .iter()
-            .enumerate()
-            .filter(|(_, owned)| **owned)
-            .map(|(shard, _)| shard.to_string())
-            .collect();
-        query.push(("shards", selected.join(",")));
+        query.push(("shards", shards.query_value()));
     }
     if let Some(partition) = &opts.partition {
         query.push(("partition", partition.clone()));
@@ -1263,7 +1173,7 @@ pub(crate) async fn fetch_all_docs(
         None => json!({}),
     };
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::POST,
         peer,
         &[dbname, "_all_docs"],
@@ -1311,10 +1221,10 @@ async fn fetch_view_mask(
     spec: &crate::view::ViewSpec,
     limit: Option<usize>,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<ViewBatch> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
@@ -1323,7 +1233,7 @@ async fn fetch_view_mask(
         ddoc,
         name: view_name,
     } = view;
-    if !mask.iter().any(|owned| *owned) {
+    if mask.is_empty() {
         return Ok(ViewBatch::default());
     }
     // Owners apply the key range and return at most `limit` rows from their
@@ -1331,8 +1241,8 @@ async fn fetch_view_mask(
     let mut local = query.clone();
     local.skip = 0;
     local.limit = limit.unwrap_or(usize::MAX);
-    local.owner_shards = Some(mask.to_vec());
-    if node == st.cluster.me {
+    local.owner_shards = Some(mask.clone());
+    if node == ctx.cluster.me {
         let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
         let docs = if query.include_docs || query.attachments {
             let ids = selection
@@ -1352,16 +1262,11 @@ async fn fetch_view_mask(
         });
     }
 
-    let peer = &st.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
+    let peer = &ctx.cluster.nodes[node];
+    let selected = mask.query_value();
     let mut params = vec![
         ("reduce", "false".to_string()),
-        ("shards", selected.join(",")),
+        ("shards", selected),
         (
             "include_docs",
             if query.include_docs { "true" } else { "false" }.to_string(),
@@ -1376,7 +1281,7 @@ async fn fetch_view_mask(
         params.push(("limit", limit.to_string()));
     }
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_view", view_name],
@@ -1443,7 +1348,7 @@ pub(crate) async fn cluster_view_rows(
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
 ) -> DbResult<ClusterViewRows> {
-    let ClusterRead { st, db, .. } = read;
+    let ClusterRead { ctx, db, .. } = read;
     let IndexRef {
         ddoc,
         name: view_name,
@@ -1458,7 +1363,7 @@ pub(crate) async fn cluster_view_rows(
     let can_limit = !reduce;
     let take = query.skip.saturating_add(query.limit);
 
-    let owned_by_node = preferred_shard_masks(st, db);
+    let owned_by_node = preferred_shard_masks(ctx, db);
     let limit = can_limit.then_some(take);
 
     let spec_ref = &spec;
@@ -1519,12 +1424,12 @@ pub(crate) async fn cluster_view_rows(
 /// paging, which applies to the merged groups. For `keys`, owners return one
 /// partial per distinct exact key, so the coordinator can rebuild the
 /// requested order, repeats and group levels.
-fn owner_reduce_query(query: &crate::view::ViewQuery, mask: &[bool]) -> crate::view::ViewQuery {
+fn owner_reduce_query(query: &crate::view::ViewQuery, mask: &ShardMask) -> crate::view::ViewQuery {
     let mut owner = query.clone();
     owner.skip = 0;
     owner.limit = usize::MAX;
     owner.reduce = Some(true);
-    owner.owner_shards = Some(mask.to_vec());
+    owner.owner_shards = Some(mask.clone());
     if let Some(keys) = &query.keys {
         owner.keys = Some(crate::view::unique_keys(keys));
         owner.group = true;
@@ -1539,10 +1444,10 @@ async fn fetch_reduce_mask(
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<Value> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
@@ -1552,21 +1457,13 @@ async fn fetch_reduce_mask(
         name: view_name,
     } = view;
     let owner = owner_reduce_query(query, mask);
-    if node == st.cluster.me {
+    if node == ctx.cluster.me {
         return crate::view::query(db, ddoc, view_name, &owner).await;
     }
 
-    let peer = &st.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
-    let mut params = vec![
-        ("reduce", "true".to_string()),
-        ("shards", selected.join(",")),
-    ];
+    let peer = &ctx.cluster.nodes[node];
+    let selected = mask.query_value();
+    let mut params = vec![("reduce", "true".to_string()), ("shards", selected)];
     if owner.group {
         params.push(("group", "true".to_string()));
     }
@@ -1575,7 +1472,7 @@ async fn fetch_reduce_mask(
     }
     push_range_params(&mut params, &owner);
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_view", view_name],
@@ -1607,7 +1504,7 @@ pub(crate) async fn cluster_reduce(
     query: &crate::view::ViewQuery,
     reducer: &str,
 ) -> DbResult<Value> {
-    let ClusterRead { st, db, .. } = read;
+    let ClusterRead { ctx, db, .. } = read;
     let IndexRef {
         ddoc,
         name: view_name,
@@ -1616,7 +1513,7 @@ pub(crate) async fn cluster_reduce(
     let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
     crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     crate::view::check_query(&spec, query)?;
-    let owned_by_node = preferred_shard_masks(st, db);
+    let owned_by_node = preferred_shard_masks(ctx, db);
     let values = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
         fetch_reduce_mask(read, view, query, node, &mask).await
     })
@@ -1630,9 +1527,14 @@ pub(crate) async fn cluster_reduce(
             crate::view::add_partial(&mut partials, key, value);
         }
     }
-    let mut js = crate::view::JsReducer::new(reducer, query.limits);
-    crate::view::assemble_reduce(partials, query, &mut js)
-        .map_err(|reason| crate::view::reduce_failure(&reason))
+    let reducer = reducer.to_string();
+    let query = query.clone();
+    crate::view::blocking(move || {
+        let mut js = crate::view::JsReducer::new(&reducer, query.limits);
+        crate::view::assemble_reduce(partials, &query, &mut js)
+            .map_err(|reason| crate::view::reduce_failure(&reason))
+    })
+    .await
 }
 
 pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {
@@ -1674,33 +1576,33 @@ pub(crate) fn row_key(row: &crate::view::Row) -> String {
 /// owns it lives elsewhere.
 async fn design_doc(read: ClusterRead<'_>, ddoc: &str) -> DbResult<Value> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
     } = read;
     match db.get_doc(ddoc, &DocOpts::default()).await {
         Err(error) if error.status == 404 => {
-            fetch_ddoc_from_replica(st, db, dbname, ddoc, headers).await
+            fetch_ddoc_from_replica(ctx, db, dbname, ddoc, headers).await
         }
         other => other,
     }
 }
 
 pub(crate) async fn fetch_ddoc_from_replica(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Db,
     dbname: &str,
     ddoc: &str,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
-    for node in replicas_of_doc(db, ddoc) {
-        if node == st.cluster.me {
+    for node in db.replicas_of_doc(ddoc) {
+        if node == ctx.cluster.me {
             continue;
         }
-        let peer = st.cluster.nodes[node].clone();
+        let peer = ctx.cluster.nodes[node].clone();
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::GET,
             &peer,
             &[dbname, ddoc],
@@ -1737,14 +1639,6 @@ pub(crate) struct FallbackMark {
     seq: u64,
 }
 
-fn mask_shards(mask: &[bool]) -> Vec<usize> {
-    mask.iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard)
-        .collect()
-}
-
 /// One stream of changes with its own sequence space: a node reading its
 /// preferred shards, or a node reading shards reassigned from a failed owner.
 struct ChangeLane {
@@ -1760,25 +1654,25 @@ pub(crate) async fn cluster_changes(
     q: &HashMap<String, String>,
     body: &[u8],
 ) -> DbResult<Value> {
-    let ClusterRead { st, db, .. } = read;
-    let n = st.cluster.nodes.len();
+    let ClusterRead { ctx, db, .. } = read;
+    let n = ctx.cluster.nodes.len();
     let raw_since = q.get("since").map(String::as_str);
     let (mut since, marks) = if raw_since == Some("now") {
         cluster_update_vector(read).await?
     } else if let Some(raw) = raw_since {
         let vector = match decode_since(raw, n) {
             Some(vector) => vector,
-            None => vec![since_component(Some(raw), st.cluster.me, n); n],
+            None => vec![since_component(Some(raw), ctx.cluster.me, n); n],
         };
         (vector, decode_fallbacks(raw, n))
     } else {
         (vec![0; n], Vec::new())
     };
     since.resize(n, 0);
-    let owned_by_node = preferred_shard_masks(st, db);
+    let owned_by_node = preferred_shard_masks(ctx, db);
 
     let doc_ids = doc_ids_from(q, body);
-    let change_filter = crate::api::resolve_changes_filter(db, q).await?;
+    let change_filter = resolve_changes_filter(db, q).await?;
     let changes = ChangesFetch {
         include_docs: flag(q, "include_docs"),
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
@@ -1806,7 +1700,7 @@ pub(crate) async fn cluster_changes(
             // Shards reassigned from a failed owner resume from the mark this
             // node left for exactly this set of shards, else from the start;
             // preferred masks are disjoint, so ids do not overlap.
-            let shards = mask_shards(&mask);
+            let shards = mask.shards();
             let since = match round {
                 Round::Owner => since_ref[node],
                 Round::Fallback => marks_ref
@@ -1905,12 +1799,12 @@ pub(crate) async fn fetch_node_changes(
     read: ClusterRead<'_>,
     changes: ChangesFetch<'_>,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
     since: u64,
     limit: Option<usize>,
 ) -> DbResult<Value> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
@@ -1922,7 +1816,7 @@ pub(crate) async fn fetch_node_changes(
         filter,
         q,
     } = changes;
-    if node == st.cluster.me {
+    if node == ctx.cluster.me {
         return db
             .changes(&ChangesOpts {
                 since,
@@ -1932,22 +1826,16 @@ pub(crate) async fn fetch_node_changes(
                 descending: false,
                 doc_ids: doc_ids.map(|ids| ids.to_vec()),
                 filter: filter.cloned(),
-                conflicts: crate::api::flag(q, "conflicts"),
-                owned: Some(mask.to_vec()),
+                conflicts: flag(q, "conflicts"),
+                owned: Some(mask.clone()),
                 until: None,
             })
             .await;
     }
 
-    let peer = &st.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
-    let mut params: Vec<(&str, String)> =
-        vec![("since", since.to_string()), ("shards", selected.join(","))];
+    let peer = &ctx.cluster.nodes[node];
+    let selected = mask.query_value();
+    let mut params: Vec<(&str, String)> = vec![("since", since.to_string()), ("shards", selected)];
     if let Some(limit) = limit {
         params.push(("limit", limit.to_string()));
     }
@@ -1963,7 +1851,7 @@ pub(crate) async fn fetch_node_changes(
     if let Some(view) = q.get("view") {
         params.push(("view", view.clone()));
     }
-    if crate::api::flag(q, "conflicts") {
+    if flag(q, "conflicts") {
         params.push(("conflicts", "true".to_string()));
     }
     // A filter function reads its own arguments from `req.query`, so the peer
@@ -1992,7 +1880,7 @@ pub(crate) async fn fetch_node_changes(
     extra.sort();
     params.extend(extra);
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, "_changes"],
@@ -2035,17 +1923,17 @@ pub(crate) async fn cluster_update_vector(
     read: ClusterRead<'_>,
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
     } = read;
-    let seqs = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
-        if node == st.cluster.me {
+    let seqs = futures::future::join_all((0..ctx.cluster.nodes.len()).map(|node| async move {
+        if node == ctx.cluster.me {
             return Some(db.update_seq());
         }
-        let peer = &st.cluster.nodes[node];
-        let request = internal_request(st, reqwest::Method::GET, peer, &[dbname], Some(headers))
+        let peer = &ctx.cluster.nodes[node];
+        let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
             .header("x-douchdb-update-seq", "1");
         let response = request.send().await.ok()?;
         if !response.status().is_success() {
@@ -2064,12 +1952,12 @@ pub(crate) async fn cluster_update_vector(
     if failed.is_empty() {
         return Ok((vector, Vec::new()));
     }
-    let groups = fallback_shard_masks(db, &preferred_shard_masks(st, db), &failed, &alive)?;
+    let groups = fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive)?;
     let marks = groups
         .into_iter()
         .map(|(node, mask)| FallbackMark {
             node,
-            shards: mask_shards(&mask),
+            shards: mask.shards(),
             seq: vector.get(node).copied().unwrap_or(0),
         })
         .collect();
@@ -2271,8 +2159,8 @@ pub(crate) async fn cluster_search(
     request: &crate::search::SearchRequest,
     limits: crate::view::ViewLimits,
 ) -> DbResult<Value> {
-    let ClusterRead { st, db, .. } = read;
-    let owned_by_node = preferred_shard_masks(st, db);
+    let ClusterRead { ctx, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(ctx, db);
     let offset = crate::search::parse_bookmark(request.bookmark.as_deref());
     let window = offset.saturating_add(request.limit);
     let values = scatter(read, &owned_by_node, "search", |node, mask, _| async move {
@@ -2325,10 +2213,10 @@ async fn fetch_search_mask(
     limits: crate::view::ViewLimits,
     window: usize,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<Value> {
     let ClusterRead {
-        st,
+        ctx,
         db,
         dbname,
         headers,
@@ -2337,29 +2225,24 @@ async fn fetch_search_mask(
         ddoc,
         name: index_name,
     } = index;
-    if !mask.iter().any(|owned| *owned) {
+    if mask.is_empty() {
         return Ok(json!({"total_rows": 0, "rows": [], "bookmark": "search:0"}));
     }
     let mut local = request.clone();
-    local.owner_shards = Some(mask.to_vec());
+    local.owner_shards = Some(mask.clone());
     local.bookmark = None;
     local.limit = window;
-    if node == st.cluster.me {
+    if node == ctx.cluster.me {
         return crate::search::query(db, ddoc, index_name, &local, limits).await;
     }
 
-    let peer = &st.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
+    let peer = &ctx.cluster.nodes[node];
+    let selected = mask.query_value();
     let mut params: Vec<(&str, String)> = vec![
         ("q", request.query.clone()),
         ("limit", window.to_string()),
         ("timeout", request.timeout_ms.to_string()),
-        ("shards", selected.join(",")),
+        ("shards", selected),
     ];
     if request.include_docs {
         params.push(("include_docs", "true".to_string()));
@@ -2419,7 +2302,7 @@ async fn fetch_search_mask(
     }
 
     let outgoing = internal_request(
-        st,
+        ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_search", index_name],
@@ -2447,6 +2330,44 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A fan-out task that panics must still count as that node's reply.
+    /// Slot 0 is a design document on nodes 0 and 1, so it is owed a reply
+    /// from each; slot 1 sits on nodes 0 and 2 and node 2 never answers. Node 0
+    /// acknowledges both, node 1 panics. Counting the panic settles the write
+    /// (slot 1 already has its quorum); skipping it leaves slot 0 owed a reply
+    /// and the request waits on node 2 forever.
+    #[tokio::test]
+    async fn panicked_fan_out_task_counts_as_answered() {
+        let ids = vec!["_design/a".to_string(), "plain".to_string()];
+        let primaries = vec![0, 0];
+        let replicas = vec![vec![0, 1], vec![0, 2]];
+        let tally = QuorumTally::new(&ids, &primaries, &replicas, 1);
+        let ack = |id: &str| json!({ "id": id, "ok": true, "rev": "1-a" });
+
+        let pending = FuturesUnordered::new();
+        pending.push(spawn_node_write(0, vec![0, 1], {
+            let results = vec![ack("_design/a"), ack("plain")];
+            async move { Ok(results) }
+        }));
+        pending.push(spawn_node_write(1, vec![0], async {
+            panic!("replica task exploded")
+        }));
+        pending.push(spawn_node_write(2, vec![1], async {
+            std::future::pending::<DbResult<Vec<Value>>>().await
+        }));
+
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_quorum(pending, tally),
+        )
+        .await
+        .expect("a panicked task left the request waiting for a replica that never answers");
+        let (out, met) = settled;
+        assert!(met);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|result| result.get("ok").is_some()));
+    }
 
     #[test]
     fn peer_map_with_foreign_node_count_is_not_adoptable() {
@@ -2532,6 +2453,136 @@ mod tests {
             let merged = reconcile_leaves(&docs, Some("3-c")).expect("exact rev");
             assert_eq!(merged.winner["_rev"], "3-c");
             assert_eq!(merged.history, ["3-c", "2-b", "1-0"]);
+        }
+    }
+
+    mod quorum_tally {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// What a node answers for one document.
+        #[derive(Clone, Copy, Debug)]
+        enum Verdict {
+            Ack,
+            Reject,
+        }
+
+        /// A cluster of `copies` nodes, every document replicated on all of
+        /// them with node 0 as primary. `nodes[n]` is `None` for an
+        /// unreachable node, else its verdict per document.
+        type Scenario = (usize, Vec<Option<Vec<Verdict>>>, Vec<bool>, Vec<usize>);
+
+        fn scenario() -> impl Strategy<Value = Scenario> {
+            (1usize..5, 1usize..5).prop_flat_map(|(docs, copies)| {
+                let verdict = prop_oneof![Just(Verdict::Ack), Just(Verdict::Reject)];
+                let node = prop::option::of(prop::collection::vec(verdict, docs));
+                (
+                    Just(docs),
+                    prop::collection::vec(node, copies),
+                    prop::collection::vec(any::<bool>(), docs),
+                    Just((0..copies).collect::<Vec<_>>()).prop_shuffle(),
+                )
+            })
+        }
+
+        fn reply(node: usize, slot: usize, verdict: Verdict) -> Value {
+            match verdict {
+                Verdict::Ack => json!({"ok": true, "id": format!("d{slot}"), "from": node}),
+                Verdict::Reject => {
+                    json!({"id": format!("d{slot}"), "error": "conflict", "from": node})
+                }
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn tally_agrees_with_a_direct_count(
+                (docs, nodes, design, order) in scenario(),
+                quorum in 1usize..5,
+            ) {
+                let copies = nodes.len();
+                let quorum = quorum.min(copies);
+                let ids: Vec<String> = (0..docs)
+                    .map(|slot| {
+                        if design[slot] { format!("_design/d{slot}") } else { format!("d{slot}") }
+                    })
+                    .collect();
+                let primaries = vec![0usize; docs];
+                let replicas = vec![(0..copies).collect::<Vec<_>>(); docs];
+                let mut tally = QuorumTally::new(&ids, &primaries, &replicas, quorum);
+                let slots: Vec<usize> = (0..docs).collect();
+                let mut answered = 0;
+                let mut settled_early = false;
+                for node in &order {
+                    let response = nodes[*node].as_ref().map(|verdicts| {
+                        verdicts
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, v)| reply(*node, slot, *v))
+                            .collect::<Vec<_>>()
+                    });
+                    tally.record(*node, slots.clone(), response);
+                    answered += 1;
+                    if tally.settled() {
+                        // Settled means the quorum is met and every design
+                        // document has heard from all of its replicas.
+                        prop_assert!(tally.met());
+                        if design.iter().any(|d| *d) {
+                            prop_assert_eq!(answered, copies);
+                        }
+                        settled_early = true;
+                        break;
+                    }
+                }
+                let acks: Vec<usize> = (0..docs)
+                    .map(|slot| {
+                        let upto = if settled_early { answered } else { copies };
+                        order[..upto]
+                            .iter()
+                            .filter(|n| matches!(&nodes[**n], Some(v) if matches!(v[slot], Verdict::Ack)))
+                            .count()
+                    })
+                    .collect();
+                prop_assert_eq!(tally.met(), acks.iter().all(|a| *a >= quorum));
+                let met = tally.met();
+                for (slot, result) in tally.finish().into_iter().enumerate() {
+                    if acks[slot] > 0 {
+                        // Any acknowledgement beats any failure, and the
+                        // primary's acknowledgement beats the others'.
+                        prop_assert!(result.get("error").is_none());
+                        let primary_acked = matches!(&nodes[0], Some(v) if matches!(v[slot], Verdict::Ack))
+                            && order[..if settled_early { answered } else { copies }].contains(&0);
+                        if primary_acked {
+                            prop_assert_eq!(&result["from"], &json!(0));
+                        }
+                    } else {
+                        prop_assert!(result.get("error").is_some());
+                        prop_assert!(!met);
+                    }
+                }
+            }
+
+            #[test]
+            fn a_document_nobody_answered_is_replica_unavailable(docs in 1usize..5) {
+                let ids: Vec<String> = (0..docs).map(|slot| format!("d{slot}")).collect();
+                let primaries = vec![0usize; docs];
+                let replicas = vec![vec![0usize, 1]; docs];
+                let mut tally = QuorumTally::new(&ids, &primaries, &replicas, 1);
+                prop_assert!(!tally.met());
+                tally.record(0, (0..docs).collect(), None);
+                tally.record(1, (0..docs).collect(), None);
+                prop_assert!(!tally.settled());
+                for (slot, result) in tally.finish().into_iter().enumerate() {
+                    prop_assert_eq!(&result["error"], &json!("replica_unavailable"));
+                    prop_assert_eq!(&result["id"], &json!(format!("d{slot}")));
+                }
+            }
+
+            #[test]
+            fn write_quorum_is_a_majority_unless_overridden(copies in 1usize..8, w in 1usize..12) {
+                prop_assert_eq!(write_quorum(0, copies), copies / 2 + 1);
+                prop_assert_eq!(write_quorum(w, copies), w.min(copies));
+            }
         }
     }
 }

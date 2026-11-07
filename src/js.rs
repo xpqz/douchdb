@@ -13,6 +13,22 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Per-call limits for running a user's JavaScript.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewLimits {
+    pub timeout: Duration,
+    pub memory: usize,
+}
+
+impl Default for ViewLimits {
+    fn default() -> Self {
+        ViewLimits {
+            timeout: Duration::from_secs(5),
+            memory: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// A single map/reduce/index call may not return more JSON than this. The
 /// QuickJS heap limit bounds allocations inside the engine; this bounds the
 /// Rust-side string that comes back before it is parsed into values.
@@ -87,6 +103,7 @@ pub enum WasmRuntime {
 }
 
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "wasm")]
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
 /// A debug-build worker needs a moment to start; a hung one is killed after this.
@@ -107,6 +124,7 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
 
 /// Select the wasm runtime. Returns an error when Wasmtime was requested but
 /// this binary was built without the `wasmtime` feature.
+#[cfg(feature = "wasm")]
 pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
     match runtime {
         WasmRuntime::Wasmi => {
@@ -131,18 +149,24 @@ pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
     }
 }
 
+/// Without the `wasm` feature there is no wasm sandbox to select.
+#[cfg(not(feature = "wasm"))]
+pub fn set_wasm_runtime(_runtime: WasmRuntime) -> Result<(), String> {
+    Err(
+        "the wasm sandbox is not compiled; rebuild with default features (the `wasm` feature)"
+            .to_string(),
+    )
+}
+
 pub fn sandboxed() -> bool {
     SANDBOX.load(Ordering::SeqCst) != 0
 }
 
 /// Dispatch a map/reduce/index call to the selected sandbox.
-pub fn sandbox_request(
-    kind: &str,
-    payload: Value,
-    limits: crate::view::ViewLimits,
-) -> Result<Value, String> {
+pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
     match SANDBOX.load(Ordering::SeqCst) {
         1 => process_request(kind, payload, limits),
+        #[cfg(feature = "wasm")]
         2 => wasm_request(kind, payload, limits),
         _ => Err("sandbox request without a sandbox".to_string()),
     }
@@ -268,10 +292,12 @@ pub fn install_landlock() -> Result<&'static str, String> {
 // ---------------------------------------------------------------------------
 // WASM engine
 
+#[cfg(feature = "wasm")]
 const WASM_RUNNER: &[u8] = include_bytes!("../wasm/qjs-runner.wasm");
 
 /// Linear memory the module declares up front (runtime, data segments and
 /// stack), in bytes. The view memory limit applies on top of it.
+#[cfg(feature = "wasm")]
 fn wasmi_baseline_memory(module: &wasmi::Module) -> usize {
     module
         .exports()
@@ -288,16 +314,14 @@ fn wasmi_baseline_memory(module: &wasmi::Module) -> usize {
 /// start, the configured view memory limit for the QuickJS heap, and room for
 /// the request and its parsed copy. The runner ignores the `memory` field in
 /// the request, so the host enforces the limit by refusing to grow past this.
-pub(crate) fn wasm_memory_cap(
-    baseline: usize,
-    limits: crate::view::ViewLimits,
-    body_len: usize,
-) -> usize {
+#[cfg(feature = "wasm")]
+pub(crate) fn wasm_memory_cap(baseline: usize, limits: ViewLimits, body_len: usize) -> usize {
     baseline
         .saturating_add(limits.memory)
         .saturating_add(body_len.saturating_mul(2))
 }
 
+#[cfg(feature = "wasm")]
 struct WasmEngineState {
     engine: wasmi::Engine,
     module: wasmi::Module,
@@ -305,11 +329,13 @@ struct WasmEngineState {
     linker: OnceLock<Result<wasmi::Linker<WasmData>, String>>,
 }
 
+#[cfg(feature = "wasm")]
 struct WasmData {
     wasi: wasmi_wasi::WasiCtx,
     limits: wasmi::StoreLimits,
 }
 
+#[cfg(feature = "wasm")]
 fn wasm_engine() -> Result<&'static WasmEngineState, String> {
     static ENGINE: OnceLock<Result<WasmEngineState, String>> = OnceLock::new();
     let state = ENGINE.get_or_init(|| {
@@ -341,6 +367,7 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
     }
 }
 
+#[cfg(feature = "wasm")]
 fn wasmi_linker(
     state: &'static WasmEngineState,
 ) -> Result<&'static wasmi::Linker<WasmData>, String> {
@@ -355,11 +382,8 @@ fn wasmi_linker(
     }
 }
 
-fn wasm_request(
-    kind: &str,
-    payload: Value,
-    limits: crate::view::ViewLimits,
-) -> Result<Value, String> {
+#[cfg(feature = "wasm")]
+fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
     let mut request = match payload {
         Value::Object(map) => map,
         _ => return Err("wasm request must be a JSON object".to_string()),
@@ -374,7 +398,8 @@ fn wasm_request(
     wasm_run(&body, limits)
 }
 
-fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
+#[cfg(feature = "wasm")]
+fn wasm_run(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
         #[cfg(feature = "wasmtime")]
         {
@@ -391,7 +416,8 @@ fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, Strin
     wasmi_request(body, limits)
 }
 
-fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
+#[cfg(feature = "wasm")]
+fn wasmi_request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     let state = wasm_engine()?;
     // The linker is immutable after setup; build it once per process instead of
     // resolving every WASI import on each request.
@@ -442,6 +468,7 @@ fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, 
 /// wasmi has no interrupt, so fuel is the only way to regain control; the
 /// slice adapts so a check happens roughly every `SLICE_TARGET` whatever the
 /// interpreter's speed (debug builds are orders of magnitude slower).
+#[cfg(feature = "wasm")]
 fn run_with_deadline(
     store: &mut wasmi::Store<WasmData>,
     start: &wasmi::TypedFunc<(), ()>,
@@ -576,6 +603,10 @@ impl Worker {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // SAFETY: the closure runs in the forked child before exec, where
+            // only async-signal-safe calls are allowed. It makes nothing but
+            // setrlimit and prctl syscalls on stack values: no allocation,
+            // no locks and no access to parent state.
             unsafe {
                 command.pre_exec(move || {
                     // The debug binary maps ~1 GB of virtual address space
@@ -643,18 +674,9 @@ impl Worker {
     /// Read the hello frame, killing the worker if it does not arrive within
     /// `timeout`.
     fn await_hello(&mut self, timeout: Duration) -> Result<Value, String> {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let pid = self.pid;
-        let watchdog = std::thread::spawn(move || {
-            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        });
+        let deadline = reaper().watch(self.pid, timeout);
         let hello = read_frame(&mut self.stdout);
-        let _ = done_tx.send(());
-        let _ = watchdog.join();
+        drop(deadline);
         match hello {
             Ok(Some(body)) => serde_json::from_slice(&body)
                 .map_err(|error| format!("worker hello: {error}"))
@@ -667,29 +689,13 @@ impl Worker {
     }
 
     fn request(&mut self, body: &[u8], timeout: Duration) -> Result<WorkerOutcome, WorkerError> {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let pid = self.pid;
-        let deadline = timeout + Duration::from_secs(2);
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let flag = timed_out.clone();
-        let watchdog = std::thread::spawn(move || match done_rx.recv_timeout(deadline) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                flag.store(true, Ordering::SeqCst);
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        });
+        let deadline = reaper().watch(self.pid, timeout + Duration::from_secs(2));
         let result = write_frame(&mut self.stdin, body).and_then(|_| {
             read_frame(&mut self.stdout)?.ok_or_else(|| "worker closed the connection".to_string())
         });
-        let _ = done_tx.send(());
-        let _ = watchdog.join();
-        let response = result.map_err(|message| WorkerError {
-            message,
-            timed_out: timed_out.load(Ordering::SeqCst),
-        })?;
+        let timed_out = deadline.expired();
+        drop(deadline);
+        let response = result.map_err(|message| WorkerError { message, timed_out })?;
         let response: Value = serde_json::from_slice(&response).map_err(|error| WorkerError {
             message: error.to_string(),
             timed_out: false,
@@ -713,6 +719,108 @@ impl Worker {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// One thread kills every worker that outlives its deadline, instead of an OS
+/// thread per request. A request registers its worker's pid and deadline and
+/// drops the returned [`Deadline`] when the exchange ends, which removes the
+/// entry. The kill happens under the lock that removal takes, and the worker
+/// is reaped only after the entry is gone, so a pid is never signalled after
+/// it could have been reused.
+struct Reaper {
+    state: Mutex<ReaperState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct ReaperState {
+    next: u64,
+    /// By deadline, then registration order: the pid and whether it fired.
+    watched: std::collections::BTreeMap<(Instant, u64), (i32, Arc<AtomicBool>)>,
+}
+
+struct Deadline {
+    key: (Instant, u64),
+    fired: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn expired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        reaper().lock().watched.remove(&self.key);
+    }
+}
+
+impl Reaper {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReaperState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn watch(&self, pid: i32, timeout: Duration) -> Deadline {
+        let fired = Arc::new(AtomicBool::new(false));
+        let mut state = self.lock();
+        state.next += 1;
+        let key = (Instant::now() + timeout, state.next);
+        state.watched.insert(key, (pid, fired.clone()));
+        drop(state);
+        self.wake.notify_one();
+        Deadline { key, fired }
+    }
+
+    fn run(&self) {
+        let mut state = self.lock();
+        loop {
+            let Some(key) = state.watched.keys().next().copied() else {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poison| poison.into_inner());
+                continue;
+            };
+            let now = Instant::now();
+            if key.0 > now {
+                state = self
+                    .wake
+                    .wait_timeout(state, key.0 - now)
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .0;
+                continue;
+            }
+            if let Some((pid, fired)) = state.watched.remove(&key) {
+                fired.store(true, Ordering::SeqCst);
+                // SAFETY: kill(2) takes plain integers and touches no memory.
+                // The entry is still in `watched`, so the worker has not been
+                // reaped and its pid cannot have been reused; the guard that
+                // reaps it removes the entry first.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+fn reaper() -> &'static Reaper {
+    static REAPER: OnceLock<&'static Reaper> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let reaper: &'static Reaper = Box::leak(Box::new(Reaper {
+            state: Mutex::new(ReaperState::default()),
+            wake: Condvar::new(),
+        }));
+        // If the thread cannot start no deadline fires, and a hung worker
+        // holds its request until the worker itself exits.
+        let _ = std::thread::Builder::new()
+            .name("js-reaper".to_string())
+            .spawn(move || reaper.run());
+        reaper
+    })
 }
 
 struct PoolState {
@@ -799,11 +907,7 @@ fn pool() -> &'static WorkerPool {
 }
 
 /// Run a map/reduce/index request in a pooled worker process.
-pub fn process_request(
-    kind: &str,
-    payload: Value,
-    limits: crate::view::ViewLimits,
-) -> Result<Value, String> {
+pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
     let mut request = match payload {
         Value::Object(map) => map,
         _ => return Err("worker request must be a JSON object".to_string()),
@@ -850,8 +954,10 @@ pub fn process_request(
     Err(last_error)
 }
 
-/// Entry point for the hidden `--js-worker` mode. Frames on stdin/stdout.
-pub fn run_worker_stdio(landlock: &str) -> Result<(), String> {
+/// Serve the hidden `--js-worker` mode: frames on stdin/stdout, each request
+/// answered by `handle`. The handler is supplied by the caller so that this
+/// module does not depend on the view and search engines it serves.
+pub fn run_worker_stdio(landlock: &str, handle: fn(Value) -> Value) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
@@ -865,7 +971,7 @@ pub fn run_worker_stdio(landlock: &str) -> Result<(), String> {
         };
         let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match serde_json::from_slice::<Value>(&body) {
-                Ok(request) => handle_worker_request(request),
+                Ok(request) => handle(request),
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
             }
         })) {
@@ -877,88 +983,13 @@ pub fn run_worker_stdio(landlock: &str) -> Result<(), String> {
     }
 }
 
-fn handle_worker_request(request: Value) -> Value {
-    let limits = crate::view::ViewLimits {
-        timeout: std::time::Duration::from_millis(
-            request
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(5_000),
-        ),
-        memory: request
-            .get("memory")
-            .and_then(Value::as_u64)
-            .unwrap_or(64 * 1024 * 1024) as usize,
-    };
-    let source = match request.get("source").and_then(Value::as_str) {
-        Some(source) => source,
-        None => return json!({"ok": false, "error": "missing source"}),
-    };
-    let started = Instant::now();
-    let result = match request.get("kind").and_then(Value::as_str) {
-        Some("map") => {
-            let docs: Vec<(String, String)> =
-                match serde_json::from_value(request.get("docs").cloned().unwrap_or_default()) {
-                    Ok(docs) => docs,
-                    Err(error) => return json!({"ok": false, "error": error.to_string()}),
-                };
-            crate::view::run_map_json(source, &docs, limits).map(|rows| json!(rows))
-        }
-        Some("reduce") => {
-            // A rereduce carries null keys (CouchDB passes null, not []).
-            let keys: Vec<Value> = match request.get("keys") {
-                None | Some(Value::Null) => Vec::new(),
-                Some(keys) => match serde_json::from_value(keys.clone()) {
-                    Ok(keys) => keys,
-                    Err(error) => {
-                        return json!({"ok": false, "error": format!("reduce keys: {error}")})
-                    }
-                },
-            };
-            let values: Vec<Value> = match request.get("values") {
-                Some(values) => match serde_json::from_value(values.clone()) {
-                    Ok(values) => values,
-                    Err(error) => {
-                        return json!({"ok": false, "error": format!("reduce values: {error}")})
-                    }
-                },
-                None => return json!({"ok": false, "error": "reduce values are missing"}),
-            };
-            let rereduce = request
-                .get("rereduce")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            crate::view::run_reduce(source, &keys, &values, rereduce, limits)
-        }
-        Some("index") => {
-            let docs: Vec<(String, String)> =
-                match serde_json::from_value(request.get("docs").cloned().unwrap_or_default()) {
-                    Ok(docs) => docs,
-                    Err(error) => return json!({"ok": false, "error": error.to_string()}),
-                };
-            crate::search::run_index_json(source, &docs, limits).map(|docs| json!(docs))
-        }
-        _ => return json!({"ok": false, "error": "unknown request kind"}),
-    };
-    let result = match result {
-        Err(error) if started.elapsed() >= limits.timeout => Err(format!(
-            "timed out after {} ms: {error}",
-            limits.timeout.as_millis()
-        )),
-        other => other,
-    };
-    match result {
-        Ok(value) => json!({"ok": true, "value": value}),
-        Err(error) => json!({"ok": false, "error": error}),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    fn wasmi_map(source: &str, limits: crate::view::ViewLimits) -> Result<Value, String> {
+    #[cfg(feature = "wasm")]
+    fn wasmi_map(source: &str, limits: ViewLimits) -> Result<Value, String> {
         let body = serde_json::to_vec(&json!({
             "kind": "map",
             "source": source,
@@ -971,8 +1002,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasmi_enforces_the_view_memory_limit() {
-        let limits = crate::view::ViewLimits {
+        let limits = ViewLimits {
             timeout: Duration::from_secs(60),
             memory: 4 * 1024 * 1024,
         };
@@ -988,8 +1020,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasmi_timeout_is_wall_clock() {
-        let limits = crate::view::ViewLimits {
+        let limits = ViewLimits {
             timeout: Duration::from_millis(150),
             memory: 64 * 1024 * 1024,
         };
@@ -1036,44 +1069,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_reduce_rejects_malformed_keys_and_values() {
-        let reduce = |keys: Value, values: Value, rereduce: bool| {
-            handle_worker_request(json!({
-                "kind": "reduce",
-                "source": "function(keys, values, rereduce){ return sum(values); }",
-                "keys": keys,
-                "values": values,
-                "rereduce": rereduce,
-            }))
-        };
-        let ok = reduce(json!([[1, "a"]]), json!([3]), false);
-        assert_eq!(ok["ok"], true, "{ok}");
-        assert_eq!(ok["value"], 3);
-        // A rereduce carries null keys.
-        let ok = reduce(Value::Null, json!([1, 2]), true);
-        assert_eq!(ok["ok"], true, "{ok}");
-        assert_eq!(ok["value"], 3);
-
-        for (keys, values) in [
-            (json!("nope"), json!([1])),
-            (json!({"a": 1}), json!([1])),
-            (json!([]), json!("nope")),
-            (json!([]), Value::Null),
-            (json!([[1, "a"]]), json!({"a": 1})),
-        ] {
-            let bad = reduce(keys.clone(), values.clone(), false);
-            assert_eq!(bad["ok"], false, "keys {keys} values {values}: {bad}");
-            assert!(bad["error"].is_string(), "{bad}");
-        }
-        let missing = handle_worker_request(
-            json!({"kind": "reduce", "source": "function(k, v, r){ return 1; }"}),
-        );
-        assert_eq!(missing["ok"], false, "{missing}");
+    fn a_finished_request_cancels_its_deadline() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut worker = Worker::spawn_command(command).expect("spawn");
+        let deadline = reaper().watch(worker.pid, Duration::from_millis(200));
+        let other = reaper().watch(worker.pid, Duration::from_secs(60));
+        drop(deadline);
+        std::thread::sleep(Duration::from_millis(500));
+        let exited = worker.child.try_wait().expect("try_wait");
+        assert!(!other.expired());
+        drop(other);
+        worker.kill();
+        assert!(exited.is_none(), "a cancelled deadline still killed it");
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasm_reduce_rejects_malformed_keys_and_values() {
-        let limits = crate::view::ViewLimits {
+        let limits = ViewLimits {
             timeout: Duration::from_secs(60),
             memory: 64 * 1024 * 1024,
         };
@@ -1138,12 +1152,20 @@ mod tests {
             return;
         }
         install_seccomp().expect("install seccomp");
+        // SAFETY: getppid and getpid take no arguments and cannot fail.
         let parent = unsafe { libc::getppid() } as libc::c_long;
+        // SAFETY: as above.
         let me = unsafe { libc::getpid() } as libc::c_long;
+        // SAFETY: gettid takes no arguments and cannot fail.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         let path = c"/nonexistent-douchdb/a".as_ptr();
         let other = c"/nonexistent-douchdb/b".as_ptr();
         let at = libc::AT_FDCWD as libc::c_long;
+        // SAFETY: each probe is a raw syscall that is harmless whether the
+        // filter allows or denies it (see the doc comment above). The path
+        // pointers are NUL-terminated literals that outlive the calls, and
+        // the other arguments are zero, -1 or process ids that name nothing
+        // dangerous.
         let probes: Vec<(&str, i32)> = unsafe {
             vec![
                 (

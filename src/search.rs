@@ -1,12 +1,14 @@
 //! Tantivy-backed CouchDB search indexes.
 
-use crate::db::{hex, ApiError, Db, DbResult};
+use crate::db::{ApiError, Db, DbResult};
+use crate::index_cache::Registry;
+use crate::util::hex;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{
@@ -75,7 +77,7 @@ pub struct SearchRequest {
     pub partition: Option<String>,
     /// Internal: only return documents whose shard is marked here. Cluster
     /// coordinators use this to split a search into disjoint owner sets.
-    pub owner_shards: Option<Vec<bool>>,
+    pub owner_shards: Option<crate::cluster::ShardMask>,
     pub sort: Vec<(String, bool)>,
     pub highlight_fields: Vec<String>,
     pub highlight_pre: String,
@@ -145,6 +147,8 @@ pub async fn load_spec(db: &Db, ddoc_id: &str, index_name: &str) -> DbResult<Sea
     Ok(SearchSpec { source, analyzer })
 }
 
+const INDEX_WRAPPER: &str = include_str!("../wasm/js/index.js");
+
 fn engine(limits: crate::view::ViewLimits) -> Result<rquickjs::Runtime, String> {
     crate::js::runtime(limits.timeout, limits.memory)
 }
@@ -175,32 +179,7 @@ pub(crate) fn run_index_json(
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     crate::js::guard("index function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              var __out = [];
-              function log(message) {{ }}
-              var index = function (name, value, options) {{
-                if (value === undefined || value === null) return;
-                __out.push([String(name), value]);
-              }};
-              var __index = ({source});
-              if (typeof __index !== "function") {{
-                throw new Error("index must be a function");
-              }}
-              return function (json) {{
-                var docs = JSON.parse(json);
-                var all = [];
-                for (var i = 0; i < docs.length; i++) {{
-                  __out = [];
-                  __index(docs[i]);
-                  all.push([docs[i]._id, __out]);
-                }}
-                return JSON.stringify(all);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = INDEX_WRAPPER.replace(crate::view::WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
@@ -219,14 +198,27 @@ pub(crate) fn run_index_json(
                     .call((batch,))
                     .map_err(|error| format!("{}: {error}", chunk[0].0))?;
                 crate::js::check_output("index function", &output)?;
-                let emitted: Vec<(String, Vec<(String, Value)>)> =
+                let emitted: Vec<Vec<(String, Value)>> =
                     serde_json::from_str(&output).map_err(|error| error.to_string())?;
-                for (id, fields) in emitted {
+                if emitted.len() != chunk.len() {
+                    return Err(format!(
+                        "{}: index returned {} results for {} documents",
+                        chunk[0].0,
+                        emitted.len(),
+                        chunk.len()
+                    ));
+                }
+                // The id comes from the stored document, not from the object
+                // the index function was handed.
+                for ((id, _), fields) in chunk.iter().zip(emitted) {
                     let mut map = Map::new();
                     for (name, value) in fields {
                         map.insert(name, value);
                     }
-                    out.push(IndexedDoc { id, fields: map });
+                    out.push(IndexedDoc {
+                        id: id.clone(),
+                        fields: map,
+                    });
                 }
             }
             Ok(out)
@@ -711,13 +703,8 @@ impl Directory for UnsyncedDirectory {
 }
 
 fn build_gate(db: &Db) -> Arc<RwLock<()>> {
-    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
-    let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut gates = gates.lock().unwrap_or_else(|poison| poison.into_inner());
-    gates
-        .entry(db.path.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(())))
-        .clone()
+    static GATES: Registry<RwLock<()>> = Registry::new();
+    GATES.get(&db.path)
 }
 
 /// What a query reads from an index: replaced as a whole when the index
@@ -813,27 +800,24 @@ impl Cached {
 
 type Entry = Arc<AsyncMutex<Option<Cached>>>;
 
-fn registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Entry>> {
-    static ENTRIES: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
-    ENTRIES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+fn registry() -> &'static Registry<AsyncMutex<Option<Cached>>> {
+    static ENTRIES: Registry<AsyncMutex<Option<Cached>>> = Registry::new();
+    &ENTRIES
 }
 
 /// The per-index entry. Its lock serialises updates and rebuilds of the index.
+/// The registry only evicts an entry nobody holds, so a query or update in
+/// flight keeps its index; opening it is done under the entry's own lock, not
+/// the registry's.
 fn index_entry(path: &Path) -> Entry {
-    registry()
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-        .clone()
+    registry().get(path)
 }
 
 /// Drop cached indexes when a database is deleted or recreated, or its index
 /// files are removed.
 pub fn forget_db(db_path: &Path) {
     let prefix = db_path.join("_search_indexes");
-    registry().retain(|path, _| !path.starts_with(&prefix));
+    registry().retain(|path| !path.starts_with(&prefix));
 }
 
 async fn ensure_index(
@@ -1150,6 +1134,14 @@ fn empty_search_response(request: &SearchRequest) -> Value {
     response
 }
 
+fn timeout_error() -> ApiError {
+    ApiError::new(
+        500,
+        "timeout",
+        "The request could not be processed in a reasonable amount of time.",
+    )
+}
+
 pub async fn query(
     db: &Db,
     ddoc: &str,
@@ -1159,11 +1151,7 @@ pub async fn query(
 ) -> DbResult<Value> {
     let started = Instant::now();
     if request.timeout_ms == 0 || started.elapsed().as_millis() as u64 > request.timeout_ms {
-        return Err(ApiError::new(
-            500,
-            "timeout",
-            "The request could not be processed in a reasonable amount of time.",
-        ));
+        return Err(timeout_error());
     }
     if request.partition.is_some() && request.limit > PAGE_LIMIT {
         return Err(ApiError::bad_request(
@@ -1177,46 +1165,77 @@ pub async fn query(
     let gate = build_gate(db).read_owned().await;
     let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
-        return Err(ApiError::new(
-            500,
-            "timeout",
-            "The request could not be processed in a reasonable amount of time.",
-        ));
+        return Err(timeout_error());
     }
-    let meta = &snapshot.meta;
-    let searcher = &snapshot.searcher;
     let schema = snapshot.index.schema();
     let id_field = schema
         .get_field(ID_FIELD)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
-    let query_text = request.query.trim();
-    let query: Box<dyn tantivy::query::Query> = if query_text == "*:*" || query_text.is_empty() {
-        Box::new(AllQuery)
-    } else {
-        let default_fields: Vec<Field> = schema
-            .fields()
-            .filter(|(_, field)| field.name() != ID_FIELD && field.name() != FIELDS_FIELD)
-            .map(|(field, _)| field)
-            .collect();
-        let parser = QueryParser::for_index(&snapshot.index, default_fields);
-        match parser.parse_query(query_text) {
-            Ok(query) => query,
-            // A node may hold no local documents with an indexed field even
-            // though another shard does. Treat an absent field as no local
-            // matches so cluster fan-out can merge other shards' rows.
-            Err(error) if error.to_string().contains("Field does not exist") => {
-                return Ok(empty_search_response(request));
-            }
-            Err(error) => {
-                return Err(ApiError::bad_request(format!(
-                    "invalid search query: {error}"
-                )))
-            }
-        }
+    let Some(query) = parse_query(&snapshot, &schema, request.query.trim())? else {
+        return Ok(empty_search_response(request));
     };
+    let matched = collect_matches(db, &snapshot, request, id_field, &*query)?;
+
+    let total_rows = matched.len();
+    let offset = parse_bookmark(request.bookmark.as_deref());
+    let limit = if request.limit == 0 {
+        0
+    } else {
+        request.limit.min(PAGE_LIMIT)
+    };
+    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
+    let rows = page_rows(db, request, &page).await?;
+    let next = offset.saturating_add(page.len());
+    let mut response = json!({
+        "total_rows": total_rows,
+        "bookmark": format!("search:{next}"),
+        "rows": rows,
+    });
+    add_facets(&mut response, request, &matched);
+    Ok(response)
+}
+
+/// Parse the query text. `None` means a field the query names does not exist
+/// in this node's index, which is no local matches rather than an error.
+fn parse_query(
+    snapshot: &Snapshot,
+    schema: &Schema,
+    query_text: &str,
+) -> DbResult<Option<Box<dyn tantivy::query::Query>>> {
+    if query_text == "*:*" || query_text.is_empty() {
+        return Ok(Some(Box::new(AllQuery)));
+    }
+    let default_fields: Vec<Field> = schema
+        .fields()
+        .filter(|(_, field)| field.name() != ID_FIELD && field.name() != FIELDS_FIELD)
+        .map(|(field, _)| field)
+        .collect();
+    let parser = QueryParser::for_index(&snapshot.index, default_fields);
+    match parser.parse_query(query_text) {
+        Ok(query) => Ok(Some(query)),
+        // A node may hold no local documents with an indexed field even
+        // though another shard does. Treat an absent field as no local
+        // matches so cluster fan-out can merge other shards' rows.
+        Err(error) if error.to_string().contains("Field does not exist") => Ok(None),
+        Err(error) => Err(ApiError::bad_request(format!(
+            "invalid search query: {error}"
+        ))),
+    }
+}
+
+/// Run the query and keep the documents this request may see, sorted.
+fn collect_matches<'a>(
+    db: &Db,
+    snapshot: &'a Snapshot,
+    request: &SearchRequest,
+    id_field: Field,
+    query: &dyn tantivy::query::Query,
+) -> DbResult<Vec<&'a SearchDoc>> {
+    let meta = &snapshot.meta;
+    let searcher = &snapshot.searcher;
     let addresses = searcher
-        .search(&*query, &DocSetCollector)
+        .search(query, &DocSetCollector)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let mut matched: Vec<&SearchDoc> = Vec::new();
@@ -1240,11 +1259,7 @@ pub async fn query(
             }
         }
         if let Some(owner_shards) = &request.owner_shards {
-            if !owner_shards
-                .get(db.shard_index(&doc.id))
-                .copied()
-                .unwrap_or(false)
-            {
+            if !owner_shards.covers(db.shard_index(&doc.id)) {
                 continue;
             }
         }
@@ -1258,15 +1273,11 @@ pub async fn query(
     } else {
         matched.sort_by(|a, b| sort_compare(a, b, &request.sort));
     }
+    Ok(matched)
+}
 
-    let total_rows = matched.len();
-    let offset = parse_bookmark(request.bookmark.as_deref());
-    let limit = if request.limit == 0 {
-        0
-    } else {
-        request.limit.min(PAGE_LIMIT)
-    };
-    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
+/// Build the result rows for one page, with documents and highlights.
+async fn page_rows(db: &Db, request: &SearchRequest, page: &[&SearchDoc]) -> DbResult<Vec<Value>> {
     let docs = if request.include_docs {
         let ids: Vec<String> = page.iter().map(|doc| doc.id.clone()).collect();
         crate::view::docs_by_ids(db, false, &ids).await?
@@ -1276,7 +1287,7 @@ pub async fn query(
 
     let terms = query_terms(&request.query);
     let mut rows = Vec::with_capacity(page.len());
-    for doc in &page {
+    for doc in page {
         let order: Vec<Value> = request
             .sort
             .iter()
@@ -1313,18 +1324,16 @@ pub async fn query(
         }
         rows.push(row);
     }
-    let next = offset.saturating_add(page.len());
-    let mut response = json!({
-        "total_rows": total_rows,
-        "bookmark": format!("search:{next}"),
-        "rows": rows,
-    });
+    Ok(rows)
+}
 
+/// Add `counts`, `ranges` and `groups`, computed over all matches.
+fn add_facets(response: &mut Value, request: &SearchRequest, matched: &[&SearchDoc]) {
     if !request.counts.is_empty() {
         let mut counts = Map::new();
         for field in &request.counts {
             let mut values: BTreeMap<String, u64> = BTreeMap::new();
-            for doc in &matched {
+            for doc in matched {
                 if let Some(value) = doc.fields.get(field) {
                     *values.entry(field_key(value)).or_default() += 1;
                 }
@@ -1362,7 +1371,7 @@ pub async fn query(
 
     if let Some(group_field) = &request.group_field {
         let mut groups: BTreeMap<String, Vec<&SearchDoc>> = BTreeMap::new();
-        for doc in &matched {
+        for doc in matched {
             let key = doc
                 .fields
                 .get(group_field)
@@ -1385,8 +1394,6 @@ pub async fn query(
             .collect();
         response["groups"] = json!(groups);
     }
-
-    Ok(response)
 }
 
 pub async fn info(
@@ -1543,12 +1550,57 @@ mod tests {
         assert!(!value_in_range(&value, "é[a TO z]"));
     }
 
+    /// Every index ever searched used to stay open, with all its stored
+    /// documents, until the database was deleted.
+    #[tokio::test]
+    async fn open_search_indexes_stay_within_the_cap() {
+        let _cap = crate::index_cache::CapGuard::new(8).await;
+        let root = std::env::temp_dir().join(format!("douchdb-search-cap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "searchcap",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "name": "apple"})], true)
+            .await
+            .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        for n in 0..20 {
+            let ddoc = format!("_design/s{n}");
+            db.put_docs(
+                vec![json!({"_id": ddoc, "indexes": {"idx": {
+                    "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}})],
+                true,
+            )
+            .await
+            .unwrap();
+            let request = SearchRequest {
+                query: "name:apple".to_string(),
+                limit: 10,
+                ..SearchRequest::default()
+            };
+            let result = query(&db, &ddoc, "idx", &request, limits).await.unwrap();
+            assert_eq!(result["total_rows"], 1, "{result}");
+        }
+        let prefix = db.path.join("_search_indexes");
+        let open = registry().count_under(&prefix);
+        assert!(open <= 8, "{open} search indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_after_each_write() {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-update-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1669,7 +1721,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-flight-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1766,7 +1818,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-gap-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -1840,7 +1892,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-search-damaged-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,

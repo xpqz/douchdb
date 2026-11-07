@@ -6,7 +6,9 @@
 //! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
-use crate::db::{hex, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::index_cache::{Registry, Slot};
+use crate::util::hex;
 use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
 use icu_collator::Collator;
@@ -18,23 +20,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-#[derive(Clone, Copy, Debug)]
-pub struct ViewLimits {
-    pub timeout: Duration,
-    pub memory: usize,
-}
-
-impl Default for ViewLimits {
-    fn default() -> Self {
-        ViewLimits {
-            timeout: Duration::from_secs(5),
-            memory: 64 * 1024 * 1024,
-        }
-    }
-}
+pub use crate::js::ViewLimits;
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewQuery {
@@ -58,19 +46,15 @@ pub struct ViewQuery {
     /// Internal cluster filter: return only rows whose shard is owned by this
     /// node. The coordinator unions the owner-only responses, so each map row
     /// crosses the network once instead of once per replica.
-    pub owner_shards: Option<Vec<bool>>,
-    pub shard_count: u32,
+    pub owner_shards: Option<crate::cluster::ShardMask>,
     /// Set for a `_partition/{p}/_design/.../_view/...` query. Only rows
     /// belonging to that partition are returned.
     pub partition: Option<String>,
-    /// Partitioned databases hash by partition, so owner-shard filtering must
-    /// use the same placement function.
-    pub partitioned: bool,
     /// Set by the cluster coordinator after summing owner-only map row counts.
     pub total_rows_override: Option<usize>,
     /// Set once rows have already been selected (by `ViewRows::select` or a
-    /// coordinator merge): the reported offset, and a signal that the
-    /// partition and shard filters have already been applied.
+    /// coordinator merge), which is also when the partition and shard filters
+    /// have been applied: the reported offset.
     pub offset_override: Option<usize>,
 }
 
@@ -648,12 +632,12 @@ impl ViewRows {
     pub(crate) fn reduce(
         &self,
         query: &ViewQuery,
-        mask: Option<&[bool]>,
+        mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
     ) -> Result<Value, String> {
         let mut partials = Partials::new();
         for (index, rows) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+            if mask.is_some_and(|mask| !mask.covers(index)) {
                 continue;
             }
             let blocks = self.block_partials(index, reducer)?;
@@ -723,7 +707,12 @@ impl ViewRows {
     /// Rows `query` can return from the shards in `mask` (all when `None`).
     /// A reduce needs every row in range; otherwise at most `skip + limit`
     /// rows are copied. `total_rows` and `offset` follow `ordered_rows`.
-    pub fn select(&self, query: &ViewQuery, mask: Option<&[bool]>, reduce: bool) -> Selection {
+    pub fn select(
+        &self,
+        query: &ViewQuery,
+        mask: Option<&crate::cluster::ShardMask>,
+        reduce: bool,
+    ) -> Selection {
         let cap = if reduce {
             usize::MAX
         } else {
@@ -735,7 +724,7 @@ impl ViewRows {
             offset: 0,
         };
         for (index, shard) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+            if mask.is_some_and(|mask| !mask.covers(index)) {
                 continue;
             }
             match &query.partition {
@@ -1093,18 +1082,31 @@ fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
     out
 }
 
-type IndexMap = HashMap<PathBuf, Arc<AsyncMutex<ViewIndex>>>;
-
-fn registry() -> &'static StdMutex<IndexMap> {
-    static INDEXES: OnceLock<StdMutex<IndexMap>> = OnceLock::new();
-    INDEXES.get_or_init(|| StdMutex::new(HashMap::new()))
+/// An index registry entry. The index is opened once, by whichever request
+/// gets there first, outside the registry's lock; the others wait on the cell.
+#[derive(Default)]
+struct IndexSlot {
+    index: tokio::sync::OnceCell<Arc<AsyncMutex<ViewIndex>>>,
 }
 
-fn registry_lock() -> std::sync::MutexGuard<'static, IndexMap> {
-    // A panic in an unrelated request must not poison every later view query.
-    registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl Slot for IndexSlot {
+    /// In use while a request holds the slot (it may be opening the index) or
+    /// the index itself.
+    fn in_use(this: &Arc<Self>) -> bool {
+        Arc::strong_count(this) > 1 || this.index.get().is_some_and(|i| Arc::strong_count(i) > 1)
+    }
+
+    const DROP_UNDER_LOCK: bool = true;
+}
+
+fn indexes() -> &'static Registry<IndexSlot> {
+    static INDEXES: Registry<IndexSlot> = Registry::new();
+    &INDEXES
+}
+
+#[cfg(test)]
+fn open_indexes_under(db_path: &Path) -> usize {
+    indexes().count_under(db_path)
 }
 
 fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
@@ -1112,20 +1114,31 @@ fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
     db.path.join("_view_indexes").join(hex(&digest))
 }
 
-fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
-    let mut indexes = registry_lock();
-    if let Some(handle) = indexes.get(path) {
-        return Ok(handle.clone());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?;
-    }
-    let index =
-        ViewIndex::open(path).map_err(|error| ApiError::new(500, "view_index_error", error))?;
-    let handle = Arc::new(AsyncMutex::new(index));
-    indexes.insert(path.to_path_buf(), handle.clone());
-    Ok(handle)
+/// The open index at `path`. Opening happens on the blocking pool in a task of
+/// its own, so a request that goes away mid-open still leaves the index open
+/// for the next one rather than a LevelDB lock held by nobody.
+async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
+    let slot = indexes().get(path);
+    let path = path.to_path_buf();
+    let opened = tokio::spawn(async move {
+        slot.index
+            .get_or_try_init(|| {
+                blocking(move || {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            ApiError::new(500, "view_index_error", error.to_string())
+                        })?;
+                    }
+                    ViewIndex::open(&path)
+                        .map(|index| Arc::new(AsyncMutex::new(index)))
+                        .map_err(|error| ApiError::new(500, "view_index_error", error))
+                })
+            })
+            .await
+            .cloned()
+    })
+    .await;
+    opened.map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?
 }
 
 /// Gate for a database's view index directories. A query holds the read side
@@ -1135,21 +1148,15 @@ fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<RwLock<()>> {
-    static GATES: OnceLock<StdMutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
-    GATES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(db.path.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(())))
-        .clone()
+    static GATES: Registry<RwLock<()>> = Registry::new();
+    GATES.get(&db.path)
 }
 
 /// Drop cached index handles when a database is deleted or recreated. The
 /// LevelDB files live under the database directory.
 pub fn forget_db(db_path: &Path) {
     let prefix = db_path.join("_view_indexes");
-    registry_lock().retain(|path, _| !path.starts_with(&prefix));
+    indexes().retain(|path| !path.starts_with(&prefix));
 }
 
 impl ViewIndex {
@@ -1380,10 +1387,14 @@ pub async fn query_with_spec(
     {
         check_query(spec, query)?;
         let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-        let mut js = JsReducer::new(reducer, query.limits);
-        return rows
-            .reduce(query, query.owner_shards.as_deref(), &mut js)
-            .map_err(|reason| reduce_failure(&reason));
+        let reducer = reducer.to_string();
+        let query = query.clone();
+        return blocking(move || {
+            let mut js = JsReducer::new(&reducer, query.limits);
+            rows.reduce(&query, query.owner_shards.as_ref(), &mut js)
+                .map_err(|reason| reduce_failure(&reason))
+        })
+        .await;
     }
     let selection = local_select(db, ddoc_id, view_name, spec, query, reduce).await?;
     let mut query = query.clone();
@@ -1396,7 +1407,7 @@ pub async fn query_with_spec(
     } else {
         HashMap::new()
     };
-    finish(spec, rows, docs, &query)
+    finish(spec, rows, docs, &query).await
 }
 
 /// Partitioned design docs may only be queried through `_partition`, and
@@ -1433,17 +1444,22 @@ pub async fn local_select(
     reduce: bool,
 ) -> DbResult<Selection> {
     let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-    Ok(rows.select(query, query.owner_shards.as_deref(), reduce))
+    Ok(rows.select(query, query.owner_shards.as_ref(), reduce))
 }
 
-pub fn finish(
+pub async fn finish(
     spec: &ViewSpec,
     rows: Arc<Vec<Row>>,
     docs: HashMap<String, Value>,
     query: &ViewQuery,
 ) -> DbResult<Value> {
     check_query(spec, query)?;
-    render(spec, &rows, &docs, query)
+    if spec.reduce.is_none() || !query.reduce.unwrap_or(true) {
+        return render(spec, &rows, &docs, query);
+    }
+    // A reduce runs user JavaScript.
+    let (spec, query) = (spec.clone(), query.clone());
+    blocking(move || render(&spec, &rows, &docs, &query)).await
 }
 
 /// Reject parameter combinations CouchDB refuses, before any rows are read.
@@ -1525,9 +1541,9 @@ async fn ensure_rows(
             spec.reduce.as_deref().unwrap_or_default()
         )
     };
-    let _gate = index_gate(db).read_owned().await;
-    let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
-    let mut index = handle.lock().await;
+    let gate = index_gate(db).read_owned().await;
+    let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
+    let mut index = handle.lock_owned().await;
     index.set_placement((db.q, db.partitioned));
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
@@ -1536,18 +1552,28 @@ async fn ensure_rows(
     // in flight has taken its sequence but is not readable yet, and an index
     // that recorded a sequence past it would never see that write.
     let current_seq = db.changes_watermark(index.last_seq, None);
+    let map = spec.map.clone();
 
+    // The map functions and the index writes run on the blocking pool, with
+    // the gate and the index lock moved in: they stay held until the work is
+    // done even if the request is dropped meanwhile, and the async workers
+    // never wait on user JavaScript or on LevelDB.
     if index.design != design || index.last_seq > current_seq {
         // Read the bound before scanning, so a write that lands during the
         // scan stays above it and is picked up by the next update.
         let bound = db.changes_watermark(0, None);
-        let rows = map_all(db, &spec.map, limits).await?;
-        index
-            .rebuild(rows, bound, &design)
-            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
-        return index
-            .sorted_rows()
-            .map_err(|error| ApiError::new(500, "view_index_error", error));
+        let docs = db.map_docs(None).await?;
+        return blocking(move || {
+            let _gate = gate;
+            let rows = run_map_json(&map, &docs, limits).map_err(|reason| {
+                ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+            })?;
+            index
+                .rebuild(rows, bound, &design)
+                .and_then(|()| index.sorted_rows())
+                .map_err(|error| ApiError::new(500, "view_index_error", error))
+        })
+        .await;
     }
 
     if index.last_seq < current_seq {
@@ -1559,42 +1585,61 @@ async fn ensure_rows(
                 ..Default::default()
             })
             .await?;
-        let mut changed = Vec::new();
-        let mut docs = Vec::new();
-        for row in rows {
-            changed.push(row.id.clone());
-            if row.id.starts_with("_design/") || row.id.starts_with("_local/") || row.deleted {
-                continue;
+        return blocking(move || {
+            let _gate = gate;
+            let mut changed = Vec::new();
+            let mut docs = Vec::new();
+            for row in rows {
+                changed.push(row.id.clone());
+                if row.id.starts_with("_design/") || row.id.starts_with("_local/") || row.deleted {
+                    continue;
+                }
+                if let Some(doc) = row.doc {
+                    docs.push((
+                        row.id,
+                        serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?,
+                    ));
+                }
             }
-            if let Some(doc) = row.doc {
-                docs.push((row.id, serde_json::from_str::<Value>(&doc)?));
+            let rows = run_map(&map, &docs, limits).map_err(|reason| {
+                ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+            })?;
+            let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+            for row in rows {
+                by_doc.entry(row.id.clone()).or_default().push(row);
             }
-        }
-        let rows = run_map(&spec.map, &docs, limits).map_err(|reason| {
-            ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-        })?;
-        let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
-        for row in rows {
-            by_doc.entry(row.id.clone()).or_default().push(row);
-        }
-        // Every sequence up to the bound was committed before it was read and
-        // the changes above covered them all, so a gap left by a write that
-        // never finished does not keep the index behind.
-        index
-            .apply(changed, by_doc, current_seq, &design)
-            .map_err(|error| ApiError::new(500, "view_index_error", error))?;
+            // Every sequence up to the bound was committed before it was read
+            // and the changes above covered them all, so a gap left by a
+            // write that never finished does not keep the index behind.
+            index
+                .apply(changed, by_doc, current_seq, &design)
+                .and_then(|()| index.sorted_rows())
+                .map_err(|error| ApiError::new(500, "view_index_error", error))
+        })
+        .await;
     }
 
-    index
-        .sorted_rows()
-        .map_err(|error| ApiError::new(500, "view_index_error", error))
+    // Warm: the snapshot is an Arc clone. Only a cold one reads LevelDB.
+    if let Some(rows) = &index.cached {
+        return Ok(rows.clone());
+    }
+    blocking(move || {
+        let _gate = gate;
+        index
+            .sorted_rows()
+            .map_err(|error| ApiError::new(500, "view_index_error", error))
+    })
+    .await
 }
 
-async fn map_all(db: &Db, map_source: &str, limits: ViewLimits) -> DbResult<Vec<Row>> {
-    let docs = db.map_docs(None).await?;
-    run_map_json(map_source, &docs, limits).map_err(|reason| {
-        ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-    })
+/// Run `work` on the blocking pool. User JavaScript, LevelDB and the worker
+/// pipes all block their thread, which must not be an async worker.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> DbResult<T> + Send + 'static,
+) -> DbResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::new(500, "view_error", format!("view task failed: {error}")))?
 }
 
 pub(crate) async fn docs_by_ids(
@@ -1633,7 +1678,7 @@ pub(crate) async fn docs_by_ids(
 pub async fn invalidate(db: &Db) -> DbResult<()> {
     let _gate = index_gate(db).write_owned().await;
     let directory = db.path.join("_view_indexes");
-    registry_lock().retain(|path, _| !path.starts_with(&directory));
+    indexes().retain(|path| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1684,7 +1729,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
             }
         }
     }
-    registry_lock().retain(|path, _| live.contains(path));
+    indexes().retain(|path| live.contains(path));
     Ok(())
 }
 
@@ -2204,41 +2249,7 @@ fn run_map_js(
 
     crate::js::guard("map function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              function sum(values) {{
-                var total = 0;
-                for (var i = 0; i < values.length; i++) total += values[i];
-                return total;
-              }}
-              function log(message) {{ }}
-              function isArray(value) {{ return Array.isArray(value); }}
-              function toJSON(value) {{ return JSON.stringify(value); }}
-              var __out = [];
-              var emit = function (key, value) {{
-                __out.push([
-                  key === undefined ? null : key,
-                  value === undefined ? null : value
-                ]);
-              }};
-              var __map = ({source});
-              if (typeof __map !== "function") {{
-                throw new Error("map must be a function");
-              }}
-              return function (json) {{
-                var docs = JSON.parse(json);
-                var all = [];
-                for (var i = 0; i < docs.length; i++) {{
-                  __out = [];
-                  __map(docs[i]);
-                  all.push(__out);
-                }}
-                return JSON.stringify(all);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = MAP_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
@@ -2298,29 +2309,15 @@ fn run_map_js(
 }
 
 fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize, usize) {
-    let mut total_rows = query.total_rows_override.unwrap_or(rows.len());
+    let total_rows = query.total_rows_override.unwrap_or(rows.len());
     let mut ordered: Vec<&Row> = if query.descending {
         rows.iter().rev().collect()
     } else {
         rows.iter().collect()
     };
 
-    // Preselected rows are already filtered, and their counts supplied.
-    let preselected = query.offset_override.is_some();
-    if let Some(partition) = query.partition.as_ref().filter(|_| !preselected) {
-        let prefix = format!("{partition}:");
-        ordered.retain(|row| row.id.starts_with(&prefix));
-        total_rows = ordered.len();
-    }
-
-    if let Some(owned) = query.owner_shards.as_ref().filter(|_| !preselected) {
-        ordered.retain(|row| {
-            let shard = crate::db::shard_index_for(&row.id, query.shard_count, query.partitioned);
-            owned.get(shard).copied().unwrap_or(false)
-        });
-        total_rows = ordered.len();
-    }
-
+    // The rows are already filtered by partition and shard, and their counts
+    // supplied, by `ViewRows::select` or the coordinator.
     // The offset is the number of rows before the query's starting key. It is
     // computed before `key`/`keys` filtering, because CouchDB reports the
     // insertion point even when no row matches.
@@ -2595,6 +2592,13 @@ struct ReduceEngine {
 
 const REDUCE_GLOBAL: &str = "__douchdb_reduce";
 
+/// The JS wrappers around user functions live once, in `wasm/js`, and are
+/// shared with the WASM runner. The placeholder is replaced by the user's
+/// function source.
+const MAP_WRAPPER: &str = include_str!("../wasm/js/map.js");
+const REDUCE_WRAPPER: &str = include_str!("../wasm/js/reduce.js");
+pub(crate) const WRAPPER_SOURCE: &str = "__DOUCHDB_SOURCE__";
+
 impl JsReducer {
     pub(crate) fn new(source: &str, limits: ViewLimits) -> Self {
         Self {
@@ -2678,28 +2682,7 @@ fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, Str
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     crate::js::guard("reduce function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              function sum(values) {{
-                var total = 0;
-                for (var i = 0; i < values.length; i++) total += values[i];
-                return total;
-              }}
-              function log(message) {{ }}
-              function isArray(value) {{ return Array.isArray(value); }}
-              function toJSON(value) {{ return JSON.stringify(value); }}
-              var __reduce = ({source});
-              if (typeof __reduce !== "function") {{
-                throw new Error("reduce must be a function");
-              }}
-              return function (keys, values, rereduce) {{
-                var result = __reduce(JSON.parse(keys), JSON.parse(values), rereduce);
-                return result === undefined ? "null" : JSON.stringify(result);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = REDUCE_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
@@ -3059,6 +3042,7 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::time::Duration;
 
     fn reduce_value(
         source: &str,
@@ -3201,7 +3185,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewseq-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3229,7 +3213,9 @@ mod tests {
             .unwrap();
 
         // Another query holds the index while this one starts and waits.
-        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
         let mut holder = handle.lock().await;
         let waiting = tokio::spawn({
             let (db, spec) = (db.clone(), spec.clone());
@@ -3262,7 +3248,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgate-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3293,7 +3279,7 @@ mod tests {
 
         // A query holds the index; a second one waits on it, holding the
         // gate for the whole call.
-        let handle = index_handle(&path).unwrap();
+        let handle = index_handle(&path).await.unwrap();
         let holder = handle.lock().await;
         let query = tokio::spawn({
             let (db, spec) = (db.clone(), spec.clone());
@@ -3317,7 +3303,7 @@ mod tests {
         query.await.unwrap().unwrap();
         removal.await.unwrap();
         assert!(!path.exists());
-        assert!(!registry_lock().contains_key(&path));
+        assert_eq!(open_indexes_under(&path), 0);
         // A later query opens a fresh index at the same path.
         ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
@@ -3347,7 +3333,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewflight-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -3379,8 +3365,12 @@ mod tests {
         };
         let limits = ViewQuery::default().limits;
         let last_seq = |name: &str| {
-            let handle = index_handle(&index_path(&db, "_design/v", name)).unwrap();
-            async move { handle.lock().await.last_seq }
+            let path = index_path(&db, "_design/v", name);
+            async move {
+                let handle = index_handle(&path).await.unwrap();
+                let seq = handle.lock().await.last_seq;
+                seq
+            }
         };
         db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
         ensure_rows(&db, "_design/v", "inc", &spec, limits)
@@ -3439,7 +3429,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgap-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -3483,7 +3473,9 @@ mod tests {
         ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
             .unwrap();
-        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
         assert_eq!(
             handle.lock().await.last_seq,
             abandoned,
@@ -3500,7 +3492,6 @@ mod tests {
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
-            shard_count: placement.0,
             ..ViewQuery::default()
         };
         let queries = [
@@ -3804,7 +3795,6 @@ mod tests {
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
-            shard_count: placement.0,
             ..ViewQuery::default()
         };
         let mut queries: Vec<ViewQuery> = vec![
@@ -3884,7 +3874,7 @@ mod tests {
             });
         }
         let masked = ViewQuery {
-            owner_shards: Some(vec![true, false, true]),
+            owner_shards: Some(crate::cluster::ShardMask::from_iter([true, false, true])),
             group_level: 1,
             ..base.clone()
         };
@@ -3904,10 +3894,22 @@ mod tests {
                     partitioned: false,
                 };
                 for query in &queries {
-                    let expected = render(&spec, rows, &HashMap::new(), query).unwrap();
+                    // The oracle filters by shard itself, independently of the
+                    // block tree under test.
+                    let visible: Vec<Row> = rows
+                        .iter()
+                        .filter(|row| {
+                            query.owner_shards.as_ref().is_none_or(|owned| {
+                                let shard = crate::db::shard_index_for(&row.id, placement.0, false);
+                                owned.covers(shard)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
                     let actual = view
-                        .reduce(query, query.owner_shards.as_deref(), &mut js)
+                        .reduce(query, query.owner_shards.as_ref(), &mut js)
                         .unwrap();
                     assert_eq!(actual, expected, "{reducer} {query:?}");
                 }
@@ -4339,6 +4341,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The same for a reduce function, which also runs user JavaScript.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_reduce_does_not_block_the_runtime() {
+        let root = std::env::temp_dir().join(format!("douchdb-slowred-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "slow",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc._id, 1); }".to_string(),
+            reduce: Some(
+                "function(k, v, re) { var t = Date.now(); while (Date.now() - t < 600) {} return 1; }"
+                    .to_string(),
+            ),
+            partitioned: false,
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let ticker = tokio::spawn(async move {
+            let mut longest = Duration::ZERO;
+            let mut last = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+                let now = std::time::Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+        tokio::task::yield_now().await;
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let longest = ticker.await.unwrap();
+        assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
+        assert!(
+            longest < Duration::from_millis(300),
+            "the reduce blocked the runtime for {longest:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every view ever queried used to keep its LevelDB handle and cached rows
+    /// until the database was deleted. The registry must stay at the cap.
+    #[tokio::test]
+    async fn open_view_indexes_stay_within_the_cap() {
+        let _cap = crate::index_cache::CapGuard::new(8).await;
+        let root = std::env::temp_dir().join(format!("douchdb-cap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "cap",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        for n in 0..40 {
+            let spec = ViewSpec {
+                map: format!("function(doc) {{ emit(doc.n + {n}, null); }}"),
+                reduce: None,
+                partitioned: false,
+            };
+            let result = query_with_spec(&db, "_design/d", &format!("v{n}"), &spec, &query)
+                .await
+                .unwrap();
+            assert_eq!(result["rows"][0]["key"], json!(1 + n));
+        }
+        let open = open_indexes_under(&db.path);
+        assert!(open <= 8, "{open} view indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn builtin_reduces_work() {
         assert_eq!(
@@ -4354,5 +4455,61 @@ mod tests {
         assert_eq!(stats["count"], 2);
         assert_eq!(stats["min"], 1);
         assert_eq!(stats["max"], 3);
+    }
+    /// A slow map function must run off the async workers: on a one-thread
+    /// runtime a task that only yields has to keep running while the map spins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_map_does_not_block_the_runtime() {
+        let root = std::env::temp_dir().join(format!("douchdb-slowmap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "slow",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { var t = Date.now(); while (Date.now() - t < 600) {} emit(doc._id, 1); }"
+                .to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let ticker = tokio::spawn(async move {
+            let mut longest = Duration::ZERO;
+            let mut last = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+                let now = std::time::Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+        tokio::task::yield_now().await;
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let longest = ticker.await.unwrap();
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
+        assert!(
+            longest < Duration::from_millis(300),
+            "the map blocked the runtime for {longest:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

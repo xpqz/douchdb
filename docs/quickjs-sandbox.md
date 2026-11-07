@@ -310,7 +310,13 @@ Two host runtimes share the same checked-in runner:
 
 The Wasmtime backend is compiled with `--features wasmtime`. Without it,
 selecting `--wasm-runtime wasmtime` fails at startup with the build command.
-The default remains `wasmi`, so a plain `cargo build` stays lean.
+The default remains `wasmi`, so a plain `cargo build` stays lean. `wasmtime`
+implies the `wasm` feature.
+
+The whole wasm sandbox (wasmi, wasmi_wasi and their wasi-common/witx/wast
+dependencies) sits behind the default-on `wasm` cargo feature. Build with
+`cargo build --release --no-default-features` to leave it out; selecting
+`--js-sandbox wasm` on such a binary exits at startup with an error.
 
 The checked-in `wasm/qjs-runner.wasm` is built from `wasm/qjs-runner/` with the
 maintained `rquickjs` crate and a WASI SDK. The host compiles the module once,

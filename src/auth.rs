@@ -101,8 +101,8 @@ pub fn session_secret(data: &Path, configured: &str) -> Result<Vec<u8>, String> 
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(describe(error)),
         }
-        let key = crate::db::random_bytes::<32>();
-        match crate::db::create_private_atomic(&path, crate::db::hex(&key).as_bytes()) {
+        let key = crate::util::random_bytes::<32>();
+        match crate::db::create_private_atomic(&path, crate::util::hex(&key).as_bytes()) {
             Ok(()) => return Ok(key.to_vec()),
             // Another process created it first; read theirs.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -465,7 +465,7 @@ mod tests {
     }
 
     fn data_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -602,7 +602,7 @@ mod tests {
 
     fn load(contents: &str) -> Result<Auth, String> {
         let file =
-            std::env::temp_dir().join(format!("douchdb-auth-load-{}.json", crate::db::uuid()));
+            std::env::temp_dir().join(format!("douchdb-auth-load-{}.json", crate::util::uuid()));
         std::fs::write(&file, contents).unwrap();
         let result = Auth::from_users_file(
             Some(("admin".into(), "secret".into())),

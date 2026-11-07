@@ -5,9 +5,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
 COPY src ./src
 COPY ui ./ui
-# `src/js.rs` embeds the checked-in QuickJS WASI runner at compile time.
+# `src/js.rs` embeds the checked-in QuickJS WASI runner, and `src/view.rs` and
+# `src/search.rs` the shared JS wrappers, at compile time.
 RUN mkdir -p wasm
 COPY wasm/qjs-runner.wasm ./wasm/qjs-runner.wasm
+COPY wasm/js ./wasm/js
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

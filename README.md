@@ -330,7 +330,9 @@ Behaviour and limits:
   checked-in QuickJS WASM runner with linear-memory limits under `wasmi`
   (default) or the optional `wasmtime` Cranelift JIT. wasmtime is 4–7× faster
   for cold map/reduce work; build with `--features wasmtime` and select it with
-  `--wasm-runtime wasmtime`. See
+  `--wasm-runtime wasmtime`. The wasm sandbox is the default-on `wasm` cargo
+  feature; `--no-default-features` drops it (and wasmi's dependency tree), and
+  `--js-sandbox wasm` then fails at startup. See
   [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.
@@ -442,6 +444,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--js-workers N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
+        [--max-open-indexes N] [--max-open-dbs N]
         [--otel-endpoint URL]
 ```
 
@@ -476,6 +479,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
+| `--max-open-dbs` | `256` | Most databases kept open between requests (CouchDB's `max_dbs_open` is 500, but a database here costs a thread and several file descriptors per shard). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. |
+| `--max-open-indexes` | `256` | Most view indexes, and most search indexes, kept open between queries. Past it the least recently used index that no query is using is closed and reopened from disk on its next query. CouchDB keeps an index process per active view with no such cap; this bounds memory and file descriptors on nodes with many databases. |
 | `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |
 
 Without `--nodes` it runs as a single node (the cluster with one member).
@@ -881,7 +886,9 @@ all acknowledged documents or refuse to serve them.
 v0.2: the replication protocol, auth, views, search, multiuser admission, a
 Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
-containing `_attachments` are rejected with a 400 `bad_request`.
+containing `_attachments` are rejected with a 400 `bad_request`. Attachments
+that a database written before v0.2 may still hold stay readable (stubs and
+`attachments=true`, with checked chunk reads) but no attachment can be added or changed.
 
 JSON numbers use arbitrary precision: integers beyond `i64`/`u64` are stored
 exactly and hashed with CouchDB's bignum ETF encoding. Document parsing also

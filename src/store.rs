@@ -16,8 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-pub const ATTEST_CHUNK: usize = 64 * 1024;
-
 /// Body keys examined per round of the compaction sweep.
 #[cfg(not(test))]
 const BODY_SWEEP_BATCH: usize = 1000;
@@ -148,13 +146,6 @@ impl LatestChanges {
             .map(|(seq, id)| (*seq, id.as_str()))
     }
 
-    /// Documents whose latest sequence is below `before`, in sequence order.
-    pub fn before(&self, before: u64) -> impl DoubleEndedIterator<Item = (u64, &str)> {
-        self.by_seq
-            .range(..(before, String::new()))
-            .map(|(seq, id)| (*seq, id.as_str()))
-    }
-
     /// Every document, in sequence order.
     pub fn all(&self) -> impl DoubleEndedIterator<Item = (u64, &str)> {
         self.by_seq.iter().map(|(seq, id)| (*seq, id.as_str()))
@@ -162,17 +153,6 @@ impl LatestChanges {
 
     pub fn seq_of(&self, id: &str) -> Option<u64> {
         self.by_id.get(id).copied()
-    }
-
-    /// Ids starting with `prefix`, in id order.
-    pub fn ids_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a String> {
-        self.by_id
-            .range::<str, _>((
-                std::ops::Bound::Included(prefix),
-                std::ops::Bound::Unbounded,
-            ))
-            .map(|(id, _)| id)
-            .take_while(move |id| id.starts_with(prefix))
     }
 }
 
@@ -326,9 +306,6 @@ pub struct Shard {
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
     latest: Option<LatestChanges>,
-    /// Ids under `_design/` whose metadata did not decode when `latest` was
-    /// built. Validation must not run without them, so it fails on these.
-    corrupt_design: Vec<String>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -520,7 +497,6 @@ impl Shard {
             deleted,
             live: None,
             latest: None,
-            corrupt_design: Vec::new(),
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -618,7 +594,7 @@ impl Shard {
             }
         }
         hasher.update(documents.to_be_bytes());
-        Ok(crate::db::hex(&hasher.finalize()))
+        Ok(crate::util::hex(&hasher.finalize()))
     }
 
     pub fn state(&mut self, with_digest: bool) -> Result<ShardState> {
@@ -711,30 +687,43 @@ impl Shard {
         if self.latest.is_none() {
             let mut latest = LatestChanges::default();
             let name = self.name.clone();
-            let mut corrupt_design = Vec::new();
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
                     Ok((id, meta)) => latest.insert(id, meta.seq),
-                    Err(corrupt) => {
-                        name.report_corrupt(&corrupt.id, &corrupt);
-                        if corrupt.id.starts_with("_design/") {
-                            corrupt_design.push(corrupt.id);
-                        }
-                    }
+                    Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
                 }
                 true
             })?;
-            self.corrupt_design = corrupt_design;
             self.latest = Some(latest);
         }
         Ok(self.latest.as_ref().expect("latest changes initialized"))
     }
 
-    /// Design documents whose metadata is corrupt. Their `validate_doc_update`
-    /// functions cannot be loaded, so callers must fail instead of skipping them.
-    pub fn corrupt_design_docs(&mut self) -> Result<Vec<String>> {
-        self.latest_changes()?;
-        Ok(self.corrupt_design.clone())
+    /// The ids of the design documents (deleted ones included), and those
+    /// among them whose metadata is corrupt. A corrupt one's
+    /// `validate_doc_update` cannot be loaded, so callers must fail instead of
+    /// skipping it. A range scan of the `_design/` keys: it neither builds nor
+    /// needs the id-to-sequence index.
+    pub fn design_docs(&mut self) -> Result<(Vec<String>, Vec<String>)> {
+        let name = self.name.clone();
+        let mut ids = Vec::new();
+        let mut corrupt_design = Vec::new();
+        self.scan_range_while(b"m/_design/", None, false, |key, value| {
+            match parse_meta(key, value) {
+                Ok((id, _)) => ids.push(id),
+                Err(corrupt) => {
+                    name.report_corrupt(&corrupt.id, &corrupt);
+                    corrupt_design.push(corrupt.id);
+                }
+            }
+            true
+        })?;
+        Ok((ids, corrupt_design))
+    }
+
+    #[cfg(test)]
+    pub fn latest_built(&self) -> bool {
+        self.latest.is_some()
     }
 
     pub fn update_latest(
@@ -871,111 +860,59 @@ impl Shard {
                 }
                 None => seek_last(&mut iter, prefix)?,
             }
-
-            let mut overlay = overlay.into_iter().rev().peekable();
-            loop {
-                let disk = if iter.valid() {
-                    iter.current()
-                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
-                } else {
-                    None
-                };
-                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
-                let take_disk = match (&disk, overlay.peek()) {
-                    (Some((disk_key, _)), Some((overlay_key, _))) => {
-                        disk_key.as_slice() >= overlay_key.as_slice()
-                    }
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
-                };
-                if take_disk {
-                    let (key, value) = disk.expect("disk item");
-                    iter.prev();
-                    if let Some((overlay_key, _)) = overlay.peek() {
-                        if overlay_key.as_slice() == key.as_slice() {
-                            let (_, overlay_value) = overlay.next().unwrap();
-                            if let Some(value) = overlay_value {
-                                if !visit(&key, &value) {
-                                    return Ok(());
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    if !visit(&key, &value) {
-                        return Ok(());
-                    }
-                } else {
-                    let (key, value) = overlay.next().unwrap();
-                    if let Some(value) = value {
-                        if !visit(&key, &value) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            for (key, value) in overlay {
-                if let Some(value) = value {
-                    if !visit(&key, &value) {
-                        break;
-                    }
-                }
-            }
         } else {
             match start {
                 Some(lower) => iter.seek(lower),
                 None => iter.seek(prefix),
             }
+        }
 
-            let mut overlay = overlay.into_iter().peekable();
-            loop {
-                let disk = if iter.valid() {
-                    iter.current()
-                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
-                } else {
-                    None
-                };
-                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
-                let take_disk = match (&disk, overlay.peek()) {
-                    (Some((disk_key, _)), Some((overlay_key, _))) => {
-                        disk_key.as_slice() <= overlay_key.as_slice()
-                    }
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
-                };
-                if take_disk {
-                    let (key, value) = disk.expect("disk item");
-                    iter.advance();
-                    if let Some((overlay_key, _)) = overlay.peek() {
-                        if overlay_key.as_slice() == key.as_slice() {
-                            let (_, overlay_value) = overlay.next().unwrap();
-                            if let Some(value) = overlay_value {
-                                if !visit(&key, &value) {
-                                    return Ok(());
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    if !visit(&key, &value) {
-                        return Ok(());
-                    }
-                } else {
-                    let (key, value) = overlay.next().unwrap();
-                    if let Some(value) = value {
-                        if !visit(&key, &value) {
-                            return Ok(());
-                        }
-                    }
+        // Merge the disk and overlay streams in scan order. An overlay entry
+        // shadows a disk entry with the same key, and a `None` value deletes it.
+        let mut overlay: Vec<_> = overlay.into_iter().collect();
+        if reverse {
+            overlay.reverse();
+        }
+        let mut overlay = overlay.into_iter().peekable();
+        loop {
+            let disk = if iter.valid() {
+                iter.current()
+                    .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            } else {
+                None
+            };
+            let disk = disk.filter(|(key, _)| key.starts_with(prefix));
+            let take_disk = match (&disk, overlay.peek()) {
+                (Some((disk_key, _)), Some((overlay_key, _))) if reverse => {
+                    disk_key.as_slice() >= overlay_key.as_slice()
                 }
-            }
-            for (key, value) in overlay {
-                if let Some(value) = value {
-                    if !visit(&key, &value) {
-                        break;
-                    }
+                (Some((disk_key, _)), Some((overlay_key, _))) => {
+                    disk_key.as_slice() <= overlay_key.as_slice()
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let next = if take_disk {
+                let Some((key, value)) = disk else { break };
+                if reverse {
+                    iter.prev();
+                } else {
+                    iter.advance();
+                }
+                match overlay.next_if(|(overlay_key, _)| *overlay_key == key) {
+                    Some((_, overlay_value)) => (key, overlay_value),
+                    None => (key, Some(value)),
+                }
+            } else {
+                match overlay.next() {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            };
+            if let (key, Some(value)) = next {
+                if !visit(&key, &value) {
+                    return Ok(());
                 }
             }
         }
@@ -2159,13 +2096,19 @@ mod scan_tests {
             if seq % 97 == 0 {
                 for cursor in [0, 1, seq / 3, seq / 2, seq - 1, seq, seq + 1, u64::MAX] {
                     assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
-                    assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+                    assert_eq!(
+                        latest.count_before(cursor),
+                        latest.all().take_while(|(seq, _)| *seq < cursor).count()
+                    );
                 }
             }
         }
         for cursor in 0..=seq + 1 {
             assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
-            assert_eq!(latest.count_before(cursor), latest.before(cursor).count());
+            assert_eq!(
+                latest.count_before(cursor),
+                latest.all().take_while(|(seq, _)| *seq < cursor).count()
+            );
         }
     }
 
@@ -2190,18 +2133,10 @@ mod scan_tests {
         assert!(after(4).is_empty());
         assert!(after(u64::MAX).is_empty());
         assert_eq!(
-            latest.before(3).map(|(seq, _)| seq).collect::<Vec<_>>(),
-            [2]
-        );
-        assert_eq!(
             latest.all().rev().map(|(seq, _)| seq).collect::<Vec<_>>(),
             [4, 3, 2]
         );
         assert_eq!(latest.seq_of("a"), Some(4));
-        assert_eq!(
-            latest.ids_with_prefix("_design/").collect::<Vec<_>>(),
-            ["_design/v"]
-        );
     }
 
     /// Updates delete the previous sequence entry. Once memtables have rolled

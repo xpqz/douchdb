@@ -40,6 +40,9 @@ fn wait_for_listener(child: &mut Child, port: u16) -> bool {
 /// WASM sandboxes. Tests for an excluded mode return early and report as
 /// passed.
 fn sandbox_tested(mode: &str) -> bool {
+    if mode == "wasm" && cfg!(not(feature = "wasm")) {
+        return false;
+    }
     match std::env::var("DOUCHDB_TEST_JS_SANDBOXES") {
         Ok(modes) => modes.split(',').any(|listed| listed.trim() == mode),
         Err(_) => true,
@@ -348,10 +351,7 @@ async fn fallback_pair(nodes: &[Server], db: &str, ids: &[String]) -> (usize, us
     assert_eq!(status, StatusCode::OK, "{map}");
     let q = map["q"].as_u64().unwrap() as u32;
     for (shard, replicas) in map["replicas"].as_array().unwrap().iter().enumerate() {
-        if !ids
-            .iter()
-            .any(|id| douchdb::db::shard_index(id, q) == shard)
-        {
+        if !ids.iter().any(|id| douchdb::shard_index(id, q) == shard) {
             continue;
         }
         let replicas: Vec<usize> = replicas
@@ -4625,7 +4625,7 @@ async fn cluster_reads_fail_with_nodedown_when_a_shard_has_no_live_copy() {
     }
     // Pin placement: the design document's shard lives on node 0 (the
     // coordinator), every other shard only on node 2, which is then killed.
-    let design = douchdb::db::shard_index("_design/v", 4);
+    let design = douchdb::shard_index("_design/v", 4);
     let replicas: Vec<Vec<usize>> = (0..4)
         .map(|shard| if shard == design { vec![0] } else { vec![2] })
         .collect();
@@ -4684,7 +4684,7 @@ async fn cluster_changes_forward_filter_query_args_to_every_shard() {
     // Node 0 holds only the design document's shard and one more; node 1
     // holds every shard. Reads from node 0 therefore fetch the rest from node
     // 1, which must evaluate the filter with the same `req.query`.
-    let design = douchdb::db::shard_index("_design/f", 4);
+    let design = douchdb::shard_index("_design/f", 4);
     let replicas: Vec<Vec<usize>> = (0..4)
         .map(|shard| {
             if shard == design || shard == (design + 1) % 4 {
@@ -5408,7 +5408,7 @@ async fn cluster_post_creates_the_document_on_its_owner() {
             assert_eq!(doc["x"], 1);
         }
         // The owner itself stores it, not just a node that can proxy to it.
-        let shard = douchdb::db::shard_index(&id, map["q"].as_u64().unwrap() as u32);
+        let shard = douchdb::shard_index(&id, map["q"].as_u64().unwrap() as u32);
         let owner = map["replicas"][shard][0].as_u64().unwrap() as usize;
         let (status, _) = nodes[owner]
             .req_with(Method::GET, &format!("/clpost/{id}"), None, &internal)
@@ -5913,7 +5913,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
     let (id, owner, writer) = (0..)
         .map(|i| format!("ae{i}"))
         .find_map(|id| {
-            let shard = douchdb::db::shard_index(&id, 4);
+            let shard = douchdb::shard_index(&id, 4);
             let owners: Vec<usize> = map["replicas"][shard]
                 .as_array()
                 .unwrap()
@@ -10185,6 +10185,26 @@ async fn js_sandboxes_agree_on_view_rows() {
     }
 }
 
+#[cfg(not(feature = "wasm"))]
+#[test]
+fn wasm_sandbox_without_the_wasm_feature_fails_at_startup() {
+    let _guard = SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let output = Command::new(env!("CARGO_BIN_EXE_douchdb"))
+        .args([
+            "--js-sandbox",
+            "wasm",
+            "--data",
+            "/tmp/douchdb-should-not-be-created",
+        ])
+        .output()
+        .expect("run douchdb");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`wasm` feature"), "{stderr}");
+}
+
 #[tokio::test]
 async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     if !sandbox_tested("wasm") {
@@ -10368,6 +10388,37 @@ async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
             );
             assert_eq!(body["rows"][0]["id"], "p1", "{mode} {view}: {body}");
         }
+    }
+}
+
+#[tokio::test]
+async fn search_hits_keep_the_original_id_when_index_changes_doc_id() {
+    // Same rule as for views: the hit id comes from the stored document, and
+    // every sandbox must agree.
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsidxid{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/p1"), json!({"v": "one"})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/s"),
+                json!({"indexes": {"changed": {
+                    "index": "function(doc){ doc._id = 'other'; index('v', doc.v); }"
+                }}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = s
+            .get(&format!("/{db}/_design/s/_search/changed?q=v:one"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["rows"][0]["id"], "p1", "{mode}: {body}");
     }
 }
 
@@ -11119,6 +11170,7 @@ fn server_exits_when_its_test_process_is_killed() {
     // SIGKILL: the helper gets no chance to run any Drop.
     drop(helper);
 
+    // SAFETY: kill(2) with signal 0 only probes whether the pid exists.
     let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while alive(pid) && std::time::Instant::now() < deadline {
@@ -11126,6 +11178,7 @@ fn server_exits_when_its_test_process_is_killed() {
     }
     let leaked = alive(pid);
     if leaked {
+        // SAFETY: kill(2) takes plain integers and touches no memory.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let prefix = format!("douchdb-test-{helper_pid}-");
@@ -11628,6 +11681,70 @@ async fn users_file_authenticates_tokens_sessions_and_roles() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn server_admin_endpoints_reject_anonymous_and_non_admin_callers() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let (status, _) = s
+        .req_with(Method::PUT, "/alpha", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let endpoints = [
+        (Method::GET, "/_db_updates"),
+        (Method::GET, "/_dbs_info"),
+        (Method::POST, "/_dbs_info"),
+        (Method::GET, "/_membership"),
+        (Method::GET, "/_node/_local/_dbs"),
+        (Method::GET, "/_node/_local/_cluster"),
+        (Method::GET, "/_node/_local/_metrics"),
+        (Method::GET, "/_node/_local/_health"),
+        (Method::POST, "/_node/_local/_cluster/discover"),
+        (Method::GET, "/_node/_local/_replication"),
+        (Method::POST, "/_node/_local/_replication/run"),
+        (Method::POST, "/_node/_local/_replication/pause"),
+        (Method::POST, "/_node/_local/_replication/resume"),
+        (Method::GET, "/_node/_local/_dbs/alpha"),
+        (Method::PUT, "/_node/_local/_dbs/alpha"),
+        (Method::GET, "/_node/_local/_dbs/alpha/shards"),
+        (Method::POST, "/_node/_local/_dbs/alpha/rebalance"),
+        (Method::POST, "/_node/_local/_dbs/alpha/cleanup"),
+    ];
+    for (method, path) in endpoints {
+        let body = || Some(json!({}));
+        let (status, anonymous) = s.req_with(method.clone(), path, body(), &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: {anonymous}"
+        );
+        assert_eq!(anonymous["error"], "unauthorized", "{method} {path}");
+        let (status, denied) = s
+            .req_with(method.clone(), path, body(), &bearer("alice-token"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {denied}");
+        assert_eq!(
+            denied,
+            json!({"error": "forbidden", "reason": "You are not authorized to access this db."}),
+            "{method} {path}"
+        );
+        // Only read-only endpoints are called as an admin: the others start
+        // rebalances and replication passes.
+        if method != Method::GET {
+            continue;
+        }
+        let (status, allowed) = s
+            .req_with(method.clone(), path, None, &bearer("root-token"))
+            .await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: {allowed}"
+        );
+        assert_ne!(status, StatusCode::FORBIDDEN, "{method} {path}: {allowed}");
+    }
 }
 
 #[tokio::test]
@@ -13060,9 +13177,9 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     // (shard s goes to node s % 3).
     let id = (0..)
         .map(|i| format!("x{i}"))
-        .find(|id| !douchdb::db::shard_index(id, 4).is_multiple_of(3))
+        .find(|id| !douchdb::shard_index(id, 4).is_multiple_of(3))
         .unwrap();
-    let target = douchdb::db::shard_index(&id, 4) % 3;
+    let target = douchdb::shard_index(&id, 4) % 3;
 
     let root = "00000000000000000000000000000000";
     let branch = |rev: &str, v: &str| {

@@ -176,10 +176,6 @@ fn encode_list(items: &[Term], out: &mut Vec<u8>) {
     out.push(NIL_EXT);
 }
 
-fn is_integer(raw: &str) -> bool {
-    !raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'))
-}
-
 /// Convert a decimal integer literal to a little-endian magnitude.
 fn decimal_magnitude(raw: &str) -> (bool, Vec<u8>) {
     let (negative, digits) = match raw.strip_prefix('-') {
@@ -223,7 +219,7 @@ pub fn from_json(value: &serde_json::Value) -> Term {
                 Term::Int(i)
             } else if let Some(u) = n.as_u64() {
                 Term::UInt(u)
-            } else if is_integer(n.as_str()) {
+            } else if crate::json::is_integer(n.as_str()) {
                 let (negative, magnitude) = decimal_magnitude(n.as_str());
                 Term::BigInt {
                     negative,

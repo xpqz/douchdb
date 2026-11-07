@@ -6,13 +6,13 @@
 //! does not fsync, so this is process-crash durability, not power-loss
 //! durability.
 
-use crate::cluster::ShardMap;
+use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
     blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
-    ATTEST_CHUNK,
 };
+use crate::util::{hex, uuid};
 use base64::Engine;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -34,25 +34,6 @@ pub const META_FIELDS: [&str; 9] = [
     "_revs_info",
     "_local_seq",
 ];
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn uuid() -> String {
-    hex(&random_bytes::<16>())
-}
-
-/// Bytes from the operating system's CSPRNG. The generator failing means the
-/// platform cannot provide randomness at all, which nothing here can recover
-/// from; carrying on with predictable ids or keys would be worse.
-pub fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    if let Err(error) = getrandom::fill(&mut buf) {
-        panic!("operating system random number generator failed: {error}");
-    }
-    buf
-}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DbFile {
@@ -117,14 +98,11 @@ pub(crate) fn changes_watermark_from(
     committed: &[u64],
     reserved: &[u64],
     since: u64,
-    owned: Option<&[bool]>,
+    owned: Option<&ShardMask>,
 ) -> u64 {
     let mut safe = u64::MAX;
     for index in 0..committed.len().min(reserved.len()) {
-        if owned
-            .map(|mask| !mask.get(index).copied().unwrap_or(false))
-            .unwrap_or(false)
-        {
+        if !shard_owned(owned, index) {
             continue;
         }
         if reserved[index] > committed[index] {
@@ -132,6 +110,12 @@ pub(crate) fn changes_watermark_from(
         }
     }
     safe
+}
+
+/// Whether the shard at `index` is selected by an `owned` mask: every shard
+/// when there is no mask, and never one the mask does not cover.
+fn shard_owned(owned: Option<&ShardMask>, index: usize) -> bool {
+    owned.is_none_or(|owned| owned.covers(index))
 }
 
 /// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
@@ -330,15 +314,15 @@ pub struct Db {
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
-    shard_map: Arc<std::sync::RwLock<ShardMap>>,
-    security: Arc<std::sync::RwLock<(u64, Value)>>,
+    shard_map: std::sync::RwLock<ShardMap>,
+    security: std::sync::RwLock<(u64, Value)>,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
-    compact_running: Arc<AtomicBool>,
+    compact_running: AtomicBool,
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
     /// seed the target replicas.
-    migration_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    migration_map: std::sync::RwLock<Option<ShardMap>>,
     /// Held shared by every cluster write for its full duration, including
     /// detached replica fan-out, and taken exclusively to drain them when a
     /// rebalance freezes the database.
@@ -346,7 +330,7 @@ pub struct Db {
     /// Unix-millisecond deadline for the cluster-wide write freeze, or zero
     /// when writes are allowed. A deadline lets peers recover if the
     /// coordinating node disappears mid-rebalance.
-    rebalance_until: Arc<AtomicU64>,
+    rebalance_until: AtomicU64,
     shards: Vec<ShardHandle>,
     /// Last committed sequence per shard, shared with the shard actors.
     committed_seq: Vec<Arc<AtomicU64>>,
@@ -357,17 +341,22 @@ pub struct Db {
     seq: Arc<AtomicU64>,
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
-    validation: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+    validation: std::sync::RwLock<Option<Vec<String>>>,
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
-    design_generation: Arc<AtomicU64>,
+    design_generation: AtomicU64,
     /// Validators merged from every node by a cluster coordinator, with the
     /// design generation and time they were loaded.
-    cluster_validation: Arc<std::sync::RwLock<Option<ClusterValidators>>>,
+    cluster_validation: std::sync::RwLock<Option<ClusterValidators>>,
 }
 
-/// Design generation, load time and sources of cluster-merged validators.
-type ClusterValidators = (u64, std::time::Instant, Vec<String>);
+/// Cluster-merged validators with the design generation and time they were
+/// loaded.
+struct ClusterValidators {
+    generation: u64,
+    loaded: std::time::Instant,
+    functions: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct DbConfig {
@@ -568,19 +557,19 @@ impl Db {
             partitioned: file.partitioned,
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
-            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
-            security: Arc::new(std::sync::RwLock::new(security)),
-            compact_running: Arc::new(AtomicBool::new(false)),
-            migration_map: Arc::new(std::sync::RwLock::new(None)),
+            shard_map: std::sync::RwLock::new(shard_map),
+            security: std::sync::RwLock::new(security),
+            compact_running: AtomicBool::new(false),
+            migration_map: std::sync::RwLock::new(None),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
-            rebalance_until: Arc::new(AtomicU64::new(0)),
+            rebalance_until: AtomicU64::new(0),
             shards,
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
-            validation: Arc::new(std::sync::RwLock::new(None)),
-            design_generation: Arc::new(AtomicU64::new(0)),
-            cluster_validation: Arc::new(std::sync::RwLock::new(None)),
+            validation: std::sync::RwLock::new(None),
+            design_generation: AtomicU64::new(0),
+            cluster_validation: std::sync::RwLock::new(None),
         })
     }
 
@@ -598,6 +587,36 @@ impl Db {
 
     pub fn exists(root: &Path, name: &str) -> bool {
         db_path(root, name).join("db.json").is_file()
+    }
+
+    /// The security object of a database that need not be open: what its
+    /// directory holds, which is what an open one holds in memory too, since
+    /// it is written before it is installed.
+    pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
+        if !Db::exists(root, name) {
+            return Err(ApiError::not_found(format!(
+                "Database does not exist: {name}"
+            )));
+        }
+        load_security(&db_path(root, name)).map(|(_, security)| security)
+    }
+
+    /// Whether a shard map this node has not acknowledged is waiting on disk.
+    pub fn has_pending_shard_map(root: &Path, name: &str) -> bool {
+        matches!(
+            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json")),
+            Ok(Some(_))
+        )
+    }
+
+    /// Whether the database can be closed and reopened without losing
+    /// anything: no rebalance is freezing it, no compaction is running, and no
+    /// cluster write holds its gate. What it keeps in memory beyond that is
+    /// rebuilt from disk.
+    pub fn quiescent(&self) -> bool {
+        !self.rebalance_in_progress()
+            && !self.compact_running.load(Ordering::SeqCst)
+            && self.write_gate.try_write().is_ok()
     }
 
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
@@ -683,9 +702,9 @@ impl Db {
 
     /// All `validate_doc_update` functions from live design documents.
     ///
-    /// Loading is cached until a design document is written. The scan walks
-    /// the shard's latest-change index, so it does not read ordinary document
-    /// bodies.
+    /// Loading is cached until a design document is written. The scan is a
+    /// range over the shards' `_design/` metadata keys, so it reads neither
+    /// ordinary documents nor the changes index.
     pub async fn validation_functions(&self) -> DbResult<Vec<String>> {
         if let Some(functions) = self
             .validation
@@ -699,21 +718,13 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
-            let corrupt = shard.call(|s| Ok(s.corrupt_design_docs()?)).await?;
+            let (mut found, corrupt) = shard.call(|s| Ok(s.design_docs()?)).await?;
             if let Some(id) = corrupt.first() {
                 // Skipping it would let writes through unvalidated.
                 return Err(ApiError::corrupt(format!(
                     "corrupt design document {id}: its validate_doc_update cannot be loaded"
                 )));
             }
-            let mut found = shard
-                .call(|s| {
-                    Ok(s.latest_changes()?
-                        .ids_with_prefix("_design/")
-                        .cloned()
-                        .collect::<Vec<String>>())
-                })
-                .await?;
             ids.append(&mut found);
         }
         ids.sort();
@@ -769,9 +780,9 @@ impl Db {
             .cluster_validation
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (generation, loaded, functions) = cached.as_ref()?;
-        (*generation == self.design_generation() && loaded.elapsed() < ttl)
-            .then(|| functions.clone())
+        let cached = cached.as_ref()?;
+        (cached.generation == self.design_generation() && cached.loaded.elapsed() < ttl)
+            .then(|| cached.functions.clone())
     }
 
     /// Cache cluster-merged validators read since `generation` was taken,
@@ -782,7 +793,11 @@ impl Db {
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
         if self.design_generation() == generation {
-            *cached = Some((generation, std::time::Instant::now(), functions));
+            *cached = Some(ClusterValidators {
+                generation,
+                loaded: std::time::Instant::now(),
+                functions,
+            });
         }
     }
 
@@ -1052,7 +1067,7 @@ impl Db {
     /// snapshot is higher and is left for the next request. (Computing this
     /// after the read is unsafe: a shard read before its commit, but
     /// committed by the time of the check, no longer holds the cursor back.)
-    pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
+    pub fn changes_watermark(&self, since: u64, owned: Option<&ShardMask>) -> u64 {
         // Load the counter first: an allocation it includes has already marked
         // its shard in flight (see `Stage::next_seq`).
         let allocated = self.seq.load(Ordering::SeqCst);
@@ -1307,14 +1322,14 @@ impl Db {
     /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
     /// coordinators use this to fetch each document from exactly one primary
     /// instead of merging the same replica from every node.
-    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &[bool]) -> DbResult<Value> {
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
     async fn all_docs_filtered(
         &self,
         opts: &AllDocsOpts,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         if let Some(keys) = &opts.keys {
             return self.all_docs_by_keys(opts, keys, owned).await;
@@ -1365,10 +1380,7 @@ impl Db {
             {
                 continue;
             }
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, index) {
                 continue;
             }
             let opts = opts.clone();
@@ -1400,16 +1412,10 @@ impl Db {
     /// `Value` and serializing it again just to hand it to QuickJS.
     /// View documents from selected shards. Cluster nodes pass their owned
     /// shards so replicas do not pay to index documents they never serve.
-    pub async fn map_docs(&self, owned: Option<&[bool]>) -> DbResult<Vec<(String, String)>> {
+    pub async fn map_docs(&self, owned: Option<&ShardMask>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
-        for (index, shard) in self.shards.iter().enumerate() {
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let mut shard_docs = shard
+        for index in self.selected_shards(owned) {
+            let mut shard_docs = self.shards[index]
                 .call(|s| {
                     // Build (or reuse) the live map, then read only bodies.
                     // This avoids decoding every full DocMeta record again for
@@ -1450,7 +1456,10 @@ impl Db {
                         };
                         let doc = read_doc(s, &id, &doc_opts);
                         if let Some(doc) = skip_corrupt(s, &id, doc)? {
-                            docs.push((id, serde_json::to_string(&doc)?));
+                            docs.push((
+                                id,
+                                serde_json::to_string(&doc).map_err(ApiError::internal)?,
+                            ));
                         }
                     }
                     Ok(docs)
@@ -1465,15 +1474,12 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         keys: &[Value],
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
-            if owned
-                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, shard) {
                 total_rows = 0;
             } else {
                 let partition = partition.clone();
@@ -1482,14 +1488,8 @@ impl Db {
                     .await?;
             }
         } else {
-            for (index, shard) in self.shards.iter().enumerate() {
-                if owned
-                    .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                total_rows += shard.call(|s| Ok(s.counts().0)).await?;
+            for index in self.selected_shards(owned) {
+                total_rows += self.shards[index].call(|s| Ok(s.counts().0)).await?;
             }
         }
 
@@ -1522,10 +1522,7 @@ impl Db {
                 }
             }
             let shard = self.shard_index(key);
-            if owned
-                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, shard) {
                 continue;
             }
             included[slot] = true;
@@ -1573,8 +1570,8 @@ impl Db {
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
         let watermark = opts
             .until
-            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_deref()));
-        let selected = self.selected_shards(opts.owned.as_deref());
+            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_ref()));
+        let selected = self.selected_shards(opts.owned.as_ref());
         let until = if opts.descending {
             u64::MAX
         } else {
@@ -1613,15 +1610,15 @@ impl Db {
             .or(scanned_last)
             .unwrap_or(opts.since);
         let pending = self
-            .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
+            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
         Ok((rows, last_seq, pending))
     }
 
     /// Indexes of the shards in `owned`, or every shard.
-    fn selected_shards(&self, owned: Option<&[bool]>) -> Vec<usize> {
+    fn selected_shards(&self, owned: Option<&ShardMask>) -> Vec<usize> {
         (0..self.shards.len())
-            .filter(|index| owned.is_none_or(|owned| owned.get(*index).copied().unwrap_or(false)))
+            .filter(|index| shard_owned(owned, *index))
             .collect()
     }
 
@@ -1663,17 +1660,11 @@ impl Db {
         &self,
         after: u64,
         descending: bool,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
         let mut pending = 0usize;
-        for (index, shard) in self.shards.iter().enumerate() {
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            pending += shard
+        for index in self.selected_shards(owned) {
+            pending += self.shards[index]
                 .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
                 .await?;
         }
@@ -1693,7 +1684,7 @@ impl Db {
                 entry["deleted"] = json!(true);
             }
             if let Some(doc) = row.doc {
-                entry["doc"] = serde_json::from_str::<Value>(&doc)?;
+                entry["doc"] = serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?;
             }
             results.push(entry);
         }
@@ -1722,7 +1713,7 @@ impl Db {
                 ));
                 return;
             }
-            let selected = db.selected_shards(opts.owned.as_deref());
+            let selected = db.selected_shards(opts.owned.as_ref());
             let mut cursors = vec![opts.since; selected.len()];
             let mut done = vec![false; selected.len()];
             let mut buffers: Vec<VecDeque<ChangeRow>> =
@@ -1731,7 +1722,7 @@ impl Db {
             // One snapshot for the whole stream, taken before any shard read.
             // The stream ends at the watermark; the client resumes from the
             // last row it received.
-            let watermark = db.changes_watermark(opts.since, opts.owned.as_deref());
+            let watermark = db.changes_watermark(opts.since, opts.owned.as_ref());
             let watermark = match db.changes_cutoff(&selected, &opts).await {
                 Ok(cutoff) => watermark.min(cutoff),
                 Err(error) => {
@@ -2326,7 +2317,6 @@ struct SplitDoc {
     id: String,
     rev: Option<String>,
     deleted: bool,
-    attachments: Option<Value>,
     revisions: Option<Value>,
     body: Map<String, Value>,
 }
@@ -2345,7 +2335,6 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     let mut rev = None;
     let mut deleted = false;
     let mut revisions = None;
-    let mut attachments = None;
     let mut body = Map::new();
 
     // One ordered pass. `serde_json::Map::remove` is a `swap_remove`, which
@@ -2368,7 +2357,6 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
             },
             "_deleted" => deleted = matches!(value, Value::Bool(true)),
             "_revisions" => revisions = Some(value),
-            "_attachments" => attachments = Some(value),
             k if META.contains(&k) => {}
             _ => {
                 body.insert(key, value);
@@ -2388,40 +2376,9 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
         id,
         rev,
         deleted,
-        attachments,
         revisions,
         body,
     })
-}
-
-fn decode_attachment(value: &Value) -> DbResult<Option<(AttMeta, Vec<u8>)>> {
-    let Some(obj) = value.as_object() else {
-        return Err(ApiError::bad_request("Attachment must be an object"));
-    };
-    let content_type = obj
-        .get("content_type")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let Some(data) = obj.get("data").and_then(Value::as_str) else {
-        if obj.get("follows").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(ApiError::bad_request(
-                "multipart attachments are not supported",
-            ));
-        }
-        return Ok(None);
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|_| ApiError::bad_request("Invalid attachment data"))?;
-    let digest = hex(&Md5::digest(&bytes));
-    let meta = AttMeta {
-        content_type,
-        digest,
-        length: bytes.len() as u64,
-        revpos: 0,
-    };
-    Ok(Some((meta, bytes)))
 }
 
 fn put_many(
@@ -2514,7 +2471,7 @@ impl Stage<'_> {
     }
 
     fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = serde_json::to_vec(meta)?;
+        let bytes = serde_json::to_vec(meta).map_err(ApiError::internal)?;
         self.ops.push((meta_key(id), Some(bytes)));
         self.staged.insert(id.to_string(), meta.clone());
         Ok(())
@@ -2530,7 +2487,6 @@ impl Stage<'_> {
             id,
             rev: parent_rev,
             deleted,
-            attachments,
             revisions: _,
             body,
         } = doc;
@@ -2570,17 +2526,20 @@ impl Stage<'_> {
             .as_ref()
             .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
-        let fallback = all_atts(&meta);
-        let atts = self.apply_attachments(&inherited, &fallback, attachments.as_ref(), pos)?;
+        // Uploads are rejected, so a new revision only carries forward the
+        // attachments that older data already holds.
+        let atts = inherited;
 
-        let hashed: Vec<Attachment> = atts
+        let hashed = atts
             .iter()
-            .map(|(name, a)| Attachment {
-                name: name.clone(),
-                content_type: a.content_type.clone(),
-                md5: hex_to_16(&a.digest),
+            .map(|(name, a)| {
+                Ok(Attachment {
+                    name: name.clone(),
+                    content_type: a.content_type.clone(),
+                    md5: hex_to_16(&a.digest)?,
+                })
             })
-            .collect();
+            .collect::<DbResult<Vec<Attachment>>>()?;
         let rev_id = hex(&new_revid(
             deleted,
             parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
@@ -2598,8 +2557,10 @@ impl Stage<'_> {
         meta.seq = seq;
         meta.atts.insert(rev.clone(), atts);
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
@@ -2614,19 +2575,13 @@ impl Stage<'_> {
             id,
             rev,
             deleted,
-            attachments,
             revisions,
             body,
         } = doc;
         let body = Value::Object(body);
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
-        let leaf = path
-            .last()
-            .cloned()
-            .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
-
         let known = meta.tree.contains(&rev);
-        if known && meta.atts.contains_key(&rev) && attachments.is_none() {
+        if known && meta.atts.contains_key(&rev) {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
 
@@ -2635,22 +2590,17 @@ impl Stage<'_> {
             .parent(&rev)
             .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
-        let fallback = all_atts(&meta);
-        let mut atts =
-            self.apply_attachments(&parent, &fallback, attachments.as_ref(), leaf.pos)?;
-        for (_, a) in atts.iter_mut() {
-            if a.revpos == 0 {
-                a.revpos = leaf.pos;
-            }
-        }
+        let atts = parent;
 
         let changed = !known;
         if changed {
             meta.tree.merge_path(&path, deleted);
         }
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
@@ -2664,64 +2614,6 @@ impl Stage<'_> {
         }
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
-    }
-
-    fn apply_attachments(
-        &mut self,
-        inherited: &[(String, AttMeta)],
-        fallback: &[(String, AttMeta)],
-        submitted: Option<&Value>,
-        pos: u64,
-    ) -> DbResult<Vec<(String, AttMeta)>> {
-        let Some(submitted) = submitted else {
-            return Ok(inherited.to_vec());
-        };
-        let Some(obj) = submitted.as_object() else {
-            return Err(ApiError::bad_request("_attachments must be an object"));
-        };
-        let mut out = Vec::new();
-        for (name, value) in obj {
-            if let Some((mut att, bytes)) = decode_attachment(value)? {
-                att.revpos = pos;
-                for (i, chunk) in bytes.chunks(ATTEST_CHUNK).enumerate() {
-                    self.ops
-                        .push((blob_prefix(&att.digest, i as u32), Some(chunk.to_vec())));
-                }
-                out.push((name.clone(), att));
-                continue;
-            }
-            let digest = value
-                .get("digest")
-                .and_then(Value::as_str)
-                .and_then(digest_from_wire);
-            let found = inherited
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, a)| a.clone())
-                .or_else(|| {
-                    fallback
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, a)| a.clone())
-                })
-                .or_else(|| {
-                    digest.as_ref().and_then(|d| {
-                        fallback
-                            .iter()
-                            .find(|(_, a)| &a.digest == d)
-                            .map(|(_, a)| a.clone())
-                    })
-                })
-                .ok_or_else(|| {
-                    ApiError::new(
-                        412,
-                        "missing_stub",
-                        format!("Invalid attachment stub in {name}"),
-                    )
-                })?;
-            out.push((name.clone(), found));
-        }
-        Ok(out)
     }
 }
 
@@ -2769,18 +2661,6 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
     Ok((rev, vec![leaf]))
 }
 
-fn all_atts(meta: &DocMeta) -> Vec<(String, AttMeta)> {
-    let mut out = Vec::new();
-    for list in meta.atts.values() {
-        for (name, att) in list {
-            if !out.iter().any(|(n, _): &(String, AttMeta)| n == name) {
-                out.push((name.clone(), att.clone()));
-            }
-        }
-    }
-    out
-}
-
 fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
     let mut last_seq = None;
     let mut tx = Tx::new();
@@ -2801,45 +2681,38 @@ fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
     shard.commit_at(tx, last_seq)
 }
 
-fn hex_to_16(hex: &str) -> [u8; 16] {
-    let bytes = hex_bytes(hex);
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = bytes.get(i).copied().unwrap_or(0);
+/// The raw bytes of a stored hex digest. The digest comes from disk, so one
+/// that is not well-formed hex is reported as corruption rather than guessed at.
+fn hex_bytes(hex: &str) -> DbResult<Vec<u8>> {
+    let corrupt = || ApiError::corrupt(format!("corrupt attachment digest {hex:?}"));
+    if !hex.len().is_multiple_of(2) {
+        return Err(corrupt());
     }
-    out
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(corrupt)
+        })
+        .collect()
 }
 
-fn hex_bytes(hex: &str) -> Vec<u8> {
-    let bytes = hex.as_bytes();
-    (0..bytes.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
-        .collect()
+fn hex_to_16(hex: &str) -> DbResult<[u8; 16]> {
+    hex_bytes(hex)?
+        .try_into()
+        .map_err(|_| ApiError::corrupt(format!("corrupt attachment digest {hex:?}")))
 }
 
 /// CouchDB writes attachment digests as `md5-<base64 of the raw digest>`, not
 /// hex. The wire format is not cosmetic: PouchDB uses it to decide whether an
 /// attachment has to be transferred.
-pub fn digest_to_wire(hex: &str) -> String {
-    format!(
+pub fn digest_to_wire(hex: &str) -> DbResult<String> {
+    Ok(format!(
         "md5-{}",
-        base64::engine::general_purpose::STANDARD.encode(hex_bytes(hex))
-    )
-}
-
-/// Parse `md5-<base64>` (and, leniently, a bare hex digest) back to hex.
-pub fn digest_from_wire(value: &str) -> Option<String> {
-    let value = value.strip_prefix("md5-").unwrap_or(value);
-    if value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Some(value.to_ascii_lowercase());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .ok()?;
-    if bytes.len() != 16 {
-        return None;
-    }
-    Some(hex(&bytes))
+        base64::engine::general_purpose::STANDARD.encode(hex_bytes(hex)?)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2905,7 +2778,7 @@ pub struct ChangesOpts {
     pub filter: Option<ChangeFilter>,
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
-    pub owned: Option<Vec<bool>>,
+    pub owned: Option<ShardMask>,
     /// Internal: a watermark the caller already read with `changes_watermark`.
     /// Rows above it are withheld, and the feed does not take a newer one, so
     /// a caller that records it as its position has seen every row up to it.
@@ -3149,7 +3022,7 @@ fn attachment_json(
     let mut out = json!({
         "content_type": att.content_type,
         "revpos": att.revpos,
-        "digest": digest_to_wire(&att.digest),
+        "digest": digest_to_wire(&att.digest)?,
         "length": att.length,
     });
     if with_data {
@@ -3561,7 +3434,7 @@ fn collect_changes(
                 },
             );
             match read {
-                Ok(doc) => Some(serde_json::to_string(&doc)?),
+                Ok(doc) => Some(serde_json::to_string(&doc).map_err(ApiError::internal)?),
                 // A tombstone may have no stored body.
                 Err(error) if deleted && error.status == 404 => None,
                 Err(error) if error.status == 404 => {
@@ -3594,6 +3467,23 @@ fn collect_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owned_mask_selects_only_the_shards_it_covers() {
+        assert!(shard_owned(None, 7));
+        let mask = ShardMask::from_iter([true, false, true]);
+        assert!(shard_owned(Some(&mask), 0));
+        assert!(!shard_owned(Some(&mask), 1));
+        assert!(shard_owned(Some(&mask), 2));
+        // A shard beyond the mask is not owned.
+        assert!(!shard_owned(Some(&mask), 3));
+        // The watermark ignores shards the mask excludes.
+        assert_eq!(
+            changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, Some(&mask)),
+            u64::MAX
+        );
+        assert_eq!(changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, None), 1);
+    }
 
     #[test]
     fn db_dir_names_are_flat_and_reversible() {
@@ -3658,7 +3548,7 @@ mod tests {
     }
 
     async fn single_shard_db(name: &str) -> (Db, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             name,
@@ -3688,7 +3578,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
-        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "stem",
@@ -3722,7 +3612,7 @@ mod tests {
 
     #[tokio::test]
     async fn replicated_writes_do_not_keep_attachments_for_stemmed_revisions() {
-        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "stematts",
@@ -3771,7 +3661,7 @@ mod tests {
             .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
             .await
             .unwrap();
-        assert_eq!(meta.tree.len(), 2);
+        assert_eq!(meta.tree.revs().count(), 2);
         let kept: Vec<&String> = meta.atts.keys().collect();
         let tree: Vec<&String> = meta.tree.revs().collect();
         assert_eq!(kept, tree, "atts only for revisions still in the tree");
@@ -3830,6 +3720,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_non_ascii_attachment_digest_is_corruption_not_a_panic() {
+        let (db, root) = single_shard_db("att-digest").await;
+        let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        db.shards[0]
+            .call(move |shard| {
+                let mut meta = shard.get_meta("a")?.unwrap();
+                meta.atts.insert(
+                    rev,
+                    vec![(
+                        "f.txt".to_string(),
+                        AttMeta {
+                            content_type: "text/plain".into(),
+                            // The second character is two bytes wide, so a
+                            // byte-offset slice at 2 lands inside it.
+                            digest: "a\u{e9}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                            length: 5,
+                            revpos: 1,
+                        },
+                    )],
+                );
+                shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.get_doc("a", &DocOpts::default()).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        assert!(error.corrupt, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
@@ -3879,6 +3803,37 @@ mod tests {
         let error = db.validation_functions().await.unwrap_err();
         assert_eq!(error.status, 500, "{error}");
         assert!(error.reason.contains("_design/v"), "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Finding the design documents used to build every shard's
+    /// id-to-sequence index, which then stays in memory for the database's life.
+    #[tokio::test]
+    async fn loading_validators_does_not_build_the_changes_index() {
+        let (db, root) = single_shard_db("ddoc-scan").await;
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/v", "validate_doc_update": "function(){}"}),
+                json!({"_id": "plain", "n": 1}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        db.shards[0]
+            .call(|shard| {
+                shard.invalidate_latest();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        let built = db.shards[0]
+            .call(|shard| Ok(shard.latest_built()))
+            .await
+            .unwrap();
+        assert!(!built, "the validator scan built the changes index");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3976,7 +3931,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
-        let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "valfail",
@@ -4025,7 +3980,7 @@ mod tests {
 
     #[test]
     fn security_versions_order_updates_and_survive_reopen() {
-        let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
@@ -4073,7 +4028,7 @@ mod tests {
     }
 
     fn open_error(file: &str, contents: &[u8]) -> ApiError {
-        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::util::uuid()));
         drop(Db::open(&root, "meta", meta_config()).unwrap());
         std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
         let error = match Db::open(&root, "meta", meta_config()) {
@@ -4107,7 +4062,7 @@ mod tests {
 
     #[test]
     fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
-        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 2,
             revs_limit: 100,
@@ -4160,7 +4115,7 @@ mod tests {
 
     #[test]
     fn write_atomic_replaces_whole_and_leaves_no_temporary_file() {
-        let dir = std::env::temp_dir().join(format!("douchdb-atomic-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-atomic-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("meta.json");
         write_atomic(&target, b"first").unwrap();
@@ -4172,7 +4127,7 @@ mod tests {
 
     #[test]
     fn failed_atomic_write_shows_no_partial_file() {
-        let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // A directory that is not there.
@@ -4208,7 +4163,7 @@ mod tests {
 
     #[test]
     fn create_private_atomic_is_exclusive_and_owner_only() {
-        let dir = std::env::temp_dir().join(format!("douchdb-private-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-private-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("secret");
         create_private_atomic(&target, b"one").unwrap();
@@ -4227,7 +4182,7 @@ mod tests {
 
     #[test]
     fn concurrent_client_shard_maps_get_distinct_versions() {
-        let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "next",
@@ -4267,7 +4222,7 @@ mod tests {
 
     #[test]
     fn equal_version_shard_maps_converge_on_one_winner() {
-        let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::util::uuid()));
         let open = |name: &str| {
             Db::open(
                 &root,
@@ -4305,7 +4260,7 @@ mod tests {
 
     #[test]
     fn expired_migration_map_does_not_affect_placement() {
-        let root = std::env::temp_dir().join(format!("douchdb-stale-mig-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-stale-mig-{}", crate::util::uuid()));
         let active = ShardMap {
             q: 2,
             node_count: 2,
@@ -4343,7 +4298,7 @@ mod tests {
 
     #[tokio::test]
     async fn design_documents_replicate_to_every_node() {
-        let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "placement",
@@ -4378,7 +4333,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_limit_reports_pending_documents() {
-        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "pending",
@@ -4430,7 +4385,7 @@ mod tests {
     #[tokio::test]
     async fn changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence() {
         let q = 4u32;
-        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "watermark",
@@ -4505,7 +4460,7 @@ mod tests {
     #[tokio::test]
     async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
-        let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "flushfail",
@@ -4585,7 +4540,12 @@ mod tests {
         assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 0, None), 9);
         // The same in-flight shard is not ours, so it does not hold us back.
         assert_eq!(
-            changes_watermark_from(&[5, 9], &[5, 12], 0, Some(&[true, false])),
+            changes_watermark_from(
+                &[5, 9],
+                &[5, 12],
+                0,
+                Some(&ShardMask::from_iter([true, false]))
+            ),
             u64::MAX
         );
         // Never below `since`.
@@ -4606,23 +4566,22 @@ mod tests {
             for (r, c) in reserved.iter_mut().zip(&committed) {
                 *r = (*r).max(*c);
             }
-            let mask = owned.as_ref().map(|m| {
-                let mut m = m.clone();
+            let mask = owned.map(|mut m| {
                 m.resize(committed.len(), false);
-                m
+                ShardMask::from_iter(m)
             });
             let watermark = changes_watermark_from(
                 &committed,
                 &reserved,
                 since,
-                mask.as_deref(),
+                mask.as_ref(),
             );
 
             // The cursor may advance to the lowest committed sequence of any
             // owned shard that still has an allocated, uncommitted write, but
             // never below `since`. With nothing in flight it is unbounded.
             let expected = (0..committed.len())
-                .filter(|&index| mask.as_ref().is_none_or(|m| m[index]))
+                .filter(|&index| mask.as_ref().is_none_or(|m| m.covers(index)))
                 .filter(|&index| reserved[index] > committed[index])
                 .map(|index| committed[index].max(since))
                 .min()

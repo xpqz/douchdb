@@ -73,14 +73,16 @@ fn changes_timeout(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
     }
 }
 
-pub(super) async fn changes(
-    st: Arc<AppState>,
-    db: Arc<Db>,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+/// `st` and `db` are the owned handles behind `req`: a streaming feed outlives
+/// the handler, so it needs `Arc`s rather than the borrows in the request.
+pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
     let limit = match changes_limit(q) {
         Ok(limit) => limit,
         Err(error) => return fail(error),
@@ -93,7 +95,7 @@ pub(super) async fn changes(
         ));
     }
     if let Some(raw) = q.get("since") {
-        if let Err(error) = validate_since(raw, st.cluster.nodes.len().max(1)) {
+        if let Err(error) = validate_since(raw, st.ctx.cluster.nodes.len().max(1)) {
             return fail(error);
         }
     }
@@ -124,7 +126,7 @@ pub(super) async fn changes(
         let stream = async_stream::stream! {
             let started = std::time::Instant::now();
             let mut sent = 0usize;
-            let mut last_heartbeat = std::time::Instant::now();
+            let mut heartbeat = Heartbeat::new(heartbeat);
             // Where the feed stopped, for the closing line CouchDB sends when
             // a continuous feed times out or reaches its limit.
             let mut trailer: Option<(Value, u64)> = None;
@@ -152,11 +154,7 @@ pub(super) async fn changes(
                             last_sent = row.get("seq").cloned();
                             sent_here += 1;
                             let json = serde_json::to_vec(&row).unwrap_or_default();
-                            let line = if eventsource {
-                                [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
-                            } else {
-                                [json.as_slice(), b"\n"].concat()
-                            };
+                            let line = feed_line(&json, eventsource);
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                             sent += 1;
                         }
@@ -180,11 +178,7 @@ pub(super) async fn changes(
                             "reason": error.reason,
                         }))
                         .unwrap_or_default();
-                        let line = if eventsource {
-                            [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
-                        } else {
-                            [json.as_slice(), b"\n"].concat()
-                        };
+                        let line = feed_line(&json, eventsource);
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                         break;
                     }
@@ -192,15 +186,12 @@ pub(super) async fn changes(
                 if started.elapsed().as_millis() as u64 >= deadline {
                     break;
                 }
-                if let Some(heartbeat) = heartbeat {
-                    if last_heartbeat.elapsed() >= heartbeat {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
-                            b": heartbeat\n\n"
-                        } else {
-                            b"\n"
-                        }));
-                        last_heartbeat = std::time::Instant::now();
-                    }
+                if heartbeat.due() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
+                        b": heartbeat\n\n"
+                    } else {
+                        b"\n"
+                    }));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -215,30 +206,25 @@ pub(super) async fn changes(
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
             }
         };
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                if eventsource {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return feed_response(
+            if eventsource {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            stream,
+        );
     }
 
     if feed == "longpoll" {
-        if let Some(heartbeat) = heartbeat {
+        if heartbeat.is_some() {
+            let mut heartbeat = Heartbeat::new(heartbeat);
             let dbname = dbname.to_string();
             let query = q.clone();
             let body = Bytes::copy_from_slice(body);
             let headers = headers.clone();
             let stream = async_stream::stream! {
                 let started = std::time::Instant::now();
-                let mut last_heartbeat = std::time::Instant::now();
                 loop {
                     if !still_allowed(&st, &db, &headers) {
                         break;
@@ -269,19 +255,13 @@ pub(super) async fn changes(
                             break;
                         }
                     }
-                    if last_heartbeat.elapsed() >= heartbeat {
+                    if heartbeat.due() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
-                        last_heartbeat = std::time::Instant::now();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             };
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from_stream(stream))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return feed_response("application/json", stream);
         }
         let started = std::time::Instant::now();
         loop {
@@ -324,6 +304,15 @@ pub(super) async fn changes(
     }
 }
 
+/// One feed entry: an SSE `data:` event for `eventsource`, else a JSON line.
+fn feed_line(json: &[u8], eventsource: bool) -> Vec<u8> {
+    if eventsource {
+        [b"data: ".as_slice(), json, b"\n\n"].concat()
+    } else {
+        [json, b"\n"].concat()
+    }
+}
+
 async fn changes_normal_raw(
     st: &AppState,
     db: &Arc<Db>,
@@ -336,18 +325,18 @@ async fn changes_normal_raw(
         return None;
     }
     let mut local_mask = None;
-    if st.cluster.is_clustered() && !local_only {
-        let masks = crate::fabric::preferred_shard_masks(st, db);
+    if st.ctx.cluster.is_clustered() && !local_only {
+        let masks = crate::fabric::preferred_shard_masks(&st.ctx, db);
         let active: Vec<usize> = masks
             .iter()
             .enumerate()
-            .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+            .filter(|(_, mask)| !mask.is_empty())
             .map(|(node, _)| node)
             .collect();
-        if active.len() != 1 || active[0] != st.cluster.me {
+        if active.len() != 1 || active[0] != st.ctx.cluster.me {
             return None;
         }
-        local_mask = Some(masks[st.cluster.me].clone());
+        local_mask = Some(masks[st.ctx.cluster.me].clone());
     }
     let (mut opts, mut progress) = changes_options(st, db, q, body, headers, local_only)
         .await
@@ -356,7 +345,7 @@ async fn changes_normal_raw(
     if let Some(mask) = local_mask {
         opts.owned = Some(mask);
     }
-    let me = st.cluster.me;
+    let me = st.ctx.cluster.me;
     let initial_seq = progress.get(me).copied().unwrap_or(0);
     let pending_descending = opts.descending;
     let pending_owned = opts.owned.clone();
@@ -394,7 +383,7 @@ async fn changes_normal_raw(
             last_seq.to_string()
         };
         let pending = pending_db
-            .changes_pending(last_seq, pending_descending, pending_owned.as_deref())
+            .changes_pending(last_seq, pending_descending, pending_owned.as_ref())
             .await
             .unwrap_or(0);
         buffer.push_str("],\"last_seq\":");
@@ -417,84 +406,6 @@ async fn changes_normal_raw(
         .ok()
 }
 
-async fn design_filter(
-    db: &Db,
-    spec: &str,
-    is_view: bool,
-    q: &HashMap<String, String>,
-) -> DbResult<ChangeFilter> {
-    let (ddoc, name) = spec
-        .split_once('/')
-        .ok_or_else(|| ApiError::bad_request("filter must be `design/name`"))?;
-    if ddoc.is_empty() || name.is_empty() || name.contains('/') {
-        return Err(ApiError::not_found("missing"));
-    }
-    let id = format!("_design/{ddoc}");
-    let doc = db
-        .get_doc(&id, &DocOpts::default())
-        .await
-        .map_err(|_| ApiError::not_found("missing"))?;
-    let source = if is_view {
-        doc.get("views")
-            .and_then(|views| views.get(name))
-            .and_then(|view| view.get("map"))
-            .and_then(Value::as_str)
-    } else {
-        doc.get("filters")
-            .and_then(|filters| filters.get(name))
-            .and_then(Value::as_str)
-    }
-    .ok_or_else(|| ApiError::not_found("missing"))?;
-    let query = q
-        .iter()
-        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-        .collect::<Map<String, Value>>();
-    Ok(ChangeFilter::Js {
-        source: source.to_string(),
-        query: Value::Object(query).to_string(),
-    })
-}
-
-pub(crate) async fn resolve_changes_filter(
-    db: &Db,
-    q: &HashMap<String, String>,
-) -> DbResult<Option<ChangeFilter>> {
-    let explicit = q.get("filter").map(String::as_str);
-    let view = q
-        .get("view")
-        .map(String::as_str)
-        .filter(|view| !view.is_empty());
-    match explicit {
-        // Id and selector filters are handled without loading bodies. PouchDB
-        // also applies selector filtering client-side.
-        Some("_doc_ids") | Some("_selector") => Ok(None),
-        Some("_design") => Ok(Some(ChangeFilter::Design)),
-        Some("_view") => {
-            let Some(view) = view else {
-                return Err(ApiError::bad_request("`view` parameter is required"));
-            };
-            design_filter(db, view, true, q).await.map(Some)
-        }
-        // A bare name means `_design/<name>` with the same filter name.
-        Some(name) if !name.contains('/') => {
-            let spec = format!("{name}/{name}");
-            design_filter(db, &spec, false, q).await.map(Some)
-        }
-        Some(name) => {
-            // CouchDB silently ignores malformed filters with more than one
-            // slash rather than failing the feed.
-            if name.matches('/').count() != 1 {
-                return Ok(None);
-            }
-            design_filter(db, name, false, q).await.map(Some)
-        }
-        None => match view {
-            Some(view) => design_filter(db, view, true, q).await.map(Some),
-            None => Ok(None),
-        },
-    }
-}
-
 async fn changes_options(
     st: &AppState,
     db: &Db,
@@ -503,12 +414,12 @@ async fn changes_options(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<(ChangesOpts, Vec<u64>)> {
-    let n = st.cluster.nodes.len().max(1);
+    let n = st.ctx.cluster.nodes.len().max(1);
     let raw_since = q.get("since").map(String::as_str);
     let mut progress = if raw_since == Some("now") {
-        if st.cluster.is_clustered() && !local_only {
+        if st.ctx.cluster.is_clustered() && !local_only {
             cluster_update_vector(ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname: &db.name,
                 headers,
@@ -517,7 +428,7 @@ async fn changes_options(
             .0
         } else {
             let mut vector = vec![0; n];
-            vector[st.cluster.me] = db.update_seq();
+            vector[st.ctx.cluster.me] = db.update_seq();
             vector
         }
     } else if let Some(raw) = raw_since {
@@ -526,13 +437,13 @@ async fn changes_options(
                 vector.resize(n.max(vector.len()), 0);
                 vector
             }
-            None => vec![since_component(Some(raw), st.cluster.me, n); n],
+            None => vec![since_component(Some(raw), st.ctx.cluster.me, n); n],
         }
     } else {
         vec![0; n]
     };
     progress.resize(n, 0);
-    let since = progress.get(st.cluster.me).copied().unwrap_or(0);
+    let since = progress.get(st.ctx.cluster.me).copied().unwrap_or(0);
     let owned = if is_forwarded(st, headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
@@ -562,10 +473,10 @@ async fn changes_once(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<Value> {
-    if st.cluster.is_clustered() && !local_only && !flag(q, "descending") {
+    if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname,
                 headers,
@@ -578,21 +489,4 @@ async fn changes_once(
 
     let (opts, _) = changes_options(st, db, q, body, headers, local_only).await?;
     db.changes(&opts).await
-}
-
-pub(crate) fn doc_ids_from(q: &HashMap<String, String>, body: &[u8]) -> Option<Vec<String>> {
-    if q.get("filter").map(String::as_str) != Some("_doc_ids") {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        if let Some(ids) = value.get("doc_ids").and_then(Value::as_array) {
-            return Some(
-                ids.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-            );
-        }
-    }
-    q.get("doc_ids")
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
 }

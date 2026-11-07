@@ -16,76 +16,24 @@ fn run(input: &str) -> Result<Value, String> {
     let request: Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
     let source = request.get("source").and_then(Value::as_str).ok_or("missing source")?;
     let kind = request.get("kind").and_then(Value::as_str).ok_or("missing kind")?;
+    // The wrappers are shared with the native engine (wasm/js); the user's
+    // function replaces the placeholder.
+    let wrap = |template: &str| template.replace("__DOUCHDB_SOURCE__", source);
+    let mut ids: Vec<String> = Vec::new();
     let (script, argument) = match kind {
-        "map" => {
+        "map" | "index" => {
             let docs = request.get("docs").and_then(Value::as_array).ok_or("missing docs")?;
             let mut raw = String::from("[");
             for (index, doc) in docs.iter().enumerate() {
                 if index > 0 { raw.push(','); }
+                // Row ids come from the host, not from the document object the
+                // user's function was handed (it may change or delete _id).
+                ids.push(doc.get(0).and_then(Value::as_str).ok_or("bad doc")?.to_string());
                 raw.push_str(doc.get(1).and_then(Value::as_str).ok_or("bad doc")?);
             }
             raw.push(']');
-            let script = format!(r#"
-                (function () {{
-                  var __out = [];
-                  function sum(values) {{ var total = 0; for (var i=0;i<values.length;i++) total += values[i]; return total; }}
-                  function log(message) {{ }}
-                  function isArray(value) {{ return Array.isArray(value); }}
-                  function toJSON(value) {{ return JSON.stringify(value); }}
-                  var emit = function (key, value) {{
-                    __out.push([key === undefined ? null : key, value === undefined ? null : value]);
-                  }};
-                  var __map = ({source});
-                  if (typeof __map !== "function") throw new Error("map must be a function");
-                  return function (json) {{
-                    var docs = JSON.parse(json);
-                    var all = [];
-                    for (var i = 0; i < docs.length; i++) {{
-                      __out = [];
-                      var __id = docs[i]._id;
-                      __map(docs[i]);
-                      for (var j = 0; j < __out.length; j++) all.push({{id: __id, key: __out[j][0], value: __out[j][1]}});
-                    }}
-                    return JSON.stringify(all);
-                  }};
-                }})()
-            "#);
-            (script, raw)
-        }
-        "index" => {
-            let docs = request.get("docs").and_then(Value::as_array).ok_or("missing docs")?;
-            let mut raw = String::from("[");
-            for (index, doc) in docs.iter().enumerate() {
-                if index > 0 { raw.push(','); }
-                raw.push_str(doc.get(1).and_then(Value::as_str).ok_or("bad doc")?);
-            }
-            raw.push(']');
-            let script = format!(r#"
-                (function () {{
-                  var __out = [];
-                  function log(message) {{ }}
-                  var index = function (name, value, options) {{
-                    if (value === undefined || value === null) return;
-                    __out.push([String(name), value]);
-                  }};
-                  var __index = ({source});
-                  if (typeof __index !== "function") throw new Error("index must be a function");
-                  return function (json) {{
-                    var docs = JSON.parse(json);
-                    var all = [];
-                    for (var i = 0; i < docs.length; i++) {{
-                      __out = [];
-                      var __id = docs[i]._id;
-                      __index(docs[i]);
-                      var fields = {{}};
-                      for (var j = 0; j < __out.length; j++) fields[__out[j][0]] = __out[j][1];
-                      all.push({{id: __id, fields: fields}});
-                    }}
-                    return JSON.stringify(all);
-                  }};
-                }})()
-            "#);
-            (script, raw)
+            let template = if kind == "map" { include_str!("../../js/map.js") } else { include_str!("../../js/index.js") };
+            (wrap(template), raw)
         }
         "reduce" => {
             // Same checks and messages as the process worker (src/js.rs): a
@@ -104,20 +52,7 @@ fn run(input: &str) -> Result<Value, String> {
             let keys = serde_json::to_string(&request.get("keys").cloned().unwrap_or(Value::Null)).unwrap();
             let values = serde_json::to_string(&request.get("values").cloned().unwrap_or(Value::Null)).unwrap();
             let rereduce = request.get("rereduce").and_then(Value::as_bool).unwrap_or(false);
-            let script = format!(r#"
-                (function () {{
-                  function sum(values) {{ var total = 0; for (var i=0;i<values.length;i++) total += values[i]; return total; }}
-                  function log(message) {{ }}
-                  function isArray(value) {{ return Array.isArray(value); }}
-                  function toJSON(value) {{ return JSON.stringify(value); }}
-                  var __reduce = ({source});
-                  if (typeof __reduce !== "function") throw new Error("reduce must be a function");
-                  return function (keys, values, rereduce) {{
-                    var result = __reduce(JSON.parse(keys), JSON.parse(values), rereduce);
-                    return result === undefined ? "null" : JSON.stringify(result);
-                  }};
-                }})()
-            "#);
+            let script = wrap(include_str!("../../js/reduce.js"));
             (script, format!("[{keys},{values},{rereduce}]"))
         }
         other => return Err(format!("unknown kind {other}")),
@@ -136,5 +71,45 @@ fn run(input: &str) -> Result<Value, String> {
             func.call((argument,)).map_err(|e| e.to_string())
         }
     })?;
-    serde_json::from_str(&output).map_err(|e| e.to_string())
+    let value: Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
+    match kind {
+        "map" => shape(value, &ids, |id, pairs| {
+            pairs
+                .into_iter()
+                .map(|pair| json!({"id": id, "key": pair.get(0), "value": pair.get(1)}))
+                .collect()
+        }),
+        "index" => shape(value, &ids, |id, pairs| {
+            let mut fields = serde_json::Map::new();
+            for pair in pairs {
+                if let Some(name) = pair.get(0).and_then(Value::as_str) {
+                    fields.insert(name.to_string(), pair.get(1).cloned().unwrap_or(Value::Null));
+                }
+            }
+            vec![json!({"id": id, "fields": fields})]
+        }),
+        _ => Ok(value),
+    }
+}
+
+/// Pair the wrapper's per-document output with the host-supplied ids.
+fn shape(
+    value: Value,
+    ids: &[String],
+    rows: impl Fn(&str, Vec<Value>) -> Vec<Value>,
+) -> Result<Value, String> {
+    let Value::Array(per_doc) = value else {
+        return Err("wrapper returned a non-array".to_string());
+    };
+    if per_doc.len() != ids.len() {
+        return Err("wrapper returned the wrong number of results".to_string());
+    }
+    let mut out = Vec::new();
+    for (id, emitted) in ids.iter().zip(per_doc) {
+        let Value::Array(pairs) = emitted else {
+            return Err("wrapper returned a malformed result".to_string());
+        };
+        out.extend(rows(id, pairs));
+    }
+    Ok(Value::Array(out))
 }

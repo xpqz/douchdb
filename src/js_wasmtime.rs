@@ -5,8 +5,8 @@
 //! build time with `--features wasmtime` and selected at runtime with
 //! `--wasm-runtime wasmtime`.
 
+use crate::js::ViewLimits;
 use crate::js::{check_output, wasm_memory_cap, MAX_OUTPUT_BYTES};
-use crate::view::ViewLimits;
 use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;

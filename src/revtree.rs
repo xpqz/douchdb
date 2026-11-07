@@ -125,16 +125,12 @@ impl RevTree {
         self.edges.contains_key(rev)
     }
 
-    /// The number of revisions in the tree.
-    pub fn len(&self) -> usize {
-        self.edges.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.edges.is_empty()
     }
 
     /// Every known revision, in string order.
+    #[cfg(test)]
     pub fn revs(&self) -> impl Iterator<Item = &String> {
         self.edges.keys()
     }
@@ -221,21 +217,20 @@ impl RevTree {
     }
 
     pub fn conflicts(&self, winner: &str) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .leaves
-            .iter()
-            .filter(|rev| *rev != winner && !self.is_deleted(rev))
-            .cloned()
-            .collect();
-        self.sort_leaves_descending(&mut out);
-        out
+        self.other_leaves(winner, false)
     }
 
     pub fn deleted_conflicts(&self, winner: &str) -> Vec<String> {
+        self.other_leaves(winner, true)
+    }
+
+    /// Leaves other than `winner` whose deleted state is `deleted`, in
+    /// descending revision order.
+    fn other_leaves(&self, winner: &str, deleted: bool) -> Vec<String> {
         let mut out: Vec<String> = self
             .leaves
             .iter()
-            .filter(|rev| *rev != winner && self.is_deleted(rev))
+            .filter(|rev| *rev != winner && self.is_deleted(rev) == deleted)
             .cloned()
             .collect();
         self.sort_leaves_descending(&mut out);

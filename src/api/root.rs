@@ -29,16 +29,17 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
         (Err(error), _) | (_, Err(error)) => return fail(error),
     };
     let mut names = st.db_names().await;
-    if st.cluster.is_clustered() && !st.cluster.is_internal_db(&headers) {
-        for (i, peer) in st.cluster.nodes.iter().enumerate() {
-            if i == st.cluster.me {
+    if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal_db(&headers) {
+        for (i, peer) in st.ctx.cluster.nodes.iter().enumerate() {
+            if i == st.ctx.cluster.me {
                 continue;
             }
             let request = st
+                .ctx
                 .client
                 .get(peer_url(peer, &["_all_dbs"]))
                 .header("x-douchdb-local-db", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str());
+                .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
             if let Ok(response) = request.send().await {
                 if let Ok(Value::Array(remote)) = response.json::<Value>().await {
@@ -58,15 +59,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
 
     let principal = st.principal(&headers);
     if !principal.admin {
-        let mut visible = Vec::new();
-        for name in names {
-            if let Ok(db) = st.db(&name).await {
-                if db_access(&st, &principal, &db).is_some() {
-                    visible.push(name);
-                }
-            }
-        }
-        names = visible;
+        names = visible_db_names(&st, &principal, names).await;
     }
 
     let descending = flag(&q, "descending");
@@ -108,17 +101,18 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
             Err(_) => return fail(ApiError::bad_request("count must be a positive integer")),
         },
     };
-    let ids: Vec<String> = (0..count).map(|_| crate::db::uuid()).collect();
+    let ids: Vec<String> = (0..count).map(|_| crate::util::uuid()).collect();
     json(StatusCode::OK, json!({ "uuids": ids }))
 }
 
 /// `_db_updates` is an in-memory global feed of database lifecycle and write
 /// events. It is intentionally best-effort: a restart starts a new sequence.
-pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn db_updates(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+    _: AdminOnly,
+) -> Response {
     let q = query(&uri);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
     let timeout = num(&q, "timeout").unwrap_or(60_000).min(300_000) as u64;
@@ -140,7 +134,7 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri
         let stream = async_stream::stream! {
             let started = std::time::Instant::now();
             let mut sent = 0usize;
-            let mut last_heartbeat = std::time::Instant::now();
+            let mut heartbeat = Heartbeat::new(heartbeat);
             loop {
                 if limit.map(|limit| sent >= limit).unwrap_or(false)
                     || !st.principal(&headers).admin
@@ -163,21 +157,13 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri
                 if started.elapsed().as_millis() as u64 >= timeout {
                     break;
                 }
-                if let Some(heartbeat) = heartbeat {
-                    if last_heartbeat.elapsed() >= heartbeat {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
-                        last_heartbeat = std::time::Instant::now();
-                    }
+                if heartbeat.due() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         };
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return feed_response("application/json", stream);
     }
 
     let started = std::time::Instant::now();
@@ -205,15 +191,11 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, headers: HeaderMap, uri
 
 pub async fn dbs_info(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     method: Method,
     uri: Uri,
+    _: AdminOnly,
     body: Bytes,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let q = query(&uri);
     let keys = if method == Method::POST {
         serde_json::from_slice::<Value>(&body)

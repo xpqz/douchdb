@@ -3,7 +3,9 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use crate::api::{access_denied, flag, internal_request, query, AppState};
+use super::{flag, internal_request, query, AdminOnly, AppState};
+use crate::db::Db;
+use crate::state::FsHealth;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
@@ -37,43 +39,13 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-/// How long the filesystem part of the health check is reused. `/_health` is
-/// unauthenticated, so it must not touch the disk on every request.
-const FS_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Result of the blocking filesystem checks.
-#[derive(Clone, Copy)]
-struct FsHealth {
-    readable: bool,
-    writable: bool,
-    unreadable: u64,
-}
-
-/// Short-lived cache of [`FsHealth`].
-#[derive(Default)]
-pub struct FsHealthCache(std::sync::Mutex<Option<(std::time::Instant, FsHealth)>>);
-
-impl FsHealthCache {
-    fn fresh(&self, now: std::time::Instant) -> Option<FsHealth> {
-        let slot = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        match *slot {
-            Some((at, value)) if now.saturating_duration_since(at) < FS_HEALTH_TTL => Some(value),
-            _ => None,
-        }
-    }
-
-    fn store(&self, now: std::time::Instant, value: FsHealth) {
-        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((now, value));
-    }
-}
-
 /// Probe the data root: list it, write and remove a scratch file, and check
 /// that every database directory still carries a parseable `db.json`. Opening
 /// every database would be far more expensive. Blocking; call it from
 /// `spawn_blocking`.
 fn probe_fs(root: &std::path::Path) -> FsHealth {
     let readable = std::fs::read_dir(root).is_ok();
-    let probe = root.join(format!(".health-{}", crate::db::uuid()));
+    let probe = root.join(format!(".health-{}", crate::util::uuid()));
     let writable = std::fs::write(&probe, b"ok").is_ok();
     let _ = std::fs::remove_file(&probe);
     let mut unreadable = 0u64;
@@ -119,11 +91,11 @@ async fn fs_health(st: &AppState) -> FsHealth {
 
 fn node_json(st: &AppState) -> Value {
     json!({
-        "index": st.cluster.me,
+        "index": st.ctx.cluster.me,
         "url": st.config.advertise,
-        "clustered": st.cluster.is_clustered(),
+        "clustered": st.ctx.cluster.is_clustered(),
         "q": st.config.q,
-        "n": st.cluster.replication_factor(),
+        "n": st.ctx.cluster.replication_factor(),
         "sync_secs": st.config.sync_secs,
     })
 }
@@ -145,7 +117,7 @@ async fn local_metrics(st: &AppState) -> Value {
                 let counts = db.shard_counts().await.unwrap_or_default();
                 let map = db.shard_map();
                 let local_shards = (0..map.q)
-                    .filter(|shard| map.replicas_of(*shard).contains(&st.cluster.me))
+                    .filter(|shard| map.replicas_of(*shard).contains(&st.ctx.cluster.me))
                     .count();
                 let docs: u64 = counts.iter().map(|(docs, _)| *docs).sum();
                 let deleted: u64 = counts.iter().map(|(_, deleted)| *deleted).sum();
@@ -166,7 +138,7 @@ async fn local_metrics(st: &AppState) -> Value {
                             "deleted": deleted,
                             "replicas": map.replicas_of(shard as u32),
                             "owner": map.owner_of(shard as u32),
-                            "local": map.replicas_of(shard as u32).contains(&st.cluster.me),
+                            "local": map.replicas_of(shard as u32).contains(&st.ctx.cluster.me),
                         })
                     })
                     .collect();
@@ -202,7 +174,7 @@ async fn local_metrics(st: &AppState) -> Value {
     metrics["replication"] = st.cluster_state.replication_json();
     metrics["discovery"] = st
         .cluster_state
-        .discovery_json(&st.cluster.nodes, &st.config.seeds);
+        .discovery_json(&st.ctx.cluster.nodes, &st.config.seeds);
     metrics["health"] = local_health(st, true).await;
     metrics
 }
@@ -223,12 +195,8 @@ fn health_status_name(rank: u8) -> &'static str {
     }
 }
 
-/// Health is deliberately explicit about what is checked. It says nothing
-/// about power-loss durability: rusty-leveldb does not fsync.
-async fn local_health(st: &AppState, detailed: bool) -> Value {
-    let mut checks = Vec::new();
-    let snapshot = crate::metrics::snapshot();
-    let process = &snapshot["process"];
+/// The process check: pid, uptime, threads and resident memory.
+fn check_process(process: &Value) -> Value {
     let threads = process["threads"]
         .as_u64()
         .map(|threads| threads.to_string())
@@ -237,7 +205,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         .as_f64()
         .map(|rss| format!("{rss:.1} MB"))
         .unwrap_or_else(|| "unavailable".to_string());
-    checks.push(json!({
+    json!({
         "name": "process",
         "status": "ok",
         "detail": format!(
@@ -246,8 +214,11 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         ),
         "uptime_secs": process["uptime_secs"],
         "rss_mb": process["rss_mb"],
-    }));
+    })
+}
 
+/// Whether the data directory is readable and writable.
+async fn check_storage(st: &AppState, detailed: bool) -> (Value, usize, u64) {
     let root = &st.root;
     let FsHealth {
         readable,
@@ -255,7 +226,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         unreadable,
     } = fs_health(st).await;
     let databases = st.db_names().await.len();
-    checks.push(json!({
+    let check = json!({
         "name": "storage",
         "status": if readable && writable { "ok" } else { "critical" },
         "detail": if detailed {
@@ -270,32 +241,47 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "databases": databases,
         "readable": readable,
         "writable": writable,
-    }));
+    });
+    (check, databases, unreadable)
+}
 
-    let pending = {
-        let dbs = st.dbs.read().await;
-        dbs.values()
-            .filter(|db| db.pending_shard_map().is_some())
+/// Databases whose shard map a peer has not acknowledged.
+async fn check_placement(st: &AppState) -> Value {
+    // From disk, so a database that is not open counts too.
+    let names = st.db_names().await;
+    let root = st.root.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        names
+            .iter()
+            .filter(|name| Db::has_pending_shard_map(&root, name))
             .count()
-    };
-    checks.push(json!({
+    })
+    .await
+    .unwrap_or(0);
+    json!({
         "name": "placement",
         "status": if pending == 0 { "ok" } else { "degraded" },
         "detail": format!("{pending} database(s) with an unacknowledged shard map"),
         "pending_databases": pending,
-    }));
+    })
+}
 
-    checks.push(json!({
+/// Databases whose files could not be read.
+fn check_databases(databases: usize, unreadable: u64) -> Value {
+    json!({
         "name": "databases",
         "status": if unreadable == 0 { "ok" } else { "critical" },
         "detail": format!("{databases} databases · {unreadable} unreadable"),
         "unreadable": unreadable,
-    }));
+    })
+}
 
-    if st.cluster.is_clustered() {
+/// Whether the placement nodes answer the discovery probes.
+fn check_cluster(st: &AppState) -> Value {
+    if st.ctx.cluster.is_clustered() {
         let mut discovery = st
             .cluster_state
-            .discovery_json(&st.cluster.nodes, &st.config.seeds);
+            .discovery_json(&st.ctx.cluster.nodes, &st.config.seeds);
         let nodes = crate::json::take_array(&mut discovery, "nodes").unwrap_or_default();
         let placement: Vec<&Value> = nodes
             .iter()
@@ -322,23 +308,28 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
                 format!("{reachable}/{total} placement nodes reachable"),
             )
         };
-        checks.push(json!({
+        json!({
             "name": "cluster",
             "status": status,
             "detail": detail,
             "reachable": reachable,
             "nodes": total,
-        }));
+        })
     } else {
-        checks.push(json!({"name": "cluster", "status": "ok", "detail": "single node"}));
+        json!({"name": "cluster", "status": "ok", "detail": "single node"})
     }
+}
 
+/// Whether background replication is running.
+fn check_replication(st: &AppState) -> Value {
     let replication = st.cluster_state.replication_json();
     let (status, detail) = if replication["paused"] == true {
         ("degraded", "background replication paused".to_string())
     } else if let Some(error) = replication["error"].as_str() {
         ("degraded", format!("last pass: {error}"))
-    } else if st.cluster.is_clustered() && replication["last_finished"].as_u64().unwrap_or(0) == 0 {
+    } else if st.ctx.cluster.is_clustered()
+        && replication["last_finished"].as_u64().unwrap_or(0) == 0
+    {
         ("degraded", "no replication pass yet".to_string())
     } else {
         (
@@ -349,7 +340,7 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
             ),
         )
     };
-    checks.push(json!({
+    json!({
         "name": "replication",
         "status": status,
         "detail": detail,
@@ -358,8 +349,11 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "last_finished": replication["last_finished"],
         "runs": replication["runs"],
         "docs": replication["docs"],
-    }));
+    })
+}
 
+/// The recent 5xx rate.
+fn check_http() -> Value {
     // Authorization denials and other 4xx responses are expected client
     // behaviour, not evidence that the server is unhealthy. Only 5xx responses
     // contribute to the readiness signal. The ratio covers a recent window and
@@ -393,14 +387,31 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
             format!("{rate:.1}% of {total} requests in the last {window}s failed with 5xx"),
         )
     };
-    checks.push(json!({
+    json!({
         "name": "http",
         "status": status,
         "detail": detail,
         "errors": errors,
         "total": total,
         "error_rate_pct": rate,
-    }));
+    })
+}
+
+/// Health is deliberately explicit about what is checked. It says nothing
+/// about power-loss durability: rusty-leveldb does not fsync.
+async fn local_health(st: &AppState, detailed: bool) -> Value {
+    let snapshot = crate::metrics::snapshot();
+    let process = &snapshot["process"];
+    let (storage, databases, unreadable) = check_storage(st, detailed).await;
+    let checks = vec![
+        check_process(process),
+        storage,
+        check_placement(st).await,
+        check_databases(databases, unreadable),
+        check_cluster(st),
+        check_replication(st),
+        check_http(),
+    ];
 
     let worst = checks
         .iter()
@@ -464,29 +475,9 @@ fn u64_map_json(map: BTreeMap<String, u64>) -> Value {
     )
 }
 
-fn percentile_from(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64 {
-    if requests == 0 {
-        return 0.0;
-    }
-    let target = (requests as f64 * pct / 100.0).ceil() as u64;
-    let mut seen = 0u64;
-    for (index, count) in buckets.iter().enumerate() {
-        seen += count;
-        if seen >= target {
-            return crate::metrics::LATENCY_BOUNDS
-                .get(index)
-                .copied()
-                .unwrap_or(max_ms);
-        }
-    }
-    max_ms
-}
-
-/// Merge node snapshots into one cluster-wide view. Counters are summed, route
-/// latency buckets are merged before percentiles are recomputed, and per-database
-/// document counts take the per-node maximum (replicas hold the same documents)
-/// while disk usage is summed.
-fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
+/// Request counters summed across nodes; latency buckets are merged before
+/// the percentiles are recomputed.
+fn aggregate_http(snapshots: &[Value]) -> Value {
     let mut http_total = 0u64;
     let mut in_flight = 0u64;
     let mut http_errors = 0u64;
@@ -498,34 +489,6 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
     let mut methods = BTreeMap::new();
     let mut routes: BTreeMap<String, RouteAgg> = BTreeMap::new();
     let mut seconds: BTreeMap<u64, (u64, u64, f64)> = BTreeMap::new();
-    let mut views = EngineAgg::default();
-    let mut search = EngineAgg::default();
-    let mut local_reads = 0u64;
-    let mut remote_reads = 0u64;
-    let mut quorum_failures = 0u64;
-    let mut degraded_reads = 0u64;
-    let mut fanout_count = 0u64;
-    let mut fanout_sum = 0u64;
-    let mut fanout_max = 0u64;
-    let mut shard_map_updates = 0u64;
-    let mut shard_map_pending = 0u64;
-    let mut rebalance_started = 0u64;
-    let mut rebalance_completed = 0u64;
-    let mut rebalance_timeout = 0u64;
-    let mut cleaned_shards = 0u64;
-    let mut corrupt_records_skipped = 0u64;
-    let mut disk_bytes = 0u64;
-    let mut failed_databases = 0u64;
-    let mut databases: BTreeMap<String, DbAgg> = BTreeMap::new();
-    let mut replication_runs = 0u64;
-    let mut replication_docs = 0u64;
-    let mut replication_error: Option<String> = None;
-    let mut replication_running = false;
-    let mut replication_paused = false;
-    let mut replication_entries: BTreeMap<String, Value> = BTreeMap::new();
-    let mut worst_health = 0u8;
-    let mut health_nodes = Vec::new();
-    let mut health_failing = Vec::new();
 
     for snapshot in snapshots {
         let http = &snapshot["http"];
@@ -575,17 +538,101 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
                     * item["requests"].as_u64().unwrap_or(0) as f64;
             }
         }
+    }
 
-        for (target, value) in [
-            (&mut views, &snapshot["views"]),
-            (&mut search, &snapshot["search"]),
-        ] {
-            target.queries += value["queries"].as_u64().unwrap_or(0);
-            target.errors += value["errors"].as_u64().unwrap_or(0);
-            target.total_ms += value["total_ms"].as_f64().unwrap_or(0.0);
-            target.max_ms = target.max_ms.max(value["max_ms"].as_f64().unwrap_or(0.0));
-        }
+    let mut route_rows: Vec<Value> = routes
+        .iter()
+        .map(|(route, stat)| {
+            json!({
+                "route": route,
+                "requests": stat.requests,
+                "errors": stat.errors,
+                "error_rate_pct": if stat.requests == 0 { 0.0 } else { stat.errors as f64 / stat.requests as f64 * 100.0 },
+                "total_ms": stat.total_ms,
+                "avg_ms": if stat.requests == 0 { 0.0 } else { stat.total_ms / stat.requests as f64 },
+                "p50_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 50.0, stat.max_ms),
+                "p95_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 95.0, stat.max_ms),
+                "p99_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 99.0, stat.max_ms),
+                "max_ms": stat.max_ms,
+                "latency_buckets": stat.buckets,
+            })
+        })
+        .collect();
+    route_rows.sort_by(|left, right| right["requests"].as_u64().cmp(&left["requests"].as_u64()));
 
+    let per_second: Vec<Value> = seconds
+        .into_iter()
+        .map(|(second, (requests, errors, total))| {
+            json!({
+                "t": second,
+                "requests": requests,
+                "errors": errors,
+                "avg_ms": if requests == 0 { 0.0 } else { total / requests as f64 },
+            })
+        })
+        .collect();
+
+    json!({
+        "total": http_total,
+        "in_flight": in_flight,
+        "errors": http_errors,
+        "error_rate_pct": if http_total == 0 { 0.0 } else { http_errors as f64 / http_total as f64 * 100.0 },
+        "status_classes": u64_map_json(status_classes),
+        "status_codes": u64_map_json(status_codes),
+        "methods": u64_map_json(methods),
+        "latency_ms": {
+            "avg": if http_total == 0 { 0.0 } else { total_ms / http_total as f64 },
+            "p50": crate::metrics::percentile(&buckets, http_total, 50.0, max_ms),
+            "p95": crate::metrics::percentile(&buckets, http_total, 95.0, max_ms),
+            "p99": crate::metrics::percentile(&buckets, http_total, 99.0, max_ms),
+            "max": max_ms,
+        },
+        "latency_buckets": {
+            "bounds": crate::metrics::LATENCY_BOUNDS,
+            "counts": buckets,
+        },
+        "routes": route_rows,
+        "per_second": per_second,
+    })
+}
+
+/// View or search query counters summed across nodes.
+fn aggregate_engine(snapshots: &[Value], key: &str) -> Value {
+    let mut engine = EngineAgg::default();
+    for snapshot in snapshots {
+        let value = &snapshot[key];
+        engine.queries += value["queries"].as_u64().unwrap_or(0);
+        engine.errors += value["errors"].as_u64().unwrap_or(0);
+        engine.total_ms += value["total_ms"].as_f64().unwrap_or(0.0);
+        engine.max_ms = engine.max_ms.max(value["max_ms"].as_f64().unwrap_or(0.0));
+    }
+    json!({
+        "queries": engine.queries,
+        "errors": engine.errors,
+        "error_rate_pct": if engine.queries == 0 { 0.0 } else { engine.errors as f64 / engine.queries as f64 * 100.0 },
+        "total_ms": engine.total_ms,
+        "avg_ms": if engine.queries == 0 { 0.0 } else { engine.total_ms / engine.queries as f64 },
+        "max_ms": engine.max_ms,
+    })
+}
+
+/// Fabric counters summed across nodes (`fanout_max` takes the maximum).
+fn aggregate_fabric(snapshots: &[Value]) -> Value {
+    let mut local_reads = 0u64;
+    let mut remote_reads = 0u64;
+    let mut quorum_failures = 0u64;
+    let mut degraded_reads = 0u64;
+    let mut fanout_count = 0u64;
+    let mut fanout_sum = 0u64;
+    let mut fanout_max = 0u64;
+    let mut shard_map_updates = 0u64;
+    let mut shard_map_pending = 0u64;
+    let mut rebalance_started = 0u64;
+    let mut rebalance_completed = 0u64;
+    let mut rebalance_timeout = 0u64;
+    let mut cleaned_shards = 0u64;
+
+    for snapshot in snapshots {
         let fabric = &snapshot["fabric"];
         local_reads += fabric["local_reads"].as_u64().unwrap_or(0);
         remote_reads += fabric["remote_reads"].as_u64().unwrap_or(0);
@@ -600,10 +647,48 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
         rebalance_completed += fabric["rebalance_completed"].as_u64().unwrap_or(0);
         rebalance_timeout += fabric["rebalance_timeout"].as_u64().unwrap_or(0);
         cleaned_shards += fabric["cleaned_shards"].as_u64().unwrap_or(0);
-        corrupt_records_skipped += snapshot["integrity"]["corrupt_records_skipped"]
-            .as_u64()
-            .unwrap_or(0);
+    }
 
+    json!({
+        "local_reads": local_reads,
+        "remote_reads": remote_reads,
+        "quorum_failures": quorum_failures,
+        "degraded_reads": degraded_reads,
+        "fanout_count": fanout_count,
+        "fanout_sum": fanout_sum,
+        "fanout_avg": if fanout_count == 0 { 0.0 } else { fanout_sum as f64 / fanout_count as f64 },
+        "fanout_max": fanout_max,
+        "shard_map_updates": shard_map_updates,
+        "shard_map_pending": shard_map_pending,
+        "rebalance_started": rebalance_started,
+        "rebalance_completed": rebalance_completed,
+        "rebalance_timeout": rebalance_timeout,
+        "cleaned_shards": cleaned_shards,
+    })
+}
+
+/// Corrupt records skipped, summed across nodes.
+fn aggregate_integrity(snapshots: &[Value]) -> Value {
+    let corrupt_records_skipped: u64 = snapshots
+        .iter()
+        .map(|snapshot| {
+            snapshot["integrity"]["corrupt_records_skipped"]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .sum();
+    json!({ "corrupt_records_skipped": corrupt_records_skipped })
+}
+
+/// Disk usage is summed across nodes; document counts are per-shard maxima so
+/// replicas are not counted twice. Returns the `storage` and `databases`
+/// sections.
+fn aggregate_storage(snapshots: &[Value]) -> (Value, Value) {
+    let mut disk_bytes = 0u64;
+    let mut failed_databases = 0u64;
+    let mut databases: BTreeMap<String, DbAgg> = BTreeMap::new();
+
+    for snapshot in snapshots {
         let storage = &snapshot["storage"];
         disk_bytes += storage["disk_bytes"].as_u64().unwrap_or(0);
         failed_databases += storage["failed_databases"]
@@ -632,6 +717,64 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
                 }
             }
         }
+    }
+
+    let doc_count: u64 = databases
+        .values()
+        .map(|entry| entry.shards.values().map(|(docs, _)| *docs).sum::<u64>())
+        .sum();
+    let doc_del_count: u64 = databases
+        .values()
+        .map(|entry| {
+            entry
+                .shards
+                .values()
+                .map(|(_, deleted)| *deleted)
+                .sum::<u64>()
+        })
+        .sum();
+
+    let database_rows: Vec<Value> = databases
+        .into_iter()
+        .map(|(name, db)| {
+            let docs: u64 = db.shards.values().map(|(docs, _)| *docs).sum();
+            let deleted: u64 = db.shards.values().map(|(_, deleted)| *deleted).sum();
+            json!({
+                "name": name,
+                "q": db.q,
+                "partitioned": db.partitioned,
+                "doc_count": docs,
+                "doc_del_count": deleted,
+                "update_seq": db.update_seq,
+                "local_shards": db.local_shards,
+                "disk_bytes": db.disk_bytes,
+                "nodes_reporting": db.nodes,
+            })
+        })
+        .collect();
+
+    let storage = json!({
+        "databases": database_rows.len(),
+        "disk_bytes": disk_bytes,
+        "disk_mb": disk_bytes as f64 / (1024.0 * 1024.0),
+        "doc_count": doc_count,
+        "doc_del_count": doc_del_count,
+        "failed_databases": failed_databases,
+    });
+    (storage, json!(database_rows))
+}
+
+/// Replication counters summed across nodes; each (database, peer) entry keeps
+/// the most recently finished report.
+fn aggregate_replication(snapshots: &[Value]) -> Value {
+    let mut replication_runs = 0u64;
+    let mut replication_docs = 0u64;
+    let mut replication_error: Option<String> = None;
+    let mut replication_running = false;
+    let mut replication_paused = false;
+    let mut replication_entries: BTreeMap<String, Value> = BTreeMap::new();
+
+    for snapshot in snapshots {
         let replication = &snapshot["replication"];
         replication_runs += replication["runs"].as_u64().unwrap_or(0);
         replication_docs += replication["docs"].as_u64().unwrap_or(0);
@@ -659,7 +802,26 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
                 }
             }
         }
+    }
 
+    json!({
+        "running": replication_running,
+        "paused": replication_paused,
+        "runs": replication_runs,
+        "docs": replication_docs,
+        "error": replication_error,
+        "entries": replication_entries.into_values().collect::<Vec<_>>(),
+    })
+}
+
+/// The worst node status wins; every node is listed, and those that are not ok
+/// are repeated under `failing`.
+fn aggregate_health(snapshots: &[Value]) -> Value {
+    let mut worst_health = 0u8;
+    let mut health_nodes = Vec::new();
+    let mut health_failing = Vec::new();
+
+    for snapshot in snapshots {
         let health = &snapshot["health"];
         let status = health["status"].as_str().unwrap_or("ok");
         worst_health = worst_health.max(health_rank(status));
@@ -680,176 +842,31 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
         }
     }
 
-    let doc_count: u64 = databases
-        .values()
-        .map(|entry| entry.shards.values().map(|(docs, _)| *docs).sum::<u64>())
-        .sum();
-    let doc_del_count: u64 = databases
-        .values()
-        .map(|entry| {
-            entry
-                .shards
-                .values()
-                .map(|(_, deleted)| *deleted)
-                .sum::<u64>()
-        })
-        .sum();
+    json!({
+        "status": health_status_name(worst_health),
+        "ok": worst_health == 0,
+        "nodes": health_nodes,
+        "failing": health_failing,
+        "generated_at": now_ms(),
+    })
+}
 
-    let mut route_rows: Vec<Value> = routes
-        .iter()
-        .map(|(route, stat)| {
-            json!({
-                "route": route,
-                "requests": stat.requests,
-                "errors": stat.errors,
-                "error_rate_pct": if stat.requests == 0 { 0.0 } else { stat.errors as f64 / stat.requests as f64 * 100.0 },
-                "total_ms": stat.total_ms,
-                "avg_ms": if stat.requests == 0 { 0.0 } else { stat.total_ms / stat.requests as f64 },
-                "p50_ms": percentile_from(&stat.buckets, stat.requests, 50.0, stat.max_ms),
-                "p95_ms": percentile_from(&stat.buckets, stat.requests, 95.0, stat.max_ms),
-                "p99_ms": percentile_from(&stat.buckets, stat.requests, 99.0, stat.max_ms),
-                "max_ms": stat.max_ms,
-                "latency_buckets": stat.buckets,
-            })
-        })
-        .collect();
-    route_rows.sort_by(|left, right| right["requests"].as_u64().cmp(&left["requests"].as_u64()));
-
-    let per_second: Vec<Value> = seconds
-        .into_iter()
-        .map(|(second, (requests, errors, total))| {
-            json!({
-                "t": second,
-                "requests": requests,
-                "errors": errors,
-                "avg_ms": if requests == 0 { 0.0 } else { total / requests as f64 },
-            })
-        })
-        .collect();
-
-    let database_rows: Vec<Value> = databases
-        .into_iter()
-        .map(|(name, db)| {
-            let docs: u64 = db.shards.values().map(|(docs, _)| *docs).sum();
-            let deleted: u64 = db.shards.values().map(|(_, deleted)| *deleted).sum();
-            json!({
-                "name": name,
-                "q": db.q,
-                "partitioned": db.partitioned,
-                "doc_count": docs,
-                "doc_del_count": deleted,
-                "update_seq": db.update_seq,
-                "local_shards": db.local_shards,
-                "disk_bytes": db.disk_bytes,
-                "nodes_reporting": db.nodes,
-            })
-        })
-        .collect();
-
+/// Merge node snapshots into one cluster-wide view. Counters are summed, route
+/// latency buckets are merged before percentiles are recomputed, and per-database
+/// document counts take the per-node maximum (replicas hold the same documents)
+/// while disk usage is summed.
+fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
+    let (storage, databases) = aggregate_storage(snapshots);
     let mut out = Map::new();
-    out.insert(
-        "http".to_string(),
-        json!({
-            "total": http_total,
-            "in_flight": in_flight,
-            "errors": http_errors,
-            "error_rate_pct": if http_total == 0 { 0.0 } else { http_errors as f64 / http_total as f64 * 100.0 },
-            "status_classes": u64_map_json(status_classes),
-            "status_codes": u64_map_json(status_codes),
-            "methods": u64_map_json(methods),
-            "latency_ms": {
-                "avg": if http_total == 0 { 0.0 } else { total_ms / http_total as f64 },
-                "p50": percentile_from(&buckets, http_total, 50.0, max_ms),
-                "p95": percentile_from(&buckets, http_total, 95.0, max_ms),
-                "p99": percentile_from(&buckets, http_total, 99.0, max_ms),
-                "max": max_ms,
-            },
-            "latency_buckets": {
-                "bounds": crate::metrics::LATENCY_BOUNDS,
-                "counts": buckets,
-            },
-            "routes": route_rows,
-            "per_second": per_second,
-        }),
-    );
-    out.insert(
-        "views".to_string(),
-        json!({
-            "queries": views.queries,
-            "errors": views.errors,
-            "error_rate_pct": if views.queries == 0 { 0.0 } else { views.errors as f64 / views.queries as f64 * 100.0 },
-            "total_ms": views.total_ms,
-            "avg_ms": if views.queries == 0 { 0.0 } else { views.total_ms / views.queries as f64 },
-            "max_ms": views.max_ms,
-        }),
-    );
-    out.insert(
-        "search".to_string(),
-        json!({
-            "queries": search.queries,
-            "errors": search.errors,
-            "error_rate_pct": if search.queries == 0 { 0.0 } else { search.errors as f64 / search.queries as f64 * 100.0 },
-            "total_ms": search.total_ms,
-            "avg_ms": if search.queries == 0 { 0.0 } else { search.total_ms / search.queries as f64 },
-            "max_ms": search.max_ms,
-        }),
-    );
-    out.insert(
-        "fabric".to_string(),
-        json!({
-            "local_reads": local_reads,
-            "remote_reads": remote_reads,
-            "quorum_failures": quorum_failures,
-            "degraded_reads": degraded_reads,
-            "fanout_count": fanout_count,
-            "fanout_sum": fanout_sum,
-            "fanout_avg": if fanout_count == 0 { 0.0 } else { fanout_sum as f64 / fanout_count as f64 },
-            "fanout_max": fanout_max,
-            "shard_map_updates": shard_map_updates,
-            "shard_map_pending": shard_map_pending,
-            "rebalance_started": rebalance_started,
-            "rebalance_completed": rebalance_completed,
-            "rebalance_timeout": rebalance_timeout,
-            "cleaned_shards": cleaned_shards,
-        }),
-    );
-    out.insert(
-        "integrity".to_string(),
-        json!({ "corrupt_records_skipped": corrupt_records_skipped }),
-    );
-    out.insert(
-        "storage".to_string(),
-        json!({
-            "databases": database_rows.len(),
-            "disk_bytes": disk_bytes,
-            "disk_mb": disk_bytes as f64 / (1024.0 * 1024.0),
-            "doc_count": doc_count,
-            "doc_del_count": doc_del_count,
-            "failed_databases": failed_databases,
-        }),
-    );
-    out.insert("databases".to_string(), json!(database_rows));
-    out.insert(
-        "replication".to_string(),
-        json!({
-            "running": replication_running,
-            "paused": replication_paused,
-            "runs": replication_runs,
-            "docs": replication_docs,
-            "error": replication_error,
-            "entries": replication_entries.into_values().collect::<Vec<_>>(),
-        }),
-    );
-    out.insert(
-        "health".to_string(),
-        json!({
-            "status": health_status_name(worst_health),
-            "ok": worst_health == 0,
-            "nodes": health_nodes,
-            "failing": health_failing,
-            "generated_at": now_ms(),
-        }),
-    );
+    out.insert("http".to_string(), aggregate_http(snapshots));
+    out.insert("views".to_string(), aggregate_engine(snapshots, "views"));
+    out.insert("search".to_string(), aggregate_engine(snapshots, "search"));
+    out.insert("fabric".to_string(), aggregate_fabric(snapshots));
+    out.insert("integrity".to_string(), aggregate_integrity(snapshots));
+    out.insert("storage".to_string(), storage);
+    out.insert("databases".to_string(), databases);
+    out.insert("replication".to_string(), aggregate_replication(snapshots));
+    out.insert("health".to_string(), aggregate_health(snapshots));
     out
 }
 
@@ -859,15 +876,13 @@ pub async fn metrics_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let q = query(&uri);
     let local = local_metrics(&st).await;
-    let cluster_requested =
-        flag(&q, "cluster") && st.cluster.is_clustered() && !st.cluster.is_internal(&headers);
+    let cluster_requested = flag(&q, "cluster")
+        && st.ctx.cluster.is_clustered()
+        && !st.ctx.cluster.is_internal(&headers);
     if !cluster_requested {
         let mut value = local.clone();
         value["scope"] = json!("local");
@@ -881,21 +896,22 @@ pub async fn metrics_status(
             "http": {"total": local["http"]["total"], "errors": local["http"]["errors"]},
             "storage": local["storage"],
         }]);
-        return crate::api::json(StatusCode::OK, value);
+        return super::json(StatusCode::OK, value);
     }
 
     let peers: Vec<(usize, String)> = st
+        .ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
         let started = std::time::Instant::now();
         let request = internal_request(
-            &st,
+            &st.ctx,
             reqwest::Method::GET,
             &url,
             &["_node", "_local", "_metrics"],
@@ -993,36 +1009,35 @@ pub async fn metrics_status(
     }
     value["health"]["status"] = json!(health_status_name(worst));
     value["health"]["ok"] = json!(worst == 0);
-    crate::api::json(StatusCode::OK, value)
+    super::json(StatusCode::OK, value)
 }
 
 pub async fn health_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let local = local_health(&st, true).await;
     let q = query(&uri);
-    let cluster_requested =
-        flag(&q, "cluster") && st.cluster.is_clustered() && !st.cluster.is_internal(&headers);
+    let cluster_requested = flag(&q, "cluster")
+        && st.ctx.cluster.is_clustered()
+        && !st.ctx.cluster.is_internal(&headers);
     if !cluster_requested {
-        return crate::api::json(StatusCode::OK, local);
+        return super::json(StatusCode::OK, local);
     }
     let peers: Vec<(usize, String)> = st
+        .ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
         let request = internal_request(
-            &st,
+            &st.ctx,
             reqwest::Method::GET,
             &url,
             &["_node", "_local", "_health"],
@@ -1044,7 +1059,7 @@ pub async fn health_status(
     .await;
     let mut worst = health_rank(local["status"].as_str().unwrap_or("ok"));
     let mut nodes = vec![json!({
-        "index": st.cluster.me,
+        "index": st.ctx.cluster.me,
         "url": st.config.advertise,
         "reachable": true,
         "status": local["status"],
@@ -1076,7 +1091,7 @@ pub async fn health_status(
             }
         }
     }
-    crate::api::json(
+    super::json(
         StatusCode::OK,
         json!({
             "status": health_status_name(worst),
@@ -1113,7 +1128,7 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
-    crate::api::json(
+    super::json(
         status,
         json!({
             "status": health["status"],
@@ -1127,29 +1142,10 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn fs_health_cache_serves_within_the_ttl_only() {
-        let cache = FsHealthCache::default();
-        let start = Instant::now();
-        assert!(cache.fresh(start).is_none());
-        cache.store(
-            start,
-            FsHealth {
-                readable: true,
-                writable: true,
-                unreadable: 3,
-            },
-        );
-        let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
-        assert_eq!(hit.map(|value| value.unreadable), Some(3));
-        assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
-    }
 
     #[test]
     fn probe_fs_counts_unreadable_db_json() {
-        let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::db::uuid()));
+        let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::util::uuid()));
         let good = dir.join("good");
         let bad = dir.join("bad");
         assert!(std::fs::create_dir_all(&good).is_ok());

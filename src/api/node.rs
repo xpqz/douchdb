@@ -3,15 +3,11 @@
 
 use super::*;
 
-pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
-    let nodes: Vec<String> = if st.cluster.nodes.is_empty() {
+pub async fn membership(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
+    let nodes: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
-        st.cluster.nodes.clone()
+        st.ctx.cluster.nodes.clone()
     };
     json(
         StatusCode::OK,
@@ -21,15 +17,11 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
 
 /// Cluster overview for the management console: membership, discovery probes,
 /// per-database shard maps and the background replicator snapshot.
-pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
-    let membership: Vec<String> = if st.cluster.nodes.is_empty() {
+pub async fn cluster_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
+    let membership: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
-        st.cluster.nodes.clone()
+        st.ctx.cluster.nodes.clone()
     };
     let mut databases = Vec::new();
     for name in st.db_names().await {
@@ -46,7 +38,7 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
                     "shard": shard,
                     "replicas": replicas,
                     "owner": map.owner_of(shard),
-                    "local": replicas.contains(&st.cluster.me),
+                    "local": replicas.contains(&st.ctx.cluster.me),
                     "docs": docs,
                     "deleted": deleted,
                 })
@@ -65,17 +57,17 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
         json!({
             "local": {
                 "url": st.config.advertise,
-                "index": st.cluster.me,
-                "clustered": st.cluster.is_clustered(),
+                "index": st.ctx.cluster.me,
+                "clustered": st.ctx.cluster.is_clustered(),
                 "q": st.config.q,
-                "n": st.cluster.replication_factor(),
+                "n": st.ctx.cluster.replication_factor(),
                 "sync_secs": st.config.sync_secs,
             },
             "membership": {
                 "all_nodes": membership.clone(),
                 "cluster_nodes": membership,
             },
-            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+            "discovery": st.cluster_state.discovery_json(&st.ctx.cluster.nodes, &st.config.seeds),
             "replication": st.cluster_state.replication_json(),
             "databases": databases,
         }),
@@ -84,11 +76,7 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
 
 /// Probe peers and reported memberships now. Returns the previous snapshot and
 /// starts the pass in the background so a dead seed cannot block the request.
-pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn cluster_discover(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     if !st.cluster_state.discovery_running() {
         tokio::spawn(crate::discovery::discover_once(st.clone()));
     }
@@ -97,30 +85,18 @@ pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMa
         json!({
             "ok": true,
             "running": st.cluster_state.discovery_running(),
-            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+            "discovery": st.cluster_state.discovery_json(&st.ctx.cluster.nodes, &st.config.seeds),
         }),
     )
 }
 
-pub async fn replication_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     json(StatusCode::OK, st.cluster_state.replication_json())
 }
 
 /// Trigger one anti-entropy pass. Background replication already runs on its
 /// timer; this is the "sync now" control for operators.
-pub async fn replication_run(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_run(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly) -> Response {
     let db = query(&uri).get("db").cloned();
     if !st.cluster_state.replication_running() {
         tokio::spawn(crate::replicate::sync_once(st.clone(), db));
@@ -131,11 +107,7 @@ pub async fn replication_run(
     )
 }
 
-pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_pause(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     st.cluster_state.set_replication_paused(true);
     json(
         StatusCode::OK,
@@ -143,11 +115,7 @@ pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderM
     )
 }
 
-pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_resume(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     st.cluster_state.set_replication_paused(false);
     json(
         StatusCode::OK,
@@ -156,11 +124,7 @@ pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: Header
 }
 
 /// mem3-style shard-map inspection and movement endpoint.
-pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn dbs_metadata(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     let mut out = Map::new();
     for name in st.db_names().await {
         if let Ok(db) = st.db(&name).await {
@@ -173,12 +137,8 @@ pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -
 pub async fn db_metadata(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     match st.db(&name).await {
         Ok(db) => json(StatusCode::OK, json!(db.shard_map())),
         Err(error) => fail(error),
@@ -192,7 +152,7 @@ pub async fn db_migration_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -204,7 +164,7 @@ pub async fn db_migration_put(
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid migration shard map")),
     };
-    if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
+    if map.q != db.q || map.node_count != st.ctx.cluster.nodes.len().max(1) {
         return fail(ApiError::bad_request(
             "migration shard map does not match database q or cluster node count",
         ));
@@ -230,7 +190,7 @@ pub async fn db_migration_delete(
     DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -250,7 +210,7 @@ pub async fn db_security_get(
     DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -275,7 +235,7 @@ pub async fn db_security_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -310,13 +270,9 @@ pub async fn db_security_put(
 pub async fn db_shard_counts(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -349,12 +305,9 @@ pub async fn db_metadata_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
     headers: HeaderMap,
+    _: AdminOnly,
     body: Bytes,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -372,7 +325,7 @@ pub async fn db_metadata_put(
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid shard map")),
     };
-    match crate::cluster_ops::apply_shard_map(&st, &db, &name, map, &headers).await {
+    match crate::cluster_ops::apply_shard_map(&st.ctx, &db, &name, map, &headers).await {
         Ok((map, pending)) => {
             let mut value = json!(map);
             value["pending"] = json!(pending);
@@ -387,11 +340,8 @@ pub async fn db_rebalance(
     DbName(name): DbName,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -400,7 +350,7 @@ pub async fn db_rebalance(
     let cleanup = flag(&q, "cleanup");
     let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
 
-    match crate::cluster_ops::rebalance(&st, &db, &name, &headers, timeout_ms, cleanup).await {
+    match crate::cluster_ops::rebalance(&st.ctx, &db, &name, &headers, timeout_ms, cleanup).await {
         Ok(value) => json(StatusCode::OK, value),
         Err(error) => fail(error),
     }
@@ -409,12 +359,8 @@ pub async fn db_rebalance(
 pub async fn db_cleanup(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -429,7 +375,7 @@ pub async fn db_cleanup(
     let map = db.shard_map();
     let mut cleared = Vec::new();
     for shard in 0..db.q {
-        if !map.replicas_of(shard).contains(&st.cluster.me) {
+        if !map.replicas_of(shard).contains(&st.ctx.cluster.me) {
             cleared.push(shard as usize);
         }
     }

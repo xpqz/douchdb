@@ -5,8 +5,8 @@
 //! records nodes that are visible on the network but absent from the placement
 //! list. That lets the console show drift without silently changing routing.
 
-use crate::api::AppState;
 use crate::cluster_state::{now_ms, NodeProbe};
+use crate::state::AppState;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ async fn probe(state: &AppState, url: &str, seed: bool, trusted: bool) -> NodePr
         ..Default::default()
     };
     let up = state
+        .ctx
         .client
         .get(format!("{url}/_up"))
         .timeout(Duration::from_secs(2))
@@ -50,14 +51,15 @@ async fn probe(state: &AppState, url: &str, seed: bool, trusted: bool) -> NodePr
     // a node that requires admin for _membership reports an error here rather
     // than receiving credentials it could replay.
     let mut membership = state
+        .ctx
         .client
         .get(format!("{url}/_membership"))
         .timeout(Duration::from_secs(2));
     if trusted {
         membership = membership
             .header("x-douchdb-forwarded", "1")
-            .header("x-douchdb-secret", state.cluster.secret.as_str());
-        if let Some(auth) = &state.auth {
+            .header("x-douchdb-secret", state.ctx.cluster.secret.as_str());
+        if let Some(auth) = &state.ctx.auth {
             membership = membership.basic_auth(&auth.user, Some(&auth.pass));
         }
     }
@@ -103,6 +105,7 @@ pub async fn discover_once(state: Arc<AppState>) {
     }
 
     let configured: Vec<String> = state
+        .ctx
         .cluster
         .nodes
         .iter()
@@ -182,9 +185,10 @@ pub fn spawn(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::Config;
     use crate::auth::Auth;
     use crate::cluster::Cluster;
+    use crate::cluster_http::ClusterCtx;
+    use crate::state::Config;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::get;
@@ -261,15 +265,18 @@ mod tests {
                 view_timeout_ms: 1000,
                 view_memory_mb: 1,
                 default_admin_only: true,
+                max_open_dbs: 256,
             },
-            auth: Some(Auth::new("admin".into(), "hunter2".into(), b"k".to_vec())),
-            cluster: Cluster {
-                nodes,
-                me: 0,
-                n: 1,
-                secret: "cluster-secret".to_string(),
+            ctx: ClusterCtx {
+                auth: Some(Auth::new("admin".into(), "hunter2".into(), b"k".to_vec())),
+                cluster: Cluster {
+                    nodes,
+                    me: 0,
+                    n: 1,
+                    secret: "cluster-secret".to_string(),
+                },
+                client: reqwest::Client::new(),
             },
-            client: reqwest::Client::new(),
             db_updates: Default::default(),
             cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
             admission: Arc::new(crate::admission::Admission::new(Default::default())),
@@ -310,7 +317,7 @@ mod tests {
         // The stranger still shows up, reachable, as a discovered node.
         let snapshot = st
             .cluster_state
-            .discovery_json(&st.cluster.nodes, &st.config.seeds);
+            .discovery_json(&st.ctx.cluster.nodes, &st.config.seeds);
         let nodes = snapshot["nodes"].as_array().cloned().unwrap_or_default();
         assert!(nodes
             .iter()

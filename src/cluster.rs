@@ -1,4 +1,5 @@
-//! Cluster placement: static node list, rendezvous hashing, request routing.
+//! Cluster placement: the static node list, the per-database shard map, and
+//! the rendezvous hashing that seeds new shard maps.
 
 use axum::http::HeaderMap;
 use md5::{Digest, Md5};
@@ -14,6 +15,60 @@ pub struct Cluster {
     pub n: usize,
     /// Shared secret for internal routing headers. Empty on a single node.
     pub secret: String,
+}
+
+/// The shards of one database that a request covers: the cluster fan-out
+/// gives each node the shards it answers for, and every shard-aware read
+/// filters by it. A shard beyond the mask is not covered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardMask(Vec<bool>);
+
+impl ShardMask {
+    /// A mask over `q` shards that covers none of them.
+    pub fn none(q: u32) -> ShardMask {
+        ShardMask(vec![false; q as usize])
+    }
+
+    /// Cover `shard`; a shard beyond the mask is ignored.
+    pub fn select(&mut self, shard: usize) {
+        if let Some(flag) = self.0.get_mut(shard) {
+            *flag = true;
+        }
+    }
+
+    pub fn covers(&self, shard: usize) -> bool {
+        self.0.get(shard).copied().unwrap_or(false)
+    }
+
+    /// No shard is covered.
+    pub fn is_empty(&self) -> bool {
+        !self.0.iter().any(|flag| *flag)
+    }
+
+    /// The number of shards the mask spans, covered or not.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The covered shards, in order.
+    pub fn shards(&self) -> Vec<usize> {
+        (0..self.0.len()).filter(|shard| self.0[*shard]).collect()
+    }
+
+    /// The covered shards as the `shards` query parameter peers read back.
+    pub fn query_value(&self) -> String {
+        self.shards()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl FromIterator<bool> for ShardMask {
+    fn from_iter<I: IntoIterator<Item = bool>>(flags: I) -> ShardMask {
+        ShardMask(flags.into_iter().collect())
+    }
 }
 
 /// Per-database placement metadata, modelled on CouchDB's `_dbs`/mem3 shard
@@ -123,16 +178,10 @@ impl Cluster {
         self.n.max(1).min(self.nodes.len().max(1))
     }
 
-    /// Rendezvous hashing over `(node, shard)`. The highest `n` scores are the
-    /// replica set, in preference order. Every node computes the same list from
-    /// the same static configuration, so no metadata needs distributing.
-    pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
-        let mut replicas = self.replicas_of_shard_ranked(shard);
-        replicas.truncate(self.replication_factor());
-        replicas
-    }
-
-    /// Every node, in rendezvous preference order for `shard`.
+    /// Every node, in rendezvous preference order for `shard`: the highest
+    /// scores of `(node, shard)` first. Only used to seed a database's
+    /// `ShardMap`; once created, the stored map is the source of truth for
+    /// placement.
     fn replicas_of_shard_ranked(&self, shard: u32) -> Vec<usize> {
         if self.nodes.is_empty() {
             return vec![0];
@@ -145,12 +194,6 @@ impl Cluster {
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         ranked.into_iter().map(|(_, i)| i).collect()
-    }
-
-    /// The first replica is the primary: reads and writes coordinate through
-    /// it, while the remaining replicas receive the same revision.
-    pub fn owner_of_shard(&self, shard: u32) -> usize {
-        self.replicas_of_shard(shard).first().copied().unwrap_or(0)
     }
 
     /// True only for a peer that presents the shared cluster secret. A client
@@ -200,6 +243,21 @@ fn score(node: &str, shard: u32) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shard_mask_covers_only_selected_shards() {
+        let mut mask = ShardMask::none(4);
+        assert!(mask.is_empty());
+        mask.select(1);
+        mask.select(3);
+        mask.select(9);
+        assert!(!mask.is_empty());
+        assert_eq!(mask.len(), 4);
+        assert!(mask.covers(1) && mask.covers(3));
+        assert!(!mask.covers(0) && !mask.covers(9));
+        assert_eq!(mask.shards(), vec![1, 3]);
+        assert_eq!(mask.query_value(), "1,3");
+    }
+
     fn cluster(n: usize) -> Cluster {
         Cluster {
             nodes: vec!["a".into(), "b".into(), "c".into()],
@@ -209,11 +267,23 @@ mod tests {
         }
     }
 
+    /// Shards in the test maps below; large enough for every shard index used.
+    const Q: u32 = 256;
+
+    fn replicas_of_shard(cluster: &Cluster, shard: u32) -> Vec<usize> {
+        cluster.shard_map(Q).replicas_of(shard).to_vec()
+    }
+
+    fn owner_of_shard(cluster: &Cluster, shard: u32) -> usize {
+        cluster.shard_map(Q).owner_of(shard)
+    }
+
     #[test]
     fn shard_owners_are_spread() {
         let cluster = cluster(1);
-        let spread: std::collections::HashSet<_> =
-            (0..64).map(|shard| cluster.owner_of_shard(shard)).collect();
+        let spread: std::collections::HashSet<_> = (0..64)
+            .map(|shard| owner_of_shard(&cluster, shard))
+            .collect();
         assert_eq!(spread.len(), 3, "all nodes own something");
     }
 
@@ -221,8 +291,8 @@ mod tests {
     fn single_node_owns_everything() {
         let cluster = Cluster::default();
         assert!(!cluster.is_clustered());
-        assert_eq!(cluster.replicas_of_shard(0), vec![0]);
-        assert_eq!(cluster.owner_of_shard(0), 0);
+        assert_eq!(replicas_of_shard(&cluster, 0), vec![0]);
+        assert_eq!(owner_of_shard(&cluster, 0), 0);
     }
 
     #[test]
@@ -258,8 +328,8 @@ mod tests {
             secret: String::new(),
         };
         for shard in 0..50 {
-            assert_eq!(a.owner_of_shard(shard), b.owner_of_shard(shard));
-            assert_eq!(a.replicas_of_shard(shard), b.replicas_of_shard(shard));
+            assert_eq!(owner_of_shard(&a, shard), owner_of_shard(&b, shard));
+            assert_eq!(replicas_of_shard(&a, shard), replicas_of_shard(&b, shard));
         }
     }
 
@@ -267,13 +337,13 @@ mod tests {
     fn replica_sets_are_distinct_and_have_the_requested_size() {
         let c = cluster(2);
         for shard in 0..64 {
-            let replicas = c.replicas_of_shard(shard);
+            let replicas = replicas_of_shard(&c, shard);
             assert_eq!(replicas.len(), 2);
             assert_ne!(replicas[0], replicas[1]);
-            assert_eq!(replicas[0], c.owner_of_shard(shard));
+            assert_eq!(replicas[0], owner_of_shard(&c, shard));
         }
         // A larger factor is clamped to the node count.
-        assert_eq!(cluster(9).replicas_of_shard(0).len(), 3);
+        assert_eq!(replicas_of_shard(&cluster(9), 0).len(), 3);
     }
 
     #[test]
@@ -286,7 +356,7 @@ mod tests {
             secret: String::new(),
         };
         let moved = (0..200)
-            .filter(|shard| three.owner_of_shard(*shard) != four.owner_of_shard(*shard))
+            .filter(|shard| owner_of_shard(&three, *shard) != owner_of_shard(&four, *shard))
             .count();
         assert!(moved > 10 && moved < 100, "moved {moved} of 200 shards");
 
@@ -297,9 +367,9 @@ mod tests {
         let mut changed = 0;
         for shard in 0..200 {
             let before: std::collections::BTreeSet<usize> =
-                three.replicas_of_shard(shard).into_iter().collect();
+                replicas_of_shard(&three, shard).into_iter().collect();
             let after: std::collections::BTreeSet<usize> =
-                four.replicas_of_shard(shard).into_iter().collect();
+                replicas_of_shard(&four, shard).into_iter().collect();
             if before != after {
                 changed += 1;
                 assert!(after.contains(&3), "shard {shard}: {before:?} -> {after:?}");

@@ -1,9 +1,10 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
-use crate::api::{internal_request_raw, AppState};
 use crate::auth::Auth;
 use crate::cluster::Cluster;
+use crate::cluster_http::internal_request_raw;
 use crate::db::Db;
+use crate::state::AppState;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use md5::{Digest, Md5};
@@ -36,15 +37,14 @@ pub async fn pull(
     cluster: &Cluster,
     auth: Option<&Auth>,
 ) -> Result<PullOutcome> {
-    const BATCH: usize = 1000;
-
-    // Include the shard map in the checkpoint id. When placement changes, the
-    // new replica starts from zero instead of skipping documents that were
-    // filtered out under the old map.
-    let map_tag = crate::db::hex(&Md5::digest(
-        serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
-    ));
-    let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag);
+    let ctx = PullCtx {
+        db,
+        peer,
+        client,
+        cluster,
+        auth,
+    };
+    let checkpoint_id = checkpoint_id(db, peer);
     let mut since = db
         .local_get(&checkpoint_id)
         .await
@@ -55,30 +55,7 @@ pub async fn pull(
 
     let mut total = 0usize;
     loop {
-        // A cluster `_changes` last_seq is an opaque base64 version vector, so
-        // forward whatever the peer gave us rather than parsing it as an integer.
-        let since_param = match &since {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-
-        let mut changes = internal_request_raw(
-            client,
-            &cluster.secret,
-            reqwest::Method::GET,
-            peer,
-            &[&db.name, "_changes"],
-        )
-        .query(&[
-            ("since", since_param.as_str()),
-            ("style", "all_docs"),
-            ("limit", &BATCH.to_string()),
-        ]);
-        if let Some(auth) = auth {
-            changes = changes.basic_auth(&auth.user, Some(&auth.pass));
-        }
-        let resp: Value = changes.send().await?.error_for_status()?.json().await?;
-
+        let resp = ctx.fetch_changes_batch(&since).await?;
         let results = resp
             .get("results")
             .and_then(Value::as_array)
@@ -87,168 +64,10 @@ pub async fn pull(
             break;
         }
 
-        // A node only stores the shards it replicates. Filter before the
-        // _bulk_get request so every revision we ask for is one we need.
-        let mut requested: BTreeSet<(String, String)> = BTreeSet::new();
-        let mut reqs = Vec::new();
-        for row in results {
-            let id = row
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("_changes row has no id"))?;
-            let changes = row
-                .get("changes")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("_changes row {id} has no changes array"))?;
-            for change in changes {
-                let rev = change
-                    .get("rev")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("_changes row {id} has no rev"))?;
-                if !crate::fabric::is_replica_of(db, id, cluster.me) {
-                    continue;
-                }
-                if requested.insert((id.to_string(), rev.to_string())) {
-                    // `revs` preserves the revision history; without it the
-                    // target stores a leaf with no ancestor metadata.
-                    reqs.push(json!({
-                        "id": id,
-                        "rev": rev,
-                        "revs": true,
-                        "attachments": true
-                    }));
-                }
-            }
-        }
-
-        let mut received: BTreeMap<(String, String), Value> = BTreeMap::new();
-        let mut unavailable: BTreeSet<(String, String)> = BTreeSet::new();
-        if !reqs.is_empty() {
-            let mut bulk = internal_request_raw(
-                client,
-                &cluster.secret,
-                reqwest::Method::POST,
-                peer,
-                &[&db.name, "_bulk_get"],
-            )
-            .json(&json!({"docs": reqs}));
-            if let Some(auth) = auth {
-                bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
-            }
-            let got: Value = bulk.send().await?.error_for_status()?.json().await?;
-            let result_rows = got
-                .get("results")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("_bulk_get response has no results array"))?;
-
-            for row in result_rows {
-                let docs = row
-                    .get("docs")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow!("_bulk_get result has no docs array"))?;
-                for entry in docs {
-                    if let Some(ok) = entry.get("ok") {
-                        let id = ok
-                            .get("_id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow!("_bulk_get ok entry has no _id"))?;
-                        let rev = ok
-                            .get("_rev")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow!("_bulk_get ok entry has no _rev"))?;
-                        received.insert((id.to_string(), rev.to_string()), ok.clone());
-                    } else if let Some(error) = entry.get("error") {
-                        let id = error
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow!("_bulk_get error has no id"))?;
-                        let rev = error
-                            .get("rev")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow!("_bulk_get error has no rev"))?;
-                        let kind = error
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown");
-                        // A peer that explicitly no longer has the revision
-                        // (purged/pruned) is a terminal answer. Transient or
-                        // malformed failures are not.
-                        if kind == "not_found" || kind == "deleted" {
-                            tracing::warn!(
-                                "peer {peer} could not supply {id}@{rev}: {kind}; treating as unavailable"
-                            );
-                            unavailable.insert((id.to_string(), rev.to_string()));
-                        } else {
-                            return Err(anyhow!(
-                                "_bulk_get failed for {id}@{rev}: {}",
-                                error.get("reason").and_then(Value::as_str).unwrap_or(kind)
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow!("_bulk_get entry is neither ok nor error"));
-                    }
-                }
-            }
-        }
-
-        // Apply the retrieved revisions and fail if any local write failed.
-        let docs: Vec<Value> = received.values().cloned().collect();
-        if !docs.is_empty() {
-            total += docs.len();
-            let applied = db
-                .put_docs(docs, false)
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
-            if let Some(error) = applied.iter().find(|result| result.get("ok").is_none()) {
-                return Err(anyhow!("replicated document was not applied: {error}"));
-            }
-        }
-
-        // Revisions omitted from the response are acceptable only when they
-        // already exist locally. This also covers idempotent duplicate pulls.
-        let mut unaccounted: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (id, rev) in &requested {
-            let key = (id.clone(), rev.clone());
-            if received.contains_key(&key) || unavailable.contains(&key) {
-                continue;
-            }
-            unaccounted.entry(id.clone()).or_default().push(rev.clone());
-        }
-        if !unaccounted.is_empty() {
-            let body = Value::Object(
-                unaccounted
-                    .iter()
-                    .map(|(id, revs)| (id.clone(), json!(revs)))
-                    .collect(),
-            );
-            let diff = db
-                .revs_diff(&body)
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
-            let mut missing = Vec::new();
-            for (id, revs) in &unaccounted {
-                let missing_set: BTreeSet<&str> = diff
-                    .get(id)
-                    .and_then(|entry| entry.get("missing"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect();
-                for rev in revs {
-                    if missing_set.contains(rev.as_str()) {
-                        missing.push(format!("{id}@{rev}"));
-                    }
-                }
-            }
-            if !missing.is_empty() {
-                return Err(anyhow!(
-                    "_bulk_get did not return {} requested revision(s): {}",
-                    missing.len(),
-                    missing.join(", ")
-                ));
-            }
-        }
+        let (requested, reqs) = ctx.revisions_to_request(results)?;
+        let (received, unavailable) = ctx.fetch_missing_docs(&reqs).await?;
+        total += write_batch(db, &received).await?;
+        ensure_all_accounted(db, &requested, &received, &unavailable).await?;
 
         let last = resp
             .get("last_seq")
@@ -271,6 +90,247 @@ pub async fn pull(
     })
 }
 
+/// Everything one pull needs to talk to a peer about one database.
+struct PullCtx<'a> {
+    db: &'a Db,
+    peer: &'a str,
+    client: &'a reqwest::Client,
+    cluster: &'a Cluster,
+    auth: Option<&'a Auth>,
+}
+
+/// A set of `(doc id, rev)` pairs.
+type RevPairs = BTreeSet<(String, String)>;
+
+/// Revisions the peer returned, and revisions it explicitly no longer has.
+type Fetched = (BTreeMap<(String, String), Value>, RevPairs);
+
+/// Include the shard map in the checkpoint id. When placement changes, the
+/// new replica starts from zero instead of skipping documents that were
+/// filtered out under the old map.
+fn checkpoint_id(db: &Db, peer: &str) -> String {
+    let map_tag = crate::util::hex(&Md5::digest(
+        serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
+    ));
+    format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag)
+}
+
+impl PullCtx<'_> {
+    /// One `_changes` page from the peer.
+    async fn fetch_changes_batch(&self, since: &Value) -> Result<Value> {
+        const BATCH: usize = 1000;
+        // A cluster `_changes` last_seq is an opaque base64 version vector, so
+        // forward whatever the peer gave us rather than parsing it as an integer.
+        let since_param = match since {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+
+        let mut changes = internal_request_raw(
+            self.client,
+            &self.cluster.secret,
+            reqwest::Method::GET,
+            self.peer,
+            &[&self.db.name, "_changes"],
+        )
+        .query(&[
+            ("since", since_param.as_str()),
+            ("style", "all_docs"),
+            ("limit", &BATCH.to_string()),
+        ]);
+        if let Some(auth) = self.auth {
+            changes = changes.basic_auth(&auth.user, Some(&auth.pass));
+        }
+        Ok(changes.send().await?.error_for_status()?.json().await?)
+    }
+
+    /// A node only stores the shards it replicates. Filter before the
+    /// _bulk_get request so every revision we ask for is one we need.
+    fn revisions_to_request(&self, results: &[Value]) -> Result<(RevPairs, Vec<Value>)> {
+        let mut requested: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut reqs = Vec::new();
+        for row in results {
+            let id = row
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("_changes row has no id"))?;
+            let changes = row
+                .get("changes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("_changes row {id} has no changes array"))?;
+            for change in changes {
+                let rev = change
+                    .get("rev")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("_changes row {id} has no rev"))?;
+                if !crate::fabric::is_replica_of(self.db, id, self.cluster.me) {
+                    continue;
+                }
+                if requested.insert((id.to_string(), rev.to_string())) {
+                    // `revs` preserves the revision history; without it the
+                    // target stores a leaf with no ancestor metadata.
+                    reqs.push(json!({
+                        "id": id,
+                        "rev": rev,
+                        "revs": true,
+                        "attachments": true
+                    }));
+                }
+            }
+        }
+        Ok((requested, reqs))
+    }
+
+    /// `_bulk_get` the requested revisions from the peer.
+    async fn fetch_missing_docs(&self, reqs: &[Value]) -> Result<Fetched> {
+        let mut received: BTreeMap<(String, String), Value> = BTreeMap::new();
+        let mut unavailable: BTreeSet<(String, String)> = BTreeSet::new();
+        if reqs.is_empty() {
+            return Ok((received, unavailable));
+        }
+        let mut bulk = internal_request_raw(
+            self.client,
+            &self.cluster.secret,
+            reqwest::Method::POST,
+            self.peer,
+            &[&self.db.name, "_bulk_get"],
+        )
+        .json(&json!({"docs": reqs}));
+        if let Some(auth) = self.auth {
+            bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
+        }
+        let got: Value = bulk.send().await?.error_for_status()?.json().await?;
+        let result_rows = got
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("_bulk_get response has no results array"))?;
+
+        for row in result_rows {
+            let docs = row
+                .get("docs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("_bulk_get result has no docs array"))?;
+            for entry in docs {
+                if let Some(ok) = entry.get("ok") {
+                    let id = ok
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("_bulk_get ok entry has no _id"))?;
+                    let rev = ok
+                        .get("_rev")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("_bulk_get ok entry has no _rev"))?;
+                    received.insert((id.to_string(), rev.to_string()), ok.clone());
+                } else if let Some(error) = entry.get("error") {
+                    let id = error
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("_bulk_get error has no id"))?;
+                    let rev = error
+                        .get("rev")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("_bulk_get error has no rev"))?;
+                    let kind = error
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    // A peer that explicitly no longer has the revision
+                    // (purged/pruned) is a terminal answer. Transient or
+                    // malformed failures are not.
+                    if kind == "not_found" || kind == "deleted" {
+                        tracing::warn!(
+                            "peer {} could not supply {id}@{rev}: {kind}; treating as unavailable",
+                            self.peer
+                        );
+                        unavailable.insert((id.to_string(), rev.to_string()));
+                    } else {
+                        return Err(anyhow!(
+                            "_bulk_get failed for {id}@{rev}: {}",
+                            error.get("reason").and_then(Value::as_str).unwrap_or(kind)
+                        ));
+                    }
+                } else {
+                    return Err(anyhow!("_bulk_get entry is neither ok nor error"));
+                }
+            }
+        }
+        Ok((received, unavailable))
+    }
+}
+
+/// Apply the retrieved revisions and fail if any local write failed. Returns
+/// how many documents were written.
+async fn write_batch(db: &Db, received: &BTreeMap<(String, String), Value>) -> Result<usize> {
+    let docs: Vec<Value> = received.values().cloned().collect();
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    let count = docs.len();
+    let applied = db
+        .put_docs(docs, false)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    if let Some(error) = applied.iter().find(|result| result.get("ok").is_none()) {
+        return Err(anyhow!("replicated document was not applied: {error}"));
+    }
+    Ok(count)
+}
+
+/// Revisions omitted from the response are acceptable only when they already
+/// exist locally. This also covers idempotent duplicate pulls.
+async fn ensure_all_accounted(
+    db: &Db,
+    requested: &BTreeSet<(String, String)>,
+    received: &BTreeMap<(String, String), Value>,
+    unavailable: &BTreeSet<(String, String)>,
+) -> Result<()> {
+    let mut unaccounted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, rev) in requested {
+        let key = (id.clone(), rev.clone());
+        if received.contains_key(&key) || unavailable.contains(&key) {
+            continue;
+        }
+        unaccounted.entry(id.clone()).or_default().push(rev.clone());
+    }
+    if unaccounted.is_empty() {
+        return Ok(());
+    }
+    let body = Value::Object(
+        unaccounted
+            .iter()
+            .map(|(id, revs)| (id.clone(), json!(revs)))
+            .collect(),
+    );
+    let diff = db
+        .revs_diff(&body)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let mut missing = Vec::new();
+    for (id, revs) in &unaccounted {
+        let missing_set: BTreeSet<&str> = diff
+            .get(id)
+            .and_then(|entry| entry.get("missing"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for rev in revs {
+            if missing_set.contains(rev.as_str()) {
+                missing.push(format!("{id}@{rev}"));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "_bulk_get did not return {} requested revision(s): {}",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Run one anti-entropy pass over every database and peer. Returns false when a
 /// pass is already in flight.
 pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
@@ -280,7 +340,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     if !state.cluster_state.begin_replication() {
         return false;
     }
-    let peers: Vec<String> = state.cluster.peers().cloned().collect();
+    let peers: Vec<String> = state.ctx.cluster.peers().cloned().collect();
     let mut names = state.db_names().await;
     names.sort();
     if let Some(only) = only_db {
@@ -292,8 +352,8 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         let Ok(db) = state.db(&name).await else {
             continue;
         };
-        crate::fabric::reconcile_shard_map(&state, &db).await;
-        crate::fabric::reconcile_security(&state, &db).await;
+        crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
+        crate::fabric::reconcile_security(&state.ctx, &db).await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();
@@ -304,9 +364,9 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                 let result = pull(
                     &db,
                     &peer,
-                    &state.client,
-                    &state.cluster,
-                    state.auth.as_ref(),
+                    &state.ctx.client,
+                    &state.ctx.cluster,
+                    state.ctx.auth.as_ref(),
                 )
                 .await;
                 match result {
@@ -403,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_bulk_get_does_not_advance_the_checkpoint() {
-        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "ae",
@@ -441,7 +501,7 @@ mod tests {
 
         let first = pull(&db, &peer, &client, &cluster, None).await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
-        let map_tag = crate::db::hex(&Md5::digest(
+        let map_tag = crate::util::hex(&Md5::digest(
             serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
         ));
         let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{peer}:{map_tag}");
@@ -505,7 +565,7 @@ mod tests {
             }}]}]}))
         }
 
-        let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "ae",

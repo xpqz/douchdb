@@ -1,8 +1,8 @@
 //! Cluster-wide metadata changes coordinated from one node: shard-map
 //! updates, rebalance and security-object propagation.
 
-use crate::api::{internal_request, is_forwarded, AppState};
 use crate::cluster::ShardMap;
+use crate::cluster_http::{internal_request, ClusterCtx};
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -17,20 +17,20 @@ use std::sync::Arc;
 /// and peers never move back to an older version. Returns whether a majority
 /// of the cluster, this node included, holds the object now.
 pub(crate) async fn set_security_everywhere(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Db,
     name: &str,
     value: Value,
     headers: &HeaderMap,
 ) -> DbResult<bool> {
     let version = db.set_security(value.clone())?;
-    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
         return Ok(true);
     }
     let envelope = json!({"version": version, "security": value});
-    let responses = join_all(st.cluster.peers().map(|peer| {
+    let responses = join_all(ctx.cluster.peers().map(|peer| {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::PUT,
             peer,
             &["_node", "_local", "_dbs", name, "security"],
@@ -47,7 +47,7 @@ pub(crate) async fn set_security_everywhere(
     }))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
-    Ok(acknowledgements > st.cluster.nodes.len().max(1) / 2)
+    Ok(acknowledgements > ctx.cluster.nodes.len().max(1) / 2)
 }
 
 fn shard_map_rejected() -> ApiError {
@@ -59,18 +59,18 @@ fn shard_map_rejected() -> ApiError {
 }
 
 pub(crate) async fn apply_shard_map(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     name: &str,
     mut map: ShardMap,
     headers: &HeaderMap,
 ) -> DbResult<(ShardMap, bool)> {
-    if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
+    if map.q != db.q || map.node_count != ctx.cluster.nodes.len().max(1) {
         return Err(ApiError::bad_request(
             "shard map does not match database q or cluster node count",
         ));
     }
-    let internal = is_forwarded(st, headers);
+    let internal = ctx.cluster.is_internal(headers);
     if internal {
         if !db.set_shard_map(map.clone())? {
             return Err(shard_map_rejected());
@@ -85,19 +85,19 @@ pub(crate) async fn apply_shard_map(
 
     let payload = serde_json::to_vec(&map)
         .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-    let peers: Vec<String> = st
+    let peers: Vec<String> = ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != ctx.cluster.me)
         .map(|(_, peer)| peer.clone())
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
             let request = internal_request(
-                st,
+                ctx,
                 reqwest::Method::PUT,
                 &peer,
                 &["_node", "_local", "_dbs", name],
@@ -123,7 +123,7 @@ pub(crate) async fn apply_shard_map(
         // anti-entropy converges every node on the tiebreak winner.
         return Err(shard_map_rejected());
     }
-    let quorum = st.cluster.nodes.len().max(1) / 2 + 1;
+    let quorum = ctx.cluster.nodes.len().max(1) / 2 + 1;
     let pending = acknowledgements < quorum;
     if pending {
         db.set_pending_shard_map(&map)?;
@@ -135,19 +135,19 @@ pub(crate) async fn apply_shard_map(
 }
 
 async fn fetch_shard_states(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     node: usize,
     headers: &HeaderMap,
     with_digest: bool,
 ) -> Option<Vec<ShardState>> {
-    if node == st.cluster.me {
+    if node == ctx.cluster.me {
         return db.shard_states(with_digest).await.ok();
     }
     let request = internal_request(
-        st,
+        ctx,
         reqwest::Method::GET,
-        &st.cluster.nodes[node],
+        &ctx.cluster.nodes[node],
         &["_node", "_local", "_dbs", &db.name, "shards"],
         Some(headers),
     );
@@ -213,7 +213,7 @@ fn source_required(
 /// accepted just before the freeze may still be finishing, so brief
 /// disagreement is retried rather than reported as corruption.
 async fn stable_source_states(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     old_map: &ShardMap,
     headers: &HeaderMap,
@@ -222,7 +222,8 @@ async fn stable_source_states(
     let deadline = std::time::Instant::now() + grace;
     loop {
         let states = futures::future::join_all(
-            (0..st.cluster.nodes.len()).map(|node| fetch_shard_states(st, db, node, headers, true)),
+            (0..ctx.cluster.nodes.len())
+                .map(|node| fetch_shard_states(ctx, db, node, headers, true)),
         )
         .await;
         if let Some(required) = source_required(&states, old_map, db.q, true) {
@@ -240,7 +241,7 @@ async fn stable_source_states(
 }
 
 async fn wait_for_rebalance(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     old_map: &ShardMap,
     map: &ShardMap,
@@ -255,8 +256,8 @@ async fn wait_for_rebalance(
         // Counts are cheap and prune most retry rounds; compare digests only
         // after every target has caught up on the source counts.
         let counts = futures::future::join_all(
-            (0..st.cluster.nodes.len())
-                .map(|node| fetch_shard_states(st, db, node, headers, false)),
+            (0..ctx.cluster.nodes.len())
+                .map(|node| fetch_shard_states(ctx, db, node, headers, false)),
         )
         .await;
         let counts_ready = source_required(&counts, old_map, db.q, false)
@@ -280,8 +281,8 @@ async fn wait_for_rebalance(
             .unwrap_or(false);
         if counts_ready {
             let digests = futures::future::join_all(
-                (0..st.cluster.nodes.len())
-                    .map(|node| fetch_shard_states(st, db, node, headers, true)),
+                (0..ctx.cluster.nodes.len())
+                    .map(|node| fetch_shard_states(ctx, db, node, headers, true)),
             )
             .await;
             let ready = source_required(&digests, old_map, db.q, true)
@@ -322,13 +323,13 @@ async fn wait_for_rebalance(
 }
 
 async fn cleanup_all_replicas(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
-    let responses = futures::future::join_all(st.cluster.nodes.iter().map(|peer| {
+    let responses = futures::future::join_all(ctx.cluster.nodes.iter().map(|peer| {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::POST,
             peer,
             &["_node", "_local", "_dbs", &db.name, "cleanup"],
@@ -371,7 +372,7 @@ struct MigrationRefused {
 }
 
 async fn send_migration(
-    st: &AppState,
+    ctx: &ClusterCtx,
     peer: &str,
     name: &str,
     map: Option<&ShardMap>,
@@ -380,9 +381,9 @@ async fn send_migration(
     let segments = ["_node", "_local", "_dbs", name, "migration"];
     let request = match map {
         Some(map) => {
-            internal_request(st, reqwest::Method::PUT, peer, &segments, Some(headers)).json(map)
+            internal_request(ctx, reqwest::Method::PUT, peer, &segments, Some(headers)).json(map)
         }
-        None => internal_request(st, reqwest::Method::DELETE, peer, &segments, Some(headers)),
+        None => internal_request(ctx, reqwest::Method::DELETE, peer, &segments, Some(headers)),
     };
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
@@ -398,14 +399,14 @@ async fn send_migration(
 }
 
 async fn set_migration_everywhere(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Db,
     name: &str,
     map: &ShardMap,
     headers: &HeaderMap,
 ) -> DbResult<()> {
     db.set_migration_map(map.clone())?;
-    let peers: Vec<String> = st.cluster.peers().cloned().collect();
+    let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that
     // migration; clearing them would unfreeze the other coordinator.
@@ -415,7 +416,7 @@ async fn set_migration_everywhere(
     }
     if failures.is_empty() {
         for peer in &peers {
-            if let Err(refused) = send_migration(st, peer, name, Some(map), headers).await {
+            if let Err(refused) = send_migration(ctx, peer, name, Some(map), headers).await {
                 if refused.conflict {
                     foreign.push(peer.clone());
                 }
@@ -428,7 +429,7 @@ async fn set_migration_everywhere(
     }
     db.clear_migration_map();
     for peer in peers.iter().filter(|peer| !foreign.contains(peer)) {
-        let _ = send_migration(st, peer, name, None, headers).await;
+        let _ = send_migration(ctx, peer, name, None, headers).await;
     }
     Err(ApiError::new(
         502,
@@ -440,17 +441,17 @@ async fn set_migration_everywhere(
     ))
 }
 
-async fn clear_migration_everywhere(st: &AppState, db: &Db, name: &str, headers: &HeaderMap) {
+async fn clear_migration_everywhere(ctx: &ClusterCtx, db: &Db, name: &str, headers: &HeaderMap) {
     db.clear_migration_map();
-    for peer in st.cluster.peers() {
-        if let Err(error) = send_migration(st, peer, name, None, headers).await {
+    for peer in ctx.cluster.peers() {
+        if let Err(error) = send_migration(ctx, peer, name, None, headers).await {
             tracing::warn!("migration map clear on {}", error.message);
         }
     }
 }
 
 async fn activate_map_everywhere(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Db,
     name: &str,
     map: &ShardMap,
@@ -458,11 +459,11 @@ async fn activate_map_everywhere(
 ) -> DbResult<()> {
     let old = db.shard_map();
     db.set_shard_map(map.clone())?;
-    let peers: Vec<String> = st.cluster.peers().cloned().collect();
+    let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::PUT,
             peer,
             &["_node", "_local", "_dbs", name],
@@ -486,7 +487,7 @@ async fn activate_map_everywhere(
     let _ = db.set_shard_map(rollback.clone());
     for peer in &peers {
         let request = internal_request(
-            st,
+            ctx,
             reqwest::Method::PUT,
             peer,
             &["_node", "_local", "_dbs", name],
@@ -513,7 +514,7 @@ async fn activate_map_everywhere(
 /// every node then clears the shards it no longer owns. Returns the new map
 /// with `pending` and, after a cleanup, `cleaned`.
 pub(crate) async fn rebalance(
-    st: &AppState,
+    ctx: &ClusterCtx,
     db: &Arc<Db>,
     name: &str,
     headers: &HeaderMap,
@@ -531,18 +532,18 @@ pub(crate) async fn rebalance(
     }
     crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
-    let mut map = ShardMap::balanced(db.q, st.cluster.nodes.len().max(1), old_map.n());
+    let mut map = ShardMap::balanced(db.q, ctx.cluster.nodes.len().max(1), old_map.n());
     map.version = old_map.version.saturating_add(1);
     // Broadcast the migration map first: it freezes writes on every peer and
     // lets anti-entropy seed the target replicas while reads stay on the old
     // active map.
-    if let Err(error) = set_migration_everywhere(st, db, name, &map, headers).await {
+    if let Err(error) = set_migration_everywhere(ctx, db, name, &map, headers).await {
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
 
     if let Err(error) = stable_source_states(
-        st,
+        ctx,
         db,
         &old_map,
         headers,
@@ -551,15 +552,15 @@ pub(crate) async fn rebalance(
     )
     .await
     {
-        clear_migration_everywhere(st, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, headers).await;
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
 
-    if let Err(error) = wait_for_rebalance(st, db, &old_map, &map, headers, timeout_ms).await {
+    if let Err(error) = wait_for_rebalance(ctx, db, &old_map, &map, headers, timeout_ms).await {
         // The active map never changed, so reads continued on the old owners
         // throughout the migration attempt.
-        clear_migration_everywhere(st, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, headers).await;
         db.set_rebalance_in_progress(false);
         if error.status == 504 {
             crate::telemetry::record_rebalance_timeout();
@@ -567,12 +568,12 @@ pub(crate) async fn rebalance(
         return Err(error);
     }
 
-    if let Err(error) = activate_map_everywhere(st, db, name, &map, headers).await {
-        clear_migration_everywhere(st, db, name, headers).await;
+    if let Err(error) = activate_map_everywhere(ctx, db, name, &map, headers).await {
+        clear_migration_everywhere(ctx, db, name, headers).await;
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
-    clear_migration_everywhere(st, db, name, headers).await;
+    clear_migration_everywhere(ctx, db, name, headers).await;
     db.set_rebalance_in_progress(false);
 
     let mut value = json!(map.clone());
@@ -581,7 +582,7 @@ pub(crate) async fn rebalance(
         return Ok(value);
     }
 
-    let cleaned = cleanup_all_replicas(st, db, headers).await?;
+    let cleaned = cleanup_all_replicas(ctx, db, headers).await?;
     let cleared = cleaned
         .iter()
         .filter_map(|response| response["cleared"].as_array())

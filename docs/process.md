@@ -28,5 +28,6 @@
 
 - **Never silence dead code with `#[allow(dead_code)]`.** Delete unused code
   instead; git history keeps it if it is needed again. An allowance hides the
-  item from every later dead-code check, and modules are `pub`, so the compiler
-  no longer reports unused public items on its own.
+  item from every later dead-code check. Modules are `pub(crate)` for the same
+  reason: a `pub` item is exempt from the lint, so `lib.rs` re-exports only
+  what `main.rs` and the tests use, and everything else stays visible to rustc.
