@@ -394,13 +394,13 @@ pub async fn db_rest(
     }
 
     match rest.as_str() {
-        "_bulk_docs" => return bulk_docs(&st, &db, &name, &q, &body, &headers).await,
-        "_bulk_get" => return bulk_get(&st, &db, &name, &q, &body, &headers).await,
+        "_bulk_docs" => return bulk_docs(req).await,
+        "_bulk_get" => return bulk_get(req).await,
         "_all_docs" => return all_docs(req, None).await,
         "_design_docs" => return design_docs(req).await,
         "_local_docs" => return local_docs(req).await,
-        "_changes" => return changes(st.clone(), db.clone(), &name, &q, &body, &headers).await,
-        "_revs_diff" => return revs_diff(&st, &db, &name, &body, &headers).await,
+        "_changes" => return changes(st.clone(), db.clone(), req).await,
+        "_revs_diff" => return revs_diff(req).await,
         "_purge" => {
             return match serde_json::from_slice::<Value>(&body) {
                 Ok(v) => match db.purge(&v).await {
