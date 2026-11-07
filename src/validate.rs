@@ -234,8 +234,8 @@ fn run_validator(
         .to_string();
     let body = serde_json::to_string(new_doc)
         .map_err(|error| ApiError::new(500, "unknown_error", error.to_string()))?;
-    let rows = run_map_json(&wrapped, &[(id, body)], ViewLimits::default())
-        .map_err(|error| ApiError::new(500, "unknown_error", error))?;
+    let rows =
+        run_map_json(&wrapped, &[(id, body)], ViewLimits::default()).map_err(ApiError::from)?;
     let Some(row) = rows.first() else {
         return Err(ApiError::new(
             500,

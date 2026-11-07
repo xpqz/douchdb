@@ -11,6 +11,7 @@ use base64::Engine;
 use serde_json::Value;
 
 use crate::etf;
+use crate::js::JsError;
 
 mod bias;
 
@@ -114,8 +115,8 @@ impl Sketch {
         Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
-    pub(crate) fn from_json(value: &Value) -> Result<Sketch, String> {
-        let bad = || "invalid _approx_count_distinct partial".to_string();
+    pub(crate) fn from_json(value: &Value) -> Result<Sketch, JsError> {
+        let bad = || JsError::Invalid("invalid _approx_count_distinct partial".to_string());
         let text = value.as_str().ok_or_else(bad)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(text)
@@ -163,7 +164,7 @@ pub(crate) fn partial<'a>(keys: impl IntoIterator<Item = &'a Value>) -> Value {
 }
 
 /// Union partial sketches into one partial.
-pub(crate) fn combine(partials: &[Value]) -> Result<Value, String> {
+pub(crate) fn combine(partials: &[Value]) -> Result<Value, JsError> {
     let mut merged = Sketch::new();
     for part in partials {
         merged.union(&Sketch::from_json(part)?);
@@ -172,7 +173,7 @@ pub(crate) fn combine(partials: &[Value]) -> Result<Value, String> {
 }
 
 /// The reported count for a partial.
-pub(crate) fn finish(partial: &Value) -> Result<Value, String> {
+pub(crate) fn finish(partial: &Value) -> Result<Value, JsError> {
     Ok(Value::from(Sketch::from_json(partial)?.count()))
 }
 

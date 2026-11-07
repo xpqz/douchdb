@@ -72,11 +72,45 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+/// The status and reason for a JavaScript or view-index failure with no
+/// context of its own. Callers that name what failed (a map, reduce or
+/// search index function) wrap the text themselves.
+impl From<crate::js::JsError> for ApiError {
+    fn from(e: crate::js::JsError) -> Self {
+        use crate::js::JsError;
+        match e {
+            JsError::Index(reason) => ApiError::new(500, "view_index_error", reason),
+            JsError::InvalidValue(reason) => ApiError::new(500, "invalid_value", reason),
+            other => ApiError::new(500, "unknown_error", other.to_string()),
+        }
+    }
+}
+
 pub type DbResult<T> = std::result::Result<T, ApiError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_errors_keep_their_status_and_reason() {
+        use crate::js::JsError;
+        let index = ApiError::from(JsError::Index("lock held".to_string()));
+        assert_eq!(
+            (index.status, index.error, index.reason.as_str()),
+            (500, "view_index_error", "lock held")
+        );
+        let invalid = ApiError::from(JsError::InvalidValue("bad _stats".to_string()));
+        assert_eq!(
+            (invalid.status, invalid.error, invalid.reason.as_str()),
+            (500, "invalid_value", "bad _stats")
+        );
+        let other = ApiError::from(JsError::Runtime("Error: x".to_string()));
+        assert_eq!(
+            (other.status, other.error, other.reason.as_str()),
+            (500, "unknown_error", "Error: x")
+        );
+    }
 
     #[test]
     fn anyhow_conversion_keeps_the_cause_chain() {

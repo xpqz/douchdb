@@ -3316,7 +3316,7 @@ fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<
                 &docs,
                 crate::view::ViewLimits::default(),
             )
-            .map_err(|reason| ApiError::new(500, "unknown_error", reason))?;
+            .map_err(ApiError::from)?;
             Ok(rows
                 .into_iter()
                 .filter(|row| matched.contains(&row.id))

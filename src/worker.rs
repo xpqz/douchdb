@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::time::Instant;
 
 /// Serve the worker protocol on stdin/stdout until EOF.
-pub fn run_stdio(landlock: &str) -> Result<(), String> {
+pub fn run_stdio(landlock: &str) -> Result<(), crate::js::JsError> {
     crate::js::run_worker_stdio(landlock, handle_request)
 }
 
@@ -78,7 +78,7 @@ pub fn handle_request(request: Value) -> Value {
             "timed out after {} ms: {error}",
             limits.timeout.as_millis()
         )),
-        other => other,
+        other => other.map_err(|error| error.to_string()),
     };
     match result {
         Ok(value) => json!({"ok": true, "value": value}),
