@@ -637,6 +637,7 @@ async fn cors_is_opt_in_and_answers_preflight() {
         &[
             "--cors-origins".to_string(),
             "http://example.test,https://*.trusted.test".to_string(),
+            "--cors-credentials".to_string(),
         ],
         false,
     );
@@ -703,6 +704,129 @@ async fn cors_is_opt_in_and_answers_preflight() {
         .headers()
         .get("access-control-allow-origin")
         .is_none());
+}
+
+/// CouchDB's `[cors]` defaults: `credentials = false`, and preflight only
+/// allows the configured headers rather than echoing whatever was asked for.
+#[tokio::test]
+async fn cors_credentials_and_headers_follow_couchdb_defaults() {
+    let preflight = |server: &Server, requested: &'static str| {
+        server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", "http://example.test")
+            .header("Access-Control-Request-Method", "PUT")
+            .header("Access-Control-Request-Headers", requested)
+            .send()
+    };
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+
+    // Default: no credentials, and a header outside the allowed list is refused.
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "content-type, authorization").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+    let allowed = header(&response, "access-control-allow-headers").unwrap_or_default();
+    assert!(allowed.contains("content-type"), "{allowed}");
+    assert_ne!(allowed, "content-type, authorization", "must not echo");
+    let response = preflight(&s, "x-evil-header").await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-origin").as_deref(),
+        Some("http://example.test")
+    );
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+
+    // Opt in to credentials and to an extra header.
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+            "--cors-credentials".to_string(),
+            "--cors-headers".to_string(),
+            "X-Custom-Header".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "x-custom-header, content-type")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+}
+
+/// The console is the one HTML surface, so it carries a Content-Security-Policy.
+/// The Vue build compiles in-DOM templates at runtime, which needs
+/// `'unsafe-eval'`; everything else is locked down to the same origin.
+#[tokio::test]
+async fn console_responses_carry_a_content_security_policy() {
+    let s = Server::start(false);
+    for path in ["/_utils/", "/_utils/app.js", "/_utils/style.css"] {
+        let response = s
+            .client
+            .get(format!("{}{path}", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"));
+        for directive in [
+            "default-src 'none'",
+            "script-src 'self' 'unsafe-eval'",
+            "frame-ancestors 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+        ] {
+            assert!(csp.contains(directive), "{path}: {csp}");
+        }
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+    }
+    // API responses are JSON and get none.
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.headers().get("content-security-policy").is_none());
 }
 
 #[tokio::test]
@@ -4148,9 +4272,15 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
-/// An `AuthSession` cookie value for `name`, signed with `key`, in the format
-/// the server issues: `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`.
-fn forged_cookie(key: &[u8], name: &str) -> String {
+/// An `AuthSession` cookie value for `name`, in the format the server issues:
+/// `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`. The HMAC key is the
+/// session secret plus the SHA-256 of the user's credential, here the admin
+/// password.
+fn forged_cookie(secret: &[u8], password: &str, name: &str) -> String {
+    use sha2::Digest;
+    let mut key = secret.to_vec();
+    key.extend_from_slice(&sha2::Sha256::digest(password.as_bytes()));
+    let key = key.as_slice();
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let exp = std::time::SystemTime::now()
@@ -4184,7 +4314,7 @@ async fn status_with_cookie(s: &Server, cookie: &str) -> StatusCode {
 #[tokio::test]
 async fn session_key_is_not_derived_from_admin_password() {
     let s = Server::start(true);
-    let forged = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let forged = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(
         status_with_cookie(&s, &forged).await,
         StatusCode::UNAUTHORIZED
@@ -4196,10 +4326,87 @@ async fn session_key_is_not_derived_from_admin_password() {
 async fn session_secret_flag_signs_cookies() {
     let secret = "an-explicit-session-secret";
     let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
-    let good = forged_cookie(secret.as_bytes(), "admin");
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &good).await, StatusCode::OK);
-    let bad = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let bad = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
+}
+
+/// One malformed `AuthSession` cookie must not hide a valid one that follows.
+#[tokio::test]
+async fn malformed_session_cookie_does_not_hide_a_valid_one() {
+    let secret = "an-explicit-session-secret";
+    let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
+    for junk in [
+        "AuthSession=!!!.!!!",
+        "AuthSession=%%%",
+        "AuthSession=Zm9v.!!!",
+    ] {
+        let both = format!("{junk}; {good}");
+        assert_eq!(
+            status_with_cookie(&s, &both).await,
+            StatusCode::OK,
+            "{both}"
+        );
+    }
+    assert_eq!(
+        status_with_cookie(&s, "AuthSession=!!!.!!!").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A cookie is signed with the session secret plus the user's credential
+/// digest (CouchDB mixes the user salt into its cookie HMAC key), so rotating
+/// a token in the users file revokes that user's sessions at once.
+#[tokio::test]
+async fn rotating_a_user_token_revokes_existing_sessions() {
+    let users = UsersFile::new(USERS);
+    let mut s = Server::start_with(&users_server_args(&users), true);
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-token"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &cookie).await, StatusCode::OK);
+
+    // Same name and roles, new token.
+    std::fs::write(&users.path, USERS.replace("alice-token", "alice-rotated")).unwrap();
+    s.restart();
+    assert_eq!(
+        status_with_cookie(&s, &cookie).await,
+        StatusCode::UNAUTHORIZED,
+        "the old cookie must not outlive the old token"
+    );
+    // The new token logs in and its cookie works.
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-rotated"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &fresh).await, StatusCode::OK);
 }
 
 /// Without `--session-secret` the server generates a random key once, keeps it

@@ -117,9 +117,15 @@ pub struct Config {
     pub seeds: Vec<String>,
     /// The URL this node advertises in cluster management views.
     pub advertise: String,
-    /// Empty disables CORS. `*` allows any origin (echoed back so credentials
-    /// work); entries may be exact origins or `https://*.example.com`.
+    /// Empty disables CORS. `*` allows any origin (echoed back, so it also
+    /// works with credentials); entries may be exact origins or `https://*.example.com`.
     pub cors_origins: Vec<String>,
+    /// Send `Access-Control-Allow-Credentials: true` (CouchDB `[cors]
+    /// credentials`, default false).
+    pub cors_credentials: bool,
+    /// Request headers allowed beyond the built-in list (CouchDB `[cors]
+    /// headers`), lowercase.
+    pub cors_headers: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     /// When true, a database with an empty `_security` object is admin-only.
@@ -367,10 +373,6 @@ impl AppState {
         }
         principal
     }
-
-    pub(crate) fn authorized(&self, headers: &HeaderMap) -> bool {
-        self.principal(headers).is_authenticated()
-    }
 }
 
 /// How long the filesystem part of the health check is reused. `/_health` is
@@ -418,6 +420,8 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             seeds: Vec::new(),
             advertise: String::new(),
             cors_origins: Vec::new(),
+            cors_credentials: false,
+            cors_headers: Vec::new(),
             view_timeout_ms: 1000,
             view_memory_mb: 1,
             default_admin_only: true,

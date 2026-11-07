@@ -11,6 +11,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,28 +48,20 @@ impl Principal {
 #[derive(Clone, Debug)]
 struct User {
     name: String,
-    token: Option<String>,
-    token_sha256: Option<[u8; 32]>,
+    /// SHA-256 of each credential the user may present: of `token`, and the
+    /// configured `token_sha256`. Plaintext tokens are not kept.
+    digests: Vec<[u8; 32]>,
     roles: Vec<String>,
     admin: bool,
+    /// Digest of the user's credentials, mixed into the cookie key.
+    salt: [u8; 32],
 }
 
 impl User {
-    fn matches_token(&self, token: &str) -> bool {
-        // An empty credential never authenticates, whatever the entry holds.
-        if token.is_empty() {
-            return false;
-        }
-        if let Some(expected) = &self.token {
-            if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
-                return true;
-            }
-        }
-        if let Some(expected) = self.token_sha256 {
-            let digest = Sha256::digest(token.as_bytes());
-            return constant_time_eq(&expected, &digest);
-        }
-        false
+    fn matches_digest(&self, digest: &[u8; 32]) -> bool {
+        self.digests.iter().fold(false, |found, expected| {
+            found | constant_time_eq(expected, digest)
+        })
     }
 }
 
@@ -132,6 +125,12 @@ pub struct Auth {
     pub user: String,
     pub pass: String,
     users: Vec<User>,
+    /// Index into `users` by name.
+    by_name: HashMap<String, usize>,
+    /// Index into `users` by the SHA-256 of a credential, so a bearer token
+    /// costs one hash and one lookup whatever the number of users. The first
+    /// user in the file wins a shared token.
+    by_digest: HashMap<[u8; 32], usize>,
     secret: Vec<u8>,
 }
 
@@ -144,8 +143,19 @@ impl Auth {
             user,
             pass,
             users: Vec::new(),
+            by_name: HashMap::new(),
+            by_digest: HashMap::new(),
             secret,
         }
+    }
+
+    fn add_user(&mut self, user: User) {
+        let index = self.users.len();
+        self.by_name.insert(user.name.clone(), index);
+        for digest in &user.digests {
+            self.by_digest.entry(*digest).or_insert(index);
+        }
+        self.users.push(user);
     }
 
     /// Load a users file. `admin` is optional; when present, the config admin
@@ -165,7 +175,8 @@ impl Auth {
             .get("users")
             .and_then(Value::as_array)
             .ok_or_else(|| "users file must contain a `users` array".to_string())?;
-        let mut users: Vec<User> = Vec::with_capacity(entries.len());
+        let (user, pass) = admin.clone().unwrap_or_default();
+        let mut auth = Auth::new(user, pass, secret);
         for entry in entries {
             let name = entry
                 .get("name")
@@ -173,7 +184,7 @@ impl Auth {
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| "each user needs a non-empty `name`".to_string())?
                 .to_string();
-            if users.iter().any(|user| user.name == name) {
+            if auth.by_name.contains_key(&name) {
                 return Err(format!("duplicate user `{name}`"));
             }
             if admin.as_ref().is_some_and(|(user, _)| *user == name) {
@@ -220,21 +231,21 @@ impl Auth {
                 .unwrap_or_default();
             let admin = entry.get("admin").and_then(Value::as_bool).unwrap_or(false)
                 || roles.iter().any(|role| role == "_admin");
-            users.push(User {
+            let digests: Vec<[u8; 32]> = token
+                .iter()
+                .map(|token| Sha256::digest(token.as_bytes()).into())
+                .chain(token_sha256)
+                .collect();
+            let salt = credential_salt(&digests);
+            auth.add_user(User {
                 name,
-                token,
-                token_sha256,
+                digests,
                 roles,
                 admin,
+                salt,
             });
         }
-        let (user, pass) = admin.unwrap_or_default();
-        Ok(Auth {
-            user,
-            pass,
-            users,
-            secret,
-        })
+        Ok(auth)
     }
 
     fn principal_for_user(&self, user: &User) -> Principal {
@@ -257,17 +268,20 @@ impl Auth {
                 admin: true,
             });
         }
-        self.users
-            .iter()
-            .find(|user| user.name == name)
-            .map(|user| self.principal_for_user(user))
+        let user = self.users.get(*self.by_name.get(name)?)?;
+        Some(self.principal_for_user(user))
     }
 
     fn token_principal(&self, token: &str) -> Option<Principal> {
-        self.users
-            .iter()
-            .find(|user| user.matches_token(token))
-            .map(|user| self.principal_for_user(user))
+        // An empty credential never authenticates, whatever the entry holds.
+        if token.is_empty() {
+            return None;
+        }
+        // The lookup key is a SHA-256 digest, so its timing reveals nothing
+        // an attacker can steer towards a stored token.
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let user = self.users.get(*self.by_digest.get(&digest)?)?;
+        Some(self.principal_for_user(user))
     }
 
     fn password_principal(&self, name: &str, password: &str) -> Option<Principal> {
@@ -284,10 +298,10 @@ impl Auth {
                 admin: true,
             });
         }
-        self.users
-            .iter()
-            .find(|user| user.name == name && user.matches_token(password))
-            .map(|user| self.principal_for_user(user))
+        let user = self.users.get(*self.by_name.get(name)?)?;
+        let digest: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+        user.matches_digest(&digest)
+            .then(|| self.principal_for_user(user))
     }
 
     /// Authenticate a name/token pair for `_session`.
@@ -339,8 +353,28 @@ impl Auth {
         self.basic_principal(header).is_some()
     }
 
-    fn sign(&self, payload: &str) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
+    /// The credential digest that keys `name`'s cookies, or `None` for an
+    /// unknown user.
+    fn cookie_salt(&self, name: &str) -> Option<[u8; 32]> {
+        if !self.user.is_empty() && name == self.user {
+            return Some(Sha256::digest(self.pass.as_bytes()).into());
+        }
+        self.users
+            .get(*self.by_name.get(name)?)
+            .map(|user| user.salt)
+    }
+
+    /// The cookie HMAC: keyed by the session secret plus the user's credential
+    /// digest, as CouchDB keys it with the secret plus the user's salt, so
+    /// changing a credential invalidates the user's sessions.
+    fn mac(&self, salt: &[u8; 32]) -> Hmac<Sha256> {
+        let mut key = self.secret.clone();
+        key.extend_from_slice(salt);
+        Hmac::<Sha256>::new_from_slice(&key).expect("hmac key")
+    }
+
+    fn sign(&self, name: &str, payload: &str) -> String {
+        let mut mac = self.mac(&self.cookie_salt(name).unwrap_or_default());
         mac.update(payload.as_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
@@ -360,7 +394,7 @@ impl Auth {
         let token = format!(
             "{}.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
-            self.sign(&payload)
+            self.sign(name, &payload)
         );
         format!("{COOKIE}={token}; Version=1; Path=/; HttpOnly; SameSite=Strict")
     }
@@ -377,21 +411,28 @@ impl Auth {
             let Some((payload_b64, sig)) = value.split_once('.') else {
                 continue;
             };
-            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(payload_b64)
-                .ok()?;
-            let payload = String::from_utf8(payload).ok()?;
-            let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(sig)
-                .ok()?;
-            let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
+            // A malformed cookie is skipped, not fatal: a valid one may follow.
+            let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+            else {
+                continue;
+            };
+            let Ok(payload) = String::from_utf8(payload) else {
+                continue;
+            };
+            let Ok(signature) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig) else {
+                continue;
+            };
+            let Some((user, exp)) = payload.rsplit_once(':') else {
+                continue;
+            };
+            let Some(salt) = self.cookie_salt(user) else {
+                continue;
+            };
+            let mut mac = self.mac(&salt);
             mac.update(payload.as_bytes());
             if mac.verify_slice(&signature).is_err() {
                 continue;
             }
-            let Some((user, exp)) = payload.rsplit_once(':') else {
-                continue;
-            };
             let Ok(exp) = exp.parse::<u64>() else {
                 continue;
             };
@@ -411,6 +452,15 @@ impl Auth {
     pub fn check_cookies(&self, header: Option<&str>) -> bool {
         self.cookie_user(header).is_some()
     }
+}
+
+/// Digest of a user's credentials, so a rotated token changes it.
+fn credential_salt(digests: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for digest in digests {
+        hasher.update(digest);
+    }
+    hasher.finalize().into()
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
@@ -586,6 +636,28 @@ mod tests {
     }
 
     #[test]
+    fn token_lookup_covers_plaintext_and_digest_and_first_user_wins() {
+        let auth = load(
+            r#"{"users":[
+                {"name":"first","token":"shared-token"},
+                {"name":"second","token":"shared-token"},
+                {"name":"both","token":"both-token-1",
+                 "token_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}
+            ]}"#,
+        )
+        .unwrap();
+        let name = |token: &str| auth.token_principal(token).and_then(|p| p.name);
+        assert_eq!(name("shared-token").as_deref(), Some("first"));
+        assert_eq!(name("both-token-1").as_deref(), Some("both"));
+        assert_eq!(name("secret").as_deref(), Some("both"));
+        assert_eq!(name("nope"), None);
+        // Basic auth still needs the right name for the token.
+        assert!(auth.authenticate("second", "shared-token").is_some());
+        assert!(auth.authenticate("both", "shared-token").is_none());
+        assert!(auth.authenticate("nobody", "shared-token").is_none());
+    }
+
+    #[test]
     fn admin_role_from_users_file() {
         let file = "douchdb-auth-test-admin-users.json";
         write_users(file);
@@ -651,12 +723,12 @@ mod tests {
     #[test]
     fn empty_credentials_never_authenticate_even_if_an_entry_exists() {
         let mut auth = Auth::new("admin".into(), String::new(), b"k".to_vec());
-        auth.users.push(User {
+        auth.add_user(User {
             name: "empty".into(),
-            token: Some(String::new()),
-            token_sha256: Some(Sha256::digest(b"").into()),
+            digests: vec![Sha256::digest(b"").into()],
             roles: vec![],
             admin: false,
+            salt: [0; 32],
         });
         let mut headers = HeaderMap::new();
         headers.insert(

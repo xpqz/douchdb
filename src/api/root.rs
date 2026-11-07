@@ -19,8 +19,13 @@ pub async fn up() -> Response {
     json(StatusCode::OK, json!({"status": "ok"}))
 }
 
-pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
-    if !st.authorized(&headers) {
+pub async fn all_dbs(
+    State(st): State<Arc<AppState>>,
+    Caller(principal): Caller,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !principal.is_authenticated() {
         return unauthorized();
     }
     let q = query(&uri);
@@ -57,7 +62,6 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
     names.sort();
     names.dedup();
 
-    let principal = st.principal(&headers);
     if !principal.admin {
         names = visible_db_names(&st, &principal, names).await;
     }

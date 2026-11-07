@@ -262,6 +262,8 @@ mod tests {
                 seeds,
                 advertise: String::new(),
                 cors_origins: Vec::new(),
+                cors_credentials: false,
+                cors_headers: Vec::new(),
                 view_timeout_ms: 1000,
                 view_memory_mb: 1,
                 default_admin_only: true,
