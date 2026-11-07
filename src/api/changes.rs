@@ -473,6 +473,8 @@ async fn changes_once(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<Value> {
+    #[cfg(test)]
+    record_changes_once(dbname);
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
@@ -489,4 +491,91 @@ async fn changes_once(
 
     let (opts, _) = changes_options(st, db, q, body, headers, local_only).await?;
     db.changes(&opts).await
+}
+
+/// `changes_once` calls per database name, so a test can tell whether an idle
+/// feed polls.
+#[cfg(test)]
+static CHANGES_ONCE_CALLS: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_changes_once(dbname: &str) {
+    let mut calls = CHANGES_ONCE_CALLS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match calls.iter_mut().find(|(name, _)| name == dbname) {
+        Some((_, count)) => *count += 1,
+        None => calls.push((dbname.to_string(), 1)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    fn changes_once_calls(dbname: &str) -> usize {
+        CHANGES_ONCE_CALLS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .find(|(name, _)| name == dbname)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// A continuous feed used to re-run `changes_once` every 50 ms for as long
+    /// as it was open. An idle one must wait for a commit instead, and a
+    /// commit must still wake it well before any fallback poll.
+    #[tokio::test]
+    async fn an_idle_continuous_feed_waits_for_a_commit_instead_of_polling() {
+        let root = std::env::temp_dir().join(format!("douchdb-idle-feed-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 500);
+        let db = st.create_db("idlefeed", false, None, None).await.unwrap();
+
+        let uri: Uri = "/idlefeed/_changes?feed=continuous&since=now&timeout=20000"
+            .parse()
+            .unwrap();
+        let q = query(&uri);
+        let headers = HeaderMap::new();
+        let body = Bytes::new();
+        let response = changes(
+            st.clone(),
+            db.clone(),
+            DbRequest {
+                st: &st,
+                db: &db,
+                name: "idlefeed",
+                method: &Method::GET,
+                uri: &uri,
+                q: &q,
+                headers: &headers,
+                body: &body,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut feed = response.into_body().into_data_stream();
+
+        // Nothing is written, so nothing arrives.
+        assert!(tokio::time::timeout(Duration::from_millis(600), feed.next())
+            .await
+            .is_err());
+        let calls = changes_once_calls("idlefeed");
+        assert!(calls <= 2, "an idle feed ran changes_once {calls} times");
+
+        // A commit wakes it long before a fallback poll could.
+        db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(3), feed.next())
+            .await
+            .expect("the feed did not wake for a commit")
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&line).contains("\"id\":\"a\""));
+
+        drop(feed);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

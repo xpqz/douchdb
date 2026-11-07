@@ -12040,6 +12040,84 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
     }
 }
 
+/// A streamed feed outlives the handler, so it must keep its admission permit
+/// until the body ends or the client goes away; otherwise any number of
+/// continuous feeds escape the per-user limit.
+#[tokio::test]
+async fn streaming_feed_holds_its_admission_permit_until_the_client_disconnects() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--max-in-flight".to_string(),
+        "8".to_string(),
+        "--per-user-in-flight".to_string(),
+        "1".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+    let alice = bearer("alice-token");
+    let bob = bearer("bob-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/feedlimit", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/feedlimit/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice", "bob"], "roles": []}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/feedlimit/d1",
+            Some(json!({})),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Alice opens a continuous feed and keeps the body open.
+    let mut request = s.client.get(format!(
+        "{}/feedlimit/_changes?feed=continuous&since=0&timeout=60000",
+        s.base
+    ));
+    for (name, value) in bearer("alice-token") {
+        request = request.header(name, value);
+    }
+    let mut feed = request.send().await.unwrap();
+    assert_eq!(feed.status(), StatusCode::OK);
+    assert!(feed.chunk().await.unwrap().is_some());
+
+    // The feed holds her only slot, so a normal request is limited...
+    let (status, body) = s.req_with(Method::GET, "/feedlimit", None, &alice).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    // ...while another user is not.
+    let (status, body) = s.req_with(Method::GET, "/feedlimit", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Disconnecting frees the slot.
+    drop(feed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, _) = s.req_with(Method::GET, "/feedlimit", None, &alice).await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice's slot was never released: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn global_admission_limit_protects_capacity_across_users() {
     let users = UsersFile::new(USERS);
