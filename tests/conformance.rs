@@ -1311,6 +1311,68 @@ async fn changes_filters_support_design_named_view_and_shorthand() {
 }
 
 #[tokio::test]
+async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
+    // A filter that rarely matches forces the scan to refill past several
+    // internal pages before the limit is met.
+    let s = Server::start(false);
+    s.fresh_db("chsparse").await;
+    let mut docs: Vec<Value> = (0..6000)
+        .map(|i| json!({"_id": format!("d{i:05}"), "hit": i % 1500 == 1499}))
+        .collect();
+    docs.push(json!({"_id": "_design/f",
+        "filters": {"hit": "function (doc) { return doc.hit === true; }"}}));
+    let (status, body) = s
+        .post("/chsparse/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, all) = s.get("/chsparse/_changes").await;
+    let all = all["results"].as_array().unwrap();
+    let expected: Vec<(&Value, &str)> = all
+        .iter()
+        .filter(|row| {
+            row["id"]
+                .as_str()
+                .map(|id| {
+                    id.starts_with('d')
+                        && id[1..].parse::<u32>().map(|i| i % 1500 == 1499) == Ok(true)
+                })
+                .unwrap_or(false)
+        })
+        .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(expected.len(), 4);
+
+    for limit in [1usize, 2, 3, 10] {
+        let (status, body) = s
+            .get(&format!("/chsparse/_changes?filter=f/hit&limit={limit}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["results"].as_array().unwrap();
+        let want = &expected[..limit.min(expected.len())];
+        let got: Vec<(&Value, &str)> = rows
+            .iter()
+            .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, want, "limit {limit}");
+        assert_eq!(
+            body["last_seq"],
+            **got.last().map(|(seq, _)| seq).unwrap(),
+            "limit {limit}"
+        );
+    }
+
+    // Starting after the second match leaves the other two.
+    let since = expected[1].0.clone();
+    let (_, body) = s
+        .get(&format!(
+            "/chsparse/_changes?filter=f/hit&limit=1&since={since}"
+        ))
+        .await;
+    assert_eq!(body["results"][0]["id"], json!(expected[2].1));
+}
+
+#[tokio::test]
 async fn bulk_docs_handles_local_docs_and_rejects_replicated_docs_without_rev() {
     let s = Server::start(false);
     s.fresh_db("bulkedge").await;
@@ -3128,6 +3190,21 @@ async fn all_dbs_pagination_and_dbs_info() {
     let (status, body) = s.post("/_dbs_info", json!({"keys": ["ccc"]})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["info"]["db_name"], "ccc");
+}
+
+#[tokio::test]
+async fn dbs_info_caps_the_number_of_keys_at_100() {
+    // CouchDB chttpd_misc: max_db_number_for_dbs_info_req defaults to 100 and
+    // a longer `keys` list is a 400 bad_request.
+    let s = Server::start(false);
+    let keys = |n: usize| -> Vec<String> { (0..n).map(|i| format!("nodb{i}")).collect() };
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(100)})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(100));
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(101)})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(body["reason"], "too_many_keys");
 }
 
 #[tokio::test]
