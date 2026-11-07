@@ -223,6 +223,22 @@ pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
     }
 }
 
+/// The wall-clock budget of one request. Each call of a batched reduce gets
+/// the full timeout, as a request of its own would, so the batch may take as
+/// many timeouts as it has calls.
+fn request_limits(request: &serde_json::Map<String, Value>, limits: ViewLimits) -> ViewLimits {
+    let calls = request
+        .get("calls")
+        .and_then(Value::as_array)
+        .map_or(1, |calls| calls.len().max(1));
+    ViewLimits {
+        timeout: limits
+            .timeout
+            .saturating_mul(u32::try_from(calls).unwrap_or(u32::MAX)),
+        ..limits
+    }
+}
+
 /// Syscalls the worker may make once it is serving requests: reading and
 /// writing the request pipes, memory management for QuickJS, futexes, clocks
 /// and exiting. Derived by tracing a worker through map, reduce, index,
@@ -450,9 +466,10 @@ fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value,
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
+    let budget = request_limits(&request, limits);
     let body = serde_json::to_vec(&Value::Object(request))
         .map_err(|error| JsError::Sandbox(error.to_string()))?;
-    wasm_run(&body, limits)
+    wasm_run(&body, budget)
 }
 
 #[cfg(feature = "wasm")]
@@ -992,6 +1009,7 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
+    let budget = request_limits(&request, limits);
     let body = serde_json::to_vec(&Value::Object(request))
         .map_err(|error| JsError::Worker(error.to_string()))?;
 
@@ -999,7 +1017,7 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
     let mut worker = pool.acquire()?;
     let mut last_error = JsError::Worker(String::new());
     for attempt in 0..2 {
-        match worker.request(&body, limits.timeout) {
+        match worker.request(&body, budget.timeout) {
             Ok(WorkerOutcome::Value(value)) => {
                 pool.release(worker);
                 return Ok(value);
