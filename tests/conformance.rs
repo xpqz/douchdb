@@ -3131,6 +3131,21 @@ async fn all_dbs_pagination_and_dbs_info() {
 }
 
 #[tokio::test]
+async fn dbs_info_caps_the_number_of_keys_at_100() {
+    // CouchDB chttpd_misc: max_db_number_for_dbs_info_req defaults to 100 and
+    // a longer `keys` list is a 400 bad_request.
+    let s = Server::start(false);
+    let keys = |n: usize| -> Vec<String> { (0..n).map(|i| format!("nodb{i}")).collect() };
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(100)})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(100));
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(101)})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(body["reason"], "Number of DBs in keys exceeds limit (100)");
+}
+
+#[tokio::test]
 async fn db_updates_reports_lifecycle_and_write_events() {
     let s = Server::start(false);
     let (_, baseline) = s.get("/_db_updates?since=0").await;
