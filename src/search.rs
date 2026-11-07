@@ -77,7 +77,7 @@ pub struct SearchRequest {
     pub partition: Option<String>,
     /// Internal: only return documents whose shard is marked here. Cluster
     /// coordinators use this to split a search into disjoint owner sets.
-    pub owner_shards: Option<Vec<bool>>,
+    pub owner_shards: Option<crate::cluster::ShardMask>,
     pub sort: Vec<(String, bool)>,
     pub highlight_fields: Vec<String>,
     pub highlight_pre: String,
@@ -1259,11 +1259,7 @@ fn collect_matches<'a>(
             }
         }
         if let Some(owner_shards) = &request.owner_shards {
-            if !owner_shards
-                .get(db.shard_index(&doc.id))
-                .copied()
-                .unwrap_or(false)
-            {
+            if !owner_shards.covers(db.shard_index(&doc.id)) {
                 continue;
             }
         }

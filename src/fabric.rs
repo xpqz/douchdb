@@ -1,6 +1,7 @@
 //! Cluster coordination: shard-map routing, replica selection, quorum
 //! reads/writes and internal node calls.
 
+use crate::cluster::ShardMask;
 use crate::cluster_http::{
     forward_client_auth, internal_request, internal_request_raw, ClusterCtx,
 };
@@ -20,9 +21,9 @@ use std::sync::Arc;
 /// node holds every shard, so the whole query can be answered locally instead
 /// of issuing one HTTP request per owner. Shards without a local replica stay
 /// with their primary owner and can still fall back to other replicas.
-pub(crate) fn preferred_shard_masks(ctx: &ClusterCtx, db: &Db) -> Vec<Vec<bool>> {
+pub(crate) fn preferred_shard_masks(ctx: &ClusterCtx, db: &Db) -> Vec<ShardMask> {
     let node_count = ctx.cluster.nodes.len().max(1);
-    let mut masks = vec![vec![false; db.q as usize]; node_count];
+    let mut masks = vec![ShardMask::none(db.q); node_count];
     let map = db.shard_map();
     for shard in 0..db.q {
         let replicas = map.replicas_of(shard);
@@ -32,7 +33,7 @@ pub(crate) fn preferred_shard_masks(ctx: &ClusterCtx, db: &Db) -> Vec<Vec<bool>>
             replicas.first().copied().unwrap_or(0)
         };
         if let Some(mask) = masks.get_mut(target) {
-            mask[shard as usize] = true;
+            mask.select(shard as usize);
         }
     }
     masks
@@ -882,18 +883,16 @@ pub(crate) async fn forward_json(
 /// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
 fn fallback_shard_masks(
     db: &Db,
-    owned_by_node: &[Vec<bool>],
+    owned_by_node: &[ShardMask],
     failed: &[usize],
     alive: &[usize],
-) -> DbResult<Vec<(usize, Vec<bool>)>> {
-    let mut groups: HashMap<usize, Vec<bool>> = HashMap::new();
+) -> DbResult<Vec<(usize, ShardMask)>> {
+    let mut groups: HashMap<usize, ShardMask> = HashMap::new();
     for &node in failed {
         for shard in 0..db.q {
             if !owned_by_node
                 .get(node)
-                .and_then(|owned| owned.get(shard as usize))
-                .copied()
-                .unwrap_or(false)
+                .is_some_and(|owned| owned.covers(shard as usize))
             {
                 continue;
             }
@@ -904,7 +903,8 @@ fn fallback_shard_masks(
                 .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
             groups
                 .entry(target)
-                .or_insert_with(|| vec![false; db.q as usize])[shard as usize] = true;
+                .or_insert_with(|| ShardMask::none(db.q))
+                .select(shard as usize);
         }
     }
     Ok(groups.into_iter().collect())
@@ -953,20 +953,20 @@ enum Round {
 /// when no request succeeds.
 async fn scatter<T, F, Fut>(
     read: ClusterRead<'_>,
-    owned_by_node: &[Vec<bool>],
+    owned_by_node: &[ShardMask],
     what: &str,
     fetch: F,
 ) -> DbResult<Vec<(usize, Round, T)>>
 where
-    F: Fn(usize, Vec<bool>, Round) -> Fut,
+    F: Fn(usize, ShardMask, Round) -> Fut,
     Fut: std::future::Future<Output = DbResult<T>>,
 {
     let ClusterRead { ctx, db, .. } = read;
-    let requests: Vec<(usize, Vec<bool>)> = owned_by_node
+    let requests: Vec<(usize, ShardMask)> = owned_by_node
         .iter()
         .cloned()
         .enumerate()
-        .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+        .filter(|(_, mask)| !mask.is_empty())
         .collect();
     crate::telemetry::record_fanout(requests.len() as u64);
     let responses = join_all(requests.into_iter().map(|(node, mask)| {
@@ -1119,7 +1119,7 @@ pub(crate) async fn fetch_all_docs(
     read: ClusterRead<'_>,
     node: usize,
     opts: &AllDocsOpts,
-    shards: Option<&[bool]>,
+    shards: Option<&ShardMask>,
 ) -> DbResult<Value> {
     let ClusterRead {
         ctx,
@@ -1136,13 +1136,7 @@ pub(crate) async fn fetch_all_docs(
     let peer = &ctx.cluster.nodes[node];
     let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(shards) = shards {
-        let selected: Vec<String> = shards
-            .iter()
-            .enumerate()
-            .filter(|(_, owned)| **owned)
-            .map(|(shard, _)| shard.to_string())
-            .collect();
-        query.push(("shards", selected.join(",")));
+        query.push(("shards", shards.query_value()));
     }
     if let Some(partition) = &opts.partition {
         query.push(("partition", partition.clone()));
@@ -1227,7 +1221,7 @@ async fn fetch_view_mask(
     spec: &crate::view::ViewSpec,
     limit: Option<usize>,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<ViewBatch> {
     let ClusterRead {
         ctx,
@@ -1239,7 +1233,7 @@ async fn fetch_view_mask(
         ddoc,
         name: view_name,
     } = view;
-    if !mask.iter().any(|owned| *owned) {
+    if mask.is_empty() {
         return Ok(ViewBatch::default());
     }
     // Owners apply the key range and return at most `limit` rows from their
@@ -1247,7 +1241,7 @@ async fn fetch_view_mask(
     let mut local = query.clone();
     local.skip = 0;
     local.limit = limit.unwrap_or(usize::MAX);
-    local.owner_shards = Some(mask.to_vec());
+    local.owner_shards = Some(mask.clone());
     if node == ctx.cluster.me {
         let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
         let docs = if query.include_docs || query.attachments {
@@ -1269,15 +1263,10 @@ async fn fetch_view_mask(
     }
 
     let peer = &ctx.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
+    let selected = mask.query_value();
     let mut params = vec![
         ("reduce", "false".to_string()),
-        ("shards", selected.join(",")),
+        ("shards", selected),
         (
             "include_docs",
             if query.include_docs { "true" } else { "false" }.to_string(),
@@ -1435,12 +1424,12 @@ pub(crate) async fn cluster_view_rows(
 /// paging, which applies to the merged groups. For `keys`, owners return one
 /// partial per distinct exact key, so the coordinator can rebuild the
 /// requested order, repeats and group levels.
-fn owner_reduce_query(query: &crate::view::ViewQuery, mask: &[bool]) -> crate::view::ViewQuery {
+fn owner_reduce_query(query: &crate::view::ViewQuery, mask: &ShardMask) -> crate::view::ViewQuery {
     let mut owner = query.clone();
     owner.skip = 0;
     owner.limit = usize::MAX;
     owner.reduce = Some(true);
-    owner.owner_shards = Some(mask.to_vec());
+    owner.owner_shards = Some(mask.clone());
     if let Some(keys) = &query.keys {
         owner.keys = Some(crate::view::unique_keys(keys));
         owner.group = true;
@@ -1455,7 +1444,7 @@ async fn fetch_reduce_mask(
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<Value> {
     let ClusterRead {
         ctx,
@@ -1473,16 +1462,8 @@ async fn fetch_reduce_mask(
     }
 
     let peer = &ctx.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
-    let mut params = vec![
-        ("reduce", "true".to_string()),
-        ("shards", selected.join(",")),
-    ];
+    let selected = mask.query_value();
+    let mut params = vec![("reduce", "true".to_string()), ("shards", selected)];
     if owner.group {
         params.push(("group", "true".to_string()));
     }
@@ -1658,14 +1639,6 @@ pub(crate) struct FallbackMark {
     seq: u64,
 }
 
-fn mask_shards(mask: &[bool]) -> Vec<usize> {
-    mask.iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard)
-        .collect()
-}
-
 /// One stream of changes with its own sequence space: a node reading its
 /// preferred shards, or a node reading shards reassigned from a failed owner.
 struct ChangeLane {
@@ -1727,7 +1700,7 @@ pub(crate) async fn cluster_changes(
             // Shards reassigned from a failed owner resume from the mark this
             // node left for exactly this set of shards, else from the start;
             // preferred masks are disjoint, so ids do not overlap.
-            let shards = mask_shards(&mask);
+            let shards = mask.shards();
             let since = match round {
                 Round::Owner => since_ref[node],
                 Round::Fallback => marks_ref
@@ -1826,7 +1799,7 @@ pub(crate) async fn fetch_node_changes(
     read: ClusterRead<'_>,
     changes: ChangesFetch<'_>,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
     since: u64,
     limit: Option<usize>,
 ) -> DbResult<Value> {
@@ -1854,21 +1827,15 @@ pub(crate) async fn fetch_node_changes(
                 doc_ids: doc_ids.map(|ids| ids.to_vec()),
                 filter: filter.cloned(),
                 conflicts: flag(q, "conflicts"),
-                owned: Some(mask.to_vec()),
+                owned: Some(mask.clone()),
                 until: None,
             })
             .await;
     }
 
     let peer = &ctx.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
-    let mut params: Vec<(&str, String)> =
-        vec![("since", since.to_string()), ("shards", selected.join(","))];
+    let selected = mask.query_value();
+    let mut params: Vec<(&str, String)> = vec![("since", since.to_string()), ("shards", selected)];
     if let Some(limit) = limit {
         params.push(("limit", limit.to_string()));
     }
@@ -1990,7 +1957,7 @@ pub(crate) async fn cluster_update_vector(
         .into_iter()
         .map(|(node, mask)| FallbackMark {
             node,
-            shards: mask_shards(&mask),
+            shards: mask.shards(),
             seq: vector.get(node).copied().unwrap_or(0),
         })
         .collect();
@@ -2246,7 +2213,7 @@ async fn fetch_search_mask(
     limits: crate::view::ViewLimits,
     window: usize,
     node: usize,
-    mask: &[bool],
+    mask: &ShardMask,
 ) -> DbResult<Value> {
     let ClusterRead {
         ctx,
@@ -2258,11 +2225,11 @@ async fn fetch_search_mask(
         ddoc,
         name: index_name,
     } = index;
-    if !mask.iter().any(|owned| *owned) {
+    if mask.is_empty() {
         return Ok(json!({"total_rows": 0, "rows": [], "bookmark": "search:0"}));
     }
     let mut local = request.clone();
-    local.owner_shards = Some(mask.to_vec());
+    local.owner_shards = Some(mask.clone());
     local.bookmark = None;
     local.limit = window;
     if node == ctx.cluster.me {
@@ -2270,17 +2237,12 @@ async fn fetch_search_mask(
     }
 
     let peer = &ctx.cluster.nodes[node];
-    let selected: Vec<String> = mask
-        .iter()
-        .enumerate()
-        .filter(|(_, owned)| **owned)
-        .map(|(shard, _)| shard.to_string())
-        .collect();
+    let selected = mask.query_value();
     let mut params: Vec<(&str, String)> = vec![
         ("q", request.query.clone()),
         ("limit", window.to_string()),
         ("timeout", request.timeout_ms.to_string()),
-        ("shards", selected.join(",")),
+        ("shards", selected),
     ];
     if request.include_docs {
         params.push(("include_docs", "true".to_string()));

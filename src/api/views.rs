@@ -430,7 +430,7 @@ pub(super) async fn view_request(
             query.owner_shards = Some(
                 (0..db.q)
                     .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
-                    .collect(),
+                    .collect::<ShardMask>(),
             );
         }
     }

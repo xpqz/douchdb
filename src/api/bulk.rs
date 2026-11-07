@@ -573,7 +573,7 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     } else if let Some(mask) = shard_mask {
         db.all_docs_owned(opts, &mask).await
     } else if flag(req.q, "owner_only") && is_forwarded(st, headers) {
-        let owned: Vec<bool> = (0..db.q)
+        let owned: ShardMask = (0..db.q)
             .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
             .collect();
         db.all_docs_owned(opts, &owned).await

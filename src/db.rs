@@ -6,7 +6,7 @@
 //! does not fsync, so this is process-crash durability, not power-loss
 //! durability.
 
-use crate::cluster::ShardMap;
+use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
@@ -98,7 +98,7 @@ pub(crate) fn changes_watermark_from(
     committed: &[u64],
     reserved: &[u64],
     since: u64,
-    owned: Option<&[bool]>,
+    owned: Option<&ShardMask>,
 ) -> u64 {
     let mut safe = u64::MAX;
     for index in 0..committed.len().min(reserved.len()) {
@@ -114,8 +114,8 @@ pub(crate) fn changes_watermark_from(
 
 /// Whether the shard at `index` is selected by an `owned` mask: every shard
 /// when there is no mask, and never one the mask does not cover.
-fn shard_owned(owned: Option<&[bool]>, index: usize) -> bool {
-    owned.is_none_or(|owned| owned.get(index).copied().unwrap_or(false))
+fn shard_owned(owned: Option<&ShardMask>, index: usize) -> bool {
+    owned.is_none_or(|owned| owned.covers(index))
 }
 
 /// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
@@ -1058,7 +1058,7 @@ impl Db {
     /// snapshot is higher and is left for the next request. (Computing this
     /// after the read is unsafe: a shard read before its commit, but
     /// committed by the time of the check, no longer holds the cursor back.)
-    pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
+    pub fn changes_watermark(&self, since: u64, owned: Option<&ShardMask>) -> u64 {
         // Load the counter first: an allocation it includes has already marked
         // its shard in flight (see `Stage::next_seq`).
         let allocated = self.seq.load(Ordering::SeqCst);
@@ -1313,14 +1313,14 @@ impl Db {
     /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
     /// coordinators use this to fetch each document from exactly one primary
     /// instead of merging the same replica from every node.
-    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &[bool]) -> DbResult<Value> {
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
     async fn all_docs_filtered(
         &self,
         opts: &AllDocsOpts,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         if let Some(keys) = &opts.keys {
             return self.all_docs_by_keys(opts, keys, owned).await;
@@ -1403,7 +1403,7 @@ impl Db {
     /// `Value` and serializing it again just to hand it to QuickJS.
     /// View documents from selected shards. Cluster nodes pass their owned
     /// shards so replicas do not pay to index documents they never serve.
-    pub async fn map_docs(&self, owned: Option<&[bool]>) -> DbResult<Vec<(String, String)>> {
+    pub async fn map_docs(&self, owned: Option<&ShardMask>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
         for index in self.selected_shards(owned) {
             let mut shard_docs = self.shards[index]
@@ -1447,7 +1447,10 @@ impl Db {
                         };
                         let doc = read_doc(s, &id, &doc_opts);
                         if let Some(doc) = skip_corrupt(s, &id, doc)? {
-                            docs.push((id, serde_json::to_string(&doc).map_err(ApiError::internal)?));
+                            docs.push((
+                                id,
+                                serde_json::to_string(&doc).map_err(ApiError::internal)?,
+                            ));
                         }
                     }
                     Ok(docs)
@@ -1462,7 +1465,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         keys: &[Value],
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
@@ -1558,8 +1561,8 @@ impl Db {
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
         let watermark = opts
             .until
-            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_deref()));
-        let selected = self.selected_shards(opts.owned.as_deref());
+            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_ref()));
+        let selected = self.selected_shards(opts.owned.as_ref());
         let until = if opts.descending {
             u64::MAX
         } else {
@@ -1598,13 +1601,13 @@ impl Db {
             .or(scanned_last)
             .unwrap_or(opts.since);
         let pending = self
-            .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
+            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
         Ok((rows, last_seq, pending))
     }
 
     /// Indexes of the shards in `owned`, or every shard.
-    fn selected_shards(&self, owned: Option<&[bool]>) -> Vec<usize> {
+    fn selected_shards(&self, owned: Option<&ShardMask>) -> Vec<usize> {
         (0..self.shards.len())
             .filter(|index| shard_owned(owned, *index))
             .collect()
@@ -1648,7 +1651,7 @@ impl Db {
         &self,
         after: u64,
         descending: bool,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
         let mut pending = 0usize;
         for index in self.selected_shards(owned) {
@@ -1701,7 +1704,7 @@ impl Db {
                 ));
                 return;
             }
-            let selected = db.selected_shards(opts.owned.as_deref());
+            let selected = db.selected_shards(opts.owned.as_ref());
             let mut cursors = vec![opts.since; selected.len()];
             let mut done = vec![false; selected.len()];
             let mut buffers: Vec<VecDeque<ChangeRow>> =
@@ -1710,7 +1713,7 @@ impl Db {
             // One snapshot for the whole stream, taken before any shard read.
             // The stream ends at the watermark; the client resumes from the
             // last row it received.
-            let watermark = db.changes_watermark(opts.since, opts.owned.as_deref());
+            let watermark = db.changes_watermark(opts.since, opts.owned.as_ref());
             let watermark = match db.changes_cutoff(&selected, &opts).await {
                 Ok(cutoff) => watermark.min(cutoff),
                 Err(error) => {
@@ -2545,8 +2548,10 @@ impl Stage<'_> {
         meta.seq = seq;
         meta.atts.insert(rev.clone(), atts);
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body).map_err(ApiError::internal)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
@@ -2583,8 +2588,10 @@ impl Stage<'_> {
             meta.tree.merge_path(&path, deleted);
         }
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body).map_err(ApiError::internal)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
@@ -2762,7 +2769,7 @@ pub struct ChangesOpts {
     pub filter: Option<ChangeFilter>,
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
-    pub owned: Option<Vec<bool>>,
+    pub owned: Option<ShardMask>,
     /// Internal: a watermark the caller already read with `changes_watermark`.
     /// Rows above it are withheld, and the feed does not take a newer one, so
     /// a caller that records it as its position has seen every row up to it.
@@ -3455,7 +3462,7 @@ mod tests {
     #[test]
     fn an_owned_mask_selects_only_the_shards_it_covers() {
         assert!(shard_owned(None, 7));
-        let mask = [true, false, true];
+        let mask = ShardMask::from_iter([true, false, true]);
         assert!(shard_owned(Some(&mask), 0));
         assert!(!shard_owned(Some(&mask), 1));
         assert!(shard_owned(Some(&mask), 2));
@@ -4524,7 +4531,12 @@ mod tests {
         assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 0, None), 9);
         // The same in-flight shard is not ours, so it does not hold us back.
         assert_eq!(
-            changes_watermark_from(&[5, 9], &[5, 12], 0, Some(&[true, false])),
+            changes_watermark_from(
+                &[5, 9],
+                &[5, 12],
+                0,
+                Some(&ShardMask::from_iter([true, false]))
+            ),
             u64::MAX
         );
         // Never below `since`.
@@ -4545,23 +4557,22 @@ mod tests {
             for (r, c) in reserved.iter_mut().zip(&committed) {
                 *r = (*r).max(*c);
             }
-            let mask = owned.as_ref().map(|m| {
-                let mut m = m.clone();
+            let mask = owned.map(|mut m| {
                 m.resize(committed.len(), false);
-                m
+                ShardMask::from_iter(m)
             });
             let watermark = changes_watermark_from(
                 &committed,
                 &reserved,
                 since,
-                mask.as_deref(),
+                mask.as_ref(),
             );
 
             // The cursor may advance to the lowest committed sequence of any
             // owned shard that still has an allocated, uncommitted write, but
             // never below `since`. With nothing in flight it is unbounded.
             let expected = (0..committed.len())
-                .filter(|&index| mask.as_ref().is_none_or(|m| m[index]))
+                .filter(|&index| mask.as_ref().is_none_or(|m| m.covers(index)))
                 .filter(|&index| reserved[index] > committed[index])
                 .map(|index| committed[index].max(since))
                 .min()

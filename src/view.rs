@@ -46,7 +46,7 @@ pub struct ViewQuery {
     /// Internal cluster filter: return only rows whose shard is owned by this
     /// node. The coordinator unions the owner-only responses, so each map row
     /// crosses the network once instead of once per replica.
-    pub owner_shards: Option<Vec<bool>>,
+    pub owner_shards: Option<crate::cluster::ShardMask>,
     /// Set for a `_partition/{p}/_design/.../_view/...` query. Only rows
     /// belonging to that partition are returned.
     pub partition: Option<String>,
@@ -632,12 +632,12 @@ impl ViewRows {
     pub(crate) fn reduce(
         &self,
         query: &ViewQuery,
-        mask: Option<&[bool]>,
+        mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
     ) -> Result<Value, String> {
         let mut partials = Partials::new();
         for (index, rows) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+            if mask.is_some_and(|mask| !mask.covers(index)) {
                 continue;
             }
             let blocks = self.block_partials(index, reducer)?;
@@ -707,7 +707,12 @@ impl ViewRows {
     /// Rows `query` can return from the shards in `mask` (all when `None`).
     /// A reduce needs every row in range; otherwise at most `skip + limit`
     /// rows are copied. `total_rows` and `offset` follow `ordered_rows`.
-    pub fn select(&self, query: &ViewQuery, mask: Option<&[bool]>, reduce: bool) -> Selection {
+    pub fn select(
+        &self,
+        query: &ViewQuery,
+        mask: Option<&crate::cluster::ShardMask>,
+        reduce: bool,
+    ) -> Selection {
         let cap = if reduce {
             usize::MAX
         } else {
@@ -719,7 +724,7 @@ impl ViewRows {
             offset: 0,
         };
         for (index, shard) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+            if mask.is_some_and(|mask| !mask.covers(index)) {
                 continue;
             }
             match &query.partition {
@@ -1386,7 +1391,7 @@ pub async fn query_with_spec(
         let query = query.clone();
         return blocking(move || {
             let mut js = JsReducer::new(&reducer, query.limits);
-            rows.reduce(&query, query.owner_shards.as_deref(), &mut js)
+            rows.reduce(&query, query.owner_shards.as_ref(), &mut js)
                 .map_err(|reason| reduce_failure(&reason))
         })
         .await;
@@ -1439,7 +1444,7 @@ pub async fn local_select(
     reduce: bool,
 ) -> DbResult<Selection> {
     let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-    Ok(rows.select(query, query.owner_shards.as_deref(), reduce))
+    Ok(rows.select(query, query.owner_shards.as_ref(), reduce))
 }
 
 pub async fn finish(
@@ -1590,7 +1595,10 @@ async fn ensure_rows(
                     continue;
                 }
                 if let Some(doc) = row.doc {
-                    docs.push((row.id, serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?));
+                    docs.push((
+                        row.id,
+                        serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?,
+                    ));
                 }
             }
             let rows = run_map(&map, &docs, limits).map_err(|reason| {
@@ -3866,7 +3874,7 @@ mod tests {
             });
         }
         let masked = ViewQuery {
-            owner_shards: Some(vec![true, false, true]),
+            owner_shards: Some(crate::cluster::ShardMask::from_iter([true, false, true])),
             group_level: 1,
             ..base.clone()
         };
@@ -3893,7 +3901,7 @@ mod tests {
                         .filter(|row| {
                             query.owner_shards.as_ref().is_none_or(|owned| {
                                 let shard = crate::db::shard_index_for(&row.id, placement.0, false);
-                                owned.get(shard).copied().unwrap_or(false)
+                                owned.covers(shard)
                             })
                         })
                         .cloned()
@@ -3901,7 +3909,7 @@ mod tests {
                     let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
                     let actual = view
-                        .reduce(query, query.owner_shards.as_deref(), &mut js)
+                        .reduce(query, query.owner_shards.as_ref(), &mut js)
                         .unwrap();
                     assert_eq!(actual, expected, "{reducer} {query:?}");
                 }

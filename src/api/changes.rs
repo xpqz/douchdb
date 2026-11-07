@@ -330,7 +330,7 @@ async fn changes_normal_raw(
         let active: Vec<usize> = masks
             .iter()
             .enumerate()
-            .filter(|(_, mask)| mask.iter().any(|owned| *owned))
+            .filter(|(_, mask)| !mask.is_empty())
             .map(|(node, _)| node)
             .collect();
         if active.len() != 1 || active[0] != st.ctx.cluster.me {
@@ -383,7 +383,7 @@ async fn changes_normal_raw(
             last_seq.to_string()
         };
         let pending = pending_db
-            .changes_pending(last_seq, pending_descending, pending_owned.as_deref())
+            .changes_pending(last_seq, pending_descending, pending_owned.as_ref())
             .await
             .unwrap_or(0);
         buffer.push_str("],\"last_seq\":");
