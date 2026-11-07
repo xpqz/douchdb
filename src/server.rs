@@ -160,6 +160,7 @@ fn build_state(
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
         default_admin_only,
+        max_open_dbs: args.max_open_dbs,
     };
     Ok(Arc::new(AppState {
         root: args.data.clone(),
@@ -294,6 +295,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         exit_on_stdin_eof();
     }
     configure_js_sandbox(&args);
+    crate::index_cache::set_max_open(args.max_open_indexes);
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     check_cluster_args(&args);
     if args.cors_origins.iter().any(|origin| origin == "*") {

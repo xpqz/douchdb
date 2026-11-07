@@ -60,9 +60,39 @@ impl DbUpdates {
     }
 }
 
+/// Default for `--max-open-dbs`. CouchDB's `max_dbs_open` is 500, but a
+/// database here holds a thread and several file descriptors per shard.
+pub const DEFAULT_MAX_OPEN_DBS: usize = 256;
+
+/// An open database and when it was last asked for.
+pub struct OpenDb {
+    db: Arc<Db>,
+    used: AtomicU64,
+}
+
+/// Source of the "last used" stamps. Only their order matters.
+static DB_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+impl OpenDb {
+    fn new(db: Arc<Db>) -> Self {
+        OpenDb {
+            db,
+            used: AtomicU64::new(DB_CLOCK.fetch_add(1, Ordering::Relaxed)),
+        }
+    }
+
+    fn touch(&self) -> Arc<Db> {
+        self.used
+            .store(DB_CLOCK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        self.db.clone()
+    }
+}
+
 pub struct AppState {
     pub root: PathBuf,
-    pub dbs: RwLock<HashMap<String, Arc<Db>>>,
+    /// The open databases, at most `config.max_open_dbs` once idle ones have
+    /// been closed. A closed database is reopened from disk on its next use.
+    pub dbs: RwLock<HashMap<String, OpenDb>>,
     /// One lock per database name. Open, create and drop of a name run one at
     /// a time, so a name is never opened twice (the second open would fail on
     /// the LevelDB lock) and a drop cannot interleave with a create or open.
@@ -95,6 +125,8 @@ pub struct Config {
     /// When true, a database with an empty `_security` object is admin-only.
     /// This is the default whenever authentication is configured.
     pub default_admin_only: bool,
+    /// Databases kept open between requests; see `AppState::close_idle`.
+    pub max_open_dbs: usize,
 }
 
 /// CouchDB's answer to creating a database with an illegal name.
@@ -138,8 +170,8 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
-        if let Some(db) = self.dbs.read().await.get(name) {
-            return Ok(db.clone());
+        if let Some(open) = self.dbs.read().await.get(name) {
+            return Ok(open.touch());
         }
         if !Db::exists(&self.root, name) {
             return Err(ApiError::not_found(format!(
@@ -150,8 +182,8 @@ impl AppState {
         // drop that won the race leaves nothing to open.
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
-        if let Some(db) = self.dbs.read().await.get(name) {
-            return Ok(db.clone());
+        if let Some(open) = self.dbs.read().await.get(name) {
+            return Ok(open.touch());
         }
         let db = Arc::new(Db::open_existing(
             &self.root,
@@ -163,8 +195,81 @@ impl AppState {
                 partitioned: false,
             },
         )?);
-        self.dbs.write().await.insert(name.to_string(), db.clone());
+        self.dbs
+            .write()
+            .await
+            .insert(name.to_string(), OpenDb::new(db.clone()));
+        self.close_idle().await;
         Ok(db)
+    }
+
+    /// Close the least recently used databases until at most
+    /// `max_open_dbs` are open. A database is closed only when nothing but the
+    /// map holds it and it is quiescent (see `Db::quiescent`), and its name
+    /// is not being opened, created or dropped, so a request in flight never
+    /// loses its database and a rebalance is never forgotten.
+    ///
+    /// Dropping a `Db` joins its shard actor threads, which waits for their
+    /// queued work, so the drop runs on the blocking pool and not on an async
+    /// worker. The name's lock travels with it: a request that wants the
+    /// database back waits for the drop, so it never meets a LevelDB lock
+    /// that is still held.
+    async fn close_idle(&self) {
+        let cap = self.config.max_open_dbs.max(1);
+        let mut closing = Vec::new();
+        {
+            let mut dbs = self.dbs.write().await;
+            if dbs.len() <= cap {
+                return;
+            }
+            let mut idle: Vec<(u64, String)> = dbs
+                .iter()
+                .filter(|(_, open)| Arc::strong_count(&open.db) == 1)
+                .map(|(name, open)| (open.used.load(Ordering::Relaxed), name.clone()))
+                .collect();
+            idle.sort();
+            for (_, name) in idle {
+                if dbs.len() <= cap {
+                    break;
+                }
+                // Holding the write lock, nobody can take a new reference
+                // from the map, so the count cannot rise from here.
+                let quiescent = dbs
+                    .get(&name)
+                    .is_some_and(|open| Arc::strong_count(&open.db) == 1 && open.db.quiescent());
+                if !quiescent {
+                    continue;
+                }
+                let Ok(guard) = self.name_lock(&name).try_lock_owned() else {
+                    continue;
+                };
+                if let Some(open) = dbs.remove(&name) {
+                    closing.push((open, guard));
+                }
+            }
+        }
+        if !closing.is_empty() {
+            tokio::task::spawn_blocking(move || drop(closing));
+        }
+    }
+
+    /// The `_security` object of a database, read from memory when it is
+    /// open and from its directory when it is not, so that asking who may see
+    /// a database does not open it. `None` when there is no such database or
+    /// its security cannot be read.
+    pub async fn db_security(&self, name: &str) -> Option<Value> {
+        if !valid_db_name(name) {
+            return None;
+        }
+        if let Some(open) = self.dbs.read().await.get(name) {
+            return Some(open.db.security());
+        }
+        let root = self.root.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || Db::read_security(&root, &name).ok())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Create a database with `q` shards and `n` copies of each; `None`
@@ -203,7 +308,11 @@ impl AppState {
                 partitioned,
             },
         )?);
-        self.dbs.write().await.insert(name.to_string(), db.clone());
+        self.dbs
+            .write()
+            .await
+            .insert(name.to_string(), OpenDb::new(db.clone()));
+        self.close_idle().await;
         self.db_updates.record(name, "created");
         Ok(db)
     }
@@ -294,10 +403,101 @@ impl FsHealthCache {
     }
 }
 
+/// A node state over `root` for tests: one node, no peers, no auth.
+#[cfg(test)]
+pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
+    Arc::new(AppState {
+        root,
+        dbs: Default::default(),
+        db_locks: Default::default(),
+        fs_health: Default::default(),
+        config: Config {
+            q: 1,
+            revs_limit: 1000,
+            sync_secs: 60,
+            seeds: Vec::new(),
+            advertise: String::new(),
+            cors_origins: Vec::new(),
+            view_timeout_ms: 1000,
+            view_memory_mb: 1,
+            default_admin_only: true,
+            max_open_dbs,
+        },
+        ctx: ClusterCtx {
+            auth: None,
+            cluster: crate::cluster::Cluster {
+                nodes: Vec::new(),
+                me: 0,
+                n: 1,
+                secret: String::new(),
+            },
+            client: reqwest::Client::new(),
+        },
+        db_updates: Default::default(),
+        cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
+        admission: Arc::new(crate::admission::Admission::new(Default::default())),
+        compaction: Arc::new(tokio::sync::Semaphore::new(1)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Every database ever opened used to stay open, with its shard actors and
+    /// stores, until it was deleted.
+    #[tokio::test]
+    async fn open_databases_stay_within_the_cap() {
+        let root = std::env::temp_dir().join(format!("douchdb-dbcap-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 4);
+        for n in 0..12 {
+            let name = format!("db{n}");
+            st.create_db(&name, false, None, None).await.unwrap();
+            st.db(&name).await.unwrap();
+        }
+        // Reopen the first ones: they were closed, and come back from disk.
+        for n in 0..3 {
+            let db = st.db(&format!("db{n}")).await.unwrap();
+            db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        }
+        let open = st.dbs.read().await.len();
+        assert!(open <= 4, "{open} databases are open, cap is 4");
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A database a request holds, or one that is being rebalanced, stays
+    /// open past the cap; idle ones go.
+    #[tokio::test]
+    async fn busy_databases_are_not_closed() {
+        let root = std::env::temp_dir().join(format!("douchdb-dbbusy-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 1);
+        let held = st.create_db("held", false, None, None).await.unwrap();
+        let moving = st.create_db("moving", false, None, None).await.unwrap();
+        assert!(moving.try_start_rebalance());
+        drop(moving);
+        for n in 0..4 {
+            st.create_db(&format!("idle{n}"), false, None, None)
+                .await
+                .unwrap();
+        }
+        let dbs = st.dbs.read().await;
+        assert!(dbs.contains_key("held"), "a database in use was closed");
+        assert!(
+            dbs.contains_key("moving"),
+            "a rebalancing database was closed"
+        );
+        assert_eq!(dbs.len(), 3, "the idle ones are closed down to the pinned");
+        drop(dbs);
+        // The held database still works.
+        held.put_docs(vec![json!({"_id": "a"})], true)
+            .await
+            .unwrap();
+        drop(held);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn fs_health_cache_serves_within_the_ttl_only() {

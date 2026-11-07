@@ -326,9 +326,6 @@ pub struct Shard {
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
     latest: Option<LatestChanges>,
-    /// Ids under `_design/` whose metadata did not decode when `latest` was
-    /// built. Validation must not run without them, so it fails on these.
-    corrupt_design: Vec<String>,
     /// Uncommitted operations, in order, plus the same view as a key overlay so
     /// jobs later in the same group observe earlier writes.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -520,7 +517,6 @@ impl Shard {
             deleted,
             live: None,
             latest: None,
-            corrupt_design: Vec::new(),
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -711,30 +707,43 @@ impl Shard {
         if self.latest.is_none() {
             let mut latest = LatestChanges::default();
             let name = self.name.clone();
-            let mut corrupt_design = Vec::new();
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
                     Ok((id, meta)) => latest.insert(id, meta.seq),
-                    Err(corrupt) => {
-                        name.report_corrupt(&corrupt.id, &corrupt);
-                        if corrupt.id.starts_with("_design/") {
-                            corrupt_design.push(corrupt.id);
-                        }
-                    }
+                    Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
                 }
                 true
             })?;
-            self.corrupt_design = corrupt_design;
             self.latest = Some(latest);
         }
         Ok(self.latest.as_ref().expect("latest changes initialized"))
     }
 
-    /// Design documents whose metadata is corrupt. Their `validate_doc_update`
-    /// functions cannot be loaded, so callers must fail instead of skipping them.
-    pub fn corrupt_design_docs(&mut self) -> Result<Vec<String>> {
-        self.latest_changes()?;
-        Ok(self.corrupt_design.clone())
+    /// The ids of the design documents (deleted ones included), and those
+    /// among them whose metadata is corrupt. A corrupt one's
+    /// `validate_doc_update` cannot be loaded, so callers must fail instead of
+    /// skipping it. A range scan of the `_design/` keys: it neither builds nor
+    /// needs the id-to-sequence index.
+    pub fn design_docs(&mut self) -> Result<(Vec<String>, Vec<String>)> {
+        let name = self.name.clone();
+        let mut ids = Vec::new();
+        let mut corrupt_design = Vec::new();
+        self.scan_range_while(b"m/_design/", None, false, |key, value| {
+            match parse_meta(key, value) {
+                Ok((id, _)) => ids.push(id),
+                Err(corrupt) => {
+                    name.report_corrupt(&corrupt.id, &corrupt);
+                    corrupt_design.push(corrupt.id);
+                }
+            }
+            true
+        })?;
+        Ok((ids, corrupt_design))
+    }
+
+    #[cfg(test)]
+    pub fn latest_built(&self) -> bool {
+        self.latest.is_some()
     }
 
     pub fn update_latest(

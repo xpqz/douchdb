@@ -32,6 +32,8 @@ pub struct Args {
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     pub max_request_mb: usize,
+    pub max_open_indexes: usize,
+    pub max_open_dbs: usize,
     pub cluster_secret: String,
     pub otel_endpoint: Option<String>,
 }
@@ -48,6 +50,7 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--js-workers N]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
+                     \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
                      \x20       [--otel-endpoint URL]       (or OTEL_EXPORTER_OTLP_ENDPOINT)";
 
@@ -152,6 +155,8 @@ pub fn parse_from(
         view_timeout_ms: 5000,
         view_memory_mb: 64,
         max_request_mb: 64,
+        max_open_indexes: crate::index_cache::DEFAULT_MAX_OPEN,
+        max_open_dbs: crate::state::DEFAULT_MAX_OPEN_DBS,
         cluster_secret: environment(&env, "DOUCHDB_CLUSTER_SECRET")?.unwrap_or_default(),
         otel_endpoint: environment(&env, "OTEL_EXPORTER_OTLP_ENDPOINT")?,
     };
@@ -235,6 +240,10 @@ pub fn parse_from(
             "--view-timeout-ms" => args.view_timeout_ms = number(&mut it, flag, 1, u64::MAX)?,
             "--view-memory-mb" => args.view_memory_mb = number(&mut it, flag, 1, u32::MAX.into())?,
             "--max-request-mb" => args.max_request_mb = number(&mut it, flag, 1, u32::MAX.into())?,
+            "--max-open-indexes" => {
+                args.max_open_indexes = number(&mut it, flag, 1, u32::MAX.into())?
+            }
+            "--max-open-dbs" => args.max_open_dbs = number(&mut it, flag, 1, u32::MAX.into())?,
             "--cluster-secret" => args.cluster_secret = value(&mut it, flag)?,
             "--otel-endpoint" => args.otel_endpoint = Some(value(&mut it, flag)?),
             "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
@@ -292,6 +301,8 @@ mod tests {
         "--view-timeout-ms",
         "--view-memory-mb",
         "--max-request-mb",
+        "--max-open-indexes",
+        "--max-open-dbs",
     ];
 
     const NEEDS_VALUE: &[&str] = &[
@@ -362,6 +373,8 @@ mod tests {
             "--view-timeout-ms",
             "--view-memory-mb",
             "--max-request-mb",
+            "--max-open-indexes",
+            "--max-open-dbs",
         ] {
             assert!(error(&[flag, "0"]).contains(flag), "{flag} 0");
         }

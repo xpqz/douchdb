@@ -1542,9 +1542,14 @@ pub(crate) async fn cluster_reduce(
             crate::view::add_partial(&mut partials, key, value);
         }
     }
-    let mut js = crate::view::JsReducer::new(reducer, query.limits);
-    crate::view::assemble_reduce(partials, query, &mut js)
-        .map_err(|reason| crate::view::reduce_failure(&reason))
+    let reducer = reducer.to_string();
+    let query = query.clone();
+    crate::view::blocking(move || {
+        let mut js = crate::view::JsReducer::new(&reducer, query.limits);
+        crate::view::assemble_reduce(partials, &query, &mut js)
+            .map_err(|reason| crate::view::reduce_failure(&reason))
+    })
+    .await
 }
 
 pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {

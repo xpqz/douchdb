@@ -59,15 +59,7 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
 
     let principal = st.principal(&headers);
     if !principal.admin {
-        let mut visible = Vec::new();
-        for name in names {
-            if let Ok(db) = st.db(&name).await {
-                if db_access(&st, &principal, &db).is_some() {
-                    visible.push(name);
-                }
-            }
-        }
-        names = visible;
+        names = visible_db_names(&st, &principal, names).await;
     }
 
     let descending = flag(&q, "descending");
