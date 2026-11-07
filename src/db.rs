@@ -10,7 +10,7 @@ use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
+    blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, LiveDoc, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -1342,19 +1342,9 @@ impl Db {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
-    async fn all_docs_filtered(
-        &self,
-        opts: &AllDocsOpts,
-        owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
-        if let Some(keys) = &opts.keys {
-            return self.all_docs_by_keys(opts, keys, owned).await;
-        }
-
-        // A shard only needs to return enough rows to satisfy the global
-        // `skip + limit`: any row in the global window is also in its shard's
-        // first `skip + limit` rows.
-        let take = opts.skip.saturating_add(opts.limit);
+    /// `opts` with a partition query's range narrowed to the partition's key
+    /// range, and the one shard that holds the partition.
+    fn partition_range(&self, opts: &AllDocsOpts) -> (AllDocsOpts, Option<usize>) {
         let mut opts = opts.clone();
         let partition_shard = opts
             .partition
@@ -1385,7 +1375,23 @@ impl Db {
                 });
             }
         }
+        (opts, partition_shard)
+    }
 
+    async fn all_docs_filtered(
+        &self,
+        opts: &AllDocsOpts,
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Value> {
+        if let Some(keys) = &opts.keys {
+            return self.all_docs_by_keys(opts, keys, owned).await;
+        }
+
+        // A shard only needs to return enough rows to satisfy the global
+        // `skip + limit`: any row in the global window is also in its shard's
+        // first `skip + limit` rows.
+        let take = opts.skip.saturating_add(opts.limit);
+        let (opts, partition_shard) = self.partition_range(opts);
         let mut rows = Vec::new();
         let mut total_rows = 0u64;
         let mut before_start = 0usize;
@@ -1421,6 +1427,131 @@ impl Db {
         let selected: Vec<_> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
         let offset = (before_start + opts.skip).min(total_rows as usize);
         finish_all_docs(selected, total_rows as usize, offset)
+    }
+
+    /// The `total_rows` and `offset` of an `_all_docs` query and a stream of
+    /// its rows, for a query without `keys`. The rows are merged by id from a
+    /// page at a time of each shard, so a listing of any size is never held
+    /// whole. Unlike `all_docs`, the pages are read as the stream is polled,
+    /// not from one snapshot, and a failure after the first page ends the
+    /// stream with an error.
+    pub(crate) async fn all_docs_stream(
+        db: Arc<Db>,
+        opts: &AllDocsOpts,
+    ) -> DbResult<(AllDocsHead, impl futures::Stream<Item = DbResult<Value>>)> {
+        const PAGE: usize = 256;
+
+        struct Cursor {
+            index: usize,
+            after: Option<String>,
+            buffer: std::collections::VecDeque<AllDocsRow>,
+            done: bool,
+        }
+
+        let (opts, partition_shard) = db.partition_range(opts);
+        let mut total_rows = 0u64;
+        let mut before_start = 0usize;
+        let mut cursors = Vec::new();
+        for (index, shard) in db.shards.iter().enumerate() {
+            if partition_shard.is_some_and(|partition| partition != index) {
+                continue;
+            }
+            let shard_opts = opts.clone();
+            let (before, docs) = shard
+                .call(move |s| {
+                    let docs = match &shard_opts.partition {
+                        Some(partition) => s.partition_live_count(partition)?,
+                        None => s.counts().0,
+                    };
+                    Ok((all_docs_before_start(s, &shard_opts)?, docs))
+                })
+                .await?;
+            before_start += before;
+            total_rows += docs;
+            cursors.push(Cursor {
+                index,
+                after: None,
+                buffer: std::collections::VecDeque::new(),
+                done: false,
+            });
+        }
+        let head = AllDocsHead {
+            total_rows: total_rows as usize,
+            offset: before_start
+                .saturating_add(opts.skip)
+                .min(total_rows as usize),
+        };
+
+        let rows = async_stream::stream! {
+            let mut skip = opts.skip;
+            let mut remaining = opts.limit;
+            while remaining > 0 {
+                let wanted = skip.saturating_add(remaining).min(PAGE);
+                let hungry: Vec<usize> = (0..cursors.len())
+                    .filter(|slot| cursors[*slot].buffer.is_empty() && !cursors[*slot].done)
+                    .collect();
+                if !hungry.is_empty() {
+                    let fetches = hungry.iter().map(|slot| {
+                        let (index, after) = (cursors[*slot].index, cursors[*slot].after.clone());
+                        let shard_opts = opts.clone();
+                        let shard = &db.shards[index];
+                        async move {
+                            shard
+                                .call(move |s| {
+                                    let scanned =
+                                        scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
+                                    let last = scanned.last().map(|row| row.id.clone());
+                                    let exhausted = scanned.len() < wanted;
+                                    Ok((load_all_docs(s, scanned, &shard_opts)?, last, exhausted))
+                                })
+                                .await
+                        }
+                    });
+                    let pages = futures::future::join_all(fetches).await;
+                    for (slot, page) in hungry.into_iter().zip(pages) {
+                        match page {
+                            Ok((rows, last, exhausted)) => {
+                                let cursor = &mut cursors[slot];
+                                cursor.buffer.extend(rows);
+                                if last.is_some() {
+                                    cursor.after = last;
+                                }
+                                cursor.done = exhausted;
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut best: Option<usize> = None;
+                for (slot, cursor) in cursors.iter().enumerate() {
+                    let Some(front) = cursor.buffer.front() else {
+                        continue;
+                    };
+                    let better = match best.and_then(|best| cursors[best].buffer.front()) {
+                        None => true,
+                        Some(current) if opts.descending => front.id > current.id,
+                        Some(current) => front.id < current.id,
+                    };
+                    if better {
+                        best = Some(slot);
+                    }
+                }
+                let Some(row) = best.and_then(|slot| cursors[slot].buffer.pop_front()) else {
+                    break;
+                };
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                remaining -= 1;
+                yield Ok(all_docs_row_json(row));
+            }
+        };
+        Ok((head, rows))
     }
 
     /// Documents for a view build, as JSON text with `_id` and `_rev` already
@@ -2875,6 +3006,12 @@ impl Default for AllDocsOpts {
     }
 }
 
+/// The counts an `_all_docs` reply leads with.
+pub(crate) struct AllDocsHead {
+    pub total_rows: usize,
+    pub offset: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ChangesOpts {
     pub since: u64,
@@ -3165,132 +3302,130 @@ fn attachment_json(
 /// Scan one shard for the live rows in the requested key range, stopping once
 /// `take` rows have been collected. Also returns how many live rows precede
 /// `startkey`, which is the shard's contribution to `offset`.
+/// How many live ids sort before the query's start key, in the query's
+/// direction: the `offset` of an `_all_docs` reply, before `skip`.
+fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
+    let Some(start) = opts.startkey.as_deref() else {
+        return Ok(0);
+    };
+    // Without a partition the rank comes from the shard's cursor, so paging by
+    // `startkey` does not recount every id before it on each request.
+    let ranked = match &opts.partition {
+        None => Some(shard.live_rank(start)?),
+        Some(_) => None,
+    };
+    let live = shard.live_docs()?;
+    let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
+    let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
+    Ok(match (opts.descending, ranked) {
+        (false, None) => live
+            .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
+            .filter(|(id, _)| in_partition(id))
+            .count(),
+        (true, None) => live
+            .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
+            .filter(|(id, _)| in_partition(id))
+            .count(),
+        (false, Some(rank)) => rank,
+        (true, Some(rank)) => live
+            .len()
+            .saturating_sub(rank + usize::from(live.contains_key(start))),
+    })
+}
+
+/// Up to `take` live ids of the query's range in the query's direction,
+/// starting after `after` when it is given. `after` must be an id this scan
+/// already returned (or the start of the range), so a later page continues
+/// where the last one stopped.
+fn scan_all_docs(
+    shard: &mut crate::store::Shard,
+    opts: &AllDocsOpts,
+    after: Option<&str>,
+    take: usize,
+) -> DbResult<Vec<AllDocsRow>> {
+    let start = opts.startkey.as_deref();
+    let end = opts.endkey.as_deref();
+    let empty_range = match (start, end) {
+        (Some(start), Some(end)) if opts.descending => start < end,
+        (Some(start), Some(end)) => start > end,
+        _ => false,
+    };
+    if empty_range {
+        return Ok(Vec::new());
+    }
+    let live = shard.live_docs()?;
+    let end_bound = match end {
+        Some(end) if opts.inclusive_end => Bound::Included(end),
+        Some(end) => Bound::Excluded(end),
+        None => Bound::Unbounded,
+    };
+    let row = |(id, doc): (&String, &LiveDoc)| AllDocsRow {
+        id: id.clone(),
+        rev: doc.rev.clone(),
+        doc: None,
+    };
+    let rows = if opts.descending {
+        let low = end_bound;
+        let high = match (after, start) {
+            (Some(after), _) => Bound::Excluded(after),
+            (None, Some(start)) => Bound::Included(start),
+            (None, None) => Bound::Unbounded,
+        };
+        live.range::<str, _>((low, high))
+            .rev()
+            .take(take)
+            .map(row)
+            .collect()
+    } else {
+        let low = match (after, start) {
+            (Some(after), _) => Bound::Excluded(after),
+            (None, Some(start)) => Bound::Included(start),
+            (None, None) => Bound::Unbounded,
+        };
+        let high = end_bound;
+        live.range::<str, _>((low, high))
+            .take(take)
+            .map(row)
+            .collect()
+    };
+    Ok(rows)
+}
+
+/// Attach each row's document when the query asks for them, leaving out any
+/// whose record is corrupt.
+fn load_all_docs(
+    shard: &mut crate::store::Shard,
+    rows: Vec<AllDocsRow>,
+    opts: &AllDocsOpts,
+) -> DbResult<Vec<AllDocsRow>> {
+    if !opts.include_docs {
+        return Ok(rows);
+    }
+    let mut readable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let doc_opts = DocOpts {
+            rev: Some(row.rev.clone()),
+            conflicts: opts.conflicts,
+            attachments: opts.attachments,
+            ..Default::default()
+        };
+        let doc = read_doc(shard, &row.id, &doc_opts);
+        if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
+            row.doc = Some(doc);
+            readable.push(row);
+        }
+    }
+    Ok(readable)
+}
+
 fn collect_all_docs(
     shard: &mut crate::store::Shard,
     opts: &AllDocsOpts,
     take: usize,
 ) -> DbResult<(Vec<AllDocsRow>, usize)> {
-    let start = opts.startkey.as_deref();
-    let end = opts.endkey.as_deref();
-    let mut rows = Vec::new();
-    // Without a partition the rank comes from the shard's cursor, so paging by
-    // `startkey` does not recount every id before it on each request.
-    let ranked = match (start, &opts.partition) {
-        (Some(start), None) => Some(shard.live_rank(start)?),
-        _ => None,
-    };
-    let before_start = {
-        let live = shard.live_docs()?;
-        let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
-        let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-        let before_start = match (start, opts.descending, ranked) {
-            (Some(start), false, None) => live
-                .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
-                .filter(|(id, _)| in_partition(id))
-                .count(),
-            (Some(start), true, None) => live
-                .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
-                .filter(|(id, _)| in_partition(id))
-                .count(),
-            (Some(_), false, Some(rank)) => rank,
-            (Some(start), true, Some(rank)) => live
-                .len()
-                .saturating_sub(rank + usize::from(live.contains_key(start))),
-            (None, _, _) => 0,
-        };
-
-        let empty_range = match (start, end) {
-            (Some(start), Some(end)) if opts.descending => start < end,
-            (Some(start), Some(end)) => start > end,
-            _ => false,
-        };
-        if !empty_range {
-            if opts.descending {
-                let range = match (start, end) {
-                    (Some(start), Some(end)) => (
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                        Bound::Included(start),
-                    ),
-                    (Some(start), None) => (Bound::Unbounded, Bound::Included(start)),
-                    (None, Some(end)) => (
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                        Bound::Unbounded,
-                    ),
-                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
-                };
-                for (id, doc) in live.range::<str, _>(range).rev() {
-                    if rows.len() >= take {
-                        break;
-                    }
-                    rows.push(AllDocsRow {
-                        id: id.clone(),
-                        rev: doc.rev.clone(),
-                        doc: None,
-                    });
-                }
-            } else {
-                let range = match (start, end) {
-                    (Some(start), Some(end)) => (
-                        Bound::Included(start),
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                    ),
-                    (Some(start), None) => (Bound::Included(start), Bound::Unbounded),
-                    (None, Some(end)) => (
-                        Bound::Unbounded,
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                    ),
-                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
-                };
-                for (id, doc) in live.range::<str, _>(range) {
-                    if rows.len() >= take {
-                        break;
-                    }
-                    rows.push(AllDocsRow {
-                        id: id.clone(),
-                        rev: doc.rev.clone(),
-                        doc: None,
-                    });
-                }
-            }
-        }
-        before_start
-    };
-
-    if opts.include_docs {
-        let mut readable = Vec::with_capacity(rows.len());
-        for mut row in rows {
-            let doc_opts = DocOpts {
-                rev: Some(row.rev.clone()),
-                conflicts: opts.conflicts,
-                attachments: opts.attachments,
-                ..Default::default()
-            };
-            let doc = read_doc(shard, &row.id, &doc_opts);
-            if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
-                row.doc = Some(doc);
-                readable.push(row);
-            }
-        }
-        rows = readable;
-    }
-
-    Ok((rows, before_start))
+    let before_start = all_docs_before_start(shard, opts)?;
+    let rows = scan_all_docs(shard, opts, None, take)?;
+    Ok((load_all_docs(shard, rows, opts)?, before_start))
 }
 
 /// Put `_id` and `_rev` in front of an already-serialized document body.
@@ -3402,15 +3537,16 @@ struct AllDocsRow {
     doc: Option<Value>,
 }
 
-fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
-    let mut results = Vec::new();
-    for AllDocsRow { id, rev, doc } in rows {
-        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-        if let Some(doc) = doc {
-            row["doc"] = doc;
-        }
-        results.push(row);
+fn all_docs_row_json(AllDocsRow { id, rev, doc }: AllDocsRow) -> Value {
+    let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
+    if let Some(doc) = doc {
+        row["doc"] = doc;
     }
+    row
+}
+
+fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
+    let results: Vec<Value> = rows.into_iter().map(all_docs_row_json).collect();
     Ok(json!({ "total_rows": total, "offset": offset, "rows": results }))
 }
 
@@ -3956,6 +4092,204 @@ mod tests {
         assert!(!built, "the validator scan built the changes index");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The streamed `_all_docs` reply, assembled in the shape of `all_docs`.
+    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> Value {
+        use futures::StreamExt;
+        let (head, rows) = Db::all_docs_stream(db.clone(), opts).await.unwrap();
+        let rows: Vec<Value> = Box::pin(rows)
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+        json!({"total_rows": head.total_rows, "offset": head.offset, "rows": rows})
+    }
+
+    #[tokio::test]
+    async fn streamed_all_docs_match_the_buffered_reply() {
+        let root = std::env::temp_dir().join(format!("douchdb-stream-{}", crate::util::uuid()));
+        let db = Arc::new(
+            Db::open(
+                &root,
+                "stream",
+                DbConfig {
+                    q: 3,
+                    revs_limit: 100,
+                    shard_map: ShardMap::balanced(3, 1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        // More documents per shard than one page, so the merge refills.
+        let docs: Vec<Value> = (0..900)
+            .map(|n| json!({"_id": format!("doc{n:04}"), "n": n, "text": "x".repeat(n % 7)}))
+            .collect();
+        let put = db.put_docs(docs, true).await.unwrap();
+        // One corrupt body, which include_docs skips.
+        let bad_id = "doc0450";
+        let bad_rev = put[450]["rev"].as_str().unwrap().to_string();
+        let shard = db.shard_index(bad_id);
+        db.shards[shard]
+            .call(move |s| {
+                s.put_raw(&body_key(bad_id, &bad_rev), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // A deleted document does not count.
+        let gone = put[10]["rev"].as_str().unwrap();
+        db.put_docs(
+            vec![json!({"_id": "doc0010", "_rev": gone, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let base = AllDocsOpts::default;
+        let shapes: Vec<(&str, AllDocsOpts)> = vec![
+            ("all", base()),
+            (
+                "include_docs",
+                AllDocsOpts {
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending",
+                AllDocsOpts {
+                    descending: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending include_docs",
+                AllDocsOpts {
+                    descending: true,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "range",
+                AllDocsOpts {
+                    startkey: Some("doc0100".into()),
+                    endkey: Some("doc0600".into()),
+                    ..base()
+                },
+            ),
+            (
+                "range exclusive end",
+                AllDocsOpts {
+                    startkey: Some("doc0100".into()),
+                    endkey: Some("doc0600".into()),
+                    inclusive_end: false,
+                    ..base()
+                },
+            ),
+            (
+                "descending range",
+                AllDocsOpts {
+                    startkey: Some("doc0600".into()),
+                    endkey: Some("doc0100".into()),
+                    descending: true,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "inverted range",
+                AllDocsOpts {
+                    startkey: Some("doc0600".into()),
+                    endkey: Some("doc0100".into()),
+                    ..base()
+                },
+            ),
+            (
+                "start between ids",
+                AllDocsOpts {
+                    startkey: Some("doc03505".into()),
+                    ..base()
+                },
+            ),
+            (
+                "skip and limit",
+                AllDocsOpts {
+                    skip: 301,
+                    limit: 400,
+                    ..base()
+                },
+            ),
+            (
+                "skip and limit with docs",
+                AllDocsOpts {
+                    skip: 7,
+                    limit: 5,
+                    include_docs: true,
+                    descending: true,
+                    ..base()
+                },
+            ),
+            ("limit zero", AllDocsOpts { limit: 0, ..base() }),
+            (
+                "skip past the end",
+                AllDocsOpts {
+                    skip: 5000,
+                    ..base()
+                },
+            ),
+            (
+                "one row",
+                AllDocsOpts {
+                    startkey: Some("doc0777".into()),
+                    endkey: Some("doc0777".into()),
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "no rows",
+                AllDocsOpts {
+                    startkey: Some("zzz".into()),
+                    ..base()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let buffered = db.all_docs(&opts).await.unwrap();
+            let streamed = streamed_all_docs(&db, &opts).await;
+            assert_eq!(
+                serde_json::to_string(&streamed).unwrap(),
+                serde_json::to_string(&buffered).unwrap(),
+                "{name}"
+            );
+        }
+
+        let empty_root =
+            std::env::temp_dir().join(format!("douchdb-stream-empty-{}", crate::util::uuid()));
+        let empty = Arc::new(
+            Db::open(
+                &empty_root,
+                "empty",
+                DbConfig {
+                    q: 3,
+                    revs_limit: 100,
+                    shard_map: ShardMap::balanced(3, 1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        let opts = AllDocsOpts::default();
+        assert_eq!(
+            streamed_all_docs(&empty, &opts).await,
+            empty.all_docs(&opts).await.unwrap()
+        );
+        drop(db);
+        drop(empty);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(empty_root);
     }
 
     #[tokio::test]

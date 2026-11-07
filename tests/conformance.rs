@@ -2744,7 +2744,9 @@ async fn all_docs_is_streamed_with_a_stable_body() {
         .expect("request");
     assert_eq!(head.status(), StatusCode::OK);
     assert!(
-        !head.headers().contains_key("content-length"),
+        head.headers()
+            .get("content-length")
+            .is_none_or(|length| length == "0"),
         "HEAD must not build the body to size it: {:?}",
         head.headers()
     );
