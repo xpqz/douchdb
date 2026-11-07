@@ -3095,6 +3095,37 @@ mod tests {
             .all(|(key, members)| key == "a" && members.len() == 2));
     }
 
+    #[test]
+    fn unique_keys_keeps_the_first_of_equal_keys_in_order() {
+        let keys = [
+            json!("b"),
+            json!(1),
+            json!("a"),
+            json!(1.0),
+            json!("b"),
+            json!([1, 2]),
+            json!(null),
+            json!([1, 2]),
+        ];
+        assert_eq!(
+            unique_keys(&keys),
+            vec![json!("b"), json!(1), json!("a"), json!([1, 2]), json!(null)]
+        );
+    }
+
+    #[test]
+    fn unique_keys_scales_with_the_number_of_keys() {
+        // A pairwise scan needs about 12 million ICU comparisons here.
+        let keys: Vec<Value> = (0..5_000).map(|n| json!(format!("key-{n:06}"))).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(unique_keys(&keys).len(), keys.len());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unique_keys took {:?}",
+            started.elapsed()
+        );
+    }
+
     // The expected values below were captured from CouchDB 3.5.
     #[test]
     fn sum_adds_arrays_and_objects_like_couchdb() {

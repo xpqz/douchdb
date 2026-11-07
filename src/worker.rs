@@ -124,4 +124,33 @@ mod tests {
             handle_request(json!({"kind": "reduce", "source": "function(k, v, r){ return 1; }"}));
         assert_eq!(missing["ok"], false, "{missing}");
     }
+
+    #[test]
+    fn worker_reduce_many_runs_every_call_in_one_request() {
+        let many = |calls: Value| {
+            handle_request(json!({
+                "kind": "reduce_many",
+                "source": "function(keys, values, rereduce){ return rereduce ? sum(values) * 10 : sum(values); }",
+                "calls": calls,
+            }))
+        };
+        let ok = many(json!([
+            {"keys": [["a", 1]], "values": [3], "rereduce": false},
+            {"keys": [["b", 2], ["c", 3]], "values": [4, 5], "rereduce": false},
+            {"keys": null, "values": [1, 2], "rereduce": true},
+        ]));
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["value"], json!([3, 9, 30]));
+
+        // The first failing call fails the request, as a sequence of single
+        // calls would.
+        let bad = many(json!([
+            {"keys": [], "values": [1], "rereduce": false},
+            {"keys": "nope", "values": [1], "rereduce": false},
+        ]));
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert!(bad["error"].is_string(), "{bad}");
+        let empty = many(json!([]));
+        assert_eq!(empty["value"], json!([]), "{empty}");
+    }
 }

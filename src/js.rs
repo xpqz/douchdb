@@ -1223,6 +1223,41 @@ mod tests {
 
     #[test]
     #[cfg(feature = "wasm")]
+    fn wasm_reduce_many_runs_every_call_in_one_request() {
+        let limits = ViewLimits {
+            timeout: Duration::from_secs(60),
+            memory: 64 * 1024 * 1024,
+        };
+        let request = |calls: Value| {
+            wasm_request(
+                "reduce_many",
+                json!({
+                    "source": "function(k, v, r){ return r ? sum(v) * 10 : sum(v); }",
+                    "calls": calls,
+                }),
+                limits,
+            )
+        };
+        assert_eq!(
+            request(json!([
+                {"keys": [["a", 1]], "values": [3], "rereduce": false},
+                {"keys": [["b", 2], ["c", 3]], "values": [4, 5], "rereduce": false},
+                {"keys": null, "values": [1, 2], "rereduce": true},
+            ]))
+            .expect("batched reduce"),
+            json!([3, 9, 30])
+        );
+        let error = request(json!([
+            {"keys": [], "values": [1], "rereduce": false},
+            {"keys": "nope", "values": [1], "rereduce": false},
+        ]))
+        .expect_err("a malformed call fails the request")
+        .to_string();
+        assert!(error.contains("reduce keys"), "{error}");
+    }
+
+    #[test]
+    #[cfg(feature = "wasm")]
     fn wasm_reduce_rejects_malformed_keys_and_values() {
         let limits = ViewLimits {
             timeout: Duration::from_secs(60),
