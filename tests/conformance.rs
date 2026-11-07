@@ -2681,6 +2681,75 @@ async fn encoded_slashes_in_document_ids_are_not_path_separators() {
     assert_eq!(doc["_id"], "_design/foo");
 }
 
+/// `_all_docs` bodies are written as they are read, so a large listing never
+/// sits in memory whole, and a HEAD does not read the rows at all. The exact
+/// bytes (field order, separators) are part of the contract.
+#[tokio::test]
+async fn all_docs_is_streamed_with_a_stable_body() {
+    let s = Server::start(false);
+    s.fresh_db("streamed").await;
+    let rev = |n: char| format!("1-{}", n.to_string().repeat(32));
+    let (status, _) = s
+        .post(
+            "/streamed/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "b", "_rev": rev('b'), "v": 2},
+                {"_id": "a", "_rev": rev('a'), "v": 1},
+                {"_id": "c", "_rev": rev('c'), "v": 3},
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = |path: &str| {
+        let request = s.client.get(format!("{}{path}", s.base));
+        async move {
+            let response = request.send().await.expect("request");
+            let headers = response.headers().clone();
+            (headers, response.text().await.expect("body"))
+        }
+    };
+
+    let (headers, body) = text("/streamed/_all_docs").await;
+    assert_eq!(
+        body,
+        format!(
+            "{{\"total_rows\":3,\"offset\":0,\"rows\":[\
+             {{\"id\":\"a\",\"key\":\"a\",\"value\":{{\"rev\":\"{a}\"}}}},\
+             {{\"id\":\"b\",\"key\":\"b\",\"value\":{{\"rev\":\"{b}\"}}}},\
+             {{\"id\":\"c\",\"key\":\"c\",\"value\":{{\"rev\":\"{c}\"}}}}]}}",
+            a = rev('a'),
+            b = rev('b'),
+            c = rev('c')
+        )
+    );
+    assert!(
+        !headers.contains_key("content-length"),
+        "the body is streamed, not sized up front: {headers:?}"
+    );
+
+    let (_, body) = text("/streamed/_all_docs?descending=true&limit=1&update_seq=true").await;
+    assert!(
+        body.starts_with(&format!(
+            "{{\"total_rows\":3,\"offset\":0,\"rows\":[{{\"id\":\"c\",\"key\":\"c\",\"value\":{{\"rev\":\"{}\"}}}}],\"update_seq\":",
+            rev('c')
+        )),
+        "{body}"
+    );
+
+    let head = s
+        .client
+        .head(format!("{}/streamed/_all_docs", s.base))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(
+        !head.headers().contains_key("content-length"),
+        "HEAD must not build the body to size it: {:?}",
+        head.headers()
+    );
+}
+
 #[tokio::test]
 async fn bulk_docs_and_all_docs() {
     let s = Server::start(false);
