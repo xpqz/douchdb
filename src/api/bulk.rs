@@ -278,8 +278,9 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
         headers,
         ..
     } = req;
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return fail(ApiError::bad_request("invalid JSON"));
+    let mut value = match json_body(body, "invalid JSON") {
+        Ok(value) => value,
+        Err(error) => return fail(error),
     };
     let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
@@ -360,8 +361,9 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
         headers,
         ..
     } = req;
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return fail(ApiError::bad_request("invalid JSON"));
+    let value = match json_body(body, "invalid JSON") {
+        Ok(value) => value,
+        Err(error) => return fail(error),
     };
     if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
         return match db.revs_diff(&value).await {
@@ -492,13 +494,10 @@ fn all_docs_opts(
         // `keys` lookup: a deleted document must not appear.
         opts.startkey = opts.startkey.or(Some(key.clone()));
         opts.endkey = opts.endkey.or(Some(key));
-    } else if let Some(raw) = q.get("keys") {
-        match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Array(keys)) => {
-                opts.keys = Some(keys);
-            }
-            Ok(_) => return Err(ApiError::bad_request("`keys` parameter must be an array.")),
-            Err(_) => return Err(ApiError::bad_request("invalid UTF-8 JSON")),
+    } else if let Some(keys) = json_param(q, "keys")? {
+        match keys {
+            Value::Array(keys) => opts.keys = Some(keys),
+            _ => return Err(ApiError::bad_request("`keys` parameter must be an array.")),
         }
     }
     if *method == Method::POST {

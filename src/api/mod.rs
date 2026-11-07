@@ -9,7 +9,10 @@ use crate::db::{
     Db, DbResult, DocOpts,
 };
 use crate::fabric::*;
-pub(crate) use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
+pub(crate) use crate::params::{
+    doc_ids_from, doc_opts, flag, json_body, json_or_string_param, json_param, lenient_json_param,
+    num, resolve_changes_filter,
+};
 use crate::state::{illegal_db_name, valid_db_name};
 pub use crate::state::{AppState, Config, DbUpdates};
 use axum::body::{Body, Bytes};

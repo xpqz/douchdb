@@ -35,17 +35,6 @@ pub(super) fn view_path(rest: &str) -> Option<(String, String)> {
     }
 }
 
-fn view_json_param(q: &HashMap<String, String>, name: &str) -> DbResult<Option<Value>> {
-    match q.get(name) {
-        // CouchDB wants JSON-encoded keys: `key=abc` is a 400, `key="abc"` is
-        // not.
-        Some(raw) => serde_json::from_str::<Value>(raw)
-            .map(Some)
-            .map_err(|_| ApiError::bad_request("invalid UTF-8 JSON")),
-        None => Ok(None),
-    }
-}
-
 fn query_values(uri: &Uri, name: &str) -> Vec<String> {
     uri.query()
         .unwrap_or_default()
@@ -144,9 +133,9 @@ pub(super) async fn search_request(
         let parsed = if body.iter().all(u8::is_ascii_whitespace) {
             None
         } else {
-            match serde_json::from_slice::<Value>(body) {
+            match json_body(body, "invalid UTF-8 JSON") {
                 Ok(value) => Some(value),
-                Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+                Err(error) => return fail(error),
             }
         };
         if let Some(value) = parsed {
@@ -218,18 +207,14 @@ pub(super) async fn search_request(
         }
         request.bookmark = q.get("bookmark").cloned();
         request.include_docs = flag(q, "include_docs");
-        if let Some(raw) = q.get("counts") {
-            if let Ok(Value::Array(counts)) = serde_json::from_str::<Value>(raw) {
-                request.counts = counts
-                    .into_iter()
-                    .filter_map(|field| field.as_str().map(str::to_string))
-                    .collect();
-            }
+        if let Some(Value::Array(counts)) = lenient_json_param(q, "counts") {
+            request.counts = counts
+                .into_iter()
+                .filter_map(|field| field.as_str().map(str::to_string))
+                .collect();
         }
-        if let Some(raw) = q.get("ranges") {
-            if let Ok(Value::Object(ranges)) = serde_json::from_str::<Value>(raw) {
-                request.ranges = ranges;
-            }
+        if let Some(Value::Object(ranges)) = lenient_json_param(q, "ranges") {
+            request.ranges = ranges;
         }
         request.group_field = q.get("group_field").cloned();
         for raw in query_values(uri, "drilldown") {
@@ -237,13 +222,10 @@ pub(super) async fn search_request(
                 request.drilldown.extend(parse_drilldown_value(&value));
             }
         }
-        if let Some(raw) = q.get("sort") {
-            let value = serde_json::from_str::<Value>(raw).unwrap_or(Value::String(raw.clone()));
+        if let Some(value) = json_or_string_param(q, "sort") {
             request.sort = crate::search::parse_sort(&value);
         }
-        if let Some(raw) = q.get("highlight_fields") {
-            let value =
-                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()));
+        if let Some(value) = json_or_string_param(q, "highlight_fields") {
             request.highlight_fields = string_list(&value);
         }
         if let Some(value) = q
@@ -348,7 +330,7 @@ pub(super) async fn view_request(
                 "group",
             ],
         )?;
-        let mut keys = match view_json_param(q, "keys")? {
+        let mut keys = match json_param(q, "keys")? {
             Some(Value::Array(keys)) => Some(keys),
             Some(_) => return Err(ApiError::bad_request("`keys` must be a JSON array")),
             None => None,
@@ -382,10 +364,10 @@ pub(super) async fn view_request(
             ));
         }
         Ok(crate::view::ViewQuery {
-            key: view_json_param(q, "key")?,
+            key: json_param(q, "key")?,
             keys,
-            startkey: view_json_param(q, "startkey")?.or(view_json_param(q, "start_key")?),
-            endkey: view_json_param(q, "endkey")?.or(view_json_param(q, "end_key")?),
+            startkey: json_param(q, "startkey")?.or(json_param(q, "start_key")?),
+            endkey: json_param(q, "endkey")?.or(json_param(q, "end_key")?),
             startkey_docid: q
                 .get("startkey_docid")
                 .or_else(|| q.get("start_key_docid"))
