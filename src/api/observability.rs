@@ -487,11 +487,9 @@ fn percentile_from(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64
     max_ms
 }
 
-/// Merge node snapshots into one cluster-wide view. Counters are summed, route
-/// latency buckets are merged before percentiles are recomputed, and per-database
-/// document counts take the per-node maximum (replicas hold the same documents)
-/// while disk usage is summed.
-fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
+/// Request counters summed across nodes; latency buckets are merged before
+/// the percentiles are recomputed.
+fn aggregate_http(snapshots: &[Value]) -> Value {
     let mut http_total = 0u64;
     let mut in_flight = 0u64;
     let mut http_errors = 0u64;
@@ -503,34 +501,6 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
     let mut methods = BTreeMap::new();
     let mut routes: BTreeMap<String, RouteAgg> = BTreeMap::new();
     let mut seconds: BTreeMap<u64, (u64, u64, f64)> = BTreeMap::new();
-    let mut views = EngineAgg::default();
-    let mut search = EngineAgg::default();
-    let mut local_reads = 0u64;
-    let mut remote_reads = 0u64;
-    let mut quorum_failures = 0u64;
-    let mut degraded_reads = 0u64;
-    let mut fanout_count = 0u64;
-    let mut fanout_sum = 0u64;
-    let mut fanout_max = 0u64;
-    let mut shard_map_updates = 0u64;
-    let mut shard_map_pending = 0u64;
-    let mut rebalance_started = 0u64;
-    let mut rebalance_completed = 0u64;
-    let mut rebalance_timeout = 0u64;
-    let mut cleaned_shards = 0u64;
-    let mut corrupt_records_skipped = 0u64;
-    let mut disk_bytes = 0u64;
-    let mut failed_databases = 0u64;
-    let mut databases: BTreeMap<String, DbAgg> = BTreeMap::new();
-    let mut replication_runs = 0u64;
-    let mut replication_docs = 0u64;
-    let mut replication_error: Option<String> = None;
-    let mut replication_running = false;
-    let mut replication_paused = false;
-    let mut replication_entries: BTreeMap<String, Value> = BTreeMap::new();
-    let mut worst_health = 0u8;
-    let mut health_nodes = Vec::new();
-    let mut health_failing = Vec::new();
 
     for snapshot in snapshots {
         let http = &snapshot["http"];
@@ -580,125 +550,7 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
                     * item["requests"].as_u64().unwrap_or(0) as f64;
             }
         }
-
-        for (target, value) in [
-            (&mut views, &snapshot["views"]),
-            (&mut search, &snapshot["search"]),
-        ] {
-            target.queries += value["queries"].as_u64().unwrap_or(0);
-            target.errors += value["errors"].as_u64().unwrap_or(0);
-            target.total_ms += value["total_ms"].as_f64().unwrap_or(0.0);
-            target.max_ms = target.max_ms.max(value["max_ms"].as_f64().unwrap_or(0.0));
-        }
-
-        let fabric = &snapshot["fabric"];
-        local_reads += fabric["local_reads"].as_u64().unwrap_or(0);
-        remote_reads += fabric["remote_reads"].as_u64().unwrap_or(0);
-        quorum_failures += fabric["quorum_failures"].as_u64().unwrap_or(0);
-        degraded_reads += fabric["degraded_reads"].as_u64().unwrap_or(0);
-        fanout_count += fabric["fanout_count"].as_u64().unwrap_or(0);
-        fanout_sum += fabric["fanout_sum"].as_u64().unwrap_or(0);
-        fanout_max = fanout_max.max(fabric["fanout_max"].as_u64().unwrap_or(0));
-        shard_map_updates += fabric["shard_map_updates"].as_u64().unwrap_or(0);
-        shard_map_pending += fabric["shard_map_pending"].as_u64().unwrap_or(0);
-        rebalance_started += fabric["rebalance_started"].as_u64().unwrap_or(0);
-        rebalance_completed += fabric["rebalance_completed"].as_u64().unwrap_or(0);
-        rebalance_timeout += fabric["rebalance_timeout"].as_u64().unwrap_or(0);
-        cleaned_shards += fabric["cleaned_shards"].as_u64().unwrap_or(0);
-        corrupt_records_skipped += snapshot["integrity"]["corrupt_records_skipped"]
-            .as_u64()
-            .unwrap_or(0);
-
-        let storage = &snapshot["storage"];
-        disk_bytes += storage["disk_bytes"].as_u64().unwrap_or(0);
-        failed_databases += storage["failed_databases"]
-            .as_array()
-            .map(|failed| failed.len() as u64)
-            .unwrap_or(0);
-        if let Some(items) = snapshot["databases"].as_array() {
-            for item in items {
-                let name = item["name"].as_str().unwrap_or("unknown").to_string();
-                let entry = databases.entry(name).or_default();
-                entry.q = item["q"].as_u64().unwrap_or(0);
-                entry.partitioned |= item["partitioned"] == true;
-                entry.update_seq = entry
-                    .update_seq
-                    .max(item["update_seq"].as_u64().unwrap_or(0));
-                entry.local_shards += item["local_shards"].as_u64().unwrap_or(0);
-                entry.disk_bytes += item["disk_bytes"].as_u64().unwrap_or(0);
-                entry.nodes += 1;
-                if let Some(shards) = item["shards"].as_array() {
-                    for shard in shards {
-                        let id = shard["shard"].as_u64().unwrap_or(0);
-                        let entry = entry.shards.entry(id).or_insert((0, 0));
-                        entry.0 = entry.0.max(shard["docs"].as_u64().unwrap_or(0));
-                        entry.1 = entry.1.max(shard["deleted"].as_u64().unwrap_or(0));
-                    }
-                }
-            }
-        }
-        let replication = &snapshot["replication"];
-        replication_runs += replication["runs"].as_u64().unwrap_or(0);
-        replication_docs += replication["docs"].as_u64().unwrap_or(0);
-        replication_running |= replication["running"] == true;
-        replication_paused |= replication["paused"] == true;
-        if replication_error.is_none() {
-            if let Some(error) = replication["error"].as_str() {
-                replication_error = Some(error.to_string());
-            }
-        }
-        if let Some(items) = replication["entries"].as_array() {
-            for item in items {
-                let key = format!(
-                    "{}|{}",
-                    item["db"].as_str().unwrap_or("?"),
-                    item["peer"].as_str().unwrap_or("?")
-                );
-                let newer = replication_entries
-                    .get(&key)
-                    .and_then(|old| old["finished"].as_u64())
-                    .unwrap_or(0)
-                    <= item["finished"].as_u64().unwrap_or(0);
-                if newer {
-                    replication_entries.insert(key, item.clone());
-                }
-            }
-        }
-
-        let health = &snapshot["health"];
-        let status = health["status"].as_str().unwrap_or("ok");
-        worst_health = worst_health.max(health_rank(status));
-        health_nodes.push(json!({
-            "index": snapshot["node"]["index"],
-            "url": snapshot["node"]["url"],
-            "status": status,
-            "checks": health["checks"],
-            "uptime_secs": health["uptime_secs"],
-        }));
-        if status != "ok" {
-            health_failing.push(json!({
-                "index": snapshot["node"]["index"],
-                "url": snapshot["node"]["url"],
-                "status": status,
-                "checks": health["checks"],
-            }));
-        }
     }
-
-    let doc_count: u64 = databases
-        .values()
-        .map(|entry| entry.shards.values().map(|(docs, _)| *docs).sum::<u64>())
-        .sum();
-    let doc_del_count: u64 = databases
-        .values()
-        .map(|entry| {
-            entry
-                .shards
-                .values()
-                .map(|(_, deleted)| *deleted)
-                .sum::<u64>()
-        })
-        .sum();
 
     let mut route_rows: Vec<Value> = routes
         .iter()
@@ -732,6 +584,168 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
         })
         .collect();
 
+    json!({
+        "total": http_total,
+        "in_flight": in_flight,
+        "errors": http_errors,
+        "error_rate_pct": if http_total == 0 { 0.0 } else { http_errors as f64 / http_total as f64 * 100.0 },
+        "status_classes": u64_map_json(status_classes),
+        "status_codes": u64_map_json(status_codes),
+        "methods": u64_map_json(methods),
+        "latency_ms": {
+            "avg": if http_total == 0 { 0.0 } else { total_ms / http_total as f64 },
+            "p50": percentile_from(&buckets, http_total, 50.0, max_ms),
+            "p95": percentile_from(&buckets, http_total, 95.0, max_ms),
+            "p99": percentile_from(&buckets, http_total, 99.0, max_ms),
+            "max": max_ms,
+        },
+        "latency_buckets": {
+            "bounds": crate::metrics::LATENCY_BOUNDS,
+            "counts": buckets,
+        },
+        "routes": route_rows,
+        "per_second": per_second,
+    })
+}
+
+/// View or search query counters summed across nodes.
+fn aggregate_engine(snapshots: &[Value], key: &str) -> Value {
+    let mut engine = EngineAgg::default();
+    for snapshot in snapshots {
+        let value = &snapshot[key];
+        engine.queries += value["queries"].as_u64().unwrap_or(0);
+        engine.errors += value["errors"].as_u64().unwrap_or(0);
+        engine.total_ms += value["total_ms"].as_f64().unwrap_or(0.0);
+        engine.max_ms = engine.max_ms.max(value["max_ms"].as_f64().unwrap_or(0.0));
+    }
+    json!({
+        "queries": engine.queries,
+        "errors": engine.errors,
+        "error_rate_pct": if engine.queries == 0 { 0.0 } else { engine.errors as f64 / engine.queries as f64 * 100.0 },
+        "total_ms": engine.total_ms,
+        "avg_ms": if engine.queries == 0 { 0.0 } else { engine.total_ms / engine.queries as f64 },
+        "max_ms": engine.max_ms,
+    })
+}
+
+/// Fabric counters summed across nodes (`fanout_max` takes the maximum).
+fn aggregate_fabric(snapshots: &[Value]) -> Value {
+    let mut local_reads = 0u64;
+    let mut remote_reads = 0u64;
+    let mut quorum_failures = 0u64;
+    let mut degraded_reads = 0u64;
+    let mut fanout_count = 0u64;
+    let mut fanout_sum = 0u64;
+    let mut fanout_max = 0u64;
+    let mut shard_map_updates = 0u64;
+    let mut shard_map_pending = 0u64;
+    let mut rebalance_started = 0u64;
+    let mut rebalance_completed = 0u64;
+    let mut rebalance_timeout = 0u64;
+    let mut cleaned_shards = 0u64;
+
+    for snapshot in snapshots {
+        let fabric = &snapshot["fabric"];
+        local_reads += fabric["local_reads"].as_u64().unwrap_or(0);
+        remote_reads += fabric["remote_reads"].as_u64().unwrap_or(0);
+        quorum_failures += fabric["quorum_failures"].as_u64().unwrap_or(0);
+        degraded_reads += fabric["degraded_reads"].as_u64().unwrap_or(0);
+        fanout_count += fabric["fanout_count"].as_u64().unwrap_or(0);
+        fanout_sum += fabric["fanout_sum"].as_u64().unwrap_or(0);
+        fanout_max = fanout_max.max(fabric["fanout_max"].as_u64().unwrap_or(0));
+        shard_map_updates += fabric["shard_map_updates"].as_u64().unwrap_or(0);
+        shard_map_pending += fabric["shard_map_pending"].as_u64().unwrap_or(0);
+        rebalance_started += fabric["rebalance_started"].as_u64().unwrap_or(0);
+        rebalance_completed += fabric["rebalance_completed"].as_u64().unwrap_or(0);
+        rebalance_timeout += fabric["rebalance_timeout"].as_u64().unwrap_or(0);
+        cleaned_shards += fabric["cleaned_shards"].as_u64().unwrap_or(0);
+    }
+
+    json!({
+        "local_reads": local_reads,
+        "remote_reads": remote_reads,
+        "quorum_failures": quorum_failures,
+        "degraded_reads": degraded_reads,
+        "fanout_count": fanout_count,
+        "fanout_sum": fanout_sum,
+        "fanout_avg": if fanout_count == 0 { 0.0 } else { fanout_sum as f64 / fanout_count as f64 },
+        "fanout_max": fanout_max,
+        "shard_map_updates": shard_map_updates,
+        "shard_map_pending": shard_map_pending,
+        "rebalance_started": rebalance_started,
+        "rebalance_completed": rebalance_completed,
+        "rebalance_timeout": rebalance_timeout,
+        "cleaned_shards": cleaned_shards,
+    })
+}
+
+/// Corrupt records skipped, summed across nodes.
+fn aggregate_integrity(snapshots: &[Value]) -> Value {
+    let corrupt_records_skipped: u64 = snapshots
+        .iter()
+        .map(|snapshot| {
+            snapshot["integrity"]["corrupt_records_skipped"]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .sum();
+    json!({ "corrupt_records_skipped": corrupt_records_skipped })
+}
+
+/// Disk usage is summed across nodes; document counts are per-shard maxima so
+/// replicas are not counted twice. Returns the `storage` and `databases`
+/// sections.
+fn aggregate_storage(snapshots: &[Value]) -> (Value, Value) {
+    let mut disk_bytes = 0u64;
+    let mut failed_databases = 0u64;
+    let mut databases: BTreeMap<String, DbAgg> = BTreeMap::new();
+
+    for snapshot in snapshots {
+        let storage = &snapshot["storage"];
+        disk_bytes += storage["disk_bytes"].as_u64().unwrap_or(0);
+        failed_databases += storage["failed_databases"]
+            .as_array()
+            .map(|failed| failed.len() as u64)
+            .unwrap_or(0);
+        if let Some(items) = snapshot["databases"].as_array() {
+            for item in items {
+                let name = item["name"].as_str().unwrap_or("unknown").to_string();
+                let entry = databases.entry(name).or_default();
+                entry.q = item["q"].as_u64().unwrap_or(0);
+                entry.partitioned |= item["partitioned"] == true;
+                entry.update_seq = entry
+                    .update_seq
+                    .max(item["update_seq"].as_u64().unwrap_or(0));
+                entry.local_shards += item["local_shards"].as_u64().unwrap_or(0);
+                entry.disk_bytes += item["disk_bytes"].as_u64().unwrap_or(0);
+                entry.nodes += 1;
+                if let Some(shards) = item["shards"].as_array() {
+                    for shard in shards {
+                        let id = shard["shard"].as_u64().unwrap_or(0);
+                        let entry = entry.shards.entry(id).or_insert((0, 0));
+                        entry.0 = entry.0.max(shard["docs"].as_u64().unwrap_or(0));
+                        entry.1 = entry.1.max(shard["deleted"].as_u64().unwrap_or(0));
+                    }
+                }
+            }
+        }
+    }
+
+    let doc_count: u64 = databases
+        .values()
+        .map(|entry| entry.shards.values().map(|(docs, _)| *docs).sum::<u64>())
+        .sum();
+    let doc_del_count: u64 = databases
+        .values()
+        .map(|entry| {
+            entry
+                .shards
+                .values()
+                .map(|(_, deleted)| *deleted)
+                .sum::<u64>()
+        })
+        .sum();
+
     let database_rows: Vec<Value> = databases
         .into_iter()
         .map(|(name, db)| {
@@ -751,110 +765,120 @@ fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
         })
         .collect();
 
+    let storage = json!({
+        "databases": database_rows.len(),
+        "disk_bytes": disk_bytes,
+        "disk_mb": disk_bytes as f64 / (1024.0 * 1024.0),
+        "doc_count": doc_count,
+        "doc_del_count": doc_del_count,
+        "failed_databases": failed_databases,
+    });
+    (storage, json!(database_rows))
+}
+
+/// Replication counters summed across nodes; each (database, peer) entry keeps
+/// the most recently finished report.
+fn aggregate_replication(snapshots: &[Value]) -> Value {
+    let mut replication_runs = 0u64;
+    let mut replication_docs = 0u64;
+    let mut replication_error: Option<String> = None;
+    let mut replication_running = false;
+    let mut replication_paused = false;
+    let mut replication_entries: BTreeMap<String, Value> = BTreeMap::new();
+
+    for snapshot in snapshots {
+        let replication = &snapshot["replication"];
+        replication_runs += replication["runs"].as_u64().unwrap_or(0);
+        replication_docs += replication["docs"].as_u64().unwrap_or(0);
+        replication_running |= replication["running"] == true;
+        replication_paused |= replication["paused"] == true;
+        if replication_error.is_none() {
+            if let Some(error) = replication["error"].as_str() {
+                replication_error = Some(error.to_string());
+            }
+        }
+        if let Some(items) = replication["entries"].as_array() {
+            for item in items {
+                let key = format!(
+                    "{}|{}",
+                    item["db"].as_str().unwrap_or("?"),
+                    item["peer"].as_str().unwrap_or("?")
+                );
+                let newer = replication_entries
+                    .get(&key)
+                    .and_then(|old| old["finished"].as_u64())
+                    .unwrap_or(0)
+                    <= item["finished"].as_u64().unwrap_or(0);
+                if newer {
+                    replication_entries.insert(key, item.clone());
+                }
+            }
+        }
+    }
+
+    json!({
+        "running": replication_running,
+        "paused": replication_paused,
+        "runs": replication_runs,
+        "docs": replication_docs,
+        "error": replication_error,
+        "entries": replication_entries.into_values().collect::<Vec<_>>(),
+    })
+}
+
+/// The worst node status wins; every node is listed, and those that are not ok
+/// are repeated under `failing`.
+fn aggregate_health(snapshots: &[Value]) -> Value {
+    let mut worst_health = 0u8;
+    let mut health_nodes = Vec::new();
+    let mut health_failing = Vec::new();
+
+    for snapshot in snapshots {
+        let health = &snapshot["health"];
+        let status = health["status"].as_str().unwrap_or("ok");
+        worst_health = worst_health.max(health_rank(status));
+        health_nodes.push(json!({
+            "index": snapshot["node"]["index"],
+            "url": snapshot["node"]["url"],
+            "status": status,
+            "checks": health["checks"],
+            "uptime_secs": health["uptime_secs"],
+        }));
+        if status != "ok" {
+            health_failing.push(json!({
+                "index": snapshot["node"]["index"],
+                "url": snapshot["node"]["url"],
+                "status": status,
+                "checks": health["checks"],
+            }));
+        }
+    }
+
+    json!({
+        "status": health_status_name(worst_health),
+        "ok": worst_health == 0,
+        "nodes": health_nodes,
+        "failing": health_failing,
+        "generated_at": now_ms(),
+    })
+}
+
+/// Merge node snapshots into one cluster-wide view. Counters are summed, route
+/// latency buckets are merged before percentiles are recomputed, and per-database
+/// document counts take the per-node maximum (replicas hold the same documents)
+/// while disk usage is summed.
+fn aggregate_metrics(snapshots: &[Value]) -> Map<String, Value> {
+    let (storage, databases) = aggregate_storage(snapshots);
     let mut out = Map::new();
-    out.insert(
-        "http".to_string(),
-        json!({
-            "total": http_total,
-            "in_flight": in_flight,
-            "errors": http_errors,
-            "error_rate_pct": if http_total == 0 { 0.0 } else { http_errors as f64 / http_total as f64 * 100.0 },
-            "status_classes": u64_map_json(status_classes),
-            "status_codes": u64_map_json(status_codes),
-            "methods": u64_map_json(methods),
-            "latency_ms": {
-                "avg": if http_total == 0 { 0.0 } else { total_ms / http_total as f64 },
-                "p50": percentile_from(&buckets, http_total, 50.0, max_ms),
-                "p95": percentile_from(&buckets, http_total, 95.0, max_ms),
-                "p99": percentile_from(&buckets, http_total, 99.0, max_ms),
-                "max": max_ms,
-            },
-            "latency_buckets": {
-                "bounds": crate::metrics::LATENCY_BOUNDS,
-                "counts": buckets,
-            },
-            "routes": route_rows,
-            "per_second": per_second,
-        }),
-    );
-    out.insert(
-        "views".to_string(),
-        json!({
-            "queries": views.queries,
-            "errors": views.errors,
-            "error_rate_pct": if views.queries == 0 { 0.0 } else { views.errors as f64 / views.queries as f64 * 100.0 },
-            "total_ms": views.total_ms,
-            "avg_ms": if views.queries == 0 { 0.0 } else { views.total_ms / views.queries as f64 },
-            "max_ms": views.max_ms,
-        }),
-    );
-    out.insert(
-        "search".to_string(),
-        json!({
-            "queries": search.queries,
-            "errors": search.errors,
-            "error_rate_pct": if search.queries == 0 { 0.0 } else { search.errors as f64 / search.queries as f64 * 100.0 },
-            "total_ms": search.total_ms,
-            "avg_ms": if search.queries == 0 { 0.0 } else { search.total_ms / search.queries as f64 },
-            "max_ms": search.max_ms,
-        }),
-    );
-    out.insert(
-        "fabric".to_string(),
-        json!({
-            "local_reads": local_reads,
-            "remote_reads": remote_reads,
-            "quorum_failures": quorum_failures,
-            "degraded_reads": degraded_reads,
-            "fanout_count": fanout_count,
-            "fanout_sum": fanout_sum,
-            "fanout_avg": if fanout_count == 0 { 0.0 } else { fanout_sum as f64 / fanout_count as f64 },
-            "fanout_max": fanout_max,
-            "shard_map_updates": shard_map_updates,
-            "shard_map_pending": shard_map_pending,
-            "rebalance_started": rebalance_started,
-            "rebalance_completed": rebalance_completed,
-            "rebalance_timeout": rebalance_timeout,
-            "cleaned_shards": cleaned_shards,
-        }),
-    );
-    out.insert(
-        "integrity".to_string(),
-        json!({ "corrupt_records_skipped": corrupt_records_skipped }),
-    );
-    out.insert(
-        "storage".to_string(),
-        json!({
-            "databases": database_rows.len(),
-            "disk_bytes": disk_bytes,
-            "disk_mb": disk_bytes as f64 / (1024.0 * 1024.0),
-            "doc_count": doc_count,
-            "doc_del_count": doc_del_count,
-            "failed_databases": failed_databases,
-        }),
-    );
-    out.insert("databases".to_string(), json!(database_rows));
-    out.insert(
-        "replication".to_string(),
-        json!({
-            "running": replication_running,
-            "paused": replication_paused,
-            "runs": replication_runs,
-            "docs": replication_docs,
-            "error": replication_error,
-            "entries": replication_entries.into_values().collect::<Vec<_>>(),
-        }),
-    );
-    out.insert(
-        "health".to_string(),
-        json!({
-            "status": health_status_name(worst_health),
-            "ok": worst_health == 0,
-            "nodes": health_nodes,
-            "failing": health_failing,
-            "generated_at": now_ms(),
-        }),
-    );
+    out.insert("http".to_string(), aggregate_http(snapshots));
+    out.insert("views".to_string(), aggregate_engine(snapshots, "views"));
+    out.insert("search".to_string(), aggregate_engine(snapshots, "search"));
+    out.insert("fabric".to_string(), aggregate_fabric(snapshots));
+    out.insert("integrity".to_string(), aggregate_integrity(snapshots));
+    out.insert("storage".to_string(), storage);
+    out.insert("databases".to_string(), databases);
+    out.insert("replication".to_string(), aggregate_replication(snapshots));
+    out.insert("health".to_string(), aggregate_health(snapshots));
     out
 }
 
