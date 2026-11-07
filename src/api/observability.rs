@@ -4,6 +4,7 @@
 //! re-exports them so route registration stays in one place.
 
 use super::{access_denied, flag, internal_request, query, AppState};
+use crate::db::Db;
 use crate::state::FsHealth;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -246,12 +247,17 @@ async fn check_storage(st: &AppState, detailed: bool) -> (Value, usize, u64) {
 
 /// Databases whose shard map a peer has not acknowledged.
 async fn check_placement(st: &AppState) -> Value {
-    let pending = {
-        let dbs = st.dbs.read().await;
-        dbs.values()
-            .filter(|db| db.pending_shard_map().is_some())
+    // From disk, so a database that is not open counts too.
+    let names = st.db_names().await;
+    let root = st.root.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        names
+            .iter()
+            .filter(|name| Db::has_pending_shard_map(&root, name))
             .count()
-    };
+    })
+    .await
+    .unwrap_or(0);
     json!({
         "name": "placement",
         "status": if pending == 0 { "ok" } else { "degraded" },

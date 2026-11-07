@@ -582,6 +582,36 @@ impl Db {
         db_path(root, name).join("db.json").is_file()
     }
 
+    /// The security object of a database that need not be open: what its
+    /// directory holds, which is what an open one holds in memory too, since
+    /// it is written before it is installed.
+    pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
+        if !Db::exists(root, name) {
+            return Err(ApiError::not_found(format!(
+                "Database does not exist: {name}"
+            )));
+        }
+        load_security(&db_path(root, name)).map(|(_, security)| security)
+    }
+
+    /// Whether a shard map this node has not acknowledged is waiting on disk.
+    pub fn has_pending_shard_map(root: &Path, name: &str) -> bool {
+        matches!(
+            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json")),
+            Ok(Some(_))
+        )
+    }
+
+    /// Whether the database can be closed and reopened without losing
+    /// anything: no rebalance is freezing it, no compaction is running, and no
+    /// cluster write holds its gate. What it keeps in memory beyond that is
+    /// rebuilt from disk.
+    pub fn quiescent(&self) -> bool {
+        !self.rebalance_in_progress()
+            && !self.compact_running.load(Ordering::SeqCst)
+            && self.write_gate.try_write().is_ok()
+    }
+
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
         std::fs::remove_dir_all(db_path(root, name))
             .map_err(|_| ApiError::not_found(format!("Database does not exist: {name}")))
@@ -665,9 +695,9 @@ impl Db {
 
     /// All `validate_doc_update` functions from live design documents.
     ///
-    /// Loading is cached until a design document is written. The scan walks
-    /// the shard's latest-change index, so it does not read ordinary document
-    /// bodies.
+    /// Loading is cached until a design document is written. The scan is a
+    /// range over the shards' `_design/` metadata keys, so it reads neither
+    /// ordinary documents nor the changes index.
     pub async fn validation_functions(&self) -> DbResult<Vec<String>> {
         if let Some(functions) = self
             .validation
@@ -681,21 +711,13 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
-            let corrupt = shard.call(|s| Ok(s.corrupt_design_docs()?)).await?;
+            let (mut found, corrupt) = shard.call(|s| Ok(s.design_docs()?)).await?;
             if let Some(id) = corrupt.first() {
                 // Skipping it would let writes through unvalidated.
                 return Err(ApiError::corrupt(format!(
                     "corrupt design document {id}: its validate_doc_update cannot be loaded"
                 )));
             }
-            let mut found = shard
-                .call(|s| {
-                    Ok(s.latest_changes()?
-                        .ids_with_prefix("_design/")
-                        .cloned()
-                        .collect::<Vec<String>>())
-                })
-                .await?;
             ids.append(&mut found);
         }
         ids.sort();

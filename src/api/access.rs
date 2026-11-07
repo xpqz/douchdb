@@ -65,10 +65,13 @@ fn security_list_empty(security: &Value, key: &str) -> bool {
 }
 
 pub(super) fn db_access(st: &AppState, principal: &Principal, db: &Db) -> Option<DbAccess> {
+    access_by_security(st, principal, &db.security())
+}
+
+fn access_by_security(st: &AppState, principal: &Principal, security: &Value) -> Option<DbAccess> {
     if principal.admin {
         return Some(DbAccess::Admin);
     }
-    let security = db.security();
     if security_matches(principal, security.get("admins")) {
         return Some(DbAccess::Admin);
     }
@@ -79,8 +82,8 @@ pub(super) fn db_access(st: &AppState, principal: &Principal, db: &Db) -> Option
     // the operator chose `open`. This is deliberately stricter than CouchDB's
     // "empty members means public" rule: setting admins without members must
     // not accidentally expose the database to every authenticated user.
-    if security_list_empty(&security, "members") {
-        if security_list_empty(&security, "admins") && !st.config.default_admin_only {
+    if security_list_empty(security, "members") {
+        if security_list_empty(security, "admins") && !st.config.default_admin_only {
             Some(DbAccess::Member)
         } else {
             None
@@ -98,8 +101,8 @@ pub(crate) async fn visible_db_names(
 ) -> Vec<String> {
     let mut visible = Vec::new();
     for name in names {
-        if let Ok(db) = st.db(&name).await {
-            if db_access(st, principal, &db).is_some() {
+        if let Some(security) = st.db_security(&name).await {
+            if access_by_security(st, principal, &security).is_some() {
                 visible.push(name);
             }
         }
