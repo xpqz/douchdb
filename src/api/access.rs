@@ -18,6 +18,32 @@ pub(crate) fn access_denied(principal: &Principal) -> Response {
     }
 }
 
+/// The authenticated caller. The admission middleware resolves the principal
+/// once per request and leaves it in the request extensions; this reads it
+/// back, and authenticates from the headers only when no middleware ran (the
+/// exempt paths).
+pub struct Caller(pub Principal);
+
+/// The principal the admission middleware left in `parts`, or one
+/// authenticated from the headers when no middleware ran (the exempt paths).
+pub(super) fn caller(st: &AppState, parts: &axum::http::request::Parts) -> Principal {
+    match parts.extensions.get::<Principal>() {
+        Some(principal) => principal.clone(),
+        None => st.principal(&parts.headers),
+    }
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        st: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Caller(caller(st, parts)))
+    }
+}
+
 /// Extractor for admin-only endpoints: rejects with the same 401 or 403 as
 /// every other access failure when the caller is not a server admin. Place it
 /// after any path extractor and before the body.
@@ -30,7 +56,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminOnly {
         parts: &mut axum::http::request::Parts,
         st: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let principal = st.principal(&parts.headers);
+        let principal = caller(st, parts);
         if principal.admin {
             Ok(AdminOnly)
         } else {

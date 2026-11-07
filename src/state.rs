@@ -373,10 +373,6 @@ impl AppState {
         }
         principal
     }
-
-    pub(crate) fn authorized(&self, headers: &HeaderMap) -> bool {
-        self.principal(headers).is_authenticated()
-    }
 }
 
 /// How long the filesystem part of the health check is reused. `/_health` is

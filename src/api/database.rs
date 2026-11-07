@@ -6,6 +6,7 @@ use super::*;
 pub async fn db_root(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    Caller(principal): Caller,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -17,7 +18,6 @@ pub async fn db_root(
         return fail(illegal_db_name(&name));
     }
     let q = query(&uri);
-    let principal = st.principal(&headers);
     let local_only = st.ctx.cluster.is_internal_db(&headers);
     if matches!(method, Method::PUT | Method::DELETE) && !principal.admin {
         return access_denied(&principal);
@@ -431,20 +431,33 @@ pub async fn db_rest(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
     Path((_, rest)): Path<(String, String)>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+    parts: axum::http::request::Parts,
     body: Bytes,
 ) -> Response {
+    let principal = caller(&st, &parts);
+    let axum::http::request::Parts {
+        method,
+        uri,
+        headers,
+        ..
+    } = parts;
     if rest.is_empty() {
         // CouchDB accepts `GET /db/` and PouchDB uses it during setup.
-        return db_root(State(st), DbName(name), method, uri, headers, body).await;
+        return db_root(
+            State(st),
+            DbName(name),
+            Caller(principal),
+            method,
+            uri,
+            headers,
+            body,
+        )
+        .await;
     }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(e) => return fail(e),
     };
-    let principal = st.principal(&headers);
     if let Some(response) =
         require_db_access(&st, &principal, &db, requires_db_admin(&rest, &method))
     {

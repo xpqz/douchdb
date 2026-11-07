@@ -71,15 +71,17 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
 /// the global in-flight pool, and view/search work uses separate heavy permits.
 pub async fn admit(
     State(st): State<Arc<AppState>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let path = req.uri().path();
-    if crate::admission::Admission::exempt(path) {
+    if crate::admission::Admission::exempt(req.uri().path()) {
         return next.run(req).await;
     }
+    // The one place a request is authenticated; handlers read it back through
+    // the `Caller` extractor.
     let principal = st.principal(req.headers());
-    let lane = crate::admission::Admission::classify(req.method(), path);
+    req.extensions_mut().insert(principal.clone());
+    let lane = crate::admission::Admission::classify(req.method(), req.uri().path());
     match st.admission.try_admit(&principal, lane) {
         Ok(permit) => hold_for_body(permit, next.run(req).await),
         Err(denied) => {
