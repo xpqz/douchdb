@@ -658,4 +658,23 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// A pass used to open every database through the cache, so with more
+    /// databases than `--max-open-dbs` each pass closed and reopened them all.
+    #[tokio::test]
+    async fn anti_entropy_pass_opens_a_bounded_number_of_databases() {
+        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 4);
+        for n in 0..20 {
+            st.create_db(&format!("db{n:02}"), false, None, None)
+                .await
+                .unwrap();
+        }
+        let before = st.db_opens.load(Ordering::Relaxed);
+        assert!(sync_once(st.clone(), None).await);
+        let opened = st.db_opens.load(Ordering::Relaxed) - before;
+        assert!(opened <= 4, "a pass opened {opened} databases, cap is 4");
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

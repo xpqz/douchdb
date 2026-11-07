@@ -1157,4 +1157,24 @@ mod tests {
         assert!(health.readable && health.writable);
         assert_eq!(health.unreadable, 1);
     }
+
+    /// A scrape used to open every database, evicting and re-opening all but
+    /// `--max-open-dbs` of them each time.
+    #[tokio::test]
+    async fn metrics_scrape_does_not_open_closed_databases() {
+        let root = std::env::temp_dir().join(format!("douchdb-metrics-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 4);
+        for n in 0..20 {
+            st.create_db(&format!("db{n:02}"), false, None, None)
+                .await
+                .unwrap();
+        }
+        let before = st.db_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let metrics = local_metrics(&st).await;
+        let opened = st.db_opens.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(metrics["databases"].as_array().map(Vec::len), Some(20));
+        assert_eq!(opened, 0, "a scrape opened {opened} databases");
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -207,6 +207,7 @@ fn build_state(
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
+        db_opens: Default::default(),
         fs_health: Default::default(),
         config,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(

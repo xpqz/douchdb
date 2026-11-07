@@ -119,6 +119,9 @@ pub struct AppState {
     /// a time, so a name is never opened twice (the second open would fail on
     /// the LevelDB lock) and a drop cannot interleave with a create or open.
     pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How many times a database has been opened from disk, creation
+    /// included. A closed database that is asked for again counts once more.
+    pub db_opens: AtomicU64,
     pub config: Config,
     pub ctx: ClusterCtx,
     pub db_updates: DbUpdates,
@@ -226,6 +229,7 @@ impl AppState {
                 partitioned: false,
             },
         )?);
+        self.db_opens.fetch_add(1, Ordering::Relaxed);
         self.dbs
             .write()
             .await
@@ -339,6 +343,7 @@ impl AppState {
                 partitioned,
             },
         )?);
+        self.db_opens.fetch_add(1, Ordering::Relaxed);
         self.dbs
             .write()
             .await
@@ -437,6 +442,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         root,
         dbs: Default::default(),
         db_locks: Default::default(),
+        db_opens: Default::default(),
         fs_health: Default::default(),
         shutdown: Default::default(),
         config: Config {
