@@ -308,6 +308,14 @@ pub(crate) fn canonical_json(value: &Value) -> String {
     }
 }
 
+/// The placement metadata of a database that is not open.
+pub struct ClosedMeta {
+    pub q: u32,
+    pub partitioned: bool,
+    pub shard_map: ShardMap,
+    pub pending_shard_map: bool,
+}
+
 pub struct Db {
     pub name: String,
     pub path: PathBuf,
@@ -609,6 +617,36 @@ impl Db {
             )));
         }
         load_security(&db_path(root, name)).map(|(_, security)| security)
+    }
+
+    /// What `open` would settle on for placement, read from the directory
+    /// without opening the database. `None` when `open` would have to rewrite
+    /// the shard map (none stored, or one for a different cluster size), so
+    /// the caller must open the database instead.
+    pub fn read_closed_meta(
+        root: &Path,
+        name: &str,
+        node_count: usize,
+    ) -> DbResult<Option<ClosedMeta>> {
+        let path = db_path(root, name);
+        let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
+            return Err(ApiError::not_found(format!(
+                "Database does not exist: {name}"
+            )));
+        };
+        let map_path = path.join("shard-map.json");
+        let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
+            return Ok(None);
+        };
+        if shard_map.node_count != node_count || !shard_map.is_valid(file.q, shard_map.node_count) {
+            return Ok(None);
+        }
+        Ok(Some(ClosedMeta {
+            q: file.q.max(1),
+            partitioned: file.partitioned,
+            shard_map,
+            pending_shard_map: Db::has_pending_shard_map(root, name),
+        }))
     }
 
     /// Whether a shard map this node has not acknowledged is waiting on disk.

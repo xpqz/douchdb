@@ -110,6 +110,28 @@ impl OpenDb {
     }
 }
 
+/// A database's placement and, when it is open, the handle that can also
+/// report counts and sequences.
+pub(crate) struct Placement {
+    pub(crate) q: u32,
+    pub(crate) partitioned: bool,
+    pub(crate) shard_map: crate::cluster::ShardMap,
+    pub(crate) pending_shard_map: bool,
+    pub(crate) open: Option<Arc<Db>>,
+}
+
+impl Placement {
+    fn of_open(db: Arc<Db>) -> Self {
+        Placement {
+            q: db.q,
+            partitioned: db.partitioned,
+            shard_map: db.shard_map(),
+            pending_shard_map: db.pending_shard_map().is_some(),
+            open: Some(db),
+        }
+    }
+}
+
 pub struct AppState {
     pub root: PathBuf,
     /// The open databases, at most `config.max_open_dbs` once idle ones have
@@ -201,11 +223,34 @@ impl AppState {
     }
 
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
+        self.open_db(name, true).await
+    }
+
+    /// Like `db`, for a sweep over every database (anti-entropy). A database
+    /// opened here enters the cache as the least recently used, and a hit
+    /// does not refresh it, so the sweep does not push the databases clients
+    /// are using out of the cache. Call `release_cold` once the handle is
+    /// dropped to close the ones that no longer fit.
+    pub(crate) async fn db_cold(&self, name: &str) -> DbResult<Arc<Db>> {
+        self.open_db(name, false).await
+    }
+
+    pub(crate) async fn release_cold(&self) {
+        self.close_idle().await;
+    }
+
+    /// The database if it is open, without opening it and without counting
+    /// as a use.
+    pub(crate) async fn open_db_if_cached(&self, name: &str) -> Option<Arc<Db>> {
+        self.dbs.read().await.get(name).map(|open| open.db.clone())
+    }
+
+    async fn open_db(&self, name: &str, hot: bool) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(open) = self.dbs.read().await.get(name) {
-            return Ok(open.touch());
+            return Ok(if hot { open.touch() } else { open.db.clone() });
         }
         if !Db::exists(&self.root, name) {
             return Err(ApiError::not_found(format!(
@@ -217,7 +262,7 @@ impl AppState {
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
         if let Some(open) = self.dbs.read().await.get(name) {
-            return Ok(open.touch());
+            return Ok(if hot { open.touch() } else { open.db.clone() });
         }
         let db = Arc::new(Db::open_existing(
             &self.root,
@@ -230,12 +275,42 @@ impl AppState {
             },
         )?);
         self.db_opens.fetch_add(1, Ordering::Relaxed);
-        self.dbs
-            .write()
-            .await
-            .insert(name.to_string(), OpenDb::new(db.clone()));
+        let open = OpenDb::new(db.clone());
+        if !hot {
+            open.used.store(0, Ordering::Relaxed);
+        }
+        self.dbs.write().await.insert(name.to_string(), open);
         self.close_idle().await;
         Ok(db)
+    }
+
+    /// Placement of a database for the management views: from memory when it
+    /// is open, from its directory when it is not, and by opening it only
+    /// when the directory cannot say (a legacy database with no shard map).
+    pub(crate) async fn placement(&self, name: &str) -> DbResult<Placement> {
+        if !valid_db_name(name) {
+            return Err(ApiError::not_found("Database does not exist."));
+        }
+        if let Some(db) = self.open_db_if_cached(name).await {
+            return Ok(Placement::of_open(db));
+        }
+        let root = self.root.clone();
+        let owned = name.to_string();
+        let nodes = self.ctx.cluster.nodes.len().max(1);
+        let closed =
+            tokio::task::spawn_blocking(move || Db::read_closed_meta(&root, &owned, nodes))
+                .await
+                .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))??;
+        match closed {
+            Some(meta) => Ok(Placement {
+                q: meta.q,
+                partitioned: meta.partitioned,
+                shard_map: meta.shard_map,
+                pending_shard_map: meta.pending_shard_map,
+                open: None,
+            }),
+            None => Ok(Placement::of_open(self.db(name).await?)),
+        }
     }
 
     /// Close the least recently used databases until at most
@@ -365,6 +440,11 @@ impl AppState {
         Db::destroy(&self.root, name)?;
         self.db_updates.record(name, "deleted");
         Ok(())
+    }
+
+    /// Names of the databases that are open now.
+    pub(crate) async fn open_db_names(&self) -> std::collections::HashSet<String> {
+        self.dbs.read().await.keys().cloned().collect()
     }
 
     pub async fn db_names(&self) -> Vec<String> {
