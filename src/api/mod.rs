@@ -1,9 +1,9 @@
 //! HTTP surface. The shape of every response here is dictated by CouchDB's
 //! wire protocol, not by taste.
 
-use crate::auth::{Auth, Principal};
-use crate::cluster::{Cluster, ShardMap};
-use crate::cluster_http::{forward_client_auth, internal_request_raw, peer_url};
+use crate::auth::Principal;
+use crate::cluster::ShardMap;
+use crate::cluster_http::{forward_client_auth, internal_request, peer_url, ClusterCtx};
 use crate::db::{
     attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError,
     ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
@@ -79,9 +79,7 @@ pub struct AppState {
     /// the LevelDB lock) and a drop cannot interleave with a create or open.
     pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub config: Config,
-    pub auth: Option<Auth>,
-    pub cluster: Cluster,
-    pub client: reqwest::Client,
+    pub ctx: ClusterCtx,
     pub db_updates: DbUpdates,
     pub cluster_state: Arc<crate::cluster_state::ClusterState>,
     pub admission: Arc<crate::admission::Admission>,
@@ -321,24 +319,7 @@ fn parse_shard_mask(raw: &str, q: u32) -> Option<Vec<bool>> {
 /// local node's shards: re-running the fan-out on the receiving side would send
 /// the request straight back and loop.
 pub(crate) fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
-    st.cluster.is_internal(headers)
-}
-
-/// `internal_request_raw` plus credentials: the calling client's own when the request
-/// was made on its behalf (`Some(headers)`), otherwise this node's.
-pub(crate) fn internal_request(
-    st: &AppState,
-    method: reqwest::Method,
-    peer: &str,
-    segments: &[&str],
-    client_headers: Option<&HeaderMap>,
-) -> reqwest::RequestBuilder {
-    let request = internal_request_raw(&st.client, &st.cluster.secret, method, peer, segments);
-    match (client_headers, &st.auth) {
-        (Some(headers), _) => forward_client_auth(request, headers),
-        (None, Some(auth)) => request.basic_auth(&auth.user, Some(&auth.pass)),
-        (None, None) => request,
-    }
+    st.ctx.cluster.is_internal(headers)
 }
 
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.
@@ -469,7 +450,7 @@ impl AppState {
             DbConfig {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
-                shard_map: self.cluster.shard_map(self.config.q),
+                shard_map: self.ctx.cluster.shard_map(self.config.q),
                 partitioned: false,
             },
         )?);
@@ -507,8 +488,9 @@ impl AppState {
                 q: q.unwrap_or(self.config.q),
                 revs_limit: self.config.revs_limit,
                 shard_map: self
+                    .ctx
                     .cluster
-                    .shard_map_n(q.unwrap_or(self.config.q), n.unwrap_or(self.cluster.n)),
+                    .shard_map_n(q.unwrap_or(self.config.q), n.unwrap_or(self.ctx.cluster.n)),
                 partitioned,
             },
         )?);
@@ -555,14 +537,14 @@ impl AppState {
     /// requests without user credentials are service admins; peers are trusted
     /// by the shared cluster secret.
     pub fn principal(&self, headers: &HeaderMap) -> Principal {
-        let Some(auth) = &self.auth else {
+        let Some(auth) = &self.ctx.auth else {
             return Principal::service_admin();
         };
         let principal = auth.principal(headers);
         if principal.is_authenticated() {
             return principal;
         }
-        if self.cluster.is_internal(headers) || self.cluster.is_internal_db(headers) {
+        if self.ctx.cluster.is_internal(headers) || self.ctx.cluster.is_internal_db(headers) {
             return Principal::service_admin();
         }
         principal

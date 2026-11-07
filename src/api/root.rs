@@ -29,16 +29,17 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
         (Err(error), _) | (_, Err(error)) => return fail(error),
     };
     let mut names = st.db_names().await;
-    if st.cluster.is_clustered() && !st.cluster.is_internal_db(&headers) {
-        for (i, peer) in st.cluster.nodes.iter().enumerate() {
-            if i == st.cluster.me {
+    if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal_db(&headers) {
+        for (i, peer) in st.ctx.cluster.nodes.iter().enumerate() {
+            if i == st.ctx.cluster.me {
                 continue;
             }
             let request = st
+                .ctx
                 .client
                 .get(peer_url(peer, &["_all_dbs"]))
                 .header("x-douchdb-local-db", "1")
-                .header("x-douchdb-secret", st.cluster.secret.as_str());
+                .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
             if let Ok(response) = request.send().await {
                 if let Ok(Value::Array(remote)) = response.json::<Value>().await {

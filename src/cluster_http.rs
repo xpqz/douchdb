@@ -1,7 +1,18 @@
 //! Plumbing for node-to-node HTTP: URL encoding, the forwarded marker and
 //! the cluster secret, and credential forwarding.
 
+use crate::auth::Auth;
+use crate::cluster::Cluster;
 use axum::http::{header, HeaderMap};
+
+/// What a node needs to talk to its peers: the placement, an HTTP client and
+/// the credentials of this node. Core cluster modules depend on this instead
+/// of the HTTP layer's application state.
+pub struct ClusterCtx {
+    pub cluster: Cluster,
+    pub client: reqwest::Client,
+    pub auth: Option<Auth>,
+}
 
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
 /// the `_session` cookie both arrive as plain headers; the peer is trusted, so
@@ -46,6 +57,23 @@ pub(crate) fn internal_request_raw(
         .request(method, peer_url(peer, segments))
         .header("x-douchdb-forwarded", "1")
         .header("x-douchdb-secret", secret)
+}
+
+/// `internal_request_raw` plus credentials: the calling client's own when the request
+/// was made on its behalf (`Some(headers)`), otherwise this node's.
+pub(crate) fn internal_request(
+    ctx: &ClusterCtx,
+    method: reqwest::Method,
+    peer: &str,
+    segments: &[&str],
+    client_headers: Option<&HeaderMap>,
+) -> reqwest::RequestBuilder {
+    let request = internal_request_raw(&ctx.client, &ctx.cluster.secret, method, peer, segments);
+    match (client_headers, &ctx.auth) {
+        (Some(headers), _) => forward_client_auth(request, headers),
+        (None, Some(auth)) => request.basic_auth(&auth.user, Some(&auth.pass)),
+        (None, None) => request,
+    }
 }
 
 pub(crate) fn percent_encode(s: &str) -> String {

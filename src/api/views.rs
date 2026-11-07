@@ -275,7 +275,7 @@ pub(super) async fn search_request(
             request.owner_shards = Some(mask);
         }
         crate::search::query(db, ddoc, index_name, &request, limits).await
-    } else if st.cluster.is_clustered() {
+    } else if st.ctx.cluster.is_clustered() {
         cluster_search(
             ClusterRead {
                 st,
@@ -431,7 +431,7 @@ pub(super) async fn view_request(
         } else if flag(q, "owner_only") {
             query.owner_shards = Some(
                 (0..db.q)
-                    .map(|shard| owner_of_shard(db, shard) == st.cluster.me)
+                    .map(|shard| owner_of_shard(db, shard) == st.ctx.cluster.me)
                     .collect(),
             );
         }
@@ -439,7 +439,7 @@ pub(super) async fn view_request(
 
     // Owners reduce their own shards and the coordinator combines the
     // partials, instead of shipping every map row.
-    let combine_reduce = if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+    let combine_reduce = if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         match crate::view::load_spec(db, ddoc, view_name).await {
             Ok(spec) => {
                 let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
@@ -472,7 +472,7 @@ pub(super) async fn view_request(
             reducer,
         )
         .await
-    } else if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+    } else if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         match cluster_view_rows(
             ClusterRead {
                 st,

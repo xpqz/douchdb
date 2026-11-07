@@ -49,7 +49,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
         return fail(ApiError::bad_request("invalid document id"));
     }
 
-    let default_read_quorum = if st.cluster.is_clustered() {
+    let default_read_quorum = if st.ctx.cluster.is_clustered() {
         db.copies() / 2 + 1
     } else {
         1
@@ -59,7 +59,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
     let revision_shaped = q.contains_key("open_revs") || flag(q, "revs_info");
     if attachment.is_none()
         && (method == Method::GET || method == Method::HEAD)
-        && st.cluster.is_clustered()
+        && st.ctx.cluster.is_clustered()
         && read_quorum > 1
         && !is_forwarded(st, headers)
     {
@@ -79,7 +79,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
     // Serve locally if this node holds a replica; otherwise try every replica
     // in preference order so a dead primary does not break reads or writes.
     let replicas = replicas_of_doc(db, &docid);
-    if st.cluster.is_clustered() && !replicas.contains(&st.cluster.me) {
+    if st.ctx.cluster.is_clustered() && !replicas.contains(&st.ctx.cluster.me) {
         let mut forward_q = q.clone();
         // The peer is a replica; answer locally instead of starting another
         // quorum read and bouncing the request back.
@@ -94,7 +94,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
         };
         let mut last = None;
         for node in replicas {
-            let peer = st.cluster.nodes[node].clone();
+            let peer = st.ctx.cluster.nodes[node].clone();
             let response = proxy(st, &request, &peer).await;
             if !unavailable(&response) {
                 return response;

@@ -8,10 +8,10 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
     if !principal.admin {
         return access_denied(&principal);
     }
-    let nodes: Vec<String> = if st.cluster.nodes.is_empty() {
+    let nodes: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
-        st.cluster.nodes.clone()
+        st.ctx.cluster.nodes.clone()
     };
     json(
         StatusCode::OK,
@@ -26,10 +26,10 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
     if !principal.admin {
         return access_denied(&principal);
     }
-    let membership: Vec<String> = if st.cluster.nodes.is_empty() {
+    let membership: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
-        st.cluster.nodes.clone()
+        st.ctx.cluster.nodes.clone()
     };
     let mut databases = Vec::new();
     for name in st.db_names().await {
@@ -46,7 +46,7 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
                     "shard": shard,
                     "replicas": replicas,
                     "owner": map.owner_of(shard),
-                    "local": replicas.contains(&st.cluster.me),
+                    "local": replicas.contains(&st.ctx.cluster.me),
                     "docs": docs,
                     "deleted": deleted,
                 })
@@ -65,17 +65,17 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
         json!({
             "local": {
                 "url": st.config.advertise,
-                "index": st.cluster.me,
-                "clustered": st.cluster.is_clustered(),
+                "index": st.ctx.cluster.me,
+                "clustered": st.ctx.cluster.is_clustered(),
                 "q": st.config.q,
-                "n": st.cluster.replication_factor(),
+                "n": st.ctx.cluster.replication_factor(),
                 "sync_secs": st.config.sync_secs,
             },
             "membership": {
                 "all_nodes": membership.clone(),
                 "cluster_nodes": membership,
             },
-            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+            "discovery": st.cluster_state.discovery_json(&st.ctx.cluster.nodes, &st.config.seeds),
             "replication": st.cluster_state.replication_json(),
             "databases": databases,
         }),
@@ -97,7 +97,7 @@ pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMa
         json!({
             "ok": true,
             "running": st.cluster_state.discovery_running(),
-            "discovery": st.cluster_state.discovery_json(&st.cluster.nodes, &st.config.seeds),
+            "discovery": st.cluster_state.discovery_json(&st.ctx.cluster.nodes, &st.config.seeds),
         }),
     )
 }
@@ -192,7 +192,7 @@ pub async fn db_migration_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -204,7 +204,7 @@ pub async fn db_migration_put(
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid migration shard map")),
     };
-    if map.q != db.q || map.node_count != st.cluster.nodes.len().max(1) {
+    if map.q != db.q || map.node_count != st.ctx.cluster.nodes.len().max(1) {
         return fail(ApiError::bad_request(
             "migration shard map does not match database q or cluster node count",
         ));
@@ -230,7 +230,7 @@ pub async fn db_migration_delete(
     DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -250,7 +250,7 @@ pub async fn db_security_get(
     DbName(name): DbName,
     headers: HeaderMap,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -275,7 +275,7 @@ pub async fn db_security_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.cluster.is_internal(&headers) {
+    if !st.ctx.cluster.is_internal(&headers) {
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
@@ -429,7 +429,7 @@ pub async fn db_cleanup(
     let map = db.shard_map();
     let mut cleared = Vec::new();
     for shard in 0..db.q {
-        if !map.replicas_of(shard).contains(&st.cluster.me) {
+        if !map.replicas_of(shard).contains(&st.ctx.cluster.me) {
             cleared.push(shard as usize);
         }
     }

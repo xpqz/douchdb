@@ -93,7 +93,7 @@ pub(super) async fn changes(
         ));
     }
     if let Some(raw) = q.get("since") {
-        if let Err(error) = validate_since(raw, st.cluster.nodes.len().max(1)) {
+        if let Err(error) = validate_since(raw, st.ctx.cluster.nodes.len().max(1)) {
             return fail(error);
         }
     }
@@ -336,7 +336,7 @@ async fn changes_normal_raw(
         return None;
     }
     let mut local_mask = None;
-    if st.cluster.is_clustered() && !local_only {
+    if st.ctx.cluster.is_clustered() && !local_only {
         let masks = crate::fabric::preferred_shard_masks(st, db);
         let active: Vec<usize> = masks
             .iter()
@@ -344,10 +344,10 @@ async fn changes_normal_raw(
             .filter(|(_, mask)| mask.iter().any(|owned| *owned))
             .map(|(node, _)| node)
             .collect();
-        if active.len() != 1 || active[0] != st.cluster.me {
+        if active.len() != 1 || active[0] != st.ctx.cluster.me {
             return None;
         }
-        local_mask = Some(masks[st.cluster.me].clone());
+        local_mask = Some(masks[st.ctx.cluster.me].clone());
     }
     let (mut opts, mut progress) = changes_options(st, db, q, body, headers, local_only)
         .await
@@ -356,7 +356,7 @@ async fn changes_normal_raw(
     if let Some(mask) = local_mask {
         opts.owned = Some(mask);
     }
-    let me = st.cluster.me;
+    let me = st.ctx.cluster.me;
     let initial_seq = progress.get(me).copied().unwrap_or(0);
     let pending_descending = opts.descending;
     let pending_owned = opts.owned.clone();
@@ -503,10 +503,10 @@ async fn changes_options(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<(ChangesOpts, Vec<u64>)> {
-    let n = st.cluster.nodes.len().max(1);
+    let n = st.ctx.cluster.nodes.len().max(1);
     let raw_since = q.get("since").map(String::as_str);
     let mut progress = if raw_since == Some("now") {
-        if st.cluster.is_clustered() && !local_only {
+        if st.ctx.cluster.is_clustered() && !local_only {
             cluster_update_vector(ClusterRead {
                 st,
                 db,
@@ -517,7 +517,7 @@ async fn changes_options(
             .0
         } else {
             let mut vector = vec![0; n];
-            vector[st.cluster.me] = db.update_seq();
+            vector[st.ctx.cluster.me] = db.update_seq();
             vector
         }
     } else if let Some(raw) = raw_since {
@@ -526,13 +526,13 @@ async fn changes_options(
                 vector.resize(n.max(vector.len()), 0);
                 vector
             }
-            None => vec![since_component(Some(raw), st.cluster.me, n); n],
+            None => vec![since_component(Some(raw), st.ctx.cluster.me, n); n],
         }
     } else {
         vec![0; n]
     };
     progress.resize(n, 0);
-    let since = progress.get(st.cluster.me).copied().unwrap_or(0);
+    let since = progress.get(st.ctx.cluster.me).copied().unwrap_or(0);
     let owned = if is_forwarded(st, headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
@@ -562,7 +562,7 @@ async fn changes_once(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<Value> {
-    if st.cluster.is_clustered() && !local_only && !flag(q, "descending") {
+    if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
                 st,

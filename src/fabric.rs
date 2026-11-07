@@ -1,10 +1,10 @@
 //! Cluster coordination: shard-map routing, replica selection, quorum
 //! reads/writes and internal node calls.
 
-use crate::api::{
-    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, internal_request, num, AppState,
+use crate::api::{doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, num, AppState};
+use crate::cluster_http::{
+    forward_client_auth, internal_request, internal_request_raw, peer_url, percent_encode,
 };
-use crate::cluster_http::{forward_client_auth, internal_request_raw, peer_url, percent_encode};
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -31,13 +31,13 @@ pub(crate) fn owner_of_shard(db: &Db, shard: u32) -> usize {
 /// of issuing one HTTP request per owner. Shards without a local replica stay
 /// with their primary owner and can still fall back to other replicas.
 pub(crate) fn preferred_shard_masks(st: &AppState, db: &Db) -> Vec<Vec<bool>> {
-    let node_count = st.cluster.nodes.len().max(1);
+    let node_count = st.ctx.cluster.nodes.len().max(1);
     let mut masks = vec![vec![false; db.q as usize]; node_count];
     let map = db.shard_map();
     for shard in 0..db.q {
         let replicas = map.replicas_of(shard);
-        let target = if replicas.contains(&st.cluster.me) {
-            st.cluster.me
+        let target = if replicas.contains(&st.ctx.cluster.me) {
+            st.ctx.cluster.me
         } else {
             replicas.first().copied().unwrap_or(0)
         };
@@ -65,7 +65,7 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
 /// older peers receive the local or pending map. This runs from anti-entropy,
 /// so a metadata update that missed a peer is repaired after that peer returns.
 pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
-    if !st.cluster.is_clustered() {
+    if !st.ctx.cluster.is_clustered() {
         return;
     }
     let local = db.shard_map();
@@ -74,9 +74,9 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let maps = join_all(st.cluster.peers().map(|peer| async move {
+    let maps = join_all(st.ctx.cluster.peers().map(|peer| async move {
         let request = internal_request(
-            st,
+            &st.ctx,
             reqwest::Method::GET,
             peer,
             &["_node", "_local", "_dbs", &db.name],
@@ -93,7 +93,7 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     .await;
 
     for map in maps.into_iter().flatten() {
-        if adoptable_peer_map(&map, desired.version, st.cluster.nodes.len())
+        if adoptable_peer_map(&map, desired.version, st.ctx.cluster.nodes.len())
             && db.set_shard_map(map.clone()).unwrap_or(false)
         {
             if db
@@ -112,18 +112,19 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
         Err(_) => return,
     };
     let peers: Vec<String> = st
+        .ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(_, peer)| peer.clone())
         .collect();
     let responses = join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
             let request = internal_request(
-                st,
+                &st.ctx,
                 reqwest::Method::PUT,
                 &peer,
                 &["_node", "_local", "_dbs", &db.name],
@@ -140,7 +141,7 @@ pub(crate) async fn reconcile_shard_map(st: &AppState, db: &Arc<Db>) {
     }))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
-    if acknowledgements > st.cluster.nodes.len().max(1) / 2 {
+    if acknowledgements > st.ctx.cluster.nodes.len().max(1) / 2 {
         db.clear_pending_shard_map();
     }
 }
@@ -163,12 +164,12 @@ fn security_supersedes(
 /// one any peer reports, then push it to the peers that hold something else.
 /// This is what brings a restored, new or rollback-missed node up to date.
 pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
-    if !st.cluster.is_clustered() {
+    if !st.ctx.cluster.is_clustered() {
         return;
     }
-    let fetched = join_all(st.cluster.peers().map(|peer| async move {
+    let fetched = join_all(st.ctx.cluster.peers().map(|peer| async move {
         let request = internal_request(
-            st,
+            &st.ctx,
             reqwest::Method::GET,
             peer,
             &["_node", "_local", "_dbs", &db.name, "security"],
@@ -209,7 +210,7 @@ pub(crate) async fn reconcile_security(st: &AppState, db: &Arc<Db>) {
             })
             .map(|(peer, _, _)| {
                 let request = internal_request(
-                    st,
+                    &st.ctx,
                     reqwest::Method::PUT,
                     peer,
                     &["_node", "_local", "_dbs", &db.name, "security"],
@@ -254,7 +255,7 @@ pub(crate) async fn proxy(st: &AppState, request: &ForwardRequest<'_>, peer: &st
         url.push('?');
         url.push_str(&encoded.join("&"));
     }
-    let request = st.client.request(
+    let request = st.ctx.client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &url,
     );
@@ -459,7 +460,7 @@ async fn replica_docs(
     }
 
     let mut replicas = replicas_of_doc(db, docid);
-    if let Some(index) = replicas.iter().position(|node| *node == st.cluster.me) {
+    if let Some(index) = replicas.iter().position(|node| *node == st.ctx.cluster.me) {
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
@@ -467,7 +468,7 @@ async fn replica_docs(
         let inner = inner.clone();
         let opts = opts.clone();
         async move {
-            if node == st.cluster.me {
+            if node == st.ctx.cluster.me {
                 crate::telemetry::record_local_read();
                 return match db.get_doc(docid, &opts).await {
                     Ok(doc) => (true, Some(doc)),
@@ -475,9 +476,9 @@ async fn replica_docs(
                 };
             }
             crate::telemetry::record_remote_read();
-            let peer = st.cluster.nodes[node].clone();
+            let peer = st.ctx.cluster.nodes[node].clone();
             let request = internal_request(
-                st,
+                &st.ctx,
                 reqwest::Method::GET,
                 &peer,
                 &[dbname, docid],
@@ -636,7 +637,7 @@ pub(crate) async fn commit_docs(
     w: usize,
     headers: &HeaderMap,
 ) -> DbResult<(Vec<Value>, bool)> {
-    if !st.cluster.is_clustered() {
+    if !st.ctx.cluster.is_clustered() {
         let results = db.put_docs(docs, new_edits).await?;
         if results.iter().any(|result| result.get("ok").is_some()) {
             st.db_updates.record(dbname, "updated");
@@ -649,7 +650,7 @@ pub(crate) async fn commit_docs(
     // under the gate closes the window between the request-entry check and
     // acquiring it.
     let gate = Arc::new(db.write_guard().await);
-    if db.rebalance_in_progress() && !st.cluster.is_internal(headers) {
+    if db.rebalance_in_progress() && !st.ctx.cluster.is_internal(headers) {
         return Err(ApiError::new(
             503,
             "rebalance_in_progress",
@@ -717,7 +718,7 @@ pub(crate) async fn commit_docs(
         let mut pending = FuturesUnordered::new();
         for (node, group) in groups {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            if node == st.cluster.me {
+            if node == st.ctx.cluster.me {
                 let subdocs: Vec<Value> =
                     group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
                 let db = db_handle.clone();
@@ -728,9 +729,9 @@ pub(crate) async fn commit_docs(
                 }));
             } else {
                 let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-                let client = st.client.clone();
-                let secret = st.cluster.secret.clone();
-                let peer = st.cluster.nodes[node].clone();
+                let client = st.ctx.client.clone();
+                let secret = st.ctx.cluster.secret.clone();
+                let peer = st.ctx.cluster.nodes[node].clone();
                 let dbname = dbname.to_string();
                 let headers = headers.clone();
                 let gate = gate.clone();
@@ -819,17 +820,17 @@ pub(crate) async fn commit_docs(
         crate::telemetry::record_fanout(groups.len() as u64);
         let mut reached = vec![false; total];
         let mut responses = Vec::new();
-        if let Some(group) = groups.remove(&st.cluster.me) {
+        if let Some(group) = groups.remove(&st.ctx.cluster.me) {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
             let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-            responses.push((st.cluster.me, slots, db.put_docs(subdocs, false).await));
+            responses.push((st.ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
         }
         let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
             let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-            let client = st.client.clone();
-            let secret = st.cluster.secret.clone();
-            let peer = st.cluster.nodes[node].clone();
+            let client = st.ctx.client.clone();
+            let secret = st.ctx.cluster.secret.clone();
+            let peer = st.ctx.cluster.nodes[node].clone();
             let dbname = dbname.to_string();
             let headers = headers.clone();
             async move {
@@ -935,7 +936,7 @@ pub(crate) async fn forward_json(
         .filter_map(|pair| pair.split_once('='))
         .collect();
     let request = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::POST,
         peer,
         &[dbname, endpoint],
@@ -1076,7 +1077,7 @@ where
     }
     if !failed.is_empty() {
         crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..st.cluster.nodes.len())
+        let alive: Vec<usize> = (0..st.ctx.cluster.nodes.len())
             .filter(|node| !failed.contains(node))
             .collect();
         let groups = fallback_shard_masks(db, owned_by_node, &failed, &alive)?;
@@ -1211,13 +1212,13 @@ pub(crate) async fn fetch_all_docs(
         dbname,
         headers,
     } = read;
-    if node == st.cluster.me {
+    if node == st.ctx.cluster.me {
         if let Some(shards) = shards {
             return db.all_docs_owned(opts, shards).await;
         }
         return db.all_docs(opts).await;
     }
-    let peer = &st.cluster.nodes[node];
+    let peer = &st.ctx.cluster.nodes[node];
     let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(shards) = shards {
         let selected: Vec<String> = shards
@@ -1263,7 +1264,7 @@ pub(crate) async fn fetch_all_docs(
         None => json!({}),
     };
     let request = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::POST,
         peer,
         &[dbname, "_all_docs"],
@@ -1332,7 +1333,7 @@ async fn fetch_view_mask(
     local.skip = 0;
     local.limit = limit.unwrap_or(usize::MAX);
     local.owner_shards = Some(mask.to_vec());
-    if node == st.cluster.me {
+    if node == st.ctx.cluster.me {
         let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
         let docs = if query.include_docs || query.attachments {
             let ids = selection
@@ -1352,7 +1353,7 @@ async fn fetch_view_mask(
         });
     }
 
-    let peer = &st.cluster.nodes[node];
+    let peer = &st.ctx.cluster.nodes[node];
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -1376,7 +1377,7 @@ async fn fetch_view_mask(
         params.push(("limit", limit.to_string()));
     }
     let request = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_view", view_name],
@@ -1552,11 +1553,11 @@ async fn fetch_reduce_mask(
         name: view_name,
     } = view;
     let owner = owner_reduce_query(query, mask);
-    if node == st.cluster.me {
+    if node == st.ctx.cluster.me {
         return crate::view::query(db, ddoc, view_name, &owner).await;
     }
 
-    let peer = &st.cluster.nodes[node];
+    let peer = &st.ctx.cluster.nodes[node];
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -1575,7 +1576,7 @@ async fn fetch_reduce_mask(
     }
     push_range_params(&mut params, &owner);
     let request = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_view", view_name],
@@ -1695,12 +1696,12 @@ pub(crate) async fn fetch_ddoc_from_replica(
     headers: &HeaderMap,
 ) -> DbResult<Value> {
     for node in replicas_of_doc(db, ddoc) {
-        if node == st.cluster.me {
+        if node == st.ctx.cluster.me {
             continue;
         }
-        let peer = st.cluster.nodes[node].clone();
+        let peer = st.ctx.cluster.nodes[node].clone();
         let request = internal_request(
-            st,
+            &st.ctx,
             reqwest::Method::GET,
             &peer,
             &[dbname, ddoc],
@@ -1761,14 +1762,14 @@ pub(crate) async fn cluster_changes(
     body: &[u8],
 ) -> DbResult<Value> {
     let ClusterRead { st, db, .. } = read;
-    let n = st.cluster.nodes.len();
+    let n = st.ctx.cluster.nodes.len();
     let raw_since = q.get("since").map(String::as_str);
     let (mut since, marks) = if raw_since == Some("now") {
         cluster_update_vector(read).await?
     } else if let Some(raw) = raw_since {
         let vector = match decode_since(raw, n) {
             Some(vector) => vector,
-            None => vec![since_component(Some(raw), st.cluster.me, n); n],
+            None => vec![since_component(Some(raw), st.ctx.cluster.me, n); n],
         };
         (vector, decode_fallbacks(raw, n))
     } else {
@@ -1922,7 +1923,7 @@ pub(crate) async fn fetch_node_changes(
         filter,
         q,
     } = changes;
-    if node == st.cluster.me {
+    if node == st.ctx.cluster.me {
         return db
             .changes(&ChangesOpts {
                 since,
@@ -1939,7 +1940,7 @@ pub(crate) async fn fetch_node_changes(
             .await;
     }
 
-    let peer = &st.cluster.nodes[node];
+    let peer = &st.ctx.cluster.nodes[node];
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -1992,7 +1993,7 @@ pub(crate) async fn fetch_node_changes(
     extra.sort();
     params.extend(extra);
     let request = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, "_changes"],
@@ -2040,13 +2041,19 @@ pub(crate) async fn cluster_update_vector(
         dbname,
         headers,
     } = read;
-    let seqs = futures::future::join_all((0..st.cluster.nodes.len()).map(|node| async move {
-        if node == st.cluster.me {
+    let seqs = futures::future::join_all((0..st.ctx.cluster.nodes.len()).map(|node| async move {
+        if node == st.ctx.cluster.me {
             return Some(db.update_seq());
         }
-        let peer = &st.cluster.nodes[node];
-        let request = internal_request(st, reqwest::Method::GET, peer, &[dbname], Some(headers))
-            .header("x-douchdb-update-seq", "1");
+        let peer = &st.ctx.cluster.nodes[node];
+        let request = internal_request(
+            &st.ctx,
+            reqwest::Method::GET,
+            peer,
+            &[dbname],
+            Some(headers),
+        )
+        .header("x-douchdb-update-seq", "1");
         let response = request.send().await.ok()?;
         if !response.status().is_success() {
             return None;
@@ -2344,11 +2351,11 @@ async fn fetch_search_mask(
     local.owner_shards = Some(mask.to_vec());
     local.bookmark = None;
     local.limit = window;
-    if node == st.cluster.me {
+    if node == st.ctx.cluster.me {
         return crate::search::query(db, ddoc, index_name, &local, limits).await;
     }
 
-    let peer = &st.cluster.nodes[node];
+    let peer = &st.ctx.cluster.nodes[node];
     let selected: Vec<String> = mask
         .iter()
         .enumerate()
@@ -2419,7 +2426,7 @@ async fn fetch_search_mask(
     }
 
     let outgoing = internal_request(
-        st,
+        &st.ctx,
         reqwest::Method::GET,
         peer,
         &[dbname, ddoc, "_search", index_name],

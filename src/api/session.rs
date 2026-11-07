@@ -68,7 +68,7 @@ pub async fn session_post(State(st): State<Arc<AppState>>, body: Bytes) -> Respo
             }
         }
     }
-    let principal = match &st.auth {
+    let principal = match &st.ctx.auth {
         Some(auth) => auth.authenticate(&user, &pass),
         None => Some(Principal {
             name: Some(if user.is_empty() {
@@ -95,7 +95,7 @@ pub async fn session_post(State(st): State<Arc<AppState>>, body: Bytes) -> Respo
             "roles": principal.roles,
         }),
     );
-    if let Some(auth) = &st.auth {
+    if let Some(auth) = &st.ctx.auth {
         let cookie_name = principal.name.as_deref().unwrap_or(&user);
         if let Ok(value) = auth.cookie_header_for(cookie_name).parse() {
             response.headers_mut().insert(header::SET_COOKIE, value);

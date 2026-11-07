@@ -281,7 +281,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     if !state.cluster_state.begin_replication() {
         return false;
     }
-    let peers: Vec<String> = state.cluster.peers().cloned().collect();
+    let peers: Vec<String> = state.ctx.cluster.peers().cloned().collect();
     let mut names = state.db_names().await;
     names.sort();
     if let Some(only) = only_db {
@@ -305,9 +305,9 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                 let result = pull(
                     &db,
                     &peer,
-                    &state.client,
-                    &state.cluster,
-                    state.auth.as_ref(),
+                    &state.ctx.client,
+                    &state.ctx.cluster,
+                    state.ctx.auth.as_ref(),
                 )
                 .await;
                 match result {

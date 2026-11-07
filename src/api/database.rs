@@ -19,7 +19,7 @@ pub async fn db_root(
     let q = query(&uri);
     let principal = st.principal(&headers);
 
-    let local_only = st.cluster.is_internal_db(&headers);
+    let local_only = st.ctx.cluster.is_internal_db(&headers);
     match method {
         Method::PUT => {
             if !principal.admin {
@@ -49,11 +49,13 @@ pub async fn db_root(
             // is told 412 as before.
             let existing = match st.create_db(&name, partitioned, shards, copies).await {
                 Ok(_) => None,
-                Err(e) if e.status == 412 && st.cluster.is_clustered() && !local_only => Some(e),
+                Err(e) if e.status == 412 && st.ctx.cluster.is_clustered() && !local_only => {
+                    Some(e)
+                }
                 Err(e) => return fail(e),
             };
             let mut status = StatusCode::CREATED;
-            if st.cluster.is_clustered() && !local_only {
+            if st.ctx.cluster.is_clustered() && !local_only {
                 // Peers build the same shard map from the same layout.
                 let mut layout = vec![("partitioned", partitioned.to_string())];
                 if let Some(shards) = shards {
@@ -76,7 +78,7 @@ pub async fn db_root(
                         status.is_success() || **status == StatusCode::PRECONDITION_FAILED
                     })
                     .count();
-                if held < st.cluster.nodes.len() / 2 + 1 {
+                if held < st.ctx.cluster.nodes.len() / 2 + 1 {
                     status = StatusCode::ACCEPTED;
                 }
             }
@@ -91,7 +93,7 @@ pub async fn db_root(
                 return access_denied(&principal);
             }
             let local = st.drop_db(&name).await;
-            if !st.cluster.is_clustered() || local_only {
+            if !st.ctx.cluster.is_clustered() || local_only {
                 return match local {
                     Ok(()) => ok(),
                     Err(e) => fail(e),
@@ -111,7 +113,7 @@ pub async fn db_root(
                     missing += 1;
                 }
             }
-            if deleted + missing == st.cluster.nodes.len() {
+            if deleted + missing == st.ctx.cluster.nodes.len() {
                 if deleted == 0 {
                     return fail(local.err().unwrap_or_else(|| {
                         ApiError::not_found(format!("Database does not exist: {name}"))
@@ -146,7 +148,7 @@ pub async fn db_root(
                         // In a cluster the update_seq is the same version vector
                         // the changes feed returns, so clients that use it as
                         // `since` do not skip another node's changes.
-                        if st.cluster.is_clustered() && !is_forwarded(&st, &headers) {
+                        if st.ctx.cluster.is_clustered() && !is_forwarded(&st, &headers) {
                             let (vector, marks) = match cluster_update_vector(ClusterRead {
                                 st: &st,
                                 db: &db,
@@ -292,14 +294,14 @@ async fn partition_info(
             "method not allowed",
         ));
     }
-    if st.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
-        if !replicas.contains(&st.cluster.me) {
+        if !replicas.contains(&st.ctx.cluster.me) {
             if let Some(node) = replicas.first() {
                 let request = internal_request(
-                    st,
+                    &st.ctx,
                     reqwest::Method::GET,
-                    &st.cluster.nodes[*node],
+                    &st.ctx.cluster.nodes[*node],
                     &[name, "_partition", partition],
                     Some(headers),
                 );
@@ -314,7 +316,7 @@ async fn partition_info(
                     Err(error) => fail(ApiError::new(
                         502,
                         "bad_gateway",
-                        format!("{}: {error}", st.cluster.nodes[*node]),
+                        format!("{}: {error}", st.ctx.cluster.nodes[*node]),
                     )),
                 };
             }
@@ -624,13 +626,14 @@ async fn fan_out_db(
     name: &str,
     layout: &[(&str, String)],
 ) -> Vec<Option<StatusCode>> {
-    futures::future::join_all(st.cluster.peers().map(|peer| {
+    futures::future::join_all(st.ctx.cluster.peers().map(|peer| {
         let request = st
+            .ctx
             .client
             .request(method.clone(), peer_url(peer, &[name]))
             .query(layout)
             .header("x-douchdb-local-db", "1")
-            .header("x-douchdb-secret", st.cluster.secret.as_str());
+            .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
         let request = forward_client_auth(request, headers);
         async move { request.send().await.ok().map(|response| response.status()) }
     }))

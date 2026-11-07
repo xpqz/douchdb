@@ -30,7 +30,7 @@ pub(crate) async fn validation_functions(
     dbname: &str,
     headers: &HeaderMap,
 ) -> DbResult<Vec<String>> {
-    if !st.cluster.is_clustered() || st.cluster.is_internal(headers) {
+    if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return db.validation_functions().await;
     }
     if let Some(functions) = db.cached_cluster_validators(CLUSTER_VALIDATORS_TTL) {
@@ -55,11 +55,11 @@ pub(crate) async fn validation_functions(
     // closed on a corrupt local design document.
     db.validation_functions().await?;
     let responses = futures::future::join_all(
-        (0..st.cluster.nodes.len())
+        (0..st.ctx.cluster.nodes.len())
             .map(|node| crate::fabric::fetch_all_docs(read, node, &opts, None)),
     )
     .await;
-    let (functions, complete) = merge_validators(responses, st.cluster.me)?;
+    let (functions, complete) = merge_validators(responses, st.ctx.cluster.me)?;
     // A set built while a peer was unreachable is used for this write only.
     // Caching it would keep skipping that peer's newer validators.
     if complete {
