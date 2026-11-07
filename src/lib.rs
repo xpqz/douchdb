@@ -30,6 +30,7 @@ pub mod ui;
 pub mod util;
 pub mod validate;
 pub mod view;
+pub mod worker;
 
 pub use cli::{parse_args, Args};
 pub use server::{run, run_worker};

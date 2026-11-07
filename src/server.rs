@@ -37,7 +37,7 @@ pub fn run_worker() -> ! {
     // Landlock first: its syscalls are not on the seccomp allowlist.
     let result = js::install_landlock().and_then(|landlock| {
         js::install_seccomp()?;
-        js::run_worker_stdio(landlock)
+        crate::worker::run_stdio(landlock)
     });
     match result {
         Ok(()) => std::process::exit(0),

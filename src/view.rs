@@ -19,23 +19,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-#[derive(Clone, Copy, Debug)]
-pub struct ViewLimits {
-    pub timeout: Duration,
-    pub memory: usize,
-}
-
-impl Default for ViewLimits {
-    fn default() -> Self {
-        ViewLimits {
-            timeout: Duration::from_secs(5),
-            memory: 64 * 1024 * 1024,
-        }
-    }
-}
+pub use crate::js::ViewLimits;
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewQuery {
@@ -3060,6 +3046,7 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::time::Duration;
 
     fn reduce_value(
         source: &str,
