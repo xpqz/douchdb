@@ -7,6 +7,7 @@
 //! JavaScript view server.
 
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::index_cache::{Registry, Slot};
 use crate::util::hex;
 use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
@@ -1080,26 +1081,31 @@ fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
     out
 }
 
-type IndexMap = HashMap<PathBuf, Arc<AsyncMutex<ViewIndex>>>;
+/// An index registry entry. The index is opened once, by whichever request
+/// gets there first, outside the registry's lock; the others wait on the cell.
+#[derive(Default)]
+struct IndexSlot {
+    index: tokio::sync::OnceCell<Arc<AsyncMutex<ViewIndex>>>,
+}
 
-fn registry() -> &'static StdMutex<IndexMap> {
-    static INDEXES: OnceLock<StdMutex<IndexMap>> = OnceLock::new();
-    INDEXES.get_or_init(|| StdMutex::new(HashMap::new()))
+impl Slot for IndexSlot {
+    /// In use while a request holds the slot (it may be opening the index) or
+    /// the index itself.
+    fn in_use(this: &Arc<Self>) -> bool {
+        Arc::strong_count(this) > 1 || this.index.get().is_some_and(|i| Arc::strong_count(i) > 1)
+    }
+
+    const DROP_UNDER_LOCK: bool = true;
+}
+
+fn indexes() -> &'static Registry<IndexSlot> {
+    static INDEXES: Registry<IndexSlot> = Registry::new();
+    &INDEXES
 }
 
 #[cfg(test)]
 fn open_indexes_under(db_path: &Path) -> usize {
-    registry_lock()
-        .keys()
-        .filter(|path| path.starts_with(db_path))
-        .count()
-}
-
-fn registry_lock() -> std::sync::MutexGuard<'static, IndexMap> {
-    // A panic in an unrelated request must not poison every later view query.
-    registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    indexes().count_under(db_path)
 }
 
 fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
@@ -1107,20 +1113,31 @@ fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
     db.path.join("_view_indexes").join(hex(&digest))
 }
 
-fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
-    let mut indexes = registry_lock();
-    if let Some(handle) = indexes.get(path) {
-        return Ok(handle.clone());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?;
-    }
-    let index =
-        ViewIndex::open(path).map_err(|error| ApiError::new(500, "view_index_error", error))?;
-    let handle = Arc::new(AsyncMutex::new(index));
-    indexes.insert(path.to_path_buf(), handle.clone());
-    Ok(handle)
+/// The open index at `path`. Opening happens on the blocking pool in a task of
+/// its own, so a request that goes away mid-open still leaves the index open
+/// for the next one rather than a LevelDB lock held by nobody.
+async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
+    let slot = indexes().get(path);
+    let path = path.to_path_buf();
+    let opened = tokio::spawn(async move {
+        slot.index
+            .get_or_try_init(|| {
+                blocking(move || {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            ApiError::new(500, "view_index_error", error.to_string())
+                        })?;
+                    }
+                    ViewIndex::open(&path)
+                        .map(|index| Arc::new(AsyncMutex::new(index)))
+                        .map_err(|error| ApiError::new(500, "view_index_error", error))
+                })
+            })
+            .await
+            .cloned()
+    })
+    .await;
+    opened.map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?
 }
 
 /// Gate for a database's view index directories. A query holds the read side
@@ -1130,21 +1147,15 @@ fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<RwLock<()>> {
-    static GATES: OnceLock<StdMutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
-    GATES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(db.path.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(())))
-        .clone()
+    static GATES: Registry<RwLock<()>> = Registry::new();
+    GATES.get(&db.path)
 }
 
 /// Drop cached index handles when a database is deleted or recreated. The
 /// LevelDB files live under the database directory.
 pub fn forget_db(db_path: &Path) {
     let prefix = db_path.join("_view_indexes");
-    registry_lock().retain(|path, _| !path.starts_with(&prefix));
+    indexes().retain(|path| !path.starts_with(&prefix));
 }
 
 impl ViewIndex {
@@ -1525,7 +1536,7 @@ async fn ensure_rows(
         )
     };
     let gate = index_gate(db).read_owned().await;
-    let handle = index_handle(&index_path(db, ddoc_id, view_name))?;
+    let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
     let mut index = handle.lock_owned().await;
     index.set_placement((db.q, db.partitioned));
     // Read after the lock: a query that updated the index while this one
@@ -1658,7 +1669,7 @@ pub(crate) async fn docs_by_ids(
 pub async fn invalidate(db: &Db) -> DbResult<()> {
     let _gate = index_gate(db).write_owned().await;
     let directory = db.path.join("_view_indexes");
-    registry_lock().retain(|path, _| !path.starts_with(&directory));
+    indexes().retain(|path| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1709,7 +1720,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
             }
         }
     }
-    registry_lock().retain(|path, _| live.contains(path));
+    indexes().retain(|path| live.contains(path));
     Ok(())
 }
 
@@ -3255,7 +3266,9 @@ mod tests {
             .unwrap();
 
         // Another query holds the index while this one starts and waits.
-        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
         let mut holder = handle.lock().await;
         let waiting = tokio::spawn({
             let (db, spec) = (db.clone(), spec.clone());
@@ -3319,7 +3332,7 @@ mod tests {
 
         // A query holds the index; a second one waits on it, holding the
         // gate for the whole call.
-        let handle = index_handle(&path).unwrap();
+        let handle = index_handle(&path).await.unwrap();
         let holder = handle.lock().await;
         let query = tokio::spawn({
             let (db, spec) = (db.clone(), spec.clone());
@@ -3343,7 +3356,7 @@ mod tests {
         query.await.unwrap().unwrap();
         removal.await.unwrap();
         assert!(!path.exists());
-        assert!(!registry_lock().contains_key(&path));
+        assert_eq!(open_indexes_under(&path), 0);
         // A later query opens a fresh index at the same path.
         ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
@@ -3405,8 +3418,12 @@ mod tests {
         };
         let limits = ViewQuery::default().limits;
         let last_seq = |name: &str| {
-            let handle = index_handle(&index_path(&db, "_design/v", name)).unwrap();
-            async move { handle.lock().await.last_seq }
+            let path = index_path(&db, "_design/v", name);
+            async move {
+                let handle = index_handle(&path).await.unwrap();
+                let seq = handle.lock().await.last_seq;
+                seq
+            }
         };
         db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
         ensure_rows(&db, "_design/v", "inc", &spec, limits)
@@ -3509,7 +3526,9 @@ mod tests {
         ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
             .unwrap();
-        let handle = index_handle(&index_path(&db, "_design/v", "v")).unwrap();
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
         assert_eq!(
             handle.lock().await.last_seq,
             abandoned,

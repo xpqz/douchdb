@@ -294,6 +294,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         exit_on_stdin_eof();
     }
     configure_js_sandbox(&args);
+    crate::index_cache::set_max_open(args.max_open_indexes);
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     check_cluster_args(&args);
     if args.cors_origins.iter().any(|origin| origin == "*") {

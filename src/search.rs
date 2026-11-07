@@ -1,13 +1,14 @@
 //! Tantivy-backed CouchDB search indexes.
 
 use crate::db::{ApiError, Db, DbResult};
+use crate::index_cache::Registry;
 use crate::util::hex;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{
@@ -712,13 +713,8 @@ impl Directory for UnsyncedDirectory {
 }
 
 fn build_gate(db: &Db) -> Arc<RwLock<()>> {
-    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
-    let gates = GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut gates = gates.lock().unwrap_or_else(|poison| poison.into_inner());
-    gates
-        .entry(db.path.clone())
-        .or_insert_with(|| Arc::new(RwLock::new(())))
-        .clone()
+    static GATES: Registry<RwLock<()>> = Registry::new();
+    GATES.get(&db.path)
 }
 
 /// What a query reads from an index: replaced as a whole when the index
@@ -814,27 +810,24 @@ impl Cached {
 
 type Entry = Arc<AsyncMutex<Option<Cached>>>;
 
-fn registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Entry>> {
-    static ENTRIES: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
-    ENTRIES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+fn registry() -> &'static Registry<AsyncMutex<Option<Cached>>> {
+    static ENTRIES: Registry<AsyncMutex<Option<Cached>>> = Registry::new();
+    &ENTRIES
 }
 
 /// The per-index entry. Its lock serialises updates and rebuilds of the index.
+/// The registry only evicts an entry nobody holds, so a query or update in
+/// flight keeps its index; opening it is done under the entry's own lock, not
+/// the registry's.
 fn index_entry(path: &Path) -> Entry {
-    registry()
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
-        .clone()
+    registry().get(path)
 }
 
 /// Drop cached indexes when a database is deleted or recreated, or its index
 /// files are removed.
 pub fn forget_db(db_path: &Path) {
     let prefix = db_path.join("_search_indexes");
-    registry().retain(|path, _| !path.starts_with(&prefix));
+    registry().retain(|path| !path.starts_with(&prefix));
 }
 
 async fn ensure_index(
@@ -1610,10 +1603,7 @@ mod tests {
             assert_eq!(result["total_rows"], 1, "{result}");
         }
         let prefix = db.path.join("_search_indexes");
-        let open = registry()
-            .keys()
-            .filter(|path| path.starts_with(&prefix))
-            .count();
+        let open = registry().count_under(&prefix);
         assert!(open <= 8, "{open} search indexes are open, cap is 8");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
