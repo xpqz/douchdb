@@ -2,14 +2,17 @@
 //! wire protocol, not by taste.
 
 use crate::auth::Principal;
-use crate::cluster::ShardMap;
+use crate::cluster::{ShardMap, ShardMask};
 use crate::cluster_http::{forward_client_auth, internal_request, peer_url};
 use crate::db::{
     attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError, ChangesOpts,
     Db, DbResult, DocOpts,
 };
 use crate::fabric::*;
-pub(crate) use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
+pub(crate) use crate::params::{
+    doc_ids_from, doc_opts, flag, json_body, json_or_string_param, json_param, lenient_json_param,
+    num, resolve_changes_filter,
+};
 use crate::state::{illegal_db_name, valid_db_name};
 pub use crate::state::{AppState, Config, DbUpdates};
 use axum::body::{Body, Bytes};
@@ -244,14 +247,14 @@ pub(crate) fn doc_error_status(result: &Value) -> StatusCode {
     }
 }
 
-fn parse_shard_mask(raw: &str, q: u32) -> Option<Vec<bool>> {
-    let mut mask = vec![false; q as usize];
+fn parse_shard_mask(raw: &str, q: u32) -> Option<ShardMask> {
+    let mut mask = ShardMask::none(q);
     for part in raw.split(',').filter(|part| !part.is_empty()) {
         let shard: usize = part.parse().ok()?;
         if shard >= mask.len() {
             return None;
         }
-        mask[shard] = true;
+        mask.select(shard);
     }
     Some(mask)
 }
@@ -392,7 +395,7 @@ mod tests {
                 .join(",");
             let mask = parse_shard_mask(&raw, q).unwrap_or_else(|| panic!("failed to parse {raw}"));
             prop_assert_eq!(mask.len(), q as usize);
-            prop_assert_eq!(mask, selected);
+            prop_assert_eq!(mask, ShardMask::from_iter(selected));
         }
 
         #[test]

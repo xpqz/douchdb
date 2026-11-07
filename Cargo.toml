@@ -6,6 +6,10 @@ description = "CouchDB wire-compatible document database on LevelDB"
 license = "Apache-2.0"
 authors = ["Stefan Kruger"]
 
+[lints.clippy]
+# Every unsafe block states why it is sound.
+undocumented_unsafe_blocks = "deny"
+
 [features]
 default = ["wasm"]
 # The wasmi-based `--js-sandbox wasm`. Without it the build drops wasmi,

@@ -127,3 +127,81 @@ pub(crate) async fn resolve_changes_filter(
         },
     }
 }
+
+/// A query parameter that must hold JSON, as CouchDB's `key`, `startkey` and
+/// `keys` do: absent is `None`, and anything that is not JSON is a 400
+/// (`key=abc` must be written `key="abc"`).
+pub(crate) fn json_param(q: &HashMap<String, String>, name: &str) -> DbResult<Option<Value>> {
+    match q.get(name) {
+        Some(raw) => serde_json::from_str::<Value>(raw)
+            .map(Some)
+            .map_err(|_| ApiError::bad_request("invalid UTF-8 JSON")),
+        None => Ok(None),
+    }
+}
+
+/// A query parameter that may hold JSON but is ignored when it does not.
+pub(crate) fn lenient_json_param(q: &HashMap<String, String>, name: &str) -> Option<Value> {
+    q.get(name)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+}
+
+/// A query parameter read as JSON when it parses, else as the plain string.
+pub(crate) fn json_or_string_param(q: &HashMap<String, String>, name: &str) -> Option<Value> {
+    q.get(name).map(|raw| {
+        serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+    })
+}
+
+/// A request body that must be JSON; `reason` is the 400 when it is not.
+pub(crate) fn json_body(body: &[u8], reason: &str) -> DbResult<Value> {
+    serde_json::from_slice::<Value>(body).map_err(|_| ApiError::bad_request(reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn query(name: &str, raw: &str) -> HashMap<String, String> {
+        HashMap::from([(name.to_string(), raw.to_string())])
+    }
+
+    #[test]
+    fn json_param_distinguishes_absent_valid_and_malformed() {
+        assert_eq!(json_param(&HashMap::new(), "key").unwrap(), None);
+        assert_eq!(
+            json_param(&query("key", "\"abc\""), "key").unwrap(),
+            Some(json!("abc"))
+        );
+        let error = json_param(&query("key", "abc"), "key").unwrap_err();
+        assert_eq!(
+            (error.status, error.reason.as_str()),
+            (400, "invalid UTF-8 JSON")
+        );
+    }
+
+    #[test]
+    fn lenient_readers_ignore_or_keep_malformed_values() {
+        assert_eq!(
+            lenient_json_param(&query("counts", "[1]"), "counts"),
+            Some(json!([1]))
+        );
+        assert_eq!(lenient_json_param(&query("counts", "x"), "counts"), None);
+        assert_eq!(
+            json_or_string_param(&query("sort", "x"), "sort"),
+            Some(json!("x"))
+        );
+        assert_eq!(
+            json_or_string_param(&query("sort", "[\"a\"]"), "sort"),
+            Some(json!(["a"]))
+        );
+        assert_eq!(json_or_string_param(&HashMap::new(), "sort"), None);
+    }
+
+    #[test]
+    fn json_body_reports_the_given_reason() {
+        assert_eq!(json_body(b"{}", "bad").unwrap(), json!({}));
+        assert_eq!(json_body(b"{", "bad").unwrap_err().reason, "bad");
+    }
+}

@@ -6,7 +6,7 @@
 //! does not fsync, so this is process-crash durability, not power-loss
 //! durability.
 
-use crate::cluster::ShardMap;
+use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
@@ -98,7 +98,7 @@ pub(crate) fn changes_watermark_from(
     committed: &[u64],
     reserved: &[u64],
     since: u64,
-    owned: Option<&[bool]>,
+    owned: Option<&ShardMask>,
 ) -> u64 {
     let mut safe = u64::MAX;
     for index in 0..committed.len().min(reserved.len()) {
@@ -114,8 +114,8 @@ pub(crate) fn changes_watermark_from(
 
 /// Whether the shard at `index` is selected by an `owned` mask: every shard
 /// when there is no mask, and never one the mask does not cover.
-fn shard_owned(owned: Option<&[bool]>, index: usize) -> bool {
-    owned.is_none_or(|owned| owned.get(index).copied().unwrap_or(false))
+fn shard_owned(owned: Option<&ShardMask>, index: usize) -> bool {
+    owned.is_none_or(|owned| owned.covers(index))
 }
 
 /// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
@@ -314,15 +314,15 @@ pub struct Db {
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
-    shard_map: Arc<std::sync::RwLock<ShardMap>>,
-    security: Arc<std::sync::RwLock<(u64, Value)>>,
+    shard_map: std::sync::RwLock<ShardMap>,
+    security: std::sync::RwLock<(u64, Value)>,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
-    compact_running: Arc<AtomicBool>,
+    compact_running: AtomicBool,
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
     /// seed the target replicas.
-    migration_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    migration_map: std::sync::RwLock<Option<ShardMap>>,
     /// Held shared by every cluster write for its full duration, including
     /// detached replica fan-out, and taken exclusively to drain them when a
     /// rebalance freezes the database.
@@ -330,7 +330,7 @@ pub struct Db {
     /// Unix-millisecond deadline for the cluster-wide write freeze, or zero
     /// when writes are allowed. A deadline lets peers recover if the
     /// coordinating node disappears mid-rebalance.
-    rebalance_until: Arc<AtomicU64>,
+    rebalance_until: AtomicU64,
     shards: Vec<ShardHandle>,
     /// Last committed sequence per shard, shared with the shard actors.
     committed_seq: Vec<Arc<AtomicU64>>,
@@ -341,17 +341,22 @@ pub struct Db {
     seq: Arc<AtomicU64>,
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
-    validation: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+    validation: std::sync::RwLock<Option<Vec<String>>>,
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
-    design_generation: Arc<AtomicU64>,
+    design_generation: AtomicU64,
     /// Validators merged from every node by a cluster coordinator, with the
     /// design generation and time they were loaded.
-    cluster_validation: Arc<std::sync::RwLock<Option<ClusterValidators>>>,
+    cluster_validation: std::sync::RwLock<Option<ClusterValidators>>,
 }
 
-/// Design generation, load time and sources of cluster-merged validators.
-type ClusterValidators = (u64, std::time::Instant, Vec<String>);
+/// Cluster-merged validators with the design generation and time they were
+/// loaded.
+struct ClusterValidators {
+    generation: u64,
+    loaded: std::time::Instant,
+    functions: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct DbConfig {
@@ -552,19 +557,19 @@ impl Db {
             partitioned: file.partitioned,
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
-            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
-            security: Arc::new(std::sync::RwLock::new(security)),
-            compact_running: Arc::new(AtomicBool::new(false)),
-            migration_map: Arc::new(std::sync::RwLock::new(None)),
+            shard_map: std::sync::RwLock::new(shard_map),
+            security: std::sync::RwLock::new(security),
+            compact_running: AtomicBool::new(false),
+            migration_map: std::sync::RwLock::new(None),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
-            rebalance_until: Arc::new(AtomicU64::new(0)),
+            rebalance_until: AtomicU64::new(0),
             shards,
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
-            validation: Arc::new(std::sync::RwLock::new(None)),
-            design_generation: Arc::new(AtomicU64::new(0)),
-            cluster_validation: Arc::new(std::sync::RwLock::new(None)),
+            validation: std::sync::RwLock::new(None),
+            design_generation: AtomicU64::new(0),
+            cluster_validation: std::sync::RwLock::new(None),
         })
     }
 
@@ -775,9 +780,9 @@ impl Db {
             .cluster_validation
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (generation, loaded, functions) = cached.as_ref()?;
-        (*generation == self.design_generation() && loaded.elapsed() < ttl)
-            .then(|| functions.clone())
+        let cached = cached.as_ref()?;
+        (cached.generation == self.design_generation() && cached.loaded.elapsed() < ttl)
+            .then(|| cached.functions.clone())
     }
 
     /// Cache cluster-merged validators read since `generation` was taken,
@@ -788,7 +793,11 @@ impl Db {
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
         if self.design_generation() == generation {
-            *cached = Some((generation, std::time::Instant::now(), functions));
+            *cached = Some(ClusterValidators {
+                generation,
+                loaded: std::time::Instant::now(),
+                functions,
+            });
         }
     }
 
@@ -1058,7 +1067,7 @@ impl Db {
     /// snapshot is higher and is left for the next request. (Computing this
     /// after the read is unsafe: a shard read before its commit, but
     /// committed by the time of the check, no longer holds the cursor back.)
-    pub fn changes_watermark(&self, since: u64, owned: Option<&[bool]>) -> u64 {
+    pub fn changes_watermark(&self, since: u64, owned: Option<&ShardMask>) -> u64 {
         // Load the counter first: an allocation it includes has already marked
         // its shard in flight (see `Stage::next_seq`).
         let allocated = self.seq.load(Ordering::SeqCst);
@@ -1313,14 +1322,14 @@ impl Db {
     /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
     /// coordinators use this to fetch each document from exactly one primary
     /// instead of merging the same replica from every node.
-    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &[bool]) -> DbResult<Value> {
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
     async fn all_docs_filtered(
         &self,
         opts: &AllDocsOpts,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         if let Some(keys) = &opts.keys {
             return self.all_docs_by_keys(opts, keys, owned).await;
@@ -1403,7 +1412,7 @@ impl Db {
     /// `Value` and serializing it again just to hand it to QuickJS.
     /// View documents from selected shards. Cluster nodes pass their owned
     /// shards so replicas do not pay to index documents they never serve.
-    pub async fn map_docs(&self, owned: Option<&[bool]>) -> DbResult<Vec<(String, String)>> {
+    pub async fn map_docs(&self, owned: Option<&ShardMask>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
         for index in self.selected_shards(owned) {
             let mut shard_docs = self.shards[index]
@@ -1447,7 +1456,10 @@ impl Db {
                         };
                         let doc = read_doc(s, &id, &doc_opts);
                         if let Some(doc) = skip_corrupt(s, &id, doc)? {
-                            docs.push((id, serde_json::to_string(&doc)?));
+                            docs.push((
+                                id,
+                                serde_json::to_string(&doc).map_err(ApiError::internal)?,
+                            ));
                         }
                     }
                     Ok(docs)
@@ -1462,7 +1474,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         keys: &[Value],
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<Value> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
@@ -1558,8 +1570,8 @@ impl Db {
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
         let watermark = opts
             .until
-            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_deref()));
-        let selected = self.selected_shards(opts.owned.as_deref());
+            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_ref()));
+        let selected = self.selected_shards(opts.owned.as_ref());
         let until = if opts.descending {
             u64::MAX
         } else {
@@ -1598,13 +1610,13 @@ impl Db {
             .or(scanned_last)
             .unwrap_or(opts.since);
         let pending = self
-            .changes_pending(last_seq, opts.descending, opts.owned.as_deref())
+            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
         Ok((rows, last_seq, pending))
     }
 
     /// Indexes of the shards in `owned`, or every shard.
-    fn selected_shards(&self, owned: Option<&[bool]>) -> Vec<usize> {
+    fn selected_shards(&self, owned: Option<&ShardMask>) -> Vec<usize> {
         (0..self.shards.len())
             .filter(|index| shard_owned(owned, *index))
             .collect()
@@ -1648,7 +1660,7 @@ impl Db {
         &self,
         after: u64,
         descending: bool,
-        owned: Option<&[bool]>,
+        owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
         let mut pending = 0usize;
         for index in self.selected_shards(owned) {
@@ -1672,7 +1684,7 @@ impl Db {
                 entry["deleted"] = json!(true);
             }
             if let Some(doc) = row.doc {
-                entry["doc"] = serde_json::from_str::<Value>(&doc)?;
+                entry["doc"] = serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?;
             }
             results.push(entry);
         }
@@ -1701,7 +1713,7 @@ impl Db {
                 ));
                 return;
             }
-            let selected = db.selected_shards(opts.owned.as_deref());
+            let selected = db.selected_shards(opts.owned.as_ref());
             let mut cursors = vec![opts.since; selected.len()];
             let mut done = vec![false; selected.len()];
             let mut buffers: Vec<VecDeque<ChangeRow>> =
@@ -1710,7 +1722,7 @@ impl Db {
             // One snapshot for the whole stream, taken before any shard read.
             // The stream ends at the watermark; the client resumes from the
             // last row it received.
-            let watermark = db.changes_watermark(opts.since, opts.owned.as_deref());
+            let watermark = db.changes_watermark(opts.since, opts.owned.as_ref());
             let watermark = match db.changes_cutoff(&selected, &opts).await {
                 Ok(cutoff) => watermark.min(cutoff),
                 Err(error) => {
@@ -2459,7 +2471,7 @@ impl Stage<'_> {
     }
 
     fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = serde_json::to_vec(meta)?;
+        let bytes = serde_json::to_vec(meta).map_err(ApiError::internal)?;
         self.ops.push((meta_key(id), Some(bytes)));
         self.staged.insert(id.to_string(), meta.clone());
         Ok(())
@@ -2545,8 +2557,10 @@ impl Stage<'_> {
         meta.seq = seq;
         meta.atts.insert(rev.clone(), atts);
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
@@ -2583,8 +2597,10 @@ impl Stage<'_> {
             meta.tree.merge_path(&path, deleted);
         }
 
-        self.ops
-            .push((body_key(&id, &rev), Some(serde_json::to_vec(&body)?)));
+        self.ops.push((
+            body_key(&id, &rev),
+            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
+        ));
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
@@ -2762,7 +2778,7 @@ pub struct ChangesOpts {
     pub filter: Option<ChangeFilter>,
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
-    pub owned: Option<Vec<bool>>,
+    pub owned: Option<ShardMask>,
     /// Internal: a watermark the caller already read with `changes_watermark`.
     /// Rows above it are withheld, and the feed does not take a newer one, so
     /// a caller that records it as its position has seen every row up to it.
@@ -3418,7 +3434,7 @@ fn collect_changes(
                 },
             );
             match read {
-                Ok(doc) => Some(serde_json::to_string(&doc)?),
+                Ok(doc) => Some(serde_json::to_string(&doc).map_err(ApiError::internal)?),
                 // A tombstone may have no stored body.
                 Err(error) if deleted && error.status == 404 => None,
                 Err(error) if error.status == 404 => {
@@ -3455,7 +3471,7 @@ mod tests {
     #[test]
     fn an_owned_mask_selects_only_the_shards_it_covers() {
         assert!(shard_owned(None, 7));
-        let mask = [true, false, true];
+        let mask = ShardMask::from_iter([true, false, true]);
         assert!(shard_owned(Some(&mask), 0));
         assert!(!shard_owned(Some(&mask), 1));
         assert!(shard_owned(Some(&mask), 2));
@@ -4524,7 +4540,12 @@ mod tests {
         assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 0, None), 9);
         // The same in-flight shard is not ours, so it does not hold us back.
         assert_eq!(
-            changes_watermark_from(&[5, 9], &[5, 12], 0, Some(&[true, false])),
+            changes_watermark_from(
+                &[5, 9],
+                &[5, 12],
+                0,
+                Some(&ShardMask::from_iter([true, false]))
+            ),
             u64::MAX
         );
         // Never below `since`.
@@ -4545,23 +4566,22 @@ mod tests {
             for (r, c) in reserved.iter_mut().zip(&committed) {
                 *r = (*r).max(*c);
             }
-            let mask = owned.as_ref().map(|m| {
-                let mut m = m.clone();
+            let mask = owned.map(|mut m| {
                 m.resize(committed.len(), false);
-                m
+                ShardMask::from_iter(m)
             });
             let watermark = changes_watermark_from(
                 &committed,
                 &reserved,
                 since,
-                mask.as_deref(),
+                mask.as_ref(),
             );
 
             // The cursor may advance to the lowest committed sequence of any
             // owned shard that still has an allocated, uncommitted write, but
             // never below `since`. With nothing in flight it is unbounded.
             let expected = (0..committed.len())
-                .filter(|&index| mask.as_ref().is_none_or(|m| m[index]))
+                .filter(|&index| mask.as_ref().is_none_or(|m| m.covers(index)))
                 .filter(|&index| reserved[index] > committed[index])
                 .map(|index| committed[index].max(since))
                 .min()

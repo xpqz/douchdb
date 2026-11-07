@@ -17,6 +17,60 @@ pub struct Cluster {
     pub secret: String,
 }
 
+/// The shards of one database that a request covers: the cluster fan-out
+/// gives each node the shards it answers for, and every shard-aware read
+/// filters by it. A shard beyond the mask is not covered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardMask(Vec<bool>);
+
+impl ShardMask {
+    /// A mask over `q` shards that covers none of them.
+    pub fn none(q: u32) -> ShardMask {
+        ShardMask(vec![false; q as usize])
+    }
+
+    /// Cover `shard`; a shard beyond the mask is ignored.
+    pub fn select(&mut self, shard: usize) {
+        if let Some(flag) = self.0.get_mut(shard) {
+            *flag = true;
+        }
+    }
+
+    pub fn covers(&self, shard: usize) -> bool {
+        self.0.get(shard).copied().unwrap_or(false)
+    }
+
+    /// No shard is covered.
+    pub fn is_empty(&self) -> bool {
+        !self.0.iter().any(|flag| *flag)
+    }
+
+    /// The number of shards the mask spans, covered or not.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The covered shards, in order.
+    pub fn shards(&self) -> Vec<usize> {
+        (0..self.0.len()).filter(|shard| self.0[*shard]).collect()
+    }
+
+    /// The covered shards as the `shards` query parameter peers read back.
+    pub fn query_value(&self) -> String {
+        self.shards()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl FromIterator<bool> for ShardMask {
+    fn from_iter<I: IntoIterator<Item = bool>>(flags: I) -> ShardMask {
+        ShardMask(flags.into_iter().collect())
+    }
+}
+
 /// Per-database placement metadata, modelled on CouchDB's `_dbs`/mem3 shard
 /// map: one ordered replica list per shard. The first entry is the preferred
 /// primary; all entries are full replicas.
@@ -188,6 +242,21 @@ fn score(node: &str, shard: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_mask_covers_only_selected_shards() {
+        let mut mask = ShardMask::none(4);
+        assert!(mask.is_empty());
+        mask.select(1);
+        mask.select(3);
+        mask.select(9);
+        assert!(!mask.is_empty());
+        assert_eq!(mask.len(), 4);
+        assert!(mask.covers(1) && mask.covers(3));
+        assert!(!mask.covers(0) && !mask.covers(9));
+        assert_eq!(mask.shards(), vec![1, 3]);
+        assert_eq!(mask.query_value(), "1,3");
+    }
 
     fn cluster(n: usize) -> Cluster {
         Cluster {
