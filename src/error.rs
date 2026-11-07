@@ -72,3 +72,16 @@ impl From<anyhow::Error> for ApiError {
 }
 
 pub type DbResult<T> = std::result::Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anyhow_conversion_keeps_the_cause_chain() {
+        let err = anyhow::anyhow!("disk full").context("writing shard 3");
+        let api = ApiError::from(err);
+        assert_eq!(api.status, 500);
+        assert_eq!(api.reason, "writing shard 3: disk full");
+    }
+}
