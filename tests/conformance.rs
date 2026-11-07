@@ -1333,7 +1333,10 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
         .filter(|row| {
             row["id"]
                 .as_str()
-                .map(|id| id.starts_with('d') && id[1..].parse::<u32>().map(|i| i % 700 == 699) == Ok(true))
+                .map(|id| {
+                    id.starts_with('d')
+                        && id[1..].parse::<u32>().map(|i| i % 700 == 699) == Ok(true)
+                })
                 .unwrap_or(false)
         })
         .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
@@ -1362,7 +1365,9 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
     // Starting after the second match leaves the other two.
     let since = expected[1].0.clone();
     let (_, body) = s
-        .get(&format!("/chsparse/_changes?filter=f/hit&limit=1&since={since}"))
+        .get(&format!(
+            "/chsparse/_changes?filter=f/hit&limit=1&since={since}"
+        ))
         .await;
     assert_eq!(body["results"][0]["id"], json!(expected[2].1));
 }

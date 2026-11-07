@@ -705,13 +705,11 @@ impl Shard {
                     .count()
                     + usize::from(live.contains_key(from.as_str()))
             }
-            Some((from, rank)) => {
-                rank.saturating_sub(
-                    live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
-                        .count()
-                        + usize::from(live.contains_key(key)),
-                )
-            }
+            Some((from, rank)) => rank.saturating_sub(
+                live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
+                    .count()
+                    + usize::from(live.contains_key(key)),
+            ),
             None => live.range::<str, _>((Unbounded, Excluded(key))).count(),
         };
         self.rank_cursor = Some((key.to_string(), rank));
@@ -2057,7 +2055,13 @@ mod scan_tests {
         };
         check(&mut shard);
         // Writes below, at and above the cursor key: insert, delete, update.
-        for (id, deleted) in [("a", false), ("d", true), ("e", false), ("z", false), ("j", true)] {
+        for (id, deleted) in [
+            ("a", false),
+            ("d", true),
+            ("e", false),
+            ("z", false),
+            ("j", true),
+        ] {
             shard.live_rank("f").unwrap();
             seq += 1;
             let mut tx = Tx::new();

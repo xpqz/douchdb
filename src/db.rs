@@ -1593,29 +1593,41 @@ impl Db {
         } else {
             watermark.min(self.changes_cutoff(&selected, opts).await?)
         };
-        let mut rows = Vec::new();
-        for index in selected {
-            let shard_opts = opts.clone();
-            let mut shard_rows = self.shards[index]
-                .call(move |s| collect_changes(s, &shard_opts, until))
-                .await?;
-            rows.append(&mut shard_rows);
-        }
-        rows.sort_by_key(|r| r.seq);
-        // Rows above the watermark are withheld; the next request re-reads
-        // them rather than skipping a later-visible lower sequence.
-        if !opts.descending {
-            rows.retain(|row| row.seq <= watermark);
-        }
-        if opts.descending {
-            rows.reverse();
-        }
-        // Filters are evaluated after merging shard rows so every shard is
-        // scanned: a shard-local limit would otherwise drop matching rows
-        // behind non-matching documents.
-        let scanned_last = rows.last().map(|row| row.seq);
-        if let Some(filter) = &opts.filter {
-            rows = apply_change_filter(rows, filter)?;
+        let mut rows;
+        let scanned_last;
+        match &opts.filter {
+            Some(filter) if !opts.descending => {
+                (rows, scanned_last) = self
+                    .filtered_changes(opts, filter, &selected, until)
+                    .await?;
+            }
+            _ => {
+                rows = Vec::new();
+                for index in selected {
+                    let shard_opts = opts.clone();
+                    let mut shard_rows = self.shards[index]
+                        .call(move |s| collect_changes(s, &shard_opts, until))
+                        .await?;
+                    rows.append(&mut shard_rows);
+                }
+                rows.sort_by_key(|r| r.seq);
+                // Rows above the watermark are withheld; the next request
+                // re-reads them rather than skipping a later-visible lower
+                // sequence.
+                if !opts.descending {
+                    rows.retain(|row| row.seq <= watermark);
+                }
+                if opts.descending {
+                    rows.reverse();
+                }
+                // A descending filter is evaluated after merging shard rows
+                // so every shard is scanned: a shard-local limit would
+                // otherwise drop matching rows behind non-matching documents.
+                scanned_last = rows.last().map(|row| row.seq);
+                if let Some(filter) = &opts.filter {
+                    rows = apply_change_filter(rows, filter)?;
+                }
+            }
         }
         if let Some(limit) = opts.limit {
             rows.truncate(limit);
@@ -1629,6 +1641,82 @@ impl Db {
             .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
         Ok((rows, last_seq, pending))
+    }
+
+    /// An ascending filtered read: scans each shard a page at a time and merges
+    /// the pages in sequence order, filtering as it goes, until `limit` rows
+    /// match or every shard is exhausted. No single shard job loads more than
+    /// a page of rows (with bodies, for a JS filter). Returns the matching
+    /// rows and the last sequence scanned.
+    async fn filtered_changes(
+        &self,
+        opts: &ChangesOpts,
+        filter: &ChangeFilter,
+        selected: &[usize],
+        until: u64,
+    ) -> DbResult<(Vec<ChangeRow>, Option<u64>)> {
+        use std::collections::VecDeque;
+
+        // `limit=0` keeps the single full pass: its `last_seq` is the last
+        // row scanned.
+        let page = match opts.limit {
+            Some(0) => usize::MAX,
+            Some(limit) => limit.clamp(64, 1024),
+            None => 1024,
+        };
+        let mut cursors = vec![opts.since; selected.len()];
+        let mut done = vec![false; selected.len()];
+        let mut buffers: Vec<VecDeque<ChangeRow>> =
+            (0..selected.len()).map(|_| VecDeque::new()).collect();
+        let mut matched: Vec<ChangeRow> = Vec::new();
+        let mut scanned_last = None;
+        loop {
+            for (slot, &index) in selected.iter().enumerate() {
+                if !buffers[slot].is_empty() || done[slot] {
+                    continue;
+                }
+                let mut shard_opts = opts.clone();
+                shard_opts.since = cursors[slot];
+                shard_opts.limit = Some(page);
+                let rows = self.shards[index]
+                    .call(move |s| collect_changes(s, &shard_opts, until))
+                    .await?;
+                match rows.last() {
+                    // A page can come back short when unreadable records are
+                    // skipped, so only an empty one ends the shard.
+                    None => done[slot] = true,
+                    Some(last) => cursors[slot] = last.seq,
+                }
+                buffers[slot].extend(rows);
+            }
+            // Everything up to the lowest buffered tail is complete: no shard
+            // can still produce a row below it.
+            let Some(cutoff) = buffers
+                .iter()
+                .zip(&done)
+                .filter(|(_, done)| !**done)
+                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq))
+                .min()
+            else {
+                break;
+            };
+            let mut batch = Vec::new();
+            for buffer in &mut buffers {
+                while buffer.front().is_some_and(|row| row.seq <= cutoff) {
+                    batch.extend(buffer.pop_front());
+                }
+            }
+            batch.sort_by_key(|row| row.seq);
+            scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
+            matched.extend(apply_change_filter(batch, filter)?);
+            if opts
+                .limit
+                .is_some_and(|limit| limit > 0 && matched.len() >= limit)
+            {
+                break;
+            }
+        }
+        Ok((matched, scanned_last))
     }
 
     /// Indexes of the shards in `owned`, or every shard.
@@ -3357,7 +3445,9 @@ fn collect_changes(
     opts: &ChangesOpts,
     until: u64,
 ) -> DbResult<Vec<ChangeRow>> {
-    let limit = if opts.filter.is_some() {
+    // A descending feed has no cursor to resume a filtered scan from, so it
+    // still reads every row; ascending callers page by `since` and `limit`.
+    let limit = if opts.filter.is_some() && opts.descending {
         usize::MAX
     } else {
         opts.limit.unwrap_or(usize::MAX)
