@@ -1,9 +1,10 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
-use crate::api::{internal_request_raw, AppState};
 use crate::auth::Auth;
 use crate::cluster::Cluster;
+use crate::cluster_http::internal_request_raw;
 use crate::db::Db;
+use crate::state::AppState;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use md5::{Digest, Md5};
@@ -280,7 +281,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     if !state.cluster_state.begin_replication() {
         return false;
     }
-    let peers: Vec<String> = state.cluster.peers().cloned().collect();
+    let peers: Vec<String> = state.ctx.cluster.peers().cloned().collect();
     let mut names = state.db_names().await;
     names.sort();
     if let Some(only) = only_db {
@@ -292,8 +293,8 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         let Ok(db) = state.db(&name).await else {
             continue;
         };
-        crate::fabric::reconcile_shard_map(&state, &db).await;
-        crate::fabric::reconcile_security(&state, &db).await;
+        crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
+        crate::fabric::reconcile_security(&state.ctx, &db).await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();
@@ -304,9 +305,9 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                 let result = pull(
                     &db,
                     &peer,
-                    &state.client,
-                    &state.cluster,
-                    state.auth.as_ref(),
+                    &state.ctx.client,
+                    &state.ctx.cluster,
+                    state.ctx.auth.as_ref(),
                 )
                 .await;
                 match result {

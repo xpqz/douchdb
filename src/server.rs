@@ -5,6 +5,7 @@ use crate::api::{self, AppState, Config};
 use crate::auth::Auth;
 use crate::cli::Args;
 use crate::cluster::Cluster;
+use crate::cluster_http::ClusterCtx;
 use crate::{admission, cluster_state, discovery, js, replicate, telemetry, ui};
 use axum::routing::{any, get};
 use axum::serve::ListenerExt;
@@ -155,7 +156,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         db_locks: Default::default(),
         fs_health: Default::default(),
         config,
-        auth,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
             args.compact_concurrency.max(1),
         )),
@@ -167,25 +167,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             heavy_per_user: args.heavy_per_user,
             background_in_flight: args.background_in_flight,
         })),
-        cluster: Cluster {
-            nodes: args.nodes.clone(),
-            me: args.me,
-            n: args.n.max(1),
-            secret: args.cluster_secret.clone(),
+        ctx: ClusterCtx {
+            cluster: Cluster {
+                nodes: args.nodes.clone(),
+                me: args.me,
+                n: args.n.max(1),
+                secret: args.cluster_secret.clone(),
+            },
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            auth,
         },
-        client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(60))
-            .build()?,
         db_updates: api::DbUpdates::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
     });
 
-    if state.cluster.is_clustered() {
+    if state.ctx.cluster.is_clustered() {
         replicate::spawn_anti_entropy(state.clone());
         tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
     }
-    if state.cluster.is_clustered() || !state.config.seeds.is_empty() {
+    if state.ctx.cluster.is_clustered() || !state.config.seeds.is_empty() {
         discovery::spawn(state.clone());
     }
 

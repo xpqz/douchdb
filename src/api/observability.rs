@@ -4,6 +4,7 @@
 //! re-exports them so route registration stays in one place.
 
 use super::{access_denied, flag, internal_request, query, AppState};
+use crate::state::FsHealth;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
@@ -35,36 +36,6 @@ fn dir_size(path: &std::path::Path) -> u64 {
         }
     }
     total
-}
-
-/// How long the filesystem part of the health check is reused. `/_health` is
-/// unauthenticated, so it must not touch the disk on every request.
-const FS_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Result of the blocking filesystem checks.
-#[derive(Clone, Copy)]
-struct FsHealth {
-    readable: bool,
-    writable: bool,
-    unreadable: u64,
-}
-
-/// Short-lived cache of [`FsHealth`].
-#[derive(Default)]
-pub struct FsHealthCache(std::sync::Mutex<Option<(std::time::Instant, FsHealth)>>);
-
-impl FsHealthCache {
-    fn fresh(&self, now: std::time::Instant) -> Option<FsHealth> {
-        let slot = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        match *slot {
-            Some((at, value)) if now.saturating_duration_since(at) < FS_HEALTH_TTL => Some(value),
-            _ => None,
-        }
-    }
-
-    fn store(&self, now: std::time::Instant, value: FsHealth) {
-        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((now, value));
-    }
 }
 
 /// Probe the data root: list it, write and remove a scratch file, and check
@@ -119,11 +90,11 @@ async fn fs_health(st: &AppState) -> FsHealth {
 
 fn node_json(st: &AppState) -> Value {
     json!({
-        "index": st.cluster.me,
+        "index": st.ctx.cluster.me,
         "url": st.config.advertise,
-        "clustered": st.cluster.is_clustered(),
+        "clustered": st.ctx.cluster.is_clustered(),
         "q": st.config.q,
-        "n": st.cluster.replication_factor(),
+        "n": st.ctx.cluster.replication_factor(),
         "sync_secs": st.config.sync_secs,
     })
 }
@@ -145,7 +116,7 @@ async fn local_metrics(st: &AppState) -> Value {
                 let counts = db.shard_counts().await.unwrap_or_default();
                 let map = db.shard_map();
                 let local_shards = (0..map.q)
-                    .filter(|shard| map.replicas_of(*shard).contains(&st.cluster.me))
+                    .filter(|shard| map.replicas_of(*shard).contains(&st.ctx.cluster.me))
                     .count();
                 let docs: u64 = counts.iter().map(|(docs, _)| *docs).sum();
                 let deleted: u64 = counts.iter().map(|(_, deleted)| *deleted).sum();
@@ -166,7 +137,7 @@ async fn local_metrics(st: &AppState) -> Value {
                             "deleted": deleted,
                             "replicas": map.replicas_of(shard as u32),
                             "owner": map.owner_of(shard as u32),
-                            "local": map.replicas_of(shard as u32).contains(&st.cluster.me),
+                            "local": map.replicas_of(shard as u32).contains(&st.ctx.cluster.me),
                         })
                     })
                     .collect();
@@ -202,7 +173,7 @@ async fn local_metrics(st: &AppState) -> Value {
     metrics["replication"] = st.cluster_state.replication_json();
     metrics["discovery"] = st
         .cluster_state
-        .discovery_json(&st.cluster.nodes, &st.config.seeds);
+        .discovery_json(&st.ctx.cluster.nodes, &st.config.seeds);
     metrics["health"] = local_health(st, true).await;
     metrics
 }
@@ -292,10 +263,10 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         "unreadable": unreadable,
     }));
 
-    if st.cluster.is_clustered() {
+    if st.ctx.cluster.is_clustered() {
         let mut discovery = st
             .cluster_state
-            .discovery_json(&st.cluster.nodes, &st.config.seeds);
+            .discovery_json(&st.ctx.cluster.nodes, &st.config.seeds);
         let nodes = crate::json::take_array(&mut discovery, "nodes").unwrap_or_default();
         let placement: Vec<&Value> = nodes
             .iter()
@@ -338,7 +309,9 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
         ("degraded", "background replication paused".to_string())
     } else if let Some(error) = replication["error"].as_str() {
         ("degraded", format!("last pass: {error}"))
-    } else if st.cluster.is_clustered() && replication["last_finished"].as_u64().unwrap_or(0) == 0 {
+    } else if st.ctx.cluster.is_clustered()
+        && replication["last_finished"].as_u64().unwrap_or(0) == 0
+    {
         ("degraded", "no replication pass yet".to_string())
     } else {
         (
@@ -866,8 +839,9 @@ pub async fn metrics_status(
     }
     let q = query(&uri);
     let local = local_metrics(&st).await;
-    let cluster_requested =
-        flag(&q, "cluster") && st.cluster.is_clustered() && !st.cluster.is_internal(&headers);
+    let cluster_requested = flag(&q, "cluster")
+        && st.ctx.cluster.is_clustered()
+        && !st.ctx.cluster.is_internal(&headers);
     if !cluster_requested {
         let mut value = local.clone();
         value["scope"] = json!("local");
@@ -885,17 +859,18 @@ pub async fn metrics_status(
     }
 
     let peers: Vec<(usize, String)> = st
+        .ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
         let started = std::time::Instant::now();
         let request = internal_request(
-            &st,
+            &st.ctx,
             reqwest::Method::GET,
             &url,
             &["_node", "_local", "_metrics"],
@@ -1007,22 +982,24 @@ pub async fn health_status(
     }
     let local = local_health(&st, true).await;
     let q = query(&uri);
-    let cluster_requested =
-        flag(&q, "cluster") && st.cluster.is_clustered() && !st.cluster.is_internal(&headers);
+    let cluster_requested = flag(&q, "cluster")
+        && st.ctx.cluster.is_clustered()
+        && !st.ctx.cluster.is_internal(&headers);
     if !cluster_requested {
         return super::json(StatusCode::OK, local);
     }
     let peers: Vec<(usize, String)> = st
+        .ctx
         .cluster
         .nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != st.cluster.me)
+        .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
     let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
         let request = internal_request(
-            &st,
+            &st.ctx,
             reqwest::Method::GET,
             &url,
             &["_node", "_local", "_health"],
@@ -1044,7 +1021,7 @@ pub async fn health_status(
     .await;
     let mut worst = health_rank(local["status"].as_str().unwrap_or("ok"));
     let mut nodes = vec![json!({
-        "index": st.cluster.me,
+        "index": st.ctx.cluster.me,
         "url": st.config.advertise,
         "reachable": true,
         "status": local["status"],
@@ -1127,25 +1104,6 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn fs_health_cache_serves_within_the_ttl_only() {
-        let cache = FsHealthCache::default();
-        let start = Instant::now();
-        assert!(cache.fresh(start).is_none());
-        cache.store(
-            start,
-            FsHealth {
-                readable: true,
-                writable: true,
-                unreadable: 3,
-            },
-        );
-        let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
-        assert_eq!(hit.map(|value| value.unreadable), Some(3));
-        assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
-    }
 
     #[test]
     fn probe_fs_counts_unreadable_db_json() {
