@@ -419,9 +419,9 @@ struct BulkBody<'a, T: serde::Serialize> {
     new_edits: bool,
 }
 
-/// `new_edits=true` writes to each document's primary (the coordinating
-/// replica), then copies the resulting full revision to the other replicas with
-/// `new_edits=false`, so every replica ends with byte-identical history.
+/// `new_edits=true` sends each document to every replica in its shard set and
+/// returns once `w` of them acknowledge (CouchDB-style; revision ids are
+/// deterministic, so no primary re-fetch/copy pass is needed).
 /// `new_edits=false` (the replication path) sends the given revision to every
 /// replica directly. The bool is whether the default write quorum was met.
 pub(crate) async fn commit_docs(
@@ -455,224 +455,338 @@ pub(crate) async fn commit_docs(
         ));
     }
 
-    // Routing needs ids, so generate them before grouping. `Db::put_docs`
-    // would otherwise assign them per replica and the copies would diverge.
-    for doc in &mut docs {
+    let ids = assign_ids(&mut docs);
+    let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
+        ids.iter().map(|id| db.placement_of_doc(id)).unzip();
+    let docs: Vec<Arc<Value>> = docs.into_iter().map(Arc::new).collect();
+    let groups = group_by_node(&docs, &replicas);
+    crate::telemetry::record_fanout(groups.len() as u64);
+
+    let (out, met) = if new_edits {
+        let tally = QuorumTally::new(&ids, &primaries, &replicas, write_quorum(w, db.copies()));
+        let db_handle = st.db(dbname).await?;
+        let pending = spawn_quorum_writes(st, &db_handle, dbname, groups, headers, &gate);
+        collect_quorum(pending, tally).await
+    } else {
+        let responses = replicate_to_all(st, db, dbname, groups, headers).await;
+        merge_replicated(&ids, &primaries, responses)
+    };
+    if !met {
+        crate::telemetry::record_quorum_failure();
+    }
+    if out.iter().any(|result| result.get("ok").is_some()) {
+        st.db_updates.record(dbname, "updated");
+    }
+    Ok((out, met))
+}
+
+/// Routing needs ids, so generate them before grouping. `Db::put_docs` would
+/// otherwise assign them per replica and the copies would diverge.
+fn assign_ids(docs: &mut [Value]) -> Vec<String> {
+    for doc in docs.iter_mut() {
         if doc.get("_id").is_none() {
             doc["_id"] = json!(crate::util::uuid());
         }
     }
-    let ids: Vec<String> = docs
-        .iter()
+    docs.iter()
         .map(|doc| {
             doc.get("_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string()
         })
-        .collect();
-    let (primaries, replicas): (Vec<usize>, Vec<Vec<usize>>) =
-        ids.iter().map(|id| db.placement_of_doc(id)).unzip();
-    let replication = db.copies();
-    // CouchDB defaults to a write quorum and lets `?w=` override it.
-    let quorum = if w == 0 {
-        replication / 2 + 1
+        .collect()
+}
+
+/// CouchDB defaults to a write quorum and lets `?w=` override it.
+fn write_quorum(w: usize, copies: usize) -> usize {
+    if w == 0 {
+        copies / 2 + 1
     } else {
-        w.min(replication)
-    };
-    let total = docs.len();
-    let docs: Vec<Arc<Value>> = docs.into_iter().map(Arc::new).collect();
-    let mut out = vec![Value::Null; total];
-    let mut acks = vec![0usize; total];
+        w.min(copies)
+    }
+}
 
-    if new_edits {
-        // CouchDB-style: send the original document to every replica in its
-        // shard set and wait for `w` acknowledgements. Revision ids are
-        // deterministic, so no primary re-fetch/copy pass is needed.
-        let db_handle = st.db(dbname).await?;
-        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
-        for (slot, doc) in docs.into_iter().enumerate() {
-            for node in &replicas[slot] {
-                groups.entry(*node).or_default().push((slot, doc.clone()));
-            }
-        }
+type SlotDocs = Vec<(usize, Arc<Value>)>;
+/// One node's answer: the node, the document slots it was sent, and the
+/// per-document results or the failure to reach it.
+type NodeReply = (usize, Vec<usize>, DbResult<Vec<Value>>);
 
-        crate::telemetry::record_fanout(groups.len() as u64);
-        let mut successes: Vec<Option<Value>> = vec![None; total];
-        let mut failures: Vec<Option<Value>> = vec![None; total];
-        // Design documents go to every node, and any node may coordinate a
-        // query against them, so their write waits for every replica to answer
-        // rather than only the quorum.
-        let mut unanswered: Vec<usize> = (0..total)
-            .map(|slot| {
-                if ids[slot].starts_with("_design/") {
-                    replicas[slot].len()
-                } else {
-                    0
-                }
-            })
-            .collect();
-        let mut pending = FuturesUnordered::new();
-        for (node, group) in groups {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-            if node == ctx.cluster.me {
-                let subdocs: Vec<Value> =
-                    group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-                let db = db_handle.clone();
-                let gate = gate.clone();
-                pending.push(tokio::spawn(async move {
-                    let _gate = gate;
-                    (node, slots, db.put_docs(subdocs, true).await)
-                }));
-            } else {
-                let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-                let client = ctx.client.clone();
-                let secret = ctx.cluster.secret.clone();
-                let peer = ctx.cluster.nodes[node].clone();
-                let dbname = dbname.to_string();
-                let headers = headers.clone();
-                let gate = gate.clone();
-                pending.push(tokio::spawn(async move {
-                    let _gate = gate;
-                    (
-                        node,
-                        slots,
-                        forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers)
-                            .await,
-                    )
-                }));
-            }
+/// The documents each node is to receive, with each document's slot in the
+/// request.
+fn group_by_node(docs: &[Arc<Value>], replicas: &[Vec<usize>]) -> HashMap<usize, SlotDocs> {
+    let mut groups: HashMap<usize, SlotDocs> = HashMap::new();
+    for (slot, doc) in docs.iter().enumerate() {
+        for node in replicas.get(slot).into_iter().flatten() {
+            groups.entry(*node).or_default().push((slot, doc.clone()));
         }
+    }
+    groups
+}
 
-        // Return as soon as every document has `w` acknowledgements. The
-        // remaining replica writes keep running as detached tasks, so a slow
-        // or unreachable replica no longer sets write tail latency.
-        while let Some(joined) = pending.next().await {
-            let Ok((node, slots, response)) = joined else {
-                continue;
-            };
-            for slot in &slots {
-                unanswered[*slot] = unanswered[*slot].saturating_sub(1);
-            }
-            match response {
-                Ok(results) => {
-                    for (slot, result) in slots.into_iter().zip(results) {
-                        if result.get("error").is_none() {
-                            acks[slot] += 1;
-                            if successes[slot].is_none() || node == primaries[slot] {
-                                successes[slot] = Some(result);
-                            }
-                        } else if failures[slot].is_none() || node == primaries[slot] {
-                            failures[slot] = Some(result);
-                        }
-                    }
-                }
-                Err(_) => {
-                    for slot in slots {
-                        if failures[slot].is_none() {
-                            failures[slot] = Some(json!({
-                                "id": ids[slot],
-                                "error": "replica_unavailable",
-                                "reason": "no replica in the shard set is reachable",
-                            }));
-                        }
-                    }
-                }
-            }
-            if acks.iter().all(|ack| *ack >= quorum) && unanswered.iter().all(|left| *left == 0) {
-                break;
-            }
-        }
+fn replica_unavailable(id: &str) -> Value {
+    json!({
+        "id": id,
+        "error": "replica_unavailable",
+        "reason": "no replica in the shard set is reachable",
+    })
+}
 
-        for slot in 0..total {
-            out[slot] = successes[slot]
-                .take()
-                .or_else(|| failures[slot].take())
-                .unwrap_or_else(|| {
-                    json!({
-                        "id": ids[slot],
-                        "error": "replica_unavailable",
-                        "reason": "no replica in the shard set is reachable",
-                    })
-                });
-        }
-        let met = acks.iter().all(|ack| *ack >= quorum);
-        if !met {
-            crate::telemetry::record_quorum_failure();
-        }
-        if out.iter().any(|result| result.get("ok").is_some()) {
-            st.db_updates.record(dbname, "updated");
-        }
-        Ok((out, met))
-    } else {
-        // Replication writes carry their own history and must reach every
-        // replica, including ones that are not the primary. A down replica is
-        // not fatal: anti-entropy will heal it when it returns.
-        let mut groups: HashMap<usize, Vec<(usize, Arc<Value>)>> = HashMap::new();
-        for (slot, doc) in docs.into_iter().enumerate() {
-            for node in &replicas[slot] {
-                groups.entry(*node).or_default().push((slot, doc.clone()));
-            }
-        }
-        crate::telemetry::record_fanout(groups.len() as u64);
-        let mut reached = vec![false; total];
-        let mut responses = Vec::new();
-        if let Some(group) = groups.remove(&ctx.cluster.me) {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+/// Start one detached write per node. Each task holds the write gate, so a
+/// slow or unreachable replica keeps running after the request returns.
+fn spawn_quorum_writes(
+    st: &AppState,
+    db: &Arc<Db>,
+    dbname: &str,
+    groups: HashMap<usize, SlotDocs>,
+    headers: &HeaderMap,
+    gate: &Arc<impl Send + Sync + 'static>,
+) -> FuturesUnordered<tokio::task::JoinHandle<NodeReply>> {
+    let ctx = &st.ctx;
+    let pending = FuturesUnordered::new();
+    for (node, group) in groups {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        if node == ctx.cluster.me {
             let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-            responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
-        }
-        let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
-            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let db = db.clone();
+            let gate = gate.clone();
+            pending.push(tokio::spawn(async move {
+                let _gate = gate;
+                (node, slots, db.put_docs(subdocs, true).await)
+            }));
+        } else {
             let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
             let client = ctx.client.clone();
             let secret = ctx.cluster.secret.clone();
             let peer = ctx.cluster.nodes[node].clone();
             let dbname = dbname.to_string();
             let headers = headers.clone();
-            async move {
+            let gate = gate.clone();
+            pending.push(tokio::spawn(async move {
+                let _gate = gate;
                 (
                     node,
                     slots,
-                    forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
+                    forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await,
                 )
-            }
-        }))
-        .await;
-        responses.extend(remote);
-        for (node, slots, response) in responses {
-            match response {
-                Ok(results) => {
-                    for (slot, result) in slots.into_iter().zip(results) {
-                        reached[slot] = true;
-                        // Prefer the primary's verdict.
-                        if node == primaries[slot] || out[slot].is_null() {
-                            out[slot] = result;
-                        }
-                    }
-                }
-                Err(_) => {
-                    for slot in slots {
-                        if out[slot].is_null() {
-                            out[slot] = json!({
-                                "id": ids[slot],
-                                "error": "replica_unavailable",
-                                "reason": "no replica in the shard set is reachable",
-                            });
-                        }
-                    }
-                }
-            }
+            }));
         }
-        let met = reached.iter().all(|ok| *ok);
-        if !met {
-            crate::telemetry::record_quorum_failure();
-        }
-        if out.iter().any(|result| result.get("ok").is_some()) {
-            st.db_updates.record(dbname, "updated");
-        }
-        Ok((out, met))
     }
+    pending
+}
+
+/// Return as soon as the tally is settled. The remaining replica writes keep
+/// running as detached tasks, so a slow or unreachable replica no longer sets
+/// write tail latency.
+async fn collect_quorum(
+    mut pending: FuturesUnordered<tokio::task::JoinHandle<NodeReply>>,
+    mut tally: QuorumTally<'_>,
+) -> (Vec<Value>, bool) {
+    while let Some(joined) = pending.next().await {
+        let Ok((node, slots, response)) = joined else {
+            continue;
+        };
+        tally.record(node, slots, response.ok());
+        if tally.settled() {
+            break;
+        }
+    }
+    let met = tally.met();
+    (tally.finish(), met)
+}
+
+/// Pure bookkeeping for a quorum write: per-document acknowledgement counts
+/// and the result to report for each document.
+struct QuorumTally<'a> {
+    ids: &'a [String],
+    primaries: &'a [usize],
+    quorum: usize,
+    acks: Vec<usize>,
+    successes: Vec<Option<Value>>,
+    failures: Vec<Option<Value>>,
+    /// Replies still owed per document. Design documents go to every node, and
+    /// any node may coordinate a query against them, so their write waits for
+    /// every replica to answer rather than only the quorum.
+    unanswered: Vec<usize>,
+}
+
+impl<'a> QuorumTally<'a> {
+    fn new(
+        ids: &'a [String],
+        primaries: &'a [usize],
+        replicas: &[Vec<usize>],
+        quorum: usize,
+    ) -> Self {
+        let total = ids.len();
+        let unanswered = ids
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| {
+                if id.starts_with("_design/") {
+                    replicas.get(slot).map_or(0, Vec::len)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        QuorumTally {
+            ids,
+            primaries,
+            quorum,
+            acks: vec![0; total],
+            successes: vec![None; total],
+            failures: vec![None; total],
+            unanswered,
+        }
+    }
+
+    /// Record one node's reply for the given slots; `None` means the node
+    /// could not be reached.
+    fn record(&mut self, node: usize, slots: Vec<usize>, response: Option<Vec<Value>>) {
+        for slot in &slots {
+            if let Some(left) = self.unanswered.get_mut(*slot) {
+                *left = left.saturating_sub(1);
+            }
+        }
+        match response {
+            Some(results) => {
+                for (slot, result) in slots.into_iter().zip(results) {
+                    let is_primary = self.primaries.get(slot) == Some(&node);
+                    let (Some(ack), Some(success), Some(failure)) = (
+                        self.acks.get_mut(slot),
+                        self.successes.get_mut(slot),
+                        self.failures.get_mut(slot),
+                    ) else {
+                        continue;
+                    };
+                    if result.get("error").is_none() {
+                        *ack += 1;
+                        if success.is_none() || is_primary {
+                            *success = Some(result);
+                        }
+                    } else if failure.is_none() || is_primary {
+                        *failure = Some(result);
+                    }
+                }
+            }
+            None => {
+                for slot in slots {
+                    if let (Some(failure), Some(id)) =
+                        (self.failures.get_mut(slot), self.ids.get(slot))
+                    {
+                        if failure.is_none() {
+                            *failure = Some(replica_unavailable(id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every document has its quorum and no design document is still owed a
+    /// reply.
+    fn settled(&self) -> bool {
+        self.met() && self.unanswered.iter().all(|left| *left == 0)
+    }
+
+    /// Every document has at least `quorum` acknowledgements.
+    fn met(&self) -> bool {
+        self.acks.iter().all(|ack| *ack >= self.quorum)
+    }
+
+    /// The result per document: a success if any replica acknowledged (the
+    /// primary's if it did), else a failure (the primary's if it reported one),
+    /// else `replica_unavailable`.
+    fn finish(self) -> Vec<Value> {
+        let ids = self.ids;
+        self.successes
+            .into_iter()
+            .zip(self.failures)
+            .enumerate()
+            .map(|(slot, (success, failure))| {
+                success.or(failure).unwrap_or_else(|| {
+                    replica_unavailable(ids.get(slot).map_or("", String::as_str))
+                })
+            })
+            .collect()
+    }
+}
+
+/// Replication writes carry their own history and must reach every replica,
+/// including ones that are not the primary. A down replica is not fatal:
+/// anti-entropy will heal it when it returns.
+async fn replicate_to_all(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    mut groups: HashMap<usize, SlotDocs>,
+    headers: &HeaderMap,
+) -> Vec<NodeReply> {
+    let ctx = &st.ctx;
+    let mut responses = Vec::new();
+    if let Some(group) = groups.remove(&ctx.cluster.me) {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
+        responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
+    }
+    let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
+        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+        let client = ctx.client.clone();
+        let secret = ctx.cluster.secret.clone();
+        let peer = ctx.cluster.nodes[node].clone();
+        let dbname = dbname.to_string();
+        let headers = headers.clone();
+        async move {
+            (
+                node,
+                slots,
+                forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
+            )
+        }
+    }))
+    .await;
+    responses.extend(remote);
+    responses
+}
+
+/// Merge the replies of a replication write: the primary's verdict wins, and
+/// the write is complete only if every document reached some replica.
+fn merge_replicated(
+    ids: &[String],
+    primaries: &[usize],
+    responses: Vec<NodeReply>,
+) -> (Vec<Value>, bool) {
+    let total = ids.len();
+    let mut out = vec![Value::Null; total];
+    let mut reached = vec![false; total];
+    for (node, slots, response) in responses {
+        match response {
+            Ok(results) => {
+                for (slot, result) in slots.into_iter().zip(results) {
+                    let (Some(reached), Some(out)) = (reached.get_mut(slot), out.get_mut(slot))
+                    else {
+                        continue;
+                    };
+                    *reached = true;
+                    if primaries.get(slot) == Some(&node) || out.is_null() {
+                        *out = result;
+                    }
+                }
+            }
+            Err(_) => {
+                for slot in slots {
+                    if let (Some(out), Some(id)) = (out.get_mut(slot), ids.get(slot)) {
+                        if out.is_null() {
+                            *out = replica_unavailable(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let met = reached.iter().all(|ok| *ok);
+    (out, met)
 }
 
 async fn forward_bulk_owned<T>(
@@ -2330,6 +2444,136 @@ mod tests {
             let merged = reconcile_leaves(&docs, Some("3-c")).expect("exact rev");
             assert_eq!(merged.winner["_rev"], "3-c");
             assert_eq!(merged.history, ["3-c", "2-b", "1-0"]);
+        }
+    }
+
+    mod quorum_tally {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// What a node answers for one document.
+        #[derive(Clone, Copy, Debug)]
+        enum Verdict {
+            Ack,
+            Reject,
+        }
+
+        /// A cluster of `copies` nodes, every document replicated on all of
+        /// them with node 0 as primary. `nodes[n]` is `None` for an
+        /// unreachable node, else its verdict per document.
+        type Scenario = (usize, Vec<Option<Vec<Verdict>>>, Vec<bool>, Vec<usize>);
+
+        fn scenario() -> impl Strategy<Value = Scenario> {
+            (1usize..5, 1usize..5).prop_flat_map(|(docs, copies)| {
+                let verdict = prop_oneof![Just(Verdict::Ack), Just(Verdict::Reject)];
+                let node = prop::option::of(prop::collection::vec(verdict, docs));
+                (
+                    Just(docs),
+                    prop::collection::vec(node, copies),
+                    prop::collection::vec(any::<bool>(), docs),
+                    Just((0..copies).collect::<Vec<_>>()).prop_shuffle(),
+                )
+            })
+        }
+
+        fn reply(node: usize, slot: usize, verdict: Verdict) -> Value {
+            match verdict {
+                Verdict::Ack => json!({"ok": true, "id": format!("d{slot}"), "from": node}),
+                Verdict::Reject => {
+                    json!({"id": format!("d{slot}"), "error": "conflict", "from": node})
+                }
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn tally_agrees_with_a_direct_count(
+                (docs, nodes, design, order) in scenario(),
+                quorum in 1usize..5,
+            ) {
+                let copies = nodes.len();
+                let quorum = quorum.min(copies);
+                let ids: Vec<String> = (0..docs)
+                    .map(|slot| {
+                        if design[slot] { format!("_design/d{slot}") } else { format!("d{slot}") }
+                    })
+                    .collect();
+                let primaries = vec![0usize; docs];
+                let replicas = vec![(0..copies).collect::<Vec<_>>(); docs];
+                let mut tally = QuorumTally::new(&ids, &primaries, &replicas, quorum);
+                let slots: Vec<usize> = (0..docs).collect();
+                let mut answered = 0;
+                let mut settled_early = false;
+                for node in &order {
+                    let response = nodes[*node].as_ref().map(|verdicts| {
+                        verdicts
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, v)| reply(*node, slot, *v))
+                            .collect::<Vec<_>>()
+                    });
+                    tally.record(*node, slots.clone(), response);
+                    answered += 1;
+                    if tally.settled() {
+                        // Settled means the quorum is met and every design
+                        // document has heard from all of its replicas.
+                        prop_assert!(tally.met());
+                        if design.iter().any(|d| *d) {
+                            prop_assert_eq!(answered, copies);
+                        }
+                        settled_early = true;
+                        break;
+                    }
+                }
+                let acks: Vec<usize> = (0..docs)
+                    .map(|slot| {
+                        let upto = if settled_early { answered } else { copies };
+                        order[..upto]
+                            .iter()
+                            .filter(|n| matches!(&nodes[**n], Some(v) if matches!(v[slot], Verdict::Ack)))
+                            .count()
+                    })
+                    .collect();
+                prop_assert_eq!(tally.met(), acks.iter().all(|a| *a >= quorum));
+                let met = tally.met();
+                for (slot, result) in tally.finish().into_iter().enumerate() {
+                    if acks[slot] > 0 {
+                        // Any acknowledgement beats any failure, and the
+                        // primary's acknowledgement beats the others'.
+                        prop_assert!(result.get("error").is_none());
+                        let primary_acked = matches!(&nodes[0], Some(v) if matches!(v[slot], Verdict::Ack))
+                            && order[..if settled_early { answered } else { copies }].contains(&0);
+                        if primary_acked {
+                            prop_assert_eq!(&result["from"], &json!(0));
+                        }
+                    } else {
+                        prop_assert!(result.get("error").is_some());
+                        prop_assert!(!met);
+                    }
+                }
+            }
+
+            #[test]
+            fn a_document_nobody_answered_is_replica_unavailable(docs in 1usize..5) {
+                let ids: Vec<String> = (0..docs).map(|slot| format!("d{slot}")).collect();
+                let primaries = vec![0usize; docs];
+                let replicas = vec![vec![0usize, 1]; docs];
+                let mut tally = QuorumTally::new(&ids, &primaries, &replicas, 1);
+                prop_assert!(!tally.met());
+                tally.record(0, (0..docs).collect(), None);
+                tally.record(1, (0..docs).collect(), None);
+                prop_assert!(!tally.settled());
+                for (slot, result) in tally.finish().into_iter().enumerate() {
+                    prop_assert_eq!(&result["error"], &json!("replica_unavailable"));
+                    prop_assert_eq!(&result["id"], &json!(format!("d{slot}")));
+                }
+            }
+
+            #[test]
+            fn write_quorum_is_a_majority_unless_overridden(copies in 1usize..8, w in 1usize..12) {
+                prop_assert_eq!(write_quorum(0, copies), copies / 2 + 1);
+                prop_assert_eq!(write_quorum(w, copies), w.min(copies));
+            }
         }
     }
 }

@@ -3,14 +3,16 @@
 
 use super::*;
 
-pub(super) async fn bulk_docs(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
     let Ok(mut value) = crate::json::from_slice(body) else {
         return fail(ApiError::bad_request("invalid UTF-8 JSON"));
     };
@@ -266,14 +268,16 @@ fn bulk_read_candidates(db: &Db, id: &str, me: usize) -> Vec<usize> {
     replicas
 }
 
-pub(super) async fn bulk_get(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
@@ -347,13 +351,15 @@ pub(super) async fn bulk_get(
     json(StatusCode::OK, json!({"results": out}))
 }
 
-pub(super) async fn revs_diff(
-    st: &AppState,
-    db: &Db,
-    dbname: &str,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        body,
+        headers,
+        ..
+    } = req;
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };

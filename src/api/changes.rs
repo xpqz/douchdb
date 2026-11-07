@@ -73,14 +73,16 @@ fn changes_timeout(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
     }
 }
 
-pub(super) async fn changes(
-    st: Arc<AppState>,
-    db: Arc<Db>,
-    dbname: &str,
-    q: &HashMap<String, String>,
-    body: &[u8],
-    headers: &HeaderMap,
-) -> Response {
+/// `st` and `db` are the owned handles behind `req`: a streaming feed outlives
+/// the handler, so it needs `Arc`s rather than the borrows in the request.
+pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
     let limit = match changes_limit(q) {
         Ok(limit) => limit,
         Err(error) => return fail(error),
