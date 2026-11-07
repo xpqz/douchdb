@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{
     DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
@@ -19,7 +19,7 @@ use tantivy::directory::{
     AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, TerminatingWrite,
     WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::query::{AllQuery, QueryParser};
+use tantivy::query::{AllQuery, EnableScoring, QueryParser};
 use tantivy::schema::{
     Field, FieldType, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
@@ -35,10 +35,23 @@ pub struct SearchSpec {
     pub analyzer: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A document as the index function emitted it.
+#[derive(Clone, Debug)]
 struct SearchDoc {
     id: String,
+    /// The shard the document lives on, which orders a rebuild's documents.
+    shard: usize,
     fields: Map<String, Value>,
+}
+
+impl SearchDoc {
+    fn new(id: String, fields: Map<String, Value>, (q, partitioned): (u32, bool)) -> Self {
+        SearchDoc {
+            shard: crate::db::shard_index_for(&id, q, partitioned),
+            id,
+            fields,
+        }
+    }
 }
 
 /// An index's description. Only the identifying fields are written to the
@@ -55,8 +68,12 @@ struct SearchMeta {
     ddoc: String,
     #[serde(default)]
     name: String,
+    /// The indexed documents by id. A document is shared, so an update
+    /// copies pointers for the documents it leaves alone, not their fields.
     #[serde(skip)]
-    docs: Vec<SearchDoc>,
+    docs: HashMap<String, Arc<SearchDoc>>,
+    #[serde(skip)]
+    kinds: KindStats,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,39 +258,139 @@ enum FieldKind {
     Bool,
 }
 
-fn infer_kinds<'a>(
-    docs: impl IntoIterator<Item = &'a Map<String, Value>>,
-) -> BTreeMap<String, FieldKind> {
-    let mut kinds: BTreeMap<String, FieldKind> = BTreeMap::new();
-    for fields in docs {
-        for (name, value) in fields {
-            // The schema's own fields cannot also be index fields.
-            if name == ID_FIELD || name == FIELDS_FIELD {
-                continue;
-            }
-            let kind = match value {
-                Value::Number(_) => FieldKind::Number,
-                Value::Bool(_) => FieldKind::Bool,
-                _ => FieldKind::Text,
-            };
-            kinds
-                .entry(name.clone())
-                .and_modify(|existing| {
-                    let current = *existing;
-                    if !matches!(
-                        (current, kind),
-                        (FieldKind::Text, _)
-                            | (_, FieldKind::Text)
-                            | (FieldKind::Number, FieldKind::Number)
-                            | (FieldKind::Bool, FieldKind::Bool)
-                    ) {
-                        *existing = FieldKind::Text;
-                    }
-                })
-                .or_insert(kind);
+/// The value kinds seen in each field, kept up to date as documents are
+/// added and removed so an update does not look at the others.
+///
+/// A rebuild reads documents shard by shard in id order and a field's type
+/// depends on which value comes first: a field is text if its first value is,
+/// and also if both numbers and booleans were indexed into it. Other values
+/// are text in a numeric or boolean field and are not indexed into it.
+#[derive(Clone, Debug, Default)]
+struct KindStats {
+    fields: BTreeMap<String, FieldTally>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FieldTally {
+    numbers: usize,
+    bools: usize,
+    texts: usize,
+    /// The kind of the field's first value, with the (shard, id) of the
+    /// document it came from. `None` while that document is gone and the
+    /// next one has not been looked up.
+    first: Option<((usize, String), FieldKind)>,
+}
+
+impl FieldTally {
+    fn total(&self) -> usize {
+        self.numbers + self.bools + self.texts
+    }
+
+    fn count(&mut self, kind: FieldKind) -> &mut usize {
+        match kind {
+            FieldKind::Text => &mut self.texts,
+            FieldKind::Number => &mut self.numbers,
+            FieldKind::Bool => &mut self.bools,
         }
     }
-    kinds
+}
+
+fn value_kind(value: &Value) -> FieldKind {
+    match value {
+        Value::Number(_) => FieldKind::Number,
+        Value::Bool(_) => FieldKind::Bool,
+        _ => FieldKind::Text,
+    }
+}
+
+/// The index's own fields cannot also be index fields.
+fn is_index_field(name: &str) -> bool {
+    name != ID_FIELD && name != FIELDS_FIELD
+}
+
+impl KindStats {
+    fn add(&mut self, doc: &SearchDoc) {
+        for (name, value) in doc.fields.iter().filter(|(name, _)| is_index_field(name)) {
+            let kind = value_kind(value);
+            let tally = self.fields.entry(name.clone()).or_default();
+            *tally.count(kind) += 1;
+            let earlier = tally
+                .first
+                .as_ref()
+                .is_none_or(|(key, _)| (doc.shard, doc.id.as_str()) < (key.0, key.1.as_str()));
+            if earlier {
+                tally.first = Some(((doc.shard, doc.id.clone()), kind));
+            }
+        }
+    }
+
+    /// Take a document out. A field whose first value was in it needs
+    /// `refresh` before more documents are added.
+    fn remove(&mut self, doc: &SearchDoc) {
+        for (name, value) in doc.fields.iter().filter(|(name, _)| is_index_field(name)) {
+            let Some(tally) = self.fields.get_mut(name) else {
+                continue;
+            };
+            let count = tally.count(value_kind(value));
+            *count = count.saturating_sub(1);
+            if tally.total() == 0 {
+                self.fields.remove(name);
+            } else if tally
+                .first
+                .as_ref()
+                .is_some_and(|(key, _)| (key.0, key.1.as_str()) == (doc.shard, doc.id.as_str()))
+            {
+                tally.first = None;
+            }
+        }
+    }
+
+    /// Find the first value again of each field that lost it, among the
+    /// documents that remain. That reads every document, but only when the
+    /// document holding a field's first value is changed or deleted.
+    fn refresh<'a>(&mut self, docs: impl Iterator<Item = &'a Arc<SearchDoc>>) {
+        let lost: Vec<String> = self
+            .fields
+            .iter()
+            .filter(|(_, tally)| tally.first.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if lost.is_empty() {
+            return;
+        }
+        for doc in docs {
+            for name in &lost {
+                let Some(value) = doc.fields.get(name) else {
+                    continue;
+                };
+                let Some(tally) = self.fields.get_mut(name) else {
+                    continue;
+                };
+                let earlier = tally
+                    .first
+                    .as_ref()
+                    .is_none_or(|(key, _)| (doc.shard, doc.id.as_str()) < (key.0, key.1.as_str()));
+                if earlier {
+                    tally.first = Some(((doc.shard, doc.id.clone()), value_kind(value)));
+                }
+            }
+        }
+    }
+
+    fn kinds(&self) -> BTreeMap<String, FieldKind> {
+        self.fields
+            .iter()
+            .filter_map(|(name, tally)| {
+                let (_, first) = tally.first.as_ref()?;
+                let kind = if *first == FieldKind::Text || (tally.numbers > 0 && tally.bools > 0) {
+                    FieldKind::Text
+                } else {
+                    *first
+                };
+                Some((name.clone(), kind))
+            })
+            .collect()
+    }
 }
 
 fn write_meta(path: &Path, meta: &SearchMeta) -> DbResult<()> {
@@ -314,8 +431,10 @@ async fn build_index(
         design: design_signature(spec),
         ddoc: ddoc.to_string(),
         name: index_name.to_string(),
-        docs: Vec::new(),
+        docs: HashMap::new(),
+        kinds: KindStats::default(),
     };
+    let placement = (db.q, db.partitioned);
     // QuickJS/Tantivy work is CPU- and IO-bound. Run it on the blocking pool so
     // a search rebuild cannot occupy a Tokio async worker for its full duration.
     let (result, gate) = tokio::task::spawn_blocking(move || {
@@ -324,7 +443,7 @@ async fn build_index(
         // permit is returned so a query can keep it for its whole lifetime.
         // The old index's files are about to be removed, so forget it first.
         *entry = None;
-        let result = build_index_files(path, docs, &source, meta, limits)
+        let result = build_index_files(path, docs, &source, meta, placement, limits)
             .and_then(|(index, meta)| Cached::open(index, meta))
             .map(|cached| {
                 let snapshot = cached.snapshot.clone();
@@ -344,6 +463,7 @@ fn build_index_files(
     docs: Vec<(String, String)>,
     source: &str,
     mut meta: SearchMeta,
+    placement: (u32, bool),
     limits: crate::view::ViewLimits,
 ) -> DbResult<(Index, SearchMeta)> {
     let indexed = run_index_json(source, &docs, limits).map_err(|reason| {
@@ -353,7 +473,14 @@ fn build_index_files(
             format!("index function failed: {reason}"),
         )
     })?;
-    let kinds = infer_kinds(indexed.iter().map(|doc| &doc.fields));
+    let indexed: Vec<Arc<SearchDoc>> = indexed
+        .into_iter()
+        .map(|doc| Arc::new(SearchDoc::new(doc.id, doc.fields, placement)))
+        .collect();
+    for doc in &indexed {
+        meta.kinds.add(doc);
+    }
+    let kinds = meta.kinds.kinds();
 
     if path.exists() {
         std::fs::remove_dir_all(&path)
@@ -397,10 +524,7 @@ fn build_index_files(
 
     meta.docs = indexed
         .into_iter()
-        .map(|doc| SearchDoc {
-            id: doc.id,
-            fields: doc.fields,
-        })
+        .map(|doc| (doc.id.clone(), doc))
         .collect();
     write_meta(&path, &meta)?;
     Ok((tantivy_index, meta))
@@ -521,6 +645,7 @@ async fn update_index(
             return Ok(Update::Rebuild(gate, entry));
         };
         let tantivy_index = snapshot.index;
+        // Free of copying unless a query still holds the previous snapshot.
         let mut meta = Arc::unwrap_or_clone(snapshot.meta);
         let indexed = run_index_json(&source, &live, limits).map_err(|reason| {
             ApiError::new(
@@ -529,21 +654,21 @@ async fn update_index(
                 format!("index function failed: {reason}"),
             )
         })?;
-        meta.docs.retain(|doc| !changed.contains(&doc.id));
-        meta.docs.extend(indexed.into_iter().map(|doc| SearchDoc {
-            id: doc.id,
-            fields: doc.fields,
-        }));
-        // A rebuild reads documents shard by shard in id order, and a field's
-        // type can depend on which value comes first, so infer in that order.
-        let (q, partitioned) = placement;
-        meta.docs.sort_by_cached_key(|doc| {
-            (
-                crate::db::shard_index_for(&doc.id, q, partitioned),
-                doc.id.clone(),
-            )
-        });
-        let kinds = infer_kinds(meta.docs.iter().map(|doc| &doc.fields));
+        for id in &changed {
+            if let Some(old) = meta.docs.remove(id) {
+                meta.kinds.remove(&old);
+            }
+        }
+        meta.kinds.refresh(meta.docs.values());
+        let mut added = Vec::with_capacity(indexed.len());
+        for doc in indexed {
+            let doc = Arc::new(SearchDoc::new(doc.id, doc.fields, placement));
+            // Each changed document appears once, and was removed above.
+            meta.docs.insert(doc.id.clone(), doc.clone());
+            meta.kinds.add(&doc);
+            added.push(doc);
+        }
+        let kinds = meta.kinds.kinds();
         let schema = tantivy_index.schema();
         let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
         let (mut id_field, mut fields_field) = (None, None);
@@ -581,7 +706,7 @@ async fn update_index(
         for id in &changed {
             writer.delete_term(Term::from_field_text(id_field, id));
         }
-        for doc in meta.docs.iter().filter(|doc| changed.contains(&doc.id)) {
+        for doc in &added {
             writer
                 .add_document(tantivy_doc(
                     &doc.id,
@@ -714,23 +839,14 @@ fn build_gate(db: &Db) -> Arc<RwLock<()>> {
 #[derive(Clone)]
 struct Snapshot {
     meta: Arc<SearchMeta>,
-    /// Each document's position in `meta.docs`.
-    positions: Arc<HashMap<String, usize>>,
     index: Index,
     searcher: Searcher,
 }
 
 impl Snapshot {
     fn new(meta: SearchMeta, index: Index, searcher: Searcher) -> Self {
-        let positions = meta
-            .docs
-            .iter()
-            .enumerate()
-            .map(|(position, doc)| (doc.id.clone(), position))
-            .collect();
         Snapshot {
             meta: Arc::new(meta),
-            positions: Arc::new(positions),
             index,
             searcher,
         }
@@ -758,7 +874,7 @@ impl Cached {
     }
 
     /// Open an index from disk, or `None` if it has to be rebuilt.
-    fn load(path: &Path) -> Option<Self> {
+    fn load(path: &Path, placement: (u32, bool)) -> Option<Self> {
         let mut meta = read_meta(path)?;
         let index = Index::open(UnsyncedDirectory::open(path).ok()?).ok()?;
         // Files a crash left incomplete fail their checksums. Every file of
@@ -791,10 +907,13 @@ impl Cached {
         for address in searcher.search(&AllQuery, &DocSetCollector).ok()? {
             let document: TantivyDocument = searcher.doc(address).ok()?;
             let fields = serde_json::from_str(&text(&document, fields_field)?).ok()?;
-            meta.docs.push(SearchDoc {
-                id: text(&document, id_field)?,
+            let doc = Arc::new(SearchDoc::new(
+                text(&document, id_field)?,
                 fields,
-            });
+                placement,
+            ));
+            meta.kinds.add(&doc);
+            meta.docs.insert(doc.id.clone(), doc);
         }
         Cached::open(index, meta).ok()
     }
@@ -838,7 +957,8 @@ async fn ensure_index(
     if entry.is_none() {
         // Opening reads every segment file and stored document.
         let load = path.clone();
-        *entry = tokio::task::spawn_blocking(move || Cached::load(&load))
+        let placement = (db.q, db.partitioned);
+        *entry = tokio::task::spawn_blocking(move || Cached::load(&load, placement))
             .await
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     }
@@ -1155,6 +1275,7 @@ pub async fn query(
     if request.timeout_ms == 0 || started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(timeout_error());
     }
+    let deadline = started + Duration::from_millis(request.timeout_ms);
     if request.partition.is_some() && request.limit > PAGE_LIMIT {
         return Err(ApiError::bad_request(
             "Limit is too large for a partitioned search.",
@@ -1165,28 +1286,30 @@ pub async fn query(
     // concurrent `_search_cleanup` cannot remove the index under an open
     // searcher.
     let gate = build_gate(db).read_owned().await;
-    let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
+    let (snapshot, gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(timeout_error());
     }
     let schema = snapshot.index.schema();
-    let id_field = schema
-        .get_field(ID_FIELD)
-        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let Some(query) = parse_query(&snapshot, &schema, request.query.trim())? else {
         return Ok(empty_search_response(request));
     };
-    let matched = collect_matches(db, &snapshot, request, id_field, &*query)?;
-
-    let total_rows = matched.len();
-    let offset = parse_bookmark(request.bookmark.as_deref());
-    let limit = if request.limit == 0 {
-        0
-    } else {
-        request.limit.min(PAGE_LIMIT)
-    };
-    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
+    // Scanning the hits is CPU-bound and can be long, so it runs on the
+    // blocking pool, which keeps the permit as a rebuild does.
+    let scan_request = request.clone();
+    let (scanned, _gate) = tokio::task::spawn_blocking(move || {
+        let scanned = scan(&snapshot, &scan_request, &*query, deadline);
+        (scanned, gate)
+    })
+    .await
+    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    let Scan {
+        total_rows,
+        offset,
+        page,
+        facets,
+    } = scanned?;
     let rows = page_rows(db, request, &page).await?;
     let next = offset.saturating_add(page.len());
     let mut response = json!({
@@ -1194,8 +1317,43 @@ pub async fn query(
         "bookmark": format!("search:{next}"),
         "rows": rows,
     });
-    add_facets(&mut response, request, &matched);
+    if let (Some(response), Value::Object(facets)) = (response.as_object_mut(), facets) {
+        response.extend(facets);
+    }
     Ok(response)
+}
+
+/// What a query found: the requested page of the matches, and the facets
+/// computed over all of them.
+struct Scan {
+    total_rows: usize,
+    offset: usize,
+    page: Vec<Arc<SearchDoc>>,
+    facets: Value,
+}
+
+fn scan(
+    snapshot: &Snapshot,
+    request: &SearchRequest,
+    query: &dyn tantivy::query::Query,
+    deadline: Instant,
+) -> DbResult<Scan> {
+    let matched = collect_matches(snapshot, request, query, deadline)?;
+    let offset = parse_bookmark(request.bookmark.as_deref());
+    let limit = if request.limit == 0 {
+        0
+    } else {
+        request.limit.min(PAGE_LIMIT)
+    };
+    let page = matched.iter().skip(offset).take(limit).cloned().collect();
+    let mut facets = json!({});
+    add_facets(&mut facets, request, &matched);
+    Ok(Scan {
+        total_rows: matched.len(),
+        offset,
+        page,
+        facets,
+    })
 }
 
 /// Parse the query text. `None` means a field the query names does not exist
@@ -1226,60 +1384,98 @@ fn parse_query(
     }
 }
 
-/// Run the query and keep the documents this request may see, sorted.
-fn collect_matches<'a>(
-    db: &Db,
-    snapshot: &'a Snapshot,
+/// Run the query and keep the documents this request may see, sorted. Each
+/// hit's id is read from the index's fast field, not from its stored fields,
+/// and the deadline is checked as the hits are read.
+fn collect_matches(
+    snapshot: &Snapshot,
     request: &SearchRequest,
-    id_field: Field,
     query: &dyn tantivy::query::Query,
-) -> DbResult<Vec<&'a SearchDoc>> {
-    let meta = &snapshot.meta;
+    deadline: Instant,
+) -> DbResult<Vec<Arc<SearchDoc>>> {
+    let index_error =
+        |error: tantivy::TantivyError| ApiError::new(500, "search_index_error", error.to_string());
     let searcher = &snapshot.searcher;
-    let addresses = searcher
-        .search(query, &DocSetCollector)
-        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-
-    let mut matched: Vec<&SearchDoc> = Vec::new();
-    for address in addresses {
-        let document: TantivyDocument = searcher
-            .doc(address)
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(searcher))
+        .map_err(index_error)?;
+    let partition = request
+        .partition
+        .as_ref()
+        .map(|partition| format!("{partition}:"));
+    let keep = |doc: &SearchDoc| {
+        partition
+            .as_ref()
+            .is_none_or(|partition| doc.id.starts_with(partition.as_str()))
+            && request
+                .owner_shards
+                .as_ref()
+                .is_none_or(|owner_shards| owner_shards.covers(doc.shard))
+            && matches_drilldown(doc, &request.drilldown)
+    };
+    let mut matched: Vec<Arc<SearchDoc>> = Vec::new();
+    for reader in searcher.segment_readers() {
+        let Some(ids) = reader.fast_fields().str(ID_FIELD).map_err(index_error)? else {
+            continue;
+        };
+        let alive = reader.alive_bitset();
+        // The hits' id ordinals first, which is cheap, so the ids themselves
+        // can be looked up together in one pass over the dictionary.
+        let mut ords: Vec<u64> = Vec::new();
+        let mut timed_out = false;
+        weight
+            .for_each_no_score(reader, &mut |docs| {
+                if timed_out || Instant::now() > deadline {
+                    timed_out = true;
+                    return;
+                }
+                for &doc in docs {
+                    if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                        continue;
+                    }
+                    ords.extend(ids.ords().first(doc));
+                }
+            })
+            .map_err(index_error)?;
+        ords.sort_unstable();
+        ords.dedup();
+        let mut looked_up = 0_usize;
+        ids.dictionary()
+            .sorted_ords_to_term_cb(&ords, |term| {
+                looked_up += 1;
+                if timed_out || (looked_up.is_multiple_of(1024) && Instant::now() > deadline) {
+                    timed_out = true;
+                    return;
+                }
+                let doc = std::str::from_utf8(term)
+                    .ok()
+                    .and_then(|id| snapshot.meta.docs.get(id));
+                if let Some(doc) = doc.filter(|doc| keep(doc)) {
+                    matched.push(Arc::clone(doc));
+                }
+            })
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-        let Some(value) = document.get_first(id_field) else {
-            continue;
-        };
-        let id = match owned_value_to_json(value.into()) {
-            Value::String(id) => id,
-            _ => continue,
-        };
-        let Some(doc) = snapshot.positions.get(&id).map(|&at| &meta.docs[at]) else {
-            continue;
-        };
-        if let Some(partition) = &request.partition {
-            if !doc.id.starts_with(&format!("{partition}:")) {
-                continue;
-            }
+        if timed_out {
+            return Err(timeout_error());
         }
-        if let Some(owner_shards) = &request.owner_shards {
-            if !owner_shards.covers(db.shard_index(&doc.id)) {
-                continue;
-            }
-        }
-        if !matches_drilldown(doc, &request.drilldown) {
-            continue;
-        }
-        matched.push(doc);
     }
     if request.sort.is_empty() {
         matched.sort_by(|a, b| a.id.cmp(&b.id));
     } else {
         matched.sort_by(|a, b| sort_compare(a, b, &request.sort));
     }
+    if Instant::now() > deadline {
+        return Err(timeout_error());
+    }
     Ok(matched)
 }
 
 /// Build the result rows for one page, with documents and highlights.
-async fn page_rows(db: &Db, request: &SearchRequest, page: &[&SearchDoc]) -> DbResult<Vec<Value>> {
+async fn page_rows(
+    db: &Db,
+    request: &SearchRequest,
+    page: &[Arc<SearchDoc>],
+) -> DbResult<Vec<Value>> {
     let docs = if request.include_docs {
         let ids: Vec<String> = page.iter().map(|doc| doc.id.clone()).collect();
         crate::view::docs_by_ids(db, false, &ids).await?
@@ -1330,7 +1526,7 @@ async fn page_rows(db: &Db, request: &SearchRequest, page: &[&SearchDoc]) -> DbR
 }
 
 /// Add `counts`, `ranges` and `groups`, computed over all matches.
-fn add_facets(response: &mut Value, request: &SearchRequest, matched: &[&SearchDoc]) {
+fn add_facets(response: &mut Value, request: &SearchRequest, matched: &[Arc<SearchDoc>]) {
     if !request.counts.is_empty() {
         let mut counts = Map::new();
         for field in &request.counts {
@@ -1594,6 +1790,238 @@ mod tests {
         let open = registry().count_under(&prefix);
         assert!(open <= 8, "{open} search indexes are open, cap is 8");
         drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A small deterministic generator, so a failing sequence can be replayed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// The kinds a rebuild infers: the documents' fields in (shard, id)
+    /// order, and a field's kind decided as each value is met.
+    fn folded_kinds(docs: &[Arc<SearchDoc>]) -> BTreeMap<String, FieldKind> {
+        let mut ordered: Vec<&Arc<SearchDoc>> = docs.iter().collect();
+        ordered.sort_by(|a, b| (a.shard, &a.id).cmp(&(b.shard, &b.id)));
+        let mut kinds: BTreeMap<String, FieldKind> = BTreeMap::new();
+        for doc in ordered {
+            for (name, value) in &doc.fields {
+                let kind = value_kind(value);
+                match kinds.get_mut(name) {
+                    None => {
+                        kinds.insert(name.clone(), kind);
+                    }
+                    Some(existing) => {
+                        if !matches!(
+                            (*existing, kind),
+                            (FieldKind::Text, _)
+                                | (_, FieldKind::Text)
+                                | (FieldKind::Number, FieldKind::Number)
+                                | (FieldKind::Bool, FieldKind::Bool)
+                        ) {
+                            *existing = FieldKind::Text;
+                        }
+                    }
+                }
+            }
+        }
+        kinds
+    }
+
+    fn random_fields(rng: &mut Lcg) -> Map<String, Value> {
+        let mut fields = Map::new();
+        for name in ["a", "b", "c"] {
+            match rng.below(6) {
+                0 => fields.insert(name.to_string(), json!(rng.below(100))),
+                1 => fields.insert(name.to_string(), json!(rng.below(2) == 0)),
+                2 => fields.insert(name.to_string(), json!(format!("w{}", rng.below(5)))),
+                _ => None,
+            };
+        }
+        fields
+    }
+
+    #[test]
+    fn kind_tallies_follow_documents_as_they_come_and_go() {
+        let placement = (3, false);
+        for seed in 0..200 {
+            let mut rng = Lcg(seed);
+            let mut docs: HashMap<String, Arc<SearchDoc>> = HashMap::new();
+            let mut stats = KindStats::default();
+            for _ in 0..60 {
+                let id = format!("d{}", rng.below(12));
+                if let Some(old) = docs.remove(&id) {
+                    stats.remove(&old);
+                }
+                stats.refresh(docs.values());
+                if rng.below(3) > 0 {
+                    let doc = Arc::new(SearchDoc::new(
+                        id.clone(),
+                        random_fields(&mut rng),
+                        placement,
+                    ));
+                    stats.add(&doc);
+                    docs.insert(id, doc);
+                }
+                let live: Vec<Arc<SearchDoc>> = docs.values().cloned().collect();
+                assert_eq!(stats.kinds(), folded_kinds(&live), "seed {seed}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn updated_indexes_match_a_rebuild_over_random_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-random-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchrandom",
+            crate::db::DbConfig {
+                q: 3,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(3),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let index = "function(doc){ for (const f of ['a', 'b', 'c']) { \
+                     if (doc[f] !== undefined) index(f, doc[f]); } }";
+        for ddoc in ["_design/a", "_design/b"] {
+            db.put_docs(
+                vec![json!({"_id": ddoc, "indexes": {"idx": {"index": index}}})],
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let limits = crate::view::ViewQuery::default().limits;
+        let mut revs: HashMap<String, String> = HashMap::new();
+        let mut rng = Lcg(7);
+        // A rebuild removes the marker; steps that keep it were incremental.
+        let marker = index_dir(&db, "_design/a", "idx").join("douchdb-test-marker");
+        let mut incremental = 0;
+        for step in 0..60 {
+            let mut batch: HashMap<String, Value> = HashMap::new();
+            for _ in 0..1 + rng.below(4) {
+                let id = format!("d{:02}", rng.below(25));
+                let mut doc = if rng.below(4) == 0 {
+                    json!({"_deleted": true})
+                } else {
+                    Value::Object(random_fields(&mut rng))
+                };
+                doc["_id"] = json!(id);
+                if let Some(rev) = revs.get(&id) {
+                    doc["_rev"] = json!(rev);
+                }
+                batch.insert(id, doc);
+            }
+            for result in db
+                .put_docs(batch.into_values().collect(), true)
+                .await
+                .unwrap()
+            {
+                if let Some(rev) = result["rev"].as_str() {
+                    revs.insert(result["id"].as_str().unwrap().to_string(), rev.to_string());
+                }
+            }
+            let rebuilt = index_dir(&db, "_design/b", "idx");
+            registry().remove(&rebuilt);
+            std::fs::remove_dir_all(rebuilt).ok();
+            if step > 0 {
+                std::fs::write(&marker, b"").unwrap();
+            }
+            if step % 5 == 4 {
+                registry().remove(&index_dir(&db, "_design/a", "idx"));
+            }
+            for q in ["*:*", "a:[10 TO 60]", "b:w1", "c:true", "a:w2 OR b:3"] {
+                for sort in [
+                    vec![],
+                    vec![("a".to_string(), true), ("b".to_string(), false)],
+                ] {
+                    let request = SearchRequest {
+                        query: q.to_string(),
+                        limit: 200,
+                        sort,
+                        counts: vec!["b".to_string()],
+                        ..SearchRequest::default()
+                    };
+                    let updated = query(&db, "_design/a", "idx", &request, limits).await;
+                    let rebuilt = query(&db, "_design/b", "idx", &request, limits).await;
+                    match (updated, rebuilt) {
+                        (Ok(updated), Ok(rebuilt)) => {
+                            assert_eq!(updated, rebuilt, "step {step} {q}")
+                        }
+                        (Err(updated), Err(rebuilt)) => {
+                            assert_eq!(updated.reason, rebuilt.reason, "step {step} {q}")
+                        }
+                        (updated, rebuilt) => {
+                            panic!("step {step} {q}: {updated:?} against {rebuilt:?}")
+                        }
+                    }
+                }
+            }
+            incremental += usize::from(marker.exists());
+        }
+        assert!(
+            incremental >= 20,
+            "only {incremental} steps were incremental"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A deadline that has passed stops the scan of the first hits, so the
+    /// query fails without having read the rest.
+    #[tokio::test]
+    async fn a_passed_deadline_fails_a_scan_in_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-passed-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchpassed",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut docs = vec![json!({"_id": "_design/a", "indexes": {"idx": {
+            "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}})];
+        docs.extend((0..50).map(|i| json!({"_id": format!("d{i:02}"), "name": "apple"})));
+        db.put_docs(docs, true).await.unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest::default();
+        query(&db, "_design/a", "idx", &request, limits)
+            .await
+            .unwrap();
+        let spec = load_spec(&db, "_design/a", "idx").await.unwrap();
+        let gate = build_gate(&db).read_owned().await;
+        let (snapshot, _gate) = ensure_index(&db, "_design/a", "idx", &spec, limits, gate)
+            .await
+            .unwrap();
+        let passed = Instant::now() - Duration::from_secs(1);
+        let error = collect_matches(&snapshot, &request, &AllQuery, passed)
+            .map(|matched| matched.len())
+            .expect_err("the deadline passed before the scan began");
+        assert_eq!(error.error, "timeout");
+        let open = Instant::now() + Duration::from_secs(60);
+        let matched = collect_matches(&snapshot, &request, &AllQuery, open).unwrap();
+        assert_eq!(matched.len(), 50);
         let _ = std::fs::remove_dir_all(root);
     }
 
