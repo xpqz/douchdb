@@ -126,7 +126,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
         let stream = async_stream::stream! {
             let started = std::time::Instant::now();
             let mut sent = 0usize;
-            let mut last_heartbeat = std::time::Instant::now();
+            let mut heartbeat = Heartbeat::new(heartbeat);
             // Where the feed stopped, for the closing line CouchDB sends when
             // a continuous feed times out or reaches its limit.
             let mut trailer: Option<(Value, u64)> = None;
@@ -154,11 +154,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                             last_sent = row.get("seq").cloned();
                             sent_here += 1;
                             let json = serde_json::to_vec(&row).unwrap_or_default();
-                            let line = if eventsource {
-                                [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
-                            } else {
-                                [json.as_slice(), b"\n"].concat()
-                            };
+                            let line = feed_line(&json, eventsource);
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                             sent += 1;
                         }
@@ -182,11 +178,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                             "reason": error.reason,
                         }))
                         .unwrap_or_default();
-                        let line = if eventsource {
-                            [b"data: ".as_slice(), json.as_slice(), b"\n\n"].concat()
-                        } else {
-                            [json.as_slice(), b"\n"].concat()
-                        };
+                        let line = feed_line(&json, eventsource);
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                         break;
                     }
@@ -194,15 +186,12 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                 if started.elapsed().as_millis() as u64 >= deadline {
                     break;
                 }
-                if let Some(heartbeat) = heartbeat {
-                    if last_heartbeat.elapsed() >= heartbeat {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
-                            b": heartbeat\n\n"
-                        } else {
-                            b"\n"
-                        }));
-                        last_heartbeat = std::time::Instant::now();
-                    }
+                if heartbeat.due() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
+                        b": heartbeat\n\n"
+                    } else {
+                        b"\n"
+                    }));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -217,30 +206,25 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
             }
         };
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                if eventsource {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return feed_response(
+            if eventsource {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            stream,
+        );
     }
 
     if feed == "longpoll" {
-        if let Some(heartbeat) = heartbeat {
+        if heartbeat.is_some() {
+            let mut heartbeat = Heartbeat::new(heartbeat);
             let dbname = dbname.to_string();
             let query = q.clone();
             let body = Bytes::copy_from_slice(body);
             let headers = headers.clone();
             let stream = async_stream::stream! {
                 let started = std::time::Instant::now();
-                let mut last_heartbeat = std::time::Instant::now();
                 loop {
                     if !still_allowed(&st, &db, &headers) {
                         break;
@@ -271,19 +255,13 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                             break;
                         }
                     }
-                    if last_heartbeat.elapsed() >= heartbeat {
+                    if heartbeat.due() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
-                        last_heartbeat = std::time::Instant::now();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             };
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from_stream(stream))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return feed_response("application/json", stream);
         }
         let started = std::time::Instant::now();
         loop {
@@ -323,6 +301,15 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
     match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
         Ok(v) => json(StatusCode::OK, v),
         Err(e) => fail(e),
+    }
+}
+
+/// One feed entry: an SSE `data:` event for `eventsource`, else a JSON line.
+fn feed_line(json: &[u8], eventsource: bool) -> Vec<u8> {
+    if eventsource {
+        [b"data: ".as_slice(), json, b"\n\n"].concat()
+    } else {
+        [json, b"\n"].concat()
     }
 }
 

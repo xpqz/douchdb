@@ -58,6 +58,43 @@ pub(crate) fn fail(e: ApiError) -> Response {
     )
 }
 
+/// A streaming 200 response for a feed: not cached, one chunk per stream item.
+pub(crate) fn feed_response(
+    content_type: &'static str,
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Paces the keep-alive lines of a feed: `due` is true once per interval, and
+/// never when the client asked for no heartbeat.
+pub(crate) struct Heartbeat {
+    every: Option<std::time::Duration>,
+    last: std::time::Instant,
+}
+
+impl Heartbeat {
+    pub(crate) fn new(every: Option<std::time::Duration>) -> Self {
+        Self {
+            every,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn due(&mut self) -> bool {
+        let due = self.every.is_some_and(|every| self.last.elapsed() >= every);
+        if due {
+            self.last = std::time::Instant::now();
+        }
+        due
+    }
+}
+
 fn ok() -> Response {
     json(StatusCode::OK, json!({"ok": true}))
 }

@@ -93,26 +93,11 @@ impl RouteStat {
         self.errors += u64::from(error);
         self.total_ms += duration_ms;
         self.max_ms = self.max_ms.max(duration_ms);
-        let bucket = LATENCY_BOUNDS
-            .iter()
-            .position(|bound| duration_ms <= *bound)
-            .unwrap_or(LATENCY_BOUNDS.len() - 1);
-        self.buckets[bucket] += 1;
+        self.buckets[bucket_of(duration_ms)] += 1;
     }
 
     fn percentile(&self, pct: f64) -> f64 {
-        if self.requests == 0 {
-            return 0.0;
-        }
-        let target = (self.requests as f64 * pct / 100.0).ceil() as u64;
-        let mut seen = 0u64;
-        for (index, count) in self.buckets.iter().enumerate() {
-            seen += count;
-            if seen >= target {
-                return LATENCY_BOUNDS[index];
-            }
-        }
-        self.max_ms
+        percentile(&self.buckets, self.requests, pct, self.max_ms)
     }
 
     fn json(&self, route: &str) -> Value {
@@ -255,7 +240,7 @@ fn bucket_of(duration_ms: f64) -> usize {
 /// Percentile from cumulative buckets. Returns the bucket's upper bound, so a
 /// p95 of 12 ms is reported as 25 ms; fine for dashboards and consistent across
 /// a merged cluster.
-fn percentile(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64 {
+pub(crate) fn percentile(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64 {
     if requests == 0 {
         return 0.0;
     }

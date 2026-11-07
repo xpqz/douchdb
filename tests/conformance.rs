@@ -10395,6 +10395,37 @@ async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
 }
 
 #[tokio::test]
+async fn search_hits_keep_the_original_id_when_index_changes_doc_id() {
+    // Same rule as for views: the hit id comes from the stored document, and
+    // every sandbox must agree.
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsidxid{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/p1"), json!({"v": "one"})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/s"),
+                json!({"indexes": {"changed": {
+                    "index": "function(doc){ doc._id = 'other'; index('v', doc.v); }"
+                }}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = s
+            .get(&format!("/{db}/_design/s/_search/changed?q=v:one"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["rows"][0]["id"], "p1", "{mode}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn pooled_process_worker_keeps_no_js_state_between_databases() {
     // One worker serves both databases. CouchDB keeps JS processes alive
     // between requests and tags them per database (couch_proc_manager); here
@@ -11651,6 +11682,70 @@ async fn users_file_authenticates_tokens_sessions_and_roles() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn server_admin_endpoints_reject_anonymous_and_non_admin_callers() {
+    let users = UsersFile::new(USERS);
+    let s = Server::start_with(&users_server_args(&users), true);
+    let (status, _) = s
+        .req_with(Method::PUT, "/alpha", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let endpoints = [
+        (Method::GET, "/_db_updates"),
+        (Method::GET, "/_dbs_info"),
+        (Method::POST, "/_dbs_info"),
+        (Method::GET, "/_membership"),
+        (Method::GET, "/_node/_local/_dbs"),
+        (Method::GET, "/_node/_local/_cluster"),
+        (Method::GET, "/_node/_local/_metrics"),
+        (Method::GET, "/_node/_local/_health"),
+        (Method::POST, "/_node/_local/_cluster/discover"),
+        (Method::GET, "/_node/_local/_replication"),
+        (Method::POST, "/_node/_local/_replication/run"),
+        (Method::POST, "/_node/_local/_replication/pause"),
+        (Method::POST, "/_node/_local/_replication/resume"),
+        (Method::GET, "/_node/_local/_dbs/alpha"),
+        (Method::PUT, "/_node/_local/_dbs/alpha"),
+        (Method::GET, "/_node/_local/_dbs/alpha/shards"),
+        (Method::POST, "/_node/_local/_dbs/alpha/rebalance"),
+        (Method::POST, "/_node/_local/_dbs/alpha/cleanup"),
+    ];
+    for (method, path) in endpoints {
+        let body = || Some(json!({}));
+        let (status, anonymous) = s.req_with(method.clone(), path, body(), &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: {anonymous}"
+        );
+        assert_eq!(anonymous["error"], "unauthorized", "{method} {path}");
+        let (status, denied) = s
+            .req_with(method.clone(), path, body(), &bearer("alice-token"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {denied}");
+        assert_eq!(
+            denied,
+            json!({"error": "forbidden", "reason": "You are not authorized to access this db."}),
+            "{method} {path}"
+        );
+        // Only read-only endpoints are called as an admin: the others start
+        // rebalances and replication passes.
+        if method != Method::GET {
+            continue;
+        }
+        let (status, allowed) = s
+            .req_with(method.clone(), path, None, &bearer("root-token"))
+            .await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}: {allowed}"
+        );
+        assert_ne!(status, StatusCode::FORBIDDEN, "{method} {path}: {allowed}");
+    }
 }
 
 #[tokio::test]

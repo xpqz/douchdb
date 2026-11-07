@@ -3,7 +3,7 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use super::{access_denied, flag, internal_request, query, AppState};
+use super::{flag, internal_request, query, AdminOnly, AppState};
 use crate::db::Db;
 use crate::state::FsHealth;
 use axum::extract::State;
@@ -475,24 +475,6 @@ fn u64_map_json(map: BTreeMap<String, u64>) -> Value {
     )
 }
 
-fn percentile_from(buckets: &[u64], requests: u64, pct: f64, max_ms: f64) -> f64 {
-    if requests == 0 {
-        return 0.0;
-    }
-    let target = (requests as f64 * pct / 100.0).ceil() as u64;
-    let mut seen = 0u64;
-    for (index, count) in buckets.iter().enumerate() {
-        seen += count;
-        if seen >= target {
-            return crate::metrics::LATENCY_BOUNDS
-                .get(index)
-                .copied()
-                .unwrap_or(max_ms);
-        }
-    }
-    max_ms
-}
-
 /// Request counters summed across nodes; latency buckets are merged before
 /// the percentiles are recomputed.
 fn aggregate_http(snapshots: &[Value]) -> Value {
@@ -568,9 +550,9 @@ fn aggregate_http(snapshots: &[Value]) -> Value {
                 "error_rate_pct": if stat.requests == 0 { 0.0 } else { stat.errors as f64 / stat.requests as f64 * 100.0 },
                 "total_ms": stat.total_ms,
                 "avg_ms": if stat.requests == 0 { 0.0 } else { stat.total_ms / stat.requests as f64 },
-                "p50_ms": percentile_from(&stat.buckets, stat.requests, 50.0, stat.max_ms),
-                "p95_ms": percentile_from(&stat.buckets, stat.requests, 95.0, stat.max_ms),
-                "p99_ms": percentile_from(&stat.buckets, stat.requests, 99.0, stat.max_ms),
+                "p50_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 50.0, stat.max_ms),
+                "p95_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 95.0, stat.max_ms),
+                "p99_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 99.0, stat.max_ms),
                 "max_ms": stat.max_ms,
                 "latency_buckets": stat.buckets,
             })
@@ -600,9 +582,9 @@ fn aggregate_http(snapshots: &[Value]) -> Value {
         "methods": u64_map_json(methods),
         "latency_ms": {
             "avg": if http_total == 0 { 0.0 } else { total_ms / http_total as f64 },
-            "p50": percentile_from(&buckets, http_total, 50.0, max_ms),
-            "p95": percentile_from(&buckets, http_total, 95.0, max_ms),
-            "p99": percentile_from(&buckets, http_total, 99.0, max_ms),
+            "p50": crate::metrics::percentile(&buckets, http_total, 50.0, max_ms),
+            "p95": crate::metrics::percentile(&buckets, http_total, 95.0, max_ms),
+            "p99": crate::metrics::percentile(&buckets, http_total, 99.0, max_ms),
             "max": max_ms,
         },
         "latency_buckets": {
@@ -894,11 +876,8 @@ pub async fn metrics_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let q = query(&uri);
     let local = local_metrics(&st).await;
     let cluster_requested = flag(&q, "cluster")
@@ -1037,11 +1016,8 @@ pub async fn health_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let local = local_health(&st, true).await;
     let q = query(&uri);
     let cluster_requested = flag(&q, "cluster")

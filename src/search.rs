@@ -147,6 +147,8 @@ pub async fn load_spec(db: &Db, ddoc_id: &str, index_name: &str) -> DbResult<Sea
     Ok(SearchSpec { source, analyzer })
 }
 
+const INDEX_WRAPPER: &str = include_str!("../wasm/js/index.js");
+
 fn engine(limits: crate::view::ViewLimits) -> Result<rquickjs::Runtime, String> {
     crate::js::runtime(limits.timeout, limits.memory)
 }
@@ -177,32 +179,7 @@ pub(crate) fn run_index_json(
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     crate::js::guard("index function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              var __out = [];
-              function log(message) {{ }}
-              var index = function (name, value, options) {{
-                if (value === undefined || value === null) return;
-                __out.push([String(name), value]);
-              }};
-              var __index = ({source});
-              if (typeof __index !== "function") {{
-                throw new Error("index must be a function");
-              }}
-              return function (json) {{
-                var docs = JSON.parse(json);
-                var all = [];
-                for (var i = 0; i < docs.length; i++) {{
-                  __out = [];
-                  __index(docs[i]);
-                  all.push([docs[i]._id, __out]);
-                }}
-                return JSON.stringify(all);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = INDEX_WRAPPER.replace(crate::view::WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
@@ -221,14 +198,27 @@ pub(crate) fn run_index_json(
                     .call((batch,))
                     .map_err(|error| format!("{}: {error}", chunk[0].0))?;
                 crate::js::check_output("index function", &output)?;
-                let emitted: Vec<(String, Vec<(String, Value)>)> =
+                let emitted: Vec<Vec<(String, Value)>> =
                     serde_json::from_str(&output).map_err(|error| error.to_string())?;
-                for (id, fields) in emitted {
+                if emitted.len() != chunk.len() {
+                    return Err(format!(
+                        "{}: index returned {} results for {} documents",
+                        chunk[0].0,
+                        emitted.len(),
+                        chunk.len()
+                    ));
+                }
+                // The id comes from the stored document, not from the object
+                // the index function was handed.
+                for ((id, _), fields) in chunk.iter().zip(emitted) {
                     let mut map = Map::new();
                     for (name, value) in fields {
                         map.insert(name, value);
                     }
-                    out.push(IndexedDoc { id, fields: map });
+                    out.push(IndexedDoc {
+                        id: id.clone(),
+                        fields: map,
+                    });
                 }
             }
             Ok(out)
