@@ -219,6 +219,7 @@ fn build_state(
             heavy_in_flight: args.heavy_in_flight,
             heavy_per_user: args.heavy_per_user,
             background_in_flight: args.background_in_flight,
+            ..Default::default()
         })),
         ctx: ClusterCtx {
             cluster: Cluster {
