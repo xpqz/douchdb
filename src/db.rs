@@ -1838,16 +1838,20 @@ impl Db {
             loop {
                 let mut best: Option<usize> = None;
                 for slot in 0..selected.len() {
-                    if buffers[slot].is_empty() && !done[slot] {
+                    while buffers[slot].is_empty() && !done[slot] {
                         let index = selected[slot];
                         let mut shard_opts = opts.clone();
                         shard_opts.since = cursors[slot];
                         shard_opts.descending = false;
                         // A shard never needs more rows than the request can
-                        // still return; a filter may discard rows, so it keeps
-                        // full pages.
+                        // still return. A filter may discard rows, so it reads
+                        // at least a small page and refills until a row
+                        // survives or the shard is exhausted.
                         let wanted = match (opts.limit, &opts.filter) {
                             (Some(limit), None) => limit.saturating_sub(emitted).max(1),
+                            (Some(limit), Some(_)) => {
+                                limit.saturating_sub(emitted).clamp(64, PAGE)
+                            }
                             _ => PAGE,
                         };
                         let requested = PAGE.min(wanted);

@@ -1316,8 +1316,8 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
     // internal pages before the limit is met.
     let s = Server::start(false);
     s.fresh_db("chsparse").await;
-    let mut docs: Vec<Value> = (0..3000)
-        .map(|i| json!({"_id": format!("d{i:05}"), "hit": i % 700 == 699}))
+    let mut docs: Vec<Value> = (0..6000)
+        .map(|i| json!({"_id": format!("d{i:05}"), "hit": i % 1500 == 1499}))
         .collect();
     docs.push(json!({"_id": "_design/f",
         "filters": {"hit": "function (doc) { return doc.hit === true; }"}}));
@@ -1335,7 +1335,7 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
                 .as_str()
                 .map(|id| {
                     id.starts_with('d')
-                        && id[1..].parse::<u32>().map(|i| i % 700 == 699) == Ok(true)
+                        && id[1..].parse::<u32>().map(|i| i % 1500 == 1499) == Ok(true)
                 })
                 .unwrap_or(false)
         })
