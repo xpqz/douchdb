@@ -2369,6 +2369,87 @@ mod tests {
         assert!(out.iter().all(|result| result.get("ok").is_some()));
     }
 
+    /// A peer that accepts a write and never answers must not accumulate
+    /// detached tasks without limit: the writes past the bound wait for a
+    /// slot instead of piling up behind the stuck peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detached_replica_writes_are_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hung = Arc::new(AtomicUsize::new(0));
+        // A deep backlog, so the listener does not cap what the writer opens.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1024).unwrap();
+        let peer = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = hung.clone();
+        let stuck = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!("douchdb-detached-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 4);
+        Arc::get_mut(&mut st).expect("sole owner").ctx.cluster = crate::cluster::Cluster {
+            nodes: vec!["http://127.0.0.1:1".to_string(), peer],
+            me: 0,
+            n: 2,
+            secret: "test-secret".to_string(),
+        };
+        let db = st
+            .create_db("bounded", false, Some(1), Some(2))
+            .await
+            .unwrap();
+
+        let writes: Vec<_> = (0..400)
+            .map(|i| {
+                let st = st.clone();
+                let db = db.clone();
+                tokio::spawn(async move {
+                    commit_docs(
+                        &st,
+                        &db,
+                        "bounded",
+                        vec![json!({"_id": format!("d{i}")})],
+                        true,
+                        1,
+                        &HeaderMap::new(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        // Wait until the count stops moving: local commits are paced by the
+        // disk, so the peer sees the writes over several seconds.
+        let mut in_flight = 0;
+        let mut stable = 0;
+        while stable < 15 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let now = hung.load(Ordering::SeqCst);
+            stable = if now > 0 && now == in_flight {
+                stable + 1
+            } else {
+                0
+            };
+            in_flight = now;
+        }
+        for write in &writes {
+            write.abort();
+        }
+        stuck.abort();
+        drop(writes);
+        drop(db);
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            in_flight < 200,
+            "{in_flight} replica writes are in flight to a peer that never answers"
+        );
+    }
+
     #[test]
     fn peer_map_with_foreign_node_count_is_not_adoptable() {
         let mut foreign = crate::cluster::ShardMap::balanced(4, 4, 1);

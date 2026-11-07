@@ -13670,6 +13670,35 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
     assert_eq!(body["total_rows"], 9);
 }
 
+/// Rebalance targets the placement database creation uses, so a cluster that
+/// has not changed has nothing to move.
+#[tokio::test]
+async fn rebalance_on_an_unchanged_cluster_moves_nothing() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("steady").await;
+    }
+    let (status, before) = nodes[0].get("/_node/_local/_dbs/steady").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/steady/rebalance?timeout_ms=20000&cleanup=true",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replicas"], before["replicas"], "{body}");
+    assert_eq!(body["version"], before["version"], "{body}");
+    let cleared: usize = body["cleaned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|response| response["cleared"].as_array().map_or(0, Vec::len))
+        .sum();
+    assert_eq!(cleared, 0, "a no-op rebalance cleared shards: {body}");
+}
+
 #[tokio::test]
 async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
     let nodes = start_cluster_with(3, "1", 1);
