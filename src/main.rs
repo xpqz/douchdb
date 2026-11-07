@@ -6,8 +6,21 @@ fn main() -> anyhow::Result<()> {
     if args.worker {
         douchdb::run_worker();
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(douchdb::run(args))
+        .build()?;
+    let result = runtime.block_on(douchdb::run(args));
+    // Dropping the runtime would wait for blocking tasks without limit; a
+    // shutdown must never hang.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    match result {
+        Err(error) => match error.downcast_ref::<douchdb::ConfigError>() {
+            Some(config) => {
+                eprintln!("{config}");
+                std::process::exit(2);
+            }
+            None => Err(error),
+        },
+        Ok(()) => Ok(()),
+    }
 }

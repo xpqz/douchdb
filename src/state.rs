@@ -106,6 +106,9 @@ pub struct AppState {
     pub compaction: Arc<tokio::sync::Semaphore>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,
+    /// Cancelled when the server starts shutting down. Streaming feeds end
+    /// (with their trailer) and background tasks stop.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone)]
@@ -413,6 +416,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         dbs: Default::default(),
         db_locks: Default::default(),
         fs_health: Default::default(),
+        shutdown: Default::default(),
         config: Config {
             q: 1,
             revs_limit: 1000,

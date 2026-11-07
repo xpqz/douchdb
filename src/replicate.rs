@@ -407,16 +407,23 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
 
 /// Pull from every peer on a timer. This is the non-client-induced replication
 /// path: a node catches up from its peers even when no client reads or writes.
-pub fn spawn_anti_entropy(state: Arc<AppState>) {
+pub fn spawn_anti_entropy(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let shutdown = state.shutdown.clone();
         let interval = Duration::from_secs(state.config.sync_secs.max(1));
-        loop {
-            if !state.cluster_state.replication_paused() {
-                sync_once(state.clone(), None).await;
+        let run = async {
+            loop {
+                if !state.cluster_state.replication_paused() {
+                    sync_once(state.clone(), None).await;
+                }
+                tokio::time::sleep(interval).await;
             }
-            tokio::time::sleep(interval).await;
+        };
+        tokio::select! {
+            () = run => {}
+            () = shutdown.cancelled() => {}
         }
-    });
+    })
 }
 
 #[cfg(test)]

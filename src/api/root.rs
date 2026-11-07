@@ -158,13 +158,16 @@ pub async fn db_updates(
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                     sent += 1;
                 }
-                if started.elapsed().as_millis() as u64 >= timeout {
+                if started.elapsed().as_millis() as u64 >= timeout || st.shutdown.is_cancelled() {
                     break;
                 }
                 if heartbeat.due() {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = st.shutdown.cancelled() => {}
+                }
             }
         };
         return feed_response("application/json", stream);
@@ -173,7 +176,10 @@ pub async fn db_updates(
     let started = std::time::Instant::now();
     loop {
         let (events, current) = st.db_updates.since(since);
-        if !events.is_empty() || feed == "normal" || started.elapsed().as_millis() as u64 >= timeout
+        if !events.is_empty()
+            || feed == "normal"
+            || started.elapsed().as_millis() as u64 >= timeout
+            || st.shutdown.is_cancelled()
         {
             let selected: Vec<Value> = events
                 .into_iter()
@@ -189,7 +195,10 @@ pub async fn db_updates(
                 json!({"results": selected, "last_seq": last_seq}),
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = st.shutdown.cancelled() => {}
+        }
     }
 }
 
