@@ -279,14 +279,15 @@ pub async fn db_root(
     }
 }
 
-async fn partition_info(
-    st: &AppState,
-    db: &Db,
-    name: &str,
-    partition: &str,
-    method: &Method,
-    headers: &HeaderMap,
-) -> Response {
+async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name,
+        method,
+        headers,
+        ..
+    } = req;
     if *method != Method::GET && *method != Method::HEAD {
         return fail(ApiError::new(
             405,
@@ -334,6 +335,60 @@ async fn partition_info(
             }),
         ),
         Err(error) => fail(error),
+    }
+}
+
+/// `/{db}/_partition/{partition}[/_endpoint...]`; `tail` is everything after
+/// `_partition/`.
+async fn partition_request(req: DbRequest<'_>, tail: &str) -> Response {
+    let (partition, suffix) = match tail.find("/_") {
+        Some(index) => (&tail[..index], &tail[index + 1..]),
+        None => (tail, ""),
+    };
+    if !req.db.partitioned {
+        return fail(ApiError::bad_request("database is not partitioned"));
+    }
+    if let Err(error) = crate::db::validate_partition(partition) {
+        return fail(error);
+    }
+    if let Some(requested) = req.q.get("partition") {
+        if requested != partition {
+            return fail(ApiError::bad_request(
+                "Conflicting value for `partition` in query string",
+            ));
+        }
+    }
+    match suffix {
+        "" => partition_info(req, partition).await,
+        "_all_docs" => all_docs(req, Some(partition.to_string())).await,
+        _ => match search_path(suffix) {
+            Some((ddoc, index, info)) => {
+                search_request(
+                    req,
+                    IndexRef {
+                        ddoc: &ddoc,
+                        name: &index,
+                    },
+                    Some(partition.to_string()),
+                    info,
+                )
+                .await
+            }
+            None => match view_path(suffix) {
+                Some((ddoc, view)) => {
+                    view_request(
+                        req,
+                        IndexRef {
+                            ddoc: &ddoc,
+                            name: &view,
+                        },
+                        Some(partition.to_string()),
+                    )
+                    .await
+                }
+                None => fail(ApiError::not_found("missing partition endpoint")),
+            },
+        },
     }
 }
 
@@ -444,55 +499,7 @@ pub async fn db_rest(
     }
 
     if let Some(tail) = rest.strip_prefix("_partition/") {
-        let (partition, suffix) = match tail.find("/_") {
-            Some(index) => (&tail[..index], &tail[index + 1..]),
-            None => (tail, ""),
-        };
-        if !db.partitioned {
-            return fail(ApiError::bad_request("database is not partitioned"));
-        }
-        if let Err(error) = crate::db::validate_partition(partition) {
-            return fail(error);
-        }
-        if let Some(requested) = q.get("partition") {
-            if requested != partition {
-                return fail(ApiError::bad_request(
-                    "Conflicting value for `partition` in query string",
-                ));
-            }
-        }
-        return match suffix {
-            "" => partition_info(&st, &db, &name, partition, &method, &headers).await,
-            "_all_docs" => all_docs(req, Some(partition.to_string())).await,
-            _ => match search_path(suffix) {
-                Some((ddoc, index, info)) => {
-                    search_request(
-                        req,
-                        IndexRef {
-                            ddoc: &ddoc,
-                            name: &index,
-                        },
-                        Some(partition.to_string()),
-                        info,
-                    )
-                    .await
-                }
-                None => match view_path(suffix) {
-                    Some((ddoc, view)) => {
-                        view_request(
-                            req,
-                            IndexRef {
-                                ddoc: &ddoc,
-                                name: &view,
-                            },
-                            Some(partition.to_string()),
-                        )
-                        .await
-                    }
-                    None => fail(ApiError::not_found("missing partition endpoint")),
-                },
-            },
-        };
+        return partition_request(req, tail).await;
     }
 
     if let Some((ddoc, view)) = view_path(&rest) {
