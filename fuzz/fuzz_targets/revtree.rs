@@ -4,6 +4,9 @@ use libfuzzer_sys::fuzz_target;
 
 #[path = "../../src/etf.rs"]
 mod etf;
+// etf.rs uses crate::json::is_integer.
+#[path = "../../src/json.rs"]
+mod json;
 #[path = "../../src/rev.rs"]
 mod rev;
 #[path = "../../src/revtree.rs"]
