@@ -880,111 +880,59 @@ impl Shard {
                 }
                 None => seek_last(&mut iter, prefix)?,
             }
-
-            let mut overlay = overlay.into_iter().rev().peekable();
-            loop {
-                let disk = if iter.valid() {
-                    iter.current()
-                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
-                } else {
-                    None
-                };
-                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
-                let take_disk = match (&disk, overlay.peek()) {
-                    (Some((disk_key, _)), Some((overlay_key, _))) => {
-                        disk_key.as_slice() >= overlay_key.as_slice()
-                    }
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
-                };
-                if take_disk {
-                    let (key, value) = disk.expect("disk item");
-                    iter.prev();
-                    if let Some((overlay_key, _)) = overlay.peek() {
-                        if overlay_key.as_slice() == key.as_slice() {
-                            let (_, overlay_value) = overlay.next().unwrap();
-                            if let Some(value) = overlay_value {
-                                if !visit(&key, &value) {
-                                    return Ok(());
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    if !visit(&key, &value) {
-                        return Ok(());
-                    }
-                } else {
-                    let (key, value) = overlay.next().unwrap();
-                    if let Some(value) = value {
-                        if !visit(&key, &value) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            for (key, value) in overlay {
-                if let Some(value) = value {
-                    if !visit(&key, &value) {
-                        break;
-                    }
-                }
-            }
         } else {
             match start {
                 Some(lower) => iter.seek(lower),
                 None => iter.seek(prefix),
             }
+        }
 
-            let mut overlay = overlay.into_iter().peekable();
-            loop {
-                let disk = if iter.valid() {
-                    iter.current()
-                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
-                } else {
-                    None
-                };
-                let disk = disk.filter(|(key, _)| key.starts_with(prefix));
-                let take_disk = match (&disk, overlay.peek()) {
-                    (Some((disk_key, _)), Some((overlay_key, _))) => {
-                        disk_key.as_slice() <= overlay_key.as_slice()
-                    }
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => break,
-                };
-                if take_disk {
-                    let (key, value) = disk.expect("disk item");
-                    iter.advance();
-                    if let Some((overlay_key, _)) = overlay.peek() {
-                        if overlay_key.as_slice() == key.as_slice() {
-                            let (_, overlay_value) = overlay.next().unwrap();
-                            if let Some(value) = overlay_value {
-                                if !visit(&key, &value) {
-                                    return Ok(());
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    if !visit(&key, &value) {
-                        return Ok(());
-                    }
-                } else {
-                    let (key, value) = overlay.next().unwrap();
-                    if let Some(value) = value {
-                        if !visit(&key, &value) {
-                            return Ok(());
-                        }
-                    }
+        // Merge the disk and overlay streams in scan order. An overlay entry
+        // shadows a disk entry with the same key, and a `None` value deletes it.
+        let mut overlay: Vec<_> = overlay.into_iter().collect();
+        if reverse {
+            overlay.reverse();
+        }
+        let mut overlay = overlay.into_iter().peekable();
+        loop {
+            let disk = if iter.valid() {
+                iter.current()
+                    .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            } else {
+                None
+            };
+            let disk = disk.filter(|(key, _)| key.starts_with(prefix));
+            let take_disk = match (&disk, overlay.peek()) {
+                (Some((disk_key, _)), Some((overlay_key, _))) if reverse => {
+                    disk_key.as_slice() >= overlay_key.as_slice()
                 }
-            }
-            for (key, value) in overlay {
-                if let Some(value) = value {
-                    if !visit(&key, &value) {
-                        break;
-                    }
+                (Some((disk_key, _)), Some((overlay_key, _))) => {
+                    disk_key.as_slice() <= overlay_key.as_slice()
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let next = if take_disk {
+                let Some((key, value)) = disk else { break };
+                if reverse {
+                    iter.prev();
+                } else {
+                    iter.advance();
+                }
+                match overlay.next_if(|(overlay_key, _)| *overlay_key == key) {
+                    Some((_, overlay_value)) => (key, overlay_value),
+                    None => (key, Some(value)),
+                }
+            } else {
+                match overlay.next() {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            };
+            if let (key, Some(value)) = next {
+                if !visit(&key, &value) {
+                    return Ok(());
                 }
             }
         }
