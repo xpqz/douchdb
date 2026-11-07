@@ -271,7 +271,8 @@ fn normalize_number(number: Number) -> Number {
     number.as_f64().and_then(Number::from_f64).unwrap_or(number)
 }
 
-fn is_integer(raw: &str) -> bool {
+/// Whether a JSON number literal has neither a fraction nor an exponent.
+pub(crate) fn is_integer(raw: &str) -> bool {
     !raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'))
 }
 
