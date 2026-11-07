@@ -12074,12 +12074,7 @@ async fn streaming_feed_holds_its_admission_permit_until_the_client_disconnects(
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = s
-        .req_with(
-            Method::PUT,
-            "/feedlimit/d1",
-            Some(json!({})),
-            &admin_auth(),
-        )
+        .req_with(Method::PUT, "/feedlimit/d1", Some(json!({})), &admin_auth())
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 

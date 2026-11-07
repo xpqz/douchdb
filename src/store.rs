@@ -1251,7 +1251,14 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
-    pub fn spawn(dir: impl AsRef<Path>, revs_limit: u64) -> Result<ShardHandle> {
+    /// `committed` is pinged after every batch that advanced this shard's
+    /// committed sequence and has been flushed, so a feed can wait for a
+    /// commit instead of polling.
+    pub fn spawn(
+        dir: impl AsRef<Path>,
+        revs_limit: u64,
+        committed: Arc<tokio::sync::watch::Sender<()>>,
+    ) -> Result<ShardHandle> {
         let dir = dir.as_ref().to_path_buf();
         let name = format!(
             "shard-{}",
@@ -1272,7 +1279,7 @@ impl ShardHandle {
             };
             let initial_seq = shard.seq();
             tracker.store(initial_seq, Ordering::SeqCst);
-            shard.set_seq_tracker(tracker);
+            shard.set_seq_tracker(tracker.clone());
             if ready_tx.send(Ok(initial_seq)).is_err() {
                 return;
             }
@@ -1281,6 +1288,7 @@ impl ShardHandle {
             // OS. rusty-leveldb does not fsync, so this is not power-loss
             // durable.
             while let Some(job) = rx.blocking_recv() {
+                let before = tracker.load(Ordering::SeqCst);
                 let mut acks = vec![job(&mut shard)];
                 for _ in 1..64 {
                     match rx.try_recv() {
@@ -1290,6 +1298,9 @@ impl ShardHandle {
                 }
                 let _ = shard.flush_pending();
                 let flush_error = shard.take_flush_failure();
+                if tracker.load(Ordering::SeqCst) > before {
+                    committed.send_replace(());
+                }
                 for ack in acks {
                     ack(flush_error.clone());
                 }
@@ -1440,7 +1451,7 @@ mod panic_tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        ShardHandle::spawn(&dir, 1000).unwrap()
+        ShardHandle::spawn(&dir, 1000, Default::default()).unwrap()
     }
 
     fn put(key: &'static [u8]) -> impl FnOnce(&mut Shard) -> std::result::Result<(), ApiError> {
@@ -1556,7 +1567,7 @@ mod panic_tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let handle = ShardHandle::spawn(&dir, 1000).unwrap();
+        let handle = ShardHandle::spawn(&dir, 1000, Default::default()).unwrap();
         handle.call(put(b"x/kept")).await.unwrap();
         drop(handle);
         // No waiting: the LevelDB LOCK must already be released.
