@@ -293,10 +293,10 @@ async fn local_health(st: &AppState, detailed: bool) -> Value {
     }));
 
     if st.cluster.is_clustered() {
-        let discovery = st
+        let mut discovery = st
             .cluster_state
             .discovery_json(&st.cluster.nodes, &st.config.seeds);
-        let nodes = discovery["nodes"].as_array().cloned().unwrap_or_default();
+        let nodes = crate::json::take_array(&mut discovery, "nodes").unwrap_or_default();
         let placement: Vec<&Value> = nodes
             .iter()
             .filter(|node| node["in_membership"] == true)
@@ -973,11 +973,9 @@ pub async fn metrics_status(
     let mut worst = health_rank(value["health"]["status"].as_str().unwrap_or("ok"));
     if reachable < node_count {
         worst = worst.max(1);
-        let mut failing = value["health"]["failing"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        for node in value["nodes"].as_array().cloned().unwrap_or_default() {
+        let mut failing =
+            crate::json::take_array(&mut value["health"], "failing").unwrap_or_default();
+        for node in &nodes {
             if node["reachable"] == false {
                 failing.push(json!({
                     "index": node["index"],

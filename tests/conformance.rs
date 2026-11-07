@@ -80,7 +80,7 @@ impl Server {
             attempt
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+        let mut cmd = server_command();
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--data")
@@ -93,12 +93,13 @@ impl Server {
         if admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
-        let base = format!("http://127.0.0.1:{port}");
+        // Built first: nothing may panic while the bare `Child` is unowned.
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
+        let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+        let base = format!("http://127.0.0.1:{port}");
         if wait_for_listener(&mut child, port) {
             // A colliding process can win the port after `free_port` checked
             // it; the child then exits while our connect succeeds against the
@@ -136,7 +137,7 @@ impl Server {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("client");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+        let mut cmd = server_command();
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{}", self.port))
             .arg("--data")
@@ -300,6 +301,18 @@ impl Drop for Server {
 /// the probe listener and keeps the port. The real server then fails to bind,
 /// and the test talks to the stray socket ("Connection reset by peer").
 static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A douchdb server command that exits when this process goes away. Dropping
+/// a `Server` kills its child, but a run killed by a timeout or Ctrl-C never
+/// drops anything. The child holds the read end of a pipe whose write end is
+/// `Child::stdin`, so the kernel closes it with this process on Linux and
+/// macOS alike, and the server exits on EOF (`DOUCHDB_EXIT_ON_STDIN_EOF`).
+fn server_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    cmd.env("DOUCHDB_EXIT_ON_STDIN_EOF", "1")
+        .stdin(std::process::Stdio::piped());
+    cmd
+}
 
 fn spawn_locked(cmd: &mut Command) -> std::io::Result<Child> {
     let _guard = SPAWN_LOCK
@@ -2167,6 +2180,27 @@ async fn nested_slash_database_directories_are_migrated_on_startup() {
     s.restart();
     let (status, body) = s.get("/mig%2Fb%2Fc/doc").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A db.json that does not parse is a server-side fault, not a missing
+/// database: the client gets 500 and the file is left for the operator.
+#[tokio::test]
+async fn corrupt_db_json_is_a_server_error_not_a_404() {
+    let mut s = Server::start(false);
+    let (status, body) = s.put("/corruptmeta", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    s.kill();
+    let db_json = s.dir.join("corruptmeta").join("db.json");
+    std::fs::write(&db_json, b"{ not json").expect("corrupt db.json");
+
+    s.restart();
+    let (status, body) = s.get("/corruptmeta").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(
+        std::fs::read(&db_json).expect("db.json"),
+        b"{ not json",
+        "the corrupt file must not be overwritten"
+    );
 }
 
 #[tokio::test]
@@ -11039,6 +11073,72 @@ async fn kill9_preserves_acknowledged_documents_and_changes() {
     assert_eq!(body["results"].as_array().unwrap().len(), 24);
 }
 
+/// Kills the child when dropped, so a failing assertion cannot leave it behind.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A test run that is killed (timeout, Ctrl-C, a CI cancel) never runs
+/// `Server::drop`; its servers must exit on their own instead of lingering as
+/// orphans (issue #119). The test re-runs itself as the "parent" that owns a
+/// server, kills that parent with SIGKILL, and expects the server to be gone.
+#[test]
+fn server_exits_when_its_test_process_is_killed() {
+    use std::io::{BufRead, BufReader};
+    const HELPER: &str = "DOUCHDB_TEST_PARENT_DEATH_HELPER";
+    if std::env::var_os(HELPER).is_some() {
+        let server = Server::start(false);
+        println!("server-pid:{}", server.child.id());
+        std::thread::sleep(Duration::from_secs(120));
+        drop(server);
+        return;
+    }
+    let mut cmd = Command::new(std::env::current_exe().expect("test exe"));
+    cmd.args([
+        "--exact",
+        "server_exits_when_its_test_process_is_killed",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(HELPER, "1")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    let mut helper = KillOnDrop(spawn_locked(&mut cmd).expect("spawn helper"));
+    let stdout = helper.0.stdout.take().expect("helper stdout");
+    let pid: i32 = BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| line.split_once("server-pid:")?.1.trim().parse().ok())
+        .expect("helper did not report its server pid");
+    let helper_pid = helper.0.id();
+    // SIGKILL: the helper gets no chance to run any Drop.
+    drop(helper);
+
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let leaked = alive(pid);
+    if leaked {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let prefix = format!("douchdb-test-{helper_pid}-");
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    assert!(!leaked, "server {pid} outlived its killed test process");
+}
+
 #[tokio::test]
 async fn anti_entropy_replicates_conflicts_and_tombstones() {
     let nodes = start_cluster_with(2, "1", 2);
@@ -11912,7 +12012,7 @@ fn startup_failure(extra: &[String]) -> Option<String> {
     let port = free_port();
     let dir = std::env::temp_dir().join(format!("douchdb-startup-{}-{}", std::process::id(), port));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_douchdb"));
+    let mut cmd = server_command();
     cmd.arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--data")
@@ -11952,6 +12052,41 @@ fn admin_without_colon_is_a_startup_error() {
             "--admin {admin:?} must fail at startup naming the flag"
         );
     }
+}
+
+#[test]
+fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
+    use std::io::Read;
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("douchdb-badq-{}-{}", std::process::id(), port));
+    let mut cmd = server_command();
+    cmd.arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&dir)
+        .args(["--q", "abc"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(done)) = child.try_wait() {
+            status = Some(done);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.expect("--q abc must stop startup, but the server kept running");
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--q") && stderr.contains("abc"), "{stderr}");
 }
 
 #[test]

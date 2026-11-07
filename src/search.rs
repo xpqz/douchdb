@@ -283,12 +283,10 @@ fn infer_kinds<'a>(
 }
 
 fn write_meta(path: &Path, meta: &SearchMeta) -> DbResult<()> {
-    std::fs::write(
-        path.join("douchdb-search-meta.json"),
-        serde_json::to_vec(meta)
-            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?,
-    )
-    .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))
+    let bytes = serde_json::to_vec(meta)
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    crate::db::write_atomic(&path.join("douchdb-search-meta.json"), &bytes)
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))
 }
 
 fn read_meta(path: &Path) -> Option<SearchMeta> {
@@ -494,8 +492,8 @@ async fn update_index(
     // committed before it was read, so a gap left by a write that never
     // finished does not keep the index behind.
     let last_seq = db.changes_watermark(since, None);
-    let changes = db
-        .changes(&crate::db::ChangesOpts {
+    let (rows, _, _) = db
+        .changes_rows(&crate::db::ChangesOpts {
             since,
             include_docs: true,
             until: Some(last_seq),
@@ -504,19 +502,18 @@ async fn update_index(
         .await?;
     let mut changed = std::collections::HashSet::new();
     let mut live = Vec::new();
-    for row in changes["results"].as_array().into_iter().flatten() {
-        let Some(id) = row.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if id.starts_with("_design/") || id.starts_with("_local/") {
+    for row in rows {
+        if row.id.starts_with("_design/") || row.id.starts_with("_local/") {
             continue;
         }
-        changed.insert(id.to_string());
-        if row.get("deleted").and_then(Value::as_bool) == Some(true) {
+        changed.insert(row.id.clone());
+        if row.deleted {
             continue;
         }
-        if let Some(doc) = row.get("doc") {
-            live.push((id.to_string(), doc.to_string()));
+        // The row already carries the document as JSON text, which is what
+        // the index function takes.
+        if let Some(doc) = row.doc {
+            live.push((row.id, doc));
         }
     }
     let source = spec.source.clone();

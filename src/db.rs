@@ -160,23 +160,144 @@ pub fn validate_partition(partition: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// Read the stored security object. Databases written before security was
-/// versioned keep a bare object in `security.json`; that is version 0.
-fn load_security(path: &Path) -> (u64, Value) {
-    let read = |name: &str| {
-        std::fs::read(path.join(name))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+/// Log a metadata file that cannot be used and return the 500 for it. The
+/// client sees the file name only; the log carries the full path.
+fn metadata_error(path: &Path, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(file = %path.display(), %error, "database metadata is unusable");
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("{}: {error}", file_name(path)),
+    )
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Read and parse one metadata file. `None` means it does not exist; one that
+/// cannot be read or parsed is a 500, never a default.
+fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option<T>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| metadata_error(path, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(metadata_error(path, error)),
+    }
+}
+
+/// Serialize `value` and replace `path` with it atomically; see
+/// [`write_atomic`].
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
+    let write_error = |error: &dyn std::fmt::Display| {
+        tracing::error!(file = %path.display(), %error, "cannot write database metadata");
+        ApiError::new(
+            500,
+            "internal_server_error",
+            format!("{}: {error}", file_name(path)),
+        )
     };
-    if let Some(stored) = read("security-versioned.json") {
-        if let (Some(version), Some(security)) = (
+    let bytes = serde_json::to_vec(value).map_err(|error| write_error(&error))?;
+    write_atomic(path, &bytes).map_err(|error| write_error(&error))
+}
+
+/// Write `bytes` to a temporary file next to `path` and fsync it. A crash
+/// before the caller publishes it leaves only the temporary file behind.
+fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    static TEMPS: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        file_name(path),
+        std::process::id(),
+        TEMPS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    match written {
+        Ok(()) => Ok(temp),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// Make a rename or link in the directory of `path` durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Replace `path` with `bytes` so that a reader, or a restart after a crash,
+/// sees the old contents or the new ones, never a partial file: write a
+/// temporary file in the same directory, fsync it, rename it over the target,
+/// then fsync the directory.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = write_temp(path, bytes, false)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    sync_parent(path)
+}
+
+/// Create `path` with `bytes`, readable by the owner only, failing with
+/// `AlreadyExists` if it is there already. The file appears whole or not at
+/// all: it is written to a temporary file and hard-linked into place.
+pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = write_temp(path, bytes, true)?;
+    let linked = std::fs::hard_link(&temp, path);
+    let _ = std::fs::remove_file(&temp);
+    linked?;
+    sync_parent(path)
+}
+
+/// Read the stored security object. Databases written before security was
+/// versioned keep a bare object in `security.json`; that is version 0. Neither
+/// file existing is an empty object; a file that is there but unusable is an
+/// error, since falling back to `{}` would make the database public.
+fn load_security(path: &Path) -> DbResult<(u64, Value)> {
+    let versioned = path.join("security-versioned.json");
+    if let Some(stored) = read_metadata::<Value>(&versioned)? {
+        return match (
             stored.get("version").and_then(Value::as_u64),
             stored.get("security"),
         ) {
-            return (version, security.clone());
-        }
+            (Some(version), Some(security)) => Ok((version, security.clone())),
+            _ => Err(metadata_error(
+                &versioned,
+                "expected an object with `version` and `security`",
+            )),
+        };
     }
-    (0, read("security.json").unwrap_or_else(|| json!({})))
+    let legacy = read_metadata::<Value>(&path.join("security.json"))?;
+    Ok((0, legacy.unwrap_or_else(|| json!({}))))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -374,39 +495,54 @@ impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
         let db_file = path.join("db.json");
-        let file: DbFile = if let Ok(bytes) = std::fs::read(&db_file) {
-            serde_json::from_slice(&bytes).map_err(|_| ApiError::not_found("bad db.json"))?
-        } else {
-            std::fs::create_dir_all(&path)
-                .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))?;
-            let file = DbFile {
-                q: config.q.max(1),
-                uuid: uuid(),
-                instance_start_time: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros()
-                    .to_string(),
-                partitioned: config.partitioned,
-            };
-            std::fs::write(&db_file, serde_json::to_vec(&file).unwrap()).ok();
-            file
+        let file: DbFile = match read_metadata(&db_file)? {
+            Some(file) => file,
+            None => {
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))?;
+                let file = DbFile {
+                    q: config.q.max(1),
+                    uuid: uuid(),
+                    instance_start_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros()
+                        .to_string(),
+                    partitioned: config.partitioned,
+                };
+                write_json_atomic(&db_file, &file)?;
+                file
+            }
         };
 
         let map_path = path.join("shard-map.json");
-        let shard_map = std::fs::read(&map_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ShardMap>(&bytes).ok())
-            .filter(|map| map.is_valid(file.q, config.shard_map.node_count))
-            .unwrap_or_else(|| {
+        let stored_map: Option<ShardMap> = read_metadata(&map_path)?;
+        if let Some(map) = &stored_map {
+            if !map.is_valid(file.q, map.node_count) {
+                return Err(metadata_error(&map_path, "not a valid shard map"));
+            }
+        }
+        let shard_map = match stored_map {
+            Some(map) if map.node_count == config.shard_map.node_count => map,
+            stored => {
+                // A legacy database has no shard map yet, and one stored for a
+                // different cluster size no longer applies: start from the
+                // configured placement and persist it.
+                if stored.is_some() {
+                    tracing::warn!(
+                        file = %map_path.display(),
+                        "shard map is for a different cluster size; replacing it"
+                    );
+                }
                 let map = if config.shard_map.q == file.q {
                     config.shard_map.clone()
                 } else {
                     ShardMap::single(file.q)
                 };
-                let _ = std::fs::write(&map_path, serde_json::to_vec(&map).unwrap());
+                write_json_atomic(&map_path, &map)?;
                 map
-            });
+            }
+        };
 
         let mut shards = Vec::new();
         let mut committed_seq = Vec::with_capacity(file.q as usize);
@@ -423,7 +559,7 @@ impl Db {
             .map(ShardHandle::initial_seq)
             .max()
             .unwrap_or(0);
-        let security = load_security(&path);
+        let security = load_security(&path)?;
 
         Ok(Db {
             name: name.to_string(),
@@ -695,18 +831,10 @@ impl Db {
         version: u64,
         value: Value,
     ) -> DbResult<()> {
-        let bytes = serde_json::to_vec(&json!({"version": version, "security": value}))
-            .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-        let write_error = |error: std::io::Error| {
-            ApiError::new(
-                500,
-                "internal_server_error",
-                format!("security-versioned.json: {error}"),
-            )
-        };
-        let tmp = self.path.join("security-versioned.json.tmp");
-        std::fs::write(&tmp, bytes).map_err(write_error)?;
-        std::fs::rename(&tmp, self.path.join("security-versioned.json")).map_err(write_error)?;
+        write_json_atomic(
+            &self.path.join("security-versioned.json"),
+            &json!({"version": version, "security": value}),
+        )?;
         *current = (version, value);
         Ok(())
     }
@@ -737,7 +865,13 @@ impl Db {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
         }
-        let current = self.shard_map();
+        // Hold the lock across compare, persist and swap, so two calls on
+        // this node cannot interleave and leave the file and the in-memory
+        // map disagreeing.
+        let mut current = self
+            .shard_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
         if shard_map.version < current.version {
             return Ok(false);
         }
@@ -750,17 +884,32 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        std::fs::write(
-            self.path.join("shard-map.json"),
-            serde_json::to_vec(&shard_map)
-                .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?,
-        )
-        .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-        *self
+        self.store_shard_map(&mut current, shard_map)?;
+        Ok(true)
+    }
+
+    /// Store a shard map placed by a client, one version newer than the
+    /// current one, and return it with that version. The version is picked
+    /// under the lock, as `set_security` does, so two concurrent updates on
+    /// this node never share one.
+    pub fn set_next_shard_map(&self, mut shard_map: ShardMap) -> DbResult<ShardMap> {
+        if !shard_map.is_valid(self.q, shard_map.node_count) {
+            return Err(ApiError::bad_request("invalid shard map"));
+        }
+        let mut current = self
             .shard_map
             .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = shard_map;
-        Ok(true)
+            .unwrap_or_else(|poison| poison.into_inner());
+        shard_map.version = current.version.saturating_add(1);
+        self.store_shard_map(&mut current, shard_map.clone())?;
+        Ok(shard_map)
+    }
+
+    /// Persist and install a shard map; the caller holds the lock.
+    fn store_shard_map(&self, current: &mut ShardMap, shard_map: ShardMap) -> DbResult<()> {
+        write_json_atomic(&self.path.join("shard-map.json"), &shard_map)?;
+        *current = shard_map;
+        Ok(())
     }
 
     /// The migration target while a rebalance freeze is running. A map left
@@ -921,19 +1070,11 @@ impl Db {
     }
 
     pub fn pending_shard_map(&self) -> Option<ShardMap> {
-        std::fs::read(self.path.join("pending-shard-map.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        read_metadata(&self.path.join("pending-shard-map.json")).unwrap_or(None)
     }
 
     pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
-        std::fs::write(
-            self.path.join("pending-shard-map.json"),
-            serde_json::to_vec(map)
-                .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?,
-        )
-        .map_err(|error| ApiError::new(500, "internal_server_error", error.to_string()))?;
-        Ok(())
+        write_json_atomic(&self.path.join("pending-shard-map.json"), map)
     }
 
     pub fn clear_pending_shard_map(&self) {
@@ -1734,7 +1875,7 @@ impl Db {
                     let mut missing = Vec::new();
                     let mut ancestors: Vec<String> = Vec::new();
                     for rev in &wanted {
-                        if !tree.edges.contains_key(rev) {
+                        if !tree.contains(rev) {
                             missing.push(rev.clone());
                             if let Some(parsed) = Rev::parse(rev) {
                                 for leaf in tree.leaves() {
@@ -1980,7 +2121,7 @@ impl Db {
                         removed.push(rev.clone());
                     }
                     if !removed.is_empty() {
-                        if meta.tree.edges.is_empty() {
+                        if meta.tree.is_empty() {
                             tx.delete(&meta_key(&id2));
                             if meta.seq != 0 {
                                 tx.delete(&seq_key(meta.seq));
@@ -2318,7 +2459,7 @@ fn put_many(
     let limit = shard.revs_limit();
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
-        meta.atts.retain(|rev, _| meta.tree.edges.contains_key(rev));
+        meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = serde_json::to_vec(meta) {
             ops.push((meta_key(id), Some(bytes)));
         }
@@ -2401,7 +2542,7 @@ impl Stage<'_> {
                 if Rev::parse(&rev).is_none() {
                     return Err(ApiError::bad_request("Invalid rev format"));
                 }
-                if !meta.tree.edges.contains_key(&rev) || !meta.tree.is_leaf(&rev) {
+                if !meta.tree.contains(&rev) || !meta.tree.is_leaf(&rev) {
                     return Err(ApiError::conflict());
                 }
                 if meta.tree.is_deleted(&rev) {
@@ -2484,18 +2625,15 @@ impl Stage<'_> {
             .cloned()
             .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
 
-        let known = meta.tree.edges.contains_key(&rev);
+        let known = meta.tree.contains(&rev);
         if known && meta.atts.contains_key(&rev) && attachments.is_none() {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
 
         let parent = meta
             .tree
-            .edges
-            .get(&rev)
-            .cloned()
-            .flatten()
-            .and_then(|p| meta.atts.get(&p).cloned())
+            .parent(&rev)
+            .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
         let fallback = all_atts(&meta);
         let mut atts =
@@ -2911,7 +3049,7 @@ fn read_doc_rev(
     rev: &str,
     opts: &DocOpts,
 ) -> DbResult<Value> {
-    if !meta.tree.edges.contains_key(rev) {
+    if !meta.tree.contains(rev) {
         return Err(ApiError::not_found("missing"));
     }
     let body = shard
@@ -3633,9 +3771,9 @@ mod tests {
             .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
             .await
             .unwrap();
-        assert_eq!(meta.tree.edges.len(), 2);
+        assert_eq!(meta.tree.len(), 2);
         let kept: Vec<&String> = meta.atts.keys().collect();
-        let tree: Vec<&String> = meta.tree.edges.keys().collect();
+        let tree: Vec<&String> = meta.tree.revs().collect();
         assert_eq!(kept, tree, "atts only for revisions still in the tree");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -3923,6 +4061,208 @@ mod tests {
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (3, json!({"a": 4})));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn meta_config() -> DbConfig {
+        DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::balanced(1, 1, 1),
+            partitioned: false,
+        }
+    }
+
+    fn open_error(file: &str, contents: &[u8]) -> ApiError {
+        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::db::uuid()));
+        drop(Db::open(&root, "meta", meta_config()).unwrap());
+        std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
+        let error = match Db::open(&root, "meta", meta_config()) {
+            Ok(_) => panic!("{file} with {contents:?} opened"),
+            Err(error) => error,
+        };
+        // The corrupt file is left for the operator, not overwritten.
+        assert_eq!(
+            std::fs::read(db_path(&root, "meta").join(file)).unwrap(),
+            contents
+        );
+        std::fs::remove_dir_all(root).ok();
+        error
+    }
+
+    #[test]
+    fn corrupt_metadata_fails_open_with_a_server_error() {
+        for (file, contents) in [
+            ("db.json", &b"{ not json"[..]),
+            ("shard-map.json", b"{ not json"),
+            ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
+            ("security-versioned.json", b"{ not json"),
+            ("security-versioned.json", br#"{"version":1}"#),
+            ("security.json", b"{ not json"),
+        ] {
+            let error = open_error(file, contents);
+            assert_eq!(error.status, 500, "{file}: {}", error.reason);
+            assert!(error.reason.contains(file), "{file}: {}", error.reason);
+        }
+    }
+
+    #[test]
+    fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
+        let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::db::uuid()));
+        let config = || DbConfig {
+            q: 2,
+            revs_limit: 100,
+            shard_map: ShardMap::balanced(2, 3, 1),
+            partitioned: false,
+        };
+        for round in 0..40 {
+            let db = Db::open(&root, &format!("race{round}"), config()).unwrap();
+            let maps: Vec<ShardMap> = (0..3)
+                .map(|node| ShardMap {
+                    q: 2,
+                    node_count: 3,
+                    replicas: vec![vec![node], vec![node]],
+                    version: 9,
+                })
+                .collect();
+            let barrier = std::sync::Barrier::new(maps.len());
+            std::thread::scope(|scope| {
+                for map in &maps {
+                    let (db, barrier) = (&db, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        db.set_shard_map(map.clone()).unwrap();
+                    });
+                }
+            });
+            // The tiebreak winner is the greatest placement, and the file on
+            // disk is the one in memory.
+            let stored: ShardMap =
+                serde_json::from_slice(&std::fs::read(db.path.join("shard-map.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                db.shard_map().replicas,
+                vec![vec![2], vec![2]],
+                "round {round}"
+            );
+            assert_eq!(stored, db.shard_map(), "round {round}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn write_atomic_replaces_whole_and_leaves_no_temporary_file() {
+        let dir = std::env::temp_dir().join(format!("douchdb-atomic-{}", crate::db::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("meta.json");
+        write_atomic(&target, b"first").unwrap();
+        write_atomic(&target, b"second").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert_eq!(names_in(&dir), ["meta.json"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_atomic_write_shows_no_partial_file() {
+        let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::db::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A directory that is not there.
+        assert!(write_atomic(&dir.join("missing").join("meta.json"), b"x").is_err());
+
+        // The rename fails: the target is a directory. The old target is
+        // untouched and the temporary file is cleaned up.
+        let target = dir.join("meta.json");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write_atomic(&target, b"x").is_err());
+        assert_eq!(names_in(&dir), ["meta.json"]);
+        assert!(target.is_dir());
+        std::fs::remove_dir(&target).unwrap();
+
+        // The directory cannot be written to; an existing file keeps its
+        // contents.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            write_atomic(&target, b"old").unwrap();
+            let locked = std::fs::Permissions::from_mode(0o555);
+            std::fs::set_permissions(&dir, locked).unwrap();
+            let failed = write_atomic(&target, b"new");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Running as root ignores the mode; the write then simply succeeds.
+            if failed.is_err() {
+                assert_eq!(std::fs::read(&target).unwrap(), b"old");
+                assert_eq!(names_in(&dir), ["meta.json"]);
+            }
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn create_private_atomic_is_exclusive_and_owner_only() {
+        let dir = std::env::temp_dir().join(format!("douchdb-private-{}", crate::db::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("secret");
+        create_private_atomic(&target, b"one").unwrap();
+        let error = create_private_atomic(&target, b"two").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"one");
+        assert_eq!(names_in(&dir), ["secret"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn concurrent_client_shard_maps_get_distinct_versions() {
+        let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::db::uuid()));
+        let db = Db::open(
+            &root,
+            "next",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: ShardMap::balanced(2, 3, 1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let start = db.shard_map().version;
+        let versions: Vec<u64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|node| {
+                    let db = &db;
+                    scope.spawn(move || {
+                        db.set_next_shard_map(ShardMap {
+                            q: 2,
+                            node_count: 3,
+                            replicas: vec![vec![node % 3], vec![node % 3]],
+                            version: 0,
+                        })
+                        .unwrap()
+                        .version
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut sorted = versions.clone();
+        sorted.sort();
+        assert_eq!(sorted, (start + 1..=start + 8).collect::<Vec<_>>());
+        assert_eq!(db.shard_map().version, start + 8);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

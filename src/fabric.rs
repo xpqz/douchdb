@@ -1125,9 +1125,9 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
         let mut total_rows = 0u64;
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut errors: HashMap<String, Value> = HashMap::new();
-        for (_, _, response) in values {
+        for (_, _, mut response) in values {
             total_rows += response["total_rows"].as_u64().unwrap_or(0);
-            for row in response["rows"].as_array().cloned().unwrap_or_default() {
+            for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
                 match row.get("id").and_then(Value::as_str) {
                     Some(id) => {
                         found.insert(id.to_string(), row);
@@ -1177,10 +1177,10 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
     let mut total_rows = 0u64;
     let mut before_start = 0usize;
     let mut rows: Vec<(String, Value)> = Vec::new();
-    for (_, _, response) in values {
+    for (_, _, mut response) in values {
         total_rows += response["total_rows"].as_u64().unwrap_or(0);
         before_start += response["offset"].as_u64().unwrap_or(0) as usize;
-        for row in response["rows"].as_array().cloned().unwrap_or_default() {
+        for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
             if let Some(id) = row.get("id").and_then(Value::as_str) {
                 rows.push((id.to_string(), row));
             }
@@ -1623,10 +1623,10 @@ pub(crate) async fn cluster_reduce(
     .await?;
 
     let mut partials = crate::view::Partials::new();
-    for (_, _, value) in values {
-        for row in value["rows"].as_array().cloned().unwrap_or_default() {
-            let key = row.get("key").cloned().unwrap_or(Value::Null);
-            let value = row.get("value").cloned().unwrap_or(Value::Null);
+    for (_, _, mut value) in values {
+        for mut row in crate::json::take_array(&mut value, "rows").unwrap_or_default() {
+            let key = row.get_mut("key").map(Value::take).unwrap_or(Value::Null);
+            let value = row.get_mut("value").map(Value::take).unwrap_or(Value::Null);
             crate::view::add_partial(&mut partials, key, value);
         }
     }
@@ -1635,22 +1635,22 @@ pub(crate) async fn cluster_reduce(
         .map_err(|reason| crate::view::reduce_failure(&reason))
 }
 
-pub(crate) fn decode_view_batch(value: Value) -> ViewBatch {
+pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {
     let total_rows = value["total_rows"].as_u64().unwrap_or(0) as usize;
     let offset = value["offset"].as_u64().unwrap_or(0) as usize;
     let mut rows = Vec::new();
     let mut docs = HashMap::new();
-    for row in value["rows"].as_array().cloned().unwrap_or_default() {
+    for mut row in crate::json::take_array(&mut value, "rows").unwrap_or_default() {
         let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
-        if let Some(doc) = row.get("doc").cloned() {
+        if let Some(doc) = row.get_mut("doc").map(Value::take) {
             docs.insert(id.clone(), doc);
         }
         rows.push(crate::view::Row {
             id,
-            key: row.get("key").cloned().unwrap_or(Value::Null),
-            value: row.get("value").cloned().unwrap_or(Value::Null),
+            key: row.get_mut("key").map(Value::take).unwrap_or(Value::Null),
+            value: row.get_mut("value").map(Value::take).unwrap_or(Value::Null),
         });
     }
     ViewBatch {

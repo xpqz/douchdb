@@ -11,7 +11,7 @@ pub(super) async fn bulk_docs(
     body: &[u8],
     headers: &HeaderMap,
 ) -> Response {
-    let Ok(value) = crate::json::from_slice(body) else {
+    let Ok(mut value) = crate::json::from_slice(body) else {
         return fail(ApiError::bad_request("invalid UTF-8 JSON"));
     };
     let new_edits = match value.get("new_edits") {
@@ -23,7 +23,7 @@ pub(super) async fn bulk_docs(
         }
         None => true,
     };
-    let Some(mut docs) = value.get("docs").and_then(Value::as_array).cloned() else {
+    let Some(mut docs) = crate::json::take_array(&mut value, "docs") else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
     if !new_edits
@@ -272,7 +272,7 @@ pub(super) async fn bulk_get(
     body: &[u8],
     headers: &HeaderMap,
 ) -> Response {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
     let attachments = flag(q, "attachments");
@@ -284,7 +284,7 @@ pub(super) async fn bulk_get(
             Err(e) => fail(e),
         };
     }
-    let Some(reqs) = value.get("docs").and_then(Value::as_array).cloned() else {
+    let Some(reqs) = crate::json::take_array(&mut value, "docs") else {
         return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
     let mut candidates: Vec<Vec<usize>> = reqs
@@ -323,8 +323,8 @@ pub(super) async fn bulk_get(
         });
         for (slots, result) in futures::future::join_all(requests).await {
             match result {
-                Ok(value) => {
-                    let rows = value["results"].as_array().cloned().unwrap_or_default();
+                Ok(mut value) => {
+                    let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
                     for (slot, row) in slots.into_iter().zip(rows) {
                         out[slot] = row;
                     }
