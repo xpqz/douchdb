@@ -108,7 +108,7 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
             Err(_) => return fail(ApiError::bad_request("count must be a positive integer")),
         },
     };
-    let ids: Vec<String> = (0..count).map(|_| crate::db::uuid()).collect();
+    let ids: Vec<String> = (0..count).map(|_| crate::util::uuid()).collect();
     json(StatusCode::OK, json!({ "uuids": ids }))
 }
 

@@ -618,7 +618,7 @@ impl Shard {
             }
         }
         hasher.update(documents.to_be_bytes());
-        Ok(crate::db::hex(&hasher.finalize()))
+        Ok(crate::util::hex(&hasher.finalize()))
     }
 
     pub fn state(&mut self, with_digest: bool) -> Result<ShardState> {

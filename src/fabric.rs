@@ -661,7 +661,7 @@ pub(crate) async fn commit_docs(
     // would otherwise assign them per replica and the copies would diverge.
     for doc in &mut docs {
         if doc.get("_id").is_none() {
-            doc["_id"] = json!(crate::db::uuid());
+            doc["_id"] = json!(crate::util::uuid());
         }
     }
     let ids: Vec<String> = docs

@@ -41,7 +41,7 @@ pub async fn pull(
     // Include the shard map in the checkpoint id. When placement changes, the
     // new replica starts from zero instead of skipping documents that were
     // filtered out under the old map.
-    let map_tag = crate::db::hex(&Md5::digest(
+    let map_tag = crate::util::hex(&Md5::digest(
         serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
     ));
     let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag);
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_bulk_get_does_not_advance_the_checkpoint() {
-        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "ae",
@@ -441,7 +441,7 @@ mod tests {
 
         let first = pull(&db, &peer, &client, &cluster, None).await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
-        let map_tag = crate::db::hex(&Md5::digest(
+        let map_tag = crate::util::hex(&Md5::digest(
             serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
         ));
         let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{peer}:{map_tag}");
@@ -505,7 +505,7 @@ mod tests {
             }}]}]}))
         }
 
-        let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::db::uuid()));
+        let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
             "ae",

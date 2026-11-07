@@ -152,7 +152,7 @@ pub(crate) async fn validate_docs_with(
         let id = match doc.get("_id").and_then(Value::as_str) {
             Some(id) => id.to_string(),
             None => {
-                let id = crate::db::uuid();
+                let id = crate::util::uuid();
                 doc["_id"] = json!(id);
                 id
             }
@@ -332,7 +332,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-validate-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,

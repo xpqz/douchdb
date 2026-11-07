@@ -8,7 +8,7 @@ use super::*;
 /// Baseline response hardening. TLS is an operator concern; these headers still
 /// stop MIME sniffing and framing when the console is served directly.
 pub async fn request_id(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let id = crate::db::uuid();
+    let id = crate::util::uuid();
     let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-couch-request-id", value);

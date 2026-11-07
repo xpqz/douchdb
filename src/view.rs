@@ -6,7 +6,8 @@
 //! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
-use crate::db::{hex, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::util::hex;
 use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
 use icu_collator::Collator;
@@ -18,23 +19,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-#[derive(Clone, Copy, Debug)]
-pub struct ViewLimits {
-    pub timeout: Duration,
-    pub memory: usize,
-}
-
-impl Default for ViewLimits {
-    fn default() -> Self {
-        ViewLimits {
-            timeout: Duration::from_secs(5),
-            memory: 64 * 1024 * 1024,
-        }
-    }
-}
+pub use crate::js::ViewLimits;
 
 #[derive(Clone, Debug, Default)]
 pub struct ViewQuery {
@@ -3059,6 +3046,7 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::time::Duration;
 
     fn reduce_value(
         source: &str,
@@ -3201,7 +3189,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewseq-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3262,7 +3250,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgate-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Arc::new(
             Db::open(
@@ -3347,7 +3335,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewflight-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
@@ -3439,7 +3427,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "douchdb-viewgap-{}-{}",
             std::process::id(),
-            crate::db::uuid()
+            crate::util::uuid()
         ));
         let db = Db::open(
             &root,
