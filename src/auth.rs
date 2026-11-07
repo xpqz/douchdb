@@ -51,6 +51,8 @@ struct User {
     token_sha256: Option<[u8; 32]>,
     roles: Vec<String>,
     admin: bool,
+    /// Digest of the user's credentials, mixed into the cookie key.
+    salt: [u8; 32],
 }
 
 impl User {
@@ -220,12 +222,14 @@ impl Auth {
                 .unwrap_or_default();
             let admin = entry.get("admin").and_then(Value::as_bool).unwrap_or(false)
                 || roles.iter().any(|role| role == "_admin");
+            let salt = credential_salt(token.as_deref(), token_sha256.as_ref());
             users.push(User {
                 name,
                 token,
                 token_sha256,
                 roles,
                 admin,
+                salt,
             });
         }
         let (user, pass) = admin.unwrap_or_default();
@@ -339,8 +343,29 @@ impl Auth {
         self.basic_principal(header).is_some()
     }
 
-    fn sign(&self, payload: &str) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
+    /// The credential digest that keys `name`'s cookies, or `None` for an
+    /// unknown user.
+    fn cookie_salt(&self, name: &str) -> Option<[u8; 32]> {
+        if !self.user.is_empty() && name == self.user {
+            return Some(Sha256::digest(self.pass.as_bytes()).into());
+        }
+        self.users
+            .iter()
+            .find(|user| user.name == name)
+            .map(|user| user.salt)
+    }
+
+    /// The cookie HMAC: keyed by the session secret plus the user's credential
+    /// digest, as CouchDB keys it with the secret plus the user's salt, so
+    /// changing a credential invalidates the user's sessions.
+    fn mac(&self, salt: &[u8; 32]) -> Hmac<Sha256> {
+        let mut key = self.secret.clone();
+        key.extend_from_slice(salt);
+        Hmac::<Sha256>::new_from_slice(&key).expect("hmac key")
+    }
+
+    fn sign(&self, name: &str, payload: &str) -> String {
+        let mut mac = self.mac(&self.cookie_salt(name).unwrap_or_default());
         mac.update(payload.as_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
@@ -360,7 +385,7 @@ impl Auth {
         let token = format!(
             "{}.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
-            self.sign(&payload)
+            self.sign(name, &payload)
         );
         format!("{COOKIE}={token}; Version=1; Path=/; HttpOnly; SameSite=Strict")
     }
@@ -384,14 +409,17 @@ impl Auth {
             let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(sig)
                 .ok()?;
-            let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac key");
+            let Some((user, exp)) = payload.rsplit_once(':') else {
+                continue;
+            };
+            let Some(salt) = self.cookie_salt(user) else {
+                continue;
+            };
+            let mut mac = self.mac(&salt);
             mac.update(payload.as_bytes());
             if mac.verify_slice(&signature).is_err() {
                 continue;
             }
-            let Some((user, exp)) = payload.rsplit_once(':') else {
-                continue;
-            };
             let Ok(exp) = exp.parse::<u64>() else {
                 continue;
             };
@@ -411,6 +439,17 @@ impl Auth {
     pub fn check_cookies(&self, header: Option<&str>) -> bool {
         self.cookie_user(header).is_some()
     }
+}
+
+/// Digest of a user's credentials, so a rotated token changes it.
+fn credential_salt(token: Option<&str>, token_sha256: Option<&[u8; 32]>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(token.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    if let Some(digest) = token_sha256 {
+        hasher.update(digest);
+    }
+    hasher.finalize().into()
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
@@ -657,6 +696,7 @@ mod tests {
             token_sha256: Some(Sha256::digest(b"").into()),
             roles: vec![],
             admin: false,
+            salt: [0; 32],
         });
         let mut headers = HeaderMap::new();
         headers.insert(

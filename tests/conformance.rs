@@ -4148,9 +4148,15 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
-/// An `AuthSession` cookie value for `name`, signed with `key`, in the format
-/// the server issues: `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`.
-fn forged_cookie(key: &[u8], name: &str) -> String {
+/// An `AuthSession` cookie value for `name`, in the format the server issues:
+/// `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`. The HMAC key is the
+/// session secret plus the SHA-256 of the user's credential, here the admin
+/// password.
+fn forged_cookie(secret: &[u8], password: &str, name: &str) -> String {
+    use sha2::Digest;
+    let mut key = secret.to_vec();
+    key.extend_from_slice(&sha2::Sha256::digest(password.as_bytes()));
+    let key = key.as_slice();
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let exp = std::time::SystemTime::now()
@@ -4184,7 +4190,7 @@ async fn status_with_cookie(s: &Server, cookie: &str) -> StatusCode {
 #[tokio::test]
 async fn session_key_is_not_derived_from_admin_password() {
     let s = Server::start(true);
-    let forged = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let forged = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(
         status_with_cookie(&s, &forged).await,
         StatusCode::UNAUTHORIZED
@@ -4196,9 +4202,9 @@ async fn session_key_is_not_derived_from_admin_password() {
 async fn session_secret_flag_signs_cookies() {
     let secret = "an-explicit-session-secret";
     let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
-    let good = forged_cookie(secret.as_bytes(), "admin");
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &good).await, StatusCode::OK);
-    let bad = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let bad = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
 }
 
