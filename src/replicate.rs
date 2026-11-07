@@ -105,12 +105,14 @@ type RevPairs = BTreeSet<(String, String)>;
 /// Revisions the peer returned, and revisions it explicitly no longer has.
 type Fetched = (BTreeMap<(String, String), Value>, RevPairs);
 
-/// Include the shard map in the checkpoint id. When placement changes, the
-/// new replica starts from zero instead of skipping documents that were
-/// filtered out under the old map.
+/// Include the replica placement in the checkpoint id. When placement changes,
+/// the new replica starts from zero instead of skipping documents that were
+/// filtered out under the old map. Only the replica lists matter: the version
+/// counter changes without changing what this node replicates, and keying on
+/// it would re-pull every document after each metadata bump.
 fn checkpoint_id(db: &Db, peer: &str) -> String {
     let map_tag = crate::util::hex(&Md5::digest(
-        serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
+        serde_json::to_vec(&db.replication_map().replicas).unwrap_or_default(),
     ));
     format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag)
 }
@@ -540,10 +542,7 @@ mod tests {
 
         let first = pull(&db, &peer, &client, &cluster, None).await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
-        let map_tag = crate::util::hex(&Md5::digest(
-            serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
-        ));
-        let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{peer}:{map_tag}");
+        let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
             db.local_get(&checkpoint_id).await.unwrap().is_none(),
             "checkpoint advanced past a missing revision"

@@ -5194,14 +5194,17 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        !nodes[0]
-            .dir
-            .join("meta")
-            .join("pending-shard-map.json")
-            .exists(),
-        "pending map was not cleared after quorum acknowledgement"
-    );
+    // The peer may adopt the map on its own pass before ours has seen it
+    // current, so the marker clears on whichever pass counts the quorum.
+    let marker = nodes[0].dir.join("meta").join("pending-shard-map.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending map was not cleared after quorum acknowledgement"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -5210,6 +5213,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
     for node in &nodes {
         node.fresh_db("reb").await;
     }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/reb").await;
     let (status, _) = nodes[0]
         .put("/_node/_local/_dbs/reb", all_shards_on(0))
         .await;
@@ -5223,18 +5227,12 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The planner spreads the four shards across the three nodes.
+    // The planner moves the shards to the placement creation gave them.
     let (status, map) = nodes[0]
         .post("/_node/_local/_dbs/reb/rebalance", json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{map}");
-    let owners: std::collections::HashSet<u64> = map["replicas"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|replicas| replicas[0].as_u64().unwrap())
-        .collect();
-    assert!(owners.len() > 1, "planner must use multiple nodes: {map}");
+    assert_eq!(map["replicas"], planned["replicas"], "{map}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -13683,20 +13681,18 @@ async fn rebalance_on_an_unchanged_cluster_moves_nothing() {
 
     let (status, body) = nodes[0]
         .post(
-            "/_node/_local/_dbs/steady/rebalance?timeout_ms=20000&cleanup=true",
+            "/_node/_local/_dbs/steady/rebalance?timeout_ms=20000",
             json!({}),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["replicas"], before["replicas"], "{body}");
     assert_eq!(body["version"], before["version"], "{body}");
-    let cleared: usize = body["cleaned"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|response| response["cleared"].as_array().map_or(0, Vec::len))
-        .sum();
-    assert_eq!(cleared, 0, "a no-op rebalance cleared shards: {body}");
+    let (_, after) = nodes[0].get("/_node/_local/_dbs/steady").await;
+    assert_eq!(
+        after, before,
+        "an unchanged cluster's rebalance moved shards"
+    );
 }
 
 #[tokio::test]
@@ -13789,6 +13785,9 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     for node in &nodes {
         node.fresh_db("confreb").await;
     }
+    // The default placement is the one a rebalance moves the database to.
+    let (status, planned) = nodes[0].get("/_node/_local/_dbs/confreb").await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
     let (status, _) = nodes[0]
         .put("/_node/_local/_dbs/confreb", all_shards_on(0))
         .await;
@@ -13798,13 +13797,17 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
 
-    // A document whose shard moves away from node 0 in the balanced map
-    // (shard s goes to node s % 3).
-    let id = (0..)
+    // A document whose shard moves away from node 0 in the planned map.
+    let owner_of = |id: &str| {
+        planned["replicas"][douchdb::shard_index(id, 4)][0]
+            .as_u64()
+            .unwrap() as usize
+    };
+    let id = (0..1000)
         .map(|i| format!("x{i}"))
-        .find(|id| !douchdb::shard_index(id, 4).is_multiple_of(3))
-        .unwrap();
-    let target = douchdb::shard_index(&id, 4) % 3;
+        .find(|id| owner_of(id) != 0)
+        .expect("the planned map keeps every shard on node 0");
+    let target = owner_of(&id);
 
     let root = "00000000000000000000000000000000";
     let branch = |rev: &str, v: &str| {

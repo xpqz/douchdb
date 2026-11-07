@@ -98,6 +98,8 @@ impl ShardMap {
 
     /// Evenly spread shard replicas across nodes. This is intentionally
     /// simple: for shard `s`, replica `k` goes to `(s + k) % node_count`.
+    /// Tests use it for a predictable placement; real placement is rendezvous.
+    #[cfg(test)]
     pub fn balanced(q: u32, node_count: usize, n: usize) -> ShardMap {
         let q = q.max(1);
         let node_count = node_count.max(1);

@@ -65,7 +65,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let maps = join_all(ctx.cluster.peers().map(|peer| async move {
+    let reported = join_all(ctx.cluster.peers().map(|peer| async move {
         let request = internal_request(
             ctx,
             reqwest::Method::GET,
@@ -73,17 +73,21 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
             &["_node", "_local", "_dbs", &db.name],
             None,
         );
-        request
-            .send()
-            .await
-            .ok()?
-            .json::<crate::cluster::ShardMap>()
-            .await
-            .ok()
+        let map = async {
+            request
+                .send()
+                .await
+                .ok()?
+                .json::<crate::cluster::ShardMap>()
+                .await
+                .ok()
+        }
+        .await;
+        (peer.clone(), map)
     }))
     .await;
 
-    for map in maps.into_iter().flatten() {
+    for map in reported.iter().filter_map(|(_, map)| map.clone()) {
         if adoptable_peer_map(&map, desired.version, ctx.cluster.nodes.len())
             && db.set_shard_map(map.clone()).unwrap_or(false)
         {
@@ -102,14 +106,12 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         Ok(payload) => payload,
         Err(_) => return,
     };
-    let peers: Vec<String> = ctx
-        .cluster
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != ctx.cluster.me)
-        .map(|(_, peer)| peer.clone())
-        .collect();
+    // A peer that already holds the map needs no PUT; it counts as an
+    // acknowledgement. One that did not answer the read is tried anyway.
+    let (current, stale): (Vec<_>, Vec<_>) = reported
+        .into_iter()
+        .partition(|(_, map)| map.as_ref() == Some(&desired));
+    let peers: Vec<String> = stale.into_iter().map(|(peer, _)| peer).collect();
     let responses = join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
@@ -130,7 +132,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         }
     }))
     .await;
-    let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
+    let acknowledgements = 1 + current.len() + responses.into_iter().filter(|ok| *ok).count();
     if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
         db.clear_pending_shard_map();
     }
@@ -456,7 +458,7 @@ pub(crate) async fn commit_docs(
     let (out, met) = if new_edits {
         let tally = QuorumTally::new(&ids, &primaries, &replicas, write_quorum(w, db.copies()));
         let db_handle = st.db(dbname).await?;
-        let pending = spawn_quorum_writes(st, &db_handle, dbname, groups, headers, &gate);
+        let pending = spawn_quorum_writes(st, &db_handle, dbname, groups, headers, &gate).await;
         collect_quorum(pending, tally).await
     } else {
         let responses = replicate_to_all(st, db, dbname, groups, headers).await;
@@ -524,8 +526,10 @@ fn replica_unavailable(id: &str) -> Value {
 }
 
 /// Start one detached write per node. Each task holds the write gate, so a
-/// slow or unreachable replica keeps running after the request returns.
-fn spawn_quorum_writes(
+/// slow or unreachable replica keeps running after the request returns. Each
+/// also holds a detached-write slot, so a slow peer makes later writes wait
+/// rather than accumulate tasks without limit.
+async fn spawn_quorum_writes(
     st: &AppState,
     db: &Arc<Db>,
     dbname: &str,
@@ -537,12 +541,13 @@ fn spawn_quorum_writes(
     let pending = FuturesUnordered::new();
     for (node, group) in groups {
         let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+        let slot = st.admission.acquire_detached().await;
         if node == ctx.cluster.me {
             let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
             let db = db.clone();
             let gate = gate.clone();
             pending.push(spawn_node_write(node, slots, async move {
-                let _gate = gate;
+                let (_gate, _slot) = (gate, slot);
                 db.put_docs(subdocs, true).await
             }));
         } else {
@@ -554,7 +559,7 @@ fn spawn_quorum_writes(
             let headers = headers.clone();
             let gate = gate.clone();
             pending.push(spawn_node_write(node, slots, async move {
-                let _gate = gate;
+                let (_gate, _slot) = (gate, slot);
                 forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await
             }));
         }

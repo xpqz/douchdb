@@ -31,6 +31,8 @@ pub struct Limits {
     pub heavy_in_flight: usize,
     pub heavy_per_user: usize,
     pub background_in_flight: usize,
+    /// Replica writes that outlive the request that started them.
+    pub detached_writes: usize,
 }
 
 impl Default for Limits {
@@ -42,6 +44,7 @@ impl Default for Limits {
             heavy_in_flight: 8,
             heavy_per_user: 1,
             background_in_flight: 2,
+            detached_writes: 128,
         }
     }
 }
@@ -141,6 +144,7 @@ pub struct Admission {
     global: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
     background: Arc<Semaphore>,
+    detached: Arc<Semaphore>,
     users: Mutex<HashMap<Key, Arc<UserState>>>,
 }
 
@@ -151,6 +155,7 @@ impl Admission {
             global: semaphore(limits.max_in_flight),
             heavy: semaphore(limits.heavy_in_flight),
             background: semaphore(limits.background_in_flight),
+            detached: semaphore(limits.detached_writes),
             users: Mutex::new(HashMap::new()),
         }
     }
@@ -221,6 +226,13 @@ impl Admission {
         })
     }
 
+    /// A slot for a replica write that keeps running after its request has
+    /// returned. Waits when every slot is taken, so a slow peer pushes back on
+    /// new writes instead of letting detached tasks pile up behind it.
+    pub async fn acquire_detached(&self) -> Option<OwnedSemaphorePermit> {
+        self.detached.clone().acquire_owned().await.ok()
+    }
+
     /// Classify a request. Logins get their own lane, only view/search work
     /// gets a heavy permit, and everything else is interactive.
     pub fn classify(method: &Method, path: &str) -> Lane {
@@ -273,6 +285,7 @@ mod tests {
             heavy_in_flight: heavy,
             heavy_per_user: heavy_user,
             background_in_flight: 1,
+            detached_writes: 1,
         })
     }
 
