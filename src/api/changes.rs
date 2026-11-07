@@ -190,7 +190,9 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                         break;
                     }
                 }
-                if started.elapsed().as_millis() as u64 >= deadline {
+                if started.elapsed().as_millis() as u64 >= deadline
+                    || limit.is_some_and(|limit| sent >= limit)
+                {
                     break;
                 }
                 if heartbeat.due() {

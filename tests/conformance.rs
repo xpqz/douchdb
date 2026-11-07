@@ -2836,7 +2836,9 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows.len(), 3, "{text}");
     assert_eq!(rows[2], json!({"last_seq": 2, "pending": 0}), "{text}");
 
-    // The same trailer closes a feed that reached its limit.
+    // The same trailer closes a feed that reached its limit, at once rather
+    // than after the next wake-up.
+    let started = std::time::Instant::now();
     let text = s
         .client
         .get(format!(
@@ -2849,6 +2851,11 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
         .text()
         .await
         .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a feed at its limit took {:?} to close",
+        started.elapsed()
+    );
     let rows = lines(&text);
     assert_eq!(rows.len(), 2, "{text}");
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
