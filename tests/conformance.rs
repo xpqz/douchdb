@@ -3204,7 +3204,7 @@ async fn dbs_info_caps_the_number_of_keys_at_100() {
     let (status, body) = s.post("/_dbs_info", json!({"keys": keys(101)})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "bad_request");
-    assert_eq!(body["reason"], "Number of DBs in keys exceeds limit (100)");
+    assert_eq!(body["reason"], "too_many_keys");
 }
 
 #[tokio::test]

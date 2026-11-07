@@ -230,9 +230,8 @@ pub async fn dbs_info(
         return fail(ApiError::bad_request("`keys` must be a JSON array"));
     };
     if keys.len() > MAX_DBS_INFO_KEYS {
-        return fail(ApiError::bad_request(format!(
-            "Number of DBs in keys exceeds limit ({MAX_DBS_INFO_KEYS})"
-        )));
+        // CouchDB 3.5 answers {"error":"bad_request","reason":"too_many_keys"}.
+        return fail(ApiError::bad_request("too_many_keys"));
     }
     let mut results = Vec::new();
     for key in keys {
