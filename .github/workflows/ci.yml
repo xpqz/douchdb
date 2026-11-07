@@ -25,6 +25,8 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy without the wasm sandbox
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Unit and integration tests
         run: cargo test
       # Servers started by the test suites must not outlive them (issue #119).

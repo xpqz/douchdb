@@ -330,7 +330,9 @@ Behaviour and limits:
   checked-in QuickJS WASM runner with linear-memory limits under `wasmi`
   (default) or the optional `wasmtime` Cranelift JIT. wasmtime is 4–7× faster
   for cold map/reduce work; build with `--features wasmtime` and select it with
-  `--wasm-runtime wasmtime`. See
+  `--wasm-runtime wasmtime`. The wasm sandbox is the default-on `wasm` cargo
+  feature; `--no-default-features` drops it (and wasmi's dependency tree), and
+  `--js-sandbox wasm` then fails at startup. See
   [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md).
 - Large groups are reduced in batches of 1000 and the partial results are
   rereduced with `rereduce=true`.

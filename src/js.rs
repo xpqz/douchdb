@@ -87,6 +87,7 @@ pub enum WasmRuntime {
 }
 
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "wasm")]
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
 /// A debug-build worker needs a moment to start; a hung one is killed after this.
@@ -107,6 +108,7 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
 
 /// Select the wasm runtime. Returns an error when Wasmtime was requested but
 /// this binary was built without the `wasmtime` feature.
+#[cfg(feature = "wasm")]
 pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
     match runtime {
         WasmRuntime::Wasmi => {
@@ -131,6 +133,15 @@ pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
     }
 }
 
+/// Without the `wasm` feature there is no wasm sandbox to select.
+#[cfg(not(feature = "wasm"))]
+pub fn set_wasm_runtime(_runtime: WasmRuntime) -> Result<(), String> {
+    Err(
+        "the wasm sandbox is not compiled; rebuild with default features (the `wasm` feature)"
+            .to_string(),
+    )
+}
+
 pub fn sandboxed() -> bool {
     SANDBOX.load(Ordering::SeqCst) != 0
 }
@@ -143,6 +154,7 @@ pub fn sandbox_request(
 ) -> Result<Value, String> {
     match SANDBOX.load(Ordering::SeqCst) {
         1 => process_request(kind, payload, limits),
+        #[cfg(feature = "wasm")]
         2 => wasm_request(kind, payload, limits),
         _ => Err("sandbox request without a sandbox".to_string()),
     }
@@ -268,10 +280,12 @@ pub fn install_landlock() -> Result<&'static str, String> {
 // ---------------------------------------------------------------------------
 // WASM engine
 
+#[cfg(feature = "wasm")]
 const WASM_RUNNER: &[u8] = include_bytes!("../wasm/qjs-runner.wasm");
 
 /// Linear memory the module declares up front (runtime, data segments and
 /// stack), in bytes. The view memory limit applies on top of it.
+#[cfg(feature = "wasm")]
 fn wasmi_baseline_memory(module: &wasmi::Module) -> usize {
     module
         .exports()
@@ -288,6 +302,7 @@ fn wasmi_baseline_memory(module: &wasmi::Module) -> usize {
 /// start, the configured view memory limit for the QuickJS heap, and room for
 /// the request and its parsed copy. The runner ignores the `memory` field in
 /// the request, so the host enforces the limit by refusing to grow past this.
+#[cfg(feature = "wasm")]
 pub(crate) fn wasm_memory_cap(
     baseline: usize,
     limits: crate::view::ViewLimits,
@@ -298,6 +313,7 @@ pub(crate) fn wasm_memory_cap(
         .saturating_add(body_len.saturating_mul(2))
 }
 
+#[cfg(feature = "wasm")]
 struct WasmEngineState {
     engine: wasmi::Engine,
     module: wasmi::Module,
@@ -305,11 +321,13 @@ struct WasmEngineState {
     linker: OnceLock<Result<wasmi::Linker<WasmData>, String>>,
 }
 
+#[cfg(feature = "wasm")]
 struct WasmData {
     wasi: wasmi_wasi::WasiCtx,
     limits: wasmi::StoreLimits,
 }
 
+#[cfg(feature = "wasm")]
 fn wasm_engine() -> Result<&'static WasmEngineState, String> {
     static ENGINE: OnceLock<Result<WasmEngineState, String>> = OnceLock::new();
     let state = ENGINE.get_or_init(|| {
@@ -341,6 +359,7 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
     }
 }
 
+#[cfg(feature = "wasm")]
 fn wasmi_linker(
     state: &'static WasmEngineState,
 ) -> Result<&'static wasmi::Linker<WasmData>, String> {
@@ -355,6 +374,7 @@ fn wasmi_linker(
     }
 }
 
+#[cfg(feature = "wasm")]
 fn wasm_request(
     kind: &str,
     payload: Value,
@@ -374,6 +394,7 @@ fn wasm_request(
     wasm_run(&body, limits)
 }
 
+#[cfg(feature = "wasm")]
 fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
     if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
         #[cfg(feature = "wasmtime")]
@@ -391,6 +412,7 @@ fn wasm_run(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, Strin
     wasmi_request(body, limits)
 }
 
+#[cfg(feature = "wasm")]
 fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, String> {
     let state = wasm_engine()?;
     // The linker is immutable after setup; build it once per process instead of
@@ -442,6 +464,7 @@ fn wasmi_request(body: &[u8], limits: crate::view::ViewLimits) -> Result<Value, 
 /// wasmi has no interrupt, so fuel is the only way to regain control; the
 /// slice adapts so a check happens roughly every `SLICE_TARGET` whatever the
 /// interpreter's speed (debug builds are orders of magnitude slower).
+#[cfg(feature = "wasm")]
 fn run_with_deadline(
     store: &mut wasmi::Store<WasmData>,
     start: &wasmi::TypedFunc<(), ()>,
@@ -958,6 +981,7 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    #[cfg(feature = "wasm")]
     fn wasmi_map(source: &str, limits: crate::view::ViewLimits) -> Result<Value, String> {
         let body = serde_json::to_vec(&json!({
             "kind": "map",
@@ -971,6 +995,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasmi_enforces_the_view_memory_limit() {
         let limits = crate::view::ViewLimits {
             timeout: Duration::from_secs(60),
@@ -988,6 +1013,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasmi_timeout_is_wall_clock() {
         let limits = crate::view::ViewLimits {
             timeout: Duration::from_millis(150),
@@ -1072,6 +1098,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasm_reduce_rejects_malformed_keys_and_values() {
         let limits = crate::view::ViewLimits {
             timeout: Duration::from_secs(60),
