@@ -27,19 +27,32 @@ fn exit_on_stdin_eof() {
     });
 }
 
-/// Run the server (or, with `--js-worker`, a sandboxed JS worker) until
-/// shutdown.
-pub async fn run(args: Args) -> anyhow::Result<()> {
-    if args.worker {
-        // Landlock first: its syscalls are not on the seccomp allowlist.
-        if let Err(error) = js::install_landlock().and_then(|landlock| {
-            js::install_seccomp()?;
-            js::run_worker_stdio(landlock)
-        }) {
+/// Run a sandboxed JS worker (`--js-worker`) on stdin/stdout until EOF.
+///
+/// This must run without an async runtime. A runtime's worker threads start
+/// asynchronously; if they are still initialising when the seccomp filter is
+/// installed, their syscalls are refused and the worker dies before it
+/// announces itself (seen under CPU load as "worker did not start").
+pub fn run_worker() -> ! {
+    // Landlock first: its syscalls are not on the seccomp allowlist.
+    let result = js::install_landlock().and_then(|landlock| {
+        js::install_seccomp()?;
+        js::run_worker_stdio(landlock)
+    });
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
             eprintln!("js worker: {error}");
             std::process::exit(1);
         }
-        return Ok(());
+    }
+}
+
+/// Run the server until shutdown. `--js-worker` is dispatched by the binary to
+/// [`run_worker`] before any runtime exists.
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    if args.worker {
+        anyhow::bail!("--js-worker must be started through run_worker, outside an async runtime");
     }
     if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
         exit_on_stdin_eof();

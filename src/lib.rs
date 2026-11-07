@@ -31,4 +31,4 @@ pub mod validate;
 pub mod view;
 
 pub use cli::{parse_args, Args};
-pub use server::run;
+pub use server::{run, run_worker};
