@@ -2,7 +2,8 @@ name: Weekly deep run
 
 # The slower checks that the per-PR workflow (ci.yml) leaves out: the WASM
 # sandbox (wasmi and the wasmtime backend) together with the native and process
-# sandboxes, and the PouchDB client suite. Also runnable on demand from the
+# sandboxes, the PouchDB client suite and a headless-Chromium PouchDB sync
+# across origins (real CORS). Also runnable on demand from the
 # Actions tab. The CouchDB differential fuzzing is not repeated here: it runs
 # nightly in nightly.yml.
 on:
@@ -73,3 +74,32 @@ jobs:
       - name: Stop douchdb
         if: always()
         run: docker rm -f douchdb-clients || true
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build douchdb image
+        run: docker build -t douchdb:browser .
+      - name: Start douchdb with CORS for the test page origin
+        run: |
+          # Published on all interfaces: the Playwright container reaches it
+          # through host.docker.internal, not through the loopback address.
+          docker run -d --name douchdb-browser -p 25986:5984 douchdb:browser \
+            --listen 0.0.0.0:5984 --data /data --admin admin:pass \
+            --cors-origins http://127.0.0.1:8099 --cors-credentials
+          for _ in $(seq 1 120); do
+            curl -fsS http://127.0.0.1:25986/ >/dev/null 2>&1 && exit 0
+            sleep 0.5
+          done
+          docker logs douchdb-browser
+          exit 1
+      - name: Browser PouchDB 9 sync (Chromium, cross-origin)
+        run: clients/pouchdb/run-browser.sh http://host.docker.internal:25986 admin:pass
+      - name: Server logs on failure
+        if: failure()
+        run: docker logs douchdb-browser || true
+      - name: Stop douchdb
+        if: always()
+        run: docker rm -f douchdb-browser || true

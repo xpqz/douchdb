@@ -873,7 +873,17 @@ npm ci
 node run.js http://127.0.0.1:5984
 ```
 
-See [clients/README.md](clients/README.md).
+A second check runs browser PouchDB in headless Chromium (Playwright, pinned
+Docker image) from a page on a different origin, so real CORS applies, and does
+a two-way sync with a conflict. Start douchdb with `--admin admin:pass
+--cors-origins http://127.0.0.1:8099 --cors-credentials`, then:
+
+```sh
+clients/pouchdb/run-browser.sh http://host.docker.internal:5984 admin:pass
+```
+
+It runs weekly in `.github/workflows/weekly.yml`. See
+[clients/README.md](clients/README.md).
 
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:
