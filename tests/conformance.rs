@@ -705,6 +705,89 @@ async fn cors_is_opt_in_and_answers_preflight() {
         .is_none());
 }
 
+/// CouchDB's `[cors]` defaults: `credentials = false`, and preflight only
+/// allows the configured headers rather than echoing whatever was asked for.
+#[tokio::test]
+async fn cors_credentials_and_headers_follow_couchdb_defaults() {
+    let preflight = |server: &Server, requested: &'static str| {
+        server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", "http://example.test")
+            .header("Access-Control-Request-Method", "PUT")
+            .header("Access-Control-Request-Headers", requested)
+            .send()
+    };
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+
+    // Default: no credentials, and a header outside the allowed list is refused.
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "content-type, authorization").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+    let allowed = header(&response, "access-control-allow-headers").unwrap_or_default();
+    assert!(allowed.contains("content-type"), "{allowed}");
+    assert_ne!(allowed, "content-type, authorization", "must not echo");
+    let response = preflight(&s, "x-evil-header").await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-origin").as_deref(),
+        Some("http://example.test")
+    );
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+
+    // Opt in to credentials and to an extra header.
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+            "--cors-credentials".to_string(),
+            "--cors-headers".to_string(),
+            "X-Custom-Header".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "x-custom-header, content-type")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+}
+
 #[tokio::test]
 async fn console_is_served_from_the_couchdb_api_origin() {
     let s = Server::start(false);
