@@ -562,13 +562,22 @@ fn spawn_quorum_writes(
 }
 
 /// Run one node's write as a detached task that reports which node and slots
-/// it answered for.
+/// it answered for. A panic is caught and reported as that node's failure: the
+/// join handle would otherwise lose the node and slots, and the tally would
+/// keep waiting for a reply that is never coming.
 fn spawn_node_write(
     node: usize,
     slots: Vec<usize>,
     write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
 ) -> tokio::task::JoinHandle<NodeReply> {
-    tokio::spawn(async move { (node, slots, write.await) })
+    use futures::FutureExt;
+    tokio::spawn(async move {
+        let result = std::panic::AssertUnwindSafe(write)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(ApiError::internal("replica write task panicked")));
+        (node, slots, result)
+    })
 }
 
 /// Return as soon as the tally is settled. The remaining replica writes keep
@@ -579,6 +588,8 @@ async fn collect_quorum(
     mut tally: QuorumTally<'_>,
 ) -> (Vec<Value>, bool) {
     while let Some(joined) = pending.next().await {
+        // Panics are caught in the task, so only a cancelled task (runtime
+        // shutdown) fails to join.
         let Ok((node, slots, response)) = joined else {
             continue;
         };
