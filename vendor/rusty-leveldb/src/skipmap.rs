@@ -13,10 +13,11 @@ const MAX_HEIGHT: usize = 12;
 const BRANCHING_FACTOR: u32 = 4;
 
 /// A node in a skipmap contains links to the next node and others that are further away (skips);
-/// `skips[0]` is the immediate element after, that is, the element contained in `next`.
+/// `skips[0]` is the immediate element after. Every node, including the head, is a heap allocation
+/// owned by the `InnerSkipMap` through `Box::into_raw`/`Box::from_raw`; no `Box` is ever moved while
+/// raw pointers into it exist (moving a `Box` invalidates such pointers under Stacked Borrows).
 struct Node {
     skips: Vec<Option<*mut Node>>,
-    next: Option<Box<Node>>,
     key: Bytes,
     value: Bytes,
 }
@@ -26,7 +27,7 @@ struct Node {
 /// `seek()` to the key to look up (this is as fast as any lookup in a skip map), and then call
 /// `current()`.
 struct InnerSkipMap {
-    head: Box<Node>,
+    head: *mut Node,
     rand: StdRng,
     len: usize,
     // approximation of memory used.
@@ -37,9 +38,18 @@ struct InnerSkipMap {
 impl Drop for InnerSkipMap {
     // Avoid possible stack overflow caused by dropping many nodes.
     fn drop(&mut self) {
-        let mut next_node = self.head.next.take();
-        while let Some(mut boxed_node) = next_node {
-            next_node = boxed_node.next.take();
+        let mut node = self.head;
+        while !node.is_null() {
+            // SAFETY: every node reachable from `head` through `skips[0]` is a live allocation made
+            // by `Box::into_raw` and owned only by this map, and is freed exactly once, here. The
+            // successor is read before the node is freed.
+            let boxed = unsafe { Box::from_raw(node) };
+            node = boxed
+                .skips
+                .first()
+                .copied()
+                .flatten()
+                .unwrap_or(std::ptr::null_mut());
         }
     }
 }
@@ -61,12 +71,11 @@ impl SkipMap {
 
         SkipMap {
             map: Rc::new(RefCell::new(InnerSkipMap {
-                head: Box::new(Node {
+                head: Box::into_raw(Box::new(Node {
                     skips: s,
-                    next: None,
                     key: Bytes::new(),
                     value: Bytes::new(),
-                }),
+                })),
                 rand: StdRng::seed_from_u64(0xdeadbeef),
                 len: 0,
                 approx_mem: size_of::<Self>() + MAX_HEIGHT * size_of::<Option<*mut Node>>(),
@@ -101,7 +110,7 @@ impl SkipMap {
     pub fn iter(&self) -> SkipMapIter {
         SkipMapIter {
             map: self.map.clone(),
-            current: self.map.borrow().head.as_ref() as *const Node,
+            current: self.map.borrow().head as *const Node,
         }
     }
 }
@@ -129,12 +138,15 @@ impl InnerSkipMap {
     /// Returns None if the given key lies past the greatest key in the table.
     fn get_greater_or_equal<'a>(&'a self, key: &[u8]) -> Option<&'a Node> {
         // Start at the highest skip link of the head node, and work down from there
-        let mut current = self.head.as_ref() as *const Node;
-        let mut level = self.head.skips.len() - 1;
+        let mut current = self.head as *const Node;
+        let mut level = MAX_HEIGHT - 1;
 
         loop {
+            // SAFETY: `current` is the head or a node reached through `skips`; all are live for as
+            // long as the map is borrowed (nodes are only freed in `Drop`).
             let current_node = unsafe { &*current };
             if let Some(next) = current_node.skips[level] {
+                // SAFETY: skip links point at live nodes owned by this map.
                 let next = unsafe { &*next };
                 let ord = self.cmp.cmp(next.key.iter().as_slice(), key);
 
@@ -157,8 +169,9 @@ impl InnerSkipMap {
             level -= 1;
         }
 
+        // SAFETY: `current` is the head or a live node (see above).
         unsafe {
-            if (current.is_null() || current == self.head.as_ref())
+            if (current.is_null() || current == self.head as *const Node)
                 || (self.cmp.cmp(&(*current).key, key) == Ordering::Less)
             {
                 None
@@ -172,12 +185,15 @@ impl InnerSkipMap {
     /// Returns None if no smaller key was found.
     fn get_next_smaller<'a>(&'a self, key: &[u8]) -> Option<&'a Node> {
         // Start at the highest skip link of the head node, and work down from there
-        let mut current = self.head.as_ref() as *const Node;
-        let mut level = self.head.skips.len() - 1;
+        let mut current = self.head as *const Node;
+        let mut level = MAX_HEIGHT - 1;
 
         loop {
+            // SAFETY: `current` is the head or a node reached through `skips`; all are live for as
+            // long as the map is borrowed (nodes are only freed in `Drop`).
             let current_node = unsafe { &*current };
             if let Some(next) = current_node.skips[level] {
+                // SAFETY: skip links point at live nodes owned by this map.
                 let next = unsafe { &*next };
                 let ord = self.cmp.cmp(next.key.iter().as_slice(), key);
 
@@ -193,8 +209,9 @@ impl InnerSkipMap {
             level -= 1;
         }
 
+        // SAFETY: `current` is the head or a live node (see above).
         unsafe {
-            if current.is_null() || current == self.head.as_ref() {
+            if current.is_null() || current == self.head as *const Node {
                 // If we're past the end for some reason or at the head
                 None
             } else if self.cmp.cmp(&(*current).key, key) != Ordering::Less {
@@ -214,7 +231,7 @@ impl InnerSkipMap {
         let prevs = &mut prevs[0..new_height];
 
         let mut level = MAX_HEIGHT - 1;
-        let mut current = self.head.as_mut() as *mut Node;
+        let mut current = self.head;
         // Set previous node for all levels to current node.
         (0..prevs.len()).for_each(|i| {
             prevs[i] = Some(current);
@@ -223,16 +240,18 @@ impl InnerSkipMap {
         // Find the node after which we want to insert the new node; this is the node with the key
         // immediately smaller than the key to be inserted.
         loop {
+            // SAFETY: `current` is the head or a live node; no `&mut` to any node exists here.
             let current_node = unsafe { &*current };
-            if let Some(next) = current_node.skips[level] {
-                let next = unsafe { &mut *next };
+            if let Some(next_ptr) = current_node.skips[level] {
+                // SAFETY: skip links point at live nodes owned by this map.
+                let next = unsafe { &*next_ptr };
                 // If the wanted position is after the current node
                 let ord = self.cmp.cmp(next.key.iter().as_slice(), &key);
 
                 assert!(ord != Ordering::Equal, "No duplicates allowed");
 
                 if ord == Ordering::Less {
-                    current = next;
+                    current = next_ptr;
                     continue;
                 }
             }
@@ -248,44 +267,41 @@ impl InnerSkipMap {
             }
         }
 
-        // Construct new node
+        // Construct the new node; its links are copied from the predecessors it is spliced after.
         let mut new_skips = Vec::new();
         new_skips.resize(new_height, None);
-        let mut new = Box::new(Node {
+        for (i, prev) in prevs.iter().enumerate() {
+            if let Some(prev) = prev {
+                // SAFETY: `prev` is the head or a live node; only a shared reference is used.
+                new_skips[i] = unsafe { (&(**prev).skips)[i] };
+            }
+        }
+        let added_mem = size_of::<Node>()
+            + size_of::<Option<*mut Node>>() * new_skips.len()
+            + key.len()
+            + val.len();
+        let newp = Box::into_raw(Box::new(Node {
             skips: new_skips,
-            next: None,
             key: key.into(),
             value: val.into(),
-        });
-        let newp = new.as_mut() as *mut Node;
+        }));
 
-        (0..new_height).for_each(|i| {
-            if let Some(prev) = prevs[i] {
-                let prev = unsafe { &mut *prev };
-                new.skips[i] = prev.skips[i];
-                prev.skips[i] = Some(newp);
+        for (i, prev) in prevs.iter().enumerate() {
+            if let Some(prev) = prev {
+                // SAFETY: `prev` is the head or a live node and no other reference to it exists;
+                // `newp` is never moved as a `Box`, so it stays valid for the map's lifetime.
+                unsafe { (&mut (**prev).skips)[i] = Some(newp) };
             }
-        });
+        }
 
-        let added_mem = size_of::<Node>()
-            + size_of::<Option<*mut Node>>() * new.skips.len()
-            + new.key.len()
-            + new.value.len();
         self.approx_mem += added_mem;
         self.len += 1;
-
-        // Insert new node by first replacing the previous element's next field with None and
-        // assigning its value to new.next...
-        new.next = unsafe { (*current).next.take() };
-        // ...and then setting the previous element's next field to the new node
-        unsafe {
-            let _ = (*current).next.replace(new);
-        };
     }
     /// Runs through the skipmap and prints everything including addresses
     fn dbg_print(&self) {
-        let mut current = self.head.as_ref() as *const Node;
+        let mut current = self.head as *const Node;
         loop {
+            // SAFETY: `current` is the head or a live node reached through `skips`.
             let current_node = unsafe { &*current };
             eprintln!(
                 "{:?} {:?}/{:?} - {:?}",
@@ -308,15 +324,14 @@ pub struct SkipMapIter {
 impl LdbIterator for SkipMapIter {
     fn advance(&mut self) -> bool {
         // we first go to the next element, then return that -- in order to skip the head node
-        let r = unsafe {
-            (*self.current)
-                .next
-                .as_ref()
-                .map(|next| {
-                    self.current = next.as_ref() as *const Node;
-                    true
-                })
-                .unwrap_or(false)
+        // SAFETY: `current` is the head or a live node, kept alive by the `Rc` to the map.
+        let next = unsafe { (*self.current).skips.first().copied().flatten() };
+        let r = match next {
+            Some(next) => {
+                self.current = next as *const Node;
+                true
+            }
+            None => false,
         };
         if !r {
             self.reset();
@@ -324,7 +339,7 @@ impl LdbIterator for SkipMapIter {
         r
     }
     fn reset(&mut self) {
-        self.current = self.map.borrow().head.as_ref();
+        self.current = self.map.borrow().head as *const Node;
     }
     fn seek(&mut self, key: &[u8]) {
         if let Some(node) = self.map.borrow().get_greater_or_equal(key) {
@@ -334,10 +349,11 @@ impl LdbIterator for SkipMapIter {
         self.reset();
     }
     fn valid(&self) -> bool {
-        self.current != self.map.borrow().head.as_ref()
+        self.current != self.map.borrow().head as *const Node
     }
     fn current(&self) -> Option<(Bytes, Bytes)> {
         if self.valid() {
+            // SAFETY: `current` is a live non-head node, kept alive by the `Rc` to the map.
             unsafe {
                 Some((
                     Bytes::copy_from_slice(&(*self.current).key),
@@ -354,6 +370,7 @@ impl LdbIterator for SkipMapIter {
             if let Some(prev) = self
                 .map
                 .borrow()
+                // SAFETY: `current` is a live non-head node (checked by `valid`).
                 .get_next_smaller(unsafe { &(*self.current).key })
             {
                 self.current = prev as *const Node;

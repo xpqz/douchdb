@@ -62,6 +62,11 @@ pub struct DB {
     cstats: [CompactionStats; NUM_LEVELS],
 }
 
+// SAFETY: `DB` holds `Rc`s (shared `Options` members, `DBIterator`, `Snapshot`) that are not
+// atomically counted. Sending a `DB` is sound only if no clone of those `Rc`s stays behind on the
+// old thread, i.e. no iterator or snapshot outlives the call that created it on the owning thread.
+// DouchDB guarantees this by confining each `DB` to its shard actor thread (`Shard` in
+// `src/store.rs`).
 unsafe impl Send for DB {}
 
 impl DB {
@@ -1854,9 +1859,18 @@ mod tests {
         db.compact_range(b"zzz", b"zzzz").unwrap();
 
         let snap = db.get_snapshot();
-        assert_eq!(db.get_at(&snap, b"m/B").unwrap().as_deref(), Some(&b"b1"[..]));
-        assert_eq!(db.get_at(&snap, b"m/A").unwrap().as_deref(), Some(&b"a2"[..]));
+        assert_eq!(
+            db.get_at(&snap, b"m/B").unwrap().as_deref(),
+            Some(&b"b1"[..])
+        );
+        assert_eq!(
+            db.get_at(&snap, b"m/A").unwrap().as_deref(),
+            Some(&b"a2"[..])
+        );
         assert_eq!(db.get_at(&snap, b"s/1").unwrap(), None);
-        assert_eq!(db.get_at(&snap, b"s/2").unwrap().as_deref(), Some(&b"B"[..]));
+        assert_eq!(
+            db.get_at(&snap, b"s/2").unwrap().as_deref(),
+            Some(&b"B"[..])
+        );
     }
 }
