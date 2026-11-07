@@ -401,121 +401,14 @@ pub async fn db_rest(
         "_local_docs" => return local_docs(req).await,
         "_changes" => return changes(st.clone(), db.clone(), req).await,
         "_revs_diff" => return revs_diff(req).await,
-        "_purge" => {
-            return match serde_json::from_slice::<Value>(&body) {
-                Ok(v) => match db.purge(&v).await {
-                    Ok(p) => {
-                        // A fully purged document is removed from `_changes`
-                        // entirely, so the view and search indexes cannot be
-                        // updated incrementally; rebuild them on the next query.
-                        if let Err(e) = crate::view::invalidate(&db).await {
-                            return fail(e);
-                        }
-                        if let Err(e) = crate::search::cleanup(&db).await {
-                            return fail(e);
-                        }
-                        json(StatusCode::OK, p)
-                    }
-                    Err(e) => fail(e),
-                },
-                Err(_) => fail(ApiError::bad_request("invalid JSON")),
-            };
-        }
-        "_compact" => {
-            let Ok(_permit) = st.compaction.try_acquire() else {
-                return fail(ApiError::new(
-                    409,
-                    "compaction_in_progress",
-                    "another compaction is already running on this node",
-                ));
-            };
-            if let Err(e) = db.compact().await {
-                return fail(e);
-            }
-            return json(StatusCode::ACCEPTED, json!({"ok": true}));
-        }
-        "_ensure_full_commit" => {
-            return match db.ensure_full_commit().await {
-                Ok(v) => json(StatusCode::CREATED, v),
-                Err(e) => fail(e),
-            }
-        }
-        "_revs_limit" => {
-            return match method {
-                Method::GET => match db.get_revs_limit().await {
-                    Ok(n) => json(StatusCode::OK, json!(n)),
-                    Err(e) => fail(e),
-                },
-                _ => {
-                    let limit = match serde_json::from_slice::<Value>(&body) {
-                        Ok(value) => match value.as_u64().filter(|limit| *limit > 0) {
-                            Some(limit) => limit,
-                            None => {
-                                return fail(ApiError::bad_request(
-                                    "`_revs_limit` must be a positive integer",
-                                ))
-                            }
-                        },
-                        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
-                    };
-                    match db.set_revs_limit(limit).await {
-                        Ok(()) => ok(),
-                        Err(e) => fail(e),
-                    }
-                }
-            }
-        }
-        "_security" => {
-            return match method {
-                Method::GET => json(StatusCode::OK, db.security()),
-                _ => {
-                    let value: Value = match serde_json::from_slice(&body) {
-                        Ok(value) => value,
-                        Err(_) => return fail(ApiError::bad_request("invalid security object")),
-                    };
-                    if let Err(error) = validate_security(&value) {
-                        return fail(error);
-                    }
-                    match crate::cluster_ops::set_security_everywhere(
-                        &st.ctx, &db, &name, value, &headers,
-                    )
-                    .await
-                    {
-                        Ok(true) => ok(),
-                        // Stored here and queued for the peers that did not
-                        // acknowledge it; anti-entropy delivers it.
-                        Ok(false) => json(StatusCode::ACCEPTED, json!({"ok": true})),
-                        Err(error) => fail(error),
-                    }
-                }
-            };
-        }
-        "_view_cleanup" => {
-            return match crate::view::cleanup(&db).await {
-                Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
-                Err(error) => fail(error),
-            }
-        }
-        "_search_cleanup" => {
-            return match crate::search::cleanup(&db).await {
-                Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
-                Err(error) => fail(error),
-            }
-        }
-        "_index_info" => {
-            let search = crate::search::all_indexes(&db);
-            let total_rows = search.len();
-            return json(
-                StatusCode::OK,
-                json!({
-                    "total_rows": total_rows,
-                    "bookmark": Value::Null,
-                    "view_indexes": [],
-                    "search_indexes": search,
-                    "nouveau_indexes": [],
-                }),
-            );
-        }
+        "_purge" => return purge(req).await,
+        "_compact" => return compact(req).await,
+        "_ensure_full_commit" => return ensure_full_commit(req).await,
+        "_revs_limit" => return revs_limit(req).await,
+        "_security" => return security(req).await,
+        "_view_cleanup" => return view_cleanup(req).await,
+        "_search_cleanup" => return search_cleanup(req).await,
+        "_index_info" => return index_info(req),
         "_local" => return fail(ApiError::bad_request("missing local doc id")),
         _ => {}
     }
@@ -615,6 +508,137 @@ pub async fn db_rest(
     }
 
     doc_request(req, &raw_rest).await
+}
+
+/// `POST /{db}/_purge`. A fully purged document is removed from `_changes`
+/// entirely, so the view and search indexes cannot be updated incrementally;
+/// they are rebuilt on the next query.
+async fn purge(req: DbRequest<'_>) -> Response {
+    let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
+        return fail(ApiError::bad_request("invalid JSON"));
+    };
+    let purged = match req.db.purge(&request).await {
+        Ok(purged) => purged,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = invalidate_indexes(req.db).await {
+        return fail(e);
+    }
+    json(StatusCode::OK, purged)
+}
+
+async fn invalidate_indexes(db: &Db) -> DbResult<()> {
+    crate::view::invalidate(db).await?;
+    crate::search::cleanup(db).await
+}
+
+/// `POST /{db}/_compact`.
+async fn compact(req: DbRequest<'_>) -> Response {
+    let Ok(_permit) = req.st.compaction.try_acquire() else {
+        return fail(ApiError::new(
+            409,
+            "compaction_in_progress",
+            "another compaction is already running on this node",
+        ));
+    };
+    if let Err(e) = req.db.compact().await {
+        return fail(e);
+    }
+    json(StatusCode::ACCEPTED, json!({"ok": true}))
+}
+
+/// `POST /{db}/_ensure_full_commit`.
+async fn ensure_full_commit(req: DbRequest<'_>) -> Response {
+    match req.db.ensure_full_commit().await {
+        Ok(v) => json(StatusCode::CREATED, v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET` or `PUT /{db}/_revs_limit`.
+async fn revs_limit(req: DbRequest<'_>) -> Response {
+    if *req.method == Method::GET {
+        return match req.db.get_revs_limit().await {
+            Ok(n) => json(StatusCode::OK, json!(n)),
+            Err(e) => fail(e),
+        };
+    }
+    let limit = match serde_json::from_slice::<Value>(req.body) {
+        Ok(value) => match value.as_u64().filter(|limit| *limit > 0) {
+            Some(limit) => limit,
+            None => {
+                return fail(ApiError::bad_request(
+                    "`_revs_limit` must be a positive integer",
+                ))
+            }
+        },
+        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+    };
+    match req.db.set_revs_limit(limit).await {
+        Ok(()) => ok(),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET` or `PUT /{db}/_security`.
+async fn security(req: DbRequest<'_>) -> Response {
+    if *req.method == Method::GET {
+        return json(StatusCode::OK, req.db.security());
+    }
+    let value: Value = match serde_json::from_slice(req.body) {
+        Ok(value) => value,
+        Err(_) => return fail(ApiError::bad_request("invalid security object")),
+    };
+    if let Err(error) = validate_security(&value) {
+        return fail(error);
+    }
+    match crate::cluster_ops::set_security_everywhere(
+        &req.st.ctx,
+        req.db,
+        req.name,
+        value,
+        req.headers,
+    )
+    .await
+    {
+        Ok(true) => ok(),
+        // Stored here and queued for the peers that did not acknowledge it;
+        // anti-entropy delivers it.
+        Ok(false) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+        Err(error) => fail(error),
+    }
+}
+
+/// `POST /{db}/_view_cleanup`.
+async fn view_cleanup(req: DbRequest<'_>) -> Response {
+    match crate::view::cleanup(req.db).await {
+        Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+        Err(error) => fail(error),
+    }
+}
+
+/// `POST /{db}/_search_cleanup`.
+async fn search_cleanup(req: DbRequest<'_>) -> Response {
+    match crate::search::cleanup(req.db).await {
+        Ok(()) => json(StatusCode::ACCEPTED, json!({"ok": true})),
+        Err(error) => fail(error),
+    }
+}
+
+/// `GET /{db}/_index_info`.
+fn index_info(req: DbRequest<'_>) -> Response {
+    let search = crate::search::all_indexes(req.db);
+    let total_rows = search.len();
+    json(
+        StatusCode::OK,
+        json!({
+            "total_rows": total_rows,
+            "bookmark": Value::Null,
+            "view_indexes": [],
+            "search_indexes": search,
+            "nouveau_indexes": [],
+        }),
+    )
 }
 
 /// Send a create or delete to every other node at once. Each answer is the
