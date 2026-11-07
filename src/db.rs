@@ -314,15 +314,15 @@ pub struct Db {
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
-    shard_map: Arc<std::sync::RwLock<ShardMap>>,
-    security: Arc<std::sync::RwLock<(u64, Value)>>,
+    shard_map: std::sync::RwLock<ShardMap>,
+    security: std::sync::RwLock<(u64, Value)>,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
-    compact_running: Arc<AtomicBool>,
+    compact_running: AtomicBool,
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
     /// seed the target replicas.
-    migration_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    migration_map: std::sync::RwLock<Option<ShardMap>>,
     /// Held shared by every cluster write for its full duration, including
     /// detached replica fan-out, and taken exclusively to drain them when a
     /// rebalance freezes the database.
@@ -330,7 +330,7 @@ pub struct Db {
     /// Unix-millisecond deadline for the cluster-wide write freeze, or zero
     /// when writes are allowed. A deadline lets peers recover if the
     /// coordinating node disappears mid-rebalance.
-    rebalance_until: Arc<AtomicU64>,
+    rebalance_until: AtomicU64,
     shards: Vec<ShardHandle>,
     /// Last committed sequence per shard, shared with the shard actors.
     committed_seq: Vec<Arc<AtomicU64>>,
@@ -341,13 +341,13 @@ pub struct Db {
     seq: Arc<AtomicU64>,
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
-    validation: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+    validation: std::sync::RwLock<Option<Vec<String>>>,
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
-    design_generation: Arc<AtomicU64>,
+    design_generation: AtomicU64,
     /// Validators merged from every node by a cluster coordinator, with the
     /// design generation and time they were loaded.
-    cluster_validation: Arc<std::sync::RwLock<Option<ClusterValidators>>>,
+    cluster_validation: std::sync::RwLock<Option<ClusterValidators>>,
 }
 
 /// Cluster-merged validators with the design generation and time they were
@@ -557,19 +557,19 @@ impl Db {
             partitioned: file.partitioned,
             uuid: file.uuid,
             instance_start_time: file.instance_start_time,
-            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
-            security: Arc::new(std::sync::RwLock::new(security)),
-            compact_running: Arc::new(AtomicBool::new(false)),
-            migration_map: Arc::new(std::sync::RwLock::new(None)),
+            shard_map: std::sync::RwLock::new(shard_map),
+            security: std::sync::RwLock::new(security),
+            compact_running: AtomicBool::new(false),
+            migration_map: std::sync::RwLock::new(None),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
-            rebalance_until: Arc::new(AtomicU64::new(0)),
+            rebalance_until: AtomicU64::new(0),
             shards,
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
-            validation: Arc::new(std::sync::RwLock::new(None)),
-            design_generation: Arc::new(AtomicU64::new(0)),
-            cluster_validation: Arc::new(std::sync::RwLock::new(None)),
+            validation: std::sync::RwLock::new(None),
+            design_generation: AtomicU64::new(0),
+            cluster_validation: std::sync::RwLock::new(None),
         })
     }
 
