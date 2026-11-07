@@ -202,6 +202,10 @@ pub async fn db_updates(
     }
 }
 
+/// CouchDB's `[chttpd] max_db_number_for_dbs_info_req` default: the most keys
+/// one `_dbs_info` request may name.
+const MAX_DBS_INFO_KEYS: usize = 100;
+
 pub async fn dbs_info(
     State(st): State<Arc<AppState>>,
     method: Method,
@@ -225,6 +229,11 @@ pub async fn dbs_info(
     let Some(keys) = keys else {
         return fail(ApiError::bad_request("`keys` must be a JSON array"));
     };
+    if keys.len() > MAX_DBS_INFO_KEYS {
+        return fail(ApiError::bad_request(format!(
+            "Number of DBs in keys exceeds limit ({MAX_DBS_INFO_KEYS})"
+        )));
+    }
     let mut results = Vec::new();
     for key in keys {
         let Some(name) = key.as_str() else {
