@@ -103,10 +103,7 @@ pub(crate) fn changes_watermark_from(
 ) -> u64 {
     let mut safe = u64::MAX;
     for index in 0..committed.len().min(reserved.len()) {
-        if owned
-            .map(|mask| !mask.get(index).copied().unwrap_or(false))
-            .unwrap_or(false)
-        {
+        if !shard_owned(owned, index) {
             continue;
         }
         if reserved[index] > committed[index] {
@@ -114,6 +111,12 @@ pub(crate) fn changes_watermark_from(
         }
     }
     safe
+}
+
+/// Whether the shard at `index` is selected by an `owned` mask: every shard
+/// when there is no mask, and never one the mask does not cover.
+fn shard_owned(owned: Option<&[bool]>, index: usize) -> bool {
+    owned.is_none_or(|owned| owned.get(index).copied().unwrap_or(false))
 }
 
 /// CouchDB partition-name rules: non-empty, no colon and not underscore-leading.
@@ -1369,10 +1372,7 @@ impl Db {
             {
                 continue;
             }
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, index) {
                 continue;
             }
             let opts = opts.clone();
@@ -1406,14 +1406,8 @@ impl Db {
     /// shards so replicas do not pay to index documents they never serve.
     pub async fn map_docs(&self, owned: Option<&[bool]>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
-        for (index, shard) in self.shards.iter().enumerate() {
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let mut shard_docs = shard
+        for index in self.selected_shards(owned) {
+            let mut shard_docs = self.shards[index]
                 .call(|s| {
                     // Build (or reuse) the live map, then read only bodies.
                     // This avoids decoding every full DocMeta record again for
@@ -1474,10 +1468,7 @@ impl Db {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
-            if owned
-                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, shard) {
                 total_rows = 0;
             } else {
                 let partition = partition.clone();
@@ -1486,14 +1477,8 @@ impl Db {
                     .await?;
             }
         } else {
-            for (index, shard) in self.shards.iter().enumerate() {
-                if owned
-                    .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                total_rows += shard.call(|s| Ok(s.counts().0)).await?;
+            for index in self.selected_shards(owned) {
+                total_rows += self.shards[index].call(|s| Ok(s.counts().0)).await?;
             }
         }
 
@@ -1526,10 +1511,7 @@ impl Db {
                 }
             }
             let shard = self.shard_index(key);
-            if owned
-                .map(|owned| !owned.get(shard).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
+            if !shard_owned(owned, shard) {
                 continue;
             }
             included[slot] = true;
@@ -1625,7 +1607,7 @@ impl Db {
     /// Indexes of the shards in `owned`, or every shard.
     fn selected_shards(&self, owned: Option<&[bool]>) -> Vec<usize> {
         (0..self.shards.len())
-            .filter(|index| owned.is_none_or(|owned| owned.get(*index).copied().unwrap_or(false)))
+            .filter(|index| shard_owned(owned, *index))
             .collect()
     }
 
@@ -1670,14 +1652,8 @@ impl Db {
         owned: Option<&[bool]>,
     ) -> DbResult<usize> {
         let mut pending = 0usize;
-        for (index, shard) in self.shards.iter().enumerate() {
-            if owned
-                .map(|owned| !owned.get(index).copied().unwrap_or(false))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            pending += shard
+        for index in self.selected_shards(owned) {
+            pending += self.shards[index]
                 .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
                 .await?;
         }
@@ -3598,6 +3574,23 @@ fn collect_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owned_mask_selects_only_the_shards_it_covers() {
+        assert!(shard_owned(None, 7));
+        let mask = [true, false, true];
+        assert!(shard_owned(Some(&mask), 0));
+        assert!(!shard_owned(Some(&mask), 1));
+        assert!(shard_owned(Some(&mask), 2));
+        // A shard beyond the mask is not owned.
+        assert!(!shard_owned(Some(&mask), 3));
+        // The watermark ignores shards the mask excludes.
+        assert_eq!(
+            changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, Some(&mask)),
+            u64::MAX
+        );
+        assert_eq!(changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, None), 1);
+    }
 
     #[test]
     fn db_dir_names_are_flat_and_reversible() {
