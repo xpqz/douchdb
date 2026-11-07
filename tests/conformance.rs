@@ -789,6 +789,46 @@ async fn cors_credentials_and_headers_follow_couchdb_defaults() {
     );
 }
 
+/// The console is the one HTML surface, so it carries a Content-Security-Policy.
+/// The Vue build compiles in-DOM templates at runtime, which needs
+/// `'unsafe-eval'`; everything else is locked down to the same origin.
+#[tokio::test]
+async fn console_responses_carry_a_content_security_policy() {
+    let s = Server::start(false);
+    for path in ["/_utils/", "/_utils/app.js", "/_utils/style.css"] {
+        let response = s
+            .client
+            .get(format!("{}{path}", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"));
+        for directive in [
+            "default-src 'none'",
+            "script-src 'self' 'unsafe-eval'",
+            "frame-ancestors 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+        ] {
+            assert!(csp.contains(directive), "{path}: {csp}");
+        }
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+    }
+    // API responses are JSON and get none.
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.headers().get("content-security-policy").is_none());
+}
+
 #[tokio::test]
 async fn console_is_served_from_the_couchdb_api_origin() {
     let s = Server::start(false);
