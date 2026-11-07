@@ -95,6 +95,8 @@ pub struct Config {
     /// When true, a database with an empty `_security` object is admin-only.
     /// This is the default whenever authentication is configured.
     pub default_admin_only: bool,
+    /// Databases kept open between requests.
+    pub max_open_dbs: usize,
 }
 
 /// CouchDB's answer to creating a database with an illegal name.
@@ -294,10 +296,69 @@ impl FsHealthCache {
     }
 }
 
+/// A node state over `root` for tests: one node, no peers, no auth.
+#[cfg(test)]
+pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
+    Arc::new(AppState {
+        root,
+        dbs: Default::default(),
+        db_locks: Default::default(),
+        fs_health: Default::default(),
+        config: Config {
+            q: 1,
+            revs_limit: 1000,
+            sync_secs: 60,
+            seeds: Vec::new(),
+            advertise: String::new(),
+            cors_origins: Vec::new(),
+            view_timeout_ms: 1000,
+            view_memory_mb: 1,
+            default_admin_only: true,
+            max_open_dbs,
+        },
+        ctx: ClusterCtx {
+            auth: None,
+            cluster: crate::cluster::Cluster {
+                nodes: Vec::new(),
+                me: 0,
+                n: 1,
+                secret: String::new(),
+            },
+            client: reqwest::Client::new(),
+        },
+        db_updates: Default::default(),
+        cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
+        admission: Arc::new(crate::admission::Admission::new(Default::default())),
+        compaction: Arc::new(tokio::sync::Semaphore::new(1)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Every database ever opened used to stay open, with its shard actors and
+    /// stores, until it was deleted.
+    #[tokio::test]
+    async fn open_databases_stay_within_the_cap() {
+        let root = std::env::temp_dir().join(format!("douchdb-dbcap-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 4);
+        for n in 0..12 {
+            let name = format!("db{n}");
+            st.create_db(&name, false, None, None).await.unwrap();
+            st.db(&name).await.unwrap();
+        }
+        // Reopen the first ones: they were closed, and come back from disk.
+        for n in 0..3 {
+            let db = st.db(&format!("db{n}")).await.unwrap();
+            db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        }
+        let open = st.dbs.read().await.len();
+        assert!(open <= 4, "{open} databases are open, cap is 4");
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn fs_health_cache_serves_within_the_ttl_only() {

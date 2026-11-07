@@ -737,6 +737,11 @@ impl Shard {
         Ok(self.corrupt_design.clone())
     }
 
+    #[cfg(test)]
+    pub fn latest_built(&self) -> bool {
+        self.latest.is_some()
+    }
+
     pub fn update_latest(
         &mut self,
         staged: &std::collections::HashMap<String, DocMeta>,

@@ -3865,6 +3865,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Finding the design documents used to build every shard's
+    /// id-to-sequence index, which then stays in memory for the database's life.
+    #[tokio::test]
+    async fn loading_validators_does_not_build_the_changes_index() {
+        let (db, root) = single_shard_db("ddoc-scan").await;
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/v", "validate_doc_update": "function(){}"}),
+                json!({"_id": "plain", "n": 1}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        db.shards[0]
+            .call(|shard| {
+                shard.invalidate_latest();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        let built = db.shards[0]
+            .call(|shard| Ok(shard.latest_built()))
+            .await
+            .unwrap();
+        assert!(!built, "the validator scan built the changes index");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn listings_skip_corrupt_records_and_point_reads_fail() {
         let (db, root) = single_shard_db("listing-corrupt").await;

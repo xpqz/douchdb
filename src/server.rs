@@ -160,6 +160,7 @@ fn build_state(
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
         default_admin_only,
+        max_open_dbs: 500,
     };
     Ok(Arc::new(AppState {
         root: args.data.clone(),

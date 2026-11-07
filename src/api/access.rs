@@ -90,6 +90,23 @@ pub(super) fn db_access(st: &AppState, principal: &Principal, db: &Db) -> Option
     }
 }
 
+/// The databases among `names` that `principal` may see.
+pub(crate) async fn visible_db_names(
+    st: &AppState,
+    principal: &Principal,
+    names: Vec<String>,
+) -> Vec<String> {
+    let mut visible = Vec::new();
+    for name in names {
+        if let Ok(db) = st.db(&name).await {
+            if db_access(st, principal, &db).is_some() {
+                visible.push(name);
+            }
+        }
+    }
+    visible
+}
+
 pub(super) fn require_db_access(
     st: &AppState,
     principal: &Principal,
@@ -217,4 +234,42 @@ pub(super) fn unauthorized() -> Response {
         StatusCode::UNAUTHORIZED,
         json!({"error": "unauthorized", "reason": "You are not authorized to access this db."}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A non-admin `_all_dbs` used to open every database on the node, and
+    /// keep it open, just to read its security object.
+    #[tokio::test]
+    async fn listing_visible_databases_does_not_open_them() {
+        let root = std::env::temp_dir().join(format!("douchdb-visible-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 500);
+        let mut names = Vec::new();
+        for n in 0..6 {
+            let name = format!("db{n}");
+            let db = st.create_db(&name, false, None, None).await.unwrap();
+            if n % 2 == 0 {
+                db.set_security(json!({"members": {"names": ["bob"]}}))
+                    .unwrap();
+            } else {
+                db.set_security(json!({"members": {"names": ["alice"]}}))
+                    .unwrap();
+            }
+            names.push(name);
+        }
+        st.dbs.write().await.clear();
+        let bob = Principal {
+            name: Some("bob".to_string()),
+            roles: Vec::new(),
+            admin: false,
+        };
+        let visible = visible_db_names(&st, &bob, names).await;
+        assert_eq!(visible, ["db0", "db2", "db4"]);
+        let open = st.dbs.read().await.len();
+        assert_eq!(open, 0, "{open} databases were opened to check access");
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
