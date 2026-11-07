@@ -18,7 +18,6 @@ pub mod js;
 pub mod js_wasmtime;
 pub mod json;
 pub mod metrics;
-pub mod observability;
 pub mod replicate;
 pub mod rev;
 pub mod revtree;

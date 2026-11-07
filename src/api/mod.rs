@@ -8,13 +8,13 @@ use crate::db::{
     ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
 };
 use crate::fabric::*;
-pub use crate::observability::{health_public, health_status, metrics_status};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
+pub use observability::{health_public, health_status, metrics_status};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,7 +87,7 @@ pub struct AppState {
     /// Bound concurrent `_compact` requests across databases on this node.
     pub compaction: Arc<tokio::sync::Semaphore>,
     /// Recent result of the health check's blocking filesystem probe.
-    pub fs_health: crate::observability::FsHealthCache,
+    pub fs_health: observability::FsHealthCache,
 }
 
 #[derive(Clone)]
@@ -624,6 +624,7 @@ mod database;
 mod documents;
 mod middleware;
 mod node;
+mod observability;
 mod root;
 mod session;
 mod views;

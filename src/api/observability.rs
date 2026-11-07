@@ -3,7 +3,7 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use crate::api::{access_denied, flag, internal_request, query, AppState};
+use super::{access_denied, flag, internal_request, query, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
@@ -881,7 +881,7 @@ pub async fn metrics_status(
             "http": {"total": local["http"]["total"], "errors": local["http"]["errors"]},
             "storage": local["storage"],
         }]);
-        return crate::api::json(StatusCode::OK, value);
+        return super::json(StatusCode::OK, value);
     }
 
     let peers: Vec<(usize, String)> = st
@@ -993,7 +993,7 @@ pub async fn metrics_status(
     }
     value["health"]["status"] = json!(health_status_name(worst));
     value["health"]["ok"] = json!(worst == 0);
-    crate::api::json(StatusCode::OK, value)
+    super::json(StatusCode::OK, value)
 }
 
 pub async fn health_status(
@@ -1010,7 +1010,7 @@ pub async fn health_status(
     let cluster_requested =
         flag(&q, "cluster") && st.cluster.is_clustered() && !st.cluster.is_internal(&headers);
     if !cluster_requested {
-        return crate::api::json(StatusCode::OK, local);
+        return super::json(StatusCode::OK, local);
     }
     let peers: Vec<(usize, String)> = st
         .cluster
@@ -1076,7 +1076,7 @@ pub async fn health_status(
             }
         }
     }
-    crate::api::json(
+    super::json(
         StatusCode::OK,
         json!({
             "status": health_status_name(worst),
@@ -1113,7 +1113,7 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
-    crate::api::json(
+    super::json(
         status,
         json!({
             "status": health["status"],
