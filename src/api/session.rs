@@ -2,8 +2,7 @@
 
 use super::*;
 
-pub async fn session_get(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
+pub async fn session_get(Caller(principal): Caller, headers: HeaderMap) -> Response {
     let had_credentials =
         headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE);
     if had_credentials && !principal.is_authenticated() {

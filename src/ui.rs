@@ -18,6 +18,15 @@ const CODEMIRROR_JS_MODE: &str =
     include_str!("../ui/vendor/codemirror/mode/javascript/javascript.js");
 const FAVICON: &str = include_str!("../ui/favicon.svg");
 
+/// Policy for the console. The vendored Vue build compiles the in-DOM
+/// templates at runtime (`Function(...)`), which needs `'unsafe-eval'`; moving
+/// to precompiled templates would let it go. `connect-src` is open to
+/// http(s) because the console's server URL can point at another node.
+const CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-eval'; \
+    style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+    connect-src 'self' http: https:; form-action 'self'; \
+    base-uri 'none'; object-src 'none'; frame-ancestors 'none'";
+
 pub async fn redirect() -> Redirect {
     Redirect::permanent("/_utils/")
 }
@@ -28,6 +37,7 @@ pub async fn index() -> Response {
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_SECURITY_POLICY, CSP),
         ],
         INDEX,
     )
@@ -69,6 +79,7 @@ pub async fn asset(Path(path): Path<String>) -> Response {
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, cache),
+            (header::CONTENT_SECURITY_POLICY, CSP),
         ],
         body,
     )

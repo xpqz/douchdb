@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Exit when stdin reaches EOF. Test harnesses set `DOUCHDB_EXIT_ON_STDIN_EOF`
 /// and hold the write end of a stdin pipe, so a server dies with its parent even
@@ -49,9 +50,32 @@ pub fn run_worker() -> ! {
     }
 }
 
-/// Choose the JS sandbox from `--js-sandbox` and `--wasm-runtime`, exiting with
-/// status 2 on a value the CLI does not know.
-fn configure_js_sandbox(args: &Args) {
+/// How long a shutdown may take, from the first SIGTERM/SIGINT, before the
+/// server gives up on a clean stop and exits anyway.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long the final telemetry flush may take.
+const TELEMETRY_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A configuration the server refuses to start with. The binary exits with
+/// status 2 after printing it.
+#[derive(Debug)]
+pub struct ConfigError(String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+fn config_error(message: impl Into<String>) -> ConfigError {
+    ConfigError(message.into())
+}
+
+/// Choose the JS sandbox from `--js-sandbox` and `--wasm-runtime`.
+fn configure_js_sandbox(args: &Args) -> Result<(), ConfigError> {
     match args.js_sandbox.as_str() {
         "native" => js::configure(js::Sandbox::Native, args.js_workers),
         "process" => js::configure(js::Sandbox::Process, args.js_workers),
@@ -61,36 +85,50 @@ fn configure_js_sandbox(args: &Args) {
                 "wasmi" => js::WasmRuntime::Wasmi,
                 "wasmtime" => js::WasmRuntime::Wasmtime,
                 other => {
-                    eprintln!("unknown --wasm-runtime value: {other} (expected wasmi or wasmtime)");
-                    std::process::exit(2);
+                    return Err(config_error(format!(
+                        "unknown --wasm-runtime value: {other} (expected wasmi or wasmtime)"
+                    )));
                 }
             };
-            if let Err(error) = js::set_wasm_runtime(runtime) {
-                eprintln!("{error}");
-                std::process::exit(2);
-            }
+            js::set_wasm_runtime(runtime).map_err(|error| config_error(error.to_string()))?;
         }
         other => {
-            eprintln!("unknown --js-sandbox value: {other} (expected native, process or wasm)");
-            std::process::exit(2);
+            return Err(config_error(format!(
+                "unknown --js-sandbox value: {other} (expected native, process or wasm)"
+            )));
         }
     }
+    Ok(())
 }
 
-/// Refuse a cluster configuration that cannot work or is not safe, exiting with
-/// status 2.
-fn check_cluster_args(args: &Args) {
+/// Refuse a cluster configuration that cannot work or is not safe.
+fn check_cluster_args(args: &Args) -> Result<(), ConfigError> {
     if args.nodes.len() > 1 {
         if args.me >= args.nodes.len() {
-            eprintln!("--me must be smaller than the number of --nodes");
-            std::process::exit(2);
+            return Err(config_error(
+                "--me must be smaller than the number of --nodes",
+            ));
         }
         if args.cluster_secret.trim().len() < 16 {
-            eprintln!(
-                "--cluster-secret of at least 16 characters is required with more than one --nodes entry"
-            );
-            std::process::exit(2);
+            return Err(config_error(
+                "--cluster-secret of at least 16 characters is required with more than one --nodes entry",
+            ));
         }
+    }
+    Ok(())
+}
+
+/// Check every option whose value the CLI parser cannot, and apply the JS
+/// sandbox choice. Runs before anything else starts, so a bad configuration
+/// leaves nothing behind.
+fn validate_config(args: &Args) -> Result<(), ConfigError> {
+    configure_js_sandbox(args)?;
+    check_cluster_args(args)?;
+    match args.default_security.as_str() {
+        "open" | "admin-only" | "" => Ok(()),
+        other => Err(config_error(format!(
+            "unknown --default-security value: {other} (expected open or admin-only)"
+        ))),
     }
 }
 
@@ -135,11 +173,8 @@ fn default_admin_only(args: &Args, auth: &Option<Auth>) -> bool {
     match args.default_security.as_str() {
         "open" => false,
         "admin-only" => true,
-        "" => auth.is_some(),
-        other => {
-            eprintln!("unknown --default-security value: {other} (expected open or admin-only)");
-            std::process::exit(2);
-        }
+        // Anything else was refused by `validate_config`.
+        _ => auth.is_some(),
     }
 }
 
@@ -157,6 +192,12 @@ fn build_state(
         seeds: args.seed_nodes.clone(),
         advertise,
         cors_origins: args.cors_origins.clone(),
+        cors_credentials: args.cors_credentials,
+        cors_headers: args
+            .cors_headers
+            .iter()
+            .map(|header| header.to_ascii_lowercase())
+            .collect(),
         view_timeout_ms: args.view_timeout_ms.max(1),
         view_memory_mb: args.view_memory_mb.max(1),
         default_admin_only,
@@ -178,6 +219,7 @@ fn build_state(
             heavy_in_flight: args.heavy_in_flight,
             heavy_per_user: args.heavy_per_user,
             background_in_flight: args.background_in_flight,
+            ..Default::default()
         })),
         ctx: ClusterCtx {
             cluster: Cluster {
@@ -194,6 +236,7 @@ fn build_state(
         },
         db_updates: api::DbUpdates::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
+        shutdown: CancellationToken::new(),
     }))
 }
 
@@ -285,8 +328,36 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Start a graceful shutdown on the first SIGTERM (Docker, systemd) or SIGINT
+/// (Ctrl-C). The handlers are installed here, before the caller binds the
+/// listener, so a signal sent as soon as the server answers is never lost.
+/// Later signals are logged and ignored: the shutdown deadline bounds the stop.
+fn handle_signals(shutdown: CancellationToken) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    tokio::spawn(async move {
+        loop {
+            let name = tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            };
+            if shutdown.is_cancelled() {
+                tracing::info!("{name} received; already shutting down");
+            } else {
+                tracing::info!("{name} received; shutting down");
+                shutdown.cancel();
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Run the server until shutdown. `--js-worker` is dispatched by the binary to
 /// [`run_worker`] before any runtime exists.
+///
+/// A configuration error is returned as a [`ConfigError`]. Telemetry is
+/// flushed on every path that got as far as starting it.
 pub async fn run(args: Args) -> anyhow::Result<()> {
     if args.worker {
         anyhow::bail!("--js-worker must be started through run_worker, outside an async runtime");
@@ -294,11 +365,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
         exit_on_stdin_eof();
     }
-    configure_js_sandbox(&args);
+    validate_config(&args)?;
     crate::index_cache::set_max_open(args.max_open_indexes);
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
-    check_cluster_args(&args);
-    if args.cors_origins.iter().any(|origin| origin == "*") {
+    let result = serve(&args).await;
+    if let Some(telemetry) = telemetry {
+        let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
+        if tokio::time::timeout(TELEMETRY_FLUSH_DEADLINE, flush)
+            .await
+            .is_err()
+        {
+            tracing::warn!("telemetry flush did not finish in time");
+        }
+    }
+    result
+}
+
+/// Start the node and serve until a shutdown signal, then stop the background
+/// tasks and close the databases, all within [`SHUTDOWN_DEADLINE`] of the signal.
+async fn serve(args: &Args) -> anyhow::Result<()> {
+    if args.cors_credentials && args.cors_origins.iter().any(|origin| origin == "*") {
         tracing::warn!(
             "CORS allows any origin and sends credentials; any website can act as a logged-in user"
         );
@@ -306,18 +392,21 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.data)?;
     crate::db::migrate_nested_dbs(&args.data).map_err(anyhow::Error::msg)?;
 
-    let advertise = advertise_url(&args);
-    let auth = build_auth(&args)?;
-    let state = build_state(&args, auth, advertise)?;
+    let advertise = advertise_url(args);
+    let auth = build_auth(args)?;
+    let state = build_state(args, auth, advertise)?;
+    let shutdown = state.shutdown.clone();
+    handle_signals(shutdown.clone())?;
+    let mut tasks = Vec::new();
     if state.ctx.cluster.is_clustered() {
-        replicate::spawn_anti_entropy(state.clone());
+        tasks.push(replicate::spawn_anti_entropy(state.clone()));
         tracing::info!("cluster mode: node {} of {}", args.me, args.nodes.len());
     }
     if state.ctx.cluster.is_clustered() || !state.config.seeds.is_empty() {
-        discovery::spawn(state.clone());
+        tasks.push(discovery::spawn(state.clone()));
     }
 
-    let app = build_router(&args, state);
+    let app = build_router(args, state.clone());
 
     // Streamed responses are written in several pieces. With Nagle's algorithm
     // a later piece waits for the client's delayed ACK of the first, adding
@@ -330,13 +419,37 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             }
         });
     tracing::info!("douchdb listening on {}", args.listen);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    if let Some(telemetry) = telemetry {
-        telemetry.shutdown();
+    let graceful = async {
+        let served = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .await;
+        // Also stops the tasks and feeds when the server failed on its own.
+        shutdown.cancel();
+        for task in tasks {
+            let _ = task.await;
+        }
+        close_databases(&state).await;
+        served.map_err(anyhow::Error::from)
+    };
+    tokio::select! {
+        result = graceful => result,
+        () = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_DEADLINE).await;
+        } => Err(anyhow::anyhow!(
+            "shutdown did not finish within {} s; exiting anyway",
+            SHUTDOWN_DEADLINE.as_secs()
+        )),
     }
-    Ok(())
+}
+
+/// Drop every open database off the async threads. Each one joins its shard
+/// actors, which finish their queued writes first, so a restart finds every
+/// acknowledged write.
+async fn close_databases(state: &AppState) {
+    let open = std::mem::take(&mut *state.dbs.write().await);
+    if open.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || drop(open)).await;
 }

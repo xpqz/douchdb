@@ -6,57 +6,79 @@ use crate::cluster_http::ClusterCtx;
 use crate::db::{ApiError, Db, DbConfig, DbResult};
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
+/// How many events `_db_updates` remembers.
+const DB_UPDATES_KEPT: usize = 5000;
+
+struct DbEvent {
+    seq: u64,
+    db_name: String,
+    kind: String,
+}
+
 #[derive(Default)]
 pub struct DbUpdates {
-    seq: AtomicU64,
-    events: Mutex<Vec<Value>>,
+    events: Mutex<DbEvents>,
+}
+
+#[derive(Default)]
+struct DbEvents {
+    seq: u64,
+    /// Oldest first, strictly increasing in `seq`.
+    kept: VecDeque<DbEvent>,
 }
 
 impl DbUpdates {
     pub(crate) fn record(&self, name: &str, kind: &str) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut events = self
             .events
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        events.push(json!({
-            "seq": seq.to_string(),
-            "db_name": name,
-            "type": kind,
-        }));
-        if events.len() > 5000 {
-            let excess = events.len() - 5000;
-            events.drain(0..excess);
+        // The sequence is assigned under the lock so the deque stays ordered.
+        events.seq += 1;
+        let seq = events.seq;
+        if events.kept.len() >= DB_UPDATES_KEPT {
+            events.kept.pop_front();
         }
+        events.kept.push_back(DbEvent {
+            seq,
+            db_name: name.to_string(),
+            kind: kind.to_string(),
+        });
     }
 
     pub(crate) fn current(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
+        self.events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .seq
     }
 
+    /// The events after `after`, oldest first, and the current sequence.
     pub(crate) fn since(&self, after: u64) -> (Vec<Value>, u64) {
         let events = self
             .events
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let first = events.kept.partition_point(|event| event.seq <= after);
         let results = events
+            .kept
             .iter()
-            .filter(|event| {
-                event["seq"]
-                    .as_str()
-                    .and_then(|seq| seq.parse::<u64>().ok())
-                    .map(|seq| seq > after)
-                    .unwrap_or(false)
+            .skip(first)
+            .map(|event| {
+                json!({
+                    "seq": event.seq.to_string(),
+                    "db_name": event.db_name,
+                    "type": event.kind,
+                })
             })
-            .cloned()
             .collect();
-        (results, self.current())
+        (results, events.seq)
     }
 }
 
@@ -106,6 +128,9 @@ pub struct AppState {
     pub compaction: Arc<tokio::sync::Semaphore>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,
+    /// Cancelled when the server starts shutting down. Streaming feeds end
+    /// (with their trailer) and background tasks stop.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone)]
@@ -117,9 +142,15 @@ pub struct Config {
     pub seeds: Vec<String>,
     /// The URL this node advertises in cluster management views.
     pub advertise: String,
-    /// Empty disables CORS. `*` allows any origin (echoed back so credentials
-    /// work); entries may be exact origins or `https://*.example.com`.
+    /// Empty disables CORS. `*` allows any origin (the request origin is
+    /// echoed back, as CouchDB does); entries may be exact origins or `https://*.example.com`.
     pub cors_origins: Vec<String>,
+    /// Send `Access-Control-Allow-Credentials: true` (CouchDB `[cors]
+    /// credentials`, default false).
+    pub cors_credentials: bool,
+    /// Request headers a preflight may ask for, replacing CouchDB's default
+    /// list when non-empty (CouchDB `[cors] headers`), lowercase.
+    pub cors_headers: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     /// When true, a database with an empty `_security` object is admin-only.
@@ -367,10 +398,6 @@ impl AppState {
         }
         principal
     }
-
-    pub(crate) fn authorized(&self, headers: &HeaderMap) -> bool {
-        self.principal(headers).is_authenticated()
-    }
 }
 
 /// How long the filesystem part of the health check is reused. `/_health` is
@@ -411,6 +438,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         dbs: Default::default(),
         db_locks: Default::default(),
         fs_health: Default::default(),
+        shutdown: Default::default(),
         config: Config {
             q: 1,
             revs_limit: 1000,
@@ -418,6 +446,8 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             seeds: Vec::new(),
             advertise: String::new(),
             cors_origins: Vec::new(),
+            cors_credentials: false,
+            cors_headers: Vec::new(),
             view_timeout_ms: 1000,
             view_memory_mb: 1,
             default_admin_only: true,
@@ -515,5 +545,23 @@ mod tests {
         let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
         assert_eq!(hit.map(|value| value.unreadable), Some(3));
         assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
+    }
+
+    #[test]
+    fn db_updates_keeps_the_newest_events_in_order() {
+        let updates = DbUpdates::default();
+        for i in 0..(DB_UPDATES_KEPT + 10) {
+            updates.record(&format!("db{i}"), "updated");
+        }
+        let total = (DB_UPDATES_KEPT + 10) as u64;
+        let (all, current) = updates.since(0);
+        assert_eq!(current, total);
+        assert_eq!(all.len(), DB_UPDATES_KEPT);
+        assert_eq!(all[0]["seq"], "11");
+        assert_eq!(all[0]["db_name"], "db10");
+        let (tail, _) = updates.since(total - 2);
+        let seqs: Vec<&str> = tail.iter().filter_map(|e| e["seq"].as_str()).collect();
+        assert_eq!(seqs, [(total - 1).to_string(), total.to_string()]);
+        assert!(updates.since(total).0.is_empty());
     }
 }

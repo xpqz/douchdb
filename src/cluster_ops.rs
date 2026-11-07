@@ -172,6 +172,62 @@ async fn fetch_shard_states(
     Some(out)
 }
 
+/// Every node that holds a replica of any shard in any of `maps`.
+fn owners_of(maps: &[&ShardMap]) -> Vec<usize> {
+    let owners: std::collections::BTreeSet<usize> = maps
+        .iter()
+        .flat_map(|map| map.replicas.iter().flatten().copied())
+        .collect();
+    owners.into_iter().collect()
+}
+
+/// Shard states from `nodes`, indexed by node. Nodes outside `nodes` are not
+/// asked and read as unreachable, which `source_required` never looks at.
+async fn fetch_states(
+    ctx: &ClusterCtx,
+    db: &Arc<Db>,
+    nodes: &[usize],
+    headers: &HeaderMap,
+    with_digest: bool,
+) -> Vec<Option<Vec<ShardState>>> {
+    let fetched = futures::future::join_all(
+        nodes
+            .iter()
+            .map(|node| fetch_shard_states(ctx, db, *node, headers, with_digest)),
+    )
+    .await;
+    let mut states = vec![None; ctx.cluster.nodes.len().max(1)];
+    for (node, state) in nodes.iter().zip(fetched) {
+        if let Some(slot) = states.get_mut(*node) {
+            *slot = state;
+        }
+    }
+    states
+}
+
+/// A poll interval that doubles from `first` to `cap` milliseconds, so a long
+/// wait does not scan every shard on every node ten times a second.
+struct Backoff {
+    next: u64,
+    cap: u64,
+}
+
+impl Backoff {
+    fn new(first: u64, cap: u64) -> Backoff {
+        Backoff { next: first, cap }
+    }
+
+    fn next(&mut self) -> std::time::Duration {
+        let current = self.next;
+        self.next = (current * 2).min(self.cap);
+        std::time::Duration::from_millis(current)
+    }
+}
+
+fn remaining(deadline: std::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(std::time::Instant::now())
+}
+
 fn same_shard_content(left: &ShardState, right: &ShardState) -> bool {
     left.docs == right.docs && left.deleted == right.deleted && left.digest == right.digest
 }
@@ -220,12 +276,10 @@ async fn stable_source_states(
     grace: std::time::Duration,
 ) -> DbResult<Vec<ShardState>> {
     let deadline = std::time::Instant::now() + grace;
+    let owners = owners_of(&[old_map]);
+    let mut delay = Backoff::new(100, 1_000);
     loop {
-        let states = futures::future::join_all(
-            (0..ctx.cluster.nodes.len())
-                .map(|node| fetch_shard_states(ctx, db, node, headers, true)),
-        )
-        .await;
+        let states = fetch_states(ctx, db, &owners, headers, true).await;
         if let Some(required) = source_required(&states, old_map, db.q, true) {
             return Ok(required);
         }
@@ -236,7 +290,7 @@ async fn stable_source_states(
                 "old replicas did not agree on a stable content digest",
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(delay.next().min(remaining(deadline))).await;
     }
 }
 
@@ -249,17 +303,19 @@ async fn wait_for_rebalance(
     timeout_ms: u64,
 ) -> DbResult<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let owners = owners_of(&[old_map, map]);
+    let mut delay = Backoff::new(250, 2_000);
+    // Per node and shard, the sequence the last failed digest comparison saw.
+    // A digest scans every document of the shard, and a shard whose sequence
+    // has not moved has the same digest, so it is not asked again.
+    let mut compared: Option<Vec<Option<Vec<u64>>>> = None;
     loop {
         // Recompute the source state each round. Once writes are frozen the
         // source stops moving, so this converges on the latest acknowledged
         // state rather than a snapshot taken before an in-flight write landed.
         // Counts are cheap and prune most retry rounds; compare digests only
         // after every target has caught up on the source counts.
-        let counts = futures::future::join_all(
-            (0..ctx.cluster.nodes.len())
-                .map(|node| fetch_shard_states(ctx, db, node, headers, false)),
-        )
-        .await;
+        let counts = fetch_states(ctx, db, &owners, headers, false).await;
         let counts_ready = source_required(&counts, old_map, db.q, false)
             .map(|required| {
                 (0..db.q).all(|shard| {
@@ -279,12 +335,16 @@ async fn wait_for_rebalance(
                 })
             })
             .unwrap_or(false);
-        if counts_ready {
-            let digests = futures::future::join_all(
-                (0..ctx.cluster.nodes.len())
-                    .map(|node| fetch_shard_states(ctx, db, node, headers, true)),
-            )
-            .await;
+        let seqs = counts
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|shards| shards.iter().map(|shard| shard.seq).collect())
+            })
+            .collect::<Vec<_>>();
+        if counts_ready && compared.as_ref() != Some(&seqs) {
+            let digests = fetch_states(ctx, db, &owners, headers, true).await;
             let ready = source_required(&digests, old_map, db.q, true)
                 .map(|required| {
                     (0..db.q).all(|shard| {
@@ -309,6 +369,14 @@ async fn wait_for_rebalance(
             if ready {
                 return Ok(());
             }
+            // An unreachable node says nothing about the content, so only a
+            // comparison that heard from every owner is remembered.
+            if owners
+                .iter()
+                .all(|node| digests.get(*node).is_some_and(Option::is_some))
+            {
+                compared = Some(seqs);
+            }
         }
 
         if std::time::Instant::now() >= deadline {
@@ -318,7 +386,7 @@ async fn wait_for_rebalance(
                 "new replicas did not match the old shard content before the timeout",
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(delay.next().min(remaining(deadline))).await;
     }
 }
 
@@ -508,7 +576,66 @@ async fn activate_map_everywhere(
     ))
 }
 
-/// Move a database to the balanced placement for the current cluster. Client
+/// The freeze, copy and activation steps of a rebalance to `map`. The caller
+/// holds the rebalance flag; every path out of here releases it.
+async fn migrate(
+    ctx: &ClusterCtx,
+    db: &Arc<Db>,
+    name: &str,
+    old_map: &ShardMap,
+    map: &ShardMap,
+    headers: &HeaderMap,
+    timeout_ms: u64,
+) -> DbResult<Value> {
+    // Broadcast the migration map first: it freezes writes on every peer and
+    // lets anti-entropy seed the target replicas while reads stay on the old
+    // active map.
+    if let Err(error) = set_migration_everywhere(ctx, db, name, map, headers).await {
+        db.set_rebalance_in_progress(false);
+        return Err(error);
+    }
+
+    if let Err(error) = stable_source_states(
+        ctx,
+        db,
+        old_map,
+        headers,
+        // Allow slow digest scans plus any in-flight write to settle.
+        std::time::Duration::from_millis(10_000),
+    )
+    .await
+    {
+        clear_migration_everywhere(ctx, db, name, headers).await;
+        db.set_rebalance_in_progress(false);
+        return Err(error);
+    }
+
+    if let Err(error) = wait_for_rebalance(ctx, db, old_map, map, headers, timeout_ms).await {
+        // The active map never changed, so reads continued on the old owners
+        // throughout the migration attempt.
+        clear_migration_everywhere(ctx, db, name, headers).await;
+        db.set_rebalance_in_progress(false);
+        if error.status == 504 {
+            crate::telemetry::record_rebalance_timeout();
+        }
+        return Err(error);
+    }
+
+    if let Err(error) = activate_map_everywhere(ctx, db, name, map, headers).await {
+        clear_migration_everywhere(ctx, db, name, headers).await;
+        db.set_rebalance_in_progress(false);
+        return Err(error);
+    }
+    clear_migration_everywhere(ctx, db, name, headers).await;
+    db.set_rebalance_in_progress(false);
+
+    let mut value = json!(map);
+    value["pending"] = json!(false);
+    Ok(value)
+}
+
+/// Move a database to the placement creation would give it on the current
+/// cluster; a database already there is left alone. Client
 /// writes are frozen on every node while the target replicas catch up, and
 /// reads stay on the old map until the new one is activated. With `cleanup`,
 /// every node then clears the shards it no longer owns. Returns the new map
@@ -532,56 +659,29 @@ pub(crate) async fn rebalance(
     }
     crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
-    let mut map = ShardMap::balanced(db.q, ctx.cluster.nodes.len().max(1), old_map.n());
-    map.version = old_map.version.saturating_add(1);
-    // Broadcast the migration map first: it freezes writes on every peer and
-    // lets anti-entropy seed the target replicas while reads stay on the old
-    // active map.
-    if let Err(error) = set_migration_everywhere(ctx, db, name, &map, headers).await {
-        db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
-
-    if let Err(error) = stable_source_states(
-        ctx,
-        db,
-        &old_map,
-        headers,
-        // Allow slow digest scans plus any in-flight write to settle.
-        std::time::Duration::from_millis(10_000),
-    )
-    .await
+    // The placement creation uses, so a cluster that has not changed since the
+    // database was made is already where it should be.
+    let map = ctx.cluster.shard_map_n(db.q, old_map.n());
+    let value = if map.q == old_map.q
+        && map.node_count == old_map.node_count
+        && map.replicas == old_map.replicas
     {
-        clear_migration_everywhere(ctx, db, name, headers).await;
+        // Nothing to move: do not freeze writes or bump the version.
         db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
-
-    if let Err(error) = wait_for_rebalance(ctx, db, &old_map, &map, headers, timeout_ms).await {
-        // The active map never changed, so reads continued on the old owners
-        // throughout the migration attempt.
-        clear_migration_everywhere(ctx, db, name, headers).await;
-        db.set_rebalance_in_progress(false);
-        if error.status == 504 {
-            crate::telemetry::record_rebalance_timeout();
-        }
-        return Err(error);
-    }
-
-    if let Err(error) = activate_map_everywhere(ctx, db, name, &map, headers).await {
-        clear_migration_everywhere(ctx, db, name, headers).await;
-        db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
-    clear_migration_everywhere(ctx, db, name, headers).await;
-    db.set_rebalance_in_progress(false);
-
-    let mut value = json!(map.clone());
-    value["pending"] = json!(false);
+        let mut value = json!(old_map);
+        value["pending"] = json!(false);
+        value
+    } else {
+        let map = ShardMap {
+            version: old_map.version.saturating_add(1),
+            ..map
+        };
+        migrate(ctx, db, name, &old_map, &map, headers, timeout_ms).await?
+    };
     if !cleanup {
         return Ok(value);
     }
-
+    let mut value = value;
     let cleaned = cleanup_all_replicas(ctx, db, headers).await?;
     let cleared = cleaned
         .iter()

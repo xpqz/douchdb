@@ -30,7 +30,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 pub(crate) struct DbRequest<'a> {
     pub st: &'a AppState,
-    pub db: &'a Db,
+    pub db: &'a Arc<Db>,
     pub name: &'a str,
     pub method: &'a Method,
     pub uri: &'a Uri,
@@ -87,6 +87,12 @@ impl Heartbeat {
             every,
             last: std::time::Instant::now(),
         }
+    }
+
+    /// Time until the next heartbeat is due; `None` when there is none.
+    pub(crate) fn next_in(&self) -> Option<std::time::Duration> {
+        self.every
+            .map(|every| every.saturating_sub(self.last.elapsed()))
     }
 
     pub(crate) fn due(&mut self) -> bool {

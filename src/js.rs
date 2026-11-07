@@ -34,16 +34,62 @@ impl Default for ViewLimits {
 /// Rust-side string that comes back before it is parsed into values.
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Why running a user's JavaScript, or the machinery around it, failed.
+///
+/// `Display` is the text that reaches HTTP reasons, logs and the worker
+/// protocol, so it must not change: the conformance tests assert on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsError {
+    /// A Rust panic from the engine bindings, contained by [`guard`].
+    Panic { label: String, message: String },
+    /// A call returned more JSON than [`MAX_OUTPUT_BYTES`].
+    OutputTooLarge { label: String, len: usize },
+    /// The engine, or the user's function, raised an error.
+    Runtime(String),
+    /// A worker process failed to start, died, or broke the frame protocol.
+    Worker(String),
+    /// The WebAssembly engine or the OS confinement failed.
+    Sandbox(String),
+    /// The request or a stored partial is malformed.
+    Invalid(String),
+    /// A reduce input CouchDB reports as `invalid_value`.
+    InvalidValue(String),
+    /// A view index could not be read or written.
+    Index(String),
+}
+
+impl std::fmt::Display for JsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsError::Panic { label, message } => write!(f, "{label} panicked: {message}"),
+            JsError::OutputTooLarge { label, len } => write!(
+                f,
+                "{label} produced {len} bytes of output (limit {MAX_OUTPUT_BYTES})"
+            ),
+            JsError::InvalidValue(reason) => write!(f, "invalid_value: {reason}"),
+            JsError::Runtime(text)
+            | JsError::Worker(text)
+            | JsError::Sandbox(text)
+            | JsError::Invalid(text)
+            | JsError::Index(text) => f.write_str(text),
+        }
+    }
+}
+
+impl std::error::Error for JsError {}
+
 /// Build a runtime with the standard view/search limits.
-pub fn runtime(timeout: Duration, memory: usize) -> Result<rquickjs::Runtime, String> {
+pub fn runtime(timeout: Duration, memory: usize) -> Result<rquickjs::Runtime, JsError> {
     let (runtime, deadline) = reusable_runtime(memory)?;
     *deadline.lock().unwrap_or_else(|poison| poison.into_inner()) = Instant::now() + timeout;
     Ok(runtime)
 }
 
 /// A runtime for several calls: the caller moves the deadline before each.
-pub fn reusable_runtime(memory: usize) -> Result<(rquickjs::Runtime, Arc<Mutex<Instant>>), String> {
-    let runtime = rquickjs::Runtime::new().map_err(|error| error.to_string())?;
+pub fn reusable_runtime(
+    memory: usize,
+) -> Result<(rquickjs::Runtime, Arc<Mutex<Instant>>), JsError> {
+    let runtime = rquickjs::Runtime::new().map_err(|error| JsError::Runtime(error.to_string()))?;
     runtime.set_memory_limit(memory);
     runtime.set_max_stack_size(512 * 1024);
     // A view is arbitrary user code. Stop runaway loops instead of hanging the
@@ -58,7 +104,7 @@ pub fn reusable_runtime(memory: usize) -> Result<(rquickjs::Runtime, Arc<Mutex<I
 
 /// Contain a Rust panic from the bindings (a C `abort` or segfault is not
 /// unwindable; that is what the worker-process plan is for).
-pub fn guard<T>(label: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub fn guard<T>(label: &str, f: impl FnOnce() -> Result<T, JsError>) -> Result<T, JsError> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(payload) => {
@@ -67,17 +113,20 @@ pub fn guard<T>(label: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T,
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("unknown panic");
-            Err(format!("{label} panicked: {message}"))
+            Err(JsError::Panic {
+                label: label.to_string(),
+                message: message.to_string(),
+            })
         }
     }
 }
 
-pub fn check_output(label: &str, output: &str) -> Result<(), String> {
+pub fn check_output(label: &str, output: &str) -> Result<(), JsError> {
     if output.len() > MAX_OUTPUT_BYTES {
-        Err(format!(
-            "{label} produced {} bytes of output (limit {MAX_OUTPUT_BYTES})",
-            output.len()
-        ))
+        Err(JsError::OutputTooLarge {
+            label: label.to_string(),
+            len: output.len(),
+        })
     } else {
         Ok(())
     }
@@ -125,7 +174,7 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
 /// Select the wasm runtime. Returns an error when Wasmtime was requested but
 /// this binary was built without the `wasmtime` feature.
 #[cfg(feature = "wasm")]
-pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
+pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), JsError> {
     match runtime {
         WasmRuntime::Wasmi => {
             WASM_RUNTIME.store(0, Ordering::SeqCst);
@@ -140,10 +189,10 @@ pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
             }
             #[cfg(not(feature = "wasmtime"))]
             {
-                Err(
+                Err(JsError::Sandbox(
                     "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
                         .to_string(),
-                )
+                ))
             }
         }
     }
@@ -151,11 +200,11 @@ pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), String> {
 
 /// Without the `wasm` feature there is no wasm sandbox to select.
 #[cfg(not(feature = "wasm"))]
-pub fn set_wasm_runtime(_runtime: WasmRuntime) -> Result<(), String> {
-    Err(
+pub fn set_wasm_runtime(_runtime: WasmRuntime) -> Result<(), JsError> {
+    Err(JsError::Sandbox(
         "the wasm sandbox is not compiled; rebuild with default features (the `wasm` feature)"
             .to_string(),
-    )
+    ))
 }
 
 pub fn sandboxed() -> bool {
@@ -163,13 +212,43 @@ pub fn sandboxed() -> bool {
 }
 
 /// Dispatch a map/reduce/index call to the selected sandbox.
-pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
+pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, JsError> {
     match SANDBOX.load(Ordering::SeqCst) {
         1 => process_request(kind, payload, limits),
         #[cfg(feature = "wasm")]
         2 => wasm_request(kind, payload, limits),
-        _ => Err("sandbox request without a sandbox".to_string()),
+        _ => Err(JsError::Sandbox(
+            "sandbox request without a sandbox".to_string(),
+        )),
     }
+}
+
+/// The wall-clock budget of one request. Each call of a batched reduce is
+/// interrupted inside the sandbox after the full timeout, as a request of its
+/// own would be; this is the hard deadline outside it, the safety net for a
+/// call that escapes that interrupt. It grows with the number of calls so a
+/// batch of slow but legitimate calls is not cut short, but only up to a
+/// ceiling, so a stuck reducer is killed in about a minute rather than after
+/// a thousand timeouts. Batches that legitimately need longer than the
+/// ceiling (over a minute of reducer time in one request) fail with a timeout.
+fn request_limits(request: &serde_json::Map<String, Value>, limits: ViewLimits) -> ViewLimits {
+    let calls = request
+        .get("calls")
+        .and_then(Value::as_array)
+        .map_or(1, |calls| calls.len().max(1));
+    ViewLimits {
+        timeout: batch_deadline(limits.timeout, calls),
+        ..limits
+    }
+}
+
+/// `timeout` per call, at most `max(4 * timeout, BATCH_DEADLINE_CEILING)`.
+fn batch_deadline(timeout: Duration, calls: usize) -> Duration {
+    const BATCH_DEADLINE_CEILING: Duration = Duration::from_secs(60);
+    let ceiling = BATCH_DEADLINE_CEILING.max(timeout.saturating_mul(4));
+    timeout
+        .saturating_mul(u32::try_from(calls).unwrap_or(u32::MAX))
+        .min(ceiling)
 }
 
 /// Syscalls the worker may make once it is serving requests: reading and
@@ -222,7 +301,7 @@ const WORKER_SYSCALLS: &[i64] = &[
 ///
 /// Install Landlock first: its syscalls are not on the list.
 #[cfg(target_os = "linux")]
-pub fn install_seccomp() -> Result<(), String> {
+pub fn install_seccomp() -> Result<(), JsError> {
     use seccompiler::{
         apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
         SeccompCondition, SeccompFilter, SeccompRule,
@@ -236,25 +315,26 @@ pub fn install_seccomp() -> Result<(), String> {
     let own_pid = std::process::id() as u64;
     let own_process = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, own_pid)
         .and_then(|condition| SeccompRule::new(vec![condition]))
-        .map_err(|error| format!("seccomp tgkill rule: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("seccomp tgkill rule: {error}")))?;
     rules.insert(libc::SYS_tgkill, vec![own_process]);
     let arch = std::env::consts::ARCH
         .try_into()
-        .map_err(|error| format!("seccomp arch: {error:?}"))?;
+        .map_err(|error| JsError::Sandbox(format!("seccomp arch: {error:?}")))?;
     let filter: BpfProgram = SeccompFilter::new(
         rules,
         SeccompAction::Errno(libc::EPERM as u32),
         SeccompAction::Allow,
         arch,
     )
-    .map_err(|error| format!("seccomp filter: {error}"))?
+    .map_err(|error| JsError::Sandbox(format!("seccomp filter: {error}")))?
     .try_into()
-    .map_err(|error| format!("seccomp compile: {error}"))?;
-    apply_filter_all_threads(&filter).map_err(|error| format!("seccomp apply: {error}"))
+    .map_err(|error| JsError::Sandbox(format!("seccomp compile: {error}")))?;
+    apply_filter_all_threads(&filter)
+        .map_err(|error| JsError::Sandbox(format!("seccomp apply: {error}")))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install_seccomp() -> Result<(), String> {
+pub fn install_seccomp() -> Result<(), JsError> {
     Ok(())
 }
 
@@ -262,7 +342,7 @@ pub fn install_seccomp() -> Result<(), String> {
 /// without Landlock (or with an older ABI) still retain the seccomp
 /// allowlist. Returns how much was enforced so the server can log it.
 #[cfg(target_os = "linux")]
-pub fn install_landlock() -> Result<&'static str, String> {
+pub fn install_landlock() -> Result<&'static str, JsError> {
     use landlock::{
         Access, AccessFs, CompatLevel, Compatible, RestrictSelfAttr, Ruleset, RulesetAttr,
         RulesetStatus, ABI,
@@ -270,13 +350,13 @@ pub fn install_landlock() -> Result<&'static str, String> {
     let status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V9))
-        .map_err(|error| format!("landlock access: {error}"))?
+        .map_err(|error| JsError::Sandbox(format!("landlock access: {error}")))?
         .create()
-        .map_err(|error| format!("landlock create: {error}"))?
+        .map_err(|error| JsError::Sandbox(format!("landlock create: {error}")))?
         .all_threads(true)
-        .map_err(|error| format!("landlock threads: {error}"))?
+        .map_err(|error| JsError::Sandbox(format!("landlock threads: {error}")))?
         .restrict_self()
-        .map_err(|error| format!("landlock restrict: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("landlock restrict: {error}")))?;
     Ok(match status.ruleset {
         RulesetStatus::FullyEnforced => "fully enforced",
         RulesetStatus::PartiallyEnforced => "partially enforced",
@@ -285,7 +365,7 @@ pub fn install_landlock() -> Result<&'static str, String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install_landlock() -> Result<&'static str, String> {
+pub fn install_landlock() -> Result<&'static str, JsError> {
     Ok("unavailable on this platform")
 }
 
@@ -326,7 +406,7 @@ struct WasmEngineState {
     engine: wasmi::Engine,
     module: wasmi::Module,
     baseline_memory: usize,
-    linker: OnceLock<Result<wasmi::Linker<WasmData>, String>>,
+    linker: OnceLock<Result<wasmi::Linker<WasmData>, JsError>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -336,8 +416,8 @@ struct WasmData {
 }
 
 #[cfg(feature = "wasm")]
-fn wasm_engine() -> Result<&'static WasmEngineState, String> {
-    static ENGINE: OnceLock<Result<WasmEngineState, String>> = OnceLock::new();
+fn wasm_engine() -> Result<&'static WasmEngineState, JsError> {
+    static ENGINE: OnceLock<Result<WasmEngineState, JsError>> = OnceLock::new();
     let state = ENGINE.get_or_init(|| {
         let mut config = wasmi::Config::default();
         config.consume_fuel(true);
@@ -353,7 +433,7 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
         });
         let engine = wasmi::Engine::new(&config);
         let module = wasmi::Module::new(&engine, WASM_RUNNER)
-            .map_err(|error| format!("wasm module: {error}"))?;
+            .map_err(|error| JsError::Sandbox(format!("wasm module: {error}")))?;
         Ok(WasmEngineState {
             engine,
             baseline_memory: wasmi_baseline_memory(&module),
@@ -370,11 +450,11 @@ fn wasm_engine() -> Result<&'static WasmEngineState, String> {
 #[cfg(feature = "wasm")]
 fn wasmi_linker(
     state: &'static WasmEngineState,
-) -> Result<&'static wasmi::Linker<WasmData>, String> {
+) -> Result<&'static wasmi::Linker<WasmData>, JsError> {
     match state.linker.get_or_init(|| {
         let mut linker = wasmi::Linker::new(&state.engine);
         wasmi_wasi::add_to_linker(&mut linker, |data: &mut WasmData| &mut data.wasi)
-            .map_err(|error| format!("wasm wasi: {error}"))?;
+            .map_err(|error| JsError::Sandbox(format!("wasm wasi: {error}")))?;
         Ok(linker)
     }) {
         Ok(linker) => Ok(linker),
@@ -383,10 +463,14 @@ fn wasmi_linker(
 }
 
 #[cfg(feature = "wasm")]
-fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
+fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, JsError> {
     let mut request = match payload {
         Value::Object(map) => map,
-        _ => return Err("wasm request must be a JSON object".to_string()),
+        _ => {
+            return Err(JsError::Invalid(
+                "wasm request must be a JSON object".to_string(),
+            ))
+        }
     };
     request.insert("kind".to_string(), Value::String(kind.to_string()));
     request.insert(
@@ -394,12 +478,14 @@ fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value,
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
-    let body = serde_json::to_vec(&Value::Object(request)).map_err(|error| error.to_string())?;
-    wasm_run(&body, limits)
+    let budget = request_limits(&request, limits);
+    let body = serde_json::to_vec(&Value::Object(request))
+        .map_err(|error| JsError::Sandbox(error.to_string()))?;
+    wasm_run(&body, budget)
 }
 
 #[cfg(feature = "wasm")]
-fn wasm_run(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
+fn wasm_run(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
         #[cfg(feature = "wasmtime")]
         {
@@ -407,17 +493,17 @@ fn wasm_run(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
         }
         #[cfg(not(feature = "wasmtime"))]
         {
-            return Err(
+            return Err(JsError::Sandbox(
                 "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
                     .to_string(),
-            );
+            ));
         }
     }
     wasmi_request(body, limits)
 }
 
 #[cfg(feature = "wasm")]
-fn wasmi_request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
+fn wasmi_request(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     let state = wasm_engine()?;
     // The linker is immutable after setup; build it once per process instead of
     // resolving every WASI import on each request.
@@ -440,27 +526,29 @@ fn wasmi_request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     store.limiter(|data| &mut data.limits);
     let instance = linker
         .instantiate_and_start(&mut store, &state.module)
-        .map_err(|error| format!("wasm instantiate: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm instantiate: {error}")))?;
     let start = instance
         .get_typed_func::<(), ()>(&store, "_start")
-        .map_err(|error| format!("wasm start: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm start: {error}")))?;
     run_with_deadline(&mut store, &start, limits.timeout)?;
     drop(store);
     let output = stdout
         .try_into_inner()
-        .map_err(|_| "wasm stdout is still borrowed".to_string())?
+        .map_err(|_| JsError::Sandbox("wasm stdout is still borrowed".to_string()))?
         .into_inner();
     check_output("wasm worker", &String::from_utf8_lossy(&output))?;
-    let response: Value =
-        serde_json::from_slice(&output).map_err(|error| format!("wasm response: {error}"))?;
+    let response: Value = serde_json::from_slice(&output)
+        .map_err(|error| JsError::Sandbox(format!("wasm response: {error}")))?;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     } else {
-        Err(response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("wasm worker failed")
-            .to_string())
+        Err(JsError::Runtime(
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("wasm worker failed")
+                .to_string(),
+        ))
     }
 }
 
@@ -473,7 +561,7 @@ fn run_with_deadline(
     store: &mut wasmi::Store<WasmData>,
     start: &wasmi::TypedFunc<(), ()>,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<(), JsError> {
     const SLICE_TARGET: Duration = Duration::from_millis(20);
     let started = Instant::now();
     let deadline = started + timeout;
@@ -482,23 +570,23 @@ fn run_with_deadline(
     let mut slice_started = started;
     store
         .set_fuel(slice)
-        .map_err(|error| format!("wasm fuel: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm fuel: {error}")))?;
     let mut call = start
         .call_resumable(&mut *store, ())
-        .map_err(|error| format!("wasm run: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm run: {error}")))?;
     loop {
         match call {
             wasmi::TypedResumableCall::Finished(()) => return Ok(()),
             wasmi::TypedResumableCall::HostTrap(trap) => {
-                return Err(format!("wasm run: {}", trap.host_error()))
+                return Err(JsError::Sandbox(format!("wasm run: {}", trap.host_error())))
             }
             wasmi::TypedResumableCall::OutOfFuel(pending) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(format!(
+                    return Err(JsError::Sandbox(format!(
                         "timed out after {} ms: wasm run exceeded its deadline",
                         timeout.as_millis()
-                    ));
+                    )));
                 }
                 let took = now
                     .saturating_duration_since(slice_started)
@@ -509,43 +597,48 @@ fn run_with_deadline(
                     .clamp(MIN_SLICE, 4_000_000_000);
                 store
                     .set_fuel(slice.max(pending.required_fuel()))
-                    .map_err(|error| format!("wasm fuel: {error}"))?;
+                    .map_err(|error| JsError::Sandbox(format!("wasm fuel: {error}")))?;
                 slice_started = Instant::now();
                 call = pending
                     .resume(&mut *store)
-                    .map_err(|error| format!("wasm run: {error}"))?;
+                    .map_err(|error| JsError::Sandbox(format!("wasm run: {error}")))?;
             }
         }
     }
 }
 
 /// One request/response exchange with a worker process.
-fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> Result<(), String> {
+fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> Result<(), JsError> {
     if body.len() > MAX_FRAME_BYTES {
-        return Err(format!("worker frame is too large: {} bytes", body.len()));
+        return Err(JsError::Worker(format!(
+            "worker frame is too large: {} bytes",
+            body.len()
+        )));
     }
     writer
         .write_all(&(body.len() as u32).to_be_bytes())
         .and_then(|_| writer.write_all(body))
         .and_then(|_| writer.flush())
-        .map_err(|error| format!("worker write: {error}"))
+        .map_err(|error| JsError::Worker(format!("worker write: {error}")))
 }
 
-fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, JsError> {
     let mut length = [0u8; 4];
     match reader.read_exact(&mut length) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(format!("worker read: {error}")),
+        Err(error) => return Err(JsError::Worker(format!("worker read: {error}"))),
     }
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_FRAME_BYTES {
-        return Err(format!("worker frame is too large: {length} bytes"));
+        return Err(JsError::Worker(format!(
+            "worker frame is too large: {length} bytes"
+        )));
     }
     let mut body = vec![0u8; length];
     reader
         .read_exact(&mut body)
-        .map_err(|error| format!("worker read body: {error}"))?;
+        .map_err(|error| JsError::Worker(format!("worker read body: {error}")))?;
     Ok(Some(body))
 }
 
@@ -567,8 +660,8 @@ struct WorkerError {
 }
 
 impl Worker {
-    fn spawn() -> Result<Worker, String> {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    fn spawn() -> Result<Worker, JsError> {
+        let exe = std::env::current_exe().map_err(|error| JsError::Worker(error.to_string()))?;
         let mut command = Command::new(exe);
         command.arg("--js-worker");
         let mut worker = Worker::spawn_command(command)?;
@@ -593,7 +686,7 @@ impl Worker {
 
     /// Start `command` as a worker: cleared environment, `/` cwd, piped
     /// stdin/stdout and the resource limits.
-    fn spawn_command(mut command: Command) -> Result<Worker, String> {
+    fn spawn_command(mut command: Command) -> Result<Worker, JsError> {
         command
             .env_clear()
             .current_dir("/")
@@ -653,16 +746,18 @@ impl Worker {
                 });
             }
         }
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| JsError::Worker(error.to_string()))?;
         let pid = child.id() as i32;
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "worker stdin unavailable".to_string())?;
+            .ok_or_else(|| JsError::Worker("worker stdin unavailable".to_string()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "worker stdout unavailable".to_string())?;
+            .ok_or_else(|| JsError::Worker("worker stdout unavailable".to_string()))?;
         Ok(Worker {
             child,
             stdin,
@@ -673,17 +768,17 @@ impl Worker {
 
     /// Read the hello frame, killing the worker if it does not arrive within
     /// `timeout`.
-    fn await_hello(&mut self, timeout: Duration) -> Result<Value, String> {
+    fn await_hello(&mut self, timeout: Duration) -> Result<Value, JsError> {
         let deadline = reaper().watch(self.pid, timeout);
         let hello = read_frame(&mut self.stdout);
         drop(deadline);
         match hello {
             Ok(Some(body)) => serde_json::from_slice(&body)
-                .map_err(|error| format!("worker hello: {error}"))
+                .map_err(|error| JsError::Worker(format!("worker hello: {error}")))
                 .inspect_err(|_| self.kill()),
             _ => {
                 self.kill();
-                Err("worker did not start".to_string())
+                Err(JsError::Worker("worker did not start".to_string()))
             }
         }
     }
@@ -691,11 +786,15 @@ impl Worker {
     fn request(&mut self, body: &[u8], timeout: Duration) -> Result<WorkerOutcome, WorkerError> {
         let deadline = reaper().watch(self.pid, timeout + Duration::from_secs(2));
         let result = write_frame(&mut self.stdin, body).and_then(|_| {
-            read_frame(&mut self.stdout)?.ok_or_else(|| "worker closed the connection".to_string())
+            read_frame(&mut self.stdout)?
+                .ok_or_else(|| JsError::Worker("worker closed the connection".to_string()))
         });
         let timed_out = deadline.expired();
         drop(deadline);
-        let response = result.map_err(|message| WorkerError { message, timed_out })?;
+        let response = result.map_err(|error| WorkerError {
+            message: error.to_string(),
+            timed_out,
+        })?;
         let response: Value = serde_json::from_slice(&response).map_err(|error| WorkerError {
             message: error.to_string(),
             timed_out: false,
@@ -846,7 +945,7 @@ impl WorkerPool {
         }
     }
 
-    fn acquire(&self) -> Result<Worker, String> {
+    fn acquire(&self) -> Result<Worker, JsError> {
         let mut state = self
             .state
             .lock()
@@ -907,10 +1006,14 @@ fn pool() -> &'static WorkerPool {
 }
 
 /// Run a map/reduce/index request in a pooled worker process.
-pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, String> {
+pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, JsError> {
     let mut request = match payload {
         Value::Object(map) => map,
-        _ => return Err("worker request must be a JSON object".to_string()),
+        _ => {
+            return Err(JsError::Invalid(
+                "worker request must be a JSON object".to_string(),
+            ))
+        }
     };
     request.insert("kind".to_string(), Value::String(kind.to_string()));
     request.insert(
@@ -918,29 +1021,31 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
-    let body = serde_json::to_vec(&Value::Object(request)).map_err(|error| error.to_string())?;
+    let budget = request_limits(&request, limits);
+    let body = serde_json::to_vec(&Value::Object(request))
+        .map_err(|error| JsError::Worker(error.to_string()))?;
 
     let pool = pool();
     let mut worker = pool.acquire()?;
-    let mut last_error = String::new();
+    let mut last_error = JsError::Worker(String::new());
     for attempt in 0..2 {
-        match worker.request(&body, limits.timeout) {
+        match worker.request(&body, budget.timeout) {
             Ok(WorkerOutcome::Value(value)) => {
                 pool.release(worker);
                 return Ok(value);
             }
             Ok(WorkerOutcome::AppError(error)) => {
                 pool.release(worker);
-                return Err(error);
+                return Err(JsError::Runtime(error));
             }
             Err(error) => {
                 worker.kill();
                 pool.discard();
-                last_error = if error.timed_out {
+                last_error = JsError::Worker(if error.timed_out {
                     format!("worker timed out: {}", error.message)
                 } else {
                     error.message
-                };
+                });
                 // A deadline kill is not retried: the request already consumed
                 // its budget. One retry covers a worker that died between
                 // requests.
@@ -957,13 +1062,13 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
 /// Serve the hidden `--js-worker` mode: frames on stdin/stdout, each request
 /// answered by `handle`. The handler is supplied by the caller so that this
 /// module does not depend on the view and search engines it serves.
-pub fn run_worker_stdio(landlock: &str, handle: fn(Value) -> Value) -> Result<(), String> {
+pub fn run_worker_stdio(landlock: &str, handle: fn(Value) -> Value) -> Result<(), JsError> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
-    let hello =
-        serde_json::to_vec(&json!({"landlock": landlock})).map_err(|error| error.to_string())?;
+    let hello = serde_json::to_vec(&json!({"landlock": landlock}))
+        .map_err(|error| JsError::Worker(error.to_string()))?;
     write_frame(&mut output, &hello)?;
     loop {
         let Some(body) = read_frame(&mut input)? else {
@@ -978,7 +1083,8 @@ pub fn run_worker_stdio(landlock: &str, handle: fn(Value) -> Value) -> Result<()
             Ok(response) => response,
             Err(_) => json!({"ok": false, "error": "worker panicked"}),
         };
-        let body = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+        let body =
+            serde_json::to_vec(&response).map_err(|error| JsError::Worker(error.to_string()))?;
         write_frame(&mut output, &body)?;
     }
 }
@@ -986,10 +1092,87 @@ pub fn run_worker_stdio(landlock: &str, handle: fn(Value) -> Value) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Display` is wire text: HTTP reasons, logs and the worker protocol.
+    #[test]
+    fn display_is_the_text_the_string_errors_carried() {
+        let panic = JsError::Panic {
+            label: "map function".to_string(),
+            message: "boom".to_string(),
+        };
+        assert_eq!(panic.to_string(), "map function panicked: boom");
+        let big = JsError::OutputTooLarge {
+            label: "reduce function".to_string(),
+            len: MAX_OUTPUT_BYTES + 1,
+        };
+        assert_eq!(
+            big.to_string(),
+            "reduce function produced 16777217 bytes of output (limit 16777216)"
+        );
+        for (error, text) in [
+            (JsError::Runtime("d0: Error: x".to_string()), "d0: Error: x"),
+            (
+                JsError::Worker("worker did not start".to_string()),
+                "worker did not start",
+            ),
+            (
+                JsError::Sandbox("wasm run: trap".to_string()),
+                "wasm run: trap",
+            ),
+            (
+                JsError::Invalid("worker request must be a JSON object".to_string()),
+                "worker request must be a JSON object",
+            ),
+            (JsError::Index("disk full".to_string()), "disk full"),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+        assert_eq!(
+            JsError::InvalidValue("non-numeric _stats input: \"a\"".to_string()).to_string(),
+            "invalid_value: non-numeric _stats input: \"a\""
+        );
+    }
+
+    #[test]
+    fn a_batch_deadline_is_bounded() {
+        let secs = Duration::from_secs;
+        // A lone call keeps its own timeout; a few calls get one each.
+        assert_eq!(batch_deadline(secs(5), 1), secs(5));
+        assert_eq!(batch_deadline(secs(5), 3), secs(15));
+        // A full batch is capped, not 1024 timeouts (about 85 minutes).
+        assert_eq!(batch_deadline(secs(5), 1024), secs(60));
+        // A long timeout still allows four calls' worth.
+        assert_eq!(batch_deadline(secs(30), 1024), secs(120));
+        assert_eq!(batch_deadline(Duration::MAX, usize::MAX), Duration::MAX);
+        let calls: Vec<Value> = (0..1024).map(|_| Value::Null).collect();
+        let request = serde_json::Map::from_iter([("calls".to_string(), Value::Array(calls))]);
+        let limits = ViewLimits {
+            timeout: secs(5),
+            memory: 1,
+        };
+        assert_eq!(request_limits(&request, limits).timeout, secs(60));
+    }
+
+    #[test]
+    fn guard_reports_a_panic_and_check_output_a_large_output() {
+        let error = guard::<()>("map function", || panic!("boom")).unwrap_err();
+        assert_eq!(error.to_string(), "map function panicked: boom");
+        assert!(check_output("x", "{}").is_ok());
+        let long = "a".repeat(MAX_OUTPUT_BYTES + 1);
+        assert_eq!(
+            check_output("index function", &long)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "index function produced {} bytes of output (limit {MAX_OUTPUT_BYTES})",
+                MAX_OUTPUT_BYTES + 1
+            )
+        );
+    }
     use sha2::{Digest, Sha256};
 
     #[cfg(feature = "wasm")]
-    fn wasmi_map(source: &str, limits: ViewLimits) -> Result<Value, String> {
+    fn wasmi_map(source: &str, limits: ViewLimits) -> Result<Value, JsError> {
         let body = serde_json::to_vec(&json!({
             "kind": "map",
             "source": source,
@@ -1015,7 +1198,9 @@ mod tests {
         // Far over the limit, but under the 128 MiB cap the host used to apply
         // whatever the configured limit was.
         let large = "function(doc){ emit('x'.repeat(12 * 1024 * 1024).length, null); }";
-        let error = wasmi_map(large, limits).expect_err("12 MiB must exceed a 4 MiB limit");
+        let error = wasmi_map(large, limits)
+            .expect_err("12 MiB must exceed a 4 MiB limit")
+            .to_string();
         assert!(!error.is_empty());
     }
 
@@ -1028,7 +1213,8 @@ mod tests {
         };
         let started = Instant::now();
         let error = wasmi_map("function(doc){ while (true) {} }", limits)
-            .expect_err("an endless loop must be stopped");
+            .expect_err("an endless loop must be stopped")
+            .to_string();
         assert!(error.contains("timed out"), "{error}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -1063,7 +1249,8 @@ mod tests {
         let started = Instant::now();
         let error = worker
             .await_hello(Duration::from_millis(300))
-            .expect_err("no hello was sent");
+            .expect_err("no hello was sent")
+            .to_string();
         assert!(error.contains("did not start"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1082,6 +1269,41 @@ mod tests {
         drop(other);
         worker.kill();
         assert!(exited.is_none(), "a cancelled deadline still killed it");
+    }
+
+    #[test]
+    #[cfg(feature = "wasm")]
+    fn wasm_reduce_many_runs_every_call_in_one_request() {
+        let limits = ViewLimits {
+            timeout: Duration::from_secs(60),
+            memory: 64 * 1024 * 1024,
+        };
+        let request = |calls: Value| {
+            wasm_request(
+                "reduce_many",
+                json!({
+                    "source": "function(k, v, r){ return r ? sum(v) * 10 : sum(v); }",
+                    "calls": calls,
+                }),
+                limits,
+            )
+        };
+        assert_eq!(
+            request(json!([
+                {"keys": [["a", 1]], "values": [3], "rereduce": false},
+                {"keys": [["b", 2], ["c", 3]], "values": [4, 5], "rereduce": false},
+                {"keys": null, "values": [1, 2], "rereduce": true},
+            ]))
+            .expect("batched reduce"),
+            json!([3, 9, 30])
+        );
+        let error = request(json!([
+            {"keys": [], "values": [1], "rereduce": false},
+            {"keys": "nope", "values": [1], "rereduce": false},
+        ]))
+        .expect_err("a malformed call fails the request")
+        .to_string();
+        assert!(error.contains("reduce keys"), "{error}");
     }
 
     #[test]
@@ -1123,13 +1345,16 @@ mod tests {
             (json!([[1, "a"]]), json!({"a": 1})),
         ] {
             let error = reduce(Some(keys.clone()), Some(values.clone()), false)
-                .expect_err(&format!("keys {keys} values {values} must be rejected"));
+                .expect_err(&format!("keys {keys} values {values} must be rejected"))
+                .to_string();
             assert!(
                 error.contains("reduce keys") || error.contains("reduce values"),
                 "{error}"
             );
         }
-        let error = reduce(None, None, false).expect_err("missing values");
+        let error = reduce(None, None, false)
+            .expect_err("missing values")
+            .to_string();
         assert!(error.contains("reduce values are missing"), "{error}");
     }
 

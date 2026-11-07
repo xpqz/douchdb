@@ -7,9 +7,13 @@
     "test": "node run.js"
   },
   "dependencies": {
+    "pouchdb": "9.0.0",
     "pouchdb-adapter-http": "9.0.0",
     "pouchdb-adapter-memory": "9.0.0",
     "pouchdb-core": "9.0.0",
     "pouchdb-replication": "9.0.0"
+  },
+  "devDependencies": {
+    "playwright-core": "1.49.1"
   }
 }

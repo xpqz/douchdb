@@ -24,6 +24,8 @@ impl<T> LRUList<T> {
             prev: std::ptr::null_mut(),
             data: None,
         }));
+        // SAFETY: `head` was just produced by `Box::into_raw`, so it is non-null, aligned and
+        // uniquely owned here.
         unsafe {
             (*head).next = head;
             (*head).prev = head;
@@ -31,7 +33,11 @@ impl<T> LRUList<T> {
         LRUList { head, count: 0 }
     }
 
-    /// Links `node` right after the head. `node` must not be linked.
+    /// Links `node` right after the head.
+    ///
+    /// # Safety
+    /// `node` must point to a live node that is not currently linked, and `self.head` and its
+    /// neighbours must be live (list invariant: every linked node is a live `Box` allocation).
     unsafe fn link_front(&mut self, node: *mut LRUNode<T>) {
         (*node).prev = self.head;
         (*node).next = (*self.head).next;
@@ -39,7 +45,10 @@ impl<T> LRUList<T> {
         (*self.head).next = node;
     }
 
-    /// Unlinks `node` from its neighbours. `node` must be linked and must not be the head.
+    /// Unlinks `node` from its neighbours.
+    ///
+    /// # Safety
+    /// `node` must be a live, linked node other than the head, so its `prev` and `next` are live.
     unsafe fn unlink(node: *mut LRUNode<T>) {
         (*(*node).prev).next = (*node).next;
         (*(*node).next).prev = (*node).prev;
@@ -52,6 +61,7 @@ impl<T> LRUList<T> {
             prev: std::ptr::null_mut(),
             data: Some(elem),
         }));
+        // SAFETY: `node` is a fresh allocation that is not linked yet.
         unsafe { self.link_front(node) };
         self.count += 1;
         LRUHandle(node)
@@ -61,6 +71,10 @@ impl<T> LRUList<T> {
         if self.count() == 0 {
             return None;
         }
+        // SAFETY: `count > 0`, so `head.prev` is a linked node other than the head. Once unlinked,
+        // no list pointer refers to it, so `Box::from_raw` takes back sole ownership of a
+        // `Box::into_raw` pointer. The map still holds the node's (now dangling) handle until the
+        // caller removes that entry; handles are never dereferenced, only passed to `remove`.
         unsafe {
             let last = (*self.head).prev;
             Self::unlink(last);
@@ -70,6 +84,8 @@ impl<T> LRUList<T> {
     }
 
     fn remove(&mut self, node_handle: LRUHandle<T>) -> T {
+        // SAFETY: a handle is created only by `insert`, is not `Clone`, and is consumed here, so
+        // `node_handle.0` is a live linked non-head node that nothing else references.
         unsafe {
             Self::unlink(node_handle.0);
             self.count -= 1;
@@ -79,6 +95,7 @@ impl<T> LRUList<T> {
 
     /// Reinserts the referenced node at the front.
     fn reinsert_front(&mut self, node_handle: &LRUHandle<T>) {
+        // SAFETY: the borrowed handle proves the node is live and linked; it is relinked at once.
         unsafe {
             Self::unlink(node_handle.0);
             self.link_front(node_handle.0);
@@ -90,12 +107,16 @@ impl<T> LRUList<T> {
     }
 
     fn _testing_head_ref(&self) -> Option<&T> {
+        // SAFETY: `head` and `head.next` are always live nodes (`next` is `head` when empty).
         unsafe { (*(*self.head).next).data.as_ref() }
     }
 }
 
 impl<T> Drop for LRUList<T> {
     fn drop(&mut self) {
+        // SAFETY: every node reachable from `head` through `next` is a live `Box::into_raw`
+        // allocation owned by this list; each is freed exactly once, with `next` read first, and
+        // `head` last. No handle can outlive the list's owner `Cache`, which drops its map too.
         unsafe {
             let mut node = (*self.head).next;
             while node != self.head {
@@ -411,6 +432,7 @@ mod regression_tests {
                 }
             }
             assert_eq!(cache.count(), cache.map.len());
+            // SAFETY: test-only walk of the live list; the cache is not mutated meanwhile.
             unsafe {
                 let head = cache.list.head;
                 let mut node = (*head).next;

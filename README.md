@@ -55,19 +55,24 @@ curl -X POST http://couch:5984/_replicate \
 
 A three-node cluster, console and Grafana OpenTelemetry stack are provided:
 
+Set the required secrets first (there are no defaults; `docs/docker.md` has a
+generator for a git-ignored `.env`), then:
+
 ```sh
 docker compose up --build -d
 ```
 
-- API + console: http://localhost:8080 — nginx round-robins across all nodes; login `admin` / `secret`
+All ports are bound to `127.0.0.1`.
+
+- API + console: http://localhost:8080 — nginx round-robins across all nodes; login with the `DOUCHDB_ADMIN` credentials from `.env`
 - Direct nodes: ports 5984, 5985 and 5986
-- Grafana: http://localhost:3000 (anonymous Admin enabled for the demo)
+- Grafana: http://localhost:3000 (login `admin` / `GRAFANA_ADMIN_PASSWORD`)
 - OTLP/HTTP: http://localhost:4318
 
 The cluster uses `q=4`, `n=3`, three data volumes and OTLP export to Grafana's
 `otel-lgtm` all-in-one backend. See [docs/docker.md](docs/docker.md) for the
 service layout, credentials, verification commands and teardown. The stack is
-for local development: it has no TLS and uses demo credentials.
+for local development: it has no TLS.
 
 ## Partitioned databases
 
@@ -443,6 +448,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]
         [--js-workers N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
+        [--cors-credentials] [--cors-headers HEADER,HEADER]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--max-open-indexes N] [--max-open-dbs N]
         [--otel-endpoint URL]
@@ -455,7 +461,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--q` | `2` | Default shards per database, fixed at creation (CouchDB's default) |
 | `--n` | `3` | Default copies of each shard, clamped to the node count (CouchDB's default) |
 | `--revs-limit` | `1000` | Revision history kept per document |
-| `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` |
+| `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` (or `DOUCHDB_ADMIN`, which keeps the password out of the process list) |
 | `--users-file` | none | JSON users file with token/roles entries (see [docs/multiuser.md](docs/multiuser.md)) |
 | `--session-secret` | random, kept in `<data>/.session-secret` | HMAC key for `AuthSession` cookies (or `DOUCHDB_SESSION_SECRET`); set the same value on every node for cross-node sessions |
 | `--default-security` | `admin-only` when auth is configured | Empty `_security` databases are `admin-only` or `open` |
@@ -476,6 +482,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
+| `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
+| `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
@@ -494,16 +502,25 @@ Cross-origin access is **off by default**. Enable it for browser clients
 ./target/release/douchdb --cors-origins 'http://localhost:5173,https://*.example.com'
 ```
 
-`*` allows any origin. Origins are echoed back in
-`Access-Control-Allow-Origin` rather than literally sending `*`, so
-`Access-Control-Allow-Credentials: true` works with `_session` cookies. `OPTIONS`
-preflights return `204` with the requested headers and a one-hour max-age;
-preflights from origins not on the list return `403` and get no CORS headers.
-Wildcards match subdomains (`https://*.example.com`), and ports must match
-exactly.
+`*` allows any origin. As in CouchDB, `Access-Control-Allow-Origin` always
+carries the request's own origin, also for `*`. Credentials are off, as in
+CouchDB's `[cors] credentials = false`: add `--cors-credentials` to send
+`Access-Control-Allow-Credentials: true`, which a browser PouchDB needs (it
+sends requests with credentials). Preflights follow CouchDB's `chttpd_cors`: a
+preflight whose method and requested headers are supported gets `204` with
+`Access-Control-Max-Age: 600`, CouchDB's full method list and the requested
+headers echoed back. The supported request headers are CouchDB's default list
+(`Accept`, `Authorization`, `Content-Type`, `Origin` and so on), or exactly
+the headers given in `--cors-headers` (CouchDB `[cors] headers` replaces the
+default list). Anything else, including a header outside that list, is not
+treated as a preflight: it gets no preflight headers and is handled as a
+plain `OPTIONS` request, so the browser rejects it. Wildcards match
+subdomains (`https://*.example.com`, a douchdb extension), and ports must
+match exactly.
 
-`--cors-origins '*'` lets any website make credentialed requests against a
-logged-in session, so prefer an explicit list outside local development. The
+`--cors-origins '*' --cors-credentials` lets any website make credentialed
+requests against a logged-in session, so prefer an explicit list outside local
+development. The
 embedded `/_utils/` console is same-origin and needs no CORS flag.
 
 ## Cluster
@@ -717,8 +734,8 @@ semantics, admission lanes, cluster caveats and deliberate non-goals.
   an unreachable or black-holed node cannot stall anti-entropy forever.
 - Request bodies default to 64 MiB (`--max-request-mb`); view JS is bounded by
   `--view-memory-mb` and `--view-timeout-ms`.
-- `--cors-origins '*'` allows any website to make credentialed requests against
-  a logged-in session. Prefer an explicit origin list.
+- `--cors-origins '*' --cors-credentials` allows any website to make credentialed
+  requests against a logged-in session. Prefer an explicit origin list.
 
 ## Search
 
@@ -856,7 +873,17 @@ npm ci
 node run.js http://127.0.0.1:5984
 ```
 
-See [clients/README.md](clients/README.md).
+A second check runs browser PouchDB in headless Chromium (Playwright, pinned
+Docker image) from a page on a different origin, so real CORS applies, and does
+a two-way sync with a conflict. Start douchdb with `--admin admin:pass
+--cors-origins http://127.0.0.1:8099 --cors-credentials`, then:
+
+```sh
+clients/pouchdb/run-browser.sh http://host.docker.internal:5984 admin:pass
+```
+
+It runs weekly in `.github/workflows/weekly.yml`. See
+[clients/README.md](clients/README.md).
 
 The 10 GB storage spike starts its own server and writes ~10 GB under
 `target/spike-data`:

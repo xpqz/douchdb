@@ -10,7 +10,8 @@ use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
+    blob_prefix, body_key, local_key, meta_key, meta_state, seq_key, AttMeta, DocMeta, LiveDoc,
+    MetaState, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -339,6 +340,9 @@ pub struct Db {
     /// One global sequence counter for the database. CouchDB's `since` is a
     /// database-wide cursor, so shard-local counters cannot be used directly.
     seq: Arc<AtomicU64>,
+    /// Pinged by the shard actors after a flushed batch that committed a new
+    /// sequence; feeds wait on it instead of polling.
+    commits: Arc<tokio::sync::watch::Sender<()>>,
     /// Cached `validate_doc_update` sources. Invalidated when a design
     /// document is written.
     validation: std::sync::RwLock<Option<Vec<String>>>,
@@ -536,8 +540,13 @@ impl Db {
         let mut shards = Vec::new();
         let mut committed_seq = Vec::with_capacity(file.q as usize);
         let mut reserved_seq = Vec::with_capacity(file.q as usize);
+        let commits = Arc::new(tokio::sync::watch::Sender::new(()));
         for i in 0..file.q {
-            let shard = ShardHandle::spawn(path.join(format!("shard-{i:04}")), config.revs_limit)?;
+            let shard = ShardHandle::spawn(
+                path.join(format!("shard-{i:04}")),
+                config.revs_limit,
+                commits.clone(),
+            )?;
             committed_seq.push(shard.seq_tracker());
             reserved_seq.push(shard.reserved_seq());
             shards.push(shard);
@@ -567,6 +576,7 @@ impl Db {
             committed_seq,
             reserved_seq,
             seq: Arc::new(AtomicU64::new(seq)),
+            commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
             cluster_validation: std::sync::RwLock::new(None),
@@ -1166,6 +1176,13 @@ impl Db {
         self.seq.load(Ordering::SeqCst)
     }
 
+    /// A receiver that changes whenever a write commits on this node. Mark it
+    /// seen (`borrow_and_update`) before reading, so a commit that lands
+    /// during the read is not missed.
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<()> {
+        self.commits.subscribe()
+    }
+
     /// Allocate a sequence on `shard` as a write still in flight would: the
     /// counter has moved but the shard has not committed it. Any later job on
     /// that shard counts it as committed, as for a write that never finished,
@@ -1198,13 +1215,15 @@ impl Db {
         let mut doc_count = 0;
         let mut deleted_count = 0;
         let mut update_seq = 0;
-        for shard in &self.shards {
-            let (docs, deleted, seq) = shard
-                .call(|s| {
-                    let (docs, deleted) = s.counts();
-                    Ok((docs, deleted, s.seq()))
-                })
-                .await?;
+        let counts = futures::future::join_all(self.shards.iter().map(|shard| {
+            shard.call(|s| {
+                let (docs, deleted) = s.counts();
+                Ok((docs, deleted, s.seq()))
+            })
+        }))
+        .await;
+        for counted in counts {
+            let (docs, deleted, seq) = counted?;
             doc_count += docs;
             deleted_count += deleted;
             update_seq = update_seq.max(seq);
@@ -1266,6 +1285,9 @@ impl Db {
 
         // A shard error is held back until the validator cache is dropped:
         // earlier shards may already have committed design documents.
+        // The shards are written one after another: each document takes the
+        // next global sequence when its shard stages it, so the order the
+        // shards run in is the order of `_changes` for this batch.
         let mut shard_error = None;
         for (shard_idx, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
@@ -1315,6 +1337,46 @@ impl Db {
             .await
     }
 
+    /// Read several documents with one round trip per shard, the shards in
+    /// parallel. Each document has its own result, in the order of `ids`; the
+    /// outer error is a shard that could not answer at all.
+    pub(crate) async fn get_docs(
+        &self,
+        ids: &[String],
+        opts: &DocOpts,
+    ) -> DbResult<Vec<DbResult<Value>>> {
+        let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
+        for (slot, id) in ids.iter().enumerate() {
+            grouped[self.shard_index(id)].push((slot, id.clone()));
+        }
+        let read = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| {
+                        Ok(batch
+                            .into_iter()
+                            .map(|(slot, id)| (slot, read_doc(s, &id, &opts)))
+                            .collect::<Vec<_>>())
+                    })
+                }),
+        )
+        .await;
+        let mut out: Vec<Option<DbResult<Value>>> = ids.iter().map(|_| None).collect();
+        for batch in read {
+            for (slot, result) in batch? {
+                out[slot] = Some(result);
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|| Err(ApiError::not_found("missing"))))
+            .collect())
+    }
+
     pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
         self.all_docs_filtered(opts, None).await
     }
@@ -1326,19 +1388,9 @@ impl Db {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
-    async fn all_docs_filtered(
-        &self,
-        opts: &AllDocsOpts,
-        owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
-        if let Some(keys) = &opts.keys {
-            return self.all_docs_by_keys(opts, keys, owned).await;
-        }
-
-        // A shard only needs to return enough rows to satisfy the global
-        // `skip + limit`: any row in the global window is also in its shard's
-        // first `skip + limit` rows.
-        let take = opts.skip.saturating_add(opts.limit);
+    /// `opts` with a partition query's range narrowed to the partition's key
+    /// range, and the one shard that holds the partition.
+    fn partition_range(&self, opts: &AllDocsOpts) -> (AllDocsOpts, Option<usize>) {
         let mut opts = opts.clone();
         let partition_shard = opts
             .partition
@@ -1369,31 +1421,49 @@ impl Db {
                 });
             }
         }
+        (opts, partition_shard)
+    }
 
+    async fn all_docs_filtered(
+        &self,
+        opts: &AllDocsOpts,
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Value> {
+        if let Some(keys) = &opts.keys {
+            return self.all_docs_by_keys(opts, keys, owned).await;
+        }
+
+        // A shard only needs to return enough rows to satisfy the global
+        // `skip + limit`: any row in the global window is also in its shard's
+        // first `skip + limit` rows.
+        let take = opts.skip.saturating_add(opts.limit);
+        let (opts, partition_shard) = self.partition_range(opts);
         let mut rows = Vec::new();
         let mut total_rows = 0u64;
         let mut before_start = 0usize;
-        for (index, shard) in self.shards.iter().enumerate() {
-            if partition_shard
-                .map(|partition| partition != index)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if !shard_owned(owned, index) {
-                continue;
-            }
-            let opts = opts.clone();
-            let (mut shard_rows, shard_offset, shard_docs) = shard
-                .call(move |s| {
-                    let docs = match &opts.partition {
-                        Some(partition) => s.partition_live_count(partition)?,
-                        None => s.counts().0,
-                    };
-                    let (rows, offset) = collect_all_docs(s, &opts, take)?;
-                    Ok((rows, offset, docs))
+        let collected = futures::future::join_all(
+            self.shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    partition_shard.is_none_or(|partition| partition == *index)
+                        && shard_owned(owned, *index)
                 })
-                .await?;
+                .map(|(_, shard)| {
+                    let opts = opts.clone();
+                    shard.call(move |s| {
+                        let docs = match &opts.partition {
+                            Some(partition) => s.partition_live_count(partition)?,
+                            None => s.counts().0,
+                        };
+                        let (rows, offset) = collect_all_docs(s, &opts, take)?;
+                        Ok((rows, offset, docs))
+                    })
+                }),
+        )
+        .await;
+        for collected in collected {
+            let (mut shard_rows, shard_offset, shard_docs) = collected?;
             rows.append(&mut shard_rows);
             before_start += shard_offset;
             total_rows += shard_docs;
@@ -1405,6 +1475,131 @@ impl Db {
         let selected: Vec<_> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
         let offset = (before_start + opts.skip).min(total_rows as usize);
         finish_all_docs(selected, total_rows as usize, offset)
+    }
+
+    /// The `total_rows` and `offset` of an `_all_docs` query and a stream of
+    /// its rows, for a query without `keys`. The rows are merged by id from a
+    /// page at a time of each shard, so a listing of any size is never held
+    /// whole. Unlike `all_docs`, the pages are read as the stream is polled,
+    /// not from one snapshot, and a failure after the first page ends the
+    /// stream with an error.
+    pub(crate) async fn all_docs_stream(
+        db: Arc<Db>,
+        opts: &AllDocsOpts,
+    ) -> DbResult<(AllDocsHead, impl futures::Stream<Item = DbResult<Value>>)> {
+        const PAGE: usize = 256;
+
+        struct Cursor {
+            index: usize,
+            after: Option<String>,
+            buffer: std::collections::VecDeque<AllDocsRow>,
+            done: bool,
+        }
+
+        let (opts, partition_shard) = db.partition_range(opts);
+        let mut total_rows = 0u64;
+        let mut before_start = 0usize;
+        let mut cursors = Vec::new();
+        for (index, shard) in db.shards.iter().enumerate() {
+            if partition_shard.is_some_and(|partition| partition != index) {
+                continue;
+            }
+            let shard_opts = opts.clone();
+            let (before, docs) = shard
+                .call(move |s| {
+                    let docs = match &shard_opts.partition {
+                        Some(partition) => s.partition_live_count(partition)?,
+                        None => s.counts().0,
+                    };
+                    Ok((all_docs_before_start(s, &shard_opts)?, docs))
+                })
+                .await?;
+            before_start += before;
+            total_rows += docs;
+            cursors.push(Cursor {
+                index,
+                after: None,
+                buffer: std::collections::VecDeque::new(),
+                done: false,
+            });
+        }
+        let head = AllDocsHead {
+            total_rows: total_rows as usize,
+            offset: before_start
+                .saturating_add(opts.skip)
+                .min(total_rows as usize),
+        };
+
+        let rows = async_stream::stream! {
+            let mut skip = opts.skip;
+            let mut remaining = opts.limit;
+            while remaining > 0 {
+                let wanted = skip.saturating_add(remaining).min(PAGE);
+                let hungry: Vec<usize> = (0..cursors.len())
+                    .filter(|slot| cursors[*slot].buffer.is_empty() && !cursors[*slot].done)
+                    .collect();
+                if !hungry.is_empty() {
+                    let fetches = hungry.iter().map(|slot| {
+                        let (index, after) = (cursors[*slot].index, cursors[*slot].after.clone());
+                        let shard_opts = opts.clone();
+                        let shard = &db.shards[index];
+                        async move {
+                            shard
+                                .call(move |s| {
+                                    let scanned =
+                                        scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
+                                    let last = scanned.last().map(|row| row.id.clone());
+                                    let exhausted = scanned.len() < wanted;
+                                    Ok((load_all_docs(s, scanned, &shard_opts)?, last, exhausted))
+                                })
+                                .await
+                        }
+                    });
+                    let pages = futures::future::join_all(fetches).await;
+                    for (slot, page) in hungry.into_iter().zip(pages) {
+                        match page {
+                            Ok((rows, last, exhausted)) => {
+                                let cursor = &mut cursors[slot];
+                                cursor.buffer.extend(rows);
+                                if last.is_some() {
+                                    cursor.after = last;
+                                }
+                                cursor.done = exhausted;
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut best: Option<usize> = None;
+                for (slot, cursor) in cursors.iter().enumerate() {
+                    let Some(front) = cursor.buffer.front() else {
+                        continue;
+                    };
+                    let better = match best.and_then(|best| cursors[best].buffer.front()) {
+                        None => true,
+                        Some(current) if opts.descending => front.id > current.id,
+                        Some(current) => front.id < current.id,
+                    };
+                    if better {
+                        best = Some(slot);
+                    }
+                }
+                let Some(row) = best.and_then(|slot| cursors[slot].buffer.pop_front()) else {
+                    break;
+                };
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                remaining -= 1;
+                yield Ok(all_docs_row_json(row));
+            }
+        };
+        Ok((head, rows))
     }
 
     /// Documents for a view build, as JSON text with `_id` and `_rev` already
@@ -1488,8 +1683,14 @@ impl Db {
                     .await?;
             }
         } else {
-            for index in self.selected_shards(owned) {
-                total_rows += self.shards[index].call(|s| Ok(s.counts().0)).await?;
+            let counts = futures::future::join_all(
+                self.selected_shards(owned)
+                    .into_iter()
+                    .map(|index| self.shards[index].call(|s| Ok(s.counts().0))),
+            )
+            .await;
+            for count in counts {
+                total_rows += count?;
             }
         }
 
@@ -1530,21 +1731,27 @@ impl Db {
         }
 
         let mut results: Vec<Option<Value>> = vec![None; page.len()];
-        for (index, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let opts = opts.clone();
-            let rows = self.shards[index]
-                .call(move |s| {
-                    let rows = batch
-                        .into_iter()
-                        .map(|(slot, key)| all_docs_key_row(s, &key, &opts).map(|row| (slot, row)))
-                        .collect::<DbResult<Vec<_>>>()?;
-                    Ok(rows)
-                })
-                .await?;
-            for (slot, row) in rows {
+        let fetched = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| {
+                        let rows = batch
+                            .into_iter()
+                            .map(|(slot, key)| {
+                                all_docs_key_row(s, &key, &opts).map(|row| (slot, row))
+                            })
+                            .collect::<DbResult<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                }),
+        )
+        .await;
+        for rows in fetched {
+            for (slot, row) in rows? {
                 results[slot] =
                     Some(row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"})));
             }
@@ -1577,29 +1784,41 @@ impl Db {
         } else {
             watermark.min(self.changes_cutoff(&selected, opts).await?)
         };
-        let mut rows = Vec::new();
-        for index in selected {
-            let shard_opts = opts.clone();
-            let mut shard_rows = self.shards[index]
-                .call(move |s| collect_changes(s, &shard_opts, until))
-                .await?;
-            rows.append(&mut shard_rows);
-        }
-        rows.sort_by_key(|r| r.seq);
-        // Rows above the watermark are withheld; the next request re-reads
-        // them rather than skipping a later-visible lower sequence.
-        if !opts.descending {
-            rows.retain(|row| row.seq <= watermark);
-        }
-        if opts.descending {
-            rows.reverse();
-        }
-        // Filters are evaluated after merging shard rows so every shard is
-        // scanned: a shard-local limit would otherwise drop matching rows
-        // behind non-matching documents.
-        let scanned_last = rows.last().map(|row| row.seq);
-        if let Some(filter) = &opts.filter {
-            rows = apply_change_filter(rows, filter)?;
+        let mut rows;
+        let scanned_last;
+        match &opts.filter {
+            Some(filter) if !opts.descending => {
+                (rows, scanned_last) = self
+                    .filtered_changes(opts, filter, &selected, until)
+                    .await?;
+            }
+            _ => {
+                rows = Vec::new();
+                for index in selected {
+                    let shard_opts = opts.clone();
+                    let mut shard_rows = self.shards[index]
+                        .call(move |s| collect_changes(s, &shard_opts, until))
+                        .await?;
+                    rows.append(&mut shard_rows);
+                }
+                rows.sort_by_key(|r| r.seq);
+                // Rows above the watermark are withheld; the next request
+                // re-reads them rather than skipping a later-visible lower
+                // sequence.
+                if !opts.descending {
+                    rows.retain(|row| row.seq <= watermark);
+                }
+                if opts.descending {
+                    rows.reverse();
+                }
+                // A descending filter is evaluated after merging shard rows
+                // so every shard is scanned: a shard-local limit would
+                // otherwise drop matching rows behind non-matching documents.
+                scanned_last = rows.last().map(|row| row.seq);
+                if let Some(filter) = &opts.filter {
+                    rows = apply_change_filter(rows, filter)?;
+                }
+            }
         }
         if let Some(limit) = opts.limit {
             rows.truncate(limit);
@@ -1613,6 +1832,82 @@ impl Db {
             .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
         Ok((rows, last_seq, pending))
+    }
+
+    /// An ascending filtered read: scans each shard a page at a time and merges
+    /// the pages in sequence order, filtering as it goes, until `limit` rows
+    /// match or every shard is exhausted. No single shard job loads more than
+    /// a page of rows (with bodies, for a JS filter). Returns the matching
+    /// rows and the last sequence scanned.
+    async fn filtered_changes(
+        &self,
+        opts: &ChangesOpts,
+        filter: &ChangeFilter,
+        selected: &[usize],
+        until: u64,
+    ) -> DbResult<(Vec<ChangeRow>, Option<u64>)> {
+        use std::collections::VecDeque;
+
+        // `limit=0` keeps the single full pass: its `last_seq` is the last
+        // row scanned.
+        let page = match opts.limit {
+            Some(0) => usize::MAX,
+            Some(limit) => limit.clamp(64, 1024),
+            None => 1024,
+        };
+        let mut cursors = vec![opts.since; selected.len()];
+        let mut done = vec![false; selected.len()];
+        let mut buffers: Vec<VecDeque<ChangeRow>> =
+            (0..selected.len()).map(|_| VecDeque::new()).collect();
+        let mut matched: Vec<ChangeRow> = Vec::new();
+        let mut scanned_last = None;
+        loop {
+            for (slot, &index) in selected.iter().enumerate() {
+                if !buffers[slot].is_empty() || done[slot] {
+                    continue;
+                }
+                let mut shard_opts = opts.clone();
+                shard_opts.since = cursors[slot];
+                shard_opts.limit = Some(page);
+                let rows = self.shards[index]
+                    .call(move |s| collect_changes(s, &shard_opts, until))
+                    .await?;
+                match rows.last() {
+                    // A page can come back short when unreadable records are
+                    // skipped, so only an empty one ends the shard.
+                    None => done[slot] = true,
+                    Some(last) => cursors[slot] = last.seq,
+                }
+                buffers[slot].extend(rows);
+            }
+            // Everything up to the lowest buffered tail is complete: no shard
+            // can still produce a row below it.
+            let Some(cutoff) = buffers
+                .iter()
+                .zip(&done)
+                .filter(|(_, done)| !**done)
+                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq))
+                .min()
+            else {
+                break;
+            };
+            let mut batch = Vec::new();
+            for buffer in &mut buffers {
+                while buffer.front().is_some_and(|row| row.seq <= cutoff) {
+                    batch.extend(buffer.pop_front());
+                }
+            }
+            batch.sort_by_key(|row| row.seq);
+            scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
+            matched.extend(apply_change_filter(batch, filter)?);
+            if opts
+                .limit
+                .is_some_and(|limit| limit > 0 && matched.len() >= limit)
+            {
+                break;
+            }
+        }
+        Ok((matched, scanned_last))
     }
 
     /// Indexes of the shards in `owned`, or every shard.
@@ -1662,13 +1957,13 @@ impl Db {
         descending: bool,
         owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
-        let mut pending = 0usize;
-        for index in self.selected_shards(owned) {
-            pending += self.shards[index]
+        futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
+            self.shards[index]
                 .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
-                .await?;
-        }
-        Ok(pending)
+        }))
+        .await
+        .into_iter()
+        .sum::<DbResult<usize>>()
     }
 
     pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
@@ -1734,16 +2029,20 @@ impl Db {
             loop {
                 let mut best: Option<usize> = None;
                 for slot in 0..selected.len() {
-                    if buffers[slot].is_empty() && !done[slot] {
+                    while buffers[slot].is_empty() && !done[slot] {
                         let index = selected[slot];
                         let mut shard_opts = opts.clone();
                         shard_opts.since = cursors[slot];
                         shard_opts.descending = false;
                         // A shard never needs more rows than the request can
-                        // still return; a filter may discard rows, so it keeps
-                        // full pages.
+                        // still return. A filter may discard rows, so it reads
+                        // at least a small page and refills until a row
+                        // survives or the shard is exhausted.
                         let wanted = match (opts.limit, &opts.filter) {
                             (Some(limit), None) => limit.saturating_sub(emitted).max(1),
+                            (Some(limit), Some(_)) => {
+                                limit.saturating_sub(emitted).clamp(64, PAGE)
+                            }
                             _ => PAGE,
                         };
                         let requested = PAGE.min(wanted);
@@ -1849,7 +2148,11 @@ impl Db {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
-        let mut out = Map::new();
+        // One round trip per shard, the shards in parallel, instead of one
+        // per document.
+        let mut ids = Vec::new();
+        let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
+            (0..self.q).map(|_| Vec::new()).collect();
         for (id, revs) in map {
             let Some(list) = revs.as_array() else {
                 continue;
@@ -1858,34 +2161,37 @@ impl Db {
                 .iter()
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
-            let id2 = id.clone();
-            let (missing, ancestors) = self
-                .shard(id)
-                .call(move |s| {
-                    let tree = s.get_meta(&id2)?.map(|m| m.tree).unwrap_or_default();
-                    let mut missing = Vec::new();
-                    let mut ancestors: Vec<String> = Vec::new();
-                    for rev in &wanted {
-                        if !tree.contains(rev) {
-                            missing.push(rev.clone());
-                            if let Some(parsed) = Rev::parse(rev) {
-                                for leaf in tree.leaves() {
-                                    if Rev::parse(&leaf)
-                                        .map(|l| l.pos < parsed.pos)
-                                        .unwrap_or(false)
-                                    {
-                                        ancestors.push(leaf);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ancestors.sort();
-                    ancestors.dedup();
-                    ancestors.truncate(10);
-                    Ok((missing, ancestors))
-                })
-                .await?;
+            grouped[self.shard_index(id)].push((ids.len(), id.clone(), wanted));
+            ids.push(id);
+        }
+        let diffs = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    self.shards[index].call(move |s| {
+                        batch
+                            .into_iter()
+                            .map(|(slot, id, wanted)| {
+                                revs_diff_one(s, &id, &wanted).map(|diff| (slot, diff))
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    })
+                }),
+        )
+        .await;
+        let mut found: Vec<Option<(Vec<String>, Vec<String>)>> = ids.iter().map(|_| None).collect();
+        for batch in diffs {
+            for (slot, diff) in batch? {
+                found[slot] = Some(diff);
+            }
+        }
+        let mut out = Map::new();
+        for (id, diff) in ids.into_iter().zip(found) {
+            let Some((missing, ancestors)) = diff else {
+                continue;
+            };
             if !missing.is_empty() {
                 let mut entry = json!({ "missing": missing });
                 if !ancestors.is_empty() {
@@ -1935,22 +2241,26 @@ impl Db {
         }
 
         let mut out: Vec<Option<Value>> = vec![None; reqs.len()];
-        for (index, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let results = self.shards[index]
-                .call(move |shard| {
-                    let mut out = Vec::with_capacity(batch.len());
-                    for (slot, id, opts) in batch {
-                        let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
-                        let result = read_doc(shard, &id, &opts);
-                        out.push((slot, id, rev, result));
-                    }
-                    Ok(out)
-                })
-                .await?;
-            for (slot, id, rev, result) in results {
+        let read = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    self.shards[index].call(move |shard| {
+                        let mut out = Vec::with_capacity(batch.len());
+                        for (slot, id, opts) in batch {
+                            let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
+                            let result = read_doc(shard, &id, &opts);
+                            out.push((slot, id, rev, result));
+                        }
+                        Ok(out)
+                    })
+                }),
+        )
+        .await;
+        for results in read {
+            for (slot, id, rev, result) in results? {
                 out[slot] = Some(match result {
                     Ok(doc) => json!({ "id": id, "docs": [{"ok": doc}] }),
                     Err(error) => json!({
@@ -2075,7 +2385,11 @@ impl Db {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
-        let mut purged = Map::new();
+        // One round trip per shard, the shards in parallel, instead of one
+        // per document.
+        let mut ids = Vec::new();
+        let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
+            (0..self.q).map(|_| Vec::new()).collect();
         for (id, revs) in map {
             let Some(list) = revs.as_array() else {
                 continue;
@@ -2084,61 +2398,41 @@ impl Db {
                 .iter()
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
-            let id2 = id.clone();
+            grouped[self.shard_index(id)].push((ids.len(), id.clone(), requested));
+            ids.push(id);
+        }
+        // Purging a document that survives takes a new sequence, so the
+        // shards run one after another to keep that order deterministic.
+        let mut done = Vec::new();
+        for (index, batch) in grouped.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
             let seq_counter = self.seq.clone();
-            let reserved = self.reserved_seq[self.shard_index(id)].clone();
-            let done = self
-                .shard(id)
-                .call(move |s| {
-                    let Some(mut meta) = s.get_meta(&id2)? else {
-                        return Ok(Vec::new());
-                    };
-                    let mut tx = Tx::new();
-                    let mut removed = Vec::new();
-                    // Like CouchDB, purge leaves only: each takes its unshared
-                    // ancestors with it, and a listed non-leaf revision is
-                    // ignored and not reported.
-                    let leaves: std::collections::BTreeSet<String> =
-                        meta.tree.leaves().into_iter().collect();
-                    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
-                        let gone = meta.tree.purge_leaf(rev);
-                        if gone.is_empty() {
-                            continue;
-                        }
-                        for dead in &gone {
-                            tx.delete(&body_key(&id2, dead));
-                            meta.atts.remove(dead);
-                        }
-                        removed.push(rev.clone());
-                    }
-                    if !removed.is_empty() {
-                        if meta.tree.is_empty() {
-                            tx.delete(&meta_key(&id2));
-                            if meta.seq != 0 {
-                                tx.delete(&seq_key(meta.seq));
-                            }
-                            s.commit(tx)?;
-                        } else {
-                            let old_seq = meta.seq;
-                            // Purging the winner changes what a normal read sees,
-                            // so it is a change as far as `_changes` is concerned.
-                            let seq = allocate_seq(&seq_counter, &reserved);
-                            meta.seq = seq;
-                            tx.delete(&seq_key(old_seq));
-                            tx.put(&seq_key(seq), id2.as_bytes());
-                            tx.put_json(&meta_key(&id2), &meta)?;
-                            s.commit_at(tx, Some(seq))?;
-                        }
-                    } else {
-                        s.commit(tx)?;
-                    }
-                    if !removed.is_empty() {
-                        s.invalidate_latest();
-                    }
-                    Ok(removed)
-                })
-                .await?;
-            purged.insert(id.clone(), json!(done));
+            let reserved = self.reserved_seq[index].clone();
+            done.push(
+                self.shards[index]
+                    .call(move |s| {
+                        batch
+                            .into_iter()
+                            .map(|(slot, id, requested)| {
+                                purge_one(s, &id, &requested, &seq_counter, &reserved)
+                                    .map(|removed| (slot, removed))
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    })
+                    .await,
+            );
+        }
+        let mut removed: Vec<Vec<String>> = ids.iter().map(|_| Vec::new()).collect();
+        for batch in done {
+            for (slot, revs) in batch? {
+                removed[slot] = revs;
+            }
+        }
+        let mut purged = Map::new();
+        for (id, revs) in ids.into_iter().zip(removed) {
+            purged.insert(id.clone(), json!(revs));
         }
         Ok(json!({ "purge_seq": 0, "purged": purged }))
     }
@@ -2185,6 +2479,92 @@ impl Db {
 /// the error name see a familiar one.
 pub fn attachments_unsupported() -> ApiError {
     ApiError::bad_request("douchdb does not support attachments")
+}
+
+/// The requested revisions of one document the shard does not have, and the
+/// leaves that could be their ancestors.
+fn revs_diff_one(
+    s: &mut crate::store::Shard,
+    id: &str,
+    wanted: &[String],
+) -> DbResult<(Vec<String>, Vec<String>)> {
+    let tree = s.get_meta(id)?.map(|m| m.tree).unwrap_or_default();
+    let mut missing = Vec::new();
+    let mut ancestors: Vec<String> = Vec::new();
+    for rev in wanted {
+        if !tree.contains(rev) {
+            missing.push(rev.clone());
+            if let Some(parsed) = Rev::parse(rev) {
+                for leaf in tree.leaves() {
+                    if Rev::parse(&leaf)
+                        .map(|l| l.pos < parsed.pos)
+                        .unwrap_or(false)
+                    {
+                        ancestors.push(leaf);
+                    }
+                }
+            }
+        }
+    }
+    ancestors.sort();
+    ancestors.dedup();
+    ancestors.truncate(10);
+    Ok((missing, ancestors))
+}
+
+/// Purge the requested leaf revisions of one document; the revisions removed.
+fn purge_one(
+    s: &mut crate::store::Shard,
+    id: &str,
+    requested: &[String],
+    seq_counter: &AtomicU64,
+    reserved: &AtomicU64,
+) -> DbResult<Vec<String>> {
+    let Some(mut meta) = s.get_meta(id)? else {
+        return Ok(Vec::new());
+    };
+    let mut tx = Tx::new();
+    let mut removed = Vec::new();
+    // Like CouchDB, purge leaves only: each takes its unshared
+    // ancestors with it, and a listed non-leaf revision is
+    // ignored and not reported.
+    let leaves: std::collections::BTreeSet<String> = meta.tree.leaves().into_iter().collect();
+    for rev in requested.iter().filter(|rev| leaves.contains(*rev)) {
+        let gone = meta.tree.purge_leaf(rev);
+        if gone.is_empty() {
+            continue;
+        }
+        for dead in &gone {
+            tx.delete(&body_key(id, dead));
+            meta.atts.remove(dead);
+        }
+        removed.push(rev.clone());
+    }
+    if !removed.is_empty() {
+        if meta.tree.is_empty() {
+            tx.delete(&meta_key(id));
+            if meta.seq != 0 {
+                tx.delete(&seq_key(meta.seq));
+            }
+            s.commit(tx)?;
+        } else {
+            let old_seq = meta.seq;
+            // Purging the winner changes what a normal read sees,
+            // so it is a change as far as `_changes` is concerned.
+            let seq = allocate_seq(seq_counter, reserved);
+            meta.seq = seq;
+            tx.delete(&seq_key(old_seq));
+            tx.put(&seq_key(seq), id.as_bytes());
+            tx.put_json(&meta_key(id), &meta)?;
+            s.commit_at(tx, Some(seq))?;
+        }
+    } else {
+        s.commit(tx)?;
+    }
+    if !removed.is_empty() {
+        s.invalidate_latest();
+    }
+    Ok(removed)
 }
 
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
@@ -2390,6 +2770,8 @@ fn put_many(
 ) -> Vec<(usize, DbResult<Value>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
+    // What each staged document's record held in the shard before this batch.
+    let mut origin: HashMap<String, Option<MetaState>> = HashMap::new();
     let mut results = Vec::new();
 
     for (i, doc) in docs {
@@ -2398,6 +2780,7 @@ fn put_many(
             shard,
             ops: &mut ops,
             staged: &mut staged,
+            origin: &mut origin,
             seq,
             reserved,
         };
@@ -2414,15 +2797,23 @@ fn put_many(
     // Prune once here so a later branch cannot resurrect a previously pruned
     // ancestor as an orphan root.
     let limit = shard.revs_limit();
+    // Each document's record is written once, here, in its final form.
+    let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
     for (id, meta) in staged.iter_mut() {
         meta.tree.prune(limit);
         meta.atts.retain(|rev, _| meta.tree.contains(rev));
-        if let Ok(bytes) = serde_json::to_vec(meta) {
-            ops.push((meta_key(id), Some(bytes)));
+        if let Ok(bytes) = meta_bytes(meta) {
+            let old = origin.get(id).cloned().flatten();
+            metas.push(MetaWrite {
+                key: meta_key(id),
+                bytes,
+                old,
+                new: meta_state(meta),
+            });
         }
     }
 
-    if let Err(e) = commit_ops(shard, ops) {
+    if let Err(e) = commit_ops(shard, ops, metas) {
         shard.invalidate_latest();
         let message = e.to_string();
         return results
@@ -2454,6 +2845,7 @@ struct Stage<'a> {
     shard: &'a mut crate::store::Shard,
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
+    origin: &'a mut HashMap<String, Option<MetaState>>,
     seq: &'a Arc<AtomicU64>,
     reserved: &'a Arc<AtomicU64>,
 }
@@ -2467,14 +2859,17 @@ impl Stage<'_> {
         if let Some(m) = self.staged.get(id) {
             return Ok(Some(m.clone()));
         }
-        Ok(self.shard.get_meta(id)?)
+        let meta = self.shard.get_meta(id)?;
+        self.origin
+            .entry(id.to_string())
+            .or_insert_with(|| meta.as_ref().and_then(meta_state));
+        Ok(meta)
     }
 
-    fn flush_meta(&mut self, id: &str, meta: &DocMeta) -> DbResult<()> {
-        let bytes = serde_json::to_vec(meta).map_err(ApiError::internal)?;
-        self.ops.push((meta_key(id), Some(bytes)));
+    /// Record the document's new metadata. `put_many` writes it, once, after
+    /// the whole batch is staged and pruned.
+    fn flush_meta(&mut self, id: &str, meta: &DocMeta) {
         self.staged.insert(id.to_string(), meta.clone());
-        Ok(())
     }
 
     fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
@@ -2565,7 +2960,7 @@ impl Stage<'_> {
         if old_seq != 0 {
             self.ops.push((seq_key(old_seq), None));
         }
-        self.flush_meta(&id, &meta)?;
+        self.flush_meta(&id, &meta);
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
     }
@@ -2610,7 +3005,7 @@ impl Stage<'_> {
             if old_seq != 0 {
                 self.ops.push((seq_key(old_seq), None));
             }
-            self.flush_meta(&id, &meta)?;
+            self.flush_meta(&id, &meta);
         }
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
@@ -2661,7 +3056,33 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
     Ok((rev, vec![leaf]))
 }
 
-fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
+#[cfg(test)]
+thread_local! {
+    static META_SERIALISES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A document's metadata record as stored.
+fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
+    #[cfg(test)]
+    META_SERIALISES.with(|count| count.set(count.get() + 1));
+    serde_json::to_vec(meta)
+}
+
+/// A document's metadata record, with the state it replaces and the state it
+/// leaves.
+struct MetaWrite {
+    key: Vec<u8>,
+    bytes: Vec<u8>,
+    old: Option<MetaState>,
+    new: Option<MetaState>,
+}
+
+/// Commit a batch's operations and its documents' metadata records.
+fn commit_ops(
+    shard: &mut crate::store::Shard,
+    ops: Ops,
+    metas: Vec<MetaWrite>,
+) -> anyhow::Result<()> {
     let mut last_seq = None;
     let mut tx = Tx::new();
     for (key, value) in ops {
@@ -2677,6 +3098,9 @@ fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
             Some(v) => tx.put(&key, &v),
             None => tx.delete(&key),
         }
+    }
+    for meta in metas {
+        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new);
     }
     shard.commit_at(tx, last_seq)
 }
@@ -2765,6 +3189,12 @@ impl Default for AllDocsOpts {
             skip: 0,
         }
     }
+}
+
+/// The counts an `_all_docs` reply leads with.
+pub(crate) struct AllDocsHead {
+    pub total_rows: usize,
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3057,122 +3487,130 @@ fn attachment_json(
 /// Scan one shard for the live rows in the requested key range, stopping once
 /// `take` rows have been collected. Also returns how many live rows precede
 /// `startkey`, which is the shard's contribution to `offset`.
+/// How many live ids sort before the query's start key, in the query's
+/// direction: the `offset` of an `_all_docs` reply, before `skip`.
+fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
+    let Some(start) = opts.startkey.as_deref() else {
+        return Ok(0);
+    };
+    // Without a partition the rank comes from the shard's cursor, so paging by
+    // `startkey` does not recount every id before it on each request.
+    let ranked = match &opts.partition {
+        None => Some(shard.live_rank(start)?),
+        Some(_) => None,
+    };
+    let live = shard.live_docs()?;
+    let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
+    let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
+    Ok(match (opts.descending, ranked) {
+        (false, None) => live
+            .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
+            .filter(|(id, _)| in_partition(id))
+            .count(),
+        (true, None) => live
+            .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
+            .filter(|(id, _)| in_partition(id))
+            .count(),
+        (false, Some(rank)) => rank,
+        (true, Some(rank)) => live
+            .len()
+            .saturating_sub(rank + usize::from(live.contains_key(start))),
+    })
+}
+
+/// Up to `take` live ids of the query's range in the query's direction,
+/// starting after `after` when it is given. `after` must be an id this scan
+/// already returned (or the start of the range), so a later page continues
+/// where the last one stopped.
+fn scan_all_docs(
+    shard: &mut crate::store::Shard,
+    opts: &AllDocsOpts,
+    after: Option<&str>,
+    take: usize,
+) -> DbResult<Vec<AllDocsRow>> {
+    let start = opts.startkey.as_deref();
+    let end = opts.endkey.as_deref();
+    let empty_range = match (start, end) {
+        (Some(start), Some(end)) if opts.descending => start < end,
+        (Some(start), Some(end)) => start > end,
+        _ => false,
+    };
+    if empty_range {
+        return Ok(Vec::new());
+    }
+    let live = shard.live_docs()?;
+    let end_bound = match end {
+        Some(end) if opts.inclusive_end => Bound::Included(end),
+        Some(end) => Bound::Excluded(end),
+        None => Bound::Unbounded,
+    };
+    let row = |(id, doc): (&String, &LiveDoc)| AllDocsRow {
+        id: id.clone(),
+        rev: doc.rev.clone(),
+        doc: None,
+    };
+    let rows = if opts.descending {
+        let low = end_bound;
+        let high = match (after, start) {
+            (Some(after), _) => Bound::Excluded(after),
+            (None, Some(start)) => Bound::Included(start),
+            (None, None) => Bound::Unbounded,
+        };
+        live.range::<str, _>((low, high))
+            .rev()
+            .take(take)
+            .map(row)
+            .collect()
+    } else {
+        let low = match (after, start) {
+            (Some(after), _) => Bound::Excluded(after),
+            (None, Some(start)) => Bound::Included(start),
+            (None, None) => Bound::Unbounded,
+        };
+        let high = end_bound;
+        live.range::<str, _>((low, high))
+            .take(take)
+            .map(row)
+            .collect()
+    };
+    Ok(rows)
+}
+
+/// Attach each row's document when the query asks for them, leaving out any
+/// whose record is corrupt.
+fn load_all_docs(
+    shard: &mut crate::store::Shard,
+    rows: Vec<AllDocsRow>,
+    opts: &AllDocsOpts,
+) -> DbResult<Vec<AllDocsRow>> {
+    if !opts.include_docs {
+        return Ok(rows);
+    }
+    let mut readable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let doc_opts = DocOpts {
+            rev: Some(row.rev.clone()),
+            conflicts: opts.conflicts,
+            attachments: opts.attachments,
+            ..Default::default()
+        };
+        let doc = read_doc(shard, &row.id, &doc_opts);
+        if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
+            row.doc = Some(doc);
+            readable.push(row);
+        }
+    }
+    Ok(readable)
+}
+
 fn collect_all_docs(
     shard: &mut crate::store::Shard,
     opts: &AllDocsOpts,
     take: usize,
 ) -> DbResult<(Vec<AllDocsRow>, usize)> {
-    let start = opts.startkey.as_deref();
-    let end = opts.endkey.as_deref();
-    let mut rows = Vec::new();
-    let before_start = {
-        let live = shard.live_docs()?;
-        let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
-        let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-        let before_start = match (start, opts.descending) {
-            (Some(start), false) => live
-                .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
-                .filter(|(id, _)| in_partition(id))
-                .count(),
-            (Some(start), true) => live
-                .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
-                .filter(|(id, _)| in_partition(id))
-                .count(),
-            (None, _) => 0,
-        };
-
-        let empty_range = match (start, end) {
-            (Some(start), Some(end)) if opts.descending => start < end,
-            (Some(start), Some(end)) => start > end,
-            _ => false,
-        };
-        if !empty_range {
-            if opts.descending {
-                let range = match (start, end) {
-                    (Some(start), Some(end)) => (
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                        Bound::Included(start),
-                    ),
-                    (Some(start), None) => (Bound::Unbounded, Bound::Included(start)),
-                    (None, Some(end)) => (
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                        Bound::Unbounded,
-                    ),
-                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
-                };
-                for (id, doc) in live.range::<str, _>(range).rev() {
-                    if rows.len() >= take {
-                        break;
-                    }
-                    rows.push(AllDocsRow {
-                        id: id.clone(),
-                        rev: doc.rev.clone(),
-                        doc: None,
-                    });
-                }
-            } else {
-                let range = match (start, end) {
-                    (Some(start), Some(end)) => (
-                        Bound::Included(start),
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                    ),
-                    (Some(start), None) => (Bound::Included(start), Bound::Unbounded),
-                    (None, Some(end)) => (
-                        Bound::Unbounded,
-                        if opts.inclusive_end {
-                            Bound::Included(end)
-                        } else {
-                            Bound::Excluded(end)
-                        },
-                    ),
-                    (None, None) => (Bound::Unbounded, Bound::Unbounded),
-                };
-                for (id, doc) in live.range::<str, _>(range) {
-                    if rows.len() >= take {
-                        break;
-                    }
-                    rows.push(AllDocsRow {
-                        id: id.clone(),
-                        rev: doc.rev.clone(),
-                        doc: None,
-                    });
-                }
-            }
-        }
-        before_start
-    };
-
-    if opts.include_docs {
-        let mut readable = Vec::with_capacity(rows.len());
-        for mut row in rows {
-            let doc_opts = DocOpts {
-                rev: Some(row.rev.clone()),
-                conflicts: opts.conflicts,
-                attachments: opts.attachments,
-                ..Default::default()
-            };
-            let doc = read_doc(shard, &row.id, &doc_opts);
-            if let Some(doc) = skip_corrupt(shard, &row.id, doc)? {
-                row.doc = Some(doc);
-                readable.push(row);
-            }
-        }
-        rows = readable;
-    }
-
-    Ok((rows, before_start))
+    let before_start = all_docs_before_start(shard, opts)?;
+    let rows = scan_all_docs(shard, opts, None, take)?;
+    Ok((load_all_docs(shard, rows, opts)?, before_start))
 }
 
 /// Put `_id` and `_rev` in front of an already-serialized document body.
@@ -3284,15 +3722,16 @@ struct AllDocsRow {
     doc: Option<Value>,
 }
 
-fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
-    let mut results = Vec::new();
-    for AllDocsRow { id, rev, doc } in rows {
-        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-        if let Some(doc) = doc {
-            row["doc"] = doc;
-        }
-        results.push(row);
+fn all_docs_row_json(AllDocsRow { id, rev, doc }: AllDocsRow) -> Value {
+    let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
+    if let Some(doc) = doc {
+        row["doc"] = doc;
     }
+    row
+}
+
+fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
+    let results: Vec<Value> = rows.into_iter().map(all_docs_row_json).collect();
     Ok(json!({ "total_rows": total, "offset": offset, "rows": results }))
 }
 
@@ -3316,7 +3755,7 @@ fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<
                 &docs,
                 crate::view::ViewLimits::default(),
             )
-            .map_err(|reason| ApiError::new(500, "unknown_error", reason))?;
+            .map_err(ApiError::from)?;
             Ok(rows
                 .into_iter()
                 .filter(|row| matched.contains(&row.id))
@@ -3331,7 +3770,9 @@ fn collect_changes(
     opts: &ChangesOpts,
     until: u64,
 ) -> DbResult<Vec<ChangeRow>> {
-    let limit = if opts.filter.is_some() {
+    // A descending feed has no cursor to resume a filtered scan from, so it
+    // still reads every row; ascending callers page by `since` and `limit`.
+    let limit = if opts.filter.is_some() && opts.descending {
         usize::MAX
     } else {
         opts.limit.unwrap_or(usize::MAX)
@@ -3467,6 +3908,44 @@ fn collect_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Metadata decodes and encodes for one `put_many` call.
+    fn write_costs(shard: &mut crate::store::Shard, docs: Vec<Value>) -> (usize, usize) {
+        let parses = crate::store::meta_parses();
+        let serialises = META_SERIALISES.with(std::cell::Cell::get);
+        let seq = Arc::new(AtomicU64::new(shard.seq()));
+        let reserved = Arc::new(AtomicU64::new(0));
+        let docs = docs.into_iter().enumerate().collect();
+        for (_, result) in put_many(shard, docs, true, &seq, &reserved) {
+            result.unwrap();
+        }
+        (
+            crate::store::meta_parses() - parses,
+            META_SERIALISES.with(std::cell::Cell::get) - serialises,
+        )
+    }
+
+    /// A write reads the document's metadata once (to stage it) and writes it
+    /// once. Staging, pruning and the commit's counter bookkeeping used to
+    /// each decode or encode it again: five decodes and two encodes per update.
+    #[test]
+    fn a_write_decodes_the_metadata_once_and_encodes_it_once() {
+        let dir = std::env::temp_dir().join(format!("douchdb-write-cost-{}", uuid()));
+        let mut shard = crate::store::Shard::open(&dir, 1000).unwrap();
+
+        // A new document has no stored metadata to decode.
+        let costs = write_costs(&mut shard, vec![json!({"_id": "a", "n": 1})]);
+        assert_eq!(costs, (0, 1), "create");
+
+        let rev = shard.get_meta("a").unwrap().unwrap().tree.winner().unwrap();
+        let update = vec![json!({"_id": "a", "_rev": rev, "n": 2})];
+        assert_eq!(write_costs(&mut shard, update), (1, 1), "update");
+
+        // Each document in a batch costs the same.
+        let batch = vec![json!({"_id": "b"}), json!({"_id": "c"})];
+        assert_eq!(write_costs(&mut shard, batch), (0, 2), "batch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_owned_mask_selects_only_the_shards_it_covers() {
@@ -3836,6 +4315,204 @@ mod tests {
         assert!(!built, "the validator scan built the changes index");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The streamed `_all_docs` reply, assembled in the shape of `all_docs`.
+    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> Value {
+        use futures::StreamExt;
+        let (head, rows) = Db::all_docs_stream(db.clone(), opts).await.unwrap();
+        let rows: Vec<Value> = Box::pin(rows)
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+        json!({"total_rows": head.total_rows, "offset": head.offset, "rows": rows})
+    }
+
+    #[tokio::test]
+    async fn streamed_all_docs_match_the_buffered_reply() {
+        let root = std::env::temp_dir().join(format!("douchdb-stream-{}", crate::util::uuid()));
+        let db = Arc::new(
+            Db::open(
+                &root,
+                "stream",
+                DbConfig {
+                    q: 3,
+                    revs_limit: 100,
+                    shard_map: ShardMap::balanced(3, 1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        // More documents per shard than one page, so the merge refills.
+        let docs: Vec<Value> = (0..900)
+            .map(|n| json!({"_id": format!("doc{n:04}"), "n": n, "text": "x".repeat(n % 7)}))
+            .collect();
+        let put = db.put_docs(docs, true).await.unwrap();
+        // One corrupt body, which include_docs skips.
+        let bad_id = "doc0450";
+        let bad_rev = put[450]["rev"].as_str().unwrap().to_string();
+        let shard = db.shard_index(bad_id);
+        db.shards[shard]
+            .call(move |s| {
+                s.put_raw(&body_key(bad_id, &bad_rev), b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // A deleted document does not count.
+        let gone = put[10]["rev"].as_str().unwrap();
+        db.put_docs(
+            vec![json!({"_id": "doc0010", "_rev": gone, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let base = AllDocsOpts::default;
+        let shapes: Vec<(&str, AllDocsOpts)> = vec![
+            ("all", base()),
+            (
+                "include_docs",
+                AllDocsOpts {
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending",
+                AllDocsOpts {
+                    descending: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending include_docs",
+                AllDocsOpts {
+                    descending: true,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "range",
+                AllDocsOpts {
+                    startkey: Some("doc0100".into()),
+                    endkey: Some("doc0600".into()),
+                    ..base()
+                },
+            ),
+            (
+                "range exclusive end",
+                AllDocsOpts {
+                    startkey: Some("doc0100".into()),
+                    endkey: Some("doc0600".into()),
+                    inclusive_end: false,
+                    ..base()
+                },
+            ),
+            (
+                "descending range",
+                AllDocsOpts {
+                    startkey: Some("doc0600".into()),
+                    endkey: Some("doc0100".into()),
+                    descending: true,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "inverted range",
+                AllDocsOpts {
+                    startkey: Some("doc0600".into()),
+                    endkey: Some("doc0100".into()),
+                    ..base()
+                },
+            ),
+            (
+                "start between ids",
+                AllDocsOpts {
+                    startkey: Some("doc03505".into()),
+                    ..base()
+                },
+            ),
+            (
+                "skip and limit",
+                AllDocsOpts {
+                    skip: 301,
+                    limit: 400,
+                    ..base()
+                },
+            ),
+            (
+                "skip and limit with docs",
+                AllDocsOpts {
+                    skip: 7,
+                    limit: 5,
+                    include_docs: true,
+                    descending: true,
+                    ..base()
+                },
+            ),
+            ("limit zero", AllDocsOpts { limit: 0, ..base() }),
+            (
+                "skip past the end",
+                AllDocsOpts {
+                    skip: 5000,
+                    ..base()
+                },
+            ),
+            (
+                "one row",
+                AllDocsOpts {
+                    startkey: Some("doc0777".into()),
+                    endkey: Some("doc0777".into()),
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "no rows",
+                AllDocsOpts {
+                    startkey: Some("zzz".into()),
+                    ..base()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let buffered = db.all_docs(&opts).await.unwrap();
+            let streamed = streamed_all_docs(&db, &opts).await;
+            assert_eq!(
+                serde_json::to_string(&streamed).unwrap(),
+                serde_json::to_string(&buffered).unwrap(),
+                "{name}"
+            );
+        }
+
+        let empty_root =
+            std::env::temp_dir().join(format!("douchdb-stream-empty-{}", crate::util::uuid()));
+        let empty = Arc::new(
+            Db::open(
+                &empty_root,
+                "empty",
+                DbConfig {
+                    q: 3,
+                    revs_limit: 100,
+                    shard_map: ShardMap::balanced(3, 1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        let opts = AllDocsOpts::default();
+        assert_eq!(
+            streamed_all_docs(&empty, &opts).await,
+            empty.all_docs(&opts).await.unwrap()
+        );
+        drop(db);
+        drop(empty);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(empty_root);
     }
 
     #[tokio::test]
@@ -4377,6 +5054,77 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(last_seq, 4);
         assert_eq!(pending, 3, "three older documents remain descending");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Requests that touch many documents fan out one call per shard; the
+    /// answers must still come back per document, in the order asked.
+    #[tokio::test]
+    async fn per_document_answers_survive_the_per_shard_fan_out() {
+        let q = 4u32;
+        let root = std::env::temp_dir().join(format!("douchdb-fan-out-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "fanout",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..12).map(|n| format!("doc-{n:02}")).collect();
+        let shards: std::collections::HashSet<usize> =
+            ids.iter().map(|id| db.shard_index(id)).collect();
+        assert!(shards.len() > 1, "the ids must spread over shards");
+        let docs = ids.iter().map(|id| json!({"_id": id, "n": id})).collect();
+        let written = db.put_docs(docs, true).await.unwrap();
+        assert!(written.iter().all(|row| row["ok"] == json!(true)));
+        let info = db.info().await.unwrap();
+        assert_eq!(info["doc_count"], json!(12));
+        assert_eq!(info["update_seq"], json!(12));
+
+        let got = db.get_docs(&ids, &DocOpts::default()).await.unwrap();
+        for (id, doc) in ids.iter().zip(&got) {
+            assert_eq!(doc.as_ref().unwrap()["n"], json!(id));
+        }
+        let mut asked = ids.clone();
+        asked.push("absent".to_string());
+        let got = db.get_docs(&asked, &DocOpts::default()).await.unwrap();
+        assert_eq!(got.last().unwrap().as_ref().unwrap_err().status, 404);
+
+        // Every document is missing one revision it was not told about, and
+        // lists the leaf it has as a possible ancestor.
+        let mut diff = Map::new();
+        for id in &ids {
+            let rev = written[ids.iter().position(|other| other == id).unwrap()]["rev"].clone();
+            diff.insert(id.clone(), json!([rev, "2-ffff"]));
+        }
+        let diff = db.revs_diff(&Value::Object(diff)).await.unwrap();
+        let rows = diff.as_object().unwrap();
+        assert_eq!(rows.len(), 12);
+        for (position, id) in ids.iter().enumerate() {
+            assert_eq!(rows[id]["missing"], json!(["2-ffff"]));
+            assert_eq!(
+                rows[id]["possible_ancestors"],
+                json!([written[position]["rev"]])
+            );
+        }
+
+        // Purging by document answers for each document, and only for the
+        // revisions it removed.
+        let mut purge = Map::new();
+        for (position, id) in ids.iter().enumerate().take(6) {
+            purge.insert(id.clone(), json!([written[position]["rev"], "9-nope"]));
+        }
+        let purged = db.purge(&Value::Object(purge)).await.unwrap();
+        for (position, id) in ids.iter().enumerate().take(6) {
+            assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
+        }
+        assert_eq!(db.info().await.unwrap()["doc_count"], json!(6));
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);

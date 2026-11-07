@@ -29,6 +29,8 @@ pub struct Args {
     pub js_workers: usize,
     pub worker: bool,
     pub cors_origins: Vec<String>,
+    pub cors_credentials: bool,
+    pub cors_headers: Vec<String>,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     pub max_request_mb: usize,
@@ -39,7 +41,8 @@ pub struct Args {
 }
 
 const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]\n\
-                     \x20       [--admin user:pass] [--users-file FILE] [--session-secret SECRET]\n\
+                     \x20       [--admin user:pass]         (or DOUCHDB_ADMIN)\n\
+                     \x20       [--users-file FILE] [--session-secret SECRET]\n\
                      \x20       [--default-security open|admin-only]\n\
                      \x20       [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]\n\
                      \x20       [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]\n\
@@ -48,7 +51,8 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--advertise URL] [--seed-nodes URL,URL]\n\
                      \x20       [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]\n\
                      \x20       [--js-workers N]\n\
-                     \x20       [--cors-origins ORIGIN,ORIGIN] [--view-timeout-ms N]\n\
+                     \x20       [--cors-origins ORIGIN,ORIGIN] [--cors-credentials]\n\
+                     \x20       [--cors-headers HEADER,HEADER] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -111,6 +115,19 @@ fn environment(
     }
 }
 
+/// Parse `user:password`. A malformed value must stop startup: ignoring it
+/// would leave the server running with authentication disabled.
+fn admin(value: &str, source: &str) -> Result<(String, String), String> {
+    match value.split_once(':') {
+        Some((user, pass)) if !user.is_empty() && !pass.is_empty() => {
+            Ok((user.to_string(), pass.to_string()))
+        }
+        _ => Err(format!(
+            "{source} expects user:password with a non-empty user and password"
+        )),
+    }
+}
+
 fn list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -131,7 +148,9 @@ pub fn parse_from(
         q: 2,
         n: 3,
         revs_limit: 1000,
-        admin: None,
+        admin: environment(&env, "DOUCHDB_ADMIN")?
+            .map(|value| admin(&value, "DOUCHDB_ADMIN"))
+            .transpose()?,
         users_file: None,
         session_secret: environment(&env, "DOUCHDB_SESSION_SECRET")?.unwrap_or_default(),
         default_security: String::new(),
@@ -152,6 +171,8 @@ pub fn parse_from(
         js_workers: 2,
         worker: false,
         cors_origins: Vec::new(),
+        cors_credentials: false,
+        cors_headers: Vec::new(),
         view_timeout_ms: 5000,
         view_memory_mb: 64,
         max_request_mb: 64,
@@ -181,22 +202,7 @@ pub fn parse_from(
             "--q" => args.q = number(&mut it, flag, 1, u32::MAX.into())?,
             "--n" => args.n = number(&mut it, flag, 1, u32::MAX.into())?,
             "--revs-limit" => args.revs_limit = number(&mut it, flag, 1, u64::MAX)?,
-            "--admin" => {
-                // A malformed value must stop startup: ignoring it would leave
-                // the server running with authentication disabled.
-                let value = it.next().unwrap_or_default();
-                match value.split_once(':') {
-                    Some((user, pass)) if !user.is_empty() && !pass.is_empty() => {
-                        args.admin = Some((user.to_string(), pass.to_string()));
-                    }
-                    _ => {
-                        return Err(
-                            "--admin expects user:password with a non-empty user and password"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
+            "--admin" => args.admin = Some(admin(&it.next().unwrap_or_default(), "--admin")?),
             "--users-file" => args.users_file = Some(value(&mut it, flag)?),
             "--session-secret" => args.session_secret = value(&mut it, flag)?,
             "--default-security" => args.default_security = value(&mut it, flag)?,
@@ -247,6 +253,8 @@ pub fn parse_from(
             "--cluster-secret" => args.cluster_secret = value(&mut it, flag)?,
             "--otel-endpoint" => args.otel_endpoint = Some(value(&mut it, flag)?),
             "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
+            "--cors-credentials" => args.cors_credentials = true,
+            "--cors-headers" => args.cors_headers = list(&value(&mut it, flag)?),
             "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -320,6 +328,7 @@ mod tests {
         "--cluster-secret",
         "--otel-endpoint",
         "--cors-origins",
+        "--cors-headers",
     ];
 
     #[test]
@@ -421,6 +430,23 @@ mod tests {
     }
 
     #[test]
+    fn admin_can_come_from_the_environment() {
+        let env = |name: &str| (name == "DOUCHDB_ADMIN").then(|| OsString::from("a:b"));
+        let args = parse_from(Vec::new(), env).unwrap().unwrap();
+        assert_eq!(args.admin, Some(("a".to_string(), "b".to_string())));
+        // The flag wins over the environment.
+        let argv = vec!["--admin".to_string(), "c:d".to_string()];
+        let args = parse_from(argv, env).unwrap().unwrap();
+        assert_eq!(args.admin, Some(("c".to_string(), "d".to_string())));
+        // A malformed value stops startup instead of disabling authentication.
+        let bad = |name: &str| (name == "DOUCHDB_ADMIN").then(|| OsString::from("nopassword"));
+        match parse_from(Vec::new(), bad) {
+            Err(message) => assert!(message.contains("DOUCHDB_ADMIN"), "{message}"),
+            Ok(_) => panic!("malformed DOUCHDB_ADMIN accepted"),
+        }
+    }
+
+    #[test]
     fn unknown_arguments_are_rejected() {
         assert!(error(&["--bogus"]).contains("--bogus"));
     }
@@ -444,6 +470,7 @@ mod tests {
     fn non_utf8_environment_values_are_rejected() {
         use std::os::unix::ffi::OsStringExt;
         for name in [
+            "DOUCHDB_ADMIN",
             "DOUCHDB_CLUSTER_SECRET",
             "DOUCHDB_SESSION_SECRET",
             "OTEL_EXPORTER_OTLP_ENDPOINT",

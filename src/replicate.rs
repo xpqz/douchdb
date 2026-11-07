@@ -105,12 +105,14 @@ type RevPairs = BTreeSet<(String, String)>;
 /// Revisions the peer returned, and revisions it explicitly no longer has.
 type Fetched = (BTreeMap<(String, String), Value>, RevPairs);
 
-/// Include the shard map in the checkpoint id. When placement changes, the
-/// new replica starts from zero instead of skipping documents that were
-/// filtered out under the old map.
+/// Include the replica placement in the checkpoint id. When placement changes,
+/// the new replica starts from zero instead of skipping documents that were
+/// filtered out under the old map. Only the replica lists matter: the version
+/// counter changes without changing what this node replicates, and keying on
+/// it would re-pull every document after each metadata bump.
 fn checkpoint_id(db: &Db, peer: &str) -> String {
     let map_tag = crate::util::hex(&Md5::digest(
-        serde_json::to_vec(&db.replication_map()).unwrap_or_default(),
+        serde_json::to_vec(&db.replication_map().replicas).unwrap_or_default(),
     ));
     format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag)
 }
@@ -407,16 +409,23 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
 
 /// Pull from every peer on a timer. This is the non-client-induced replication
 /// path: a node catches up from its peers even when no client reads or writes.
-pub fn spawn_anti_entropy(state: Arc<AppState>) {
+pub fn spawn_anti_entropy(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let shutdown = state.shutdown.clone();
         let interval = Duration::from_secs(state.config.sync_secs.max(1));
-        loop {
-            if !state.cluster_state.replication_paused() {
-                sync_once(state.clone(), None).await;
+        let run = async {
+            loop {
+                if !state.cluster_state.replication_paused() {
+                    sync_once(state.clone(), None).await;
+                }
+                tokio::time::sleep(interval).await;
             }
-            tokio::time::sleep(interval).await;
+        };
+        tokio::select! {
+            () = run => {}
+            () = shutdown.cancelled() => {}
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -461,6 +470,38 @@ mod tests {
         Json(json!({"results": [a, b]}))
     }
 
+    /// A version bump that leaves every replica list alone must keep the
+    /// checkpoint: the filter has not changed, so re-pulling from zero is waste.
+    #[test]
+    fn version_only_shard_map_bump_keeps_the_checkpoint_id() {
+        let root = std::env::temp_dir().join(format!("douchdb-ckid-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "ck",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: crate::cluster::ShardMap::balanced(2, 2, 1),
+                partitioned: false,
+            },
+        )
+        .expect("db");
+        let before = checkpoint_id(&db, "http://peer");
+        let mut bumped = db.shard_map();
+        bumped.version += 1;
+        assert!(db.set_shard_map(bumped).expect("set map"));
+        assert_eq!(db.shard_map().version, 1);
+        assert_eq!(before, checkpoint_id(&db, "http://peer"));
+
+        let mut moved = db.shard_map();
+        moved.version += 1;
+        moved.replicas = vec![vec![1], vec![0]];
+        assert!(db.set_shard_map(moved).expect("set map"));
+        assert_ne!(before, checkpoint_id(&db, "http://peer"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn partial_bulk_get_does_not_advance_the_checkpoint() {
         let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
@@ -501,10 +542,7 @@ mod tests {
 
         let first = pull(&db, &peer, &client, &cluster, None).await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
-        let map_tag = crate::util::hex(&Md5::digest(
-            serde_json::to_vec(&db.shard_map()).unwrap_or_default(),
-        ));
-        let checkpoint_id = format!("ae{CHECKPOINT_VERSION}:{peer}:{map_tag}");
+        let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
             db.local_get(&checkpoint_id).await.unwrap().is_none(),
             "checkpoint advanced past a missing revision"

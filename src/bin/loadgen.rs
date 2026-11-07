@@ -9,7 +9,8 @@
 //!   --path '/perf/doc-{id}' --start 0 --count 10000 --concurrency 64
 //!
 //! `--method PUT --body '{"n": {id}}'` writes instead: `{id}` is replaced in
-//! both the path and the JSON body.
+//! both the path and the JSON body. `--header 'Authorization: Bearer TOKEN'`
+//! (repeatable) adds a header to every request.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ struct Args {
     timeout: Duration,
     method: reqwest::Method,
     body: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 fn parse_args() -> Args {
@@ -39,6 +41,7 @@ fn parse_args() -> Args {
         timeout: Duration::from_secs(120),
         method: reqwest::Method::GET,
         body: None,
+        headers: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -71,6 +74,14 @@ fn parse_args() -> Args {
                     .unwrap_or_else(|_| panic!("unknown method: {method}"));
             }
             "--body" => args.body = it.next(),
+            "--header" => {
+                let header = it.next().unwrap_or_default();
+                let (name, value) = header
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("--header needs `Name: value`, got {header:?}"));
+                args.headers
+                    .push((name.trim().to_string(), value.trim().to_string()));
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -91,7 +102,17 @@ fn percentile(values: &[f64], pct: f64) -> f64 {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = parse_args();
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    for (name, value) in &args.headers {
+        default_headers.append(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .unwrap_or_else(|_| panic!("bad header name {name:?}")),
+            reqwest::header::HeaderValue::from_str(value)
+                .unwrap_or_else(|_| panic!("bad header value for {name}")),
+        );
+    }
     let client = reqwest::Client::builder()
+        .default_headers(default_headers)
         .pool_max_idle_per_host(args.concurrency + 8)
         .timeout(args.timeout)
         .build()

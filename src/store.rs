@@ -204,6 +204,10 @@ impl Fenwick {
 #[derive(Default)]
 pub struct Tx {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Metadata writes whose before and after states the caller already
+    /// knows, by index into `ops`. `commit_at` would otherwise read and decode
+    /// both records to learn them.
+    known: std::collections::HashMap<usize, (Option<MetaState>, Option<MetaState>)>,
 }
 
 impl Tx {
@@ -223,6 +227,21 @@ impl Tx {
 
     pub fn delete(&mut self, key: &[u8]) {
         self.ops.push((key.to_vec(), None));
+    }
+
+    /// Write a document's metadata record, saying what the document's state
+    /// was in the shard before (`old`) and is after the write (`new`), so the
+    /// commit need not decode either. `old` must be the state of the record
+    /// the shard holds when the transaction commits.
+    pub fn put_meta(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        old: Option<MetaState>,
+        new: Option<MetaState>,
+    ) {
+        self.known.insert(self.ops.len(), (old, new));
+        self.put(key, value);
     }
 }
 
@@ -302,6 +321,11 @@ pub struct Shard {
     /// `_all_docs` range query and then maintained in memory. Keeping this out
     /// of LevelDB avoids an extra write per ingested document.
     live: Option<BTreeMap<String, LiveDoc>>,
+    /// The last `live_rank` answer: how many live ids sort before this key.
+    /// Paging `_all_docs` by `startkey` asks for nearby keys, so the next rank
+    /// is found by counting only the ids between the two keys. Kept in step
+    /// with `live` on every write and dropped whenever `live` is.
+    rank_cursor: Option<(String, usize)>,
     /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
@@ -321,7 +345,11 @@ pub struct Shard {
     flush_failure: Option<String>,
 }
 
-fn meta_state(meta: &DocMeta) -> Option<(String, bool, bool)> {
+/// What a document's metadata says about it: the winning revision, whether it
+/// is live, and whether that revision has attachments.
+pub(crate) type MetaState = (String, bool, bool);
+
+pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
         let has_attachments = meta
@@ -392,10 +420,24 @@ impl ShardName {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static META_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many metadata records this thread has decoded, for tests that pin the
+/// cost of a write.
+#[cfg(test)]
+pub(crate) fn meta_parses() -> usize {
+    META_PARSES.with(std::cell::Cell::get)
+}
+
 /// Decode a stored metadata record. A record that does not parse is
 /// corruption: point reads and writes fail on it, and listings skip it
 /// through `ShardName::report_corrupt`.
 fn parse_meta(key: &[u8], value: &[u8]) -> std::result::Result<(String, DocMeta), CorruptRecord> {
+    #[cfg(test)]
+    META_PARSES.with(|count| count.set(count.get() + 1));
     let id = key
         .get(2..)
         .and_then(|id| std::str::from_utf8(id).ok())
@@ -496,6 +538,7 @@ impl Shard {
             docs,
             deleted,
             live: None,
+            rank_cursor: None,
             latest: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
@@ -677,8 +720,37 @@ impl Shard {
                 true
             })?;
             self.live = Some(live);
+            self.rank_cursor = None;
         }
         Ok(self.live.as_ref().expect("live index initialized"))
+    }
+
+    /// How many live documents have an id below `key`. Counts from the
+    /// previous call's key when there is one, so walking through the keys in
+    /// either direction costs the distance moved, not the position.
+    pub fn live_rank(&mut self, key: &str) -> Result<usize> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.live_docs()?;
+        let (Some(live), cursor) = (self.live.as_ref(), self.rank_cursor.take()) else {
+            return Ok(0);
+        };
+        let rank = match &cursor {
+            Some((from, rank)) if key == from.as_str() => *rank,
+            Some((from, rank)) if key > from.as_str() => {
+                rank + live
+                    .range::<str, _>((Excluded(from.as_str()), Excluded(key)))
+                    .count()
+                    + usize::from(live.contains_key(from.as_str()))
+            }
+            Some((from, rank)) => rank.saturating_sub(
+                live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
+                    .count()
+                    + usize::from(live.contains_key(key)),
+            ),
+            None => live.range::<str, _>((Unbounded, Excluded(key))).count(),
+        };
+        self.rank_cursor = Some((key.to_string(), rank));
+        Ok(rank)
     }
 
     /// Each document's latest sequence, built lazily from metadata. Used by
@@ -937,8 +1009,10 @@ impl Shard {
         let mut written: std::collections::HashMap<&[u8], &Option<Vec<u8>>> =
             std::collections::HashMap::new();
         let mut states = Vec::with_capacity(tx.ops.len() + 1);
-        for (key, value) in &tx.ops {
-            if key.starts_with(b"m/") {
+        for (index, (key, value)) in tx.ops.iter().enumerate() {
+            if let Some(known) = tx.known.remove(&index) {
+                states.push(Some(known));
+            } else if key.starts_with(b"m/") {
                 let old = match written.get(key.as_slice()) {
                     Some(earlier) => (*earlier).clone(),
                     None => self.get_checked(key)?,
@@ -988,18 +1062,26 @@ impl Shard {
                 }
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = std::str::from_utf8(&key[2..]) {
-                        match new_state {
+                        let (was_live, is_live) = match new_state {
                             Some((rev, true, has_attachments)) => {
-                                live.insert(
+                                let old = live.insert(
                                     id.to_string(),
                                     LiveDoc {
                                         rev,
                                         has_attachments,
                                     },
                                 );
+                                (old.is_some(), true)
                             }
-                            _ => {
-                                live.remove(id);
+                            _ => (live.remove(id).is_some(), false),
+                        };
+                        if let Some((from, rank)) = self.rank_cursor.as_mut() {
+                            if id < from.as_str() && was_live != is_live {
+                                if is_live {
+                                    *rank += 1;
+                                } else {
+                                    *rank = rank.saturating_sub(1);
+                                }
                             }
                         }
                     }
@@ -1050,6 +1132,7 @@ impl Shard {
         self.docs = mark.docs;
         self.deleted = mark.deleted;
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
     }
 
@@ -1107,6 +1190,7 @@ impl Shard {
         self.pending.clear();
         self.overlay.clear();
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
         self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
         self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
@@ -1152,6 +1236,7 @@ impl Shard {
         self.docs = 0;
         self.deleted = 0;
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
         self.pending.clear();
         self.overlay.clear();
@@ -1251,7 +1336,14 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
-    pub fn spawn(dir: impl AsRef<Path>, revs_limit: u64) -> Result<ShardHandle> {
+    /// `committed` is pinged after every batch that advanced this shard's
+    /// committed sequence and has been flushed, so a feed can wait for a
+    /// commit instead of polling.
+    pub fn spawn(
+        dir: impl AsRef<Path>,
+        revs_limit: u64,
+        committed: Arc<tokio::sync::watch::Sender<()>>,
+    ) -> Result<ShardHandle> {
         let dir = dir.as_ref().to_path_buf();
         let name = format!(
             "shard-{}",
@@ -1272,7 +1364,7 @@ impl ShardHandle {
             };
             let initial_seq = shard.seq();
             tracker.store(initial_seq, Ordering::SeqCst);
-            shard.set_seq_tracker(tracker);
+            shard.set_seq_tracker(tracker.clone());
             if ready_tx.send(Ok(initial_seq)).is_err() {
                 return;
             }
@@ -1281,6 +1373,7 @@ impl ShardHandle {
             // OS. rusty-leveldb does not fsync, so this is not power-loss
             // durable.
             while let Some(job) = rx.blocking_recv() {
+                let before = tracker.load(Ordering::SeqCst);
                 let mut acks = vec![job(&mut shard)];
                 for _ in 1..64 {
                     match rx.try_recv() {
@@ -1290,6 +1383,9 @@ impl ShardHandle {
                 }
                 let _ = shard.flush_pending();
                 let flush_error = shard.take_flush_failure();
+                if tracker.load(Ordering::SeqCst) > before {
+                    committed.send_replace(());
+                }
                 for ack in acks {
                     ack(flush_error.clone());
                 }
@@ -1440,7 +1536,7 @@ mod panic_tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        ShardHandle::spawn(&dir, 1000).unwrap()
+        ShardHandle::spawn(&dir, 1000, Default::default()).unwrap()
     }
 
     fn put(key: &'static [u8]) -> impl FnOnce(&mut Shard) -> std::result::Result<(), ApiError> {
@@ -1556,7 +1652,7 @@ mod panic_tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let handle = ShardHandle::spawn(&dir, 1000).unwrap();
+        let handle = ShardHandle::spawn(&dir, 1000, Default::default()).unwrap();
         handle.call(put(b"x/kept")).await.unwrap();
         drop(handle);
         // No waiting: the LevelDB LOCK must already be released.
@@ -1972,6 +2068,46 @@ mod scan_tests {
         tx.put_json(&meta_key("d"), &meta(false, 5)).unwrap();
         shard.commit_at(tx, Some(5)).unwrap();
         assert_eq!(live_ids(&mut shard), ["c", "d"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_rank_follows_the_cursor_through_writes() {
+        let dir = temp_shard_dir("live-rank");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut seq = 0;
+        let mut tx = Tx::new();
+        for id in ["b", "d", "f", "h", "j"] {
+            seq += 1;
+            tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
+        }
+        shard.commit_at(tx, Some(seq)).unwrap();
+        let probes = ["a", "d", "e", "j", "z", "c", "f", "a", "h"];
+        let check = |shard: &mut Shard| {
+            for probe in probes {
+                let expected = live_ids(shard)
+                    .iter()
+                    .filter(|id| id.as_str() < probe)
+                    .count();
+                assert_eq!(shard.live_rank(probe).unwrap(), expected, "rank of {probe}");
+            }
+        };
+        check(&mut shard);
+        // Writes below, at and above the cursor key: insert, delete, update.
+        for (id, deleted) in [
+            ("a", false),
+            ("d", true),
+            ("e", false),
+            ("z", false),
+            ("j", true),
+        ] {
+            shard.live_rank("f").unwrap();
+            seq += 1;
+            let mut tx = Tx::new();
+            tx.put_json(&meta_key(id), &meta(deleted, seq)).unwrap();
+            shard.commit_at(tx, Some(seq)).unwrap();
+            check(&mut shard);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -19,8 +19,13 @@ pub async fn up() -> Response {
     json(StatusCode::OK, json!({"status": "ok"}))
 }
 
-pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response {
-    if !st.authorized(&headers) {
+pub async fn all_dbs(
+    State(st): State<Arc<AppState>>,
+    Caller(principal): Caller,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !principal.is_authenticated() {
         return unauthorized();
     }
     let q = query(&uri);
@@ -57,7 +62,6 @@ pub async fn all_dbs(State(st): State<Arc<AppState>>, headers: HeaderMap, uri: U
     names.sort();
     names.dedup();
 
-    let principal = st.principal(&headers);
     if !principal.admin {
         names = visible_db_names(&st, &principal, names).await;
     }
@@ -154,13 +158,16 @@ pub async fn db_updates(
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                     sent += 1;
                 }
-                if started.elapsed().as_millis() as u64 >= timeout {
+                if started.elapsed().as_millis() as u64 >= timeout || st.shutdown.is_cancelled() {
                     break;
                 }
                 if heartbeat.due() {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = st.shutdown.cancelled() => {}
+                }
             }
         };
         return feed_response("application/json", stream);
@@ -169,7 +176,10 @@ pub async fn db_updates(
     let started = std::time::Instant::now();
     loop {
         let (events, current) = st.db_updates.since(since);
-        if !events.is_empty() || feed == "normal" || started.elapsed().as_millis() as u64 >= timeout
+        if !events.is_empty()
+            || feed == "normal"
+            || started.elapsed().as_millis() as u64 >= timeout
+            || st.shutdown.is_cancelled()
         {
             let selected: Vec<Value> = events
                 .into_iter()
@@ -185,9 +195,16 @@ pub async fn db_updates(
                 json!({"results": selected, "last_seq": last_seq}),
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = st.shutdown.cancelled() => {}
+        }
     }
 }
+
+/// CouchDB's `[chttpd] max_db_number_for_dbs_info_req` default: the most keys
+/// one `_dbs_info` request may name.
+const MAX_DBS_INFO_KEYS: usize = 100;
 
 pub async fn dbs_info(
     State(st): State<Arc<AppState>>,
@@ -212,6 +229,10 @@ pub async fn dbs_info(
     let Some(keys) = keys else {
         return fail(ApiError::bad_request("`keys` must be a JSON array"));
     };
+    if keys.len() > MAX_DBS_INFO_KEYS {
+        // CouchDB 3.5 answers {"error":"bad_request","reason":"too_many_keys"}.
+        return fail(ApiError::bad_request("too_many_keys"));
+    }
     let mut results = Vec::new();
     for key in keys {
         let Some(name) = key.as_str() else {

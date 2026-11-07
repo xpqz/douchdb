@@ -1,6 +1,9 @@
 use rquickjs::{Context, Function, Runtime};
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::io::Read;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 fn main() {
     let mut input = String::new();
@@ -19,6 +22,10 @@ fn run(input: &str) -> Result<Value, String> {
     // The wrappers are shared with the native engine (wasm/js); the user's
     // function replaces the placeholder.
     let wrap = |template: &str| template.replace("__DOUCHDB_SOURCE__", source);
+    if kind == "reduce_many" {
+        let timeout = request.get("timeout_ms").and_then(Value::as_u64).map(Duration::from_millis);
+        return reduce_many(&request, wrap(include_str!("../../js/reduce.js")), timeout);
+    }
     let mut ids: Vec<String> = Vec::new();
     let (script, argument) = match kind {
         "map" | "index" => {
@@ -90,6 +97,54 @@ fn run(input: &str) -> Result<Value, String> {
         }),
         _ => Ok(value),
     }
+}
+
+/// Run the calls of a batched reduce in order against one compiled reducer.
+/// Each call is checked as a lone reduce is; the first failure ends the batch.
+/// A call that outlives `timeout` is interrupted, so one runaway call does not
+/// spend the budget of the whole batch; the host's own deadline still applies.
+fn reduce_many(request: &Value, script: String, timeout: Option<Duration>) -> Result<Value, String> {
+    let calls = request.get("calls").and_then(Value::as_array).ok_or("reduce calls are missing")?;
+    let mut arguments = Vec::with_capacity(calls.len());
+    for call in calls {
+        if let Some(keys) = call.get("keys").filter(|keys| !keys.is_null()) {
+            serde_json::from_value::<Vec<Value>>(keys.clone())
+                .map_err(|error| format!("reduce keys: {error}"))?;
+        }
+        match call.get("values") {
+            Some(values) => {
+                serde_json::from_value::<Vec<Value>>(values.clone())
+                    .map_err(|error| format!("reduce values: {error}"))?;
+            }
+            None => return Err("reduce values are missing".to_string()),
+        }
+        let keys = call.get("keys").cloned().unwrap_or(Value::Null).to_string();
+        let values = call.get("values").cloned().unwrap_or(Value::Null).to_string();
+        let rereduce = call.get("rereduce").and_then(Value::as_bool).unwrap_or(false);
+        arguments.push((keys, values, rereduce));
+    }
+    let runtime = Runtime::new().map_err(|e| e.to_string())?;
+    let deadline = Rc::new(Cell::new(None::<Instant>));
+    let shared = Rc::clone(&deadline);
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        shared.get().is_some_and(|deadline| Instant::now() > deadline)
+    })));
+    let context = Context::full(&runtime).map_err(|e| e.to_string())?;
+    let outputs: Vec<String> = context.with(|ctx| {
+        let func: Function = ctx.eval(script).map_err(|e| e.to_string())?;
+        arguments
+            .into_iter()
+            .map(|call| {
+                deadline.set(timeout.map(|timeout| Instant::now() + timeout));
+                func.call(call).map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, String>>()
+    })?;
+    outputs
+        .iter()
+        .map(|output| serde_json::from_str(output).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<Value>, String>>()
+        .map(Value::Array)
 }
 
 /// Pair the wrapper's per-document output with the host-supplied ids.

@@ -63,14 +63,20 @@ fn has_reserved_number_key(body: &[u8]) -> bool {
             return false;
         }
         let end = index + 1;
-        if let Ok(key) = serde_json::from_slice::<String>(&body[start..end]) {
-            let mut next = end;
-            while next < body.len() && body[next].is_ascii_whitespace() {
-                next += 1;
-            }
-            if next < body.len() && body[next] == b':' && key == NUMBER_TOKEN {
-                return true;
-            }
+        // Only an object key can be the reserved one, so look for the ':'
+        // first. Escapes only lengthen a literal, so one shorter than the
+        // token cannot decode to it. Decoding is left for the rare candidate.
+        let mut next = end;
+        while next < body.len() && body[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if next < body.len()
+            && body[next] == b':'
+            && end - start - 2 >= NUMBER_TOKEN.len()
+            && serde_json::from_slice::<String>(&body[start..end])
+                .is_ok_and(|key| key == NUMBER_TOKEN)
+        {
+            return true;
         }
         index = end;
     }

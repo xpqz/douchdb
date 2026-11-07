@@ -7,17 +7,26 @@ Decision date: 2 November 2026.
 ## Decision
 
 DouchDB currently vendors `rusty-leveldb` 4.0.2 under
-`vendor/rusty-leveldb` and applies three changes:
+`vendor/rusty-leveldb` and applies the patches below. Each has its own
+**upstreamed?** gate; the fork can be deleted only when all are released
+upstream (or the dependency is replaced).
 
-1. the circular, heap-allocated-sentinel LRU list from **upstream PR #69**
-   (open and unmerged at the time of writing);
-2. a local duplicate-key eviction fix in `Cache::insert`;
-3. fail-closed read handling: table/checksum errors are propagated instead of
-   becoming a false "not found", damaged footers return an error, and
-   unchecksummed bloom filters are disabled.
+| # | Patch | Upstreamed? |
+|---|-------|-------------|
+| 1 | Circular heap-sentinel LRU list (`cache.rs`) | upstream PR #69, open and unmerged, not released |
+| 2 | Duplicate-key eviction fix in `Cache::insert` | no; issue text drafted |
+| 3a | `DB::get_internal` / `Version::get` propagate table errors | no; issue text drafted |
+| 3b | `Footer::decode` returns `None` on a damaged footer | no; issue text drafted |
+| 3c | Filter-block offset bounds checks | no; issue text drafted |
+| 3d | `filter_policy.name() == "_"` skips the filter block (bloom off; filter blocks are unchecksummed) | no; issue text drafted |
+| 4 | `Version::get` deletion branch requires the same user key (neighbouring tombstone) | no; issue text drafted |
+| 5 | Skipmap nodes owned via raw pointers, fixing a Miri Stacked Borrows violation | no; issue text drafted |
+
+Issue texts ready to file (not yet filed; that needs the owner's approval) are
+in [`docs/upstream/rusty-leveldb-issues.md`](upstream/rusty-leveldb-issues.md).
 
 The patch is wired through `[patch.crates-io]` in `Cargo.toml`, copied into the
-Docker build, and its cache tests run in CI. See
+Docker build, and its full test suite runs in CI. See
 [`vendor/rusty-leveldb/PATCHES.md`](../vendor/rusty-leveldb/PATCHES.md).
 
 ## Why this exists
@@ -54,18 +63,20 @@ release build safe enough to continue operating.
 - The vendored list comes from an **unmerged** upstream PR, not a released
   crate.
 - The fork is maintained locally and must be re-checked when upstream changes.
-- The duplicate-key fix and cache-invariant tests are our own code.
+- Patches 2 to 5 and the cache-invariant tests are our own code.
 - A vendored dependency adds review and supply-chain burden.
 
 Mitigations: the vendored source is pinned in-tree, the only edits are
-documented in `PATCHES.md`, cache tests run in CI, and the incident evidence is
+documented in `PATCHES.md`, the vendor test suite runs in CI, and the incident evidence is
 retained under `docs/bugs/`.
 
 ## When to revisit
 
 Revisit immediately when any of these happens:
 
-- upstream PR #69 is merged **and** a new `rusty-leveldb` release contains it;
+- upstream PR #69 is merged **and** a release contains it (this alone does
+  not allow removing the fork: patches 2 to 5 must be released too);
+- any patch in the table above is upstreamed in a release;
 - another cache corruption or stack overflow is observed;
 - the storage backend is migrated to a safe engine (`fjall`, `redb`, or a
   maintained LevelDB binding);
@@ -74,10 +85,11 @@ Revisit immediately when any of these happens:
 
 ## Removal checklist
 
-1. Switch `Cargo.toml` back to the registry version containing the fix.
+0. Confirm every row of the patch table is released upstream.
+1. Switch `Cargo.toml` back to the registry version containing the fixes.
 2. Delete the `[patch.crates-io]` entry and `vendor/rusty-leveldb`.
 3. Remove the vendor `COPY` from the Dockerfile.
-4. Remove the vendored-cache CI step.
+4. Remove the "Vendored storage tests" CI step (the full vendor suite).
 5. Update `Cargo.lock`, README/PLAN and this document.
 6. Run `cargo fmt`, Clippy, both test configurations, and the large ARM64
    import/changes/repair workload against a copy of the existing volumes.

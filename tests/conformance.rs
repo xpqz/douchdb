@@ -637,6 +637,7 @@ async fn cors_is_opt_in_and_answers_preflight() {
         &[
             "--cors-origins".to_string(),
             "http://example.test,https://*.trusted.test".to_string(),
+            "--cors-credentials".to_string(),
         ],
         false,
     );
@@ -697,12 +698,341 @@ async fn cors_is_opt_in_and_answers_preflight() {
         Some("http://example.test")
     );
 
+    // CouchDB answers an unlisted origin as the plain request it is.
     let response = options(&s, "http://evil.test").await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
     assert!(response
         .headers()
         .get("access-control-allow-origin")
         .is_none());
+}
+
+/// CouchDB's `[cors]` defaults: `credentials = false`, and a preflight is only
+/// answered when every requested header is in the allowed list.
+#[tokio::test]
+async fn cors_credentials_and_headers_follow_couchdb_defaults() {
+    let preflight = |server: &Server, requested: &'static str| {
+        server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", "http://example.test")
+            .header("Access-Control-Request-Method", "PUT")
+            .header("Access-Control-Request-Headers", requested)
+            .send()
+    };
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+
+    // Default: no credentials, and a header outside the allowed list is not a
+    // preflight (see cors_preflight_matches_chttpd_cors for the details).
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "content-type, authorization").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+    let allowed = header(&response, "access-control-allow-headers").unwrap_or_default();
+    assert_eq!(allowed, "content-type, authorization", "echoed");
+    let response = preflight(&s, "x-evil-header").await.unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-headers"), None);
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-origin").as_deref(),
+        Some("http://example.test")
+    );
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+
+    // Opt in to credentials and to an extra header.
+    let s = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://example.test".to_string(),
+            "--cors-credentials".to_string(),
+            "--cors-headers".to_string(),
+            "X-Custom-Header,Content-Type".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&s, "x-custom-header, content-type")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .header("Origin", "http://example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+}
+
+/// Preflights exactly as CouchDB's `chttpd_cors` (3.5.3) answers them: a
+/// preflight that passes gets 204 with the request origin, `Max-Age: 600`, the
+/// full method list and the requested headers echoed back; anything else
+/// (header not in `[cors] headers`, unknown method, no request method) is not
+/// treated as a preflight at all, so it gets no preflight headers.
+#[tokio::test]
+async fn cors_preflight_matches_chttpd_cors() {
+    const METHODS: &str = "CONNECT, COPY, DELETE, GET, HEAD, OPTIONS, POST, PUT, TRACE";
+    let preflight = |server: &Server,
+                     origin: &'static str,
+                     method: Option<&'static str>,
+                     requested: Option<&'static str>| {
+        let mut request = server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", origin);
+        if let Some(method) = method {
+            request = request.header("Access-Control-Request-Method", method);
+        }
+        if let Some(requested) = requested {
+            request = request.header("Access-Control-Request-Headers", requested);
+        }
+        request.send()
+    };
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+
+    // Any origin, credentials off (CouchDB's default).
+    let any = Server::start_with(&["--cors-origins".to_string(), "*".to_string()], false);
+    // The preflights browser PouchDB 9 sends for replication, captured from
+    // Chromium (clients/pouchdb/browser.js): _changes, _revs_diff, _bulk_get,
+    // _bulk_docs, _local checkpoints and the database itself all ask for
+    // exactly these, with Basic auth in `authorization`.
+    for (method, requested) in [
+        ("GET", "authorization"),
+        ("GET", "authorization,content-type"),
+        ("POST", "authorization,content-type"),
+        ("PUT", "authorization,content-type"),
+    ] {
+        let response = preflight(&any, "http://app.test", Some(method), Some(requested))
+            .await
+            .unwrap();
+        let context = format!("{method} {requested}");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{context}");
+        assert_eq!(
+            header(&response, "access-control-allow-origin").as_deref(),
+            Some("http://app.test"),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-headers").as_deref(),
+            Some(requested),
+            "{context}: the requested headers are echoed verbatim"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-methods").as_deref(),
+            Some(METHODS),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-max-age").as_deref(),
+            Some("600"),
+            "{context}"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-credentials"),
+            None,
+            "{context}"
+        );
+        assert_eq!(header(&response, "access-control-expose-headers"), None);
+        assert!(!header(&response, "vary")
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("origin"));
+    }
+    // No requested headers: Allow-Headers is present and empty.
+    let response = preflight(&any, "http://app.test", Some("PUT"), None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-headers").as_deref(),
+        Some("")
+    );
+
+    // Not a preflight: a header outside the supported list, an unknown method,
+    // no request method. No preflight headers and no 403; the request is
+    // handled as the plain OPTIONS it is.
+    for (method, requested) in [
+        (Some("PUT"), Some("x-evil")),
+        (Some("PUT"), Some("content-type, x-evil")),
+        (Some("PUT"), Some("referer")),
+        (Some("FOO"), Some("content-type")),
+        (None, Some("content-type")),
+    ] {
+        let response = preflight(&any, "http://app.test", method, requested)
+            .await
+            .unwrap();
+        let context = format!("{method:?} {requested:?}");
+        assert_ne!(response.status(), StatusCode::NO_CONTENT, "{context}");
+        assert_ne!(response.status(), StatusCode::FORBIDDEN, "{context}");
+        for name in [
+            "access-control-allow-headers",
+            "access-control-allow-methods",
+            "access-control-max-age",
+        ] {
+            assert_eq!(header(&response, name), None, "{context}: {name}");
+        }
+    }
+
+    // A specific origin with credentials on: credentials are advertised; an
+    // origin that is not listed gets no CORS headers at all.
+    let credentialed = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://app.test".to_string(),
+            "--cors-credentials".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(
+        &credentialed,
+        "http://app.test",
+        Some("PUT"),
+        Some("authorization,content-type"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-credentials").as_deref(),
+        Some("true")
+    );
+    let response = preflight(
+        &credentialed,
+        "http://other.test",
+        Some("PUT"),
+        Some("content-type"),
+    )
+    .await
+    .unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "access-control-allow-origin"), None);
+
+    // `--cors-headers` is CouchDB's `[cors] headers`: it replaces the default
+    // list rather than extending it.
+    let custom = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "http://app.test".to_string(),
+            "--cors-headers".to_string(),
+            "X-Foo".to_string(),
+        ],
+        false,
+    );
+    let response = preflight(&custom, "http://app.test", Some("PUT"), Some("x-foo"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = preflight(
+        &custom,
+        "http://app.test",
+        Some("PUT"),
+        Some("content-type"),
+    )
+    .await
+    .unwrap();
+    assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, "access-control-allow-headers"), None);
+
+    // Actual responses: the origin (also for `*`), and an expose list that
+    // starts with content-type and ends with CouchDB's own headers.
+    let response = any
+        .client
+        .get(format!("{}/", any.base))
+        .header("Origin", "http://app.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-allow-origin").as_deref(),
+        Some("http://app.test")
+    );
+    assert_eq!(header(&response, "access-control-allow-credentials"), None);
+    assert!(!header(&response, "vary")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("origin"));
+    let exposed = header(&response, "access-control-expose-headers").unwrap_or_default();
+    assert!(exposed.starts_with("content-type"), "{exposed}");
+    assert!(
+        exposed.ends_with(
+            "accept-ranges, etag, server, x-couch-request-id, x-couch-update-newrev, x-couchdb-body-time"
+        ),
+        "{exposed}"
+    );
+}
+
+/// The console is the one HTML surface, so it carries a Content-Security-Policy.
+/// The Vue build compiles in-DOM templates at runtime, which needs
+/// `'unsafe-eval'`; everything else is locked down to the same origin.
+#[tokio::test]
+async fn console_responses_carry_a_content_security_policy() {
+    let s = Server::start(false);
+    for path in ["/_utils/", "/_utils/app.js", "/_utils/style.css"] {
+        let response = s
+            .client
+            .get(format!("{}{path}", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"));
+        for directive in [
+            "default-src 'none'",
+            "script-src 'self' 'unsafe-eval'",
+            "frame-ancestors 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+        ] {
+            assert!(csp.contains(directive), "{path}: {csp}");
+        }
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+    }
+    // API responses are JSON and get none.
+    let response = s
+        .client
+        .get(format!("{}/_all_dbs", s.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.headers().get("content-security-policy").is_none());
 }
 
 #[tokio::test]
@@ -1184,6 +1514,68 @@ async fn changes_filters_support_design_named_view_and_shorthand() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = s.get("/chfilter/_changes?filter=_view").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
+    // A filter that rarely matches forces the scan to refill past several
+    // internal pages before the limit is met.
+    let s = Server::start(false);
+    s.fresh_db("chsparse").await;
+    let mut docs: Vec<Value> = (0..6000)
+        .map(|i| json!({"_id": format!("d{i:05}"), "hit": i % 1500 == 1499}))
+        .collect();
+    docs.push(json!({"_id": "_design/f",
+        "filters": {"hit": "function (doc) { return doc.hit === true; }"}}));
+    let (status, body) = s
+        .post("/chsparse/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, all) = s.get("/chsparse/_changes").await;
+    let all = all["results"].as_array().unwrap();
+    let expected: Vec<(&Value, &str)> = all
+        .iter()
+        .filter(|row| {
+            row["id"]
+                .as_str()
+                .map(|id| {
+                    id.starts_with('d')
+                        && id[1..].parse::<u32>().map(|i| i % 1500 == 1499) == Ok(true)
+                })
+                .unwrap_or(false)
+        })
+        .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(expected.len(), 4);
+
+    for limit in [1usize, 2, 3, 10] {
+        let (status, body) = s
+            .get(&format!("/chsparse/_changes?filter=f/hit&limit={limit}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["results"].as_array().unwrap();
+        let want = &expected[..limit.min(expected.len())];
+        let got: Vec<(&Value, &str)> = rows
+            .iter()
+            .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, want, "limit {limit}");
+        assert_eq!(
+            body["last_seq"],
+            **got.last().map(|(seq, _)| seq).unwrap(),
+            "limit {limit}"
+        );
+    }
+
+    // Starting after the second match leaves the other two.
+    let since = expected[1].0.clone();
+    let (_, body) = s
+        .get(&format!(
+            "/chsparse/_changes?filter=f/hit&limit=1&since={since}"
+        ))
+        .await;
+    assert_eq!(body["results"][0]["id"], json!(expected[2].1));
 }
 
 #[tokio::test]
@@ -2495,6 +2887,77 @@ async fn encoded_slashes_in_document_ids_are_not_path_separators() {
     assert_eq!(doc["_id"], "_design/foo");
 }
 
+/// `_all_docs` bodies are written as they are read, so a large listing never
+/// sits in memory whole, and a HEAD does not read the rows at all. The exact
+/// bytes (field order, separators) are part of the contract.
+#[tokio::test]
+async fn all_docs_is_streamed_with_a_stable_body() {
+    let s = Server::start(false);
+    s.fresh_db("streamed").await;
+    let rev = |n: char| format!("1-{}", n.to_string().repeat(32));
+    let (status, _) = s
+        .post(
+            "/streamed/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "b", "_rev": rev('b'), "v": 2},
+                {"_id": "a", "_rev": rev('a'), "v": 1},
+                {"_id": "c", "_rev": rev('c'), "v": 3},
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = |path: &str| {
+        let request = s.client.get(format!("{}{path}", s.base));
+        async move {
+            let response = request.send().await.expect("request");
+            let headers = response.headers().clone();
+            (headers, response.text().await.expect("body"))
+        }
+    };
+
+    let (headers, body) = text("/streamed/_all_docs").await;
+    assert_eq!(
+        body,
+        format!(
+            "{{\"total_rows\":3,\"offset\":0,\"rows\":[\
+             {{\"id\":\"a\",\"key\":\"a\",\"value\":{{\"rev\":\"{a}\"}}}},\
+             {{\"id\":\"b\",\"key\":\"b\",\"value\":{{\"rev\":\"{b}\"}}}},\
+             {{\"id\":\"c\",\"key\":\"c\",\"value\":{{\"rev\":\"{c}\"}}}}]}}",
+            a = rev('a'),
+            b = rev('b'),
+            c = rev('c')
+        )
+    );
+    assert!(
+        !headers.contains_key("content-length"),
+        "the body is streamed, not sized up front: {headers:?}"
+    );
+
+    let (_, body) = text("/streamed/_all_docs?descending=true&limit=1&update_seq=true").await;
+    assert!(
+        body.starts_with(&format!(
+            "{{\"total_rows\":3,\"offset\":0,\"rows\":[{{\"id\":\"c\",\"key\":\"c\",\"value\":{{\"rev\":\"{}\"}}}}],\"update_seq\":",
+            rev('c')
+        )),
+        "{body}"
+    );
+
+    let head = s
+        .client
+        .head(format!("{}/streamed/_all_docs", s.base))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(
+        head.headers()
+            .get("content-length")
+            .is_none_or(|length| length == "0"),
+        "HEAD must not build the body to size it: {:?}",
+        head.headers()
+    );
+}
+
 #[tokio::test]
 async fn bulk_docs_and_all_docs() {
     let s = Server::start(false);
@@ -2836,7 +3299,9 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows.len(), 3, "{text}");
     assert_eq!(rows[2], json!({"last_seq": 2, "pending": 0}), "{text}");
 
-    // The same trailer closes a feed that reached its limit.
+    // The same trailer closes a feed that reached its limit, at once rather
+    // than after the next wake-up.
+    let started = std::time::Instant::now();
     let text = s
         .client
         .get(format!(
@@ -2849,6 +3314,11 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
         .text()
         .await
         .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a feed at its limit took {:?} to close",
+        started.elapsed()
+    );
     let rows = lines(&text);
     assert_eq!(rows.len(), 2, "{text}");
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
@@ -2997,6 +3467,21 @@ async fn all_dbs_pagination_and_dbs_info() {
     let (status, body) = s.post("/_dbs_info", json!({"keys": ["ccc"]})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["info"]["db_name"], "ccc");
+}
+
+#[tokio::test]
+async fn dbs_info_caps_the_number_of_keys_at_100() {
+    // CouchDB chttpd_misc: max_db_number_for_dbs_info_req defaults to 100 and
+    // a longer `keys` list is a 400 bad_request.
+    let s = Server::start(false);
+    let keys = |n: usize| -> Vec<String> { (0..n).map(|i| format!("nodb{i}")).collect() };
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(100)})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(100));
+    let (status, body) = s.post("/_dbs_info", json!({"keys": keys(101)})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "bad_request");
+    assert_eq!(body["reason"], "too_many_keys");
 }
 
 #[tokio::test]
@@ -4141,9 +4626,15 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
-/// An `AuthSession` cookie value for `name`, signed with `key`, in the format
-/// the server issues: `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`.
-fn forged_cookie(key: &[u8], name: &str) -> String {
+/// An `AuthSession` cookie value for `name`, in the format the server issues:
+/// `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`. The HMAC key is the
+/// session secret plus the SHA-256 of the user's credential, here the admin
+/// password.
+fn forged_cookie(secret: &[u8], password: &str, name: &str) -> String {
+    use sha2::Digest;
+    let mut key = secret.to_vec();
+    key.extend_from_slice(&sha2::Sha256::digest(password.as_bytes()));
+    let key = key.as_slice();
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let exp = std::time::SystemTime::now()
@@ -4177,7 +4668,7 @@ async fn status_with_cookie(s: &Server, cookie: &str) -> StatusCode {
 #[tokio::test]
 async fn session_key_is_not_derived_from_admin_password() {
     let s = Server::start(true);
-    let forged = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let forged = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(
         status_with_cookie(&s, &forged).await,
         StatusCode::UNAUTHORIZED
@@ -4189,10 +4680,87 @@ async fn session_key_is_not_derived_from_admin_password() {
 async fn session_secret_flag_signs_cookies() {
     let secret = "an-explicit-session-secret";
     let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
-    let good = forged_cookie(secret.as_bytes(), "admin");
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &good).await, StatusCode::OK);
-    let bad = forged_cookie(b"admin:douchdb:douchdb", "admin");
+    let bad = forged_cookie(b"admin:douchdb:douchdb", "douchdb", "admin");
     assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
+}
+
+/// One malformed `AuthSession` cookie must not hide a valid one that follows.
+#[tokio::test]
+async fn malformed_session_cookie_does_not_hide_a_valid_one() {
+    let secret = "an-explicit-session-secret";
+    let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
+    for junk in [
+        "AuthSession=!!!.!!!",
+        "AuthSession=%%%",
+        "AuthSession=Zm9v.!!!",
+    ] {
+        let both = format!("{junk}; {good}");
+        assert_eq!(
+            status_with_cookie(&s, &both).await,
+            StatusCode::OK,
+            "{both}"
+        );
+    }
+    assert_eq!(
+        status_with_cookie(&s, "AuthSession=!!!.!!!").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A cookie is signed with the session secret plus the user's credential
+/// digest (CouchDB mixes the user salt into its cookie HMAC key), so rotating
+/// a token in the users file revokes that user's sessions at once.
+#[tokio::test]
+async fn rotating_a_user_token_revokes_existing_sessions() {
+    let users = UsersFile::new(USERS);
+    let mut s = Server::start_with(&users_server_args(&users), true);
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-token"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &cookie).await, StatusCode::OK);
+
+    // Same name and roles, new token.
+    std::fs::write(&users.path, USERS.replace("alice-token", "alice-rotated")).unwrap();
+    s.restart();
+    assert_eq!(
+        status_with_cookie(&s, &cookie).await,
+        StatusCode::UNAUTHORIZED,
+        "the old cookie must not outlive the old token"
+    );
+    // The new token logs in and its cookie works.
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-rotated"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &fresh).await, StatusCode::OK);
 }
 
 /// Without `--session-secret` the server generates a random key once, keeps it
@@ -4733,6 +5301,18 @@ fn all_shards_on(node: usize) -> Value {
     })
 }
 
+/// A node to pin a database on so that a rebalance has to move it: node 0
+/// unless the planned placement already keeps every shard there. Default
+/// placement depends on the random ports.
+fn node_to_pin_away_from(planned: &Value) -> usize {
+    let all_on_zero = planned["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|replicas| replicas[0] == 0);
+    usize::from(all_on_zero)
+}
+
 #[tokio::test]
 async fn cluster_shard_map_moves_data_between_nodes() {
     let mut nodes = start_cluster_with(3, "1", 1);
@@ -4832,14 +5412,17 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        !nodes[0]
-            .dir
-            .join("meta")
-            .join("pending-shard-map.json")
-            .exists(),
-        "pending map was not cleared after quorum acknowledgement"
-    );
+    // The peer may adopt the map on its own pass before ours has seen it
+    // current, so the marker clears on whichever pass counts the quorum.
+    let marker = nodes[0].dir.join("meta").join("pending-shard-map.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending map was not cleared after quorum acknowledgement"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -4848,6 +5431,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
     for node in &nodes {
         node.fresh_db("reb").await;
     }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/reb").await;
     let (status, _) = nodes[0]
         .put("/_node/_local/_dbs/reb", all_shards_on(0))
         .await;
@@ -4861,18 +5445,12 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The planner spreads the four shards across the three nodes.
+    // The planner moves the shards to the placement creation gave them.
     let (status, map) = nodes[0]
         .post("/_node/_local/_dbs/reb/rebalance", json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{map}");
-    let owners: std::collections::HashSet<u64> = map["replicas"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|replicas| replicas[0].as_u64().unwrap())
-        .collect();
-    assert!(owners.len() > 1, "planner must use multiple nodes: {map}");
+    assert_eq!(map["replicas"], planned["replicas"], "{map}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -6113,6 +6691,77 @@ async fn view_index_updates_incrementally_and_persists() {
     assert_eq!(status, StatusCode::OK);
     let (_, body) = s.get("/incview/_design/v/_view/by_city").await;
     assert_eq!(body["total_rows"], 2);
+}
+
+#[tokio::test]
+async fn view_index_rebuilds_and_catches_up_in_pages() {
+    let s = Server::start(false);
+    s.fresh_db("pagedview").await;
+    let docs = |range: std::ops::Range<u32>| {
+        json!({"docs": range
+            .map(|n| json!({"_id": format!("d{n:05}"), "n": n}))
+            .collect::<Vec<_>>()})
+    };
+    let (status, _) = s.post("/pagedview/_bulk_docs", docs(0..9000)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let design = |map: &str, rev: Option<&str>| {
+        let mut body = json!({"views": {"by_n": {"map": map}}});
+        if let Some(rev) = rev {
+            body["_rev"] = json!(rev);
+        }
+        body
+    };
+    let (status, put) = s
+        .put(
+            "/pagedview/_design/v",
+            design("function(doc){ emit(doc.n, 1); }", None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The first build writes more rows than one batch holds.
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=0").await;
+    assert_eq!(body["total_rows"], 9000);
+
+    // A new map function replaces every stored row, old and new, in batches.
+    let rev = put["rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .put(
+            "/pagedview/_design/v",
+            design("function(doc){ emit(doc.n + 100000, 1); }", Some(&rev)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=1").await;
+    assert_eq!(body["total_rows"], 9000);
+    assert_eq!(body["rows"][0]["key"], 100000);
+
+    // A catch-up longer than one page of changes: new documents, a changed
+    // one and a deleted one.
+    let (status, _) = s.post("/pagedview/_bulk_docs", docs(9000..11500)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, doc) = s.get("/pagedview/d00001").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    s.put("/pagedview/d00001", json!({"_rev": rev, "n": 5}))
+        .await;
+    let (_, doc) = s.get("/pagedview/d00002").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .req(
+            Method::DELETE,
+            &format!("/pagedview/d00002?rev={rev}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=0").await;
+    assert_eq!(body["total_rows"], 11499);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=100005").await;
+    assert_eq!(body["rows"][0]["id"], "d00001");
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=111499").await;
+    assert_eq!(body["rows"][0]["id"], "d11499");
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=100001").await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -12040,6 +12689,79 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
     }
 }
 
+/// A streamed feed outlives the handler, so it must keep its admission permit
+/// until the body ends or the client goes away; otherwise any number of
+/// continuous feeds escape the per-user limit.
+#[tokio::test]
+async fn streaming_feed_holds_its_admission_permit_until_the_client_disconnects() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--max-in-flight".to_string(),
+        "8".to_string(),
+        "--per-user-in-flight".to_string(),
+        "1".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+    let alice = bearer("alice-token");
+    let bob = bearer("bob-token");
+
+    let (status, body) = s
+        .req_with(Method::PUT, "/feedlimit", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/feedlimit/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice", "bob"], "roles": []}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(Method::PUT, "/feedlimit/d1", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Alice opens a continuous feed and keeps the body open.
+    let mut request = s.client.get(format!(
+        "{}/feedlimit/_changes?feed=continuous&since=0&timeout=60000",
+        s.base
+    ));
+    for (name, value) in bearer("alice-token") {
+        request = request.header(name, value);
+    }
+    let mut feed = request.send().await.unwrap();
+    assert_eq!(feed.status(), StatusCode::OK);
+    assert!(feed.chunk().await.unwrap().is_some());
+
+    // The feed holds her only slot, so a normal request is limited...
+    let (status, body) = s.req_with(Method::GET, "/feedlimit", None, &alice).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    // ...while another user is not.
+    let (status, body) = s.req_with(Method::GET, "/feedlimit", None, &bob).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Disconnecting frees the slot.
+    drop(feed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, _) = s.req_with(Method::GET, "/feedlimit", None, &alice).await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice's slot was never released: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn global_admission_limit_protects_capacity_across_users() {
     let users = UsersFile::new(USERS);
@@ -12204,6 +12926,96 @@ fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
     let status = status.expect("--q abc must stop startup, but the server kept running");
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("--q") && stderr.contains("abc"), "{stderr}");
+}
+
+/// Send `signal` to a running server.
+fn signal_server(server: &Server, signal: i32) {
+    // SAFETY: kill(2) takes plain integers and touches no memory.
+    let rc = unsafe { libc::kill(server.child.id() as i32, signal) };
+    assert_eq!(rc, 0, "kill({signal}) failed");
+}
+
+/// Wait up to `limit` for the server process to exit on its own.
+fn wait_for_exit(server: &mut Server, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = server.child.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// SIGTERM (Docker, systemd) must shut the server down gracefully like Ctrl-C:
+/// an open continuous feed ends with its `last_seq` trailer instead of holding
+/// the shutdown, and the process exits 0 well inside the shutdown deadline.
+#[tokio::test]
+async fn sigterm_ends_a_continuous_feed_with_its_trailer_and_exits_zero() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigfeed").await;
+    let (status, _) = s.put("/sigfeed/a", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client = Client::new();
+    let mut response = client
+        .get(format!(
+            "{}/sigfeed/_changes?feed=continuous&since=0&timeout=300000",
+            s.base
+        ))
+        .send()
+        .await
+        .expect("open feed");
+    let mut text = String::new();
+    while !text.contains("\"id\":\"a\"") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .expect("first change")
+            .expect("read feed")
+            .expect("feed ended early");
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    signal_server(&s, libc::SIGTERM);
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Ok(Some(chunk)) = response.chunk().await {
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the feed was still open: {text}");
+    assert!(text.contains("\"last_seq\""), "no trailer: {text}");
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Everything acknowledged before a SIGTERM is there after a restart.
+#[tokio::test]
+async fn sigterm_then_restart_keeps_acknowledged_documents() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigdocs").await;
+    let docs: Vec<Value> = (0..50)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let (status, body) = s.post("/sigdocs/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    signal_server(&s, libc::SIGTERM);
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    s.restart();
+    let (status, body) = s.get("/sigdocs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["doc_count"], 50, "{body}");
+}
+
+/// A second signal while shutting down neither hangs nor changes the outcome.
+#[tokio::test]
+async fn a_second_sigterm_during_shutdown_does_not_hang() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigtwice").await;
+    signal_server(&s, libc::SIGTERM);
+    signal_server(&s, libc::SIGTERM);
+    signal_server(&s, libc::SIGINT);
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 #[test]
@@ -13074,6 +13886,33 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
     assert_eq!(body["total_rows"], 9);
 }
 
+/// Rebalance targets the placement database creation uses, so a cluster that
+/// has not changed has nothing to move.
+#[tokio::test]
+async fn rebalance_on_an_unchanged_cluster_moves_nothing() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("steady").await;
+    }
+    let (status, before) = nodes[0].get("/_node/_local/_dbs/steady").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/steady/rebalance?timeout_ms=20000",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["replicas"], before["replicas"], "{body}");
+    assert_eq!(body["version"], before["version"], "{body}");
+    let (_, after) = nodes[0].get("/_node/_local/_dbs/steady").await;
+    assert_eq!(
+        after, before,
+        "an unchanged cluster's rebalance moved shards"
+    );
+}
+
 #[tokio::test]
 async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
     let nodes = start_cluster_with(3, "1", 1);
@@ -13164,8 +14003,12 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     for node in &nodes {
         node.fresh_db("confreb").await;
     }
+    // The default placement is the one a rebalance moves the database to.
+    let (status, planned) = nodes[0].get("/_node/_local/_dbs/confreb").await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let pinned = node_to_pin_away_from(&planned);
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/confreb", all_shards_on(0))
+        .put("/_node/_local/_dbs/confreb", all_shards_on(pinned))
         .await;
     assert_eq!(status, StatusCode::OK);
     let internal = [
@@ -13173,13 +14016,18 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
 
-    // A document whose shard moves away from node 0 in the balanced map
-    // (shard s goes to node s % 3).
-    let id = (0..)
+    // A document whose shard moves away from the pinned node in the planned
+    // map. Some shard does: the pin is chosen so the plan is not all on it.
+    let owner_of = |id: &str| {
+        planned["replicas"][douchdb::shard_index(id, 4)][0]
+            .as_u64()
+            .unwrap() as usize
+    };
+    let id = (0..1000)
         .map(|i| format!("x{i}"))
-        .find(|id| !douchdb::shard_index(id, 4).is_multiple_of(3))
-        .unwrap();
-    let target = douchdb::shard_index(&id, 4) % 3;
+        .find(|id| owner_of(id) != pinned)
+        .expect("the pin was chosen so that some shard moves");
+    let target = owner_of(&id);
 
     let root = "00000000000000000000000000000000";
     let branch = |rev: &str, v: &str| {
@@ -13535,8 +14383,12 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     for node in &nodes {
         node.fresh_db("rebread").await;
     }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/rebread").await;
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/rebread", all_shards_on(0))
+        .put(
+            "/_node/_local/_dbs/rebread",
+            all_shards_on(node_to_pin_away_from(&planned)),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)

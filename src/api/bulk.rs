@@ -606,8 +606,93 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(opts) => opts,
         Err(error) => return fail(error),
     };
+    if opts.keys.is_none()
+        && !req.st.ctx.cluster.is_clustered()
+        && !is_forwarded(req.st, req.headers)
+    {
+        return stream_all_docs(&req, &opts).await;
+    }
     let result = run_all_docs(&req, &opts).await;
     all_docs_reply(&req, result, json!(req.db.update_seq()))
+}
+
+/// Rows are encoded into chunks of about this size as they are read.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// `_all_docs` without `keys` on this node: the body is written while the
+/// rows are read, so a listing of any size takes constant memory and the
+/// first bytes leave before the last row is read. The bytes are those of the
+/// buffered reply. An error on the first page still gets its status; one
+/// after that can only end the connection early. A HEAD reads no rows.
+async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
+    let (head, rows) = match Db::all_docs_stream(req.db.clone(), opts).await {
+        Ok(stream) => stream,
+        Err(error) => return fail(error),
+    };
+    if !still_allowed(req.st, req.db, req.headers) {
+        return access_denied(&req.st.principal(req.headers));
+    }
+    let body = if *req.method == Method::HEAD {
+        Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())
+    } else {
+        // Reading the first row reads the first page of every shard, so an
+        // error there still gets a status.
+        let mut rows = Box::pin(rows);
+        let first_row = rows.next().await;
+        if let Some(Err(error)) = first_row {
+            return fail(error);
+        }
+        let rows = futures::stream::iter(first_row).chain(rows);
+        let db = req.db.clone();
+        let with_update_seq = flag(req.q, "update_seq");
+        let stream = async_stream::stream! {
+            let mut rows = Box::pin(rows);
+            let mut buffer = format!(
+                "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+                head.total_rows, head.offset
+            )
+            .into_bytes();
+            let mut first = true;
+            while let Some(item) = rows.next().await {
+                let encoded = item.and_then(|row| {
+                    serde_json::to_vec(&row).map_err(ApiError::internal)
+                });
+                match encoded {
+                    Ok(encoded) => {
+                        if !first {
+                            buffer.push(b',');
+                        }
+                        first = false;
+                        buffer.extend_from_slice(&encoded);
+                    }
+                    Err(error) => {
+                        yield Err(std::io::Error::other(format!(
+                            "{}: {}",
+                            error.error, error.reason
+                        )));
+                        return;
+                    }
+                }
+                if buffer.len() >= STREAM_CHUNK {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+                }
+            }
+            buffer.push(b']');
+            if with_update_seq {
+                buffer.extend_from_slice(
+                    format!(",\"update_seq\":{}", db.update_seq()).as_bytes(),
+                );
+            }
+            buffer.push(b'}');
+            yield Ok(Bytes::from(buffer));
+        };
+        Body::from_stream(stream)
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// First and one-past-last id of the design documents.

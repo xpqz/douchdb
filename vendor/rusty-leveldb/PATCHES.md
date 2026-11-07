@@ -39,9 +39,49 @@ that are exposed by large bulk imports and changes-feed reads:
    value branch already did. Regression test:
    `db_impl::tests::test_db_impl_get_ignores_neighbouring_tombstone`.
 
+## Upstream status of each patch
+
+Each patch has its own gate: it can be dropped only when a published
+`rusty-leveldb` release contains an equivalent fix. Ready-to-file issue texts
+are in [`docs/upstream/rusty-leveldb-issues.md`](../../docs/upstream/rusty-leveldb-issues.md).
+Nothing below has been filed upstream yet (filing needs approval).
+
+| # | Patch | Files | Upstreamed? |
+|---|-------|-------|-------------|
+| 1 | Circular heap-sentinel LRU list | `cache.rs` | PR #69 open, unmerged, not released |
+| 2 | Duplicate-key `Cache::insert` | `cache.rs` | No; issue text drafted |
+| 3a | `get_internal` / `Version::get` propagate table errors | `db_impl.rs`, `version.rs` | No; issue text drafted |
+| 3b | `Footer::decode` returns `None` on a damaged footer | `table_builder.rs` | No; issue text drafted |
+| 3c | Filter-block offset bounds checks | `filter_block.rs` | No; issue text drafted |
+| 3d | `filter_policy.name() == "_"` skips the filter block (bloom disabled) | `table_builder.rs` | No; issue text drafted |
+| 4 | Deletion branch compares user keys | `version.rs` | No; issue text drafted |
+| 5 | Skipmap nodes owned via raw pointers (Miri/Stacked Borrows) | `skipmap.rs` | No; issue text drafted |
+
+The fork can be removed only when **every** row is upstreamed and released, or
+the dependency is replaced; see `docs/storage-dependency.md`.
+
+5. **Skipmap aliasing (Stacked Borrows violation).** Miri
+   (`cargo miri test skipmap`, nightly-2026-11-07, default Stacked Borrows)
+   rejected `InnerSkipMap::insert`: raw `*mut Node` skip pointers were taken
+   from a `Box`, which was then moved into its predecessor's `next` field,
+   invalidating them. The redundant owning `next: Option<Box<Node>>` chain is
+   removed; every node (and the head) is now owned through
+   `Box::into_raw`/`Box::from_raw` and linked only through `skips`, with
+   iterative teardown. Miri passes for the skipmap tests under both Stacked
+   and Tree Borrows. Safety comments were added to `cache.rs` and
+   `skipmap.rs`. Upstreamed? No; issue text drafted.
+
 `src/cache.rs` also has regression tests for duplicate-key replacement, list/
 map/forward-chain/back-link invariants under random LRU operations, and dropping
-a 100,000-node cache on a 64 KiB stack. The cache tests pass in debug and
+a 100,000-node cache on a 64 KiB stack. Re-run Miri with the Docker recipe below after touching `cache.rs` or
+`skipmap.rs` (needs nightly; not run in CI). The 100,000-node drop test and the
+random-operation test are too slow under Miri; skip them with
+`-- --skip dropping_a_long --skip duplicate_and_lru_operations`:
+
+    docker run --rm --init --name miri -v "$PWD/vendor/rusty-leveldb:/src" -w /src \
+      rustlang/rust:nightly sh -c 'rustup component add miri && cargo miri test --lib skipmap'
+
+The cache tests pass in debug and
 release on x86_64 and on `linux/arm64` Rust 1.97.
 
 `scripts/storage_faults.py` exercises clean SIGKILL, kill-during-compaction,

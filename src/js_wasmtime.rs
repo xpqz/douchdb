@@ -6,7 +6,7 @@
 //! `--wasm-runtime wasmtime`.
 
 use crate::js::ViewLimits;
-use crate::js::{check_output, wasm_memory_cap, MAX_OUTPUT_BYTES};
+use crate::js::{check_output, wasm_memory_cap, JsError, MAX_OUTPUT_BYTES};
 use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -31,12 +31,12 @@ struct WasmtimeState {
 
 /// Compile and cache the wasm module at startup instead of paying the
 /// Cranelift compilation cost on the first query.
-pub fn warm() -> Result<(), String> {
+pub fn warm() -> Result<(), JsError> {
     engine().map(|_| ())
 }
 
-fn engine() -> Result<&'static WasmtimeState, String> {
-    static ENGINE: OnceLock<Result<WasmtimeState, String>> = OnceLock::new();
+fn engine() -> Result<&'static WasmtimeState, JsError> {
+    static ENGINE: OnceLock<Result<WasmtimeState, JsError>> = OnceLock::new();
     let state = ENGINE.get_or_init(|| {
         let mut config = Config::new();
         // Epoch interruption is a cheap wall-clock deadline check, unlike
@@ -49,12 +49,13 @@ fn engine() -> Result<&'static WasmtimeState, String> {
         } else {
             wasmtime::OptLevel::Speed
         });
-        let engine = Engine::new(&config).map_err(|error| format!("wasmtime engine: {error}"))?;
-        let module =
-            Module::new(&engine, WASM_RUNNER).map_err(|error| format!("wasm module: {error}"))?;
+        let engine = Engine::new(&config)
+            .map_err(|error| JsError::Sandbox(format!("wasmtime engine: {error}")))?;
+        let module = Module::new(&engine, WASM_RUNNER)
+            .map_err(|error| JsError::Sandbox(format!("wasm module: {error}")))?;
         let mut linker: Linker<WasmtimeData> = Linker::new(&engine);
         p1::add_to_linker_sync(&mut linker, |data: &mut WasmtimeData| &mut data.wasi)
-            .map_err(|error| format!("wasm wasi: {error}"))?;
+            .map_err(|error| JsError::Sandbox(format!("wasm wasi: {error}")))?;
         // Linear memory the module declares up front; the view memory limit
         // applies on top of it.
         let baseline_memory = module
@@ -68,7 +69,7 @@ fn engine() -> Result<&'static WasmtimeState, String> {
             .unwrap_or(0);
         let pre = linker
             .instantiate_pre(&module)
-            .map_err(|error| format!("wasm instantiate: {error}"))?;
+            .map_err(|error| JsError::Sandbox(format!("wasm instantiate: {error}")))?;
         // A single ticker advances every store's epoch. Each request sets its
         // deadline in ticks, so the timeout remains a wall-clock budget.
         let ticker = engine.clone();
@@ -78,7 +79,7 @@ fn engine() -> Result<&'static WasmtimeState, String> {
                 std::thread::sleep(EPOCH_TICK);
                 ticker.increment_epoch();
             })
-            .map_err(|error| format!("wasmtime epoch thread: {error}"))?;
+            .map_err(|error| JsError::Sandbox(format!("wasmtime epoch thread: {error}")))?;
         Ok(WasmtimeState {
             engine,
             baseline_memory,
@@ -91,7 +92,7 @@ fn engine() -> Result<&'static WasmtimeState, String> {
     }
 }
 
-pub fn request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
+pub fn request(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     // The synchronous WASI shim calls `Handle::current().block_on()`, which
     // panics when invoked from inside the server's Tokio runtime. The wasm call
     // is CPU-bound anyway, so hop to a plain thread and block the caller.
@@ -100,14 +101,18 @@ pub fn request(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
             scope
                 .spawn(|| request_inner(body, limits))
                 .join()
-                .unwrap_or_else(|payload| Err(format!("wasmtime worker panicked: {payload:?}")))
+                .unwrap_or_else(|payload| {
+                    Err(JsError::Sandbox(format!(
+                        "wasmtime worker panicked: {payload:?}"
+                    )))
+                })
         })
     } else {
         request_inner(body, limits)
     }
 }
 
-fn request_inner(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
+fn request_inner(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     let state = engine()?;
     let stdout = MemoryOutputPipe::new(MAX_OUTPUT_BYTES + 1);
     let wasi = WasiCtxBuilder::new()
@@ -134,27 +139,29 @@ fn request_inner(body: &[u8], limits: ViewLimits) -> Result<Value, String> {
     let instance = state
         .pre
         .instantiate(&mut store)
-        .map_err(|error| format!("wasm instantiate: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm instantiate: {error}")))?;
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
-        .map_err(|error| format!("wasm start: {error}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm start: {error}")))?;
     start
         .call(&mut store, ())
-        .map_err(|error| format!("wasm run: {error:?}"))?;
+        .map_err(|error| JsError::Sandbox(format!("wasm run: {error:?}")))?;
     drop(store);
 
     let output = stdout.contents();
     check_output("wasm worker", &String::from_utf8_lossy(&output))?;
-    let response: Value =
-        serde_json::from_slice(&output).map_err(|error| format!("wasm response: {error}"))?;
+    let response: Value = serde_json::from_slice(&output)
+        .map_err(|error| JsError::Sandbox(format!("wasm response: {error}")))?;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     } else {
-        Err(response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("wasm worker failed")
-            .to_string())
+        Err(JsError::Runtime(
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("wasm worker failed")
+                .to_string(),
+        ))
     }
 }
 
@@ -200,7 +207,7 @@ mod tests {
         let started = Instant::now();
         let error = request(&body, limits(Duration::from_millis(150))).unwrap_err();
         assert!(
-            error.contains("interrupt") || error.contains("epoch"),
+            error.to_string().contains("interrupt") || error.to_string().contains("epoch"),
             "{error}"
         );
         assert!(started.elapsed() < Duration::from_secs(3));

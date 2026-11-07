@@ -160,6 +160,25 @@ limits only.
 
 `/_up`, `/_health`, `_utils` assets and the favicon are exempt.
 
+A streamed response (a `continuous`, `eventsource` or heartbeat `longpoll`
+`_changes` feed, or a continuous `_db_updates` feed) keeps its permit for as
+long as its body is open, and releases it when the body ends or the client
+disconnects. Such feeds are charged to the normal lane, with no lane or limit of
+their own: a feed is a connection that a client holds open, so it is accounted
+like any other in-flight request. The consequence is that a user who holds
+`--per-user-in-flight` feeds open gets 429 on everything else, so size the
+limit for the feeds a client needs (a PouchDB sync holds one per database) plus
+its ordinary traffic. CouchDB has no admission control, so it has no matching
+behaviour to copy; this is a deliberate douchdb departure that keeps the
+global bound honest.
+
+A `_changes` feed does not poll while idle. It waits for a commit on the
+database (a notification sent by the shard after each flushed write) and
+re-reads only then, still honouring `heartbeat` and `timeout` to the
+millisecond. As a fallback it also re-checks every 5 seconds on a standalone
+node, which bounds how stale an access revocation can be, and every second on a
+clustered node, where commits on peers cannot be observed locally.
+
 Admission buckets are keyed on anonymous, named user, or login, so a user
 literally named `anonymous` does not share the anonymous bucket. `POST
 /_session` is its own lane: logins are charged to one shared login bucket (with
