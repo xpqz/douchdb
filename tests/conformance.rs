@@ -11060,6 +11060,72 @@ async fn kill9_preserves_acknowledged_documents_and_changes() {
     assert_eq!(body["results"].as_array().unwrap().len(), 24);
 }
 
+/// Kills the child when dropped, so a failing assertion cannot leave it behind.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A test run that is killed (timeout, Ctrl-C, a CI cancel) never runs
+/// `Server::drop`; its servers must exit on their own instead of lingering as
+/// orphans (issue #119). The test re-runs itself as the "parent" that owns a
+/// server, kills that parent with SIGKILL, and expects the server to be gone.
+#[test]
+fn server_exits_when_its_test_process_is_killed() {
+    use std::io::{BufRead, BufReader};
+    const HELPER: &str = "DOUCHDB_TEST_PARENT_DEATH_HELPER";
+    if std::env::var_os(HELPER).is_some() {
+        let server = Server::start(false);
+        println!("server-pid:{}", server.child.id());
+        std::thread::sleep(Duration::from_secs(120));
+        drop(server);
+        return;
+    }
+    let mut cmd = Command::new(std::env::current_exe().expect("test exe"));
+    cmd.args([
+        "--exact",
+        "server_exits_when_its_test_process_is_killed",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(HELPER, "1")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    let mut helper = KillOnDrop(spawn_locked(&mut cmd).expect("spawn helper"));
+    let stdout = helper.0.stdout.take().expect("helper stdout");
+    let pid: i32 = BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| line.split_once("server-pid:")?.1.trim().parse().ok())
+        .expect("helper did not report its server pid");
+    let helper_pid = helper.0.id();
+    // SIGKILL: the helper gets no chance to run any Drop.
+    drop(helper);
+
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let leaked = alive(pid);
+    if leaked {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let prefix = format!("douchdb-test-{helper_pid}-");
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    assert!(!leaked, "server {pid} outlived its killed test process");
+}
+
 #[tokio::test]
 async fn anti_entropy_replicates_conflicts_and_tombstones() {
     let nodes = start_cluster_with(2, "1", 2);
