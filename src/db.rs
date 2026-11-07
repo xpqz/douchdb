@@ -5003,7 +5003,11 @@ mod tests {
         assert_eq!(db.replication_map().replicas, target.replicas);
 
         // The freeze window ends without the coordinator clearing the map.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The clock counts from its first reading, so "expired" (an end of 1)
+        // only holds once it has reached 1.
+        while now_millis() < 1 {
+            std::thread::yield_now();
+        }
         db.rebalance_until.store(1, Ordering::SeqCst);
         assert!(!db.rebalance_in_progress());
         assert!(db.is_replica_of("doc", 0) && !db.is_replica_of("doc", 1));

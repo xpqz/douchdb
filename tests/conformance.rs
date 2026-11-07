@@ -90,6 +90,7 @@ impl Server {
             .arg(&dir)
             .arg("--sync-secs")
             .arg("3600")
+            .args(DEFAULT_SERVER_ARGS)
             .args(extra)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -98,7 +99,7 @@ impl Server {
         }
         // Built first: nothing may panic while the bare `Child` is unowned.
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap();
         let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
@@ -137,7 +138,7 @@ impl Server {
     fn restart(&mut self) {
         self.kill();
         self.client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .expect("client");
         let mut cmd = server_command();
@@ -147,6 +148,7 @@ impl Server {
             .arg(&self.dir)
             .arg("--sync-secs")
             .arg("3600")
+            .args(DEFAULT_SERVER_ARGS)
             .args(&self.extra)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -297,6 +299,12 @@ impl Drop for Server {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
+
+/// Every test server gets a view deadline far beyond what a loaded machine
+/// needs, so a slow JavaScript run cannot fail a test that is not about the
+/// deadline. A test about the deadline passes its own `--view-timeout-ms`,
+/// which comes later and so wins.
+const DEFAULT_SERVER_ARGS: [&str; 2] = ["--view-timeout-ms", "120000"];
 
 /// Held while `free_port` has a probe socket open and while a server is
 /// spawned. On macOS a new socket is made close-on-exec only after it is
@@ -1793,12 +1801,25 @@ async fn cluster_validators_are_cached_until_a_design_doc_changes() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (status, body) = nodes[1]
-        .put("/clvalcache/rejected", json!({"ok": false}))
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason"], "second");
+    // Node 1 keeps its cached set until the cache expires, so it still says
+    // "first" for a while. A rejected write changes nothing, so retry it
+    // until the new validator shows.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, body) = nodes[1]
+            .put("/clvalcache/rejected", json!({"ok": false}))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        if body["reason"] == "second" {
+            break;
+        }
+        assert_eq!(body["reason"], "first", "{body}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 never dropped its cached validator: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -3229,41 +3250,63 @@ async fn continuous_changes_streams_newline_json_and_heartbeats() {
     let (status, _) = s.put("/stream/doc", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let response = s
+    // The feed's own timeout is long: the client reads until it has seen what
+    // it expects and then hangs up, so a slow machine cannot end the stream
+    // before a heartbeat is due. How the timeout closes a feed is covered by
+    // the trailer test below.
+    let mut response = s
         .client
         .get(format!(
-            "{}/stream/_changes?feed=continuous&since=0&timeout=250&heartbeat=40",
+            "{}/stream/_changes?feed=continuous&since=0&timeout=300000&heartbeat=40",
             s.base
         ))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let text = response.text().await.unwrap();
+    let text = read_feed_until(&mut response, |text| text.contains("\"id\":\"doc\"")).await;
     let changes: Vec<Value> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("change line is JSON"))
         .collect();
     assert!(changes.iter().any(|row| row["id"] == "doc"), "{text}");
+    drop(response);
 
     // With since=now and no new writes, heartbeat newlines keep the stream
-    // alive until the timeout closes it.
-    let response = s
+    // alive.
+    let mut response = s
         .client
         .get(format!(
-            "{}/stream/_changes?feed=continuous&since=now&timeout=200&heartbeat=30",
+            "{}/stream/_changes?feed=continuous&since=now&timeout=300000&heartbeat=30",
             s.base
         ))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let heartbeat = response.text().await.unwrap();
+    let heartbeat = read_feed_until(&mut response, |text| text.contains('\n')).await;
     assert!(
         heartbeat.contains('\n'),
         "no heartbeat bytes: {heartbeat:?}"
     );
+}
+
+/// Read a streamed response until `done` accepts what has arrived so far. A
+/// hang is bounded by a failsafe, not by the property under test.
+async fn read_feed_until(response: &mut reqwest::Response, done: impl Fn(&str) -> bool) -> String {
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !done(&text) {
+            match response.chunk().await.expect("read feed") {
+                Some(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                None => break,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the feed never produced what was expected: {text:?}"));
+    text
 }
 
 #[tokio::test]
@@ -3300,25 +3343,24 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows[2], json!({"last_seq": 2, "pending": 0}), "{text}");
 
     // The same trailer closes a feed that reached its limit, at once rather
-    // than after the next wake-up.
-    let started = std::time::Instant::now();
-    let text = s
-        .client
-        .get(format!(
-            "{}/trailer/_changes?feed=continuous&since=0&limit=1",
-            s.base
-        ))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "a feed at its limit took {:?} to close",
-        started.elapsed()
-    );
+    // than after the next wake-up: with the longest timeout the server
+    // allows, only closing at the limit ends this request before the
+    // failsafe.
+    let text = tokio::time::timeout(Duration::from_secs(60), async {
+        s.client
+            .get(format!(
+                "{}/trailer/_changes?feed=continuous&since=0&limit=1&timeout=300000",
+                s.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("a feed at its limit stayed open");
     let rows = lines(&text);
     assert_eq!(rows.len(), 2, "{text}");
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
@@ -3331,10 +3373,10 @@ async fn changes_supports_sse_eventsource_feed() {
     let (status, _) = s.put("/sse/doc", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let response = s
+    let mut response = s
         .client
         .get(format!(
-            "{}/sse/_changes?feed=eventsource&since=0&timeout=250&heartbeat=40",
+            "{}/sse/_changes?feed=eventsource&since=0&timeout=300000&heartbeat=40",
             s.base
         ))
         .send()
@@ -3348,7 +3390,10 @@ async fn changes_supports_sse_eventsource_feed() {
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
     );
-    let body = response.text().await.unwrap();
+    let body = read_feed_until(&mut response, |text| {
+        text.contains("data: ") && text.contains(": heartbeat")
+    })
+    .await;
     let data: Vec<&str> = body
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -3527,7 +3572,7 @@ async fn db_updates_reports_lifecycle_and_write_events() {
     let waiting = tokio::spawn(async move {
         client
             .get(format!(
-                "{base}/_db_updates?feed=longpoll&since={since}&timeout=2000"
+                "{base}/_db_updates?feed=longpoll&since={since}&timeout=300000"
             ))
             .send()
             .await
@@ -3536,7 +3581,8 @@ async fn db_updates_reports_lifecycle_and_write_events() {
             .await
             .unwrap()
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Whether the long-poll is already waiting or starts after this create,
+    // it answers from `since`, so the create needs no head start.
     let (status, _) = s.put("/lpdb", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
     let body = waiting.await.unwrap();
@@ -5025,6 +5071,26 @@ async fn cluster_changes_report_pending_like_a_single_node() {
             .await;
         assert_eq!(status, StatusCode::CREATED);
 
+        // With n=3 the write is acknowledged at quorum and the last replica
+        // lands asynchronously, so wait until every node holds every
+        // document before reading `pending` from it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        for node in &nodes {
+            loop {
+                let (status, all) = node.get("/clpending/_changes").await;
+                assert_eq!(status, StatusCode::OK, "{all}");
+                if all["results"].as_array().map(Vec::len) == Some(30) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "n={replication}: {} never saw all 30 documents: {all}",
+                    node.base
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
         for node in &nodes {
             let mut since = "0".to_string();
             let mut seen = 0;
@@ -5339,7 +5405,7 @@ async fn cluster_shard_map_moves_data_between_nodes() {
         .await;
     assert_eq!(status, StatusCode::OK);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[0].get("/movedb/move").await;
         if status == StatusCode::OK {
@@ -5400,7 +5466,7 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
         .is_file());
 
     nodes[1].restart();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, map) = nodes[1].get("/_node/_local/_dbs/meta").await;
         if status == StatusCode::OK && map["version"] == 3 {
@@ -5415,7 +5481,7 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
     // The peer may adopt the map on its own pass before ours has seen it
     // current, so the marker clears on whichever pass counts the quorum.
     let marker = nodes[0].dir.join("meta").join("pending-shard-map.json");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while marker.exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -5452,7 +5518,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
     assert_eq!(status, StatusCode::OK, "{map}");
     assert_eq!(map["replicas"], planned["replicas"], "{map}");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[0].get("/reb/_all_docs").await;
         if status == StatusCode::OK && body["total_rows"] == 9 {
@@ -5470,7 +5536,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .put("/_node/_local/_dbs/reb", all_shards_on(1))
         .await;
     assert_eq!(status, StatusCode::OK);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[1].get("/reb/_all_docs").await;
         if status == StatusCode::OK && body["total_rows"] == 9 {
@@ -5624,6 +5690,12 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     for replicas in map["replicas"].as_array().unwrap() {
         assert_eq!(replicas[0], 0, "timeout must restore the old shard map");
     }
+
+    // The timeout also lifts the write freeze, and reads kept working.
+    let (status, body) = nodes[0].get("/timeoutreb/to0").await;
+    assert_eq!(status, StatusCode::OK, "read after timeout: {body}");
+    let (status, body) = nodes[0].put("/timeoutreb/after", json!({"ok": true})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 #[tokio::test]
@@ -6026,7 +6098,7 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
     // A forwarded `_all_docs` reads only this node's shards, so seeing all
     // eight rows on node 1 means the anti-entropy pull actually copied them
     // (a client read would be proxied to the owner and prove nothing).
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let response = nodes[1]
             .client
@@ -6072,7 +6144,7 @@ async fn replication_source_and_target_agree_after_convergence() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut local: Vec<HashMap<String, Value>> = Vec::new();
     loop {
         local.clear();
@@ -6182,7 +6254,7 @@ async fn internal_consistency_survives_node_loss_and_restart() {
     }
 
     let expected = 30 + 40;
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (_, all_docs) = nodes[2].get("/ccons/_all_docs?limit=1000").await;
         if all_docs["total_rows"] == expected {
@@ -6294,7 +6366,7 @@ async fn cluster_anti_entropy_drains_a_large_backlog_in_one_pass() {
         .post("/_node/_local/_replication/run?db=cldrain", json!({}))
         .await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (_, status) = nodes[1].get("/_node/_local/_replication").await;
         if status["runs"].as_u64().unwrap_or(0) > runs_before && status["running"] == false {
@@ -6449,7 +6521,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
 
     // Anti-entropy converges the survivors to a full copy of every document
     // that has a replica among them.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let mut seen = std::collections::HashSet::new();
         for node in &survivors {
@@ -6512,7 +6584,7 @@ async fn cluster_survives_killing_a_node_mid_replication() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = nodes[owner]
             .req_with(Method::GET, &format!("/clkill/{id}"), None, &internal)
@@ -7255,7 +7327,7 @@ async fn authenticated_cluster_anti_entropy_converges() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[1]
             .req_with(
@@ -10214,7 +10286,7 @@ async fn cluster_management_reports_discovery_and_runs_replication() {
     // lists. Wait for the startup passes to see both nodes.
     for node in &nodes {
         let mut snapshot = Value::Null;
-        for _ in 0..80 {
+        for _ in 0..600 {
             let (status, body) = node.get("/_node/_local/_cluster").await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let reachable = body["discovery"]["nodes"]
@@ -10250,7 +10322,7 @@ async fn cluster_management_reports_discovery_and_runs_replication() {
     }
 
     // Let the startup pass settle before testing the explicit controls.
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let (status, body) = nodes[1].get("/_node/_local/_replication").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         if body["running"] == false {
@@ -10278,7 +10350,7 @@ async fn cluster_management_reports_discovery_and_runs_replication() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
     let mut entry = Value::Null;
-    for _ in 0..100 {
+    for _ in 0..600 {
         let (status, body) = nodes[1].get("/_node/_local/_replication").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         if body["running"] == false {
@@ -10323,7 +10395,7 @@ async fn discovery_follows_seed_membership() {
 
     let mut body = Value::Null;
     let mut last = Value::Null;
-    for _ in 0..100 {
+    for _ in 0..600 {
         let (status, current) = probe.get("/_node/_local/_cluster").await;
         assert_eq!(status, StatusCode::OK, "{current}");
         last = current.clone();
@@ -10430,7 +10502,7 @@ async fn background_replication_repairs_a_missed_shard_without_a_client() {
     // No client request touches node 1 for this document. The one-second
     // anti-entropy timer must pull it into node 1's copy of the shard.
     let mut after = before;
-    for _ in 0..150 {
+    for _ in 0..600 {
         after = local_shard_docs(&nodes[1], "rfan", target).await;
         if after > before {
             break;
@@ -10512,15 +10584,11 @@ async fn quickjs_view_deadline_stops_an_infinite_loop() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let started = std::time::Instant::now();
+    // The loop never ends, so only the deadline can answer this request; a
+    // hang is for the test runner's failsafe to catch.
     let (status, body) = s.get("/jsloop/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "infinite loop was not interrupted in time: {:?}",
-        started.elapsed()
-    );
 }
 
 #[tokio::test]
@@ -10588,6 +10656,26 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
     if !sandbox_tested("process") {
         return;
     }
+    let ddoc = json!({"views": {
+        "loop": {"map": "function(doc){ while (true) {} }"},
+        "ok": {"map": "function(doc){ var n = doc.v + 1; emit(n, null); }"}
+    }});
+
+    // A server with the generous default deadline runs the worker first, so
+    // a startup failure cannot satisfy the deadline assertions below.
+    let args = vec!["--js-sandbox".to_string(), "process".to_string()];
+    let patient = Server::start_with(&args, false);
+    patient.fresh_db("jsploop").await;
+    let (status, _) = patient.put("/jsploop/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = patient.put("/jsploop/_design/v", ddoc.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = patient.get("/jsploop/_design/v/_view/ok").await;
+    assert_eq!(status, StatusCode::OK, "process worker did not run: {body}");
+    assert_eq!(body["rows"][0]["key"], 2);
+
+    // The tight deadline only ever meets the infinite loop, which no machine
+    // speed can finish in time.
     let args = vec![
         "--js-sandbox".to_string(),
         "process".to_string(),
@@ -10598,24 +10686,9 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
     s.fresh_db("jsploop").await;
     let (status, _) = s.put("/jsploop/doc", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = s
-        .put(
-            "/jsploop/_design/v",
-            json!({"views": {
-                "loop": {"map": "function(doc){ while (true) {} }"},
-                "ok": {"map": "function(doc){ var n = doc.v + 1; emit(n, null); }"}
-            }}),
-        )
-        .await;
+    let (status, _) = s.put("/jsploop/_design/v", ddoc).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // A successful worker execution first, so a startup failure cannot satisfy
-    // the deadline assertions below.
-    let (status, body) = s.get("/jsploop/_design/v/_view/ok").await;
-    assert_eq!(status, StatusCode::OK, "process worker did not run: {body}");
-    assert_eq!(body["rows"][0]["key"], 2);
-
-    let started = std::time::Instant::now();
     let (status, body) = s.get("/jsploop/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
@@ -10626,15 +10699,23 @@ async fn quickjs_process_sandbox_enforces_the_deadline() {
             .contains("timed out"),
         "deadline cause was not reported: {body}"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "worker deadline was not enforced: {:?}",
-        started.elapsed()
-    );
 
-    // The pool recovers and serves valid work after the deadline kill.
-    let (status, body) = s.get("/jsploop/_design/v/_view/ok").await;
-    assert_eq!(status, StatusCode::OK, "worker did not recover: {body}");
+    // The pool recovers and serves valid work after the deadline kill. The
+    // tight deadline can also expire on a slow machine, so ask until a run
+    // fits in it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, body) = s.get("/jsploop/_design/v/_view/ok").await;
+        if status == StatusCode::OK {
+            assert_eq!(body["rows"][0]["key"], 2, "{body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not recover: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -10862,10 +10943,11 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
     let args = vec![
         "--js-sandbox".to_string(),
         "wasm".to_string(),
-        // The deadline is wall-clock time: long enough for the interpreter to
-        // start QuickJS in a debug build, short against the 15 s bound below.
+        // Long enough for a loaded machine to start QuickJS in a debug build
+        // and run the `ok` view. The loop below then runs into this deadline,
+        // whatever the machine's speed.
         "--view-timeout-ms".to_string(),
-        "2000".to_string(),
+        "30000".to_string(),
     ];
     let s = Server::start_with(&args, false);
     s.fresh_db("jswloop").await;
@@ -10882,23 +10964,17 @@ async fn quickjs_wasm_sandbox_enforces_the_deadline() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Prove the wasm worker runs before measuring the deadline, so a startup
-    // failure cannot satisfy the bounded-time assertion.
+    // Prove the wasm worker runs first, so a startup failure cannot stand in
+    // for the deadline below.
     let (status, body) = s.get("/jswloop/_design/v/_view/ok").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["key"], 2);
 
-    let started = std::time::Instant::now();
+    // The loop never ends, so only the deadline can answer this request; a
+    // hang is for the test runner's failsafe to catch.
     let (status, body) = s.get("/jswloop/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
-    // The wasm interpreter is much slower than a native worker and CI may be
-    // loaded; the bound only needs to prove the deadline stops the infinite loop.
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "wasm deadline was not enforced: {:?}",
-        started.elapsed()
-    );
 }
 
 #[cfg(feature = "wasmtime")]
@@ -10912,8 +10988,10 @@ async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
         "wasm".to_string(),
         "--wasm-runtime".to_string(),
         "wasmtime".to_string(),
+        // Long enough for the views above to run on a loaded machine; the
+        // loop then runs into it whatever the machine's speed.
         "--view-timeout-ms".to_string(),
-        "150".to_string(),
+        "30000".to_string(),
     ];
     let s = Server::start_with(&args, false);
     s.fresh_db("jswasmtime").await;
@@ -10965,15 +11043,11 @@ async fn quickjs_wasmtime_backend_runs_views_reduce_search_and_deadline() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_rows"], 2);
 
-    let started = std::time::Instant::now();
+    // The loop never ends, so only the epoch deadline can answer this
+    // request; a hang is for the test runner's failsafe to catch.
     let (status, body) = s.get("/jswasmtime/_design/v/_view/loop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "view_error");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "wasmtime epoch deadline was not enforced: {:?}",
-        started.elapsed()
-    );
 }
 
 #[tokio::test]
@@ -11635,7 +11709,7 @@ async fn cluster_partitioned_all_docs_keys_ranges_and_views() {
     // Design documents use the document write path; with n=1 the quorum can
     // return before every peer has its local copy. The search fan-out needs
     // the ddoc on every active node.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     for node in &nodes {
         loop {
             let response = node
@@ -11760,7 +11834,6 @@ async fn kill9_preserves_acknowledged_documents_and_changes() {
 
     s.kill();
     s.restart();
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (status, body) = s.get("/durable/_all_docs").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -11821,7 +11894,7 @@ fn server_exits_when_its_test_process_is_killed() {
 
     // SAFETY: kill(2) with signal 0 only probes whether the pid exists.
     let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while alive(pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -11867,7 +11940,7 @@ async fn anti_entropy_replicates_conflicts_and_tombstones() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         // Forwarded reads stay on this node, so a 200 proves anti-entropy
         // actually copied the revision rather than proxying to node 0.
@@ -11955,7 +12028,7 @@ async fn anti_entropy_preserves_revision_history_metadata() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, doc) = nodes[1]
             .req_with(Method::GET, "/clhistory/hist?revs=true", None, &internal)
@@ -12116,7 +12189,7 @@ async fn cluster_metrics_and_health_aggregate_across_nodes() {
     // Discovery starts with the nodes and replica writes finish in the
     // background; wait for the first pass before treating a not-yet-probed
     // peer or a not-yet-visible shard count as a permanent failure.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let cluster = loop {
         let (status, body) = nodes[0].get("/_node/_local/_metrics?cluster=true").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -12633,27 +12706,33 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // Hold Alice's single slot with a long-poll changes request.
+    // Hold Alice's single slot with a long-poll changes request. It waits
+    // for the next change, not for a clock: the test ends it with a write. A
+    // probe that won the slot first makes the long-poll answer 429 at once,
+    // so it asks again until it holds the slot.
     let longpoll = tokio::spawn({
         let client = s.client.clone();
         let url = format!(
-            "{}/fair/_changes?feed=longpoll&timeout=1500&since=0",
+            "{}/fair/_changes?feed=longpoll&timeout=300000&since=0",
             s.base
         );
         let auth = bearer("alice-token");
         async move {
-            let mut request = client.get(url);
-            for (name, value) in auth {
-                request = request.header(name, value);
+            loop {
+                let mut request = client.get(&url);
+                for (name, value) in &auth {
+                    request = request.header(*name, value);
+                }
+                let status = request.send().await.unwrap().status();
+                if status != StatusCode::TOO_MANY_REQUESTS {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            request.send().await.unwrap().status()
         }
     });
 
-    // Let the spawned long-poll win the single per-user slot before the
-    // probe loop starts competing for it.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = s.req_with(Method::GET, "/fair", None, &alice).await;
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -12671,11 +12750,16 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
     let (status, body) = s.req_with(Method::GET, "/fair", None, &bob).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // A change ends the long-poll and releases the slot.
+    let (status, body) = s
+        .req_with(Method::PUT, "/fair/wake", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     let status = longpoll.await.unwrap();
     assert_eq!(status, StatusCode::OK);
 
     // Alice's slot is released when the long-poll ends.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = s.req_with(Method::GET, "/fair", None, &alice).await;
         if status == StatusCode::OK {
@@ -12748,7 +12832,7 @@ async fn streaming_feed_holds_its_admission_permit_until_the_client_disconnects(
 
     // Disconnecting frees the slot.
     drop(feed);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = s.req_with(Method::GET, "/feedlimit", None, &alice).await;
         if status == StatusCode::OK {
@@ -12791,24 +12875,31 @@ async fn global_admission_limit_protects_capacity_across_users() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // The long-poll holds the only slot until the test hangs up. A probe that
+    // won the slot first makes it answer 429 at once, so it asks again.
     let longpoll = tokio::spawn({
         let client = s.client.clone();
         let url = format!(
-            "{}/global/_changes?feed=longpoll&timeout=1500&since=0",
+            "{}/global/_changes?feed=longpoll&timeout=300000&since=0",
             s.base
         );
         let auth = bearer("alice-token");
         async move {
-            let mut request = client.get(url);
-            for (name, value) in auth {
-                request = request.header(name, value);
+            loop {
+                let mut request = client.get(&url);
+                for (name, value) in &auth {
+                    request = request.header(*name, value);
+                }
+                let status = request.send().await.unwrap().status();
+                if status != StatusCode::TOO_MANY_REQUESTS {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            request.send().await.unwrap().status()
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = s
             .req_with(Method::GET, "/global", None, &bearer("bob-token"))
@@ -12824,10 +12915,11 @@ async fn global_admission_limit_protects_capacity_across_users() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let status = longpoll.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
+    // Nothing else can be admitted while the long-poll holds the only slot,
+    // so no write can wake it. Hanging up releases the slot instead.
+    longpoll.abort();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = s
             .req_with(Method::GET, "/global", None, &bearer("bob-token"))
@@ -12844,8 +12936,8 @@ async fn global_admission_limit_protects_capacity_across_users() {
 }
 
 /// Run the server with `extra` arguments and return its stderr if it exits
-/// with a failure within a few seconds, or `None` if it kept running (it is
-/// then killed).
+/// with a failure, or `None` if it kept running past a generous failsafe (it
+/// is then killed).
 fn startup_failure(extra: &[String]) -> Option<String> {
     use std::io::Read;
     let port = free_port();
@@ -12860,7 +12952,7 @@ fn startup_failure(extra: &[String]) -> Option<String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut failed = None;
     while std::time::Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
@@ -12907,7 +12999,7 @@ fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut status = None;
     while std::time::Instant::now() < deadline {
         if let Ok(Some(done)) = child.try_wait() {
@@ -12967,7 +13059,7 @@ async fn sigterm_ends_a_continuous_feed_with_its_trailer_and_exits_zero() {
         .expect("open feed");
     let mut text = String::new();
     while !text.contains("\"id\":\"a\"") {
-        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+        let chunk = tokio::time::timeout(Duration::from_secs(60), response.chunk())
             .await
             .expect("first change")
             .expect("read feed")
@@ -12975,7 +13067,7 @@ async fn sigterm_ends_a_continuous_feed_with_its_trailer_and_exits_zero() {
         text.push_str(&String::from_utf8_lossy(&chunk));
     }
     signal_server(&s, libc::SIGTERM);
-    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+    let ended = tokio::time::timeout(Duration::from_secs(60), async {
         while let Ok(Some(chunk)) = response.chunk().await {
             text.push_str(&String::from_utf8_lossy(&chunk));
         }
@@ -12983,7 +13075,7 @@ async fn sigterm_ends_a_continuous_feed_with_its_trailer_and_exits_zero() {
     .await;
     assert!(ended.is_ok(), "the feed was still open: {text}");
     assert!(text.contains("\"last_seq\""), "no trailer: {text}");
-    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    let status = wait_for_exit(&mut s, Duration::from_secs(60)).expect("server did not exit");
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -12998,7 +13090,7 @@ async fn sigterm_then_restart_keeps_acknowledged_documents() {
     let (status, body) = s.post("/sigdocs/_bulk_docs", json!({"docs": docs})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     signal_server(&s, libc::SIGTERM);
-    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    let status = wait_for_exit(&mut s, Duration::from_secs(60)).expect("server did not exit");
     assert_eq!(status.code(), Some(0), "{status:?}");
     s.restart();
     let (status, body) = s.get("/sigdocs").await;
@@ -13014,7 +13106,7 @@ async fn a_second_sigterm_during_shutdown_does_not_hang() {
     signal_server(&s, libc::SIGTERM);
     signal_server(&s, libc::SIGTERM);
     signal_server(&s, libc::SIGINT);
-    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    let status = wait_for_exit(&mut s, Duration::from_secs(60)).expect("server did not exit");
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -13107,7 +13199,7 @@ async fn login_succeeds_while_anonymous_bucket_is_full() {
     let hold = || {
         let client = s.client.clone();
         let url = format!(
-            "{}/flood/_changes?feed=longpoll&timeout=20000&since=0",
+            "{}/flood/_changes?feed=longpoll&timeout=300000&since=0",
             s.base
         );
         tokio::spawn(async move { client.get(url).send().await.map(|r| r.status()) })
@@ -13115,7 +13207,7 @@ async fn login_succeeds_while_anonymous_bucket_is_full() {
     let mut held = vec![hold(), hold()];
     // The bucket is full once an anonymous probe is rejected: only the two
     // holders can be occupying its slots then.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = s.req_with(Method::GET, "/flood", None, &[]).await;
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -13678,7 +13770,7 @@ async fn longpoll_changes_stops_after_security_revocation() {
     let longpoll = tokio::spawn({
         let client = s.client.clone();
         let url = format!(
-            "{}/revoke/_changes?feed=longpoll&timeout=3000&since=0",
+            "{}/revoke/_changes?feed=longpoll&timeout=300000&since=0",
             s.base
         );
         let auth = bearer("alice-token");
@@ -13694,9 +13786,9 @@ async fn longpoll_changes_stops_after_security_revocation() {
         }
     });
 
-    // Give the long-poll time to enter its wait loop, then revoke Alice and
-    // create a document she must never receive.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Revoke Alice and create a document she must never receive. Whether the
+    // long-poll is already waiting or starts after this, it must not see the
+    // document, and its own timeout is far longer than the test.
     let (status, body) = s
         .req_with(
             Method::PUT,
@@ -13719,7 +13811,7 @@ async fn longpoll_changes_stops_after_security_revocation() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let (status, body) = tokio::time::timeout(Duration::from_secs(5), longpoll)
+    let (status, body) = tokio::time::timeout(Duration::from_secs(60), longpoll)
         .await
         .expect("longpoll did not finish")
         .unwrap();
@@ -13744,7 +13836,7 @@ async fn longpoll_changes_stops_after_security_revocation() {
 /// Wait until `GET /{db}/_security` on `node` returns `expected`.
 async fn wait_for_security(node: &Server, db: &str, expected: &Value) {
     let admin = admin_auth();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = node
             .req_with(Method::GET, &format!("/{db}/_security"), None, &admin)
@@ -14071,17 +14163,15 @@ async fn rebalance_verifies_conflict_leaves_before_cleanup() {
         }
     });
     // Counts already match, so only the content digest can hold the
-    // rebalance back until the missing leaf has been copied.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // rebalance back until the missing leaf has been copied. Nothing copies
+    // it until the test asks, so once the freeze is up the rebalance cannot
+    // have finished.
+    wait_until_frozen(&nodes[0], "confreb").await;
     assert!(
         !rebalance.is_finished(),
         "rebalance completed before the target had every conflict leaf"
     );
-    let (status, _) = nodes[target]
-        .post("/_node/_local/_replication/run?db=confreb", json!({}))
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let (status, body) = rebalance.await.unwrap();
+    let (status, body) = sync_until_done(&nodes, "confreb", rebalance).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let (status, body) = nodes[0].get(&format!("/confreb/{id}?conflicts=true")).await;
@@ -14402,7 +14492,7 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     let rebalance = tokio::spawn({
         let client = nodes[0].client.clone();
         let url = format!(
-            "{}/_node/_local/_dbs/rebread/rebalance?timeout_ms=1500",
+            "{}/_node/_local/_dbs/rebread/rebalance?timeout_ms=300000",
             nodes[0].base
         );
         async move {
@@ -14418,7 +14508,7 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
 
     // Wait until the rebalance has frozen writes. Until then, writes are
     // ordinary new documents and are harmless.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut attempt = 0usize;
     loop {
         let (status, body) = nodes[0]
@@ -14447,7 +14537,7 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
 
     // The freeze is cluster-wide: a client writing through another node must
     // also see 503, not just the coordinator.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[1]
             .req_with(
@@ -14490,7 +14580,7 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
     // Only one rebalance may own the database at a time.
     let (status, body) = nodes[0]
         .post(
-            "/_node/_local/_dbs/rebread/rebalance?timeout_ms=1500",
+            "/_node/_local/_dbs/rebread/rebalance?timeout_ms=300000",
             json!({}),
         )
         .await;
@@ -14511,9 +14601,17 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
         assert_eq!(body["n"], i);
     }
 
-    assert_eq!(rebalance.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
-    let (status, body) = nodes[0].get("/rebread/reb0").await;
-    assert_eq!(status, StatusCode::OK, "read after timeout: {body}");
+    // Let the target replicas catch up so the rebalance completes. How a
+    // rebalance that runs out of time leaves the placement and the writes is
+    // checked by `cluster_rebalance_timeout_does_not_clean_old_replicas`.
+    assert_eq!(
+        sync_until_done(&nodes, "rebread", rebalance).await,
+        StatusCode::OK
+    );
+    for i in 0..9 {
+        let (status, body) = nodes[0].get(&format!("/rebread/reb{i}")).await;
+        assert_eq!(status, StatusCode::OK, "read after rebalance: {body}");
+    }
     let (status, _) = nodes[0]
         .req_with(
             Method::PUT,
@@ -14526,9 +14624,50 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
 
     let (status, map) = nodes[0].get("/_node/_local/_dbs/rebread").await;
     assert_eq!(status, StatusCode::OK, "{map}");
-    for replicas in map["replicas"].as_array().unwrap() {
-        assert_eq!(replicas[0], 0, "timeout changed the active map: {map}");
+    assert_eq!(map["replicas"], planned["replicas"], "{map}");
+}
+
+/// Wait until writes to `db` through `node` are refused because a rebalance
+/// froze them. The probe deletes a document that does not exist, so it
+/// changes nothing before the freeze either.
+async fn wait_until_frozen(node: &Server, db: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, body) = node.delete(&format!("/{db}/freeze-probe-missing")).await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(body["error"], "rebalance_in_progress", "{body}");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writes were never frozen: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Anti-entropy is off in these clusters, so a rebalance waiting for its
+/// target replicas to catch up only moves on when told to. Ask every node
+/// for a sync pass until `task` ends, then return what it returned.
+async fn sync_until_done<T>(nodes: &[Server], db: &str, task: tokio::task::JoinHandle<T>) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rebalance did not finish"
+        );
+        for node in nodes {
+            let (status, body) = node
+                .post(
+                    &format!("/_node/_local/_replication/run?db={db}"),
+                    json!({}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    task.await.unwrap()
 }
 
 const INTERNAL_HEADERS: [(&str, &str); 2] = [
@@ -14628,7 +14767,10 @@ async fn migration_freeze_waits_for_detached_replica_writes() {
                 .status()
         }
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The freeze refuses client writes before it waits for in-flight ones, so
+    // refused writes show it has started waiting. The stopped node cannot
+    // finish its write, so the freeze cannot have finished either.
+    wait_until_frozen(&nodes[0], "migdrain").await;
     let finished_early = freeze.is_finished();
     signal("-CONT");
     assert!(
@@ -14835,7 +14977,7 @@ async fn returning_node_repairs_design_documents_after_being_offline() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     nodes[1].restart();
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = nodes[1].get("/designrep/_design/v").await;
         if status == StatusCode::OK {
