@@ -1151,6 +1151,14 @@ fn empty_search_response(request: &SearchRequest) -> Value {
     response
 }
 
+fn timeout_error() -> ApiError {
+    ApiError::new(
+        500,
+        "timeout",
+        "The request could not be processed in a reasonable amount of time.",
+    )
+}
+
 pub async fn query(
     db: &Db,
     ddoc: &str,
@@ -1160,11 +1168,7 @@ pub async fn query(
 ) -> DbResult<Value> {
     let started = Instant::now();
     if request.timeout_ms == 0 || started.elapsed().as_millis() as u64 > request.timeout_ms {
-        return Err(ApiError::new(
-            500,
-            "timeout",
-            "The request could not be processed in a reasonable amount of time.",
-        ));
+        return Err(timeout_error());
     }
     if request.partition.is_some() && request.limit > PAGE_LIMIT {
         return Err(ApiError::bad_request(
@@ -1178,46 +1182,77 @@ pub async fn query(
     let gate = build_gate(db).read_owned().await;
     let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
-        return Err(ApiError::new(
-            500,
-            "timeout",
-            "The request could not be processed in a reasonable amount of time.",
-        ));
+        return Err(timeout_error());
     }
-    let meta = &snapshot.meta;
-    let searcher = &snapshot.searcher;
     let schema = snapshot.index.schema();
     let id_field = schema
         .get_field(ID_FIELD)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
-    let query_text = request.query.trim();
-    let query: Box<dyn tantivy::query::Query> = if query_text == "*:*" || query_text.is_empty() {
-        Box::new(AllQuery)
-    } else {
-        let default_fields: Vec<Field> = schema
-            .fields()
-            .filter(|(_, field)| field.name() != ID_FIELD && field.name() != FIELDS_FIELD)
-            .map(|(field, _)| field)
-            .collect();
-        let parser = QueryParser::for_index(&snapshot.index, default_fields);
-        match parser.parse_query(query_text) {
-            Ok(query) => query,
-            // A node may hold no local documents with an indexed field even
-            // though another shard does. Treat an absent field as no local
-            // matches so cluster fan-out can merge other shards' rows.
-            Err(error) if error.to_string().contains("Field does not exist") => {
-                return Ok(empty_search_response(request));
-            }
-            Err(error) => {
-                return Err(ApiError::bad_request(format!(
-                    "invalid search query: {error}"
-                )))
-            }
-        }
+    let Some(query) = parse_query(&snapshot, &schema, request.query.trim())? else {
+        return Ok(empty_search_response(request));
     };
+    let matched = collect_matches(db, &snapshot, request, id_field, &*query)?;
+
+    let total_rows = matched.len();
+    let offset = parse_bookmark(request.bookmark.as_deref());
+    let limit = if request.limit == 0 {
+        0
+    } else {
+        request.limit.min(PAGE_LIMIT)
+    };
+    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
+    let rows = page_rows(db, request, &page).await?;
+    let next = offset.saturating_add(page.len());
+    let mut response = json!({
+        "total_rows": total_rows,
+        "bookmark": format!("search:{next}"),
+        "rows": rows,
+    });
+    add_facets(&mut response, request, &matched);
+    Ok(response)
+}
+
+/// Parse the query text. `None` means a field the query names does not exist
+/// in this node's index, which is no local matches rather than an error.
+fn parse_query(
+    snapshot: &Snapshot,
+    schema: &Schema,
+    query_text: &str,
+) -> DbResult<Option<Box<dyn tantivy::query::Query>>> {
+    if query_text == "*:*" || query_text.is_empty() {
+        return Ok(Some(Box::new(AllQuery)));
+    }
+    let default_fields: Vec<Field> = schema
+        .fields()
+        .filter(|(_, field)| field.name() != ID_FIELD && field.name() != FIELDS_FIELD)
+        .map(|(field, _)| field)
+        .collect();
+    let parser = QueryParser::for_index(&snapshot.index, default_fields);
+    match parser.parse_query(query_text) {
+        Ok(query) => Ok(Some(query)),
+        // A node may hold no local documents with an indexed field even
+        // though another shard does. Treat an absent field as no local
+        // matches so cluster fan-out can merge other shards' rows.
+        Err(error) if error.to_string().contains("Field does not exist") => Ok(None),
+        Err(error) => Err(ApiError::bad_request(format!(
+            "invalid search query: {error}"
+        ))),
+    }
+}
+
+/// Run the query and keep the documents this request may see, sorted.
+fn collect_matches<'a>(
+    db: &Db,
+    snapshot: &'a Snapshot,
+    request: &SearchRequest,
+    id_field: Field,
+    query: &dyn tantivy::query::Query,
+) -> DbResult<Vec<&'a SearchDoc>> {
+    let meta = &snapshot.meta;
+    let searcher = &snapshot.searcher;
     let addresses = searcher
-        .search(&*query, &DocSetCollector)
+        .search(query, &DocSetCollector)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
     let mut matched: Vec<&SearchDoc> = Vec::new();
@@ -1259,15 +1294,11 @@ pub async fn query(
     } else {
         matched.sort_by(|a, b| sort_compare(a, b, &request.sort));
     }
+    Ok(matched)
+}
 
-    let total_rows = matched.len();
-    let offset = parse_bookmark(request.bookmark.as_deref());
-    let limit = if request.limit == 0 {
-        0
-    } else {
-        request.limit.min(PAGE_LIMIT)
-    };
-    let page: Vec<&SearchDoc> = matched.iter().skip(offset).take(limit).copied().collect();
+/// Build the result rows for one page, with documents and highlights.
+async fn page_rows(db: &Db, request: &SearchRequest, page: &[&SearchDoc]) -> DbResult<Vec<Value>> {
     let docs = if request.include_docs {
         let ids: Vec<String> = page.iter().map(|doc| doc.id.clone()).collect();
         crate::view::docs_by_ids(db, false, &ids).await?
@@ -1277,7 +1308,7 @@ pub async fn query(
 
     let terms = query_terms(&request.query);
     let mut rows = Vec::with_capacity(page.len());
-    for doc in &page {
+    for doc in page {
         let order: Vec<Value> = request
             .sort
             .iter()
@@ -1314,18 +1345,16 @@ pub async fn query(
         }
         rows.push(row);
     }
-    let next = offset.saturating_add(page.len());
-    let mut response = json!({
-        "total_rows": total_rows,
-        "bookmark": format!("search:{next}"),
-        "rows": rows,
-    });
+    Ok(rows)
+}
 
+/// Add `counts`, `ranges` and `groups`, computed over all matches.
+fn add_facets(response: &mut Value, request: &SearchRequest, matched: &[&SearchDoc]) {
     if !request.counts.is_empty() {
         let mut counts = Map::new();
         for field in &request.counts {
             let mut values: BTreeMap<String, u64> = BTreeMap::new();
-            for doc in &matched {
+            for doc in matched {
                 if let Some(value) = doc.fields.get(field) {
                     *values.entry(field_key(value)).or_default() += 1;
                 }
@@ -1363,7 +1392,7 @@ pub async fn query(
 
     if let Some(group_field) = &request.group_field {
         let mut groups: BTreeMap<String, Vec<&SearchDoc>> = BTreeMap::new();
-        for doc in &matched {
+        for doc in matched {
             let key = doc
                 .fields
                 .get(group_field)
@@ -1386,8 +1415,6 @@ pub async fn query(
             .collect();
         response["groups"] = json!(groups);
     }
-
-    Ok(response)
 }
 
 pub async fn info(
