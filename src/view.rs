@@ -2245,41 +2245,7 @@ fn run_map_js(
 
     crate::js::guard("map function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              function sum(values) {{
-                var total = 0;
-                for (var i = 0; i < values.length; i++) total += values[i];
-                return total;
-              }}
-              function log(message) {{ }}
-              function isArray(value) {{ return Array.isArray(value); }}
-              function toJSON(value) {{ return JSON.stringify(value); }}
-              var __out = [];
-              var emit = function (key, value) {{
-                __out.push([
-                  key === undefined ? null : key,
-                  value === undefined ? null : value
-                ]);
-              }};
-              var __map = ({source});
-              if (typeof __map !== "function") {{
-                throw new Error("map must be a function");
-              }}
-              return function (json) {{
-                var docs = JSON.parse(json);
-                var all = [];
-                for (var i = 0; i < docs.length; i++) {{
-                  __out = [];
-                  __map(docs[i]);
-                  all.push(__out);
-                }}
-                return JSON.stringify(all);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = MAP_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;
@@ -2636,6 +2602,13 @@ struct ReduceEngine {
 
 const REDUCE_GLOBAL: &str = "__douchdb_reduce";
 
+/// The JS wrappers around user functions live once, in `wasm/js`, and are
+/// shared with the WASM runner. The placeholder is replaced by the user's
+/// function source.
+const MAP_WRAPPER: &str = include_str!("../wasm/js/map.js");
+const REDUCE_WRAPPER: &str = include_str!("../wasm/js/reduce.js");
+pub(crate) const WRAPPER_SOURCE: &str = "__DOUCHDB_SOURCE__";
+
 impl JsReducer {
     pub(crate) fn new(source: &str, limits: ViewLimits) -> Self {
         Self {
@@ -2719,28 +2692,7 @@ fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, Str
     let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
     crate::js::guard("reduce function", || {
         context.with(|ctx| {
-            let wrapped = format!(
-                r#"
-            (function () {{
-              function sum(values) {{
-                var total = 0;
-                for (var i = 0; i < values.length; i++) total += values[i];
-                return total;
-              }}
-              function log(message) {{ }}
-              function isArray(value) {{ return Array.isArray(value); }}
-              function toJSON(value) {{ return JSON.stringify(value); }}
-              var __reduce = ({source});
-              if (typeof __reduce !== "function") {{
-                throw new Error("reduce must be a function");
-              }}
-              return function (keys, values, rereduce) {{
-                var result = __reduce(JSON.parse(keys), JSON.parse(values), rereduce);
-                return result === undefined ? "null" : JSON.stringify(result);
-              }};
-            }})()
-            "#
-            );
+            let wrapped = REDUCE_WRAPPER.replace(WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| format!("compile: {error}"))?;

@@ -1,0 +1,31 @@
+name: WASM runner
+
+# Rebuilds wasm/qjs-runner.wasm with the pinned toolchain (about a minute plus
+# the image pull) and compares it with the checked-in checksum. Runs only when
+# the runner, its shared JS wrappers or the build script change, so the main CI
+# workflow stays fast.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wasm/**"
+      - ".github/workflows/wasm-runner.yml"
+  pull_request:
+    paths:
+      - "wasm/**"
+      - ".github/workflows/wasm-runner.yml"
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild the runner
+        run: sh wasm/build.sh
+      - name: Compare with the checked-in checksum
+        run: |
+          sha256sum -c wasm/qjs-runner.sha256 || {
+            echo "wasm/qjs-runner.wasm is stale: run wasm/build.sh and commit the result" >&2
+            exit 1
+          }

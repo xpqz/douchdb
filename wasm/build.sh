@@ -1,6 +1,8 @@
 #!/bin/sh
 # Rebuild wasm/qjs-runner.wasm in Docker with the pinned toolchain from
 # wasm/README.md, then print its checksum. Needs only Docker; run from anywhere.
+# The build is pinned to linux/amd64 because the arm64 and x86_64 WASI SDK
+# builds give different wasm bytes; CI rebuilds on x86_64 and compares.
 set -eu
 
 IMAGE=rust:1.96.1-bookworm
@@ -12,7 +14,7 @@ wasm_dir=$(cd "$(dirname "$0")" && pwd)
 volume=qjs-runner-target-$$
 trap 'docker volume rm -f "$volume" >/dev/null' EXIT
 
-docker run --rm \
+docker run --rm --platform linux/amd64 \
   -v "$wasm_dir":/work \
   -v "$volume":/target \
   -e CARGO_TARGET_DIR=/target \
