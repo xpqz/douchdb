@@ -10395,6 +10395,37 @@ async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
 }
 
 #[tokio::test]
+async fn search_hits_keep_the_original_id_when_index_changes_doc_id() {
+    // Same rule as for views: the hit id comes from the stored document, and
+    // every sandbox must agree.
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsidxid{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/p1"), json!({"v": "one"})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/s"),
+                json!({"indexes": {"changed": {
+                    "index": "function(doc){ doc._id = 'other'; index('v', doc.v); }"
+                }}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = s
+            .get(&format!("/{db}/_design/s/_search/changed?q=v:one"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+        assert_eq!(body["rows"][0]["id"], "p1", "{mode}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn pooled_process_worker_keeps_no_js_state_between_databases() {
     // One worker serves both databases. CouchDB keeps JS processes alive
     // between requests and tags them per database (couch_proc_manager); here
