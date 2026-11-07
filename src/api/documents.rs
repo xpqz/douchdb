@@ -67,12 +67,12 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
             // Revision-shaped responses are served locally, but the requested
             // quorum still has to be reachable.
             if let Some(response) =
-                quorum_reachable(st, db, dbname, &docid, q, headers, read_quorum).await
+                quorum_reachable(&st.ctx, db, dbname, &docid, q, headers, read_quorum).await
             {
                 return response;
             }
         } else {
-            return quorum_read(st, db, dbname, &docid, q, headers, read_quorum).await;
+            return quorum_read(&st.ctx, db, dbname, &docid, q, headers, read_quorum).await;
         }
     }
 
@@ -95,7 +95,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
         let mut last = None;
         for node in replicas {
             let peer = st.ctx.cluster.nodes[node].clone();
-            let response = proxy(st, &request, &peer).await;
+            let response = proxy(&st.ctx, &request, &peer).await;
             if !unavailable(&response) {
                 return response;
             }

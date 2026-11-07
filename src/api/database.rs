@@ -150,7 +150,7 @@ pub async fn db_root(
                         // `since` do not skip another node's changes.
                         if st.ctx.cluster.is_clustered() && !is_forwarded(&st, &headers) {
                             let (vector, marks) = match cluster_update_vector(ClusterRead {
-                                st: &st,
+                                ctx: &st.ctx,
                                 db: &db,
                                 dbname: &name,
                                 headers: &headers,
@@ -477,7 +477,7 @@ pub async fn db_rest(
                         return fail(error);
                     }
                     match crate::cluster_ops::set_security_everywhere(
-                        &st, &db, &name, value, &headers,
+                        &st.ctx, &db, &name, value, &headers,
                     )
                     .await
                     {

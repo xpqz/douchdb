@@ -293,8 +293,8 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         let Ok(db) = state.db(&name).await else {
             continue;
         };
-        crate::fabric::reconcile_shard_map(&state, &db).await;
-        crate::fabric::reconcile_security(&state, &db).await;
+        crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
+        crate::fabric::reconcile_security(&state.ctx, &db).await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();

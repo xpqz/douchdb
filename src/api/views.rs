@@ -278,7 +278,7 @@ pub(super) async fn search_request(
     } else if st.ctx.cluster.is_clustered() {
         cluster_search(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname,
                 headers,
@@ -459,7 +459,7 @@ pub(super) async fn view_request(
     let result = if let Some(reducer) = combine_reduce.as_deref() {
         cluster_reduce(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname,
                 headers,
@@ -475,7 +475,7 @@ pub(super) async fn view_request(
     } else if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         match cluster_view_rows(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname,
                 headers,

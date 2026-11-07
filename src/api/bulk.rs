@@ -88,10 +88,11 @@ pub(super) async fn bulk_docs(
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
-        let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
-            Ok(functions) => functions,
-            Err(error) => return fail(error),
-        };
+        let functions =
+            match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await {
+                Ok(functions) => functions,
+                Err(error) => return fail(error),
+            };
         match crate::validate::validate_docs_with(&functions, db, &mut docs, &principal).await {
             Ok(errors) => errors,
             Err(error) => return fail(error),
@@ -196,7 +197,8 @@ pub(super) async fn validate_write(
     headers: &HeaderMap,
 ) -> Option<Response> {
     let principal = st.principal(headers);
-    let functions = match crate::validate::validation_functions(st, db, dbname, headers).await {
+    let functions = match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await
+    {
         Ok(functions) => functions,
         Err(error) => return Some(fail(error)),
     };
@@ -316,7 +318,7 @@ pub(super) async fn bulk_get(
                     if latest {
                         query.push_str("&latest=true");
                     }
-                    forward_json(st, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers).await
                 };
                 (slots, result)
             }
@@ -391,7 +393,7 @@ pub(super) async fn revs_diff(
                     db.revs_diff(&sub).await
                 } else {
                     let peer = st.ctx.cluster.nodes[node].clone();
-                    forward_json(st, &peer, dbname, "_revs_diff", "", &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers).await
                 };
                 (slots, result)
             }
@@ -554,7 +556,7 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         cluster_all_docs(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname: req.name,
                 headers,

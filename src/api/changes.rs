@@ -337,7 +337,7 @@ async fn changes_normal_raw(
     }
     let mut local_mask = None;
     if st.ctx.cluster.is_clustered() && !local_only {
-        let masks = crate::fabric::preferred_shard_masks(st, db);
+        let masks = crate::fabric::preferred_shard_masks(&st.ctx, db);
         let active: Vec<usize> = masks
             .iter()
             .enumerate()
@@ -508,7 +508,7 @@ async fn changes_options(
     let mut progress = if raw_since == Some("now") {
         if st.ctx.cluster.is_clustered() && !local_only {
             cluster_update_vector(ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname: &db.name,
                 headers,
@@ -565,7 +565,7 @@ async fn changes_once(
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
-                st,
+                ctx: &st.ctx,
                 db,
                 dbname,
                 headers,

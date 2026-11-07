@@ -372,7 +372,7 @@ pub async fn db_metadata_put(
         Ok(map) => map,
         Err(_) => return fail(ApiError::bad_request("invalid shard map")),
     };
-    match crate::cluster_ops::apply_shard_map(&st, &db, &name, map, &headers).await {
+    match crate::cluster_ops::apply_shard_map(&st.ctx, &db, &name, map, &headers).await {
         Ok((map, pending)) => {
             let mut value = json!(map);
             value["pending"] = json!(pending);
@@ -400,7 +400,7 @@ pub async fn db_rebalance(
     let cleanup = flag(&q, "cleanup");
     let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
 
-    match crate::cluster_ops::rebalance(&st, &db, &name, &headers, timeout_ms, cleanup).await {
+    match crate::cluster_ops::rebalance(&st.ctx, &db, &name, &headers, timeout_ms, cleanup).await {
         Ok(value) => json(StatusCode::OK, value),
         Err(error) => fail(error),
     }
