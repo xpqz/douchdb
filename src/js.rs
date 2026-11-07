@@ -223,6 +223,34 @@ pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
     }
 }
 
+/// The wall-clock budget of one request. Each call of a batched reduce is
+/// interrupted inside the sandbox after the full timeout, as a request of its
+/// own would be; this is the hard deadline outside it, the safety net for a
+/// call that escapes that interrupt. It grows with the number of calls so a
+/// batch of slow but legitimate calls is not cut short, but only up to a
+/// ceiling, so a stuck reducer is killed in about a minute rather than after
+/// a thousand timeouts. Batches that legitimately need longer than the
+/// ceiling (over a minute of reducer time in one request) fail with a timeout.
+fn request_limits(request: &serde_json::Map<String, Value>, limits: ViewLimits) -> ViewLimits {
+    let calls = request
+        .get("calls")
+        .and_then(Value::as_array)
+        .map_or(1, |calls| calls.len().max(1));
+    ViewLimits {
+        timeout: batch_deadline(limits.timeout, calls),
+        ..limits
+    }
+}
+
+/// `timeout` per call, at most `max(4 * timeout, BATCH_DEADLINE_CEILING)`.
+fn batch_deadline(timeout: Duration, calls: usize) -> Duration {
+    const BATCH_DEADLINE_CEILING: Duration = Duration::from_secs(60);
+    let ceiling = BATCH_DEADLINE_CEILING.max(timeout.saturating_mul(4));
+    timeout
+        .saturating_mul(u32::try_from(calls).unwrap_or(u32::MAX))
+        .min(ceiling)
+}
+
 /// Syscalls the worker may make once it is serving requests: reading and
 /// writing the request pipes, memory management for QuickJS, futexes, clocks
 /// and exiting. Derived by tracing a worker through map, reduce, index,
@@ -450,9 +478,10 @@ fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value,
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
+    let budget = request_limits(&request, limits);
     let body = serde_json::to_vec(&Value::Object(request))
         .map_err(|error| JsError::Sandbox(error.to_string()))?;
-    wasm_run(&body, limits)
+    wasm_run(&body, budget)
 }
 
 #[cfg(feature = "wasm")]
@@ -992,6 +1021,7 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
         json!(limits.timeout.as_millis() as u64),
     );
     request.insert("memory".to_string(), json!(limits.memory));
+    let budget = request_limits(&request, limits);
     let body = serde_json::to_vec(&Value::Object(request))
         .map_err(|error| JsError::Worker(error.to_string()))?;
 
@@ -999,7 +1029,7 @@ pub fn process_request(kind: &str, payload: Value, limits: ViewLimits) -> Result
     let mut worker = pool.acquire()?;
     let mut last_error = JsError::Worker(String::new());
     for attempt in 0..2 {
-        match worker.request(&body, limits.timeout) {
+        match worker.request(&body, budget.timeout) {
             Ok(WorkerOutcome::Value(value)) => {
                 pool.release(worker);
                 return Ok(value);
@@ -1101,6 +1131,26 @@ mod tests {
             JsError::InvalidValue("non-numeric _stats input: \"a\"".to_string()).to_string(),
             "invalid_value: non-numeric _stats input: \"a\""
         );
+    }
+
+    #[test]
+    fn a_batch_deadline_is_bounded() {
+        let secs = Duration::from_secs;
+        // A lone call keeps its own timeout; a few calls get one each.
+        assert_eq!(batch_deadline(secs(5), 1), secs(5));
+        assert_eq!(batch_deadline(secs(5), 3), secs(15));
+        // A full batch is capped, not 1024 timeouts (about 85 minutes).
+        assert_eq!(batch_deadline(secs(5), 1024), secs(60));
+        // A long timeout still allows four calls' worth.
+        assert_eq!(batch_deadline(secs(30), 1024), secs(120));
+        assert_eq!(batch_deadline(Duration::MAX, usize::MAX), Duration::MAX);
+        let calls: Vec<Value> = (0..1024).map(|_| Value::Null).collect();
+        let request = serde_json::Map::from_iter([("calls".to_string(), Value::Array(calls))]);
+        let limits = ViewLimits {
+            timeout: secs(5),
+            memory: 1,
+        };
+        assert_eq!(request_limits(&request, limits).timeout, secs(60));
     }
 
     #[test]
@@ -1219,6 +1269,41 @@ mod tests {
         drop(other);
         worker.kill();
         assert!(exited.is_none(), "a cancelled deadline still killed it");
+    }
+
+    #[test]
+    #[cfg(feature = "wasm")]
+    fn wasm_reduce_many_runs_every_call_in_one_request() {
+        let limits = ViewLimits {
+            timeout: Duration::from_secs(60),
+            memory: 64 * 1024 * 1024,
+        };
+        let request = |calls: Value| {
+            wasm_request(
+                "reduce_many",
+                json!({
+                    "source": "function(k, v, r){ return r ? sum(v) * 10 : sum(v); }",
+                    "calls": calls,
+                }),
+                limits,
+            )
+        };
+        assert_eq!(
+            request(json!([
+                {"keys": [["a", 1]], "values": [3], "rereduce": false},
+                {"keys": [["b", 2], ["c", 3]], "values": [4, 5], "rereduce": false},
+                {"keys": null, "values": [1, 2], "rereduce": true},
+            ]))
+            .expect("batched reduce"),
+            json!([3, 9, 30])
+        );
+        let error = request(json!([
+            {"keys": [], "values": [1], "rereduce": false},
+            {"keys": "nope", "values": [1], "rereduce": false},
+        ]))
+        .expect_err("a malformed call fails the request")
+        .to_string();
+        assert!(error.contains("reduce keys"), "{error}");
     }
 
     #[test]

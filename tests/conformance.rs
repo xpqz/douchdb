@@ -6478,6 +6478,77 @@ async fn view_index_updates_incrementally_and_persists() {
 }
 
 #[tokio::test]
+async fn view_index_rebuilds_and_catches_up_in_pages() {
+    let s = Server::start(false);
+    s.fresh_db("pagedview").await;
+    let docs = |range: std::ops::Range<u32>| {
+        json!({"docs": range
+            .map(|n| json!({"_id": format!("d{n:05}"), "n": n}))
+            .collect::<Vec<_>>()})
+    };
+    let (status, _) = s.post("/pagedview/_bulk_docs", docs(0..9000)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let design = |map: &str, rev: Option<&str>| {
+        let mut body = json!({"views": {"by_n": {"map": map}}});
+        if let Some(rev) = rev {
+            body["_rev"] = json!(rev);
+        }
+        body
+    };
+    let (status, put) = s
+        .put(
+            "/pagedview/_design/v",
+            design("function(doc){ emit(doc.n, 1); }", None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The first build writes more rows than one batch holds.
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=0").await;
+    assert_eq!(body["total_rows"], 9000);
+
+    // A new map function replaces every stored row, old and new, in batches.
+    let rev = put["rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .put(
+            "/pagedview/_design/v",
+            design("function(doc){ emit(doc.n + 100000, 1); }", Some(&rev)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=1").await;
+    assert_eq!(body["total_rows"], 9000);
+    assert_eq!(body["rows"][0]["key"], 100000);
+
+    // A catch-up longer than one page of changes: new documents, a changed
+    // one and a deleted one.
+    let (status, _) = s.post("/pagedview/_bulk_docs", docs(9000..11500)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, doc) = s.get("/pagedview/d00001").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    s.put("/pagedview/d00001", json!({"_rev": rev, "n": 5}))
+        .await;
+    let (_, doc) = s.get("/pagedview/d00002").await;
+    let rev = doc["_rev"].as_str().unwrap().to_string();
+    let (status, _) = s
+        .req(
+            Method::DELETE,
+            &format!("/pagedview/d00002?rev={rev}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?limit=0").await;
+    assert_eq!(body["total_rows"], 11499);
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=100005").await;
+    assert_eq!(body["rows"][0]["id"], "d00001");
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=111499").await;
+    assert_eq!(body["rows"][0]["id"], "d11499");
+    let (_, body) = s.get("/pagedview/_design/v/_view/by_n?key=100001").await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn view_index_is_reused_after_restart() {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

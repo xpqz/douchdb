@@ -15,7 +15,10 @@ memory, fuel and a 128 MiB linear-memory cap.
 The runner ignores the `memory` and `timeout_ms` request fields on purpose:
 the host enforces both from outside (a cap on linear-memory growth and a
 wall-clock deadline in wasmi and Wasmtime), which holds even if the guest is
-compromised or stuck in a tight loop.
+compromised or stuck in a tight loop. The one use the runner makes of
+`timeout_ms` is in a batched `reduce_many` request, whose host deadline is the
+timeout times the number of calls: it interrupts a call that outlives
+`timeout_ms`, so one runaway reducer does not spend the whole batch's budget.
 
 Rebuild it with Docker (nothing else is needed):
 
@@ -52,7 +55,7 @@ default-on `wasm` cargo feature; `--no-default-features` builds without wasmi.
 Expected artifact checksum for the checked-in binary:
 
 ```text
-bb2954248ce2327df3459dafe92e1d3081f1bbcac416cabe1eac3e92a3d85c45  qjs-runner.wasm
+f3961f44893d65cf42fb6c981c972474a802838d75fc880a03b2c853f7b0cd3d  qjs-runner.wasm
 ```
 
 `wasm/qjs-runner.sha256` is the manifest checked by the unit test:
