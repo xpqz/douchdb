@@ -4220,7 +4220,11 @@ async fn malformed_session_cookie_does_not_hide_a_valid_one() {
         "AuthSession=Zm9v.!!!",
     ] {
         let both = format!("{junk}; {good}");
-        assert_eq!(status_with_cookie(&s, &both).await, StatusCode::OK, "{both}");
+        assert_eq!(
+            status_with_cookie(&s, &both).await,
+            StatusCode::OK,
+            "{both}"
+        );
     }
     assert_eq!(
         status_with_cookie(&s, "AuthSession=!!!.!!!").await,

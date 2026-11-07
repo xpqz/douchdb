@@ -402,13 +402,17 @@ impl Auth {
             let Some((payload_b64, sig)) = value.split_once('.') else {
                 continue;
             };
-            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(payload_b64)
-                .ok()?;
-            let payload = String::from_utf8(payload).ok()?;
-            let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(sig)
-                .ok()?;
+            // A malformed cookie is skipped, not fatal: a valid one may follow.
+            let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+            else {
+                continue;
+            };
+            let Ok(payload) = String::from_utf8(payload) else {
+                continue;
+            };
+            let Ok(signature) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig) else {
+                continue;
+            };
             let Some((user, exp)) = payload.rsplit_once(':') else {
                 continue;
             };
