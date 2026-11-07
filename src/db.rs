@@ -3827,6 +3827,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_non_ascii_attachment_digest_is_corruption_not_a_panic() {
+        let (db, root) = single_shard_db("att-digest").await;
+        let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        db.shards[0]
+            .call(move |shard| {
+                let mut meta = shard.get_meta("a")?.unwrap();
+                meta.atts.insert(
+                    rev,
+                    vec![(
+                        "f.txt".to_string(),
+                        AttMeta {
+                            content_type: "text/plain".into(),
+                            // The second character is two bytes wide, so a
+                            // byte-offset slice at 2 lands inside it.
+                            digest: "a\u{e9}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                            length: 5,
+                            revpos: 1,
+                        },
+                    )],
+                );
+                shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db.get_doc("a", &DocOpts::default()).await.unwrap_err();
+        assert_eq!(error.status, 500, "{error}");
+        assert!(error.corrupt, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
