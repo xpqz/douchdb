@@ -134,7 +134,7 @@ pub async fn db_updates(
         let stream = async_stream::stream! {
             let started = std::time::Instant::now();
             let mut sent = 0usize;
-            let mut last_heartbeat = std::time::Instant::now();
+            let mut heartbeat = Heartbeat::new(heartbeat);
             loop {
                 if limit.map(|limit| sent >= limit).unwrap_or(false)
                     || !st.principal(&headers).admin
@@ -157,21 +157,13 @@ pub async fn db_updates(
                 if started.elapsed().as_millis() as u64 >= timeout {
                     break;
                 }
-                if let Some(heartbeat) = heartbeat {
-                    if last_heartbeat.elapsed() >= heartbeat {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
-                        last_heartbeat = std::time::Instant::now();
-                    }
+                if heartbeat.due() {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         };
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return feed_response("application/json", stream);
     }
 
     let started = std::time::Instant::now();
