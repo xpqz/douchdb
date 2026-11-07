@@ -47,18 +47,14 @@ pub struct ViewQuery {
     /// node. The coordinator unions the owner-only responses, so each map row
     /// crosses the network once instead of once per replica.
     pub owner_shards: Option<Vec<bool>>,
-    pub shard_count: u32,
     /// Set for a `_partition/{p}/_design/.../_view/...` query. Only rows
     /// belonging to that partition are returned.
     pub partition: Option<String>,
-    /// Partitioned databases hash by partition, so owner-shard filtering must
-    /// use the same placement function.
-    pub partitioned: bool,
     /// Set by the cluster coordinator after summing owner-only map row counts.
     pub total_rows_override: Option<usize>,
     /// Set once rows have already been selected (by `ViewRows::select` or a
-    /// coordinator merge): the reported offset, and a signal that the
-    /// partition and shard filters have already been applied.
+    /// coordinator merge), which is also when the partition and shard filters
+    /// have been applied: the reported offset.
     pub offset_override: Option<usize>,
 }
 
@@ -2305,29 +2301,15 @@ fn run_map_js(
 }
 
 fn ordered_rows<'a>(rows: &'a [Row], query: &ViewQuery) -> (Vec<&'a Row>, usize, usize) {
-    let mut total_rows = query.total_rows_override.unwrap_or(rows.len());
+    let total_rows = query.total_rows_override.unwrap_or(rows.len());
     let mut ordered: Vec<&Row> = if query.descending {
         rows.iter().rev().collect()
     } else {
         rows.iter().collect()
     };
 
-    // Preselected rows are already filtered, and their counts supplied.
-    let preselected = query.offset_override.is_some();
-    if let Some(partition) = query.partition.as_ref().filter(|_| !preselected) {
-        let prefix = format!("{partition}:");
-        ordered.retain(|row| row.id.starts_with(&prefix));
-        total_rows = ordered.len();
-    }
-
-    if let Some(owned) = query.owner_shards.as_ref().filter(|_| !preselected) {
-        ordered.retain(|row| {
-            let shard = crate::db::shard_index_for(&row.id, query.shard_count, query.partitioned);
-            owned.get(shard).copied().unwrap_or(false)
-        });
-        total_rows = ordered.len();
-    }
-
+    // The rows are already filtered by partition and shard, and their counts
+    // supplied, by `ViewRows::select` or the coordinator.
     // The offset is the number of rows before the query's starting key. It is
     // computed before `key`/`keys` filtering, because CouchDB reports the
     // insertion point even when no row matches.
@@ -3502,7 +3484,6 @@ mod tests {
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
-            shard_count: placement.0,
             ..ViewQuery::default()
         };
         let queries = [
@@ -3806,7 +3787,6 @@ mod tests {
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
-            shard_count: placement.0,
             ..ViewQuery::default()
         };
         let mut queries: Vec<ViewQuery> = vec![
@@ -3906,7 +3886,19 @@ mod tests {
                     partitioned: false,
                 };
                 for query in &queries {
-                    let expected = render(&spec, rows, &HashMap::new(), query).unwrap();
+                    // The oracle filters by shard itself, independently of the
+                    // block tree under test.
+                    let visible: Vec<Row> = rows
+                        .iter()
+                        .filter(|row| {
+                            query.owner_shards.as_ref().is_none_or(|owned| {
+                                let shard = crate::db::shard_index_for(&row.id, placement.0, false);
+                                owned.get(shard).copied().unwrap_or(false)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
                     let actual = view
                         .reduce(query, query.owner_shards.as_deref(), &mut js)

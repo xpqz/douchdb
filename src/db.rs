@@ -11,7 +11,6 @@ pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
     blob_prefix, body_key, local_key, meta_key, seq_key, AttMeta, DocMeta, ShardHandle, Tx,
-    ATTEST_CHUNK,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -2306,7 +2305,6 @@ struct SplitDoc {
     id: String,
     rev: Option<String>,
     deleted: bool,
-    attachments: Option<Value>,
     revisions: Option<Value>,
     body: Map<String, Value>,
 }
@@ -2325,7 +2323,6 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     let mut rev = None;
     let mut deleted = false;
     let mut revisions = None;
-    let mut attachments = None;
     let mut body = Map::new();
 
     // One ordered pass. `serde_json::Map::remove` is a `swap_remove`, which
@@ -2348,7 +2345,6 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
             },
             "_deleted" => deleted = matches!(value, Value::Bool(true)),
             "_revisions" => revisions = Some(value),
-            "_attachments" => attachments = Some(value),
             k if META.contains(&k) => {}
             _ => {
                 body.insert(key, value);
@@ -2368,40 +2364,9 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
         id,
         rev,
         deleted,
-        attachments,
         revisions,
         body,
     })
-}
-
-fn decode_attachment(value: &Value) -> DbResult<Option<(AttMeta, Vec<u8>)>> {
-    let Some(obj) = value.as_object() else {
-        return Err(ApiError::bad_request("Attachment must be an object"));
-    };
-    let content_type = obj
-        .get("content_type")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let Some(data) = obj.get("data").and_then(Value::as_str) else {
-        if obj.get("follows").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(ApiError::bad_request(
-                "multipart attachments are not supported",
-            ));
-        }
-        return Ok(None);
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|_| ApiError::bad_request("Invalid attachment data"))?;
-    let digest = hex(&Md5::digest(&bytes));
-    let meta = AttMeta {
-        content_type,
-        digest,
-        length: bytes.len() as u64,
-        revpos: 0,
-    };
-    Ok(Some((meta, bytes)))
 }
 
 fn put_many(
@@ -2510,7 +2475,6 @@ impl Stage<'_> {
             id,
             rev: parent_rev,
             deleted,
-            attachments,
             revisions: _,
             body,
         } = doc;
@@ -2550,17 +2514,20 @@ impl Stage<'_> {
             .as_ref()
             .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
-        let fallback = all_atts(&meta);
-        let atts = self.apply_attachments(&inherited, &fallback, attachments.as_ref(), pos)?;
+        // Uploads are rejected, so a new revision only carries forward the
+        // attachments that older data already holds.
+        let atts = inherited;
 
-        let hashed: Vec<Attachment> = atts
+        let hashed = atts
             .iter()
-            .map(|(name, a)| Attachment {
-                name: name.clone(),
-                content_type: a.content_type.clone(),
-                md5: hex_to_16(&a.digest),
+            .map(|(name, a)| {
+                Ok(Attachment {
+                    name: name.clone(),
+                    content_type: a.content_type.clone(),
+                    md5: hex_to_16(&a.digest)?,
+                })
             })
-            .collect();
+            .collect::<DbResult<Vec<Attachment>>>()?;
         let rev_id = hex(&new_revid(
             deleted,
             parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
@@ -2594,19 +2561,13 @@ impl Stage<'_> {
             id,
             rev,
             deleted,
-            attachments,
             revisions,
             body,
         } = doc;
         let body = Value::Object(body);
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
-        let leaf = path
-            .last()
-            .cloned()
-            .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
-
         let known = meta.tree.contains(&rev);
-        if known && meta.atts.contains_key(&rev) && attachments.is_none() {
+        if known && meta.atts.contains_key(&rev) {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
 
@@ -2615,14 +2576,7 @@ impl Stage<'_> {
             .parent(&rev)
             .and_then(|p| meta.atts.get(p).cloned())
             .unwrap_or_default();
-        let fallback = all_atts(&meta);
-        let mut atts =
-            self.apply_attachments(&parent, &fallback, attachments.as_ref(), leaf.pos)?;
-        for (_, a) in atts.iter_mut() {
-            if a.revpos == 0 {
-                a.revpos = leaf.pos;
-            }
-        }
+        let atts = parent;
 
         let changed = !known;
         if changed {
@@ -2644,64 +2598,6 @@ impl Stage<'_> {
         }
 
         Ok(json!({"ok": true, "id": id, "rev": rev}))
-    }
-
-    fn apply_attachments(
-        &mut self,
-        inherited: &[(String, AttMeta)],
-        fallback: &[(String, AttMeta)],
-        submitted: Option<&Value>,
-        pos: u64,
-    ) -> DbResult<Vec<(String, AttMeta)>> {
-        let Some(submitted) = submitted else {
-            return Ok(inherited.to_vec());
-        };
-        let Some(obj) = submitted.as_object() else {
-            return Err(ApiError::bad_request("_attachments must be an object"));
-        };
-        let mut out = Vec::new();
-        for (name, value) in obj {
-            if let Some((mut att, bytes)) = decode_attachment(value)? {
-                att.revpos = pos;
-                for (i, chunk) in bytes.chunks(ATTEST_CHUNK).enumerate() {
-                    self.ops
-                        .push((blob_prefix(&att.digest, i as u32), Some(chunk.to_vec())));
-                }
-                out.push((name.clone(), att));
-                continue;
-            }
-            let digest = value
-                .get("digest")
-                .and_then(Value::as_str)
-                .and_then(digest_from_wire);
-            let found = inherited
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, a)| a.clone())
-                .or_else(|| {
-                    fallback
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, a)| a.clone())
-                })
-                .or_else(|| {
-                    digest.as_ref().and_then(|d| {
-                        fallback
-                            .iter()
-                            .find(|(_, a)| &a.digest == d)
-                            .map(|(_, a)| a.clone())
-                    })
-                })
-                .ok_or_else(|| {
-                    ApiError::new(
-                        412,
-                        "missing_stub",
-                        format!("Invalid attachment stub in {name}"),
-                    )
-                })?;
-            out.push((name.clone(), found));
-        }
-        Ok(out)
     }
 }
 
@@ -2749,18 +2645,6 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
     Ok((rev, vec![leaf]))
 }
 
-fn all_atts(meta: &DocMeta) -> Vec<(String, AttMeta)> {
-    let mut out = Vec::new();
-    for list in meta.atts.values() {
-        for (name, att) in list {
-            if !out.iter().any(|(n, _): &(String, AttMeta)| n == name) {
-                out.push((name.clone(), att.clone()));
-            }
-        }
-    }
-    out
-}
-
 fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
     let mut last_seq = None;
     let mut tx = Tx::new();
@@ -2781,45 +2665,38 @@ fn commit_ops(shard: &mut crate::store::Shard, ops: Ops) -> anyhow::Result<()> {
     shard.commit_at(tx, last_seq)
 }
 
-fn hex_to_16(hex: &str) -> [u8; 16] {
-    let bytes = hex_bytes(hex);
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = bytes.get(i).copied().unwrap_or(0);
+/// The raw bytes of a stored hex digest. The digest comes from disk, so one
+/// that is not well-formed hex is reported as corruption rather than guessed at.
+fn hex_bytes(hex: &str) -> DbResult<Vec<u8>> {
+    let corrupt = || ApiError::corrupt(format!("corrupt attachment digest {hex:?}"));
+    if !hex.len().is_multiple_of(2) {
+        return Err(corrupt());
     }
-    out
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(corrupt)
+        })
+        .collect()
 }
 
-fn hex_bytes(hex: &str) -> Vec<u8> {
-    let bytes = hex.as_bytes();
-    (0..bytes.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
-        .collect()
+fn hex_to_16(hex: &str) -> DbResult<[u8; 16]> {
+    hex_bytes(hex)?
+        .try_into()
+        .map_err(|_| ApiError::corrupt(format!("corrupt attachment digest {hex:?}")))
 }
 
 /// CouchDB writes attachment digests as `md5-<base64 of the raw digest>`, not
 /// hex. The wire format is not cosmetic: PouchDB uses it to decide whether an
 /// attachment has to be transferred.
-pub fn digest_to_wire(hex: &str) -> String {
-    format!(
+pub fn digest_to_wire(hex: &str) -> DbResult<String> {
+    Ok(format!(
         "md5-{}",
-        base64::engine::general_purpose::STANDARD.encode(hex_bytes(hex))
-    )
-}
-
-/// Parse `md5-<base64>` (and, leniently, a bare hex digest) back to hex.
-pub fn digest_from_wire(value: &str) -> Option<String> {
-    let value = value.strip_prefix("md5-").unwrap_or(value);
-    if value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Some(value.to_ascii_lowercase());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .ok()?;
-    if bytes.len() != 16 {
-        return None;
-    }
-    Some(hex(&bytes))
+        base64::engine::general_purpose::STANDARD.encode(hex_bytes(hex)?)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3129,7 +3006,7 @@ fn attachment_json(
     let mut out = json!({
         "content_type": att.content_type,
         "revpos": att.revpos,
-        "digest": digest_to_wire(&att.digest),
+        "digest": digest_to_wire(&att.digest)?,
         "length": att.length,
     });
     if with_data {

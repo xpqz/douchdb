@@ -1,4 +1,5 @@
-//! Cluster placement: static node list, rendezvous hashing, request routing.
+//! Cluster placement: the static node list, the per-database shard map, and
+//! the rendezvous hashing that seeds new shard maps.
 
 use axum::http::HeaderMap;
 use md5::{Digest, Md5};
@@ -123,7 +124,10 @@ impl Cluster {
         self.n.max(1).min(self.nodes.len().max(1))
     }
 
-    /// Every node, in rendezvous preference order for `shard`.
+    /// Every node, in rendezvous preference order for `shard`: the highest
+    /// scores of `(node, shard)` first. Only used to seed a database's
+    /// `ShardMap`; once created, the stored map is the source of truth for
+    /// placement.
     fn replicas_of_shard_ranked(&self, shard: u32) -> Vec<usize> {
         if self.nodes.is_empty() {
             return vec![0];

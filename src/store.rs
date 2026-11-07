@@ -16,8 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-pub const ATTEST_CHUNK: usize = 64 * 1024;
-
 /// Body keys examined per round of the compaction sweep.
 #[cfg(not(test))]
 const BODY_SWEEP_BATCH: usize = 1000;

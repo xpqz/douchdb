@@ -413,9 +413,7 @@ pub(super) async fn view_request(
                 memory: st.config.view_memory_mb.saturating_mul(1024 * 1024),
             },
             owner_shards: None,
-            shard_count: db.q,
             partition: partition.clone().or_else(|| q.get("partition").cloned()),
-            partitioned: db.partitioned,
             total_rows_override: None,
             offset_override: None,
         })
