@@ -55,19 +55,24 @@ curl -X POST http://couch:5984/_replicate \
 
 A three-node cluster, console and Grafana OpenTelemetry stack are provided:
 
+Set the required secrets first (there are no defaults; `docs/docker.md` has a
+generator for a git-ignored `.env`), then:
+
 ```sh
 docker compose up --build -d
 ```
 
-- API + console: http://localhost:8080 — nginx round-robins across all nodes; login `admin` / `secret`
+All ports are bound to `127.0.0.1`.
+
+- API + console: http://localhost:8080 — nginx round-robins across all nodes; login with the `DOUCHDB_ADMIN` credentials from `.env`
 - Direct nodes: ports 5984, 5985 and 5986
-- Grafana: http://localhost:3000 (anonymous Admin enabled for the demo)
+- Grafana: http://localhost:3000 (login `admin` / `GRAFANA_ADMIN_PASSWORD`)
 - OTLP/HTTP: http://localhost:4318
 
 The cluster uses `q=4`, `n=3`, three data volumes and OTLP export to Grafana's
 `otel-lgtm` all-in-one backend. See [docs/docker.md](docs/docker.md) for the
 service layout, credentials, verification commands and teardown. The stack is
-for local development: it has no TLS and uses demo credentials.
+for local development: it has no TLS.
 
 ## Partitioned databases
 
@@ -456,7 +461,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--q` | `2` | Default shards per database, fixed at creation (CouchDB's default) |
 | `--n` | `3` | Default copies of each shard, clamped to the node count (CouchDB's default) |
 | `--revs-limit` | `1000` | Revision history kept per document |
-| `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` |
+| `--admin` | none | Server-admin `user:pass` for Basic auth and `_session` (or `DOUCHDB_ADMIN`, which keeps the password out of the process list) |
 | `--users-file` | none | JSON users file with token/roles entries (see [docs/multiuser.md](docs/multiuser.md)) |
 | `--session-secret` | random, kept in `<data>/.session-secret` | HMAC key for `AuthSession` cookies (or `DOUCHDB_SESSION_SECRET`); set the same value on every node for cross-node sessions |
 | `--default-security` | `admin-only` when auth is configured | Empty `_security` databases are `admin-only` or `open` |

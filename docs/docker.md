@@ -4,9 +4,28 @@
 load-balanced edge that also serves the embedded console, and Grafana's
 OpenTelemetry LGTM stack.
 
+The stack needs four secrets before it will start; there are no defaults.
+Generate a `.env` file next to `docker-compose.yml` (compose reads it
+automatically, and it is git-ignored):
+
 ```sh
+umask 077
+cat > .env <<EOF
+DOUCHDB_CLUSTER_SECRET=$(openssl rand -hex 24)
+DOUCHDB_SESSION_SECRET=$(openssl rand -hex 24)
+DOUCHDB_ADMIN=admin:$(openssl rand -hex 12)
+GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 12)
+EOF
 docker compose up --build -d
 ```
+
+`docker compose up` without them fails with a message naming the missing
+variable. Read the generated admin password from `.env`.
+
+Every published port is bound to `127.0.0.1`, so the stack is reachable only
+from the machine running it. To expose it to a network, change the port
+mappings deliberately and put TLS in front; the compose file does not provide
+it.
 
 | URL | What |
 |---|---|
@@ -18,7 +37,7 @@ docker compose up --build -d
 | http://localhost:3000/ | Grafana (traces and metrics) |
 | http://localhost:4318/ | OTLP/HTTP receiver |
 
-Console login: `admin` / `secret`.
+Console login: the `DOUCHDB_ADMIN` user and password from `.env`. Grafana login: `admin` and `GRAFANA_ADMIN_PASSWORD`; anonymous access is disabled.
 
 ## Cluster
 
@@ -29,7 +48,7 @@ All three nodes use:
 --nodes http://node0:5984,http://node1:5984,http://node2:5984
 --me 0|1|2
 --sync-secs 3
---admin admin:secret
+--admin <DOUCHDB_ADMIN>
 --cluster-secret <DOUCHDB_CLUSTER_SECRET>
 --otel-endpoint http://otel-lgtm:4318
 ```
@@ -40,20 +59,13 @@ cluster shape for a three-node deployment; the trade-off is 3× storage and
 three replica writes per document. Point reads default to a quorum (`r=2`);
 use `?r=1` for the local-replica fast path.
 
-Data lives in the `node0-data`, `node1-data` and `node2-data` volumes. The
-default cluster secret is `dev-cluster-secret-please-change`; override it for
-anything beyond a local demo:
+Data lives in the `node0-data`, `node1-data` and `node2-data` volumes.
 
-```sh
-DOUCHDB_CLUSTER_SECRET='replace-with-a-long-random-secret' docker compose up --build -d
-```
-
-Session cookies are signed with `DOUCHDB_SESSION_SECRET` (default
-`dev-session-secret-please-change`, shared by all three nodes so a login works
-behind the proxy); override it the same way as the cluster secret.
-
-The admin password is set in the compose commands. Change it in
-`docker-compose.yml` before exposing the stack.
+The secrets reach the nodes as the `DOUCHDB_CLUSTER_SECRET`,
+`DOUCHDB_SESSION_SECRET` and `DOUCHDB_ADMIN` environment variables rather than
+command-line flags, so they do not appear in the process list. The session
+secret signs cookies and is shared by all three nodes so a login works behind
+the proxy.
 
 ## Load balancing
 

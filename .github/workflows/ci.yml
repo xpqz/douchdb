@@ -6,8 +6,8 @@ on:
   pull_request:
 
 # CI runs the native and process (seccomp/Landlock, x86_64) QuickJS sandboxes.
-# The WASM sandbox tests (including the wasmtime backend) are not run here; run them locally with
-# `cargo test` and `cargo test --features wasmtime`.
+# The WASM sandbox tests (including the wasmtime backend) run in the weekly
+# workflow (weekly.yml), which also runs all three sandboxes together.
 env:
   DOUCHDB_TEST_JS_SANDBOXES: native,process
 
@@ -16,11 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -55,14 +56,14 @@ jobs:
           docker run --rm \
             -v "$PWD/jepsen-clj:/work" \
             -w /work \
-            clojure:tools-deps-bookworm \
+            clojure:tools-deps-bookworm@sha256:fcf9e4765c784b8455d25de7606c2b6833b16ee45fb3b5eb0f23851d5d218dcd \
             clojure -M -e "(require 'douchdb.core)"
 
   differential:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Python syntax
         run: python3 -m py_compile differential/*.py
       - name: Build fuzzer image
@@ -88,7 +89,7 @@ jobs:
         run: python3 differential/run.py --changes --skip-build
       - name: Upload differential artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: differential-artifacts
           path: differential/artifacts/
@@ -98,10 +99,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: clients/pouchdb/package-lock.json
       - name: Build douchdb image
@@ -110,7 +111,7 @@ jobs:
         run: |
           docker run -d --name douchdb-clients -p 127.0.0.1:25985:5984 douchdb:clients \
             --listen 0.0.0.0:5984 --data /data
-          for i in $(seq 1 120); do
+          for _ in $(seq 1 120); do
             curl -fsS http://127.0.0.1:25985/ >/dev/null 2>&1 && exit 0
             sleep 0.5
           done
