@@ -265,7 +265,7 @@ mod tests {
                 view_timeout_ms: 1000,
                 view_memory_mb: 1,
                 default_admin_only: true,
-                max_open_dbs: 500,
+                max_open_dbs: 256,
             },
             ctx: ClusterCtx {
                 auth: Some(Auth::new("admin".into(), "hunter2".into(), b"k".to_vec())),

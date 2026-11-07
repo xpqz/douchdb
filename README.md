@@ -479,7 +479,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
-| `--max-open-dbs` | `500` | Most databases kept open between requests (CouchDB's `max_dbs_open` default). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. |
+| `--max-open-dbs` | `256` | Most databases kept open between requests (CouchDB's `max_dbs_open` is 500, but a database here costs a thread and several file descriptors per shard). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. |
 | `--max-open-indexes` | `256` | Most view indexes, and most search indexes, kept open between queries. Past it the least recently used index that no query is using is closed and reopened from disk on its next query. CouchDB keeps an index process per active view with no such cap; this bounds memory and file descriptors on nodes with many databases. |
 | `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |
 

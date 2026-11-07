@@ -60,8 +60,9 @@ impl DbUpdates {
     }
 }
 
-/// CouchDB's `max_dbs_open` default.
-pub const DEFAULT_MAX_OPEN_DBS: usize = 500;
+/// Default for `--max-open-dbs`. CouchDB's `max_dbs_open` is 500, but a
+/// database here holds a thread and several file descriptors per shard.
+pub const DEFAULT_MAX_OPEN_DBS: usize = 256;
 
 /// An open database and when it was last asked for.
 pub struct OpenDb {
