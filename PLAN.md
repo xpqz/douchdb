@@ -315,7 +315,8 @@ the bulk of the growth.
 1. **Single-node store.** Doc CRUD, rev trees, `_bulk_docs`, `_all_docs`. Done.
 2. **Replication round-trips.** `_changes`, `_revs_diff`, `_bulk_get`, `_local`,
    `new_edits=false`. Done, including PouchDB and CouchDB round-trips.
-3. ~~**Attachments.**~~ Removed in v0.2; the API rejects `_attachments`.
+3. ~~**Attachments.**~~ Removed in v0.2; the API rejects `_attachments`. The
+   read path stays for data written before v0.2; the write path is gone.
 4. **Cluster.** Shard map, routing, quorum, anti-entropy. Done, including
    versions, rebalance/cleanup and node-loss failover.
 5. **Ersatz CouchDB.** `_purge`, `_compact`, `_session`, `_security`,
