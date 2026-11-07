@@ -25,7 +25,7 @@ jobs:
         run: sh wasm/build.sh
       - name: Compare with the checked-in checksum
         run: |
-          sha256sum -c wasm/qjs-runner.sha256 || {
+          (cd wasm && sha256sum -c qjs-runner.sha256) || {
             echo "wasm/qjs-runner.wasm is stale: run wasm/build.sh and commit the result" >&2
             exit 1
           }
