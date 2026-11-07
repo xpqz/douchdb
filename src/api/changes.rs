@@ -338,7 +338,14 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
 /// only bounds how long a security change or other out-of-band state can go
 /// unnoticed. A clustered feed also reads peers, whose commits this node
 /// cannot observe, so it polls more often.
-const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// A test must not be answered by this fallback: with it out of reach, a feed
+/// that does not wake for a commit hangs instead of passing late.
+const LOCAL_FEED_RECHECK: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(3600)
+} else {
+    std::time::Duration::from_secs(5)
+};
 const CLUSTER_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Sleep an idle feed until a commit lands, the recheck interval passes, the
@@ -628,7 +635,7 @@ mod tests {
 
         // A commit wakes it long before a fallback poll could.
         db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(3), feed.next())
+        let line = tokio::time::timeout(Duration::from_secs(60), feed.next())
             .await
             .expect("the feed did not wake for a commit")
             .unwrap()

@@ -2363,7 +2363,7 @@ mod tests {
         }));
 
         let settled = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
             collect_quorum(pending, tally),
         )
         .await

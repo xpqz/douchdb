@@ -3411,15 +3411,11 @@ mod tests {
 
     #[test]
     fn unique_keys_scales_with_the_number_of_keys() {
-        // A pairwise scan needs about 12 million ICU comparisons here.
-        let keys: Vec<Value> = (0..5_000).map(|n| json!(format!("key-{n:06}"))).collect();
-        let started = std::time::Instant::now();
+        // A pairwise scan needs over a billion ICU comparisons here, which
+        // no machine finishes; sorting needs under a million. No clock is
+        // involved: the pairwise version would not return.
+        let keys: Vec<Value> = (0..50_000).map(|n| json!(format!("key-{n:06}"))).collect();
         assert_eq!(unique_keys(&keys).len(), keys.len());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "unique_keys took {:?}",
-            started.elapsed()
-        );
     }
 
     // The expected values below were captured from CouchDB 3.5.
@@ -3560,7 +3556,9 @@ mod tests {
             let (db, spec) = (db.clone(), spec.clone());
             async move { ensure_rows(&db, "_design/v", "v", &spec, limits).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         // The holder catches the index up with writes that land meanwhile.
         db.put_docs(vec![write("b"), write("c")], true)
             .await
@@ -4291,15 +4289,17 @@ mod tests {
 
     #[test]
     fn js_reducer_gives_every_call_the_full_timeout() {
+        // Three calls of 1.5 s need more than one 4 s budget between them,
+        // but each fits its own with a wide margin for a loaded machine.
         let limits = ViewLimits {
-            timeout: Duration::from_millis(300),
+            timeout: Duration::from_secs(4),
             ..ViewLimits::default()
         };
         let mut reducer = JsReducer::new(
-            "function(k, v, re){ var end = Date.now() + 150; while (Date.now() < end) {} return 1; }",
+            "function(k, v, re){ var end = Date.now() + 1500; while (Date.now() < end) {} return 1; }",
             limits,
         );
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert_eq!(reducer.call(&[], &[json!(1)], false).unwrap(), json!(1));
         }
         let mut endless = JsReducer::new("function(k, v, re){ while (true) {} }", limits);
@@ -4706,20 +4706,22 @@ mod tests {
             ),
             partitioned: false,
         };
+        // A task that does nothing but yield counts how often the runtime got
+        // to run it. A call that blocks the runtime leaves it a handful of
+        // turns; one that runs on the blocking pool leaves it thousands.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let ticker = tokio::spawn(async move {
-            let mut longest = Duration::ZERO;
-            let mut last = std::time::Instant::now();
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-                let now = std::time::Instant::now();
-                longest = longest.max(now - last);
-                last = now;
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let (flag, ticks) = (stop.clone(), ticks.clone());
+            async move {
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            longest
         });
         tokio::task::yield_now().await;
+        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
@@ -4727,12 +4729,13 @@ mod tests {
         let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
             .unwrap();
+        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let longest = ticker.await.unwrap();
+        ticker.await.unwrap();
         assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
         assert!(
-            longest < Duration::from_millis(300),
-            "the reduce blocked the runtime for {longest:?}"
+            ticks_during > 1_000,
+            "the reduce blocked the runtime: {ticks_during} turns while it ran"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -4820,20 +4823,22 @@ mod tests {
             reduce: None,
             partitioned: false,
         };
+        // A task that does nothing but yield counts how often the runtime got
+        // to run it. A call that blocks the runtime leaves it a handful of
+        // turns; one that runs on the blocking pool leaves it thousands.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let ticker = tokio::spawn(async move {
-            let mut longest = Duration::ZERO;
-            let mut last = std::time::Instant::now();
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-                let now = std::time::Instant::now();
-                longest = longest.max(now - last);
-                last = now;
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let (flag, ticks) = (stop.clone(), ticks.clone());
+            async move {
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            longest
         });
         tokio::task::yield_now().await;
+        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
@@ -4841,12 +4846,13 @@ mod tests {
         let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
             .unwrap();
+        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let longest = ticker.await.unwrap();
+        ticker.await.unwrap();
         assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
         assert!(
-            longest < Duration::from_millis(300),
-            "the map blocked the runtime for {longest:?}"
+            ticks_during > 1_000,
+            "the map blocked the runtime: {ticks_during} turns while it ran"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);

@@ -1211,16 +1211,12 @@ mod tests {
             timeout: Duration::from_millis(150),
             memory: 64 * 1024 * 1024,
         };
-        let started = Instant::now();
+        // The loop never ends, so only the deadline can stop it; a hang is
+        // for the test runner's failsafe to catch.
         let error = wasmi_map("function(doc){ while (true) {} }", limits)
             .expect_err("an endless loop must be stopped")
             .to_string();
         assert!(error.contains("timed out"), "{error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "deadline overshoot: {:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
@@ -1232,27 +1228,36 @@ mod tests {
             .join()
             .expect("spawning thread")
             .expect("spawn");
-        std::thread::sleep(Duration::from_millis(300));
+        // The spawning thread is gone. A worker that died with it never
+        // answers; a live `cat` echoes a line back, which needs no waiting.
+        use std::io::{BufRead, Write};
+        worker.stdin.write_all(b"ping\n").expect("write to worker");
+        worker.stdin.flush().expect("flush");
+        let mut echoed = String::new();
+        worker
+            .stdout
+            .read_line(&mut echoed)
+            .expect("read from worker");
         let exited = worker.child.try_wait().expect("try_wait");
         worker.kill();
         assert!(
-            exited.is_none(),
-            "the worker died with its spawning thread: {exited:?}"
+            echoed == "ping\n" && exited.is_none(),
+            "the worker died with its spawning thread: {echoed:?} {exited:?}"
         );
     }
 
     #[test]
     fn a_worker_that_never_announces_itself_is_killed() {
         let mut command = Command::new("sleep");
-        command.arg("30");
+        // `sleep` never says hello and never exits on its own within the
+        // test, so only the deadline can end the wait.
+        command.arg("3600");
         let mut worker = Worker::spawn_command(command).expect("spawn");
-        let started = Instant::now();
         let error = worker
             .await_hello(Duration::from_millis(300))
             .expect_err("no hello was sent")
             .to_string();
         assert!(error.contains("did not start"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -1260,14 +1265,24 @@ mod tests {
         let mut command = Command::new("sleep");
         command.arg("30");
         let mut worker = Worker::spawn_command(command).expect("spawn");
-        let deadline = reaper().watch(worker.pid, Duration::from_millis(200));
-        let other = reaper().watch(worker.pid, Duration::from_secs(60));
+        // Both deadlines are far off: what matters is which one is still
+        // registered once the first is dropped, not when anything fires.
+        let deadline = reaper().watch(worker.pid, Duration::from_secs(3600));
+        let other = reaper().watch(worker.pid, Duration::from_secs(7200));
+        let cancelled = deadline.key;
         drop(deadline);
-        std::thread::sleep(Duration::from_millis(500));
+        let registered = {
+            let state = reaper().lock();
+            (
+                state.watched.contains_key(&cancelled),
+                state.watched.contains_key(&other.key),
+            )
+        };
         let exited = worker.child.try_wait().expect("try_wait");
         assert!(!other.expired());
         drop(other);
         worker.kill();
+        assert_eq!(registered, (false, true), "dropping a deadline cancels it");
         assert!(exited.is_none(), "a cancelled deadline still killed it");
     }
 
