@@ -160,26 +160,33 @@ pub async fn discover_once(state: Arc<AppState>) {
 
 /// Probe immediately, then retry quickly while the rest of the cluster boots,
 /// and settle into the configured sync interval.
-pub fn spawn(state: Arc<AppState>) {
+pub fn spawn(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let shutdown = state.shutdown.clone();
         let interval = Duration::from_secs(state.config.sync_secs.max(1));
-        let quick = [
-            Duration::from_millis(200),
-            Duration::from_millis(400),
-            Duration::from_millis(800),
-            Duration::from_millis(1600),
-            Duration::from_millis(3200),
-        ];
-        discover_once(state.clone()).await;
-        for delay in quick {
-            tokio::time::sleep(delay).await;
+        let run = async {
+            let quick = [
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(1600),
+                Duration::from_millis(3200),
+            ];
             discover_once(state.clone()).await;
+            for delay in quick {
+                tokio::time::sleep(delay).await;
+                discover_once(state.clone()).await;
+            }
+            loop {
+                tokio::time::sleep(interval).await;
+                discover_once(state.clone()).await;
+            }
+        };
+        tokio::select! {
+            () = run => {}
+            () = shutdown.cancelled() => {}
         }
-        loop {
-            tokio::time::sleep(interval).await;
-            discover_once(state.clone()).await;
-        }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -255,6 +262,7 @@ mod tests {
             dbs: Default::default(),
             db_locks: Default::default(),
             fs_health: Default::default(),
+            shutdown: Default::default(),
             config: Config {
                 q: 1,
                 revs_limit: 1000,

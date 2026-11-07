@@ -12493,6 +12493,96 @@ fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
     assert!(stderr.contains("--q") && stderr.contains("abc"), "{stderr}");
 }
 
+/// Send `signal` to a running server.
+fn signal_server(server: &Server, signal: i32) {
+    // SAFETY: kill(2) takes plain integers and touches no memory.
+    let rc = unsafe { libc::kill(server.child.id() as i32, signal) };
+    assert_eq!(rc, 0, "kill({signal}) failed");
+}
+
+/// Wait up to `limit` for the server process to exit on its own.
+fn wait_for_exit(server: &mut Server, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = server.child.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// SIGTERM (Docker, systemd) must shut the server down gracefully like Ctrl-C:
+/// an open continuous feed ends with its `last_seq` trailer instead of holding
+/// the shutdown, and the process exits 0 well inside the shutdown deadline.
+#[tokio::test]
+async fn sigterm_ends_a_continuous_feed_with_its_trailer_and_exits_zero() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigfeed").await;
+    let (status, _) = s.put("/sigfeed/a", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client = Client::new();
+    let mut response = client
+        .get(format!(
+            "{}/sigfeed/_changes?feed=continuous&since=0&timeout=300000",
+            s.base
+        ))
+        .send()
+        .await
+        .expect("open feed");
+    let mut text = String::new();
+    while !text.contains("\"id\":\"a\"") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .expect("first change")
+            .expect("read feed")
+            .expect("feed ended early");
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    signal_server(&s, libc::SIGTERM);
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Ok(Some(chunk)) = response.chunk().await {
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the feed was still open: {text}");
+    assert!(text.contains("\"last_seq\""), "no trailer: {text}");
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Everything acknowledged before a SIGTERM is there after a restart.
+#[tokio::test]
+async fn sigterm_then_restart_keeps_acknowledged_documents() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigdocs").await;
+    let docs: Vec<Value> = (0..50)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let (status, body) = s.post("/sigdocs/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    signal_server(&s, libc::SIGTERM);
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    s.restart();
+    let (status, body) = s.get("/sigdocs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["doc_count"], 50, "{body}");
+}
+
+/// A second signal while shutting down neither hangs nor changes the outcome.
+#[tokio::test]
+async fn a_second_sigterm_during_shutdown_does_not_hang() {
+    let mut s = Server::start(false);
+    s.fresh_db("sigtwice").await;
+    signal_server(&s, libc::SIGTERM);
+    signal_server(&s, libc::SIGTERM);
+    signal_server(&s, libc::SIGINT);
+    let status = wait_for_exit(&mut s, Duration::from_secs(15)).expect("server did not exit");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
 #[test]
 fn users_file_name_colliding_with_admin_is_a_startup_error() {
     let users = UsersFile::new(r#"{"users":[{"name":"admin","token":"long-enough-token"}]}"#);

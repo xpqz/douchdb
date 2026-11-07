@@ -192,6 +192,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                 }
                 if started.elapsed().as_millis() as u64 >= deadline
                     || limit.is_some_and(|limit| sent >= limit)
+                    || st.shutdown.is_cancelled()
                 {
                     break;
                 }
@@ -202,7 +203,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                         b"\n"
                     }));
                 }
-                wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline).await;
+                wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
             }
             // CouchDB's eventsource feed ends without this line.
             if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
@@ -246,7 +247,8 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                                 .as_array()
                                 .map(|rows| !rows.is_empty())
                                 .unwrap_or(false)
-                                || started.elapsed().as_millis() as u64 >= deadline)
+                                || started.elapsed().as_millis() as u64 >= deadline
+                                || st.shutdown.is_cancelled())
                                 && still_allowed(&st, &db, &headers) =>
                         {
                             let mut line = serde_json::to_vec(&value).unwrap_or_default();
@@ -269,7 +271,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                     if heartbeat.due() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                     }
-                    wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline).await;
+                    wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
                 }
             };
             return feed_response("application/json", stream);
@@ -294,14 +296,25 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
                     }
                     return json(StatusCode::OK, v);
                 }
-                Ok(v) if started.elapsed().as_millis() as u64 >= deadline => {
+                Ok(v)
+                    if started.elapsed().as_millis() as u64 >= deadline
+                        || st.shutdown.is_cancelled() =>
+                {
                     if !still_allowed(&st, &db, headers) {
                         return access_denied(&st.principal(headers));
                     }
                     return json(StatusCode::OK, v);
                 }
                 Ok(_) => {
-                    wait_for_commit(&mut wake, recheck, &no_heartbeat, started, deadline).await
+                    wait_for_commit(
+                        &mut wake,
+                        recheck,
+                        &no_heartbeat,
+                        started,
+                        deadline,
+                        &st.shutdown,
+                    )
+                    .await
                 }
                 Err(e) => return fail(e),
             }
@@ -329,13 +342,15 @@ const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(5
 const CLUSTER_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Sleep an idle feed until a commit lands, the recheck interval passes, the
-/// next heartbeat is due or the feed's deadline arrives, whichever is first.
+/// next heartbeat is due, the feed's deadline arrives or the server starts
+/// shutting down, whichever is first.
 async fn wait_for_commit(
     wake: &mut tokio::sync::watch::Receiver<()>,
     recheck: std::time::Duration,
     heartbeat: &Heartbeat,
     started: std::time::Instant,
     deadline_ms: u64,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) {
     let left = std::time::Duration::from_millis(deadline_ms).saturating_sub(started.elapsed());
     let wait = recheck
@@ -344,6 +359,7 @@ async fn wait_for_commit(
     tokio::select! {
         _ = wake.changed() => {}
         _ = tokio::time::sleep(wait) => {}
+        _ = shutdown.cancelled() => {}
     }
 }
 

@@ -37,4 +37,4 @@ pub(crate) mod worker;
 
 pub use cli::parse_args;
 pub use db::shard_index;
-pub use server::{run, run_worker};
+pub use server::{run, run_worker, ConfigError};

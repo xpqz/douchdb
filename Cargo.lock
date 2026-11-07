@@ -847,6 +847,7 @@ dependencies = [
  "sha2",
  "tantivy",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
