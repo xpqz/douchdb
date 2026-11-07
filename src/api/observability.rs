@@ -3,7 +3,7 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use super::{access_denied, flag, internal_request, query, AppState};
+use super::{flag, internal_request, query, AdminOnly, AppState};
 use crate::db::Db;
 use crate::state::FsHealth;
 use axum::extract::State;
@@ -876,11 +876,8 @@ pub async fn metrics_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let q = query(&uri);
     let local = local_metrics(&st).await;
     let cluster_requested = flag(&q, "cluster")
@@ -1019,11 +1016,8 @@ pub async fn health_status(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let local = local_health(&st, true).await;
     let q = query(&uri);
     let cluster_requested = flag(&q, "cluster")

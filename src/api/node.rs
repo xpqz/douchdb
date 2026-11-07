@@ -3,11 +3,7 @@
 
 use super::*;
 
-pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn membership(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     let nodes: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
@@ -21,11 +17,7 @@ pub async fn membership(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
 
 /// Cluster overview for the management console: membership, discovery probes,
 /// per-database shard maps and the background replicator snapshot.
-pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn cluster_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     let membership: Vec<String> = if st.ctx.cluster.nodes.is_empty() {
         vec!["nonode@localhost".to_string()]
     } else {
@@ -84,11 +76,7 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, headers: HeaderMap)
 
 /// Probe peers and reported memberships now. Returns the previous snapshot and
 /// starts the pass in the background so a dead seed cannot block the request.
-pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn cluster_discover(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     if !st.cluster_state.discovery_running() {
         tokio::spawn(crate::discovery::discover_once(st.clone()));
     }
@@ -102,25 +90,13 @@ pub async fn cluster_discover(State(st): State<Arc<AppState>>, headers: HeaderMa
     )
 }
 
-pub async fn replication_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     json(StatusCode::OK, st.cluster_state.replication_json())
 }
 
 /// Trigger one anti-entropy pass. Background replication already runs on its
 /// timer; this is the "sync now" control for operators.
-pub async fn replication_run(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_run(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly) -> Response {
     let db = query(&uri).get("db").cloned();
     if !st.cluster_state.replication_running() {
         tokio::spawn(crate::replicate::sync_once(st.clone(), db));
@@ -131,11 +107,7 @@ pub async fn replication_run(
     )
 }
 
-pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_pause(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     st.cluster_state.set_replication_paused(true);
     json(
         StatusCode::OK,
@@ -143,11 +115,7 @@ pub async fn replication_pause(State(st): State<Arc<AppState>>, headers: HeaderM
     )
 }
 
-pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn replication_resume(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     st.cluster_state.set_replication_paused(false);
     json(
         StatusCode::OK,
@@ -156,11 +124,7 @@ pub async fn replication_resume(State(st): State<Arc<AppState>>, headers: Header
 }
 
 /// mem3-style shard-map inspection and movement endpoint.
-pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
+pub async fn dbs_metadata(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     let mut out = Map::new();
     for name in st.db_names().await {
         if let Ok(db) = st.db(&name).await {
@@ -173,12 +137,8 @@ pub async fn dbs_metadata(State(st): State<Arc<AppState>>, headers: HeaderMap) -
 pub async fn db_metadata(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     match st.db(&name).await {
         Ok(db) => json(StatusCode::OK, json!(db.shard_map())),
         Err(error) => fail(error),
@@ -310,13 +270,9 @@ pub async fn db_security_put(
 pub async fn db_shard_counts(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -349,12 +305,9 @@ pub async fn db_metadata_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
     headers: HeaderMap,
+    _: AdminOnly,
     body: Bytes,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -387,11 +340,8 @@ pub async fn db_rebalance(
     DbName(name): DbName,
     headers: HeaderMap,
     uri: Uri,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),
@@ -409,12 +359,8 @@ pub async fn db_rebalance(
 pub async fn db_cleanup(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
-    headers: HeaderMap,
+    _: AdminOnly,
 ) -> Response {
-    let principal = st.principal(&headers);
-    if !principal.admin {
-        return access_denied(&principal);
-    }
     let db = match st.db(&name).await {
         Ok(db) => db,
         Err(error) => return fail(error),

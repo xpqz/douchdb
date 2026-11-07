@@ -18,6 +18,27 @@ pub(crate) fn access_denied(principal: &Principal) -> Response {
     }
 }
 
+/// Extractor for admin-only endpoints: rejects with the same 401 or 403 as
+/// every other access failure when the caller is not a server admin. Place it
+/// after any path extractor and before the body.
+pub struct AdminOnly;
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for AdminOnly {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        st: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let principal = st.principal(&parts.headers);
+        if principal.admin {
+            Ok(AdminOnly)
+        } else {
+            Err(access_denied(&principal))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DbAccess {
     Member,
