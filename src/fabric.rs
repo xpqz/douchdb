@@ -1,12 +1,13 @@
 //! Cluster coordination: shard-map routing, replica selection, quorum
 //! reads/writes and internal node calls.
 
-use crate::api::{doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, num, AppState};
+use crate::api::{doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, num};
 use crate::cluster_http::{
     forward_client_auth, internal_request, internal_request_raw, peer_url, percent_encode,
     ClusterCtx,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::state::AppState;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;

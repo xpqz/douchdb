@@ -24,6 +24,7 @@ pub mod rev;
 pub mod revtree;
 pub mod search;
 pub mod server;
+pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod ui;

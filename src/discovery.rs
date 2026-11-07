@@ -5,8 +5,8 @@
 //! records nodes that are visible on the network but absent from the placement
 //! list. That lets the console show drift without silently changing routing.
 
-use crate::api::AppState;
 use crate::cluster_state::{now_ms, NodeProbe};
+use crate::state::AppState;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -185,10 +185,10 @@ pub fn spawn(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::Config;
     use crate::auth::Auth;
     use crate::cluster::Cluster;
     use crate::cluster_http::ClusterCtx;
+    use crate::state::Config;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::get;

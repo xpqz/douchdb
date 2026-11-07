@@ -3,12 +3,14 @@
 
 use crate::auth::Principal;
 use crate::cluster::ShardMap;
-use crate::cluster_http::{forward_client_auth, internal_request, peer_url, ClusterCtx};
+use crate::cluster_http::{forward_client_auth, internal_request, peer_url};
 use crate::db::{
     attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError,
-    ChangeFilter, ChangesOpts, Db, DbConfig, DbResult, DocOpts,
+    ChangeFilter, ChangesOpts, Db, DbResult, DocOpts,
 };
 use crate::fabric::*;
+use crate::state::{illegal_db_name, valid_db_name};
+pub use crate::state::{AppState, Config, DbUpdates};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -18,95 +20,7 @@ use futures::StreamExt;
 pub use observability::{health_public, health_status, metrics_status};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
-
-#[derive(Default)]
-pub struct DbUpdates {
-    seq: AtomicU64,
-    events: Mutex<Vec<Value>>,
-}
-
-impl DbUpdates {
-    pub(crate) fn record(&self, name: &str, kind: &str) {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut events = self
-            .events
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        events.push(json!({
-            "seq": seq.to_string(),
-            "db_name": name,
-            "type": kind,
-        }));
-        if events.len() > 5000 {
-            let excess = events.len() - 5000;
-            events.drain(0..excess);
-        }
-    }
-
-    fn current(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
-    }
-
-    fn since(&self, after: u64) -> (Vec<Value>, u64) {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let results = events
-            .iter()
-            .filter(|event| {
-                event["seq"]
-                    .as_str()
-                    .and_then(|seq| seq.parse::<u64>().ok())
-                    .map(|seq| seq > after)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        (results, self.current())
-    }
-}
-
-pub struct AppState {
-    pub root: PathBuf,
-    pub dbs: RwLock<HashMap<String, Arc<Db>>>,
-    /// One lock per database name. Open, create and drop of a name run one at
-    /// a time, so a name is never opened twice (the second open would fail on
-    /// the LevelDB lock) and a drop cannot interleave with a create or open.
-    pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    pub config: Config,
-    pub ctx: ClusterCtx,
-    pub db_updates: DbUpdates,
-    pub cluster_state: Arc<crate::cluster_state::ClusterState>,
-    pub admission: Arc<crate::admission::Admission>,
-    /// Bound concurrent `_compact` requests across databases on this node.
-    pub compaction: Arc<tokio::sync::Semaphore>,
-    /// Recent result of the health check's blocking filesystem probe.
-    pub fs_health: observability::FsHealthCache,
-}
-
-#[derive(Clone)]
-pub struct Config {
-    pub q: u32,
-    pub revs_limit: u64,
-    pub sync_secs: u64,
-    /// Additional peers probed for membership discovery.
-    pub seeds: Vec<String>,
-    /// The URL this node advertises in cluster management views.
-    pub advertise: String,
-    /// Empty disables CORS. `*` allows any origin (echoed back so credentials
-    /// work); entries may be exact origins or `https://*.example.com`.
-    pub cors_origins: Vec<String>,
-    pub view_timeout_ms: u64,
-    pub view_memory_mb: usize,
-    /// When true, a database with an empty `_security` object is admin-only.
-    /// This is the default whenever authentication is configured.
-    pub default_admin_only: bool,
-}
+use std::sync::Arc;
 
 /// A request against one database, as `db_rest` hands it to a handler.
 #[derive(Clone, Copy)]
@@ -385,173 +299,6 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for DbName {
         };
         raw.map(|segment| DbName(percent_decode(segment)))
             .ok_or_else(|| fail(ApiError::bad_request("missing database name")))
-    }
-}
-
-/// CouchDB's answer to creating a database with an illegal name.
-fn illegal_db_name(name: &str) -> ApiError {
-    ApiError::new(
-        400,
-        "illegal_database_name",
-        format!(
-            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
-             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
-        ),
-    )
-}
-
-fn valid_db_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('_')
-        && !name.starts_with('/')
-        && !name.ends_with('/')
-        && !name.contains("//")
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
-        })
-}
-
-// ---------------------------------------------------------------------------
-// state
-
-impl AppState {
-    fn name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .db_locks
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        locks.entry(name.to_string()).or_default().clone()
-    }
-
-    pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
-        if !valid_db_name(name) {
-            return Err(ApiError::not_found("Database does not exist."));
-        }
-        if let Some(db) = self.dbs.read().await.get(name) {
-            return Ok(db.clone());
-        }
-        if !Db::exists(&self.root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
-        }
-        // Concurrent first requests for one name share a single open, and a
-        // drop that won the race leaves nothing to open.
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
-        if let Some(db) = self.dbs.read().await.get(name) {
-            return Ok(db.clone());
-        }
-        let db = Arc::new(Db::open_existing(
-            &self.root,
-            name,
-            DbConfig {
-                q: self.config.q,
-                revs_limit: self.config.revs_limit,
-                shard_map: self.ctx.cluster.shard_map(self.config.q),
-                partitioned: false,
-            },
-        )?);
-        self.dbs.write().await.insert(name.to_string(), db.clone());
-        Ok(db)
-    }
-
-    /// Create a database with `q` shards and `n` copies of each; `None`
-    /// takes the node's configured default.
-    pub async fn create_db(
-        &self,
-        name: &str,
-        partitioned: bool,
-        q: Option<u32>,
-        n: Option<usize>,
-    ) -> DbResult<Arc<Db>> {
-        if !valid_db_name(name) {
-            return Err(illegal_db_name(name));
-        }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
-        crate::view::forget_db(&crate::db::db_path(&self.root, name));
-        crate::search::forget_db(&crate::db::db_path(&self.root, name));
-        if Db::exists(&self.root, name) {
-            return Err(ApiError::new(
-                412,
-                "file_exists",
-                "The database could not be created, the file already exists.",
-            ));
-        }
-        let db = Arc::new(Db::open(
-            &self.root,
-            name,
-            DbConfig {
-                q: q.unwrap_or(self.config.q),
-                revs_limit: self.config.revs_limit,
-                shard_map: self
-                    .ctx
-                    .cluster
-                    .shard_map_n(q.unwrap_or(self.config.q), n.unwrap_or(self.ctx.cluster.n)),
-                partitioned,
-            },
-        )?);
-        self.dbs.write().await.insert(name.to_string(), db.clone());
-        self.db_updates.record(name, "created");
-        Ok(db)
-    }
-
-    pub async fn drop_db(&self, name: &str) -> DbResult<()> {
-        if !valid_db_name(name) {
-            return Err(ApiError::not_found("Database does not exist."));
-        }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
-        self.dbs.write().await.remove(name);
-        crate::view::forget_db(&crate::db::db_path(&self.root, name));
-        crate::search::forget_db(&crate::db::db_path(&self.root, name));
-        Db::destroy(&self.root, name)?;
-        self.db_updates.record(name, "deleted");
-        Ok(())
-    }
-
-    pub async fn db_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                if entry.path().join("db.json").is_file() {
-                    if let Some(name) = entry
-                        .file_name()
-                        .to_str()
-                        .and_then(crate::db::dir_name_to_db_name)
-                    {
-                        names.push(name);
-                    }
-                }
-            }
-        }
-        names.sort();
-        names
-    }
-
-    /// The caller's principal. With no auth configured every request is a
-    /// service admin, preserving the single-user default. Internal cluster
-    /// requests without user credentials are service admins; peers are trusted
-    /// by the shared cluster secret.
-    pub fn principal(&self, headers: &HeaderMap) -> Principal {
-        let Some(auth) = &self.ctx.auth else {
-            return Principal::service_admin();
-        };
-        let principal = auth.principal(headers);
-        if principal.is_authenticated() {
-            return principal;
-        }
-        if self.ctx.cluster.is_internal(headers) || self.ctx.cluster.is_internal_db(headers) {
-            return Principal::service_admin();
-        }
-        principal
-    }
-
-    fn authorized(&self, headers: &HeaderMap) -> bool {
-        self.principal(headers).is_authenticated()
     }
 }
 
