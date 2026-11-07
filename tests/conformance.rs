@@ -4202,6 +4202,59 @@ async fn session_secret_flag_signs_cookies() {
     assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
 }
 
+/// A cookie is signed with the session secret plus the user's credential
+/// digest (CouchDB mixes the user salt into its cookie HMAC key), so rotating
+/// a token in the users file revokes that user's sessions at once.
+#[tokio::test]
+async fn rotating_a_user_token_revokes_existing_sessions() {
+    let users = UsersFile::new(USERS);
+    let mut s = Server::start_with(&users_server_args(&users), true);
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-token"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cookie = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &cookie).await, StatusCode::OK);
+
+    // Same name and roles, new token.
+    std::fs::write(&users.path, USERS.replace("alice-token", "alice-rotated")).unwrap();
+    s.restart();
+    assert_eq!(
+        status_with_cookie(&s, &cookie).await,
+        StatusCode::UNAUTHORIZED,
+        "the old cookie must not outlive the old token"
+    );
+    // The new token logs in and its cookie works.
+    let (status, headers, body) = s
+        .req_headers(
+            Method::POST,
+            "/_session",
+            Some(json!({"name": "alice", "password": "alice-rotated"})),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let fresh = headers
+        .get("set-cookie")
+        .expect("session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(status_with_cookie(&s, &fresh).await, StatusCode::OK);
+}
+
 /// Without `--session-secret` the server generates a random key once, keeps it
 /// in the data directory (owner-only) and reuses it after a restart.
 #[tokio::test]
