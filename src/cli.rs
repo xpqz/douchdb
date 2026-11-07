@@ -429,6 +429,23 @@ mod tests {
     }
 
     #[test]
+    fn admin_can_come_from_the_environment() {
+        let env = |name: &str| (name == "DOUCHDB_ADMIN").then(|| OsString::from("a:b"));
+        let args = parse_from(Vec::new(), env).unwrap().unwrap();
+        assert_eq!(args.admin, Some(("a".to_string(), "b".to_string())));
+        // The flag wins over the environment.
+        let argv = vec!["--admin".to_string(), "c:d".to_string()];
+        let args = parse_from(argv, env).unwrap().unwrap();
+        assert_eq!(args.admin, Some(("c".to_string(), "d".to_string())));
+        // A malformed value stops startup instead of disabling authentication.
+        let bad = |name: &str| (name == "DOUCHDB_ADMIN").then(|| OsString::from("nopassword"));
+        match parse_from(Vec::new(), bad) {
+            Err(message) => assert!(message.contains("DOUCHDB_ADMIN"), "{message}"),
+            Ok(_) => panic!("malformed DOUCHDB_ADMIN accepted"),
+        }
+    }
+
+    #[test]
     fn unknown_arguments_are_rejected() {
         assert!(error(&["--bogus"]).contains("--bogus"));
     }
