@@ -1087,6 +1087,14 @@ fn registry() -> &'static StdMutex<IndexMap> {
     INDEXES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+fn open_indexes_under(db_path: &Path) -> usize {
+    registry_lock()
+        .keys()
+        .filter(|path| path.starts_with(db_path))
+        .count()
+}
+
 fn registry_lock() -> std::sync::MutexGuard<'static, IndexMap> {
     // A panic in an unrelated request must not poison every later view query.
     registry()
@@ -4355,6 +4363,47 @@ mod tests {
             assert_eq!(restored[1].key, json!("Paris"));
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every view ever queried used to keep its LevelDB handle and cached rows
+    /// until the database was deleted. The registry must stay at the cap.
+    #[tokio::test]
+    async fn open_view_indexes_stay_within_the_cap() {
+        crate::index_cache::set_max_open(8);
+        let root = std::env::temp_dir().join(format!("douchdb-cap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "cap",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        for n in 0..40 {
+            let spec = ViewSpec {
+                map: format!("function(doc) {{ emit(doc.n + {n}, null); }}"),
+                reduce: None,
+                partitioned: false,
+            };
+            let result = query_with_spec(&db, "_design/d", &format!("v{n}"), &spec, &query)
+                .await
+                .unwrap();
+            assert_eq!(result["rows"][0]["key"], json!(1 + n));
+        }
+        let open = open_indexes_under(&db.path);
+        assert!(open <= 8, "{open} view indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

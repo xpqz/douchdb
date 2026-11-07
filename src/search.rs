@@ -1571,6 +1571,54 @@ mod tests {
         assert!(!value_in_range(&value, "é[a TO z]"));
     }
 
+    /// Every index ever searched used to stay open, with all its stored
+    /// documents, until the database was deleted.
+    #[tokio::test]
+    async fn open_search_indexes_stay_within_the_cap() {
+        crate::index_cache::set_max_open(8);
+        let root = std::env::temp_dir().join(format!("douchdb-search-cap-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "searchcap",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "name": "apple"})], true)
+            .await
+            .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        for n in 0..20 {
+            let ddoc = format!("_design/s{n}");
+            db.put_docs(
+                vec![json!({"_id": ddoc, "indexes": {"idx": {
+                    "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}})],
+                true,
+            )
+            .await
+            .unwrap();
+            let request = SearchRequest {
+                query: "name:apple".to_string(),
+                limit: 10,
+                ..SearchRequest::default()
+            };
+            let result = query(&db, &ddoc, "idx", &request, limits).await.unwrap();
+            assert_eq!(result["total_rows"], 1, "{result}");
+        }
+        let prefix = db.path.join("_search_indexes");
+        let open = registry()
+            .keys()
+            .filter(|path| path.starts_with(&prefix))
+            .count();
+        assert!(open <= 8, "{open} search indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_after_each_write() {
         let root = std::env::temp_dir().join(format!(
