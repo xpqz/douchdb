@@ -359,11 +359,13 @@ the bulk of the growth.
   filesystem confinement is Linux-only; use the portable `--js-sandbox wasm`
   engine on other hosts that need a hard boundary.
 * **Storage-cache teardown.** `rusty-leveldb` 4.0.2 is vendored with the
-  UB-free circular LRU from upstream PR #69, duplicate-key eviction and
-  cache-invariant tests after a recursive cache-drop stack overflow on Linux
-  ARM64 bulk imports; see `vendor/rusty-leveldb/PATCHES.md`. This is a
-  temporary vendored dependency: the decision and removal checklist are in
-  `docs/storage-dependency.md`, tracked by issue #105.
+  UB-free circular LRU from upstream PR #69 plus our own fixes (duplicate-key
+  eviction, propagated table errors, footer and filter-block checks, bloom off,
+  the neighbouring-tombstone deletion fix) after a recursive cache-drop stack
+  overflow on Linux ARM64 bulk imports. Each patch has its own upstreamed? gate
+  in `vendor/rusty-leveldb/PATCHES.md`; PR #69 alone does not retire the fork.
+  This is a temporary vendored dependency: the decision and removal checklist
+  are in `docs/storage-dependency.md`, tracked by issue #105.
 * **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
   ~27 s. More shards or an observable `compact_running` flag plus off-path
   scheduling remain options; `_compact` maps to `compact_range` and returns
