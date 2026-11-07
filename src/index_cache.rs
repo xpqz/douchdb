@@ -153,6 +153,7 @@ impl<V: Slot> Registry<V> {
     }
 
     /// Forget the entry for `key`.
+    #[cfg(test)]
     pub fn remove(&self, key: &Path) {
         self.retain(|path| path != key);
     }

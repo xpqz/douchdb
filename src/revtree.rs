@@ -125,16 +125,12 @@ impl RevTree {
         self.edges.contains_key(rev)
     }
 
-    /// The number of revisions in the tree.
-    pub fn len(&self) -> usize {
-        self.edges.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.edges.is_empty()
     }
 
     /// Every known revision, in string order.
+    #[cfg(test)]
     pub fn revs(&self) -> impl Iterator<Item = &String> {
         self.edges.keys()
     }

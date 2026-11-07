@@ -431,7 +431,7 @@ pub(super) async fn view_request(
         } else if flag(q, "owner_only") {
             query.owner_shards = Some(
                 (0..db.q)
-                    .map(|shard| owner_of_shard(db, shard) == st.ctx.cluster.me)
+                    .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
                     .collect(),
             );
         }

@@ -352,6 +352,7 @@ pub fn record_corrupt_record_skipped() {
 }
 
 /// Corrupt stored records skipped so far by listings and scans.
+#[cfg(test)]
 pub fn corrupt_records_skipped() -> u64 {
     state().corrupt_records_skipped
 }

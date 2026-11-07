@@ -3768,7 +3768,7 @@ mod tests {
             .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
             .await
             .unwrap();
-        assert_eq!(meta.tree.len(), 2);
+        assert_eq!(meta.tree.revs().count(), 2);
         let kept: Vec<&String> = meta.atts.keys().collect();
         let tree: Vec<&String> = meta.tree.revs().collect();
         assert_eq!(kept, tree, "atts only for revisions still in the tree");
