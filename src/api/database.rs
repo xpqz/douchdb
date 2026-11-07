@@ -18,257 +18,32 @@ pub async fn db_root(
     }
     let q = query(&uri);
     let principal = st.principal(&headers);
-
     let local_only = st.ctx.cluster.is_internal_db(&headers);
+    if matches!(method, Method::PUT | Method::DELETE) && !principal.admin {
+        return access_denied(&principal);
+    }
     match method {
-        Method::PUT => {
-            if !principal.admin {
-                return access_denied(&principal);
-            }
-            let partitioned = flag(&q, "partitioned");
-            let positive = |param: &str| -> Result<Option<usize>, ApiError> {
-                match q.get(param) {
-                    None => Ok(None),
-                    Some(raw) => raw
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|value| *value > 0)
-                        .map(Some)
-                        .ok_or_else(|| {
-                            ApiError::bad_request(format!("`{param}` must be a positive integer"))
-                        }),
-                }
-            };
-            let (shards, copies) = match (positive("q"), positive("n")) {
-                (Ok(shards), Ok(copies)) => (shards.map(|q| q as u32), copies),
-                (Err(e), _) | (_, Err(e)) => return fail(e),
-            };
-            // A database that already exists here is not the end of a clustered
-            // create: the peers may have missed it, so they still get the call
-            // (CouchDB heals that by replicating the shard map) and the client
-            // is told 412 as before.
-            let existing = match st.create_db(&name, partitioned, shards, copies).await {
-                Ok(_) => None,
-                Err(e) if e.status == 412 && st.ctx.cluster.is_clustered() && !local_only => {
-                    Some(e)
-                }
-                Err(e) => return fail(e),
-            };
-            let mut status = StatusCode::CREATED;
-            if st.ctx.cluster.is_clustered() && !local_only {
-                // Peers build the same shard map from the same layout.
-                let mut layout = vec![("partitioned", partitioned.to_string())];
-                if let Some(shards) = shards {
-                    layout.push(("q", shards.to_string()));
-                }
-                if let Some(copies) = copies {
-                    layout.push(("n", copies.to_string()));
-                }
-                let answers = fan_out_db(&st, &headers, Method::PUT, &name, &layout).await;
-                if let Some(e) = existing {
-                    return fail(e);
-                }
-                // As fabric_db_create: 201 once a majority of the nodes hold
-                // the database (a peer that already had it counts), otherwise
-                // 202. The local node is one of them.
-                let held = 1 + answers
-                    .iter()
-                    .flatten()
-                    .filter(|status| {
-                        status.is_success() || **status == StatusCode::PRECONDITION_FAILED
-                    })
-                    .count();
-                if held < st.ctx.cluster.nodes.len() / 2 + 1 {
-                    status = StatusCode::ACCEPTED;
-                }
-            }
-            let mut response = json(status, json!({"ok": true}));
-            if let Ok(value) = format!("/{name}").parse() {
-                response.headers_mut().insert(header::LOCATION, value);
-            }
-            response
-        }
-        Method::DELETE => {
-            if !principal.admin {
-                return access_denied(&principal);
-            }
-            let local = st.drop_db(&name).await;
-            if !st.ctx.cluster.is_clustered() || local_only {
-                return match local {
-                    Ok(()) => ok(),
-                    Err(e) => fail(e),
-                };
-            }
-            let answers = fan_out_db(&st, &headers, Method::DELETE, &name, &[]).await;
-            // As fabric_db_delete: 200 when every node answered (deleted or
-            // not found) and at least one deleted it, 404 when every node
-            // answered not found, 202 when some deleted it but a node did not
-            // answer, 500 when none did.
-            let mut deleted = usize::from(local.is_ok());
-            let mut missing = usize::from(matches!(&local, Err(e) if e.status == 404));
-            for status in answers.iter().flatten() {
-                if status.is_success() {
-                    deleted += 1;
-                } else if *status == StatusCode::NOT_FOUND {
-                    missing += 1;
-                }
-            }
-            if deleted + missing == st.ctx.cluster.nodes.len() {
-                if deleted == 0 {
-                    return fail(local.err().unwrap_or_else(|| {
-                        ApiError::not_found(format!("Database does not exist: {name}"))
-                    }));
-                }
-                ok()
-            } else if deleted > 0 {
-                json(StatusCode::ACCEPTED, json!({"ok": true}))
-            } else {
-                fail(ApiError::new(
-                    500,
-                    "internal_server_error",
-                    "no node confirmed the delete",
-                ))
-            }
-        }
-        Method::GET | Method::HEAD => match st.db(&name).await {
-            Ok(db) => {
-                if let Some(response) = require_db_access(&st, &principal, &db, false) {
-                    return response;
-                }
-                if is_forwarded(&st, &headers)
-                    && headers
-                        .get("x-douchdb-update-seq")
-                        .and_then(|value| value.to_str().ok())
-                        == Some("1")
-                {
-                    return json(StatusCode::OK, json!({"update_seq": db.update_seq()}));
-                }
-                match db.info().await {
-                    Ok(mut info) => {
-                        // In a cluster the update_seq is the same version vector
-                        // the changes feed returns, so clients that use it as
-                        // `since` do not skip another node's changes.
-                        if st.ctx.cluster.is_clustered() && !is_forwarded(&st, &headers) {
-                            let (vector, marks) = match cluster_update_vector(ClusterRead {
-                                ctx: &st.ctx,
-                                db: &db,
-                                dbname: &name,
-                                headers: &headers,
-                            })
-                            .await
-                            {
-                                Ok(token) => token,
-                                Err(e) => return fail(e),
-                            };
-                            let seq = encode_token(&vector, &marks);
-                            info["update_seq"] = json!(seq);
-                            info["committed_update_seq"] = json!(seq);
-                        }
-                        json(StatusCode::OK, info)
-                    }
-                    Err(e) => fail(e),
-                }
-            }
-            Err(e) => fail(e),
-        },
-        Method::POST => {
-            // Create a document with a server-generated id.
+        Method::PUT => create_db(&st, &name, &q, &headers, local_only).await,
+        Method::DELETE => delete_db(&st, &name, &headers, local_only).await,
+        Method::GET | Method::HEAD | Method::POST => {
             let db = match st.db(&name).await {
                 Ok(db) => db,
                 Err(e) => return fail(e),
             };
-            if let Some(response) = require_db_access(&st, &principal, &db, false) {
-                return response;
-            }
-            if let Some(response) = reject_during_rebalance(&st, &db, &Method::POST, "", &headers) {
-                return response;
-            }
-            // CouchDB reads the body as JSON first; an empty one is as
-            // invalid as garbage.
-            let Ok(mut doc) = crate::json::from_slice(&body) else {
-                return fail(ApiError::bad_request("invalid UTF-8 JSON"));
+            let req = DbRequest {
+                st: &st,
+                db: &db,
+                name: &name,
+                method: &method,
+                uri: &uri,
+                q: &q,
+                headers: &headers,
+                body: &body,
             };
-            if let Err(e) = validate_doc(&doc) {
-                return fail(e);
-            }
-            if let Err(e) = validate_design_doc(&doc) {
-                return fail(e);
-            }
-            if doc.get("_id").is_none() {
-                doc["_id"] = json!(crate::util::uuid());
-            }
-            let id = match doc.get("_id") {
-                Some(Value::String(id)) if !id.is_empty() => id.clone(),
-                Some(Value::String(_)) => {
-                    return fail(ApiError::new(
-                        400,
-                        "illegal_docid",
-                        "Document id must not be empty",
-                    ))
-                }
-                Some(_) => {
-                    return fail(ApiError::new(
-                        400,
-                        "illegal_docid",
-                        "Document id must be a string",
-                    ))
-                }
-                None => unreachable!("id generated above"),
-            };
-            if let Err(e) = db.validate_doc_id(&id) {
-                return fail(e);
-            }
-            if let Some(response) =
-                require_design_admin(&st, &db, &headers, std::slice::from_ref(&doc))
-            {
-                return response;
-            }
-            if id.starts_with("_local/") {
-                // Local documents bypass the shard path and validation, as
-                // with `PUT /{db}/_local/{id}`.
-                let local = id.strip_prefix("_local/").unwrap_or(&id);
-                return match db.local_put(local, doc).await {
-                    Ok(v) => json(StatusCode::CREATED, v),
-                    Err(e) => fail(e),
-                };
-            }
-            if let Some(response) = validate_write(&st, &db, &name, &mut doc, &headers).await {
-                return response;
-            }
-            // `commit_docs` routes the generated id to every replica in its
-            // shard set, so a dead primary does not lose the document.
-            match commit_docs(
-                &st,
-                &db,
-                &name,
-                vec![doc],
-                true,
-                num(&q, "w").unwrap_or(0),
-                &headers,
-            )
-            .await
-            {
-                Ok((mut results, quorum)) => {
-                    let mut result = results.pop().unwrap_or(Value::Null);
-                    if result.get("error").is_some() {
-                        if let Some(object) = result.as_object_mut() {
-                            object.remove("id");
-                        }
-                        return json(doc_error_status(&result), result);
-                    }
-                    if q.get("batch").map(String::as_str) == Some("ok") {
-                        return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
-                    }
-                    json(
-                        if quorum {
-                            StatusCode::CREATED
-                        } else {
-                            StatusCode::ACCEPTED
-                        },
-                        result,
-                    )
-                }
-                Err(e) => fail(e),
+            if method == Method::POST {
+                create_doc(req, &principal).await
+            } else {
+                db_info(req, &principal).await
             }
         }
         _ => fail(ApiError::new(
@@ -276,6 +51,266 @@ pub async fn db_root(
             "method_not_allowed",
             "method not allowed",
         )),
+    }
+}
+
+/// `PUT /{db}`.
+async fn create_db(
+    st: &AppState,
+    name: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+    local_only: bool,
+) -> Response {
+    let partitioned = flag(q, "partitioned");
+    let positive = |param: &str| -> Result<Option<usize>, ApiError> {
+        match q.get(param) {
+            None => Ok(None),
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!("`{param}` must be a positive integer"))
+                }),
+        }
+    };
+    let (shards, copies) = match (positive("q"), positive("n")) {
+        (Ok(shards), Ok(copies)) => (shards.map(|q| q as u32), copies),
+        (Err(e), _) | (_, Err(e)) => return fail(e),
+    };
+    // A database that already exists here is not the end of a clustered
+    // create: the peers may have missed it, so they still get the call
+    // (CouchDB heals that by replicating the shard map) and the client
+    // is told 412 as before.
+    let existing = match st.create_db(name, partitioned, shards, copies).await {
+        Ok(_) => None,
+        Err(e) if e.status == 412 && st.ctx.cluster.is_clustered() && !local_only => Some(e),
+        Err(e) => return fail(e),
+    };
+    let mut status = StatusCode::CREATED;
+    if st.ctx.cluster.is_clustered() && !local_only {
+        // Peers build the same shard map from the same layout.
+        let mut layout = vec![("partitioned", partitioned.to_string())];
+        if let Some(shards) = shards {
+            layout.push(("q", shards.to_string()));
+        }
+        if let Some(copies) = copies {
+            layout.push(("n", copies.to_string()));
+        }
+        let answers = fan_out_db(st, headers, Method::PUT, name, &layout).await;
+        if let Some(e) = existing {
+            return fail(e);
+        }
+        // As fabric_db_create: 201 once a majority of the nodes hold
+        // the database (a peer that already had it counts), otherwise
+        // 202. The local node is one of them.
+        let held = 1 + answers
+            .iter()
+            .flatten()
+            .filter(|status| status.is_success() || **status == StatusCode::PRECONDITION_FAILED)
+            .count();
+        if held < st.ctx.cluster.nodes.len() / 2 + 1 {
+            status = StatusCode::ACCEPTED;
+        }
+    }
+    let mut response = json(status, json!({"ok": true}));
+    if let Ok(value) = format!("/{name}").parse() {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
+}
+
+/// `DELETE /{db}`.
+async fn delete_db(st: &AppState, name: &str, headers: &HeaderMap, local_only: bool) -> Response {
+    let local = st.drop_db(name).await;
+    if !st.ctx.cluster.is_clustered() || local_only {
+        return match local {
+            Ok(()) => ok(),
+            Err(e) => fail(e),
+        };
+    }
+    let answers = fan_out_db(st, headers, Method::DELETE, name, &[]).await;
+    // As fabric_db_delete: 200 when every node answered (deleted or
+    // not found) and at least one deleted it, 404 when every node
+    // answered not found, 202 when some deleted it but a node did not
+    // answer, 500 when none did.
+    let mut deleted = usize::from(local.is_ok());
+    let mut missing = usize::from(matches!(&local, Err(e) if e.status == 404));
+    for status in answers.iter().flatten() {
+        if status.is_success() {
+            deleted += 1;
+        } else if *status == StatusCode::NOT_FOUND {
+            missing += 1;
+        }
+    }
+    if deleted + missing == st.ctx.cluster.nodes.len() {
+        if deleted == 0 {
+            return fail(local.err().unwrap_or_else(|| {
+                ApiError::not_found(format!("Database does not exist: {name}"))
+            }));
+        }
+        ok()
+    } else if deleted > 0 {
+        json(StatusCode::ACCEPTED, json!({"ok": true}))
+    } else {
+        fail(ApiError::new(
+            500,
+            "internal_server_error",
+            "no node confirmed the delete",
+        ))
+    }
+}
+
+/// `GET /{db}`.
+async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name,
+        headers,
+        ..
+    } = req;
+    if let Some(response) = require_db_access(st, principal, db, false) {
+        return response;
+    }
+    if is_forwarded(st, headers)
+        && headers
+            .get("x-douchdb-update-seq")
+            .and_then(|value| value.to_str().ok())
+            == Some("1")
+    {
+        return json(StatusCode::OK, json!({"update_seq": db.update_seq()}));
+    }
+    match db.info().await {
+        Ok(mut info) => {
+            // In a cluster the update_seq is the same version vector
+            // the changes feed returns, so clients that use it as
+            // `since` do not skip another node's changes.
+            if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+                let (vector, marks) = match cluster_update_vector(ClusterRead {
+                    ctx: &st.ctx,
+                    db,
+                    dbname: name,
+                    headers,
+                })
+                .await
+                {
+                    Ok(token) => token,
+                    Err(e) => return fail(e),
+                };
+                let seq = encode_token(&vector, &marks);
+                info["update_seq"] = json!(seq);
+                info["committed_update_seq"] = json!(seq);
+            }
+            json(StatusCode::OK, info)
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// `POST /{db}`: create a document with a server-generated id.
+async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name,
+        q,
+        headers,
+        body,
+        ..
+    } = req;
+    if let Some(response) = require_db_access(st, principal, db, false) {
+        return response;
+    }
+    if let Some(response) = reject_during_rebalance(st, db, &Method::POST, "", headers) {
+        return response;
+    }
+    // CouchDB reads the body as JSON first; an empty one is as
+    // invalid as garbage.
+    let Ok(mut doc) = crate::json::from_slice(body) else {
+        return fail(ApiError::bad_request("invalid UTF-8 JSON"));
+    };
+    if let Err(e) = validate_doc(&doc) {
+        return fail(e);
+    }
+    if let Err(e) = validate_design_doc(&doc) {
+        return fail(e);
+    }
+    if doc.get("_id").is_none() {
+        doc["_id"] = json!(crate::util::uuid());
+    }
+    let id = match doc.get("_id") {
+        Some(Value::String(id)) if !id.is_empty() => id.clone(),
+        Some(Value::String(_)) => {
+            return fail(ApiError::new(
+                400,
+                "illegal_docid",
+                "Document id must not be empty",
+            ))
+        }
+        Some(_) => {
+            return fail(ApiError::new(
+                400,
+                "illegal_docid",
+                "Document id must be a string",
+            ))
+        }
+        None => unreachable!("id generated above"),
+    };
+    if let Err(e) = db.validate_doc_id(&id) {
+        return fail(e);
+    }
+    if let Some(response) = require_design_admin(st, db, headers, std::slice::from_ref(&doc)) {
+        return response;
+    }
+    if id.starts_with("_local/") {
+        // Local documents bypass the shard path and validation, as
+        // with `PUT /{db}/_local/{id}`.
+        let local = id.strip_prefix("_local/").unwrap_or(&id);
+        return match db.local_put(local, doc).await {
+            Ok(v) => json(StatusCode::CREATED, v),
+            Err(e) => fail(e),
+        };
+    }
+    if let Some(response) = validate_write(st, db, name, &mut doc, headers).await {
+        return response;
+    }
+    // `commit_docs` routes the generated id to every replica in its
+    // shard set, so a dead primary does not lose the document.
+    match commit_docs(
+        st,
+        db,
+        name,
+        vec![doc],
+        true,
+        num(q, "w").unwrap_or(0),
+        headers,
+    )
+    .await
+    {
+        Ok((mut results, quorum)) => {
+            let mut result = results.pop().unwrap_or(Value::Null);
+            if result.get("error").is_some() {
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("id");
+                }
+                return json(doc_error_status(&result), result);
+            }
+            if q.get("batch").map(String::as_str) == Some("ok") {
+                return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
+            }
+            json(
+                if quorum {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                result,
+            )
+        }
+        Err(e) => fail(e),
     }
 }
 
