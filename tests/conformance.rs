@@ -4208,6 +4208,26 @@ async fn session_secret_flag_signs_cookies() {
     assert_eq!(status_with_cookie(&s, &bad).await, StatusCode::UNAUTHORIZED);
 }
 
+/// One malformed `AuthSession` cookie must not hide a valid one that follows.
+#[tokio::test]
+async fn malformed_session_cookie_does_not_hide_a_valid_one() {
+    let secret = "an-explicit-session-secret";
+    let s = Server::start_with(&["--session-secret".to_string(), secret.to_string()], true);
+    let good = forged_cookie(secret.as_bytes(), "douchdb", "admin");
+    for junk in [
+        "AuthSession=!!!.!!!",
+        "AuthSession=%%%",
+        "AuthSession=Zm9v.!!!",
+    ] {
+        let both = format!("{junk}; {good}");
+        assert_eq!(status_with_cookie(&s, &both).await, StatusCode::OK, "{both}");
+    }
+    assert_eq!(
+        status_with_cookie(&s, "AuthSession=!!!.!!!").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 /// A cookie is signed with the session secret plus the user's credential
 /// digest (CouchDB mixes the user salt into its cookie HMAC key), so rotating
 /// a token in the users file revokes that user's sessions at once.
