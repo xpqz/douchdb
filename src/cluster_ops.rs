@@ -1,7 +1,7 @@
 //! Cluster-wide metadata changes coordinated from one node: shard-map
 //! updates, rebalance and security-object propagation.
 
-use crate::api::{internal_request, is_forwarded, AppState};
+use crate::api::{internal_request, AppState};
 use crate::cluster::ShardMap;
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
@@ -24,7 +24,7 @@ pub(crate) async fn set_security_everywhere(
     headers: &HeaderMap,
 ) -> DbResult<bool> {
     let version = db.set_security(value.clone())?;
-    if !st.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !st.cluster.is_clustered() || st.cluster.is_internal(headers) {
         return Ok(true);
     }
     let envelope = json!({"version": version, "security": value});
@@ -70,7 +70,7 @@ pub(crate) async fn apply_shard_map(
             "shard map does not match database q or cluster node count",
         ));
     }
-    let internal = is_forwarded(st, headers);
+    let internal = st.cluster.is_internal(headers);
     if internal {
         if !db.set_shard_map(map.clone())? {
             return Err(shard_map_rejected());

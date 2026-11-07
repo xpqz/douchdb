@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod cluster;
+pub mod cluster_http;
 pub mod cluster_ops;
 pub mod cluster_state;
 pub mod db;

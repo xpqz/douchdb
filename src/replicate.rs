@@ -1,8 +1,9 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
-use crate::api::{internal_request_raw, AppState};
+use crate::api::AppState;
 use crate::auth::Auth;
 use crate::cluster::Cluster;
+use crate::cluster_http::internal_request_raw;
 use crate::db::Db;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;

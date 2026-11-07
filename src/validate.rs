@@ -30,7 +30,7 @@ pub(crate) async fn validation_functions(
     dbname: &str,
     headers: &HeaderMap,
 ) -> DbResult<Vec<String>> {
-    if !st.cluster.is_clustered() || crate::api::is_forwarded(st, headers) {
+    if !st.cluster.is_clustered() || st.cluster.is_internal(headers) {
         return db.validation_functions().await;
     }
     if let Some(functions) = db.cached_cluster_validators(CLUSTER_VALIDATORS_TTL) {

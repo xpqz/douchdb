@@ -2,9 +2,9 @@
 //! reads/writes and internal node calls.
 
 use crate::api::{
-    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, forward_client_auth,
-    internal_request, internal_request_raw, num, peer_url, percent_encode, AppState,
+    doc_ids_from, doc_opts, doc_response, etag_matches, fail, flag, internal_request, num, AppState,
 };
+use crate::cluster_http::{forward_client_auth, internal_request_raw, peer_url, percent_encode};
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -649,7 +649,7 @@ pub(crate) async fn commit_docs(
     // under the gate closes the window between the request-entry check and
     // acquiring it.
     let gate = Arc::new(db.write_guard().await);
-    if db.rebalance_in_progress() && !crate::api::is_forwarded(st, headers) {
+    if db.rebalance_in_progress() && !st.cluster.is_internal(headers) {
         return Err(ApiError::new(
             503,
             "rebalance_in_progress",
