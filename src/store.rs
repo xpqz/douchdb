@@ -302,6 +302,11 @@ pub struct Shard {
     /// `_all_docs` range query and then maintained in memory. Keeping this out
     /// of LevelDB avoids an extra write per ingested document.
     live: Option<BTreeMap<String, LiveDoc>>,
+    /// The last `live_rank` answer: how many live ids sort before this key.
+    /// Paging `_all_docs` by `startkey` asks for nearby keys, so the next rank
+    /// is found by counting only the ids between the two keys. Kept in step
+    /// with `live` on every write and dropped whenever `live` is.
+    rank_cursor: Option<(String, usize)>,
     /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
@@ -496,6 +501,7 @@ impl Shard {
             docs,
             deleted,
             live: None,
+            rank_cursor: None,
             latest: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
@@ -677,8 +683,39 @@ impl Shard {
                 true
             })?;
             self.live = Some(live);
+            self.rank_cursor = None;
         }
         Ok(self.live.as_ref().expect("live index initialized"))
+    }
+
+    /// How many live documents have an id below `key`. Counts from the
+    /// previous call's key when there is one, so walking through the keys in
+    /// either direction costs the distance moved, not the position.
+    pub fn live_rank(&mut self, key: &str) -> Result<usize> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.live_docs()?;
+        let (Some(live), cursor) = (self.live.as_ref(), self.rank_cursor.take()) else {
+            return Ok(0);
+        };
+        let rank = match &cursor {
+            Some((from, rank)) if key == from.as_str() => *rank,
+            Some((from, rank)) if key > from.as_str() => {
+                rank + live
+                    .range::<str, _>((Excluded(from.as_str()), Excluded(key)))
+                    .count()
+                    + usize::from(live.contains_key(from.as_str()))
+            }
+            Some((from, rank)) => {
+                rank.saturating_sub(
+                    live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
+                        .count()
+                        + usize::from(live.contains_key(key)),
+                )
+            }
+            None => live.range::<str, _>((Unbounded, Excluded(key))).count(),
+        };
+        self.rank_cursor = Some((key.to_string(), rank));
+        Ok(rank)
     }
 
     /// Each document's latest sequence, built lazily from metadata. Used by
@@ -988,18 +1025,26 @@ impl Shard {
                 }
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = std::str::from_utf8(&key[2..]) {
-                        match new_state {
+                        let (was_live, is_live) = match new_state {
                             Some((rev, true, has_attachments)) => {
-                                live.insert(
+                                let old = live.insert(
                                     id.to_string(),
                                     LiveDoc {
                                         rev,
                                         has_attachments,
                                     },
                                 );
+                                (old.is_some(), true)
                             }
-                            _ => {
-                                live.remove(id);
+                            _ => (live.remove(id).is_some(), false),
+                        };
+                        if let Some((from, rank)) = self.rank_cursor.as_mut() {
+                            if id < from.as_str() && was_live != is_live {
+                                if is_live {
+                                    *rank += 1;
+                                } else {
+                                    *rank = rank.saturating_sub(1);
+                                }
                             }
                         }
                     }
@@ -1050,6 +1095,7 @@ impl Shard {
         self.docs = mark.docs;
         self.deleted = mark.deleted;
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
     }
 
@@ -1107,6 +1153,7 @@ impl Shard {
         self.pending.clear();
         self.overlay.clear();
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
         self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
         self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
@@ -1152,6 +1199,7 @@ impl Shard {
         self.docs = 0;
         self.deleted = 0;
         self.live = None;
+        self.rank_cursor = None;
         self.latest = None;
         self.pending.clear();
         self.overlay.clear();
@@ -1983,6 +2031,40 @@ mod scan_tests {
         tx.put_json(&meta_key("d"), &meta(false, 5)).unwrap();
         shard.commit_at(tx, Some(5)).unwrap();
         assert_eq!(live_ids(&mut shard), ["c", "d"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_rank_follows_the_cursor_through_writes() {
+        let dir = temp_shard_dir("live-rank");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut seq = 0;
+        let mut tx = Tx::new();
+        for id in ["b", "d", "f", "h", "j"] {
+            seq += 1;
+            tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
+        }
+        shard.commit_at(tx, Some(seq)).unwrap();
+        let probes = ["a", "d", "e", "j", "z", "c", "f", "a", "h"];
+        let check = |shard: &mut Shard| {
+            for probe in probes {
+                let expected = live_ids(shard)
+                    .iter()
+                    .filter(|id| id.as_str() < probe)
+                    .count();
+                assert_eq!(shard.live_rank(probe).unwrap(), expected, "rank of {probe}");
+            }
+        };
+        check(&mut shard);
+        // Writes below, at and above the cursor key: insert, delete, update.
+        for (id, deleted) in [("a", false), ("d", true), ("e", false), ("z", false), ("j", true)] {
+            shard.live_rank("f").unwrap();
+            seq += 1;
+            let mut tx = Tx::new();
+            tx.put_json(&meta_key(id), &meta(deleted, seq)).unwrap();
+            shard.commit_at(tx, Some(seq)).unwrap();
+            check(&mut shard);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

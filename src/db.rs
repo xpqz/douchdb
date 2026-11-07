@@ -3081,20 +3081,30 @@ fn collect_all_docs(
     let start = opts.startkey.as_deref();
     let end = opts.endkey.as_deref();
     let mut rows = Vec::new();
+    // Without a partition the rank comes from the shard's cursor, so paging by
+    // `startkey` does not recount every id before it on each request.
+    let ranked = match (start, &opts.partition) {
+        (Some(start), None) => Some(shard.live_rank(start)?),
+        _ => None,
+    };
     let before_start = {
         let live = shard.live_docs()?;
         let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
         let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-        let before_start = match (start, opts.descending) {
-            (Some(start), false) => live
+        let before_start = match (start, opts.descending, ranked) {
+            (Some(start), false, None) => live
                 .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
                 .filter(|(id, _)| in_partition(id))
                 .count(),
-            (Some(start), true) => live
+            (Some(start), true, None) => live
                 .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
                 .filter(|(id, _)| in_partition(id))
                 .count(),
-            (None, _) => 0,
+            (Some(_), false, Some(rank)) => rank,
+            (Some(start), true, Some(rank)) => live
+                .len()
+                .saturating_sub(rank + usize::from(live.contains_key(start))),
+            (None, _, _) => 0,
         };
 
         let empty_range = match (start, end) {
