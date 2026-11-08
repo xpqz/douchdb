@@ -544,9 +544,10 @@ impl Db {
         let shard_map = match stored_map {
             Some(map) if map.node_count == config.shard_map.node_count => map,
             stored => {
-                // A legacy database has no shard map yet, and one stored for a
-                // different cluster size no longer applies: start from the
-                // configured placement and persist it.
+                // A database without a shard map yet (a new one, or one
+                // interrupted before the map was written), and one stored for a
+                // different cluster size, start from the configured placement,
+                // which is then persisted.
                 if stored.is_some() {
                     tracing::warn!(
                         file = %map_path.display(),
