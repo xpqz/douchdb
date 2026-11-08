@@ -19,6 +19,7 @@ pub(crate) mod js;
 #[cfg(feature = "wasmtime")]
 pub(crate) mod js_wasmtime;
 pub(crate) mod json;
+pub(crate) mod listener;
 pub(crate) mod metrics;
 pub(crate) mod params;
 pub(crate) mod replicate;

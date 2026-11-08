@@ -343,6 +343,19 @@ pub fn peer_route(path: &str) -> Option<String> {
 
 /// Add one finished request's peer totals to its route. `route` is always a
 /// `route_label` value, so the label set stays bounded.
+static INTERNAL_HTTP1: AtomicU64 = AtomicU64::new(0);
+static INTERNAL_HTTP2: AtomicU64 = AtomicU64::new(0);
+
+/// Count a request sent by another node, by the protocol it arrived on.
+pub fn record_internal_request(version: axum::http::Version) {
+    let counter = if version == axum::http::Version::HTTP_2 {
+        &INTERNAL_HTTP2
+    } else {
+        &INTERNAL_HTTP1
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_peer(route: &str, internal: bool, calls: u64, rounds: u64, wait_ms: f64) {
     let mut state = state();
     let stat = state.routes.entry(route.to_string()).or_default();
@@ -639,6 +652,11 @@ pub fn snapshot() -> Value {
             "in_flight": IN_FLIGHT.load(Ordering::Relaxed),
             // Requests whose peer accounting is still open (see cluster_http).
             "peer_open": crate::cluster_http::open_scopes(),
+            // Requests sent by other nodes, by the protocol they arrived on.
+            "internal_requests": {
+                "http1": INTERNAL_HTTP1.load(Ordering::Relaxed),
+                "http2": INTERNAL_HTTP2.load(Ordering::Relaxed),
+            },
             "errors": state.errors,
             "error_rate_pct": pct(state.errors, state.requests),
             "status_classes": status_classes,

@@ -48,6 +48,37 @@ impl NodeHealth {
     }
 }
 
+/// The client for node-to-node requests (connect 2 s, request 60 s).
+///
+/// With `http2` it speaks HTTP/2: cleartext prior knowledge to `http://`
+/// peers, where every node's listener accepts it, and ALPN to `https://`
+/// peers (h2 if the peer offers it, else HTTP/1.1). Without it every peer
+/// call is HTTP/1.1, whatever ALPN would pick. All peers must then run a build
+/// whose listener accepts HTTP/2 before `http2` is switched on, see the README.
+pub(crate) fn peer_client(http2: bool, tls_peers: bool) -> reqwest::Result<reqwest::Client> {
+    use crate::listener::peer_h2;
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(60));
+    let builder = if !http2 {
+        builder.http1_only()
+    } else {
+        let builder = if tls_peers {
+            builder
+        } else {
+            builder.http2_prior_knowledge()
+        };
+        builder
+            .http2_initial_stream_window_size(peer_h2::STREAM_WINDOW)
+            .http2_initial_connection_window_size(peer_h2::CONNECTION_WINDOW)
+            .http2_max_frame_size(peer_h2::MAX_FRAME)
+            .http2_keep_alive_interval(peer_h2::PING_INTERVAL)
+            .http2_keep_alive_timeout(peer_h2::PING_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
+    };
+    builder.build()
+}
+
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
 /// the `_session` cookie both arrive as plain headers; the peer is trusted, so
 /// forward whichever one the client used.

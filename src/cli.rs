@@ -40,6 +40,7 @@ pub struct Args {
     pub js_worker_startup_ms: u64,
     pub max_open_indexes: usize,
     pub max_open_dbs: usize,
+    pub peer_http2: bool,
     pub cluster_secret: String,
     pub otel_endpoint: Option<String>,
 }
@@ -62,6 +63,7 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]\n\
                      \x20       [--rebalance-freeze-ms N] [--js-worker-startup-ms N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
+                     \x20       [--peer-http2]\n\
                      \x20       [--otel-endpoint URL]       (or OTEL_EXPORTER_OTLP_ENDPOINT)";
 
 /// Parse the process arguments and environment. A bad command line prints a
@@ -188,6 +190,7 @@ pub fn parse_from(
         js_worker_startup_ms: crate::js::DEFAULT_WORKER_STARTUP_MS,
         max_open_indexes: crate::index_cache::DEFAULT_MAX_OPEN,
         max_open_dbs: crate::state::DEFAULT_MAX_OPEN_DBS,
+        peer_http2: false,
         cluster_secret: environment(&env, "DOUCHDB_CLUSTER_SECRET")?.unwrap_or_default(),
         otel_endpoint: environment(&env, "OTEL_EXPORTER_OTLP_ENDPOINT")?,
     };
@@ -272,6 +275,7 @@ pub fn parse_from(
                 args.max_open_indexes = number(&mut it, flag, 1, u32::MAX.into())?
             }
             "--max-open-dbs" => args.max_open_dbs = number(&mut it, flag, 1, u32::MAX.into())?,
+            "--peer-http2" => args.peer_http2 = true,
             "--cluster-secret" => args.cluster_secret = value(&mut it, flag)?,
             "--otel-endpoint" => args.otel_endpoint = Some(value(&mut it, flag)?),
             "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
@@ -427,6 +431,12 @@ mod tests {
         ] {
             assert!(parse(&[flag, "0"]).is_ok(), "{flag} 0");
         }
+    }
+
+    #[test]
+    fn peer_http2_is_off_unless_asked_for() {
+        assert!(!parse(&[]).unwrap().unwrap().peer_http2);
+        assert!(parse(&["--peer-http2"]).unwrap().unwrap().peer_http2);
     }
 
     #[test]
