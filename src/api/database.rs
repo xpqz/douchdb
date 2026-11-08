@@ -267,15 +267,6 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     if let Some(response) = require_design_admin(st, db, headers, std::slice::from_ref(&doc)) {
         return response;
     }
-    if id.starts_with("_local/") {
-        // Local documents bypass the shard path and validation, as
-        // with `PUT /{db}/_local/{id}`.
-        let local = id.strip_prefix("_local/").unwrap_or(&id);
-        return match db.local_put(local, doc).await {
-            Ok(v) => json(StatusCode::CREATED, v),
-            Err(e) => fail(e),
-        };
-    }
     if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
     }
@@ -531,7 +522,7 @@ pub async fn db_rest(
         .to_string();
 
     if let Some(id) = raw_rest.strip_prefix("_local/") {
-        return local_doc(&db, &percent_decode(id), &method, &body).await;
+        return local_doc(req, &percent_decode(id)).await;
     }
 
     if let Some((ddoc, index, info)) = search_path(&rest) {

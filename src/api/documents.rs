@@ -2,35 +2,113 @@
 
 use super::*;
 
-pub(super) async fn local_doc(db: &Db, id: &str, method: &Method, body: &[u8]) -> Response {
+/// `GET|PUT|DELETE /{db}/_local/{id}`. A local document belongs to the shard
+/// its id hashes to and is read and written on that shard's copies, as in
+/// CouchDB. A request a peer already routed touches this node's copy only.
+pub(super) async fn local_doc(req: DbRequest<'_>, id: &str) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name,
+        method,
+        headers,
+        body,
+        ..
+    } = req;
+    let routed = st.ctx.cluster.is_clustered() && !is_forwarded(st, headers);
     match method.as_str() {
-        "GET" => match db.local_get(id).await {
-            Ok(Some(doc)) => json(StatusCode::OK, doc),
-            Ok(None) => fail(ApiError::not_found("missing")),
-            Err(e) => fail(e),
-        },
-        "PUT" => match crate::json::from_slice(body) {
-            Ok(doc) => {
-                if let Err(e) = validate_doc(&doc) {
-                    return fail(e);
-                }
-                match db.local_put(id, doc).await {
-                    Ok(v) => json(StatusCode::CREATED, v),
-                    Err(e) => fail(e),
-                }
+        "GET" => {
+            let found = if routed {
+                read_local_doc(
+                    ClusterRead {
+                        ctx: &st.ctx,
+                        db,
+                        dbname: name,
+                        headers,
+                    },
+                    id,
+                )
+                .await
+            } else {
+                db.local_get(id).await
+            };
+            match found {
+                Ok(Some(doc)) => json(StatusCode::OK, doc),
+                Ok(None) => fail(ApiError::not_found("missing")),
+                Err(e) => fail(e),
             }
-            Err(_) => fail(ApiError::bad_request("invalid JSON")),
-        },
-        "DELETE" => match db.local_delete(id).await {
-            Ok(v) => json(StatusCode::OK, v),
-            Err(e) => fail(e),
-        },
+        }
+        "PUT" => {
+            let mut doc: Value = match crate::json::from_slice(body) {
+                Ok(doc) => doc,
+                Err(_) => return fail(ApiError::bad_request("invalid JSON")),
+            };
+            if let Err(e) = validate_doc(&doc) {
+                return fail(e);
+            }
+            doc["_id"] = json!(format!("_local/{id}"));
+            match write_local_doc(&req, doc, StatusCode::CREATED).await {
+                Ok(response) => response,
+                Err(e) => fail(e),
+            }
+        }
+        "DELETE" => {
+            // A missing document is a 404 here, though `_bulk_docs` reports
+            // a delete of one as a success.
+            let found = if routed {
+                read_local_doc(
+                    ClusterRead {
+                        ctx: &st.ctx,
+                        db,
+                        dbname: name,
+                        headers,
+                    },
+                    id,
+                )
+                .await
+            } else {
+                db.local_get(id).await
+            };
+            match found {
+                Ok(Some(_)) => {}
+                Ok(None) => return fail(ApiError::not_found("missing")),
+                Err(e) => return fail(e),
+            }
+            let doc = json!({"_id": format!("_local/{id}"), "_deleted": true});
+            match write_local_doc(&req, doc, StatusCode::OK).await {
+                Ok(response) => response,
+                Err(e) => fail(e),
+            }
+        }
         _ => fail(ApiError::new(
             405,
             "method_not_allowed",
             "method not allowed",
         )),
     }
+}
+
+/// Write one `_local` document to every copy of its shard and answer with
+/// `ok` when the write quorum acknowledged, else 202, as for any document.
+async fn write_local_doc(req: &DbRequest<'_>, doc: Value, ok: StatusCode) -> DbResult<Response> {
+    let (mut results, quorum) = commit_docs(
+        req.st,
+        req.db,
+        req.name,
+        vec![doc],
+        true,
+        num(req.q, "w").unwrap_or(0),
+        req.headers,
+    )
+    .await?;
+    let mut result = results.pop().unwrap_or(Value::Null);
+    if result.get("error").is_some() {
+        if let Some(object) = result.as_object_mut() {
+            object.remove("id");
+        }
+        return Ok(json(doc_error_status(&result), result));
+    }
+    Ok(json(if quorum { ok } else { StatusCode::ACCEPTED }, result))
 }
 
 pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {

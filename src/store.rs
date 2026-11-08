@@ -87,6 +87,12 @@ pub fn local_key(id: &str) -> Vec<u8> {
     key(b"l/", id)
 }
 
+/// `ck/<id>`: a node-local anti-entropy checkpoint. Not a `_local` document:
+/// it is never listed, shared or moved with a shard.
+pub fn checkpoint_key(id: &str) -> Vec<u8> {
+    key(b"ck/", id)
+}
+
 fn key(prefix: &[u8], rest: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + rest.len());
     out.extend_from_slice(prefix);
@@ -1409,7 +1415,10 @@ impl Shard {
             iter.reset();
             iter.advance();
             while let Some((key, _)) = iter.current() {
-                if key.as_ref() != b"z/revs_limit" && key.as_ref() != PURGED_INFOS_LIMIT_KEY {
+                if key.as_ref() != b"z/revs_limit"
+                    && key.as_ref() != PURGED_INFOS_LIMIT_KEY
+                    && !key.starts_with(b"ck/")
+                {
                     keys.push(key.to_vec());
                 }
                 if !iter.advance() {

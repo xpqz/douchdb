@@ -10,8 +10,8 @@ use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, meta_state, seq_key, AttMeta, DocMeta, LiveDoc,
-    MetaState, PurgeInfo, ShardHandle, Tx,
+    blob_prefix, body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, AttMeta,
+    DocMeta, LiveDoc, MetaState, PurgeInfo, Shard, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -1354,7 +1354,18 @@ impl Db {
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
+        let mut locals: Vec<(usize, Value)> = Vec::new();
         for (i, doc) in docs.into_iter().enumerate() {
+            // `_local/` documents have no revision tree and no sequence; they
+            // are applied to the shard of their id further down.
+            if doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("_local/"))
+            {
+                locals.push((i, doc));
+                continue;
+            }
             match doc_id(&doc) {
                 Ok(id) => match self.validate_doc_id(&id) {
                     Ok(()) => {
@@ -1412,6 +1423,10 @@ impl Db {
                     }),
                 });
             }
+        }
+
+        for (slot, result) in self.put_local_docs(locals).await {
+            out[slot] = Some(result);
         }
 
         if touches_design {
@@ -2394,17 +2409,144 @@ impl Db {
 
     // ----- local documents -------------------------------------------------
 
+    /// The shard that holds `_local/{id}`: the same hash as any document, so
+    /// a local document lives on the replicas of the shard its id falls in.
+    fn local_shard(&self, id: &str) -> &ShardHandle {
+        &self.shards[self.shard_index(&format!("_local/{id}"))]
+    }
+
     pub async fn local_get(&self, id: &str) -> DbResult<Option<Value>> {
         let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| read_local(s, &id))
+            .await
+    }
+
+    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<Value> {
+        let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| write_local(s, &id, body))
+            .await
+    }
+
+    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
+        let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| delete_local(s, &id))
+            .await
+    }
+
+    /// Apply the `_local/` documents of a `_bulk_docs` batch, each on the
+    /// shard of its id. A delete of a missing document is a success at rev
+    /// 0-0, unlike `DELETE /db/_local/id`, as in CouchDB.
+    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
+        let mut out = Vec::with_capacity(docs.len());
+        for (slot, doc) in docs {
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
+            let deleted = doc
+                .get("_deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = if deleted {
+                match self.local_delete(&name).await {
+                    Err(error) if error.status == 404 => {
+                        Ok(json!({"ok": true, "id": id, "rev": "0-0"}))
+                    }
+                    other => other,
+                }
+            } else {
+                self.local_put(&name, doc).await
+            };
+            out.push((
+                slot,
+                result.unwrap_or_else(
+                    |error| json!({"id": id, "error": error.error, "reason": error.reason}),
+                ),
+            ));
+        }
+        out
+    }
+
+    /// Store `_local/` documents exactly as given, `_rev` included, unless
+    /// this node already holds a newer one. A rebalance uses it to hand a
+    /// shard's local documents to a new replica; a normal write would number
+    /// the copy one higher.
+    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<Value> {
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
+            let result = self
+                .local_shard(&name)
+                .call(move |s| install_local(s, &name, doc))
+                .await;
+            out.push(result.unwrap_or_else(
+                |error| json!({"id": id, "error": error.error, "reason": error.reason}),
+            ));
+        }
+        out
+    }
+
+    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
+    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
+    /// CouchDB reports neither `total_rows` nor `offset` for them.
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+        self.local_docs_filtered(opts, None).await
+    }
+
+    /// Like `local_docs`, but only the shards whose `owned` entry is true.
+    /// A cluster coordinator asks each node for one copy of every shard.
+    pub async fn local_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+        self.local_docs_filtered(opts, Some(owned)).await
+    }
+
+    async fn local_docs_filtered(
+        &self,
+        opts: &AllDocsOpts,
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Value> {
+        let listed = futures::future::join_all(
+            self.shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| shard_owned(owned, *index))
+                .map(|(_, shard)| shard.call(list_local)),
+        )
+        .await;
+        let mut docs: Vec<(String, Value)> = Vec::new();
+        for shard_docs in listed {
+            docs.extend(shard_docs?);
+        }
+        docs.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows = local_doc_rows(docs, opts);
+        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+    }
+
+    /// A node-local record that is not a document: the replication
+    /// checkpoints of anti-entropy. They belong to this node and one peer,
+    /// so they are neither shared with the cluster nor listed by
+    /// `_local_docs`, and they live on the first shard whatever the
+    /// placement.
+    pub async fn checkpoint_get(&self, id: &str) -> DbResult<Option<Value>> {
+        let key = checkpoint_key(id);
         self.shards[0]
-            .call(move |s| match s.get_checked(&local_key(&id))? {
+            .call(move |s| match s.get_checked(&key)? {
                 Some(bytes) => serde_json::from_slice::<Value>(&bytes)
                     .map(Some)
                     .map_err(|error| {
                         ApiError::new(
                             500,
                             "internal_server_error",
-                            format!("corrupt local document {id}: {error}"),
+                            format!("corrupt checkpoint: {error}"),
                         )
                     }),
                 None => Ok(None),
@@ -2412,83 +2554,17 @@ impl Db {
             .await
     }
 
-    pub async fn local_put(&self, id: &str, mut body: Value) -> DbResult<Value> {
-        let id = id.to_string();
+    pub async fn checkpoint_put(&self, id: &str, value: &Value) -> DbResult<()> {
+        let key = checkpoint_key(id);
+        let value = value.clone();
         self.shards[0]
             .call(move |s| {
-                let key = local_key(&id);
-                // CouchDB (couch_db_updater:update_local_docs/2) numbers a
-                // local write from the supplied `_rev`, absent meaning 0, and
-                // never conflicts: the stored revision is not consulted.
-                let supplied = match body.get("_rev") {
-                    None => 0,
-                    Some(rev) => rev
-                        .as_str()
-                        .and_then(|r| r.strip_prefix("0-"))
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
-                };
-                let next = supplied.saturating_add(1);
-                let rev = format!("0-{next}");
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("_id".into(), json!(format!("_local/{id}")));
-                    obj.insert("_rev".into(), json!(rev));
-                }
                 let mut tx = Tx::new();
-                tx.put_json(&key, &body)?;
+                tx.put_json(&key, &value)?;
                 s.commit(tx)?;
-                Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+                Ok(())
             })
             .await
-    }
-
-    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
-        let id = id.to_string();
-        self.shards[0]
-            .call(move |s| {
-                if s.get_checked(&local_key(&id))?.is_none() {
-                    return Err(ApiError::not_found("missing"));
-                }
-                let mut tx = Tx::new();
-                tx.delete(&local_key(&id));
-                s.commit(tx)?;
-                Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
-            })
-            .await
-    }
-
-    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
-    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
-    /// CouchDB reports neither `total_rows` nor `offset` for them.
-    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
-        let opts = opts.clone();
-        let rows = self.shards[0]
-            .call(move |s| {
-                let mut docs: Vec<(String, Value)> = Vec::new();
-                let mut corrupt = None;
-                s.scan_range_while(b"l/", None, false, |key, value| {
-                    let Some(id) = key
-                        .strip_prefix(b"l/")
-                        .and_then(|id| std::str::from_utf8(id).ok())
-                    else {
-                        return true;
-                    };
-                    match serde_json::from_slice::<Value>(value) {
-                        Ok(doc) => docs.push((format!("_local/{id}"), doc)),
-                        Err(error) => {
-                            corrupt = Some(format!("corrupt local document {id}: {error}"));
-                            return false;
-                        }
-                    }
-                    true
-                })?;
-                if let Some(reason) = corrupt {
-                    return Err(ApiError::new(500, "internal_server_error", reason));
-                }
-                Ok(local_doc_rows(docs, &opts))
-            })
-            .await?;
-        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
     }
 
     // ----- maintenance -----------------------------------------------------
@@ -4177,6 +4253,107 @@ fn all_docs_key_row(
     Ok(Some(row))
 }
 
+fn corrupt_local(id: &str, error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("corrupt local document {id}: {error}"),
+    )
+}
+
+/// The revision number of a `0-N` local revision.
+fn local_rev_number(doc: &Value) -> Option<u64> {
+    doc.get("_rev")?
+        .as_str()?
+        .strip_prefix("0-")?
+        .parse::<u64>()
+        .ok()
+}
+
+fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
+    match s.get_checked(&local_key(id))? {
+        Some(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map(Some)
+            .map_err(|error| corrupt_local(id, error)),
+        None => Ok(None),
+    }
+}
+
+fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
+    // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
+    // from the supplied `_rev`, absent meaning 0, and never conflicts: the
+    // stored revision is not consulted.
+    let supplied = match body.get("_rev") {
+        None => 0,
+        Some(rev) => rev
+            .as_str()
+            .and_then(|r| r.strip_prefix("0-"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
+    };
+    let next = supplied.saturating_add(1);
+    let rev = format!("0-{next}");
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("_id".into(), json!(format!("_local/{id}")));
+        obj.insert("_rev".into(), json!(rev));
+    }
+    let mut tx = Tx::new();
+    tx.put_json(&local_key(id), &body)?;
+    s.commit(tx)?;
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+}
+
+fn delete_local(s: &mut Shard, id: &str) -> DbResult<Value> {
+    if s.get_checked(&local_key(id))?.is_none() {
+        return Err(ApiError::not_found("missing"));
+    }
+    let mut tx = Tx::new();
+    tx.delete(&local_key(id));
+    s.commit(tx)?;
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
+}
+
+/// Keep a copy of a local document as it is, unless a newer one is stored.
+fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<Value> {
+    let Some(incoming) = local_rev_number(&doc) else {
+        return Err(ApiError::bad_request("Invalid rev format"));
+    };
+    let held = read_local(s, id)?.as_ref().and_then(local_rev_number);
+    let rev = doc.get("_rev").cloned().unwrap_or(Value::Null);
+    if held.is_none_or(|held| held < incoming) {
+        let mut tx = Tx::new();
+        tx.put_json(&local_key(id), &doc)?;
+        s.commit(tx)?;
+    }
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+}
+
+/// Every local document of one shard, with its `_local/` id.
+fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
+    let mut docs: Vec<(String, Value)> = Vec::new();
+    let mut corrupt = None;
+    s.scan_range_while(b"l/", None, false, |key, value| {
+        let Some(id) = key
+            .strip_prefix(b"l/")
+            .and_then(|id| std::str::from_utf8(id).ok())
+        else {
+            return true;
+        };
+        match serde_json::from_slice::<Value>(value) {
+            Ok(doc) => docs.push((format!("_local/{id}"), doc)),
+            Err(error) => {
+                corrupt = Some(corrupt_local(id, error));
+                return false;
+            }
+        }
+        true
+    })?;
+    match corrupt {
+        Some(error) => Err(error),
+        None => Ok(docs),
+    }
+}
+
 /// Select and render `_local_docs` rows from every local document, which
 /// arrive in id order.
 fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
@@ -4712,6 +4889,61 @@ mod tests {
         let error = db.get_doc("a", &DocOpts::default()).await.unwrap_err();
         assert_eq!(error.status, 500, "{error}");
         assert!(error.corrupt, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_docs_spread_over_shards_and_checkpoints_stay_out_of_the_listing() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-local-shards-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "local-shards",
+            DbConfig {
+                q: 4,
+                revs_limit: 100,
+                shard_map: ShardMap::single(4),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..16).map(|i| format!("doc{i:02}")).collect();
+        for id in &ids {
+            db.local_put(id, json!({"v": id})).await.unwrap();
+        }
+        let holding: std::collections::BTreeSet<usize> = ids
+            .iter()
+            .map(|id| db.shard_index(&format!("_local/{id}")))
+            .collect();
+        assert!(holding.len() > 1, "the ids should not share one shard");
+
+        db.checkpoint_put("ae2:peer", &json!({"seq": 3}))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.checkpoint_get("ae2:peer").await.unwrap(),
+            Some(json!({"seq": 3}))
+        );
+        assert_eq!(db.local_get("ae2:peer").await.unwrap(), None);
+
+        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap();
+        let listed: Vec<&str> = listing["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        let expected: Vec<String> = ids.iter().map(|id| format!("_local/{id}")).collect();
+        assert_eq!(listed, expected);
+
+        // A copy keeps its revision and never replaces a newer one.
+        let copy = json!({"_id": "_local/doc00", "_rev": "0-5", "v": "copy"});
+        db.install_local_docs(vec![copy]).await;
+        assert_eq!(db.local_get("doc00").await.unwrap().unwrap()["_rev"], "0-5");
+        let stale = json!({"_id": "_local/doc00", "_rev": "0-2", "v": "stale"});
+        db.install_local_docs(vec![stale]).await;
+        assert_eq!(db.local_get("doc00").await.unwrap().unwrap()["v"], "copy");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

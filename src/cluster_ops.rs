@@ -666,6 +666,20 @@ async fn migrate(
         return Err(error);
     }
 
+    // Local documents are not carried by anti-entropy; hand them over while
+    // writes are still frozen and the old copies are the source of truth.
+    let read = crate::fabric::ClusterRead {
+        ctx,
+        db,
+        dbname: name,
+        headers,
+    };
+    if let Err(error) = crate::fabric::copy_local_docs(read, old_map, map).await {
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
+        db.set_rebalance_in_progress(false);
+        return Err(error);
+    }
+
     let map = match activate_map_everywhere(ctx, db, name, map, headers).await {
         Ok(activated) => activated,
         Err(error) => {
