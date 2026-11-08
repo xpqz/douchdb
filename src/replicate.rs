@@ -48,7 +48,7 @@ pub async fn pull(
     ctx.sync_purges().await?;
     let checkpoint_id = checkpoint_id(db, peer);
     let mut since = db
-        .local_get(&checkpoint_id)
+        .checkpoint_get(&checkpoint_id)
         .await
         .ok()
         .flatten()
@@ -82,7 +82,7 @@ pub async fn pull(
         if last == since {
             break;
         }
-        db.local_put(&checkpoint_id, json!({ "seq": last }))
+        db.checkpoint_put(&checkpoint_id, &json!({ "seq": last }))
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         since = last;
@@ -135,7 +135,7 @@ impl PullCtx<'_> {
         let checkpoint = purge_checkpoint_id(self.db, self.peer);
         let since: Vec<u64> = self
             .db
-            .local_get(&checkpoint)
+            .checkpoint_get(&checkpoint)
             .await
             .ok()
             .flatten()
@@ -195,7 +195,7 @@ impl PullCtx<'_> {
         }
         if seqs != since {
             self.db
-                .local_put(&checkpoint, json!({ "seqs": seqs }))
+                .checkpoint_put(&checkpoint, &json!({ "seqs": seqs }))
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;
         }
@@ -722,7 +722,7 @@ mod tests {
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
         let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
-            db.local_get(&checkpoint_id).await.unwrap().is_none(),
+            db.checkpoint_get(&checkpoint_id).await.unwrap().is_none(),
             "checkpoint advanced past a missing revision"
         );
 
@@ -735,7 +735,7 @@ mod tests {
             .await
             .is_ok());
         let checkpoint = db
-            .local_get(&checkpoint_id)
+            .checkpoint_get(&checkpoint_id)
             .await
             .unwrap()
             .expect("checkpoint");

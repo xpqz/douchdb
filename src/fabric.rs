@@ -1578,18 +1578,31 @@ pub(crate) async fn fetch_all_docs(
     opts: &AllDocsOpts,
     shards: Option<&ShardMask>,
 ) -> DbResult<Value> {
-    let ClusterRead {
-        ctx,
-        db,
-        dbname,
-        headers,
-    } = read;
+    let ClusterRead { ctx, db, .. } = read;
     if node == ctx.cluster.me {
         if let Some(shards) = shards {
             return db.all_docs_owned(opts, shards).await;
         }
         return db.all_docs(opts).await;
     }
+    fetch_remote_docs(read, node, "_all_docs", opts, shards).await
+}
+
+/// An `_all_docs`-shaped query (`endpoint` names which) answered by a peer
+/// from its own shards.
+async fn fetch_remote_docs(
+    read: ClusterRead<'_>,
+    node: usize,
+    endpoint: &str,
+    opts: &AllDocsOpts,
+    shards: Option<&ShardMask>,
+) -> DbResult<Value> {
+    let ClusterRead {
+        ctx,
+        dbname,
+        headers,
+        ..
+    } = read;
     let peer = &ctx.cluster.nodes[node];
     let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(shards) = shards {
@@ -1633,7 +1646,7 @@ pub(crate) async fn fetch_all_docs(
         ctx,
         reqwest::Method::POST,
         peer,
-        &[dbname, "_all_docs"],
+        &[dbname, endpoint],
         Some(headers),
     )
     .query(&query)
@@ -1644,12 +1657,297 @@ pub(crate) async fn fetch_all_docs(
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
-        return Err(ApiError::new(status, "all_docs_failed", text));
+        let error = if endpoint == "_all_docs" {
+            "all_docs_failed"
+        } else {
+            "local_docs_failed"
+        };
+        return Err(ApiError::new(status, error, text));
     }
     response
         .json::<Value>()
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
+/// Hand the `_local` documents of every shard to the replicas the shard gains
+/// in a rebalance from `old_map` to `map`. They take no sequence, so the
+/// `_changes`-driven anti-entropy that seeds the other documents never
+/// carries them, and it must not: a local delete leaves no tombstone, so a
+/// pull would bring a deleted document back.
+///
+/// Writes are frozen, so each old copy is read once, the newest revision of
+/// each document wins, and the copy is installed with its revision as is. A
+/// failure leaves the active map untouched; the caller abandons the
+/// migration.
+pub(crate) async fn copy_local_docs(
+    read: ClusterRead<'_>,
+    old_map: &crate::cluster::ShardMap,
+    map: &crate::cluster::ShardMap,
+) -> DbResult<()> {
+    let ClusterRead {
+        ctx,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let mut gained: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut sources: HashMap<usize, ShardMask> = HashMap::new();
+    for shard in 0..db.q {
+        let old = old_map.replicas_of(shard);
+        let new: Vec<usize> = map
+            .replicas_of(shard)
+            .iter()
+            .copied()
+            .filter(|node| !old.contains(node))
+            .collect();
+        if new.is_empty() {
+            continue;
+        }
+        gained.insert(shard as usize, new);
+        for node in old {
+            sources
+                .entry(*node)
+                .or_insert_with(|| ShardMask::none(db.q))
+                .select(shard as usize);
+        }
+    }
+    if gained.is_empty() {
+        return Ok(());
+    }
+
+    let opts = AllDocsOpts {
+        include_docs: true,
+        ..Default::default()
+    };
+    let opts = &opts;
+    let listings = in_request_scope(crate::cluster_http::in_one_round(join_all(
+        sources.iter().map(|(node, mask)| async move {
+            if *node == ctx.cluster.me {
+                db.local_docs_owned(opts, mask).await
+            } else {
+                fetch_remote_docs(read, *node, "_local_docs", opts, Some(mask)).await
+            }
+        }),
+    )))
+    .await;
+    let mut newest: BTreeMap<String, Value> = BTreeMap::new();
+    for listing in listings {
+        let mut listing = listing?;
+        for mut row in crate::json::take_array(&mut listing, "rows").unwrap_or_default() {
+            let Some(doc) = row.get_mut("doc").map(Value::take) else {
+                continue;
+            };
+            let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let current = newest.get(&id).map_or(0, local_rev_number);
+            if !newest.contains_key(&id) || local_rev_number(&doc) > current {
+                newest.insert(id, doc);
+            }
+        }
+    }
+
+    let mut per_node: HashMap<usize, Vec<Value>> = HashMap::new();
+    for (id, doc) in newest {
+        let Some(nodes) = gained.get(&db.shard_index(&id)) else {
+            continue;
+        };
+        for node in nodes {
+            per_node.entry(*node).or_default().push(doc.clone());
+        }
+    }
+    let installs = in_request_scope(crate::cluster_http::in_one_round(join_all(
+        per_node.into_iter().map(|(node, docs)| async move {
+            if node == ctx.cluster.me {
+                return Ok(db.install_local_docs(docs).await);
+            }
+            forward_bulk_owned(
+                ctx.client.clone(),
+                ctx.cluster.secret.clone(),
+                ctx.cluster.nodes[node].clone(),
+                dbname.to_string(),
+                docs,
+                false,
+                headers.clone(),
+            )
+            .await
+        }),
+    )))
+    .await;
+    for results in installs {
+        if let Some(failed) = results?.iter().find(|result| result.get("error").is_some()) {
+            return Err(ApiError::new(
+                502,
+                "rebalance_failed",
+                format!("a replica refused a _local document: {failed}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The number of a `0-N` local revision, 0 for anything else.
+fn local_rev_number(doc: &Value) -> u64 {
+    doc.get("_rev")
+        .and_then(Value::as_str)
+        .and_then(|rev| rev.strip_prefix("0-"))
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `GET /db/_local/{id}` in a cluster. Like `fabric_doc_open`, every copy of
+/// the document's shard is asked and the highest revision wins; local
+/// documents are not read-repaired. A copy that cannot be reached does not
+/// fail the read while another answered: the read-quorum shortfall that
+/// `fabric_doc_open` also lets through for them. `None` means the copies that
+/// answered do not have it.
+pub(crate) async fn read_local_doc(read: ClusterRead<'_>, id: &str) -> DbResult<Option<Value>> {
+    let ClusterRead {
+        ctx,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let mut replicas = db.replicas_of_doc(&format!("_local/{id}"));
+    if let Some(index) = replicas.iter().position(|node| *node == ctx.cluster.me) {
+        let local = replicas.remove(index);
+        replicas.insert(0, local);
+    }
+    let responses =
+        crate::cluster_http::in_one_round(join_all(replicas.into_iter().map(|node| async move {
+            if node == ctx.cluster.me {
+                crate::telemetry::record_local_read();
+                return db.local_get(id).await.ok();
+            }
+            crate::telemetry::record_remote_read();
+            let peer = &ctx.cluster.nodes[node];
+            let request = internal_request(
+                ctx,
+                reqwest::Method::GET,
+                peer,
+                &[dbname, "_local", id],
+                Some(headers),
+            );
+            match send_peer(request).await {
+                Ok(response) if response.status().is_success() => {
+                    response.json::<Value>().await.ok().map(Some)
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => Some(None),
+                Ok(_) | Err(_) => None,
+            }
+        })))
+        .await;
+    let answered = responses.iter().flatten().count();
+    let newest = responses
+        .into_iter()
+        .flatten()
+        .flatten()
+        .max_by_key(local_rev_number);
+    match newest {
+        Some(doc) => Ok(Some(doc)),
+        None if answered > 0 => Ok(None),
+        None => Err(ApiError::new(500, "error", "read_failure")),
+    }
+}
+
+/// `_local_docs` across the cluster, as `_all_docs` is read: one copy of each
+/// shard, chosen by `preferred_shard_masks`, so a document is listed once.
+/// Like CouchDB (`fabric_view_all_docs` with the `_local` namespace) it
+/// reports no `total_rows` or `offset`.
+pub(crate) async fn cluster_local_docs(
+    read: ClusterRead<'_>,
+    opts: &AllDocsOpts,
+) -> DbResult<Value> {
+    let ClusterRead { ctx, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(ctx, db);
+
+    if let Some(keys) = &opts.keys {
+        // Only keys in the `_local/` namespace are looked up at all.
+        let keys: Vec<Value> = keys
+            .iter()
+            .filter(|key| key.as_str().is_some_and(|key| key.starts_with("_local/")))
+            .cloned()
+            .collect();
+        let mut key_opts = opts.clone();
+        key_opts.keys = Some(keys.clone());
+        key_opts.skip = 0;
+        key_opts.limit = usize::MAX;
+        key_opts.startkey = None;
+        key_opts.endkey = None;
+        key_opts.descending = false;
+
+        let key_opts = &key_opts;
+        let values = scatter(
+            read,
+            &owned_by_node,
+            "local_docs",
+            |node, mask, _| async move { fetch_local_docs(read, node, key_opts, &mask).await },
+        )
+        .await?;
+        let mut found: HashMap<String, Value> = HashMap::new();
+        for (_, _, mut response) in values {
+            for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
+                if let Some(id) = row.get("id").and_then(Value::as_str) {
+                    found.insert(id.to_string(), row);
+                }
+            }
+        }
+        let ordered: Vec<&Value> = if opts.descending {
+            keys.iter().rev().collect()
+        } else {
+            keys.iter().collect()
+        };
+        let rows: Vec<Value> = ordered
+            .into_iter()
+            .skip(opts.skip)
+            .take(opts.limit)
+            .map(|key| {
+                key.as_str()
+                    .and_then(|name| found.get(name).cloned())
+                    .unwrap_or_else(|| json!({"key": key, "error": "not_found"}))
+            })
+            .collect();
+        return Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}));
+    }
+
+    let mut window = opts.clone();
+    window.skip = 0;
+    window.limit = opts.skip.saturating_add(opts.limit);
+    let window = &window;
+    let values = scatter(
+        read,
+        &owned_by_node,
+        "local_docs",
+        |node, mask, _| async move { fetch_local_docs(read, node, window, &mask).await },
+    )
+    .await?;
+    let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
+    for (_, _, mut response) in values {
+        for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                by_id.entry(id.to_string()).or_insert(row);
+            }
+        }
+    }
+    let mut rows: Vec<Value> = by_id.into_values().collect();
+    if opts.descending {
+        rows.reverse();
+    }
+    let rows: Vec<Value> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
+    Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+}
+
+async fn fetch_local_docs(
+    read: ClusterRead<'_>,
+    node: usize,
+    opts: &AllDocsOpts,
+    shards: &ShardMask,
+) -> DbResult<Value> {
+    if node == read.ctx.cluster.me {
+        return read.db.local_docs_owned(opts, shards).await;
+    }
+    fetch_remote_docs(read, node, "_local_docs", opts, Some(shards)).await
 }
 
 /// One owner's part of a cluster view query.
