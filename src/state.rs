@@ -597,6 +597,44 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// A database an earlier douchdb created under a name CouchDB refuses (a
+    /// leading digit or '-') stays listed, readable, writable and deletable;
+    /// only creating such a name is refused.
+    #[tokio::test]
+    async fn legacy_database_names_stay_reachable() {
+        let root = std::env::temp_dir().join(format!("douchdb-legacy-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 4);
+        let legacy = ["1abc", "-abc"];
+        for name in legacy {
+            assert!(!valid_db_name(name));
+            assert!(st.create_db(name, false, None, None).await.is_err());
+            // As an earlier version left it: opened without the name check.
+            let db = crate::db::Db::open(
+                &root,
+                name,
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    shard_map: st.ctx.cluster.shard_map_n(1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap();
+            drop(db);
+        }
+        assert_eq!(st.db_names().await, ["-abc", "1abc"]);
+        for name in legacy {
+            let db = st.db(name).await.unwrap();
+            db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+            assert!(st.db_security(name).await.is_some());
+            assert!(st.placement(name).await.is_ok());
+            drop(db);
+            st.drop_db(name).await.unwrap();
+        }
+        assert!(st.db_names().await.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Every database ever opened used to stay open, with its shard actors and
     /// stores, until it was deleted.
     #[tokio::test]
