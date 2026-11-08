@@ -155,6 +155,7 @@ pub async fn db_metadata(
 pub async fn db_migration_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -176,7 +177,7 @@ pub async fn db_migration_put(
         ));
     }
     // Freezes client writes on this peer for the verification window.
-    if let Err(error) = db.begin_migration(map) {
+    if let Err(error) = db.begin_migration(map, query.get("id").cloned()) {
         return fail(error);
     }
     // Writes accepted before the freeze may still be fanning out to replicas.
@@ -191,9 +192,14 @@ pub async fn db_migration_put(
     ok()
 }
 
+/// Clears the migration announced with the same `id`. A different id, or none
+/// while the migration has one, is a 409 and leaves the freeze in place, so a
+/// stale or rival coordinator cannot unfreeze another's rebalance. Clearing
+/// when there is nothing to clear succeeds.
 pub async fn db_migration_delete(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
@@ -202,9 +208,15 @@ pub async fn db_migration_delete(
     }
     match st.db(&name).await {
         Ok(db) => {
-            db.clear_migration_map();
-            db.set_rebalance_in_progress(false);
-            ok()
+            if db.clear_migration_if(query.get("id").map(String::as_str)) {
+                ok()
+            } else {
+                fail(ApiError::new(
+                    409,
+                    "rebalance_in_progress",
+                    "the migration in progress belongs to another coordinator",
+                ))
+            }
         }
         Err(error) => fail(error),
     }
