@@ -6301,6 +6301,26 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows[0]["deleted"], true);
 }
 
+// In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
+// per-node token (CouchDB packs per-shard purge seqs with
+// `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
+#[tokio::test]
+async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clpurge").await;
+    }
+    let (_, r) = nodes[0].put("/clpurge/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:0,0"), "{info}");
+
+    let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
+}
+
 #[tokio::test]
 async fn cluster_changes_report_pending_like_a_single_node() {
     // n=1 fans out to every node; n=3 lets the coordinator read every shard
