@@ -249,16 +249,22 @@ impl RevTree {
         });
     }
 
-    /// Root-to-leaf path containing `rev`.
-    pub fn path(&self, rev: &str) -> Vec<String> {
+    /// Root-to-leaf path containing `rev`. Fails when the parent links loop,
+    /// which only a damaged stored tree can do.
+    pub fn path(&self, rev: &str) -> Result<Vec<String>, CyclicTree> {
         let mut path = Vec::new();
-        let mut cur = Some(rev.to_string());
-        while let Some(rev) = cur {
-            path.push(rev.clone());
-            cur = self.edges.get(&rev).cloned().flatten();
+        let mut cur = Some(rev);
+        while let Some(node) = cur {
+            // An acyclic chain visits each edge key once, plus a final
+            // revision that is not a key (the argument, or a dangling parent).
+            if path.len() > self.edges.len() {
+                return Err(CyclicTree);
+            }
+            path.push(node.to_string());
+            cur = self.parent(node);
         }
         path.reverse();
-        path
+        Ok(path)
     }
 
     /// Remove the leaf `rev` and every ancestor no other branch shares, as
@@ -292,14 +298,16 @@ impl RevTree {
     /// Keep the newest `limit` revisions on every root-to-leaf path. Leaves are
     /// never removed, even when another branch is much deeper. Shared ancestors
     /// are retained once; a revision whose parent was pruned becomes a root.
-    pub fn prune(&mut self, limit: u64) {
+    ///
+    /// Fails, leaving the tree untouched, when the parent links loop.
+    pub fn prune(&mut self, limit: u64) -> Result<(), CyclicTree> {
         let limit = limit.max(1) as usize;
         if self.leaves.is_empty() {
-            return;
+            return Ok(());
         }
         let mut keep: BTreeSet<String> = BTreeSet::new();
         for leaf in &self.leaves {
-            let path = self.path(leaf);
+            let path = self.path(leaf)?;
             let start = path.len().saturating_sub(limit);
             for rev in &path[start..] {
                 keep.insert(rev.clone());
@@ -321,8 +329,22 @@ impl RevTree {
         // Every kept revision keeps the child on its way to a kept leaf, so
         // the leaves are unchanged, and no parent link dangles any more.
         self.dangling.clear();
+        Ok(())
     }
 }
+
+/// The parent links of a stored tree form a loop, so a revision has no
+/// root-to-leaf path. Only on-disk corruption can cause it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CyclicTree;
+
+impl std::fmt::Display for CyclicTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "revision tree has a cycle in its parent links")
+    }
+}
+
+impl std::error::Error for CyclicTree {}
 
 #[cfg(test)]
 mod tests {
@@ -346,13 +368,16 @@ mod tests {
     fn path_on_a_cyclic_tree_terminates() {
         let tree = cyclic_tree();
         assert_eq!(tree.leaves(), vec!["z".to_string()]);
-        let _ = tree.path("z");
+        assert_eq!(tree.path("z"), Err(CyclicTree));
+        assert_eq!(tree.path("x"), Err(CyclicTree));
     }
 
     #[test]
     fn prune_on_a_cyclic_tree_terminates() {
         let mut tree = cyclic_tree();
-        tree.prune(2);
+        let before = tree.clone();
+        assert_eq!(tree.prune(2), Err(CyclicTree));
+        assert_eq!(tree, before);
     }
 
     #[test]
@@ -381,7 +406,7 @@ mod tests {
         assert_eq!(tree.leaves(), vec![format!("3-{}", id(3))]);
         assert_eq!(tree.winner().unwrap(), format!("3-{}", id(3)));
         assert_eq!(
-            tree.path(&format!("3-{}", id(3))).len(),
+            tree.path(&format!("3-{}", id(3))).unwrap().len(),
             3,
             "shared prefix is not duplicated"
         );
@@ -431,10 +456,10 @@ mod tests {
         let leaf = format!("3-{}", id(3));
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("{root},{middle},{leaf}")), false);
-        assert!(tree.path(&leaf).contains(&root));
-        assert!(tree.path(&leaf).contains(&middle));
-        assert!(!tree.path(&middle).contains(&leaf));
-        assert!(!tree.path(&leaf).contains(&format!("1-{}", id(9))));
+        assert!(tree.path(&leaf).unwrap().contains(&root));
+        assert!(tree.path(&leaf).unwrap().contains(&middle));
+        assert!(!tree.path(&middle).unwrap().contains(&leaf));
+        assert!(!tree.path(&leaf).unwrap().contains(&format!("1-{}", id(9))));
     }
 
     #[test]
@@ -482,6 +507,7 @@ mod tests {
         tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), false);
         assert!(tree
             .path(&format!("2-{}", id(2)))
+            .unwrap()
             .contains(&format!("1-{}", id(1))));
         assert!(!tree.is_leaf(&format!("1-{}", id(1))));
         assert!(tree.is_leaf(&format!("2-{}", id(2))));
@@ -498,7 +524,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             false,
         );
-        tree.prune(3);
+        tree.prune(3).unwrap();
         assert_eq!(tree.edges.len(), 3);
         assert_eq!(tree.winner().unwrap(), path[9]);
         assert!(tree.edges[&path[7]].is_none(), "pruned rev becomes a root");
@@ -530,7 +556,7 @@ mod tests {
             true,
         );
 
-        tree.prune(2);
+        tree.prune(2).unwrap();
 
         assert!(tree.edges.contains_key(&live), "short live leaf was pruned");
         assert!(
@@ -571,7 +597,7 @@ mod tests {
             false,
         );
 
-        tree.prune(1);
+        tree.prune(1).unwrap();
 
         assert_eq!(tree.leaves().len(), 2);
         assert!(tree.edges.contains_key(&live));
@@ -587,7 +613,7 @@ mod tests {
         let sibling = format!("3-{}", id(4));
         let mut tree = RevTree::default();
         tree.merge_path(&revs(&format!("{parent},{leaf}")), false);
-        tree.prune(2);
+        tree.prune(2).unwrap();
         assert!(!tree.edges.contains_key(&base));
 
         // A later replicated path still carries the pruned base. It must not
@@ -802,7 +828,7 @@ mod tests {
             for rev in old.edges.keys() {
                 assert_eq!(tree.is_leaf(rev), old.is_leaf(rev), "{stored} {rev}");
                 assert_eq!(tree.leaves_from(rev), old.leaves_from(rev), "{stored}");
-                assert_eq!(tree.path(rev), old.path(rev), "{stored}");
+                assert_eq!(tree.path(rev).unwrap(), old.path(rev), "{stored}");
             }
         }
     }
@@ -822,7 +848,7 @@ mod tests {
             old.merge_path(&path, true);
             assert_eq!(tree.leaves(), old.leaves(), "{stored}");
             assert_eq!(tree.winner(), old.winner(), "{stored}");
-            tree.prune(2);
+            tree.prune(2).unwrap();
             old.prune(2);
             assert_eq!(tree.leaves(), old.leaves(), "{stored}");
             assert_eq!(
@@ -891,7 +917,7 @@ mod tests {
         for rev in old.edges.keys() {
             prop_assert_eq!(tree.is_leaf(rev), old.is_leaf(rev));
             prop_assert_eq!(tree.leaves_from(rev), old.leaves_from(rev));
-            prop_assert_eq!(tree.path(rev), old.path(rev));
+            prop_assert_eq!(tree.path(rev).unwrap(), old.path(rev));
             prop_assert_eq!(tree.is_deleted(rev), old.deleted.contains(rev));
         }
         prop_assert!(!tree.is_leaf("0-unknown"));
@@ -912,7 +938,7 @@ mod tests {
                         old.merge_path(&path, deleted);
                     }
                     Op::Prune(limit) => {
-                        tree.prune(limit);
+                        tree.prune(limit).unwrap();
                         old.prune(limit);
                     }
                     Op::Purge(pick) => {
@@ -947,17 +973,17 @@ mod tests {
                 prop_assert!(tree.edges.contains_key(leaf));
             }
 
-            tree.prune(limit);
+            tree.prune(limit).unwrap();
 
             prop_assert_eq!(tree.leaves(), leaves);
             prop_assert_eq!(tree.winner(), winner);
             for leaf in tree.leaves() {
-                let path = tree.path(&leaf);
+                let path = tree.path(&leaf).unwrap();
                 prop_assert_eq!(path.last(), Some(&leaf));
             }
 
             let once = tree.clone();
-            tree.prune(limit);
+            tree.prune(limit).unwrap();
             prop_assert_eq!(&tree, &once);
         }
 
@@ -970,7 +996,7 @@ mod tests {
                 tree.merge_path(path, *deleted);
             }
             let leaves = tree.leaves();
-            tree.prune(1);
+            tree.prune(1).unwrap();
             let mut edges: Vec<String> = tree.edges.keys().cloned().collect();
             edges.sort();
             let mut expected = leaves;
