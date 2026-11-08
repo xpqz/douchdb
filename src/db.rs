@@ -5626,6 +5626,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_visible_update_seq_excludes_uncommitted_allocations() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-updseq-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "updseq",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+
+        db.put_docs(vec![json!({"_id": doc_id_for_shard(&db, 0)})], true)
+            .await
+            .unwrap();
+        // Shard 1 has allocated a sequence it has not committed, and shard 0
+        // then commits a higher one.
+        let held = db.start_in_flight_write(1);
+        let later = doc_id_for_shard(&db, 0) + "-later";
+        db.put_docs(vec![json!({"_id": later})], true)
+            .await
+            .unwrap();
+
+        // Neither the `update_seq` reported by GET /db and `since=now` nor
+        // the one in the database info may reach the held sequence, or a
+        // feed resumed from it would skip that write when it commits.
+        assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
+        let info = db.info().await.unwrap();
+        let reported = info["update_seq"].as_u64().unwrap();
+        assert!(reported < held, "info update_seq {reported}");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
