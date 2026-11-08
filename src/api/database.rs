@@ -274,7 +274,7 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
             Err(e) => fail(e),
         };
     }
-    if let Some(response) = validate_write(st, db, name, &mut doc, headers).await {
+    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
     }
     // `commit_docs` routes the generated id to every replica in its
