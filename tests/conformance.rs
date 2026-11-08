@@ -4543,7 +4543,10 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     let (_, body) = s
         .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
         .await;
-    assert!(body.as_object().unwrap().contains_key("purge_seq"), "{body}");
+    assert!(
+        body.as_object().unwrap().contains_key("purge_seq"),
+        "{body}"
+    );
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = s.get("/purgeseq").await;
     assert_eq!(info["purge_seq"], json!(2), "{info}");

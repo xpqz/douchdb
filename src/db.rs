@@ -1387,23 +1387,25 @@ impl Db {
         let update_seq = self.update_seq();
         let mut doc_count = 0;
         let mut deleted_count = 0;
+        let mut purge_seq = 0u64;
         let counts = futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok(s.counts()))),
+                .map(|shard| shard.call(|s| Ok((s.counts(), s.purge_seq()?)))),
         )
         .await;
         for counted in counts {
-            let (docs, deleted) = counted?;
+            let ((docs, deleted), purged) = counted?;
             doc_count += docs;
             deleted_count += deleted;
+            purge_seq = purge_seq.saturating_add(purged);
         }
         let mut info = json!({
             "db_name": self.name,
             "doc_count": doc_count,
             "doc_del_count": deleted_count,
             "update_seq": update_seq,
-            "purge_seq": 0,
+            "purge_seq": purge_seq,
             "compact_running": compact_running,
             "disk_size": 0,
             "data_size": 0,
@@ -2617,7 +2619,8 @@ impl Db {
         for (id, revs) in ids.into_iter().zip(removed) {
             purged.insert(id.clone(), json!(revs));
         }
-        Ok(json!({ "purge_seq": 0, "purged": purged }))
+        // CouchDB always answers `purge_seq: null` here (chttpd_db `_purge`).
+        Ok(json!({ "purge_seq": Value::Null, "purged": purged }))
     }
 
     pub async fn compact(&self) -> DbResult<()> {
@@ -2724,6 +2727,7 @@ fn purge_one(
         removed.push(rev.clone());
     }
     if !removed.is_empty() {
+        s.count_purge(&mut tx)?;
         if meta.tree.is_empty() {
             tx.delete(&meta_key(id));
             if meta.seq != 0 {
