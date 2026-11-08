@@ -5010,6 +5010,139 @@ async fn document_writes_validate_like_couchdb() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB 3.5 compiles every map and reduce function of a design document
+/// when it is saved (couch_mrview:validate/2 and
+/// couch_query_servers:try_compile/4), on every write path including
+/// replication, and only then looks at the members. Nothing else in the
+/// document is compiled at save time. A bad `_rev` is a conflict before the
+/// document is validated.
+#[tokio::test]
+async fn design_doc_functions_compile_on_save() {
+    let s = Server::start(false);
+    s.fresh_db("cc").await;
+
+    let bad_map = "function(doc){ emit(doc._id }";
+    let bad_reduce = "function(keys, values){ return sum(values }";
+    let (status, body) = s
+        .put(
+            "/cc/_design/a",
+            json!({"views": {"v": {"map": bad_map, "reduce": "_count"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("Compilation of the map function in the 'v' view failed: "),
+        "{reason}"
+    );
+    assert!(reason.ends_with(&format!(" ({bad_map})")), "{reason}");
+
+    let (status, body) = s
+        .put(
+            "/cc/_design/a",
+            json!({"views": {"w": {"map": "function(d){}", "reduce": bad_reduce}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("Compilation of the reduce function in the 'w' view failed: "),
+        "{reason}"
+    );
+
+    // A source that is valid JavaScript but not a function.
+    let (status, body) = s
+        .put("/cc/_design/a", json!({"views": {"v": {"map": "1 + 1"}}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Expression does not eval to a function."),
+        "{body}"
+    );
+
+    // POST, `_bulk_docs` (a row error) and replication take the same path.
+    let bad = json!({"_id": "_design/p", "views": {"v": {"map": bad_map}}});
+    let (status, body) = s.post("/cc", bad.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let (status, body) = s
+        .post("/cc/_bulk_docs", json!({"docs": [bad, {"_id": "ok1"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "compilation_error", "{body}");
+    assert_eq!(body[1]["ok"], true, "{body}");
+    let (status, body) = s
+        .post(
+            "/cc/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "_design/r", "_rev": "1-abc",
+                "views": {"v": {"map": bad_map}}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "compilation_error", "{body}");
+    let (status, _) = s.get("/cc/_design/r").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Accepted: builtin reduces, an unknown language, and the members CouchDB
+    // does not compile at save time.
+    for reduce in ["_sum", "_count", "_stats", "_approx_count_distinct"] {
+        let (status, body) = s
+            .put(
+                &format!("/cc/_design/b{reduce}"),
+                json!({"views": {"v": {"map": "function(d){ emit(d._id, 1); }", "reduce": reduce}}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+    }
+    let (status, body) = s
+        .put(
+            "/cc/_design/lang",
+            json!({"language": "klingon", "views": {"v": {"map": bad_map}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .put(
+            "/cc/_design/others",
+            json!({
+                "validate_doc_update": "function(",
+                "filters": {"f": "function("},
+                "shows": {"s": "function("},
+                "lists": {"l": "function("},
+                "updates": {"u": "function("},
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A bad `_rev` is a conflict, whatever else is wrong with the document.
+    let (status, body) = s
+        .put(
+            "/cc/_design/good",
+            json!({"views": {"v": {"map": "function(d){}"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for doc in [
+        json!({"_rev": "1-abc", "views": 1}),
+        json!({"_rev": "1-abc", "views": {"v": {"map": bad_map}}}),
+        json!({"views": 1}),
+        json!({"views": {"v": {"map": bad_map}}}),
+    ] {
+        let (status, body) = s.put("/cc/_design/good", doc.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{doc}: {body}");
+        assert_eq!(body["error"], "conflict", "{doc}");
+    }
+}
+
 #[tokio::test]
 async fn rejects_unknown_special_members_like_couchdb() {
     let s = Server::start(false);
