@@ -4082,6 +4082,151 @@ async fn new_edits_false_derives_rev_from_revisions() {
     );
 }
 
+// couch_doc:transfer_fields/3 (src/couch/src/couch_doc.erl) validates
+// `_revisions` for every document, in this order: `start` must be an integer,
+// `ids` must be an array, then each id is parsed by parse_revid/2. All of them
+// are `doc_validation`, 400.
+#[tokio::test]
+async fn malformed_revisions_answer_doc_validation_with_couchdb_reasons() {
+    let s = Server::start(false);
+    s.fresh_db("badrevs").await;
+    let hex32 = "a".repeat(32);
+    let bad_hex = "z".repeat(32);
+    let start_reason = "_revisions.start isn't an integer.";
+    let ids_reason = "_revisions.ids isn't a array.";
+    let cases = [
+        (json!({"ids": ["aaaa"]}), start_reason),
+        (json!({"start": "1", "ids": ["aaaa"]}), start_reason),
+        (json!({"start": 1.5, "ids": ["aaaa"]}), start_reason),
+        (json!({"start": null, "ids": ["aaaa"]}), start_reason),
+        // `start` is checked before `ids`.
+        (json!({"start": "x", "ids": "y"}), start_reason),
+        (json!({"start": 1}), ids_reason),
+        (json!({"start": 1, "ids": "aaaa"}), ids_reason),
+        (json!({"start": 1, "ids": {"a": 1}}), ids_reason),
+        (json!({"start": 1, "ids": [1]}), "RevId isn't a string"),
+        (
+            json!({"start": 1, "ids": [hex32.clone(), null]}),
+            "RevId isn't a string",
+        ),
+        (
+            json!({"start": 0, "ids": [["aaaa"]]}),
+            "RevId isn't a string",
+        ),
+        // parse_revid/2 only takes a non-negative start for short ids.
+        (
+            json!({"start": -1, "ids": ["aaaa"]}),
+            "RevId isn't a string",
+        ),
+        (
+            json!({"start": 1, "ids": [bad_hex.clone()]}),
+            "RevId isn't a valid hexadecimal",
+        ),
+        (
+            json!({"start": 2, "ids": [hex32, "bbbb", bad_hex]}),
+            "RevId isn't a valid hexadecimal",
+        ),
+    ];
+    for (revisions, reason) in cases {
+        for path in ["p?new_edits=false", "p"] {
+            let (status, body) = s
+                .put(
+                    &format!("/badrevs/{path}"),
+                    json!({"_revisions": revisions}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{revisions} {path}: {body}"
+            );
+            assert_eq!(
+                body,
+                json!({"error": "doc_validation", "reason": reason}),
+                "{revisions} {path}"
+            );
+        }
+    }
+
+    let (status, body) = s
+        .post(
+            "/badrevs/_bulk_docs",
+            json!({"new_edits": false, "docs": [{"_id": "b", "_revisions": {"start": "1"}}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "doc_validation", "reason": start_reason})
+    );
+
+    // A `_revisions` that is not an object falls through to the unknown
+    // special member clause.
+    let (status, body) = s
+        .put("/badrevs/p?new_edits=false", json!({"_revisions": "x"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "doc_validation", "reason": "Bad special document member: _revisions"})
+    );
+
+    let (status, body) = s.get("/badrevs/p").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+// Deliberate departure: CouchDB 3.5.3 stores `_revisions` with `start: 0` as
+// `0-x`, but nothing generates such revisions, so douchdb answers 400. The
+// validation itself accepts `start: 0`.
+#[tokio::test]
+async fn revisions_start_zero_is_refused() {
+    let s = Server::start(false);
+    s.fresh_db("zero").await;
+    let (status, body) = s
+        .put(
+            "/zero/z?new_edits=false",
+            json!({"_revisions": {"start": 0, "ids": ["aaaa"]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "bad_request", "reason": "Invalid rev format"})
+    );
+    let (status, body) = s.get("/zero/z").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+// CouchDB stores `_revisions` as given, whatever `start` and the number of ids:
+// with fewer ids than `start` the oldest id sits at `start - len + 1`.
+#[tokio::test]
+async fn revisions_with_fewer_ids_than_start_are_stored_as_given() {
+    let s = Server::start(false);
+    s.fresh_db("short").await;
+    let (status, body) = s
+        .post(
+            "/short/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "s", "_revisions": {"start": 5, "ids": ["bbbb", "aaaa"]}, "v": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/short/s?revs=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "5-bbbb");
+    assert_eq!(
+        body["_revisions"],
+        json!({"start": 5, "ids": ["bbbb", "aaaa"]})
+    );
+    let (_, body) = s.get("/short/s?open_revs=all").await;
+    assert_eq!(body[0]["ok"]["_rev"], "5-bbbb");
+    let (_, body) = s
+        .post("/short/_revs_diff", json!({"s": ["4-aaaa", "3-aaaa"]}))
+        .await;
+    assert_eq!(body, json!({"s": {"missing": ["3-aaaa"]}}));
+}
+
 #[tokio::test]
 async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     let s = Server::start(false);
