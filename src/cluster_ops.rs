@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Apply a security object locally and push it to every peer.
 ///
 /// The object is versioned, so the local write is kept even when peers are
-/// unreachable: anti-entropy (`fabric::reconcile_security`) delivers it later
+/// unreachable: anti-entropy (`fabric::sync_metadata`) delivers it later
 /// and peers never move back to an older version. Returns whether a majority
 /// of the cluster, this node included, holds the object now.
 pub(crate) async fn set_security_everywhere(
