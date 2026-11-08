@@ -17499,7 +17499,15 @@ async fn quorum_merges_ancestry_across_replicas_with_different_history_lengths()
     }
     // Node 1 keeps only the newest revision, so its tombstone history is
     // shorter than node 2's for the identical leaf.
-    let (status, body) = nodes[1].put("/histories/_revs_limit", json!(1)).await;
+    // A request marked as internal is applied to this node alone.
+    let (status, body) = nodes[1]
+        .req_with(
+            Method::PUT,
+            "/histories/_revs_limit",
+            Some(json!(1)),
+            &node_headers(),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, limit) = nodes[1].get("/histories/_revs_limit").await;
     assert_eq!(limit, 1);

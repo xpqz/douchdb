@@ -50,6 +50,52 @@ pub(crate) async fn set_security_everywhere(
     Ok(acknowledgements > ctx.cluster.nodes.len().max(1) / 2)
 }
 
+/// Set `_revs_limit` or `_purged_infos_limit` on every node.
+///
+/// CouchDB's `fabric_db_meta:set_revs_limit/3` and `set_purge_infos_limit/3`
+/// submit the change to every shard copy and answer `ok` only when all of
+/// them did; any failed or unreachable worker fails the request (500) while
+/// the copies that already applied it keep the new value, and nothing syncs
+/// the limit to a node that missed it. The same here: the caller writes the
+/// local copy, `endpoint` is the path segment after the database.
+pub(crate) async fn set_limit_on_peers(
+    ctx: &ClusterCtx,
+    name: &str,
+    endpoint: &str,
+    limit: u64,
+    headers: &HeaderMap,
+) -> DbResult<()> {
+    if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
+        return Ok(());
+    }
+    let responses = crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| {
+        let request = internal_request(
+            ctx,
+            reqwest::Method::PUT,
+            peer,
+            &[name, endpoint],
+            Some(headers),
+        )
+        .json(&limit);
+        async move {
+            send_peer(request)
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+        }
+    })))
+    .await;
+    if responses.into_iter().all(|ok| ok) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            500,
+            "internal_server_error",
+            format!("`{endpoint}` was not set on every node"),
+        ))
+    }
+}
+
 fn shard_map_rejected() -> ApiError {
     ApiError::new(
         409,
