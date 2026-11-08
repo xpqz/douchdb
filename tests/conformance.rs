@@ -2803,6 +2803,64 @@ async fn database_names_follow_the_couchdb_rule() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB's `validate_dbname` drops one trailing `.couch` before applying the
+/// regex, which also allows a `.` plus ten or more digits at the end (the
+/// shard timestamp). `fabric_db_create` runs the same check, so the clustered
+/// `PUT /foo.couch` creates the database literally named `foo.couch`, not
+/// `foo`, and `foo.1234567890` is an ordinary name.
+#[tokio::test]
+async fn database_names_allow_couch_extension_and_shard_timestamp() {
+    let s = Server::start(false);
+    for name in [
+        "ext.couch",
+        "ts.1234567890",
+        "ts2.12345678901234",
+        "both.1234567890.couch",
+        "_users.couch",
+    ] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        let (status, body) = s.get(&format!("/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["db_name"], name, "{body}");
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{name}: {body}");
+        assert_eq!(body["error"], "file_exists", "{name}: {body}");
+    }
+    let (status, body) = s.put("/ext.couch/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The extension is part of the name: `ext` was never created.
+    let (status, body) = s.get("/ext").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = s.get("/ts").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (_, body) = s.get("/_all_dbs").await;
+    let listed: Vec<&str> = body
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for name in ["ext.couch", "ts.1234567890", "both.1234567890.couch"] {
+        assert!(listed.contains(&name), "{name}: {body}");
+    }
+    assert!(!listed.contains(&"ext"), "{body}");
+
+    // Only one `.couch` is dropped, and nine digits are not a timestamp.
+    for name in [
+        "dbl.couch.couch",
+        ".couch",
+        "short.123456789",
+        "ts.1234567890.1234567890",
+        "ts.1234567890x",
+        "digits.couch.1234567890",
+    ] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{name}: {body}");
+    }
+}
+
 /// Stop the server for good, then start it again on the same data directory.
 /// `restart` alone leaves the old process running, and the pooled HTTP
 /// connections point at it, so a test of what a fresh process reads from disk
