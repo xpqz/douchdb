@@ -1650,11 +1650,14 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
             .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
             .collect();
         assert_eq!(got, want, "limit {limit}");
-        assert_eq!(
-            body["last_seq"],
-            **got.last().map(|(seq, _)| seq).unwrap(),
-            "limit {limit}"
-        );
+        // A feed that stopped at its limit ends at its last row; one that ran
+        // out of documents ends at the last one it scanned.
+        let want_seq = if limit < expected.len() {
+            (**got.last().map(|(seq, _)| seq).unwrap()).clone()
+        } else {
+            all.last().unwrap()["seq"].clone()
+        };
+        assert_eq!(body["last_seq"], want_seq, "limit {limit}");
     }
 
     // Starting after the second match leaves the other two.
@@ -1665,6 +1668,83 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
         ))
         .await;
     assert_eq!(body["results"][0]["id"], json!(expected[2].1));
+}
+
+#[tokio::test]
+async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() {
+    // CouchDB (couch_changes:changes_enumerator) advances the feed's `seq` for
+    // every document it scans, matching or not, so a filter that matches
+    // nothing still ends at the last scanned sequence. Every feed mode must
+    // say the same.
+    let s = Server::start(false);
+    s.fresh_db("chscanned").await;
+    let docs = vec![
+        json!({"_id": "a"}),
+        json!({"_id": "b"}),
+        json!({"_id": "c"}),
+        json!({"_id": "_design/f",
+        "filters": {
+            "none": "function (doc) { return false; }",
+            "first": "function (doc) { return doc._id === 'a'; }"
+        }}),
+    ];
+    let (status, body) = s
+        .post("/chscanned/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, all) = s.get("/chscanned/_changes").await;
+    assert_eq!(all["last_seq"], 4, "{all}");
+
+    let lines = |text: &str| -> Vec<Value> {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("line is JSON"))
+            .collect()
+    };
+    // `none` matches nothing; `first` matches only the first document, so the
+    // documents scanned after the last match still count.
+    for (filter, since, matched) in [("none", 0, 0), ("none", 2, 0), ("first", 0, 1)] {
+        let query = format!("filter=f/{filter}&since={since}");
+        for feed in ["normal", "longpoll"] {
+            for extra in ["", "&heartbeat=1000"] {
+                let (status, body) = s
+                    .get(&format!(
+                        "/chscanned/_changes?{query}&feed={feed}&timeout=1{extra}"
+                    ))
+                    .await;
+                let label = format!("{filter} {feed}{extra} since {since}: {body}");
+                assert_eq!(status, StatusCode::OK, "{label}");
+                assert_eq!(
+                    body["results"].as_array().map(Vec::len),
+                    Some(matched),
+                    "{label}"
+                );
+                assert_eq!(body["last_seq"], 4, "{label}");
+            }
+        }
+        let text = s
+            .client
+            .get(format!(
+                "{}/chscanned/_changes?{query}&feed=continuous&timeout=1",
+                s.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let rows = lines(&text);
+        assert_eq!(
+            rows.last(),
+            Some(&json!({"last_seq": 4, "pending": 0})),
+            "{filter} continuous since {since}: {text}"
+        );
+    }
+
+    // A feed already at the head has scanned nothing and stays there.
+    let (_, body) = s.get("/chscanned/_changes?filter=f/none&since=4").await;
+    assert_eq!(body["last_seq"], 4, "{body}");
 }
 
 #[tokio::test]
@@ -5693,6 +5773,42 @@ async fn cluster_changes_report_pending_like_a_single_node() {
 }
 
 #[tokio::test]
+async fn cluster_changes_report_the_scanned_position_when_nothing_matches() {
+    // As on a single node (couch_changes:changes_enumerator), a filter that
+    // matches nothing still ends where the scan did: the same position an
+    // unfiltered read reaches.
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clscanned").await;
+    }
+    let mut docs: Vec<Value> = (0..20)
+        .map(|i| json!({"_id": format!("s{i:02}")}))
+        .collect();
+    docs.push(json!({"_id": "_design/f",
+        "filters": {"none": "function (doc) { return false; }"}}));
+    let (status, body) = nodes[0]
+        .post("/clscanned/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, all) = nodes[0].get("/clscanned/_changes").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["results"].as_array().map(Vec::len), Some(21), "{all}");
+    let (_, start) = nodes[0].get("/clscanned/_changes?limit=0").await;
+    for feed in ["normal", "longpoll"] {
+        let (status, body) = nodes[0]
+            .get(&format!(
+                "/clscanned/_changes?filter=f/none&feed={feed}&timeout=1"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["results"], json!([]), "{feed}: {body}");
+        assert_eq!(body["last_seq"], all["last_seq"], "{feed}: {body}");
+        assert_ne!(body["last_seq"], start["last_seq"], "{feed}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn cluster_changes_limit_covers_all_nodes() {
     let nodes = start_cluster_with(3, "3600", 1);
     for node in &nodes {
@@ -5808,6 +5924,124 @@ async fn cluster_changes_since_now_with_a_node_down_uses_another_replica() {
     assert_eq!(got, vec!["fresh"], "since=now replayed history: {body}");
 }
 
+/// The ids of a `_changes` response, in order.
+fn change_ids(body: &Value) -> Vec<&str> {
+    body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect()
+}
+
+/// A `since=now` vector made while a node is down must still hold a position
+/// for that node. Its slot used to be 0, so once it was back and read its own
+/// shards again, every change it already held was replayed.
+#[tokio::test]
+async fn cluster_changes_since_now_with_a_node_down_does_not_replay_it_after_recovery() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clnowback").await;
+    }
+    let ids: Vec<String> = (0..9).map(|i| format!("nb{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clnowback/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (reader, victim) = fallback_pair(&nodes, "clnowback", &ids).await;
+    nodes[victim].kill();
+    let url = nodes[victim].base.clone();
+    wait_until_known_down(&nodes[reader], &url).await;
+
+    let (status, body) = nodes[reader].get("/clnowback/_changes?since=now").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+    let since = body["last_seq"].as_str().unwrap().to_string();
+    // The database's own update_seq never carries the placeholder for the
+    // missing position.
+    let (status, info) = nodes[reader].get("/clnowback").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert!(
+        !info["update_seq"]
+            .as_str()
+            .unwrap()
+            .contains("18446744073709551615"),
+        "{info}"
+    );
+
+    nodes[victim].restart();
+    wait_until_known_up(&nodes[reader], &url).await;
+    let (status, _) = nodes[reader].put("/clnowback/fresh", json!({})).await;
+    assert!(status == StatusCode::CREATED || status == StatusCode::ACCEPTED);
+    let (status, body) = nodes[reader]
+        .get(&format!("/clnowback/_changes?since={since}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        change_ids(&body),
+        vec!["fresh"],
+        "since=now replayed history: {body}"
+    );
+}
+
+/// A replica that is down at `since=now` and is not the preferred owner of
+/// any shard gets no position in the vector. When the preferred owner later
+/// fails and that replica is the only copy left, it is read from its start: a
+/// feed may replay but must deliver every change made after `since=now`,
+/// including those that landed on the replica while it was up again.
+#[tokio::test]
+async fn cluster_changes_since_now_does_not_skip_what_a_replica_that_was_down_holds() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clnowrep").await;
+    }
+    // Node 0 coordinates and holds nothing; node 1 is the preferred owner of
+    // every shard and node 2 its replica.
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/clnowrep",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<String> = (0..9).map(|i| format!("nr{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clnowrep/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let replica_url = nodes[2].base.clone();
+    let owner_url = nodes[1].base.clone();
+
+    nodes[2].kill();
+    wait_until_known_down(&nodes[0], &replica_url).await;
+    let (status, body) = nodes[0].get("/clnowrep/_changes?since=now").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+    let since = body["last_seq"].as_str().unwrap().to_string();
+
+    nodes[2].restart();
+    wait_until_known_up(&nodes[0], &replica_url).await;
+    // Written to both copies, every shard, after `since=now`.
+    let late: Vec<String> = (0..8).map(|i| format!("late{i}")).collect();
+    let docs: Vec<Value> = late.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clnowrep/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    nodes[1].kill();
+    wait_until_known_down(&nodes[0], &owner_url).await;
+    let (status, body) = nodes[0]
+        .get(&format!("/clnowrep/_changes?since={since}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let got = change_ids(&body);
+    for id in &late {
+        assert!(got.contains(&id.as_str()), "{id} was skipped: {body}");
+    }
+}
+
 #[tokio::test]
 async fn cluster_changes_since_now_fails_when_a_shard_has_no_live_copy() {
     let mut nodes = start_cluster_with(3, "3600", 1);
@@ -5882,6 +6116,119 @@ async fn cluster_reads_fail_with_nodedown_when_a_shard_has_no_live_copy() {
     let (status, body) = nodes[0]
         .post("/clreadgone/_all_docs", json!({"keys": ["rg1", "rg2"]}))
         .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
+/// A 3-node cluster, one copy per shard, every shard pinned to node 2 and
+/// holding a few documents; node 2 is killed. Node 0 is the coordinator and
+/// holds nothing, so every read has to reach the dead node.
+async fn cluster_with_only_copy_dead(db: &str, partitioned: bool) -> Vec<Server> {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    let suffix = if partitioned { "?partitioned=true" } else { "" };
+    let (status, _) = nodes[0].put(&format!("/{db}{suffix}"), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(&format!("/_node/_local/_dbs/{db}"), all_shards_on(2))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let docs: Vec<Value> = (0..4).map(|i| json!({"_id": format!("p:d{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post(&format!("/{db}/_bulk_docs"), json!({"docs": docs}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "{status}"
+    );
+    nodes[2].kill();
+    nodes
+}
+
+#[tokio::test]
+async fn cluster_doc_get_fails_with_read_failure_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("cldocgone", false).await;
+    // CouchDB: fabric_doc_open answers {error, read_failure}, which chttpd's
+    // error_info renders through maybe_handle_error as 500 error/read_failure.
+    let (status, body) = nodes[0].get("/cldocgone/p:d1").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "error", "{body}");
+    assert_eq!(body["reason"], "read_failure", "{body}");
+}
+
+#[tokio::test]
+async fn cluster_bulk_get_reports_per_doc_errors_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("clbulkgetgone", false).await;
+    // CouchDB: chttpd_db:bulk_get_docs_batched maps a failed
+    // fabric:open_revs to a per-doc internal_fabric_error.
+    let (status, body) = nodes[0]
+        .post(
+            "/clbulkgetgone/_bulk_get",
+            json!({"docs": [{"id": "p:d1"}, {"id": "p:d2"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{body}");
+    for row in results {
+        let error = &row["docs"][0]["error"];
+        assert_eq!(error["error"], "internal_fabric_error", "{body}");
+        assert_eq!(error["reason"], "all_workers_died", "{body}");
+        assert_eq!(error["id"], row["id"], "{body}");
+        assert_eq!(error["rev"], "undefined", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn cluster_revs_diff_reports_revisions_missing_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("clrevsgone", false).await;
+    // CouchDB: fabric_doc_missing_revs ignores workers that went down, so
+    // revisions nobody answered for are reported missing.
+    let (status, body) = nodes[0]
+        .post(
+            "/clrevsgone/_revs_diff",
+            json!({"p:d1": ["1-aaa"], "p:d2": ["1-bbb", "2-ccc"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["p:d1"], json!({"missing": ["1-aaa"]}), "{body}");
+    assert_eq!(
+        body["p:d2"],
+        json!({"missing": ["1-bbb", "2-ccc"]}),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_partition_info_fails_with_nodedown_when_the_owner_is_unreachable() {
+    let nodes = cluster_with_only_copy_dead("clpartgone", true).await;
+    // CouchDB: fabric_db_partition_info answers {error, {nodedown, <<"progress
+    // not possible">>}}, which chttpd maps to 412.
+    let (status, body) = nodes[0].get("/clpartgone/_partition/p").await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
+#[tokio::test]
+async fn cluster_scatter_fallback_to_a_dead_replica_fails_with_nodedown() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clfallgone").await;
+    }
+    // Every shard on nodes 1 and 2, neither of which answers: the owner
+    // round fails, and the substitute node chosen for the fallback round has
+    // not been asked yet but is dead as well.
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/clfallgone",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    nodes[1].kill();
+    nodes[2].kill();
+    let (status, body) = nodes[0].get("/clfallgone/_all_docs").await;
     assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
     assert_eq!(body["error"], "nodedown", "{body}");
     assert_eq!(body["reason"], "progress not possible", "{body}");

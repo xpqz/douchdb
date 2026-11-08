@@ -1323,6 +1323,7 @@ pub async fn query(
     // concurrent `_search_cleanup` cannot remove the index under an open
     // searcher.
     let gate = build_gate(db).read().await?;
+    db.check_live()?;
     let (snapshot, gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(timeout_error());
@@ -1642,6 +1643,7 @@ pub async fn info(
 ) -> DbResult<Value> {
     let spec = load_spec(db, ddoc, index_name).await?;
     let gate = build_gate(db).read().await?;
+    db.check_live()?;
     let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     let meta = &snapshot.meta;
     let copies = db.replicas_of_shard(0).len().max(1);
@@ -1665,6 +1667,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Wait for in-flight builds (including builds whose request was cancelled)
     // before removing their directories.
     let _gate = build_gate(db).write().await?;
+    db.check_live()?;
     drop_cached(&db.path);
     let directory = db.path.join("_search_indexes");
     if directory.exists() {

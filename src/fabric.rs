@@ -63,11 +63,13 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
 /// endpoint, so a rolling upgrade keeps converging.
 async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], known_acks: usize) {
     let mut known_acks = known_acks;
-    let local = db.shard_map();
-    let mut desired = db
-        .pending_shard_map()
-        .filter(|pending| pending.version >= local.version)
-        .unwrap_or_else(|| local.clone());
+    let mut desired = match desired_shard_map(db) {
+        Ok(desired) => desired,
+        Err(error) => {
+            tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+            return;
+        }
+    };
 
     let reported =
         crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
@@ -97,6 +99,8 @@ async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], k
         {
             if db
                 .pending_shard_map()
+                .ok()
+                .flatten()
                 .is_some_and(|pending| pending.version <= map.version)
             {
                 // The adopted map supersedes (or beat the tiebreak against) ours.
@@ -327,11 +331,12 @@ pub(crate) struct MetadataSyncReply {
 
 /// The shard map anti-entropy spreads for `db`: the pending one if it is at
 /// least as new as the stored one, else the stored one.
-fn desired_shard_map(db: &Db) -> crate::cluster::ShardMap {
+fn desired_shard_map(db: &Db) -> DbResult<crate::cluster::ShardMap> {
     let local = db.shard_map();
-    db.pending_shard_map()
+    Ok(db
+        .pending_shard_map()?
         .filter(|pending| pending.version >= local.version)
-        .unwrap_or(local)
+        .unwrap_or(local))
 }
 
 /// The receiver's side of the exchange: compare `summary` with what the local
@@ -424,10 +429,17 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             continue;
         };
         let (version, security) = db.security_versioned();
+        let desired = match desired_shard_map(&db) {
+            Ok(desired) => desired,
+            Err(error) => {
+                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+                continue;
+            }
+        };
         sent.summary.insert(
             name.clone(),
             DbSummary {
-                shard_map: shard_map_stamp(&desired_shard_map(&db)),
+                shard_map: shard_map_stamp(&desired),
                 security: security_stamp(version, &security),
             },
         );
@@ -470,7 +482,13 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             .map(|(peer, reply)| (peer, reply))
             .collect();
 
-        let mut desired = desired_shard_map(&db);
+        let mut desired = match desired_shard_map(&db) {
+            Ok(desired) => desired,
+            Err(error) => {
+                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+                continue;
+            }
+        };
         for (_, reply) in &holders {
             let Some(map) = reply
                 .differs
@@ -484,6 +502,8 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             {
                 if db
                     .pending_shard_map()
+                    .ok()
+                    .flatten()
                     .is_some_and(|pending| pending.version <= map.version)
                 {
                     // The adopted map supersedes (or beat the tiebreak against) ours.
@@ -516,7 +536,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
                     .shard_map = Some(desired.clone());
             }
         }
-        if db.pending_shard_map().is_some() {
+        if !matches!(db.pending_shard_map(), Ok(None)) {
             pending.insert(name.clone(), current);
         }
 
@@ -1296,6 +1316,18 @@ pub(crate) async fn forward_json(
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
+/// CouchDB's `{error, {nodedown, <<"progress not possible">>}}`, which chttpd
+/// maps to 412 (`error_info({error, {nodedown, Reason}})`).
+pub(crate) fn nodedown() -> ApiError {
+    ApiError::new(412, "nodedown", "progress not possible")
+}
+
+/// True when a peer request failed because the peer could not be reached (or
+/// is unhealthy), rather than because the peer rejected the request.
+pub(crate) fn peer_unreachable(error: &ApiError) -> bool {
+    matches!(error.status, 502..=504)
+}
+
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
 /// copy is CouchDB's `{error, {nodedown, <<"progress not possible">>}}`
 /// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
@@ -1318,7 +1350,7 @@ fn fallback_shard_masks(
                 .replicas_of_shard(shard)
                 .into_iter()
                 .find(|candidate| alive.contains(candidate))
-                .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
+                .ok_or_else(nodedown)?;
             groups
                 .entry(target)
                 .or_insert_with(|| ShardMask::none(db.q))
@@ -1384,17 +1416,19 @@ where
     F: Fn(usize, ShardMask, Round) -> Fut,
     Fut: std::future::Future<Output = DbResult<T>>,
 {
-    scatter_nodes(read, owned_by_node, what, false, fetch).await
+    scatter_nodes(read, owned_by_node, what, false, &[], fetch).await
 }
 
 /// [`scatter`], optionally also asking the nodes that own no shard (with an
 /// empty mask), so that one round both reads the shards and learns which
-/// nodes answer.
+/// nodes answer. Nodes in `avoid` are routed around like nodes known to be
+/// down, as long as every shard keeps a live copy without them.
 async fn scatter_nodes<T, F, Fut>(
     read: ClusterRead<'_>,
     owned_by_node: &[ShardMask],
     what: &str,
     include_idle: bool,
+    avoid: &[usize],
     fetch: F,
 ) -> DbResult<Vec<(usize, Round, T)>>
 where
@@ -1409,11 +1443,19 @@ where
         .collect();
     let mut excluded: Vec<usize> = Vec::new();
     let mut rerouted: Vec<(usize, ShardMask, Round)> = Vec::new();
-    if !known_down.is_empty() {
-        let alive: Vec<usize> = (0..nodes)
-            .filter(|node| !known_down.contains(node))
-            .collect();
-        if let Ok(groups) = fallback_shard_masks(db, owned_by_node, &known_down, &alive) {
+    let mut avoided = known_down.clone();
+    avoided.extend(
+        avoid
+            .iter()
+            .copied()
+            .filter(|node| *node != ctx.cluster.me && !known_down.contains(node)),
+    );
+    for skipped in [avoided, known_down] {
+        if skipped.is_empty() {
+            continue;
+        }
+        let alive: Vec<usize> = (0..nodes).filter(|node| !skipped.contains(node)).collect();
+        if let Ok(groups) = fallback_shard_masks(db, owned_by_node, &skipped, &alive) {
             if !groups.is_empty() {
                 crate::telemetry::record_degraded_read();
             }
@@ -1421,7 +1463,8 @@ where
                 .into_iter()
                 .map(|(node, mask)| (node, mask, Round::Fallback))
                 .collect();
-            excluded = known_down;
+            excluded = skipped;
+            break;
         }
     }
     let mut requests: Vec<(usize, ShardMask, Round)> = owned_by_node
@@ -1466,6 +1509,9 @@ where
                         }
                     }
                 }
+                // The substitute node failed too: no copy of these shards
+                // answered, which is nodedown, not the transport error.
+                Err(error) if peer_unreachable(&error) => return Err(nodedown()),
                 Err(error) => return Err(error),
             }
         }
@@ -2118,6 +2164,14 @@ pub(crate) struct FallbackMark {
     seq: u64,
 }
 
+/// A vector slot for a node whose sequence was not known when the token was
+/// made because it did not answer. The node's own sequence at that moment
+/// cannot be learned afterwards, so the slot is not a position: a feed reads
+/// the node's shards from another replica for as long as it can, and only
+/// replays the node from its start when there is no alternative (a feed may
+/// replay, never skip).
+pub(crate) const UNKNOWN_SEQ: u64 = u64::MAX;
+
 /// One stream of changes with its own sequence space: a node reading its
 /// preferred shards, or a node reading shards reassigned from a failed owner.
 struct ChangeLane {
@@ -2156,6 +2210,7 @@ pub(crate) async fn cluster_changes(
         (vec![0; n], Vec::new())
     };
     since.resize(n, 0);
+    let unknown: Vec<usize> = (0..n).filter(|&node| since[node] == UNKNOWN_SEQ).collect();
     let owned_by_node = preferred_shard_masks(ctx, db);
 
     let doc_ids = doc_ids_from(q, body);
@@ -2183,6 +2238,7 @@ pub(crate) async fn cluster_changes(
         &owned_by_node,
         "changes",
         now,
+        &unknown,
         |node, mask, round| async move {
             let shards = mask.shards();
             if now {
@@ -2200,14 +2256,17 @@ pub(crate) async fn cluster_changes(
             }
             // Shards reassigned from a failed owner resume from the mark this
             // node left for exactly this set of shards, else from the start;
-            // preferred masks are disjoint, so ids do not overlap.
+            // preferred masks are disjoint, so ids do not overlap. A node
+            // whose position was unknown when the token was made is read
+            // from the start too: a feed may replay, never skip.
             let since = match round {
-                Round::Owner => since_ref[node],
+                Round::Owner => Some(since_ref[node]).filter(|seq| *seq != UNKNOWN_SEQ),
                 Round::Fallback => marks_ref
                     .iter()
                     .find(|mark| mark.node == node && mark.shards == shards)
-                    .map_or(0, |mark| mark.seq),
-            };
+                    .map(|mark| mark.seq),
+            }
+            .unwrap_or(0);
             let start = ChangesStart::At(since);
             let value = fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
             Ok((shards, Some(since), value))
@@ -2216,6 +2275,7 @@ pub(crate) async fn cluster_changes(
     .await?;
 
     let mut progress = since.clone();
+    let mut answered = vec![false; n];
     let mut fallbacks: Vec<FallbackMark> = Vec::new();
     let mut lanes: Vec<ChangeLane> = Vec::new();
     let mut pending = 0;
@@ -2236,7 +2296,14 @@ pub(crate) async fn cluster_changes(
         let mark = match round {
             Round::Owner => {
                 if let Some(slot) = progress.get_mut(node) {
-                    *slot = (*slot).max(lane_since);
+                    *slot = if *slot == UNKNOWN_SEQ {
+                        lane_since
+                    } else {
+                        (*slot).max(lane_since)
+                    };
+                }
+                if let Some(seen) = answered.get_mut(node) {
+                    *seen = true;
                 }
                 None
             }
@@ -2255,6 +2322,17 @@ pub(crate) async fn cluster_changes(
             rows: rows.into(),
             last,
         });
+    }
+
+    if now {
+        // A node that gave no answer has no position in this vector.
+        for (slot, _) in progress
+            .iter_mut()
+            .zip(&answered)
+            .filter(|(_, seen)| !**seen)
+        {
+            *slot = UNKNOWN_SEQ;
+        }
     }
 
     let limit = limit.unwrap_or(usize::MAX);
@@ -2288,6 +2366,27 @@ pub(crate) async fn cluster_changes(
         }
         if out.len() >= limit || !progressed {
             break;
+        }
+    }
+    // A lane whose rows were all returned has also scanned past them: a filter
+    // may have discarded documents after its last row, or all of them, and
+    // CouchDB's feed position covers every document scanned
+    // (`couch_changes:changes_enumerator`).
+    for lane in lanes.iter().filter(|lane| lane.rows.is_empty()) {
+        let Some(last) = lane.last else {
+            continue;
+        };
+        match lane.mark {
+            None => {
+                if let Some(slot) = progress.get_mut(lane.node) {
+                    *slot = (*slot).max(last);
+                }
+            }
+            Some(mark) => {
+                if let Some(mark) = fallbacks.get_mut(mark) {
+                    mark.seq = mark.seq.max(last);
+                }
+            }
         }
     }
     // Rows fetched but not returned are still to come.
@@ -2478,8 +2577,8 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
 /// replica holds each of its shards; the feed then reads those shards from the
 /// replica, so the mark starts at that replica's current sequence. When some
 /// shard has no live copy the answer is 412 `nodedown` / `progress not
-/// possible`. The unreachable node's own slot stays 0, so after it returns its
-/// changes are replayed rather than skipped.
+/// possible`. The unreachable node's own slot is [`UNKNOWN_SEQ`], so after it
+/// returns its changes are neither replayed nor skipped wholesale.
 pub(crate) async fn cluster_update_vector(
     read: ClusterRead<'_>,
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
@@ -2523,6 +2622,11 @@ pub(crate) async fn cluster_update_vector(
             shards: mask.shards(),
             seq: vector.get(node).copied().unwrap_or(0),
         })
+        .collect();
+    let vector = vector
+        .into_iter()
+        .zip(&seqs)
+        .map(|(seq, answer)| answer.map_or(UNKNOWN_SEQ, |_| seq))
         .collect();
     Ok((vector, marks))
 }

@@ -101,6 +101,12 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
             }
             last = Some(response);
         }
+        if method == Method::GET || method == Method::HEAD {
+            // No copy answered. CouchDB's fabric_doc_open returns
+            // {error, read_failure}; chttpd's error_info has no clause for
+            // it, so maybe_handle_error renders it as 500 error/read_failure.
+            return fail(ApiError::new(500, "error", "read_failure"));
+        }
         return last.unwrap_or_else(|| {
             fail(ApiError::new(
                 502,

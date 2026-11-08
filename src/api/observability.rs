@@ -277,7 +277,8 @@ async fn check_placement(st: &AppState) -> Value {
     let pending = tokio::task::spawn_blocking(move || {
         names
             .iter()
-            .filter(|name| Db::has_pending_shard_map(&root, name))
+            // A pending map that cannot be read is as unsettled as one waiting.
+            .filter(|name| !matches!(Db::has_pending_shard_map(&root, name), Ok(false)))
             .count()
     })
     .await

@@ -1730,6 +1730,7 @@ async fn ensure_rows(
         )
     };
     let gate = index_gate(db).read().await?;
+    db.check_live()?;
     let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
     // A query queued behind a long build leaves when the database is deleted.
     let mut index = gate.until(handle.lock_owned()).await?;
@@ -1898,6 +1899,7 @@ pub(crate) async fn docs_by_ids(
 /// document without advancing the database sequence.
 pub async fn invalidate(db: &Db) -> DbResult<()> {
     let _gate = index_gate(db).write().await?;
+    db.check_live()?;
     let directory = db.path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
@@ -1916,6 +1918,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Before the live set is read, so a view queried meanwhile is not removed
     // as stale, and so no query holds an index being removed.
     let _gate = index_gate(db).write().await?;
+    db.check_live()?;
     let mut live = std::collections::HashSet::new();
     let mut all = db
         .all_docs(&AllDocsOpts {

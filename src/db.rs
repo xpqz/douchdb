@@ -452,6 +452,8 @@ pub struct Db {
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
     design_generation: AtomicU64,
+    /// Set when the database is deleted; see `mark_deleted`.
+    deleted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -686,6 +688,7 @@ impl Db {
             commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
+            deleted: AtomicBool::new(false),
         })
     }
 
@@ -743,15 +746,15 @@ impl Db {
             q: file.q.max(1),
             partitioned: file.partitioned,
             shard_map,
-            pending_shard_map: Db::has_pending_shard_map(root, name),
+            pending_shard_map: Db::has_pending_shard_map(root, name)?,
         }))
     }
 
     /// Whether a shard map this node has not acknowledged is waiting on disk.
-    pub fn has_pending_shard_map(root: &Path, name: &str) -> bool {
-        matches!(
-            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json")),
-            Ok(Some(_))
+    pub fn has_pending_shard_map(root: &Path, name: &str) -> DbResult<bool> {
+        Ok(
+            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json"))?
+                .is_some(),
         )
     }
 
@@ -765,9 +768,32 @@ impl Db {
             && self.write_gate.try_write().is_ok()
     }
 
+    /// Record that the database is being deleted. A request that still holds
+    /// this handle then gets `not_found` from `check_live` instead of using
+    /// the index directories, which a gate registered by path cannot ensure:
+    /// it is dropped with the database, and the handle would take a fresh one.
+    pub fn mark_deleted(&self) {
+        self.deleted.store(true, Ordering::SeqCst);
+    }
+
+    /// `not_found` once the database has been deleted, as CouchDB answers a
+    /// request for a database that is gone (`couch_server`).
+    pub fn check_live(&self) -> DbResult<()> {
+        if self.deleted.load(Ordering::SeqCst) {
+            Err(ApiError::not_found("Database does not exist."))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
-        std::fs::remove_dir_all(db_path(root, name))
-            .map_err(|_| ApiError::not_found(format!("Database does not exist: {name}")))
+        match std::fs::remove_dir_all(db_path(root, name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::not_found(
+                format!("Database does not exist: {name}"),
+            )),
+            Err(error) => Err(metadata_error(&db_path(root, name), error)),
+        }
     }
 
     pub fn shard_index(&self, docid: &str) -> usize {
@@ -1233,8 +1259,10 @@ impl Db {
         changes_watermark_from(&committed, &reserved, since, owned).min(allocated)
     }
 
-    pub fn pending_shard_map(&self) -> Option<ShardMap> {
-        read_metadata(&self.path.join("pending-shard-map.json")).unwrap_or(None)
+    /// The shard map this node has not acknowledged yet. `None` when there is
+    /// none; one that cannot be read or parsed is an error.
+    pub fn pending_shard_map(&self) -> DbResult<Option<ShardMap>> {
+        read_metadata(&self.path.join("pending-shard-map.json"))
     }
 
     pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
@@ -1315,13 +1343,13 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// Current allocated sequence counter. This is the same database-wide
-    /// counter used for `update_seq`, without asking every shard actor. A
-    /// write in flight has already taken its sequence, so this can be ahead
-    /// of what `changes` returns; indexes bound themselves with
-    /// `changes_watermark` instead.
+    /// The update sequence a client may be shown: the changes watermark, so
+    /// every write at or below it is committed. The allocated counter can be
+    /// ahead of it (a write in flight has already taken its sequence); a
+    /// client that resumed `_changes` from the counter would skip that write
+    /// once it commits.
     pub fn update_seq(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
+        self.changes_watermark(0, None)
     }
 
     /// A receiver that changes whenever a write commits on this node. Mark it
@@ -1360,21 +1388,21 @@ impl Db {
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
+        // Taken before reading the shards: the highest committed sequence of
+        // any one shard can sit above another shard's uncommitted write.
+        let update_seq = self.update_seq();
         let mut doc_count = 0;
         let mut deleted_count = 0;
-        let mut update_seq = 0;
-        let counts = futures::future::join_all(self.shards.iter().map(|shard| {
-            shard.call(|s| {
-                let (docs, deleted) = s.counts();
-                Ok((docs, deleted, s.seq()))
-            })
-        }))
+        let counts = futures::future::join_all(
+            self.shards
+                .iter()
+                .map(|shard| shard.call(|s| Ok(s.counts()))),
+        )
         .await;
         for counted in counts {
-            let (docs, deleted, seq) = counted?;
+            let (docs, deleted) = counted?;
             doc_count += docs;
             deleted_count += deleted;
-            update_seq = update_seq.max(seq);
         }
         let mut info = json!({
             "db_name": self.name,
@@ -1971,11 +1999,18 @@ impl Db {
         if let Some(limit) = opts.limit {
             rows.truncate(limit);
         }
-        let last_seq = rows
-            .last()
-            .map(|r| r.seq)
-            .or(scanned_last)
-            .unwrap_or(opts.since);
+        // CouchDB's feed position is the last document scanned, matching or
+        // not (`couch_changes:changes_enumerator`), except that a feed which
+        // stopped at its limit ends at its last row.
+        let at_limit = opts
+            .limit
+            .is_some_and(|limit| limit > 0 && rows.len() >= limit);
+        let last_seq = if at_limit {
+            rows.last().map(|r| r.seq)
+        } else {
+            scanned_last.or(rows.last().map(|r| r.seq))
+        }
+        .unwrap_or(opts.since);
         let pending = self
             .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
@@ -2140,7 +2175,7 @@ impl Db {
     pub(crate) fn changes_stream_arc(
         db: Arc<Db>,
         opts: ChangesOpts,
-    ) -> impl futures::Stream<Item = DbResult<ChangeRow>> + 'static {
+    ) -> impl futures::Stream<Item = DbResult<ChangesItem>> + 'static {
         async_stream::stream! {
             use std::collections::VecDeque;
 
@@ -2238,11 +2273,14 @@ impl Db {
                     }
                 }
                 let Some(slot) = best else {
+                    // Every shard is exhausted: report how far the scan got.
+                    let scanned = cursors.iter().copied().max().unwrap_or(opts.since);
+                    yield Ok(ChangesItem::Scanned(scanned));
                     break;
                 };
                 let row = buffers[slot].pop_front().expect("buffered row");
                 emitted += 1;
-                yield Ok(row);
+                yield Ok(ChangesItem::Row(row));
                 if opts.limit.map(|limit| emitted >= limit).unwrap_or(false) {
                     break;
                 }
@@ -3390,6 +3428,16 @@ impl ChangeFilter {
     fn needs_doc(&self) -> bool {
         matches!(self, ChangeFilter::Js { .. })
     }
+}
+
+/// What a changes stream yields: the rows, then, when the scan ran to the end
+/// rather than stopping at the limit, the last sequence it scanned. A filter
+/// may have discarded rows after the last one yielded, and CouchDB's feed
+/// position (`couch_changes:changes_enumerator`) covers them too.
+#[derive(Debug)]
+pub(crate) enum ChangesItem {
+    Row(ChangeRow),
+    Scanned(u64),
 }
 
 #[derive(Debug)]
@@ -5039,6 +5087,62 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_pending_shard_map_is_an_error_not_none() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-pending-bad-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+        let is_err = |text: String| text.starts_with("Err");
+
+        // Missing is the legitimate "nothing pending".
+        assert_eq!(format!("{:?}", db.pending_shard_map()), "Ok(None)");
+        assert_eq!(
+            format!("{:?}", Db::has_pending_shard_map(&root, "pending")),
+            "Ok(false)"
+        );
+
+        // Content that does not parse.
+        std::fs::write(&pending, b"{not json").unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+
+        // A read error that is not NotFound: a directory in place of the file.
+        std::fs::remove_file(&pending).unwrap();
+        std::fs::create_dir(&pending).unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn destroy_answers_not_found_only_for_a_missing_database() {
+        let root = std::env::temp_dir().join(format!("douchdb-destroy-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(Db::destroy(&root, "gone").unwrap_err().status, 404);
+
+        // A path that exists but is not a directory cannot be removed as one.
+        std::fs::write(db_path(&root, "stuck"), b"not a directory").unwrap();
+        assert_eq!(Db::destroy(&root, "stuck").unwrap_err().status, 500);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn clear_pending_shard_map_reports_what_it_cannot_remove() {
         let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let db = Db::open(
@@ -5058,9 +5162,9 @@ mod tests {
         db.clear_pending_shard_map().unwrap();
 
         db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
-        assert!(db.pending_shard_map().is_some());
+        assert!(db.pending_shard_map().unwrap().is_some());
         db.clear_pending_shard_map().unwrap();
-        assert!(db.pending_shard_map().is_none());
+        assert!(db.pending_shard_map().unwrap().is_none());
 
         // A path that cannot be unlinked is an error, not a silent success.
         std::fs::create_dir(&pending).unwrap();
@@ -5516,6 +5620,45 @@ mod tests {
         let (rows, _, _) = db.changes_rows(&resumed).await.unwrap();
         assert!(rows.iter().any(|row| row.id == later));
         assert!(rows.iter().all(|row| row.seq > last_seq));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn client_visible_update_seq_excludes_uncommitted_allocations() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-updseq-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "updseq",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+
+        db.put_docs(vec![json!({"_id": doc_id_for_shard(&db, 0)})], true)
+            .await
+            .unwrap();
+        // Shard 1 has allocated a sequence it has not committed, and shard 0
+        // then commits a higher one.
+        let held = db.start_in_flight_write(1);
+        let later = doc_id_for_shard(&db, 0) + "-later";
+        db.put_docs(vec![json!({"_id": later})], true)
+            .await
+            .unwrap();
+
+        // Neither the `update_seq` reported by GET /db and `since=now` nor
+        // the one in the database info may reach the held sequence, or a
+        // feed resumed from it would skip that write when it commits.
+        assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
+        let info = db.info().await.unwrap();
+        let reported = info["update_seq"].as_u64().unwrap();
+        assert!(reported < held, "info update_seq {reported}");
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);

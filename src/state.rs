@@ -121,14 +121,14 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    fn of_open(db: Arc<Db>) -> Self {
-        Placement {
+    fn of_open(db: Arc<Db>) -> DbResult<Self> {
+        Ok(Placement {
             q: db.q,
             partitioned: db.partitioned,
             shard_map: db.shard_map(),
-            pending_shard_map: db.pending_shard_map().is_some(),
+            pending_shard_map: db.pending_shard_map()?.is_some(),
             open: Some(db),
-        }
+        })
     }
 }
 
@@ -292,7 +292,7 @@ impl AppState {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(db) = self.open_db_if_cached(name).await {
-            return Ok(Placement::of_open(db));
+            return Placement::of_open(db);
         }
         let root = self.root.clone();
         let owned = name.to_string();
@@ -309,7 +309,7 @@ impl AppState {
                 pending_shard_map: meta.pending_shard_map,
                 open: None,
             }),
-            None => Ok(Placement::of_open(self.db(name).await?)),
+            None => Placement::of_open(self.db(name).await?),
         }
     }
 
@@ -435,7 +435,11 @@ impl AppState {
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
-        self.dbs.write().await.remove(name);
+        // Marked before the gates are forgotten: a request holding the handle
+        // can no longer take a fresh gate and reach the index directories.
+        if let Some(open) = self.dbs.write().await.remove(name) {
+            open.db.mark_deleted();
+        }
         let path = crate::db::db_path(&self.root, name);
         crate::view::forget_db(&path).await;
         crate::search::forget_db(&path).await;
@@ -614,6 +618,69 @@ mod tests {
             .await
             .unwrap();
         drop(held);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A request that cloned the database before it was deleted must not be
+    /// able to touch the index directories afterwards, neither while the
+    /// directory is removed nor in a database recreated under the same name:
+    /// the deleted database's gate is gone, so a stale handle would otherwise
+    /// take a fresh one. CouchDB answers 404 once the database is gone.
+    #[tokio::test]
+    async fn a_stale_handle_cannot_touch_the_indexes_of_a_deleted_database() {
+        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 4);
+        let ddoc = json!({"_id": "_design/d",
+            "views": {"v": {"map": "function(doc) { emit(doc.n, null); }"}},
+            "indexes": {"s": {"index": "function(doc){ if (doc.n) index('n', doc.n); }"}}});
+        let stale = st.create_db("stale", false, None, None).await.unwrap();
+        stale
+            .put_docs(vec![json!({"_id": "a", "n": 1}), ddoc], true)
+            .await
+            .unwrap();
+        let view_query = crate::view::ViewQuery::default();
+        let limits = view_query.limits;
+        let request = crate::search::SearchRequest {
+            query: "n:1".to_string(),
+            ..Default::default()
+        };
+        crate::view::query(&stale, "_design/d", "v", &view_query)
+            .await
+            .unwrap();
+        crate::search::query(&stale, "_design/d", "s", &request, limits)
+            .await
+            .unwrap();
+        let path = stale.path.clone();
+        assert!(path.join("_view_indexes").exists());
+        assert!(path.join("_search_indexes").exists());
+
+        // The request still holds its handle when the database goes away.
+        st.drop_db("stale").await.unwrap();
+        assert!(!path.exists());
+        let error = crate::view::query(&stale, "_design/d", "v", &view_query)
+            .await
+            .expect_err("a view query ran on a deleted database");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        let error = crate::search::query(&stale, "_design/d", "s", &request, limits)
+            .await
+            .expect_err("a search ran on a deleted database");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        assert!(!path.exists(), "a stale query recreated the directory");
+
+        // Nor can it reach the database created under the same name.
+        let fresh = st.create_db("stale", false, None, None).await.unwrap();
+        let error = crate::view::query(&stale, "_design/d", "v", &view_query)
+            .await
+            .expect_err("a stale view query ran on the recreated database");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        let error = crate::search::query(&stale, "_design/d", "s", &request, limits)
+            .await
+            .expect_err("a stale search ran on the recreated database");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        assert!(!path.join("_view_indexes").exists());
+        assert!(!path.join("_search_indexes").exists());
+        drop((stale, fresh));
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
     }
