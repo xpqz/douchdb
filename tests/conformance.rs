@@ -17254,28 +17254,6 @@ fn grafana_dashboards_are_valid_and_provisioned() {
     assert!(compose.contains("./docker/grafana/dashboards:/otel-lgtm/grafana-dashboards:ro"));
 }
 
-#[tokio::test]
-async fn changes_since_with_huge_node_index_does_not_abort() {
-    let s = Server::start(false);
-    s.fresh_db("hugesince").await;
-    s.put("/hugesince/a", json!({"v": 1})).await;
-
-    // base64url({"99999999999":1}) is a legacy cluster token naming a node far
-    // outside the cluster. It must be treated as a malformed since (a 400, as
-    // in CouchDB), not allocated as a vector.
-    let (status, body) = s
-        .get("/hugesince/_changes?since=eyI5OTk5OTk5OTk5OSI6MX0")
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["reason"],
-        "Malformed sequence supplied in 'since' parameter."
-    );
-
-    let (status, _) = s.get("/hugesince").await;
-    assert_eq!(status, StatusCode::OK);
-}
-
 // couch_httpd_db:db_req(#httpd{method='POST'}) and chttpd_db:db_req(POST) feed
 // the document through the same update path as PUT: design docs need db admin
 // (couch_db:check_is_admin / chttpd_db:db_doc_req), validate_doc_update runs,

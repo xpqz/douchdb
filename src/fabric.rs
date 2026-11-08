@@ -10,7 +10,6 @@ use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
-use base64::Engine;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
@@ -2074,12 +2073,12 @@ pub(crate) async fn fetch_ddoc_from_replica(
     Err(ApiError::not_found(format!("missing {ddoc}")))
 }
 
-fn last_seq_for_node(value: &Value, node: usize, nodes: usize) -> Option<u64> {
+fn last_seq_for_node(value: &Value, node: usize) -> Option<u64> {
     let seq = value.get("last_seq")?;
     if let Some(seq) = seq.as_u64() {
         return Some(seq);
     }
-    let decoded = decode_since(seq.as_str()?, nodes)?;
+    let decoded = decode_since(seq.as_str()?)?;
     decoded.get(node).copied()
 }
 
@@ -2131,9 +2130,9 @@ pub(crate) async fn cluster_changes(
     } else if raw_since == Some("now") {
         cluster_update_vector(read).await?
     } else if let Some(raw) = raw_since {
-        let vector = match decode_since(raw, n) {
+        let vector = match decode_since(raw) {
             Some(vector) => vector,
-            None => vec![since_component(Some(raw), ctx.cluster.me, n); n],
+            None => vec![since_component(Some(raw), ctx.cluster.me); n],
         };
         (vector, decode_fallbacks(raw, n))
     } else {
@@ -2216,7 +2215,7 @@ pub(crate) async fn cluster_changes(
             _ => Vec::new(),
         };
         rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
-        let last = last_seq_for_node(&value, node, n);
+        let last = last_seq_for_node(&value, node);
         // A node that resolved `since=now` itself started just before its
         // first row, or where it reports having stopped when there is none.
         let lane_since = lane_since.unwrap_or_else(|| match rows.first() {
@@ -2588,7 +2587,7 @@ pub(crate) fn encode_token(vector: &[u64], marks: &[FallbackMark]) -> String {
 
     // This runs once per change row in a cluster feed. The old form was
     // base64(JSON) and allocated a map plus a base64 buffer for every row.
-    // `v1:` is still an opaque token to clients; `decode_since` accepts both.
+    // `v1:` is an opaque token to clients.
     let mut out = String::with_capacity(3 + vector.len() * 12);
     out.push_str("v1:");
     for (index, seq) in vector.iter().enumerate() {
@@ -2636,43 +2635,21 @@ pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
         .collect()
 }
 
-/// Decodes a since token for a cluster of `nodes` nodes. A legacy token naming
-/// a node index outside the cluster is invalid (`None`) rather than allocated.
-pub(crate) fn decode_since(raw: &str, nodes: usize) -> Option<Vec<u64>> {
-    let raw = raw.trim_matches('"');
-    if let Some(rest) = raw.strip_prefix("v1:") {
-        let mut out = Vec::new();
-        let rest = rest.split('~').next().unwrap_or(rest);
-        for part in rest.split(',') {
-            out.push(part.parse().ok()?);
-        }
-        return Some(out);
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw)
-        .ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    let mut out = Vec::new();
-    for (key, seq) in value.as_object()? {
-        let index: usize = key.parse().ok()?;
-        if index >= nodes {
-            return None;
-        }
-        if out.len() <= index {
-            out.resize(index + 1, 0);
-        }
-        out[index] = seq.as_u64()?;
-    }
-    Some(out)
+/// Decodes a `v1:` since token into its per-node sequence vector. Anything
+/// else is not one of ours (`None`).
+pub(crate) fn decode_since(raw: &str) -> Option<Vec<u64>> {
+    let rest = raw.trim_matches('"').strip_prefix("v1:")?;
+    let rest = rest.split('~').next().unwrap_or(rest);
+    rest.split(',').map(|part| part.parse().ok()).collect()
 }
 
-pub(crate) fn since_component(raw: Option<&str>, index: usize, nodes: usize) -> u64 {
+pub(crate) fn since_component(raw: Option<&str>, index: usize) -> u64 {
     let Some(raw) = raw else { return 0 };
     let raw = raw.trim_matches('"');
     if let Ok(seq) = raw.parse::<u64>() {
         return seq;
     }
-    decode_since(raw, nodes)
+    decode_since(raw)
         .and_then(|vector| vector.get(index).copied())
         .unwrap_or(0)
 }
@@ -3175,18 +3152,11 @@ mod tests {
         }];
         let token = encode_token(&[5, 0, 7], &marks);
         assert_eq!(token, "v1:5,0,7~1:0.3:42");
-        assert_eq!(decode_since(&token, 3), Some(vec![5, 0, 7]));
+        assert_eq!(decode_since(&token), Some(vec![5, 0, 7]));
         assert_eq!(decode_fallbacks(&token, 3), marks);
         assert!(decode_fallbacks(&token, 1).is_empty());
         assert!(decode_fallbacks("v1:5,0,7~x:1:2", 3).is_empty());
         assert!(decode_fallbacks("7", 3).is_empty());
-    }
-
-    #[test]
-    fn decode_since_rejects_out_of_range_node_index() {
-        let enc = |text: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
-        assert_eq!(decode_since(&enc(br#"{"99999999999":1}"#), 2), None);
-        assert_eq!(decode_since(&enc(br#"{"1":7}"#), 2), Some(vec![0, 7]));
     }
 
     fn doc(rev: &str, start: u64, ids: &[&str], deleted: bool) -> Value {
