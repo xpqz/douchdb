@@ -5247,6 +5247,47 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(body["userCtx"]["roles"], json!([]));
 }
 
+/// CouchDB's `GET /_session` `info.authenticated` is the name of the handler
+/// that authenticated the request (`couch_httpd_auth:handle_session_req/2`):
+/// "default" for basic auth, "cookie" for an AuthSession cookie. It is absent
+/// for an anonymous request. `authentication_db` is always reported.
+#[tokio::test]
+async fn session_info_authenticated_is_the_handler_name() {
+    let s = Server::start(true);
+    let (status, body) = s.get("/_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["info"].get("authenticated").is_none(), "{body}");
+    assert_eq!(body["info"]["authentication_db"], "_users", "{body}");
+
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "default", "{body}");
+
+    let response = s
+        .client
+        .post(format!("{}/_session", s.base))
+        .json(&json!({"name": "admin", "password": "douchdb"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("AuthSession cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &[("Cookie", cookie)])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "cookie", "{body}");
+}
+
 /// An `AuthSession` cookie value for `name`, in the format the server issues:
 /// `base64url(name:exp).base64url(HMAC-SHA256(name:exp))`. The HMAC key is the
 /// session secret plus the SHA-256 of the user's credential, here the admin
