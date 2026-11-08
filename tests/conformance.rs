@@ -392,10 +392,16 @@ fn free_port() -> u16 {
     // Tests run in parallel threads. The kernel's ephemeral-port pool can hand
     // the same released port to two tests, so assign ports from a process-wide
     // counter and confirm each one is free.
+    //
+    // The range sits below every OS's ephemeral range (macOS 49152 and up,
+    // Linux 32768 and up). Inside it, any outgoing connection, from a test
+    // server or any other process, can be given a source port equal to a
+    // test server's port, and while a node is killed its port is free for
+    // such a connection or a listener to take.
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
     loop {
         let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-        let candidate = 31000 + ((std::process::id() as usize + n * 37) % 20000);
+        let candidate = 20000 + ((std::process::id() as usize + n * 37) % 12000);
         let _guard = SPAWN_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -5305,7 +5311,8 @@ async fn wait_until_known_down(node: &Server, url: &str) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "discovery never reported {url} down: {body}"
+            "discovery never reported {url} down; last probe of it: {}; snapshot: {body}",
+            peer_probe(discovery, url)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -5332,10 +5339,20 @@ async fn wait_until_known_up(node: &Server, url: &str) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "discovery never reported {url} up: {body}"
+            "discovery never reported {url} up; last probe of it: {}; snapshot: {body}",
+            peer_probe(discovery, url)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The discovery snapshot's entry for the peer at `url`, including the probe
+/// error, for a failed wait to print.
+fn peer_probe(discovery: &Value, url: &str) -> String {
+    discovery["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|peer| peer["url"] == url))
+        .map_or_else(|| format!("{url} is not listed"), Value::to_string)
 }
 
 #[tokio::test]
