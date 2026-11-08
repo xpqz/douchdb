@@ -372,6 +372,10 @@ fn sweep_order(
     (order, next)
 }
 
+/// Route label under which the peer calls of anti-entropy metadata sync are
+/// counted in the metrics (`peer_calls` per route, one request per pass).
+const ANTI_ENTROPY_ROUTE: &str = "_background/anti_entropy";
+
 /// Run one anti-entropy pass over the databases and peers. Returns false when
 /// a pass is already in flight.
 ///
@@ -405,13 +409,20 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         names = order;
     }
 
+    // Anti-entropy runs outside any client request, so its metadata calls
+    // are counted in a scope of their own, one per pass, under a fixed route
+    // label (never derived from a path).
+    let metadata_stats = crate::cluster_http::PeerStats::new(ANTI_ENTROPY_ROUTE.to_string(), false);
     let mut error: Option<String> = None;
     for name in names {
         let Ok(db) = state.db_cold(&name).await else {
             continue;
         };
-        crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
-        crate::fabric::reconcile_security(&state.ctx, &db).await;
+        crate::cluster_http::with_stats(metadata_stats.clone(), async {
+            crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
+            crate::fabric::reconcile_security(&state.ctx, &db).await;
+        })
+        .await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();
@@ -461,6 +472,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         drop(db);
         state.release_cold().await;
     }
+    drop(metadata_stats);
     state.cluster_state.finish_replication(error);
     true
 }

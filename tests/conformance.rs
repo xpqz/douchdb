@@ -14375,6 +14375,208 @@ async fn cluster_security_without_quorum_is_accepted_and_converges() {
     wait_for_security(&nodes[1], "secpend", &security).await;
 }
 
+/// Headers that mark a request as sent by another node of the test cluster.
+fn node_headers() -> [(&'static str, String); 2] {
+    [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ]
+}
+
+/// Run one anti-entropy pass on `node` and wait until it, and the peer
+/// accounting of its calls, are done. Returns the metadata traffic that pass
+/// (and any other pass finished meanwhile) generated: `(passes, peer calls)`
+/// from the `_background/anti_entropy` route. Waits on conditions only.
+async fn metadata_pass(node: &Server) -> (u64, u64) {
+    let before = anti_entropy_counters(node).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (_, status) = node.get("/_node/_local/_replication").await;
+        let runs = status["runs"].as_u64().unwrap_or(0);
+        let (code, body) = node.post("/_node/_local/_replication/run", json!({})).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+        loop {
+            let (_, status) = node.get("/_node/_local/_replication").await;
+            let (_, metrics) = node.get("/_node/_local/_metrics").await;
+            if status["running"] == false
+                && metrics["http"]["peer_open"] == 0
+                && status["runs"].as_u64().unwrap_or(0) > runs
+            {
+                let after = anti_entropy_counters(node).await;
+                return (after.0 - before.0, after.1 - before.1);
+            }
+            if status["running"] == false && metrics["http"]["peer_open"] == 0 {
+                // The run request found a pass already finished or skipped.
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pass never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(std::time::Instant::now() < deadline, "pass never started");
+    }
+}
+
+/// `(passes, peer calls)` counted so far under the anti-entropy route.
+async fn anti_entropy_counters(node: &Server) -> (u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    metrics["http"]["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["route"] == "_background/anti_entropy")
+        .map(|row| {
+            (
+                row["peer_requests"].as_u64().unwrap_or(0),
+                row["peer_calls"].as_u64().unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Peer calls per anti-entropy pass on a converged cluster, after a warm-up
+/// pass. Every pass of a converged cluster makes the same calls.
+async fn calls_per_pass(node: &Server) -> u64 {
+    metadata_pass(node).await;
+    let (passes, calls) = metadata_pass(node).await;
+    assert!(passes >= 1, "no pass was counted");
+    assert_eq!(
+        calls % passes,
+        0,
+        "passes differ: {calls} calls in {passes}"
+    );
+    calls / passes
+}
+
+#[tokio::test]
+async fn cluster_metadata_sync_cost_does_not_grow_with_database_count() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for i in 0..2 {
+        for node in &nodes {
+            node.fresh_db(&format!("meta{i}")).await;
+        }
+    }
+    let few = calls_per_pass(&nodes[0]).await;
+    for i in 2..20 {
+        for node in &nodes {
+            node.fresh_db(&format!("meta{i}")).await;
+        }
+    }
+    let many = calls_per_pass(&nodes[0]).await;
+    // One exchange per peer, however many databases there are.
+    assert_eq!(few, 2, "2 databases");
+    assert_eq!(many, 2, "20 databases");
+}
+
+/// Wait until `check` holds, running an anti-entropy pass on every node
+/// between attempts.
+async fn converge_with_passes<F, Fut>(nodes: &[Server], what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match check().await {
+            Ok(()) => return,
+            Err(why) => assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not converge: {why}"
+            ),
+        }
+        for node in nodes {
+            metadata_pass(node).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_metadata_sync_settles_equal_version_shard_maps_and_security() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("tie").await;
+        node.fresh_db("other").await;
+    }
+    let internal = node_headers();
+    // Competing placements that share a version, on two nodes; the third
+    // node has neither. The greater placement wins everywhere.
+    for (node, target) in [(0, 0), (1, 1)] {
+        let mut map = all_shards_on(target);
+        map["version"] = json!(5);
+        let (status, body) = nodes[node]
+            .req_with(Method::PUT, "/_node/_local/_dbs/tie", Some(map), &internal)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // The same for the security object, with a newer version on one node of
+    // another database.
+    for (node, name) in [(0, "alice"), (1, "bob")] {
+        let envelope = json!({"version": 7, "security": {
+            "admins": {"names": [], "roles": []},
+            "members": {"names": [name], "roles": []}
+        }});
+        let (status, body) = nodes[node]
+            .req_with(
+                Method::PUT,
+                "/_node/_local/_dbs/tie/security",
+                Some(envelope),
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let newer = json!({"version": 9, "security": {
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["carol"], "roles": []}
+    }});
+    let (status, body) = nodes[2]
+        .req_with(
+            Method::PUT,
+            "/_node/_local/_dbs/other/security",
+            Some(newer.clone()),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    converge_with_passes(&nodes, "metadata", || async {
+        for node in &nodes {
+            let (_, map) = node
+                .req_with(Method::GET, "/_node/_local/_dbs/tie", None, &internal)
+                .await;
+            if map["version"] != 5 || map["replicas"] != all_shards_on(1)["replicas"] {
+                return Err(format!("{} shard map {map}", node.base));
+            }
+            let (_, security) = node
+                .req_with(
+                    Method::GET,
+                    "/_node/_local/_dbs/tie/security",
+                    None,
+                    &internal,
+                )
+                .await;
+            if security["version"] != 7
+                || security["security"]["members"]["names"] != json!(["bob"])
+            {
+                return Err(format!("{} security {security}", node.base));
+            }
+            let (_, security) = node
+                .req_with(
+                    Method::GET,
+                    "/_node/_local/_dbs/other/security",
+                    None,
+                    &internal,
+                )
+                .await;
+            if security != newer {
+                return Err(format!("{} other security {security}", node.base));
+            }
+        }
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn cluster_rebalance_requires_explicit_cleanup() {
     let nodes = start_cluster_with(3, "1", 1);
