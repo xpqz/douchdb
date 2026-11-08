@@ -4540,9 +4540,12 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     let (_, info) = s.get("/purgeseq").await;
     assert_eq!(info["purge_seq"], json!(0), "{info}");
 
-    let (_, body) = s
+    let (status, body) = s
         .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
         .await;
+    // purge_results_to_json (chttpd_db.erl) answers 201 unless a result was
+    // only accepted or failed.
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     assert!(
         body.as_object().unwrap().contains_key("purge_seq"),
         "{body}"
