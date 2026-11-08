@@ -7639,8 +7639,13 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     for node in &nodes {
         node.fresh_db("timeoutreb").await;
     }
+    // Default placement depends on the random ports. Pinning to node 0 when the
+    // planned placement already keeps every shard there would leave nothing to
+    // move: the rebalance would succeed instead of timing out.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/timeoutreb").await;
+    let pin = node_to_pin_away_from(&planned);
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/timeoutreb", all_shards_on(0))
+        .put("/_node/_local/_dbs/timeoutreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)
@@ -7663,7 +7668,7 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (status, counts) = nodes[0]
+    let (status, counts) = nodes[pin]
         .req_with(
             Method::GET,
             "/_node/_local/_dbs/timeoutreb/shards",
@@ -7682,7 +7687,7 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     let (status, map) = nodes[0].get("/_node/_local/_dbs/timeoutreb").await;
     assert_eq!(status, StatusCode::OK, "{map}");
     for replicas in map["replicas"].as_array().unwrap() {
-        assert_eq!(replicas[0], 0, "timeout must restore the old shard map");
+        assert_eq!(replicas[0], pin, "timeout must restore the old shard map");
     }
 
     // The timeout also lifts the write freeze, and reads kept working.
