@@ -2430,7 +2430,10 @@ impl Db {
                     self.shards[index].call(move |shard| {
                         let mut out = Vec::with_capacity(batch.len());
                         for (slot, id, opts) in batch {
-                            let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
+                            let rev = opts
+                                .rev
+                                .as_deref()
+                                .map_or_else(|| "undefined".into(), canonical_rev);
                             let result = read_doc(shard, &id, &opts);
                             out.push((slot, id, rev, result));
                         }

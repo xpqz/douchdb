@@ -3828,13 +3828,11 @@ async fn changes_revs_diff_and_bulk_get() {
         )
         .await;
     assert_eq!(
-        body["results"][0]["docs"][0]["error"]["rev"],
-        "2-abcdef0123456789abcdef0123456789",
+        body["results"][0]["docs"][0]["error"]["rev"], "2-abcdef0123456789abcdef0123456789",
         "{body}"
     );
     assert_eq!(
-        body["results"][1]["docs"][0]["error"]["rev"],
-        "1-abcdef0123456789abcdef0123456789",
+        body["results"][1]["docs"][0]["error"]["rev"], "1-abcdef0123456789abcdef0123456789",
         "{body}"
     );
 
