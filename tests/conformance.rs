@@ -7379,12 +7379,16 @@ fn all_shards_on(node: usize) -> Value {
 /// unless the planned placement already keeps every shard there. Default
 /// placement depends on the random ports.
 fn node_to_pin_away_from(planned: &Value) -> usize {
-    let all_on_zero = planned["replicas"]
+    usize::from(planned_keeps_every_shard_on(planned, 0))
+}
+
+/// Whether the planned placement keeps the first copy of every shard on `node`.
+fn planned_keeps_every_shard_on(planned: &Value, node: usize) -> bool {
+    planned["replicas"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|replicas| replicas[0] == 0);
-    usize::from(all_on_zero)
+        .all(|replicas| replicas[0] == node)
 }
 
 #[tokio::test]
@@ -7506,8 +7510,11 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         node.fresh_db("reb").await;
     }
     let (_, planned) = nodes[0].get("/_node/_local/_dbs/reb").await;
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/reb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // first rebalance always has shards to move.
+    let from = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/reb", all_shards_on(from))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7525,6 +7532,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::OK, "{map}");
     assert_eq!(map["replicas"], planned["replicas"], "{map}");
+    assert_ne!(map["version"], pinned["version"], "nothing moved: {map}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -7538,25 +7546,30 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Move everything to node1, wait for convergence, then clean node0's
-    // non-owned local shards.
+    // Move everything to another node, wait for convergence, then clean the
+    // first pin's non-owned local shards. The destination is neither the node
+    // that holds every shard of the first pin nor one the planned placement
+    // already keeps every shard on, so this move always happens.
+    let to = (0..nodes.len())
+        .find(|node| *node != from && !planned_keeps_every_shard_on(&planned, *node))
+        .unwrap();
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/reb", all_shards_on(1))
+        .put("/_node/_local/_dbs/reb", all_shards_on(to))
         .await;
     assert_eq!(status, StatusCode::OK);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let (status, body) = nodes[1].get("/reb/_all_docs").await;
+        let (status, body) = nodes[to].get("/reb/_all_docs").await;
         if status == StatusCode::OK && body["total_rows"] == 9 {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("shard move did not converge on node1: {status} {body}");
+            panic!("shard move did not converge on node {to}: {status} {body}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let (status, cleared) = nodes[0]
+    let (status, cleared) = nodes[from]
         .post("/_node/_local/_dbs/reb/cleanup", json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{cleared}");
@@ -7566,11 +7579,11 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (_, info) = nodes[0]
+    let (_, info) = nodes[from]
         .req_with(Method::GET, "/reb", None, &internal)
         .await;
     assert_eq!(info["doc_count"], 0, "old replica was not cleared");
-    let (_, info) = nodes[1]
+    let (_, info) = nodes[to]
         .req_with(Method::GET, "/reb", None, &internal)
         .await;
     assert_eq!(info["doc_count"], 9, "new replica lost data");
@@ -7586,8 +7599,12 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
     for node in &nodes {
         node.fresh_db("autoreb").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/autoreb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/autoreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/autoreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7607,6 +7624,7 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pending"], false);
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
     assert_eq!(body["cleaned"].as_array().unwrap().len(), 3);
     let map = body.as_object().unwrap();
     let replicas = map["replicas"].as_array().unwrap();
@@ -16399,8 +16417,12 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
     for node in &nodes {
         node.fresh_db("noclean").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/noclean", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/noclean").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/noclean", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)
@@ -16418,6 +16440,7 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
     assert!(body.get("cleaned").is_none(), "{body}");
 
     // The migration completed, but the old node keeps its local copies until
@@ -16426,7 +16449,7 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (status, counts) = nodes[0]
+    let (status, counts) = nodes[pin]
         .req_with(
             Method::GET,
             "/_node/_local/_dbs/noclean/shards",
@@ -16480,8 +16503,12 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
     for node in &nodes {
         node.fresh_db("delreb").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/delreb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/delreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/delreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -16513,6 +16540,7 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
 
     // Every tombstone must exist exactly once on the new owners; a deleted-only
     // shard has live count 0, so counts alone cannot establish this.
