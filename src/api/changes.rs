@@ -517,6 +517,13 @@ async fn changes_options(
         vec![0; n]
     };
     progress.resize(n, 0);
+    // This node always knows its own sequence; a token made elsewhere while it
+    // was down has no position for it, and then it is read from the start.
+    if let Some(slot) = progress.get_mut(st.ctx.cluster.me) {
+        if *slot == crate::fabric::UNKNOWN_SEQ {
+            *slot = 0;
+        }
+    }
     let since = progress.get(st.ctx.cluster.me).copied().unwrap_or(0);
     let owned = if is_forwarded(st, headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))

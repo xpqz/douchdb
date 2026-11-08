@@ -200,6 +200,18 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                     Ok(token) => token,
                     Err(e) => return fail(e),
                 };
+                // A node that did not answer has no position to report; 0
+                // makes a feed resumed from here replay it, never skip it.
+                let vector: Vec<u64> = vector
+                    .into_iter()
+                    .map(|seq| {
+                        if seq == crate::fabric::UNKNOWN_SEQ {
+                            0
+                        } else {
+                            seq
+                        }
+                    })
+                    .collect();
                 let seq = encode_token(&vector, &marks);
                 info["update_seq"] = json!(seq);
                 info["committed_update_seq"] = json!(seq);

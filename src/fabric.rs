@@ -2148,8 +2148,9 @@ pub(crate) struct FallbackMark {
 /// made because it did not answer. The node's own sequence at that moment
 /// cannot be learned afterwards, so the slot is not a position: a feed reads
 /// the node's shards from another replica for as long as it can, and only
-/// starts the node from its current sequence when there is no alternative.
-const UNKNOWN_SEQ: u64 = u64::MAX;
+/// replays the node from its start when there is no alternative (a feed may
+/// replay, never skip).
+pub(crate) const UNKNOWN_SEQ: u64 = u64::MAX;
 
 /// One stream of changes with its own sequence space: a node reading its
 /// preferred shards, or a node reading shards reassigned from a failed owner.
@@ -2236,23 +2237,19 @@ pub(crate) async fn cluster_changes(
             // Shards reassigned from a failed owner resume from the mark this
             // node left for exactly this set of shards, else from the start;
             // preferred masks are disjoint, so ids do not overlap. A node
-            // whose position was unknown when the token was made starts from
-            // its current sequence instead of replaying its history.
-            let known = match round {
-                Round::Owner => Some(since_ref[node]),
+            // whose position was unknown when the token was made is read
+            // from the start too: a feed may replay, never skip.
+            let since = match round {
+                Round::Owner => Some(since_ref[node]).filter(|seq| *seq != UNKNOWN_SEQ),
                 Round::Fallback => marks_ref
                     .iter()
                     .find(|mark| mark.node == node && mark.shards == shards)
                     .map(|mark| mark.seq),
-            };
-            let since = match known {
-                Some(since) if since != UNKNOWN_SEQ => Some(since),
-                None if since_ref[node] != UNKNOWN_SEQ => Some(0),
-                _ => None,
-            };
-            let start = since.map_or(ChangesStart::Now, ChangesStart::At);
+            }
+            .unwrap_or(0);
+            let start = ChangesStart::At(since);
             let value = fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
-            Ok((shards, since, value))
+            Ok((shards, Some(since), value))
         },
     )
     .await?;

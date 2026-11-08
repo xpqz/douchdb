@@ -5958,6 +5958,17 @@ async fn cluster_changes_since_now_with_a_node_down_does_not_replay_it_after_rec
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
     let since = body["last_seq"].as_str().unwrap().to_string();
+    // The database's own update_seq never carries the placeholder for the
+    // missing position.
+    let (status, info) = nodes[reader].get("/clnowback").await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert!(
+        !info["update_seq"]
+            .as_str()
+            .unwrap()
+            .contains("18446744073709551615"),
+        "{info}"
+    );
 
     nodes[victim].restart();
     wait_until_known_up(&nodes[reader], &url).await;
@@ -5975,11 +5986,12 @@ async fn cluster_changes_since_now_with_a_node_down_does_not_replay_it_after_rec
 }
 
 /// A replica that is down at `since=now` and is not the preferred owner of
-/// any shard gets a vector slot too. When the preferred owner later fails and
-/// that replica takes over, it must resume from "now", not from its first
-/// change.
+/// any shard gets no position in the vector. When the preferred owner later
+/// fails and that replica is the only copy left, it is read from its start: a
+/// feed may replay but must deliver every change made after `since=now`,
+/// including those that landed on the replica while it was up again.
 #[tokio::test]
-async fn cluster_changes_since_now_does_not_replay_a_replica_that_was_down() {
+async fn cluster_changes_since_now_does_not_skip_what_a_replica_that_was_down_holds() {
     let mut nodes = start_cluster_with(3, "3600", 2);
     for node in &nodes {
         node.fresh_db("clnowrep").await;
@@ -6011,16 +6023,23 @@ async fn cluster_changes_since_now_does_not_replay_a_replica_that_was_down() {
 
     nodes[2].restart();
     wait_until_known_up(&nodes[0], &replica_url).await;
+    // Written to both copies, every shard, after `since=now`.
+    let late: Vec<String> = (0..8).map(|i| format!("late{i}")).collect();
+    let docs: Vec<Value> = late.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clnowrep/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
     nodes[1].kill();
     wait_until_known_down(&nodes[0], &owner_url).await;
     let (status, body) = nodes[0]
         .get(&format!("/clnowrep/_changes?since={since}"))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        change_ids(&body).is_empty(),
-        "since=now replayed history from the replica: {body}"
-    );
+    let got = change_ids(&body);
+    for id in &late {
+        assert!(got.contains(&id.as_str()), "{id} was skipped: {body}");
+    }
 }
 
 #[tokio::test]
