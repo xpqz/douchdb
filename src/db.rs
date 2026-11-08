@@ -2938,6 +2938,12 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
     compile_views(obj)
 }
 
+/// Every compile of a view function with the name of the thread that ran it,
+/// for the tests that check where the compile happens.
+#[cfg(test)]
+static COMPILE_LOG: std::sync::Mutex<Vec<(String, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// CouchDB's `try_compile`. A design document in another language is saved
 /// unchecked: there is no query server to compile it.
 fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
@@ -2962,6 +2968,14 @@ fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
             if member == "reduce" && source.starts_with('_') {
                 continue;
             }
+            #[cfg(test)]
+            COMPILE_LOG
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((
+                    source.clone(),
+                    std::thread::current().name().map(str::to_string),
+                ));
             if let Err(message) = check_compiles(function, source, limits) {
                 return Err(ApiError::new(
                     400,
@@ -5959,6 +5973,82 @@ mod tests {
         )
         .unwrap();
         (db, root)
+    }
+
+    /// The threads a given map function was compiled on.
+    fn compiled_on(source: &str) -> Vec<Option<String>> {
+        COMPILE_LOG
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|(compiled, _)| compiled == source)
+            .map(|(_, thread)| thread.clone())
+            .collect()
+    }
+
+    fn design_doc_with_map(map: &str) -> Value {
+        json!({"_id": "_design/d", "views": {"v": {"map": map}}})
+    }
+
+    /// Saving a design document must not hold its shard's writer while the
+    /// functions compile: the check runs before the shard job, never on the
+    /// shard thread, and once per save.
+    #[tokio::test]
+    async fn design_doc_compile_runs_outside_the_shard_thread() {
+        let (db, root) = purge_test_db("compile-outside", ShardMap::single(1));
+        let map = "function(doc){ /* outside-shard */ emit(doc._id, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(map)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+        let threads = compiled_on(map);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert!(
+            threads
+                .iter()
+                .flatten()
+                .all(|name| !name.starts_with("shard-")),
+            "compiled on the shard thread: {threads:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A revision conflict still wins over a compile error, and a replicated
+    /// design document that is already stored is not compiled again.
+    #[tokio::test]
+    async fn compile_verdict_keeps_conflict_first_and_skips_stored_docs() {
+        let (db, root) = purge_test_db("compile-order", ShardMap::single(1));
+        let good = "function(doc){ /* order-good */ emit(1, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(good)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+
+        let bad = "function(doc){ /* order-bad */ emit(";
+        let conflict = db
+            .put_docs(vec![design_doc_with_map(bad)], true)
+            .await
+            .unwrap();
+        assert_eq!(conflict[0]["error"], "conflict", "{conflict:?}");
+
+        let replicated_map = "function(doc){ /* order-replicated */ emit(1, 1); }";
+        let hash = "b".repeat(32);
+        let replicated = json!({
+            "_id": "_design/r",
+            "_rev": format!("1-{hash}"),
+            "_revisions": {"start": 1, "ids": [hash]},
+            "views": {"v": {"map": replicated_map}},
+        });
+        for _ in 0..2 {
+            let out = db.put_docs(vec![replicated.clone()], false).await.unwrap();
+            assert_eq!(out[0]["ok"], true, "{out:?}");
+        }
+        assert_eq!(compiled_on(replicated_map).len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A purge info another copy recorded is applied once: replaying it
