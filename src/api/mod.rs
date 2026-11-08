@@ -5,8 +5,8 @@ use crate::auth::Principal;
 use crate::cluster::{ShardMap, ShardMask};
 use crate::cluster_http::{forward_client_auth, internal_request, peer_url, send_peer};
 use crate::db::{
-    attachments_unsupported, validate_design_doc, validate_doc, AllDocsOpts, ApiError, ChangesOpts,
-    Db, DbResult, DocOpts,
+    attachments_unsupported, validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult,
+    DocOpts,
 };
 use crate::fabric::*;
 pub(crate) use crate::params::{

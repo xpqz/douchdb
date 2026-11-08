@@ -22,6 +22,9 @@ const BODY_SWEEP_BATCH: usize = 1000;
 #[cfg(test)]
 const BODY_SWEEP_BATCH: usize = 3;
 
+/// Count of purged documents, big-endian like the other `z/` counters.
+const PURGE_SEQ_KEY: &[u8] = b"z/purge_seq";
+
 pub fn meta_key(docid: &str) -> Vec<u8> {
     key(b"m/", docid)
 }
@@ -858,6 +861,26 @@ impl Shard {
             .get_at(&snapshot, key)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(value.map(|bytes| bytes.to_vec()))
+    }
+
+    /// How many documents have been purged from this shard.
+    pub fn purge_seq(&mut self) -> Result<u64> {
+        Ok(self
+            .get_checked(PURGE_SEQ_KEY)?
+            .filter(|bytes| bytes.len() == 8)
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .fold(0, |acc, byte| (acc << 8) | u64::from(*byte))
+            })
+            .unwrap_or(0))
+    }
+
+    /// Count one more purged document in `tx`.
+    pub fn count_purge(&mut self, tx: &mut Tx) -> Result<()> {
+        let next = self.purge_seq()?.saturating_add(1);
+        tx.put(PURGE_SEQ_KEY, &next.to_be_bytes());
+        Ok(())
     }
 
     pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {

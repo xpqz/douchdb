@@ -607,10 +607,79 @@ fn reduce_blocks(
 }
 
 fn is_builtin(source: &str) -> bool {
-    matches!(
-        source,
-        "_count" | "_sum" | "_stats" | "_approx_count_distinct"
-    )
+    Builtin::parse(source).is_some()
+}
+
+/// The built-in reduces, which CouchDB selects by name prefix:
+/// `_sum_anything` is `_sum`. `_top_N` and `_bottom_N` carry their rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Builtin {
+    Count,
+    Sum,
+    Stats,
+    Distinct,
+    Top(usize),
+    Bottom(usize),
+    First,
+    Last,
+}
+
+/// The largest `N` of `_top_N` and `_bottom_N`.
+const MAX_RANK: i64 = 100;
+
+impl Builtin {
+    /// The built-in a reduce source names, in the order of CouchDB's
+    /// `couch_query_servers:builtin_reduce/4`.
+    pub(crate) fn parse(source: &str) -> Option<Builtin> {
+        if source.starts_with("_sum") {
+            Some(Builtin::Sum)
+        } else if source.starts_with("_count") {
+            Some(Builtin::Count)
+        } else if source.starts_with("_stats") {
+            Some(Builtin::Stats)
+        } else if source.starts_with("_approx_count_distinct") {
+            Some(Builtin::Distinct)
+        } else if let Some(rank) = source.strip_prefix("_top_") {
+            parse_rank(rank).ok().map(Builtin::Top)
+        } else if let Some(rank) = source.strip_prefix("_bottom_") {
+            parse_rank(rank).ok().map(Builtin::Bottom)
+        } else if source.starts_with("_first") {
+            Some(Builtin::First)
+        } else if source.starts_with("_last") {
+            Some(Builtin::Last)
+        } else {
+            None
+        }
+    }
+}
+
+/// CouchDB's `check_rank/1`: Erlang's `binary_to_integer` (optional sign,
+/// then digits) in 1..=100.
+fn parse_rank(rank: &str) -> Result<usize, String> {
+    let digits = rank.strip_prefix(['+', '-']).unwrap_or(rank);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid rank reducer".to_string());
+    }
+    match rank.parse::<i64>() {
+        Ok(value) if (1..=MAX_RANK).contains(&value) => Ok(value as usize),
+        _ => Err(format!("rank value must be between 1 and {MAX_RANK}")),
+    }
+}
+
+/// CouchDB's save-time check of a view's reduce (`couch_mrview:validate/2`):
+/// a name starting with `_` must be a builtin. The error is the reason of
+/// `invalid_design_doc`.
+pub(crate) fn check_reduce_name(reduce: &str) -> Result<(), String> {
+    if let Some(rank) = reduce
+        .strip_prefix("_top_")
+        .or_else(|| reduce.strip_prefix("_bottom_"))
+    {
+        return parse_rank(rank).map(|_| ());
+    }
+    if reduce.starts_with('_') && Builtin::parse(reduce).is_none() {
+        return Err(format!("`{reduce}` is not a supported reduce function."));
+    }
+    Ok(())
 }
 
 impl Clone for ViewRows {
@@ -1042,12 +1111,16 @@ fn reduce_rows<'a>(
     rows: impl Iterator<Item = &'a Row> + Clone,
     reducer: &mut JsReducer,
 ) -> Result<Value, JsError> {
-    match reducer.source() {
-        "_count" => Ok(json!(rows.count())),
-        "_sum" => reduce_sum(rows.map(|row| &row.value)),
-        "_stats" => reduce_stats(rows.map(|row| &row.value)),
-        "_approx_count_distinct" => Ok(crate::hll::partial(rows.map(|row| &row.key))),
-        _ => {
+    match Builtin::parse(reducer.source()) {
+        Some(Builtin::Count) => Ok(json!(rows.count())),
+        Some(Builtin::Sum) => reduce_sum(rows.map(|row| &row.value)),
+        Some(Builtin::Stats) => reduce_stats(rows.map(|row| &row.value)),
+        Some(Builtin::Distinct) => Ok(crate::hll::partial(rows.map(|row| &row.key))),
+        Some(Builtin::Top(rank)) => Ok(rank_list(rows.map(|row| &row.value), rank, true)),
+        Some(Builtin::Bottom(rank)) => Ok(rank_list(rows.map(|row| &row.value), rank, false)),
+        Some(Builtin::First) => Ok(extreme_partial(rows.min_by(|a, b| row_cmp(a, b)))),
+        Some(Builtin::Last) => Ok(extreme_partial(rows.max_by(|a, b| row_cmp(a, b)))),
+        None => {
             let keys: Vec<Value> = rows.clone().map(|row| json!([row.id, row.key])).collect();
             let values: Vec<Value> = rows.map(|row| row.value.clone()).collect();
             reduce_with(reducer, &keys, &values)
@@ -1130,8 +1203,8 @@ pub(crate) fn assemble_reduce(
         };
         // Owners hand their sketches to the coordinator, which reports the
         // estimate of the union.
-        if reducer.source() == "_approx_count_distinct" && query.owner_shards.is_none() {
-            value = crate::hll::finish(&value)?;
+        if query.owner_shards.is_none() {
+            value = finish_partial(reducer.source(), value)?;
         }
         rows.push(json!({"key": key, "value": value}));
     }
@@ -1143,22 +1216,101 @@ pub(crate) fn combine_partials(
     reducer: &mut JsReducer,
     partials: &[Value],
 ) -> Result<Value, JsError> {
-    match reducer.source() {
-        "_count" => Ok(json!(partials
+    match Builtin::parse(reducer.source()) {
+        Some(Builtin::Count) => Ok(json!(partials
             .iter()
             .map(|value| value.as_u64().unwrap_or(0))
             .sum::<u64>())),
         // A partial that is already an error stays the error.
-        "_sum" => match partials.iter().find(|value| {
+        Some(Builtin::Sum) => match partials.iter().find(|value| {
             value.get("error").and_then(Value::as_str) == Some("builtin_reduce_error")
         }) {
             Some(error) => Ok(error.clone()),
             None => reduce_sum(partials),
         },
-        "_stats" => reduce_stats(partials),
-        "_approx_count_distinct" => crate::hll::combine(partials),
-        _ => reducer.call(&[], partials, true),
+        Some(Builtin::Stats) => reduce_stats(partials),
+        Some(Builtin::Distinct) => crate::hll::combine(partials),
+        Some(Builtin::Top(rank)) => rank_combine(partials, rank, true),
+        Some(Builtin::Bottom(rank)) => rank_combine(partials, rank, false),
+        Some(Builtin::First) => extreme_combine(partials, false),
+        Some(Builtin::Last) => extreme_combine(partials, true),
+        None => reducer.call(&[], partials, true),
     }
+}
+
+/// The reported value for a partial reduction. Most partials are the value;
+/// a sketch is reported as its estimate, and `_first` and `_last` keep the
+/// `[key, docid, value]` of their row until the end.
+fn finish_partial(source: &str, partial: Value) -> Result<Value, JsError> {
+    match Builtin::parse(source) {
+        Some(Builtin::Distinct) => crate::hll::finish(&partial),
+        Some(Builtin::First | Builtin::Last) => match partial {
+            Value::Array(mut parts) if parts.len() == 3 => Ok(parts.swap_remove(2)),
+            _ => Ok(Value::Null),
+        },
+        _ => Ok(partial),
+    }
+}
+
+/// The `rank` largest (or smallest) distinct values, as CouchDB's
+/// `builtin_rank_n/4` keeps them: a collation-sorted list in which a value
+/// equal to one already kept is dropped.
+fn rank_list<'a>(values: impl Iterator<Item = &'a Value>, rank: usize, top: bool) -> Value {
+    let mut sorted: Vec<&Value> = values.collect();
+    // A stable sort keeps the earliest of equal values first, as `umerge`
+    // prefers the accumulated list.
+    sorted.sort_by(|a, b| if top { cmp_json(b, a) } else { cmp_json(a, b) });
+    sorted.dedup_by(|later, earlier| cmp_json(later, earlier) == Ordering::Equal);
+    Value::Array(sorted.into_iter().take(rank).cloned().collect())
+}
+
+fn rank_combine(partials: &[Value], rank: usize, top: bool) -> Result<Value, JsError> {
+    let mut values = Vec::new();
+    for partial in partials {
+        let Value::Array(list) = partial else {
+            return Err(JsError::Invalid(
+                "invalid _top_N/_bottom_N partial".to_string(),
+            ));
+        };
+        values.extend(list);
+    }
+    Ok(rank_list(values.into_iter(), rank, top))
+}
+
+/// The `[key, docid, value]` of the row `_first` or `_last` picked, or `[]`
+/// for no rows.
+fn extreme_partial(row: Option<&Row>) -> Value {
+    match row {
+        Some(row) => json!([row.key, row.id, row.value]),
+        None => json!([]),
+    }
+}
+
+/// The partial of the smallest (or largest) `[key, docid]` among `partials`.
+fn extreme_combine(partials: &[Value], last: bool) -> Result<Value, JsError> {
+    let mut best: Option<(&Value, &str, &Value)> = None;
+    for partial in partials {
+        let parts = match partial.as_array().map(Vec::as_slice) {
+            Some([]) => continue,
+            Some([key, Value::String(id), value]) => (key, id.as_str(), value),
+            _ => return Err(JsError::Invalid("invalid _first/_last partial".to_string())),
+        };
+        let better = best.is_none_or(|(key, id, _)| {
+            let order = cmp_json(parts.0, key).then_with(|| parts.1.cmp(id));
+            if last {
+                order != Ordering::Less
+            } else {
+                order == Ordering::Less
+            }
+        });
+        if better {
+            best = Some(parts);
+        }
+    }
+    Ok(match best {
+        Some((key, id, value)) => json!([key, id, value]),
+        None => json!([]),
+    })
 }
 
 /// Rows are ordered by CouchDB key collation, then document id.
@@ -2378,6 +2530,79 @@ pub(crate) fn run_map_json(
     run_map_js(source, docs, limits)
 }
 
+/// Which of a view's functions [`check_compiles`] is looking at.
+#[derive(Clone, Copy)]
+pub(crate) enum ViewFunction {
+    Map,
+    Reduce,
+}
+
+/// Compile a view function without running it, as CouchDB's `add_fun` does
+/// when a design document is saved. The source is evaluated in the same
+/// position as in the real wrappers, so it compiles here exactly when it would
+/// at query time; the stand-in it is wrapped in does nothing with its input.
+/// Returns the engine's message, to be put in CouchDB's `compilation_error`.
+pub(crate) fn check_compiles(
+    function: ViewFunction,
+    source: &str,
+    limits: ViewLimits,
+) -> Result<(), String> {
+    const NOT_A_FUNCTION: &str = "Expression does not eval to a function.";
+    let probe = format!(
+        "(function(){{ if (typeof ({source}) !== \"function\") throw new Error(\"{NOT_A_FUNCTION}\"); return function(){{}}; }})()"
+    );
+    let result = if crate::js::sandboxed() {
+        // The sandbox has no compile-only request; the probe's stand-in
+        // function runs once on an empty input.
+        match function {
+            ViewFunction::Map => {
+                run_map_js(&probe, &[("_".to_string(), "{}".to_string())], limits).map(|_| ())
+            }
+            ViewFunction::Reduce => run_reduce(&probe, &[], &[], false, limits).map(|_| ()),
+        }
+    } else {
+        probe_native(&probe, limits).map_err(JsError::Runtime)
+    };
+    result.map_err(|error| {
+        let text = error.to_string();
+        let text = text.trim_start_matches("compile: ");
+        if text.contains(NOT_A_FUNCTION) {
+            NOT_A_FUNCTION.to_string()
+        } else {
+            text.to_string()
+        }
+    })
+}
+
+/// Evaluate the probe in-process, keeping the exception's own name and
+/// message, which a plain `rquickjs::Error` does not carry.
+fn probe_native(probe: &str, limits: ViewLimits) -> Result<(), String> {
+    let runtime = engine(limits).map_err(|error| error.to_string())?;
+    let context = rquickjs::Context::full(&runtime).map_err(|error| error.to_string())?;
+    crate::js::guard("view function", || {
+        Ok(
+            context.with(|ctx| match ctx.eval::<rquickjs::Value, _>(probe) {
+                Ok(_) => Ok(()),
+                Err(rquickjs::Error::Exception) => {
+                    let thrown = ctx.catch();
+                    let text = |member: &str| {
+                        thrown
+                            .as_object()
+                            .and_then(|object| object.get::<_, String>(member).ok())
+                    };
+                    Err(match (text("name"), text("message")) {
+                        (Some(name), Some(message)) => format!("{name}: {message}"),
+                        (None, Some(message)) => message,
+                        _ => "Exception generated by QuickJS".to_string(),
+                    })
+                }
+                Err(other) => Err(other.to_string()),
+            }),
+        )
+    })
+    .map_err(|error| error.to_string())?
+}
+
 /// The native path must emit exactly what the JavaScript view server would.
 /// JavaScript numbers are doubles, so a float or an integer beyond 2^53 can
 /// come back different (`100.0` as `100`, `2^63` rounded). Re-run the
@@ -2632,25 +2857,13 @@ fn render(
         }
         let mut out = Vec::new();
         for (key, members) in groups {
-            let value = match reducer.as_str() {
-                "_count" => Ok(json!(members.len())),
-                "_sum" => reduce_sum(members.iter().map(|row| &row.value)),
-                "_stats" => reduce_stats(members.iter().map(|row| &row.value)),
-                "_approx_count_distinct" => {
-                    let partial = crate::hll::partial(members.iter().map(|row| &row.key));
-                    if query.owner_shards.is_some() {
-                        Ok(partial)
-                    } else {
-                        crate::hll::finish(&partial)
-                    }
+            let value = reduce_rows(members.iter().copied(), &mut js).and_then(|partial| {
+                if query.owner_shards.is_some() {
+                    Ok(partial)
+                } else {
+                    finish_partial(reducer, partial)
                 }
-                _ => {
-                    let keys: Vec<Value> =
-                        members.iter().map(|row| json!([row.id, row.key])).collect();
-                    let values: Vec<Value> = members.iter().map(|row| row.value.clone()).collect();
-                    reduce_with(&mut js, &keys, &values)
-                }
-            };
+            });
             let value = match value {
                 Ok(value) => value,
                 Err(reason) => return Err(reduce_failure(&reason)),
@@ -3880,6 +4093,10 @@ mod tests {
             "_sum",
             "_stats",
             "_approx_count_distinct",
+            "_top_3",
+            "_bottom_2",
+            "_first",
+            "_last",
             "function(k, v, re){ return sum(v); }",
         ] {
             let spec = ViewSpec {
@@ -4248,6 +4465,10 @@ mod tests {
             "_sum",
             "_stats",
             "_approx_count_distinct",
+            "_top_3",
+            "_bottom_2",
+            "_first",
+            "_last",
             "function(k, v, re){ return sum(v); }",
         ];
         let check = |view: &ViewRows, rows: &[Row], reducers: &[&str]| {

@@ -31,7 +31,12 @@ where behaviour is best-effort, it says so.
 
 - A read asks `r` replicas (`r` defaults to `n/2+1`, `?r=1` is the local fast
   path). If fewer than `r` replicas answer, the response is
-  `503 quorum_not_met`.
+  `503 quorum_not_met`. This is a deliberate departure from CouchDB, whose
+  `fabric_doc_open` serves the best document it received when `r` is not met;
+  douchdb stays strict because linearizability checks depend on it. When no
+  replica answered at all, the errors are CouchDB's: `500 error`/`read_failure`
+  for a plain or `revs_info` read, `503 service unavailable`
+  (`all_workers_died`) for `open_revs` or an explicit `rev`.
 - Replica responses are reconciled by revision ancestry before winner
   selection. A longer ancestry on one replica is not discarded.
 - The winner is the live leaf with the highest position, then the greatest

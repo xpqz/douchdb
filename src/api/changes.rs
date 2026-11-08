@@ -89,8 +89,12 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
         Err(error) => return fail(error),
     };
     let local_only = is_forwarded(&st, headers);
-    let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
-    if !["normal", "continuous", "live", "longpoll", "eventsource"].contains(&feed) {
+    // `live` is sugar for `continuous` (`chttpd_db:parse_changes_query`).
+    let feed = match q.get("feed").map(String::as_str).unwrap_or("normal") {
+        "live" => "continuous",
+        feed => feed,
+    };
+    if !["normal", "continuous", "longpoll", "eventsource"].contains(&feed) {
         return fail(ApiError::bad_request(
             "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
         ));

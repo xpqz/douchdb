@@ -572,6 +572,36 @@ async fn welcome_and_database_lifecycle() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The first line of the raw HTTP/1.1 response to `GET path`.
+fn raw_status_line(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// CouchDB answers through mochiweb, which takes reason phrases from
+/// `httpd_util:reason_phrase/1`; for 404 that is "Object Not Found".
+#[tokio::test]
+async fn not_found_status_line_says_object_not_found() {
+    let s = Server::start(false);
+    assert_eq!(
+        raw_status_line(s.port, "/no-such-db"),
+        "HTTP/1.1 404 Object Not Found"
+    );
+    assert_eq!(raw_status_line(s.port, "/"), "HTTP/1.1 200 OK");
+}
+
 /// Status of `GET /{db}` answered from `node`'s own copy only, as a peer
 /// would: the coordinator's cluster-wide `update_seq` would also need every
 /// other node to have the database.
@@ -2637,6 +2667,36 @@ async fn plus_in_paths_and_query_strings_decodes_as_space() {
 /// The database segment is decoded like any other path segment, so `a+b` is
 /// the name "a b", which CouchDB 3.5 refuses on create with
 /// `illegal_database_name` and reports as missing everywhere else. Only
+/// A missing database answers with CouchDB's exact reason on every path that
+/// can discover it, whatever layer notices first.
+#[tokio::test]
+async fn missing_database_reason_is_couchdb_text() {
+    let s = Server::start(false);
+    for (method, path) in [
+        ("GET", "/missing"),
+        ("DELETE", "/missing"),
+        ("GET", "/missing/doc"),
+        ("PUT", "/missing/doc"),
+        ("GET", "/missing/_changes"),
+        ("GET", "/missing/_all_docs"),
+        ("GET", "/missing/_security"),
+        ("POST", "/missing/_bulk_docs"),
+    ] {
+        let (status, body) = match method {
+            "GET" => s.get(path).await,
+            "DELETE" => s.delete(path).await,
+            "POST" => s.post(path, json!({"docs": []})).await,
+            _ => s.put(path, json!({})).await,
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {body}");
+        assert_eq!(body["error"], "not_found", "{method} {path}: {body}");
+        assert_eq!(
+            body["reason"], "Database does not exist.",
+            "{method} {path}: {body}"
+        );
+    }
+}
+
 /// `a%2Bb` names the legal database "a+b".
 #[tokio::test]
 async fn plus_in_database_names_decodes_as_space() {
@@ -2695,6 +2755,52 @@ async fn plus_in_database_names_decodes_as_space() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = s.delete("/pa%2Bb").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// CouchDB's `couch_db:validate_dbname` accepts `^[a-z][a-z0-9_$()+/-]*$` and
+/// the system databases `_users`, `_replicator` and `_global_changes`.
+#[tokio::test]
+async fn database_names_follow_the_couchdb_rule() {
+    let s = Server::start(false);
+    let reason = |name: &str| {
+        format!(
+            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+        )
+    };
+    for (path, name) in [
+        ("/1abc", "1abc"),
+        ("/-abc", "-abc"),
+        ("/$abc", "$abc"),
+        ("/(abc", "(abc"),
+        ("/_other", "_other"),
+        ("/_dbs", "_dbs"),
+        ("/aBc", "aBc"),
+        ("/ab.c", "ab.c"),
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
+        assert_eq!(body["reason"], reason(name), "{path}: {body}");
+    }
+
+    // The slash is legal anywhere after the first letter, doubled or trailing.
+    for path in [
+        "/_users",
+        "/_replicator",
+        "/_global_changes",
+        "/a-1",
+        "/a$()%2B_-9",
+        "/a%2F%2Fb",
+        "/a%2Fb%2F",
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let (status, body) = s.put("/_users/org.couchdb.user:bob", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 /// Stop the server for good, then start it again on the same data directory.
@@ -3587,6 +3693,37 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
 }
 
+/// CouchDB's `chttpd_db:parse_changes_query` rewrites `feed=live` to
+/// `continuous` ("sugar for continuous"), so it streams one JSON line per
+/// change and closes with the `last_seq` line, not a single `results` object.
+#[tokio::test]
+async fn changes_feed_live_is_continuous() {
+    let s = Server::start(false);
+    s.fresh_db("livefeed").await;
+    let (status, _) = s.put("/livefeed/a", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = s
+        .client
+        .get(format!(
+            "{}/livefeed/_changes?feed=live&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("line is JSON"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows[0]["id"], "a", "{text}");
+    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 0}), "{text}");
+}
+
 #[tokio::test]
 async fn changes_supports_sse_eventsource_feed() {
     let s = Server::start(false);
@@ -3678,6 +3815,26 @@ async fn changes_revs_diff_and_bulk_get() {
         .is_none());
     assert_eq!(body["results"][1]["docs"][0]["error"]["error"], "not_found");
     assert_eq!(body["results"][1]["docs"][0]["error"]["rev"], "undefined");
+
+    // The rev an entry reports is the canonical lower-case form (CouchDB's
+    // couch_doc:parse_rev/1 decodes the hex id), not the string as requested.
+    let (_, body) = s
+        .post(
+            "/rep/_bulk_get",
+            json!({"docs": [
+                {"id": "a", "rev": "2-ABCDEF0123456789ABCDEF0123456789"},
+                {"id": "nope", "rev": "1-ABCDEF0123456789ABCDEF0123456789"}
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        body["results"][0]["docs"][0]["error"]["rev"], "2-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
+    assert_eq!(
+        body["results"][1]["docs"][0]["error"]["rev"], "1-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
 
     let (_, body) = s
         .post(
@@ -4006,6 +4163,151 @@ async fn new_edits_false_derives_rev_from_revisions() {
     );
 }
 
+// couch_doc:transfer_fields/3 (src/couch/src/couch_doc.erl) validates
+// `_revisions` for every document, in this order: `start` must be an integer,
+// `ids` must be an array, then each id is parsed by parse_revid/2. All of them
+// are `doc_validation`, 400.
+#[tokio::test]
+async fn malformed_revisions_answer_doc_validation_with_couchdb_reasons() {
+    let s = Server::start(false);
+    s.fresh_db("badrevs").await;
+    let hex32 = "a".repeat(32);
+    let bad_hex = "z".repeat(32);
+    let start_reason = "_revisions.start isn't an integer.";
+    let ids_reason = "_revisions.ids isn't a array.";
+    let cases = [
+        (json!({"ids": ["aaaa"]}), start_reason),
+        (json!({"start": "1", "ids": ["aaaa"]}), start_reason),
+        (json!({"start": 1.5, "ids": ["aaaa"]}), start_reason),
+        (json!({"start": null, "ids": ["aaaa"]}), start_reason),
+        // `start` is checked before `ids`.
+        (json!({"start": "x", "ids": "y"}), start_reason),
+        (json!({"start": 1}), ids_reason),
+        (json!({"start": 1, "ids": "aaaa"}), ids_reason),
+        (json!({"start": 1, "ids": {"a": 1}}), ids_reason),
+        (json!({"start": 1, "ids": [1]}), "RevId isn't a string"),
+        (
+            json!({"start": 1, "ids": [hex32.clone(), null]}),
+            "RevId isn't a string",
+        ),
+        (
+            json!({"start": 0, "ids": [["aaaa"]]}),
+            "RevId isn't a string",
+        ),
+        // parse_revid/2 only takes a non-negative start for short ids.
+        (
+            json!({"start": -1, "ids": ["aaaa"]}),
+            "RevId isn't a string",
+        ),
+        (
+            json!({"start": 1, "ids": [bad_hex.clone()]}),
+            "RevId isn't a valid hexadecimal",
+        ),
+        (
+            json!({"start": 2, "ids": [hex32, "bbbb", bad_hex]}),
+            "RevId isn't a valid hexadecimal",
+        ),
+    ];
+    for (revisions, reason) in cases {
+        for path in ["p?new_edits=false", "p"] {
+            let (status, body) = s
+                .put(
+                    &format!("/badrevs/{path}"),
+                    json!({"_revisions": revisions}),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{revisions} {path}: {body}"
+            );
+            assert_eq!(
+                body,
+                json!({"error": "doc_validation", "reason": reason}),
+                "{revisions} {path}"
+            );
+        }
+    }
+
+    let (status, body) = s
+        .post(
+            "/badrevs/_bulk_docs",
+            json!({"new_edits": false, "docs": [{"_id": "b", "_revisions": {"start": "1"}}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "doc_validation", "reason": start_reason})
+    );
+
+    // A `_revisions` that is not an object falls through to the unknown
+    // special member clause.
+    let (status, body) = s
+        .put("/badrevs/p?new_edits=false", json!({"_revisions": "x"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "doc_validation", "reason": "Bad special document member: _revisions"})
+    );
+
+    let (status, body) = s.get("/badrevs/p").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+// Deliberate departure: CouchDB 3.5.3 stores `_revisions` with `start: 0` as
+// `0-x`, but nothing generates such revisions, so douchdb answers 400. The
+// validation itself accepts `start: 0`.
+#[tokio::test]
+async fn revisions_start_zero_is_refused() {
+    let s = Server::start(false);
+    s.fresh_db("zero").await;
+    let (status, body) = s
+        .put(
+            "/zero/z?new_edits=false",
+            json!({"_revisions": {"start": 0, "ids": ["aaaa"]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "bad_request", "reason": "Invalid rev format"})
+    );
+    let (status, body) = s.get("/zero/z").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+// CouchDB stores `_revisions` as given, whatever `start` and the number of ids:
+// with fewer ids than `start` the oldest id sits at `start - len + 1`.
+#[tokio::test]
+async fn revisions_with_fewer_ids_than_start_are_stored_as_given() {
+    let s = Server::start(false);
+    s.fresh_db("short").await;
+    let (status, body) = s
+        .post(
+            "/short/_bulk_docs",
+            json!({"new_edits": false, "docs": [
+                {"_id": "s", "_revisions": {"start": 5, "ids": ["bbbb", "aaaa"]}, "v": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get("/short/s?revs=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_rev"], "5-bbbb");
+    assert_eq!(
+        body["_revisions"],
+        json!({"start": 5, "ids": ["bbbb", "aaaa"]})
+    );
+    let (_, body) = s.get("/short/s?open_revs=all").await;
+    assert_eq!(body[0]["ok"]["_rev"], "5-bbbb");
+    let (_, body) = s
+        .post("/short/_revs_diff", json!({"s": ["4-aaaa", "3-aaaa"]}))
+        .await;
+    assert_eq!(body, json!({"s": {"missing": ["3-aaaa"]}}));
+}
+
 #[tokio::test]
 async fn new_edits_false_merges_paths_and_keeps_conflicts() {
     let s = Server::start(false);
@@ -4205,7 +4507,7 @@ async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     let rev3 = r3["rev"].as_str().unwrap().to_string();
 
     let (status, body) = s.post("/purge/_purge", json!({"a": [rev2]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["purged"]["a"], json!([]), "interior revs are ignored");
     let (status, body) = s.get(&format!("/purge/a?rev={rev2}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -4222,6 +4524,41 @@ async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = s.get(&format!("/purge/a?rev={rev1}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// CouchDB answers `_purge` with `"purge_seq": null` (chttpd_db `db_req` for
+// `_purge`) and reports the database's purge sequence in `GET /db`, where it
+// advances once per purged document.
+#[tokio::test]
+async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
+    let s = Server::start(false);
+    s.fresh_db("purgeseq").await;
+    let (_, r) = s.put("/purgeseq/a", json!({"v": 1})).await;
+    let rev_a = r["rev"].as_str().unwrap().to_string();
+    let (_, r) = s.put("/purgeseq/b", json!({"v": 1})).await;
+    let rev_b = r["rev"].as_str().unwrap().to_string();
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(0), "{info}");
+
+    let (status, body) = s
+        .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
+        .await;
+    // purge_results_to_json (chttpd_db.erl) answers 201 unless a result was
+    // only accepted or failed.
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body.as_object().unwrap().contains_key("purge_seq"),
+        "{body}"
+    );
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(2), "{info}");
+
+    // A purge that removes nothing does not advance it.
+    let (_, body) = s.post("/purgeseq/_purge", json!({"a": ["1-x"]})).await;
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(2), "{info}");
 }
 
 #[tokio::test]
@@ -4789,6 +5126,217 @@ async fn document_writes_validate_like_couchdb() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB 3.5 accepts a reduce by prefix: anything starting with `_sum`,
+/// `_count`, `_stats`, `_approx_count_distinct`, `_first` or `_last`, and
+/// `_top_N` / `_bottom_N` with N in 1..=100 (couch_mrview:validate/2 and
+/// check_rank/1). Any other `_` name is not supported. This holds on every
+/// write path, including replication (`new_edits=false`).
+#[tokio::test]
+async fn design_doc_reduce_names_match_couchdb_prefix_rule() {
+    let s = Server::start(false);
+    s.fresh_db("rn").await;
+    let map = "function(d){ emit(d._id, 1); }";
+    let accepted = [
+        "_sum",
+        "_sum_foo",
+        "_count",
+        "_count_x",
+        "_stats",
+        "_stats2",
+        "_approx_count_distinct",
+        "_approx_count_distinct_x",
+        "_first",
+        "_firstfoo",
+        "_last",
+        "_last_x",
+        "_top_1",
+        "_top_100",
+        "_top_05",
+        "_top_+7",
+        "_bottom_1",
+        "_bottom_100",
+    ];
+    for (i, reduce) in accepted.iter().enumerate() {
+        let doc = json!({"views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s.put(&format!("/rn/_design/put{i}"), doc).await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let doc = json!({"_id": format!("_design/rep{i}"), "_rev": "1-abc",
+            "views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s
+            .post("/rn/_bulk_docs", json!({"new_edits": false, "docs": [doc]}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let (status, body) = s.get(&format!("/rn/_design/rep{i}")).await;
+        assert_eq!(status, StatusCode::OK, "{reduce}: {body}");
+    }
+
+    let rank_range = "rank value must be between 1 and 100";
+    let rejected = [
+        ("_nope", "`_nope` is not a supported reduce function."),
+        ("_top", "`_top` is not a supported reduce function."),
+        ("_bottom", "`_bottom` is not a supported reduce function."),
+        ("_Sum", "`_Sum` is not a supported reduce function."),
+        ("_top_0", rank_range),
+        ("_top_101", rank_range),
+        ("_top_-3", rank_range),
+        ("_bottom_0", rank_range),
+        ("_bottom_99999999999999999999", rank_range),
+        ("_top_", "invalid rank reducer"),
+        ("_top_x", "invalid rank reducer"),
+        ("_top_1_0", "invalid rank reducer"),
+        ("_top_1.5", "invalid rank reducer"),
+        ("_bottom_ 5", "invalid rank reducer"),
+    ];
+    for (i, (reduce, reason)) in rejected.iter().enumerate() {
+        let doc = json!({"views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s.put(&format!("/rn/_design/bad{i}"), doc).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reduce}: {body}");
+        assert_eq!(body["error"], "invalid_design_doc", "{reduce}: {body}");
+        assert_eq!(body["reason"], *reason, "{reduce}");
+        let doc = json!({"_id": format!("_design/badrep{i}"), "_rev": "1-abc",
+            "views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s
+            .post("/rn/_bulk_docs", json!({"new_edits": false, "docs": [doc]}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let (status, body) = s.get(&format!("/rn/_design/badrep{i}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{reduce}: {body}");
+    }
+}
+
+/// CouchDB 3.5 compiles every map and reduce function of a design document
+/// when it is saved (couch_mrview:validate/2 and
+/// couch_query_servers:try_compile/4), on every write path including
+/// replication, and only then looks at the members. Nothing else in the
+/// document is compiled at save time. A bad `_rev` is a conflict before the
+/// document is validated.
+#[tokio::test]
+async fn design_doc_functions_compile_on_save() {
+    let s = Server::start(false);
+    s.fresh_db("cc").await;
+
+    let bad_map = "function(doc){ emit(doc._id }";
+    let bad_reduce = "function(keys, values){ return sum(values }";
+    let (status, body) = s
+        .put(
+            "/cc/_design/a",
+            json!({"views": {"v": {"map": bad_map, "reduce": "_count"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("Compilation of the map function in the 'v' view failed: "),
+        "{reason}"
+    );
+    assert!(reason.ends_with(&format!(" ({bad_map})")), "{reason}");
+
+    let (status, body) = s
+        .put(
+            "/cc/_design/a",
+            json!({"views": {"w": {"map": "function(d){}", "reduce": bad_reduce}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("Compilation of the reduce function in the 'w' view failed: "),
+        "{reason}"
+    );
+
+    // A source that is valid JavaScript but not a function.
+    let (status, body) = s
+        .put("/cc/_design/a", json!({"views": {"v": {"map": "1 + 1"}}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Expression does not eval to a function."),
+        "{body}"
+    );
+
+    // POST, `_bulk_docs` (a row error) and replication take the same path.
+    let bad = json!({"_id": "_design/p", "views": {"v": {"map": bad_map}}});
+    let (status, body) = s.post("/cc", bad.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "compilation_error", "{body}");
+    let (status, body) = s
+        .post("/cc/_bulk_docs", json!({"docs": [bad, {"_id": "ok1"}]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "compilation_error", "{body}");
+    assert_eq!(body[1]["ok"], true, "{body}");
+    let (status, body) = s
+        .post(
+            "/cc/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "_design/r", "_rev": "1-abc",
+                "views": {"v": {"map": bad_map}}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body[0]["error"], "compilation_error", "{body}");
+    let (status, _) = s.get("/cc/_design/r").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Accepted: builtin reduces, an unknown language, and the members CouchDB
+    // does not compile at save time.
+    for reduce in ["_sum", "_count", "_stats", "_approx_count_distinct"] {
+        let (status, body) = s
+            .put(
+                &format!("/cc/_design/b{reduce}"),
+                json!({"views": {"v": {"map": "function(d){ emit(d._id, 1); }", "reduce": reduce}}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+    }
+    let (status, body) = s
+        .put(
+            "/cc/_design/lang",
+            json!({"language": "klingon", "views": {"v": {"map": bad_map}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .put(
+            "/cc/_design/others",
+            json!({
+                "validate_doc_update": "function(",
+                "filters": {"f": "function("},
+                "shows": {"s": "function("},
+                "lists": {"l": "function("},
+                "updates": {"u": "function("},
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A bad `_rev` is a conflict, whatever else is wrong with the document.
+    let (status, body) = s
+        .put(
+            "/cc/_design/good",
+            json!({"views": {"v": {"map": "function(d){}"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for doc in [
+        json!({"_rev": "1-abc", "views": 1}),
+        json!({"_rev": "1-abc", "views": {"v": {"map": bad_map}}}),
+        json!({"views": 1}),
+        json!({"views": {"v": {"map": bad_map}}}),
+    ] {
+        let (status, body) = s.put("/cc/_design/good", doc.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{doc}: {body}");
+        assert_eq!(body["error"], "conflict", "{doc}");
+    }
+}
+
 #[tokio::test]
 async fn rejects_unknown_special_members_like_couchdb() {
     let s = Server::start(false);
@@ -4891,6 +5439,47 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["userCtx"]["name"], Value::Null, "{body}");
     assert_eq!(body["userCtx"]["roles"], json!([]));
+}
+
+/// CouchDB's `GET /_session` `info.authenticated` is the name of the handler
+/// that authenticated the request (`couch_httpd_auth:handle_session_req/2`):
+/// "default" for basic auth, "cookie" for an AuthSession cookie. It is absent
+/// for an anonymous request. `authentication_db` is always reported.
+#[tokio::test]
+async fn session_info_authenticated_is_the_handler_name() {
+    let s = Server::start(true);
+    let (status, body) = s.get("/_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["info"].get("authenticated").is_none(), "{body}");
+    assert_eq!(body["info"]["authentication_db"], "_users", "{body}");
+
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "default", "{body}");
+
+    let response = s
+        .client
+        .post(format!("{}/_session", s.base))
+        .json(&json!({"name": "admin", "password": "douchdb"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("AuthSession cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &[("Cookie", cookie)])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "cookie", "{body}");
 }
 
 /// An `AuthSession` cookie value for `name`, in the format the server issues:
@@ -5710,6 +6299,26 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "v1");
     assert_eq!(rows[0]["deleted"], true);
+}
+
+// In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
+// per-node token (CouchDB packs per-shard purge seqs with
+// `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
+#[tokio::test]
+async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clpurge").await;
+    }
+    let (_, r) = nodes[0].put("/clpurge/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:0,0"), "{info}");
+
+    let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
 }
 
 #[tokio::test]
@@ -7954,7 +8563,7 @@ async fn purge_invalidates_view_indexes() {
     assert_eq!(body["total_rows"], 1);
 
     let (status, _) = s.post("/purgeview/_purge", json!({"a": [rev]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     let (_, body) = s.get("/purgeview/_design/v/_view/cities").await;
     assert_eq!(body["total_rows"], 0);
 }
@@ -8516,7 +9125,7 @@ async fn views_map_reduce_collation_and_query_options() {
         "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return rereduce ? sum(values) : sum(values) * 2; }"},
         "by_type_city": {"map": "function(doc){ emit([doc.type, doc.city], 1); }", "reduce": "_count"},
         "meta": {"map": "function(doc){ emit(doc._id, doc._rev); }"},
-        "bad": {"map": "function(doc){ emit(; }"}
+        "bad": {"map": "function(doc){ throw new Error(\"boom\"); }"}
     }});
     let (status, body) = s.put("/shop/_design/shop", ddoc).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -8746,7 +9355,7 @@ async fn views_map_reduce_collation_and_query_options() {
         .await;
     assert!(body["update_seq"].is_number() || body["update_seq"].is_string());
 
-    // A map-only view rejects reduce=true, and a broken map is a view error.
+    // A map-only view rejects reduce=true, and a map that throws is a view error.
     let (status, body) = s.get("/shop/_design/shop/_view/by_city?reduce=true").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "query_parse_error");
@@ -9604,6 +10213,135 @@ async fn couchdb_builtin_reduce_ports() {
     assert_eq!(body["rows"][0]["value"], 4);
 }
 
+/// Builtin reduces CouchDB 3.5 runs by name prefix (`_sum_foo` is `_sum`) and
+/// the rank/extreme builtins `_first`, `_last`, `_top_N`, `_bottom_N`
+/// (couch_query_servers:builtin_reduce/4). `_first` and `_last` pick the
+/// value of the row with the smallest or largest `[key, docid]`; `_top_N` and
+/// `_bottom_N` list the N largest or smallest distinct values.
+const RANK_DOCS: [(&str, &str, i64); 6] = [
+    ("a1", "a", 5),
+    ("a2", "a", 3),
+    ("a3", "a", 5),
+    ("b1", "b", 9),
+    ("b2", "b", 1),
+    ("c1", "c", 7),
+];
+
+fn rank_ddoc() -> Value {
+    let map = "function(d){ emit(d.k, d.v); }";
+    json!({"views": {
+        "sum_x": {"map": map, "reduce": "_sum_foo"},
+        "count_x": {"map": map, "reduce": "_count_x"},
+        "stats_x": {"map": map, "reduce": "_stats_x"},
+        "first": {"map": map, "reduce": "_first"},
+        "last": {"map": map, "reduce": "_lastly"},
+        "top2": {"map": map, "reduce": "_top_2"},
+        "top100": {"map": map, "reduce": "_top_100"},
+        "bottom2": {"map": map, "reduce": "_bottom_2"}
+    }})
+}
+
+async fn assert_rank_reduces(node: &Server, db: &str) {
+    let rows = |view: &'static str, query: &'static str| {
+        let path = format!("/{db}/_design/d/_view/{view}{query}");
+        async move {
+            let (status, body) = node.get(&path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            body["rows"].clone()
+        }
+    };
+    assert_eq!(rows("sum_x", "").await, json!([{"key": null, "value": 30}]));
+    assert_eq!(
+        rows("count_x", "").await,
+        json!([{"key": null, "value": 6}])
+    );
+    let stats = rows("stats_x", "").await;
+    assert_eq!(stats[0]["value"]["count"], 6, "{stats}");
+    assert_eq!(stats[0]["value"]["sum"], 30, "{stats}");
+
+    assert_eq!(rows("first", "").await, json!([{"key": null, "value": 5}]));
+    assert_eq!(
+        rows("first", "?group=true").await,
+        json!([{"key": "a", "value": 5}, {"key": "b", "value": 9}, {"key": "c", "value": 7}])
+    );
+    assert_eq!(rows("last", "").await, json!([{"key": null, "value": 7}]));
+    assert_eq!(
+        rows("last", "?group=true").await,
+        json!([{"key": "a", "value": 5}, {"key": "b", "value": 1}, {"key": "c", "value": 7}])
+    );
+    assert_eq!(
+        rows("first", "?startkey=%22b%22").await,
+        json!([{"key": null, "value": 9}])
+    );
+
+    assert_eq!(
+        rows("top2", "").await,
+        json!([{"key": null, "value": [9, 7]}])
+    );
+    assert_eq!(
+        rows("top2", "?group=true").await,
+        json!([
+            {"key": "a", "value": [5, 3]},
+            {"key": "b", "value": [9, 1]},
+            {"key": "c", "value": [7]}
+        ])
+    );
+    assert_eq!(
+        rows("top100", "").await,
+        json!([{"key": null, "value": [9, 7, 5, 3, 1]}])
+    );
+    assert_eq!(
+        rows("bottom2", "").await,
+        json!([{"key": null, "value": [1, 3]}])
+    );
+    assert_eq!(
+        rows("bottom2", "?group=true").await,
+        json!([
+            {"key": "a", "value": [3, 5]},
+            {"key": "b", "value": [1, 9]},
+            {"key": "c", "value": [7]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn couchdb_prefixed_and_ranked_builtin_reduces() {
+    let s = Server::start(false);
+    s.fresh_db("rank").await;
+    let docs: Vec<Value> = RANK_DOCS
+        .iter()
+        .map(|(id, k, v)| json!({"_id": id, "k": k, "v": v}))
+        .collect();
+    let (status, _) = s.post("/rank/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.put("/rank/_design/d", rank_ddoc()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_rank_reduces(&s, "rank").await;
+}
+
+/// Owners reduce their shards and the coordinator rereduces the partials, so
+/// every builtin must combine across shards and nodes.
+#[tokio::test]
+async fn cluster_prefixed_and_ranked_builtin_reduces() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clrank").await;
+    }
+    let docs: Vec<Value> = RANK_DOCS
+        .iter()
+        .map(|(id, k, v)| json!({"_id": id, "k": k, "v": v}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clrank/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = nodes[0].put("/clrank/_design/d", rank_ddoc()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for node in &nodes {
+        assert_rank_reduces(node, "clrank").await;
+    }
+}
+
 #[tokio::test]
 async fn couchdb_approx_count_distinct_counts_keys() {
     // Expected bodies were captured from CouchDB 3.5.3. `_approx_count_distinct`
@@ -10174,7 +10912,7 @@ async fn purged_documents_leave_search_results() {
     let (_, doc) = s.get("/searchpurge/apple").await;
     let rev = doc["_rev"].as_str().unwrap().to_string();
     let (status, body) = s.post("/searchpurge/_purge", json!({"apple": [rev]})).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     // A later write moves the database on, so the index must catch up from
     // its changes, where a fully purged document no longer appears.
     let (status, _) = s.put("/searchpurge/egg", json!({"item": "egg"})).await;
@@ -16289,6 +17027,33 @@ async fn revision_shaped_reads_do_not_bypass_the_read_quorum() {
             "query {query}: {body}"
         );
         assert_eq!(body["error"], "quorum_not_met", "query {query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn quorum_read_with_no_answering_replica_fails_like_fabric() {
+    let nodes = cluster_with_only_copy_dead("clqgone", false).await;
+    // fabric_doc_open answers {error, read_failure} when no replica replied;
+    // chttpd renders it through maybe_handle_error as 500 error/read_failure.
+    // revs_info also goes through fabric:open_doc.
+    for query in ["r=2", "r=2&revs_info=true"] {
+        let (status, body) = nodes[0].get(&format!("/clqgone/p:d1?{query}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{query}: {body}");
+        assert_eq!(body["error"], "error", "{query}: {body}");
+        assert_eq!(body["reason"], "read_failure", "{query}: {body}");
+    }
+    // fabric_doc_open_revs answers all_workers_died, which chttpd error_info
+    // maps to 503 "service unavailable". An explicit rev reads through
+    // fabric:open_revs as well.
+    for query in ["r=2&open_revs=all", "r=2&rev=1-abc"] {
+        let (status, body) = nodes[0].get(&format!("/clqgone/p:d1?{query}")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{query}: {body}");
+        assert_eq!(body["error"], "service unavailable", "{query}: {body}");
+        assert_eq!(
+            body["reason"],
+            "Nodes are unable to service this request due to overloading or maintenance mode.",
+            "{query}: {body}"
+        );
     }
 }
 

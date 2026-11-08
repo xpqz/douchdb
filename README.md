@@ -550,9 +550,13 @@ router; there is no coordinator role.
   committed. Overlapping writes can therefore cause a short re-read, but not a
   skipped document. Cluster feeds keep their opaque version-vector cursor.
 - `?w=` / `?r=` select write and read quorum. The default read quorum is
-  `r = (n/2)+1`; `?r=1` is the local fast path. An unmet read quorum returns
-  `503 quorum_not_met`, including tombstones and all conflict leaves in the
-  merged comparison. Ancestry is merged from every replica before leaf bodies
+  `r = (n/2)+1`; `?r=1` is the local fast path. A read that reaches fewer than
+  `r` replicas returns `503 quorum_not_met`, a deliberate departure from
+  CouchDB's `fabric_doc_open`, which serves the best document it received.
+  When no replica answers, the errors are CouchDB's: `500 read_failure` for a
+  plain or `revs_info` read, `503 service unavailable` for `open_revs` or an
+  explicit `rev`. Replica answers are merged, tombstones and all conflict
+  leaves included. Ancestry is merged from every replica before leaf bodies
   are deduplicated, so a longer history on one node is not lost; requested
   histories return the longest retained path deterministically. Revision-shaped
   reads (`open_revs`, `revs_info=true`) still require `r` reachable replicas,

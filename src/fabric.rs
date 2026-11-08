@@ -1322,10 +1322,14 @@ pub(crate) fn nodedown() -> ApiError {
     ApiError::new(412, "nodedown", "progress not possible")
 }
 
-/// True when a peer request failed because the peer could not be reached (or
-/// is unhealthy), rather than because the peer rejected the request.
+/// True when a peer request failed in transport (connect, timeout, reset, or
+/// no usable response), rather than because the peer answered with an error.
+/// Every such failure is built as 502 `bad_gateway`; a peer's own error
+/// response keeps its status under another name (`request_failed`,
+/// `all_docs_failed`, ...), so a 503 or 504 the peer produced is an answer,
+/// not a node that is down.
 pub(crate) fn peer_unreachable(error: &ApiError) -> bool {
-    matches!(error.status, 502..=504)
+    error.status == 502 && error.error == "bad_gateway"
 }
 
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
@@ -2245,7 +2249,7 @@ pub(crate) async fn cluster_changes(
                 if mask.is_empty() {
                     // Owns no shard: only its sequence is wanted, for its
                     // slot in the vector.
-                    let seq = fetch_update_seq(read, node).await?;
+                    let (seq, _) = fetch_node_seqs(read, node).await?;
                     let empty = json!({"results": [], "last_seq": seq, "pending": 0});
                     return Ok((shards, None, empty));
                 }
@@ -2538,8 +2542,9 @@ pub(crate) async fn fetch_node_changes(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
-/// One node's current update sequence: its own, or what the peer reports.
-async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
+/// One node's current update sequence and purge sequence: its own, or what
+/// the peer reports in the same answer.
+async fn fetch_node_seqs(read: ClusterRead<'_>, node: usize) -> DbResult<(u64, u64)> {
     let ClusterRead {
         ctx,
         db,
@@ -2547,7 +2552,7 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
         headers,
     } = read;
     if node == ctx.cluster.me {
-        return Ok(db.update_seq());
+        return Ok((db.update_seq(), db.purge_seq().await?));
     }
     let peer = &ctx.cluster.nodes[node];
     let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
@@ -2564,9 +2569,13 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
         .json::<Value>()
         .await
         .map_err(|e| bad(e.to_string()))?;
-    body["update_seq"]
+    let update_seq = body["update_seq"]
         .as_u64()
-        .ok_or_else(|| bad(format!("{peer}: no update_seq")))
+        .ok_or_else(|| bad(format!("{peer}: no update_seq")))?;
+    let purge_seq = body["purge_seq"]
+        .as_u64()
+        .ok_or_else(|| bad(format!("{peer}: no purge_seq")))?;
+    Ok((update_seq, purge_seq))
 }
 
 /// Current per-node update_seq vector, plus fallback marks for the shards of
@@ -2582,6 +2591,15 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
 pub(crate) async fn cluster_update_vector(
     read: ClusterRead<'_>,
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
+    let (vector, marks, _) = cluster_seq_vectors(read).await?;
+    Ok((vector, marks))
+}
+
+/// [`cluster_update_vector`] plus the per-node purge sequence vector, which
+/// the same peer answers carry; a node that did not answer counts as 0.
+pub(crate) async fn cluster_seq_vectors(
+    read: ClusterRead<'_>,
+) -> DbResult<(Vec<u64>, Vec<FallbackMark>, Vec<u64>)> {
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
     // A peer discovery found unreachable is not asked, as long as the shards
@@ -2591,6 +2609,7 @@ pub(crate) async fn cluster_update_vector(
         .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
         .collect();
     let mut seqs: Vec<Option<u64>> = vec![None; nodes];
+    let mut purge_seqs: Vec<u64> = vec![0; nodes];
     let mut to_ask: Vec<usize> = (0..nodes)
         .filter(|node| !held_back.contains(node))
         .collect();
@@ -2598,17 +2617,18 @@ pub(crate) async fn cluster_update_vector(
         let answers = crate::cluster_http::in_one_round(futures::future::join_all(
             to_ask
                 .iter()
-                .map(|&node| async move { fetch_update_seq(read, node).await.ok() }),
+                .map(|&node| async move { fetch_node_seqs(read, node).await.ok() }),
         ))
         .await;
-        for (&node, seq) in to_ask.iter().zip(answers) {
-            seqs[node] = seq;
+        for (&node, answer) in to_ask.iter().zip(answers) {
+            seqs[node] = answer.map(|(seq, _)| seq);
+            purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
         }
         let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
         let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
         let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
         if failed.is_empty() {
-            return Ok((vector, Vec::new()));
+            return Ok((vector, Vec::new(), purge_seqs));
         }
         match fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive) {
             Err(_) if !held_back.is_empty() => to_ask = std::mem::take(&mut held_back),
@@ -2628,7 +2648,7 @@ pub(crate) async fn cluster_update_vector(
         .zip(&seqs)
         .map(|(seq, answer)| answer.map_or(UNKNOWN_SEQ, |_| seq))
         .collect();
-    Ok((vector, marks))
+    Ok((vector, marks, purge_seqs))
 }
 
 pub(crate) fn encode_since(vector: &[u64]) -> String {
@@ -2996,6 +3016,98 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A one-shot HTTP peer that answers every request with `status`.
+    fn peer_answering(status: u16) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peer = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the request head and body before answering.
+                while let Ok(read) = socket.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if seen.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                );
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        peer
+    }
+
+    async fn forward_to(peer: &str) -> ApiError {
+        let ctx = ClusterCtx {
+            cluster: crate::cluster::Cluster {
+                nodes: vec![peer.to_string()],
+                me: 0,
+                n: 1,
+                secret: "test-secret".to_string(),
+            },
+            client: reqwest::Client::new(),
+            auth: None,
+            health: Default::default(),
+        };
+        forward_json(
+            &ctx,
+            peer,
+            "db",
+            "_all_docs",
+            "",
+            &json!({}),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("the peer does not answer successfully")
+    }
+
+    /// A peer that answers 503 or 504 itself is reachable: its own error is
+    /// not a transport failure, so callers must not treat it as nodedown.
+    #[tokio::test]
+    async fn a_peer_answering_5xx_itself_is_not_unreachable() {
+        for status in [502, 503, 504] {
+            let error = forward_to(&peer_answering(status)).await;
+            assert_eq!(error.status, status);
+            assert!(
+                !peer_unreachable(&error),
+                "a peer that answered {status} was classified as unreachable"
+            );
+        }
+    }
+
+    /// A refused connection is the genuine transport failure.
+    #[tokio::test]
+    async fn a_refused_connection_is_unreachable() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}", listener.local_addr().expect("addr"))
+        };
+        let error = forward_to(&closed).await;
+        assert!(
+            peer_unreachable(&error),
+            "{} {}",
+            error.status,
+            error.reason
+        );
+    }
 
     /// A fan-out task that panics must still count as that node's reply.
     /// Slot 0 is a design document on nodes 0 and 1, so it is owed a reply

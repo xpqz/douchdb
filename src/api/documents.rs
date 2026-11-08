@@ -354,9 +354,6 @@ async fn put_doc(
     }
     // The URL owns the id: CouchDB ignores a conflicting `_id` in the body.
     doc["_id"] = json!(docid);
-    if let Err(e) = validate_design_doc(&doc) {
-        return fail(e);
-    }
     if let Err(error) = db.validate_doc_id(docid) {
         return fail(error);
     }

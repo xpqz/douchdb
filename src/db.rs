@@ -697,9 +697,7 @@ impl Db {
     /// drop cannot bring the database back.
     pub fn open_existing(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         if !Db::exists(root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         }
         Db::open(root, name, config)
     }
@@ -713,9 +711,7 @@ impl Db {
     /// it is written before it is installed.
     pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
         if !Db::exists(root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         }
         load_security(&db_path(root, name)).map(|(_, security)| security)
     }
@@ -731,9 +727,7 @@ impl Db {
     ) -> DbResult<Option<ClosedMeta>> {
         let path = db_path(root, name);
         let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         };
         let map_path = path.join("shard-map.json");
         let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
@@ -780,7 +774,7 @@ impl Db {
     /// request for a database that is gone (`couch_server`).
     pub fn check_live(&self) -> DbResult<()> {
         if self.deleted.load(Ordering::SeqCst) {
-            Err(ApiError::not_found("Database does not exist."))
+            Err(ApiError::db_not_found())
         } else {
             Ok(())
         }
@@ -789,9 +783,9 @@ impl Db {
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
         match std::fs::remove_dir_all(db_path(root, name)) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::not_found(
-                format!("Database does not exist: {name}"),
-            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ApiError::db_not_found())
+            }
             Err(error) => Err(metadata_error(&db_path(root, name), error)),
         }
     }
@@ -1393,23 +1387,25 @@ impl Db {
         let update_seq = self.update_seq();
         let mut doc_count = 0;
         let mut deleted_count = 0;
+        let mut purge_seq = 0u64;
         let counts = futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok(s.counts()))),
+                .map(|shard| shard.call(|s| Ok((s.counts(), s.purge_seq()?)))),
         )
         .await;
         for counted in counts {
-            let (docs, deleted) = counted?;
+            let ((docs, deleted), purged) = counted?;
             doc_count += docs;
             deleted_count += deleted;
+            purge_seq = purge_seq.saturating_add(purged);
         }
         let mut info = json!({
             "db_name": self.name,
             "doc_count": doc_count,
             "doc_del_count": deleted_count,
             "update_seq": update_seq,
-            "purge_seq": 0,
+            "purge_seq": purge_seq,
             "compact_running": compact_running,
             "disk_size": 0,
             "data_size": 0,
@@ -2436,7 +2432,10 @@ impl Db {
                     self.shards[index].call(move |shard| {
                         let mut out = Vec::with_capacity(batch.len());
                         for (slot, id, opts) in batch {
-                            let rev = opts.rev.clone().unwrap_or_else(|| "undefined".into());
+                            let rev = opts
+                                .rev
+                                .as_deref()
+                                .map_or_else(|| "undefined".into(), canonical_rev);
                             let result = read_doc(shard, &id, &opts);
                             out.push((slot, id, rev, result));
                         }
@@ -2567,6 +2566,19 @@ impl Db {
 
     // ----- maintenance -----------------------------------------------------
 
+    /// Documents purged from this node's shards, summed.
+    pub async fn purge_seq(&self) -> DbResult<u64> {
+        let counts = futures::future::join_all(
+            self.shards
+                .iter()
+                .map(|shard| shard.call(|s| Ok(s.purge_seq()?))),
+        )
+        .await;
+        counts
+            .into_iter()
+            .try_fold(0u64, |sum, count| Ok(sum.saturating_add(count?)))
+    }
+
     pub async fn purge(&self, body: &Value) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
@@ -2620,7 +2632,8 @@ impl Db {
         for (id, revs) in ids.into_iter().zip(removed) {
             purged.insert(id.clone(), json!(revs));
         }
-        Ok(json!({ "purge_seq": 0, "purged": purged }))
+        // CouchDB always answers `purge_seq: null` here (chttpd_db `_purge`).
+        Ok(json!({ "purge_seq": Value::Null, "purged": purged }))
     }
 
     pub async fn compact(&self) -> DbResult<()> {
@@ -2727,6 +2740,7 @@ fn purge_one(
         removed.push(rev.clone());
     }
     if !removed.is_empty() {
+        s.count_purge(&mut tx)?;
         if meta.tree.is_empty() {
             tx.delete(&meta_key(id));
             if meta.seq != 0 {
@@ -2774,6 +2788,9 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
             ));
         }
     }
+    if let Some(revisions) = obj.get("_revisions") {
+        validate_revisions(revisions)?;
+    }
     // CouchDB (couch_doc.erl) accepts only a boolean `_deleted`.
     if obj.get("_deleted").is_some_and(|value| !value.is_boolean()) {
         return Err(ApiError::new(
@@ -2785,16 +2802,16 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
     Ok(())
 }
 
-/// The structural checks CouchDB applies to a design document before storing
-/// it (couch_mrview_util and the design-doc validator): wrong member types are
-/// `invalid_design_doc`, not a stored document that fails later.
-pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
+/// What CouchDB checks when a design document is saved
+/// (`couch_mrview:validate/2`): wrong member types are `invalid_design_doc`,
+/// and every map and reduce function of a JavaScript design document must
+/// compile (`compilation_error`), not fail later at query time. Nothing else
+/// is compiled at save time. It runs after the revision check, on every write
+/// path including replication. `obj` is the document without its `_`
+/// metadata members.
+fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbResult<()> {
     let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
-    let Some(obj) = doc.as_object() else {
-        return Ok(());
-    };
-    let is_design = matches!(obj.get("_id"), Some(Value::String(id)) if id.starts_with("_design/"));
-    if !is_design || obj.get("_deleted") == Some(&Value::Bool(true)) {
+    if !id.starts_with("_design/") || deleted {
         return Ok(());
     }
     let wrong = |field: &str, kind: &str| invalid(format!("`{field}` field must have {kind} type"));
@@ -2841,18 +2858,49 @@ pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
                     }
                 }
                 if let Some(Value::String(reduce)) = view.get("reduce") {
-                    if reduce.starts_with('_')
-                        && !["_sum", "_count", "_stats", "_approx_count_distinct"]
-                            .contains(&reduce.as_str())
-                    {
-                        return Err(invalid(format!(
-                            "`{reduce}` is not a supported reduce function."
-                        )));
-                    }
+                    crate::view::check_reduce_name(reduce).map_err(invalid)?;
                 }
             }
         }
         Some(_) => return Err(wrong("views", "object")),
+    }
+    compile_views(obj)
+}
+
+/// CouchDB's `try_compile`. A design document in another language is saved
+/// unchecked: there is no query server to compile it.
+fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
+    use crate::view::{check_compiles, ViewFunction};
+    if obj
+        .get("language")
+        .and_then(Value::as_str)
+        .is_some_and(|language| language != "javascript")
+    {
+        return Ok(());
+    }
+    let Some(Value::Object(views)) = obj.get("views") else {
+        return Ok(());
+    };
+    let limits = crate::view::ViewLimits::default();
+    for (name, view) in views {
+        let functions = [(ViewFunction::Map, "map"), (ViewFunction::Reduce, "reduce")];
+        for (function, member) in functions {
+            let Some(Value::String(source)) = view.get(member) else {
+                continue;
+            };
+            if member == "reduce" && source.starts_with('_') {
+                continue;
+            }
+            if let Err(message) = check_compiles(function, source, limits) {
+                return Err(ApiError::new(
+                    400,
+                    "compilation_error",
+                    format!(
+                        "Compilation of the {member} function in the '{name}' view failed: {message} ({source})"
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -3108,6 +3156,12 @@ impl Stage<'_> {
             },
         };
 
+        // CouchDB validates a design document only once its revision is known
+        // to be the right one: a conflict wins over a malformed member.
+        if let Value::Object(members) = &body {
+            validate_design_doc(&id, deleted, members)?;
+        }
+
         let parent_path = match parent.as_ref() {
             Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
             None => Vec::new(),
@@ -3180,6 +3234,13 @@ impl Stage<'_> {
         if known && meta.atts.contains_key(&rev) {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
         }
+        // A replicated design document is validated too (couch_db:
+        // prep_and_validate_replicated_updates), unless it is already stored.
+        if !known {
+            if let Value::Object(members) = &body {
+                validate_design_doc(&id, deleted, members)?;
+            }
+        }
 
         let parent = meta
             .tree
@@ -3213,28 +3274,65 @@ impl Stage<'_> {
     }
 }
 
+/// Check a document's `_revisions` the way `couch_doc:transfer_fields/3` does,
+/// which runs for every document whatever `new_edits` says: `start` must be an
+/// integer, `ids` an array, then each id goes through `parse_revid/2`. Returns
+/// the validated start and ids.
+fn validate_revisions(revisions: &Value) -> DbResult<(i64, Vec<&str>)> {
+    let doc_validation = |reason: &str| ApiError::new(400, "doc_validation", reason);
+    // couch_doc.erl:302 (`_revisions` clause); a non-object value reaches the
+    // unknown special member clause at couch_doc.erl:378 instead.
+    let Some(props) = revisions.as_object() else {
+        return Err(doc_validation("Bad special document member: _revisions"));
+    };
+    // couch_doc.erl:307
+    let Some(start) = props.get("start").and_then(Value::as_i64) else {
+        return Err(doc_validation("_revisions.start isn't an integer."));
+    };
+    // couch_doc.erl:309
+    let Some(ids) = props.get("ids").and_then(Value::as_array) else {
+        return Err(doc_validation("_revisions.ids isn't a array."));
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match id.as_str() {
+            // parse_revid/2 (couch_doc.erl:191): past position 0 a 32-byte id
+            // must be hex; `binary:decode_hex` failing is couch_doc.erl:321.
+            Some(id) if start != 0 && id.len() == 32 => {
+                if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(doc_validation("RevId isn't a valid hexadecimal"));
+                }
+                out.push(id);
+            }
+            // couch_doc.erl:195
+            Some(id) if start >= 0 => out.push(id),
+            // No parse_revid/2 clause matches: couch_doc.erl:319.
+            _ => return Err(doc_validation("RevId isn't a string")),
+        }
+    }
+    Ok((start, out))
+}
+
 /// Reconstruct the root-to-leaf path of a replicated document and the revision
 /// it writes. Like CouchDB (`couch_doc:transfer_fields/3`), `_revisions`
 /// defines the revision when present and non-empty, even without or against
 /// `_rev`; otherwise `_rev` alone does.
 fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(String, Vec<Rev>)> {
     let mut path = Vec::new();
+    let mut named_ids = false;
     if let Some(revs) = revisions {
-        let Some(start) = revs.get("start").and_then(Value::as_u64) else {
-            return Err(ApiError::bad_request("_revisions.start is not an integer"));
-        };
-        let Some(ids) = revs.get("ids").and_then(Value::as_array) else {
-            return Err(ApiError::bad_request("_revisions.ids is not an array"));
-        };
-        for (i, id) in ids.iter().enumerate() {
-            let Some(id) = id.as_str() else {
-                return Err(ApiError::bad_request(
-                    "_revisions.ids contains a non-string",
-                ));
+        let (start, ids) = validate_revisions(revs)?;
+        named_ids = !ids.is_empty();
+        for (i, id) in ids.into_iter().enumerate() {
+            let Some(pos) = u64::try_from(start)
+                .ok()
+                .and_then(|start| start.checked_sub(i as u64))
+            else {
+                break;
             };
-            let pos = start
-                .checked_sub(i as u64)
-                .ok_or_else(|| ApiError::bad_request("_revisions is malformed"))?;
+            // Deliberate departure: CouchDB stores revisions at position 0
+            // (`_revisions` with `start: 0`), but nothing generates them, so
+            // the path stops before position 0 and `Rev::parse` refuses it.
             if pos == 0 {
                 break;
             }
@@ -3248,11 +3346,16 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
             return Ok((format!("{}-{}", leaf.pos, leaf.id_string()), path));
         }
     }
-    let rev = rev.ok_or_else(|| {
-        ApiError::bad_request(
-            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
-        )
-    })?;
+    let rev = match rev {
+        Some(rev) => rev,
+        // Ids that all sit at position 0 or below name no revision.
+        None if named_ids => return Err(ApiError::bad_request("Invalid rev format")),
+        None => {
+            return Err(ApiError::bad_request(
+                "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
+            ))
+        }
+    };
     let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
     Ok((rev, vec![leaf]))
 }
