@@ -2881,47 +2881,6 @@ async fn slash_database_and_parent_name_coexist() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// A data directory written by an older version keeps "a/b" at `a/b/`. On
-/// startup it is moved to its flat directory, once, and the parent database
-/// "a" that shared the tree is left intact.
-#[tokio::test]
-async fn nested_slash_database_directories_are_migrated_on_startup() {
-    let mut s = Server::start(false);
-    // The database name is not stored in the directory, so flat databases can
-    // be moved into the old nested layout while the server is stopped.
-    for name in ["mig", "migb", "migc"] {
-        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
-        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
-        s.put(&format!("/{name}/doc"), json!({"v": name})).await;
-    }
-    s.kill();
-    std::fs::rename(s.dir.join("migb"), s.dir.join("mig").join("b")).expect("nest b");
-    std::fs::rename(s.dir.join("migc"), s.dir.join("mig/b/c")).expect("nest c");
-
-    s.restart();
-    let (_, body) = s.get("/_all_dbs").await;
-    let listed: Vec<&str> = body
-        .as_array()
-        .expect("array")
-        .iter()
-        .filter_map(|n| n.as_str())
-        .filter(|n| n.starts_with("mig"))
-        .collect();
-    assert_eq!(listed, ["mig", "mig/b", "mig/b/c"], "{body}");
-    for (name, value) in [("mig", "mig"), ("mig%2Fb", "migb"), ("mig%2Fb%2Fc", "migc")] {
-        let (status, body) = s.get(&format!("/{name}/doc")).await;
-        assert_eq!(status, StatusCode::OK, "{name}: {body}");
-        assert_eq!(body["v"], value);
-    }
-    assert!(!s.dir.join("mig/b").exists(), "old nested dir left behind");
-    assert!(s.dir.join("mig%2Fb").join("db.json").is_file());
-
-    // A second startup has nothing left to move.
-    s.restart();
-    let (status, body) = s.get("/mig%2Fb%2Fc/doc").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-}
-
 /// A db.json that does not parse is a server-side fault, not a missing
 /// database: the client gets 500 and the file is left for the operator.
 #[tokio::test]

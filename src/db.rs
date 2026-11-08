@@ -507,86 +507,6 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
     (!name.contains('%')).then_some(name)
 }
 
-/// Whether `segment` could be one '/'-separated part of a database name.
-fn is_db_name_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && !segment.starts_with('_')
-        && segment.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')')
-        })
-}
-
-fn collect_nested_dbs(dir: &Path, rel: &[String], found: &mut Vec<(Vec<String>, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(segment) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_db_name_segment(&segment) || !path.is_dir() {
-            continue;
-        }
-        let mut parts = rel.to_vec();
-        parts.push(segment);
-        if parts.len() > 1 && path.join("db.json").is_file() {
-            found.push((parts.clone(), path.clone()));
-        }
-        collect_nested_dbs(&path, &parts, found);
-    }
-}
-
-/// Move databases that an older version stored as nested directories
-/// (`<root>/a/b`) to their flat directory (`<root>/a%2Fb`). Deepest first, so
-/// moving `a/b` never carries `a/b/c` along unmoved. Every target is checked
-/// before anything moves, and an existing target is never overwritten: the
-/// error names both directories and the data root is left as it was. Returns
-/// the moves made as `(from, to)`.
-pub fn migrate_nested_dbs(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let mut found = Vec::new();
-    collect_nested_dbs(root, &[], &mut found);
-    found.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-    let mut plan = Vec::new();
-    for (parts, from) in found {
-        let to = db_path(root, &parts.join("/"));
-        if to.exists() {
-            return Err(format!(
-                "cannot migrate database {}: {} is already there; move one of {} or {} away",
-                parts.join("/"),
-                to.display(),
-                from.display(),
-                to.display()
-            ));
-        }
-        plan.push((from, to));
-    }
-    let mut moved = Vec::new();
-    for (from, to) in plan {
-        std::fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "cannot move database directory {} to {}: {e}",
-                from.display(),
-                to.display()
-            )
-        })?;
-        tracing::info!(from = %from.display(), to = %to.display(), "migrated nested database directory");
-        // Drop the parent directories the move left empty; one that still
-        // holds anything (a database, another file) is not ours to remove.
-        let mut parent = from.parent();
-        while let Some(dir) = parent.filter(|dir| *dir != root) {
-            if std::fs::remove_dir(dir).is_err() {
-                break;
-            }
-            parent = dir.parent();
-        }
-        moved.push((from, to));
-    }
-    Ok(moved)
-}
-
 impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
@@ -4443,38 +4363,6 @@ mod tests {
         assert_ne!(db_dir_name("a/b"), db_dir_name("a"));
         assert_eq!(dir_name_to_db_name("a%2fb"), None);
         assert_eq!(dir_name_to_db_name("a%b"), None);
-    }
-
-    #[test]
-    fn nested_db_migration_never_overwrites() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-{}", uuid()));
-        for dir in ["a/b", "a%2Fb"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let err = migrate_nested_dbs(&root).unwrap_err();
-        assert!(err.contains("already there"), "{err}");
-        assert!(root.join("a/b/db.json").is_file());
-        assert!(root.join("a%2Fb/db.json").is_file());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn nested_db_migration_moves_deepest_first_and_prunes_empty_parents() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-ok-{}", uuid()));
-        for dir in ["a/b/c", "a/b", "x/y", "top"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let moved = migrate_nested_dbs(&root).unwrap();
-        assert_eq!(moved.len(), 3);
-        for dir in ["a%2Fb%2Fc", "a%2Fb", "x%2Fy", "top"] {
-            assert!(root.join(dir).join("db.json").is_file(), "{dir}");
-        }
-        assert!(!root.join("a").exists());
-        assert!(!root.join("x").exists());
-        assert!(migrate_nested_dbs(&root).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
