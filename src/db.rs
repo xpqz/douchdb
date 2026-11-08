@@ -2841,14 +2841,7 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
                     }
                 }
                 if let Some(Value::String(reduce)) = view.get("reduce") {
-                    if reduce.starts_with('_')
-                        && !["_sum", "_count", "_stats", "_approx_count_distinct"]
-                            .contains(&reduce.as_str())
-                    {
-                        return Err(invalid(format!(
-                            "`{reduce}` is not a supported reduce function."
-                        )));
-                    }
+                    crate::view::check_reduce_name(reduce).map_err(&invalid)?;
                 }
             }
         }

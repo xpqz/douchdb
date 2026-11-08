@@ -10196,7 +10196,10 @@ async fn assert_rank_reduces(node: &Server, db: &str) {
         }
     };
     assert_eq!(rows("sum_x", "").await, json!([{"key": null, "value": 30}]));
-    assert_eq!(rows("count_x", "").await, json!([{"key": null, "value": 6}]));
+    assert_eq!(
+        rows("count_x", "").await,
+        json!([{"key": null, "value": 6}])
+    );
     let stats = rows("stats_x", "").await;
     assert_eq!(stats[0]["value"]["count"], 6, "{stats}");
     assert_eq!(stats[0]["value"]["sum"], 30, "{stats}");
