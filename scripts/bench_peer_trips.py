@@ -95,7 +95,7 @@ def start_cluster(args, replication):
                 "--me", str(index),
                 "--sync-secs", "3600",
                 "--cluster-secret", "bench-peer-trips",
-            ],
+            ] + args.node_arg,
             stdout=log,
             stderr=log,
         )
@@ -111,6 +111,37 @@ def start_cluster(args, replication):
                     raise RuntimeError(f"node on {port} did not start")
                 time.sleep(0.1)
     return ports, PROCESSES[-3:]
+
+
+def peer_connections(ports, procs):
+    """Established TCP connections each node holds open to each other node.
+
+    Counts the connections a node opened (its local port is an ephemeral one,
+    the remote port is a node's listening port), per ordered pair, from lsof.
+    Returns {"0->1": count, ...}. Nodes that are gone are skipped.
+    """
+    live = [(i, p.pid) for i, p in enumerate(procs) if p.poll() is None]
+    counts = {}
+    if not live:
+        return counts
+    out = subprocess.run(
+        ["lsof", "-nP", "-a", "-p", ",".join(str(pid) for _, pid in live),
+         "-iTCP", "-sTCP:ESTABLISHED", "-Fpn"],
+        capture_output=True, text=True, timeout=30,
+    ).stdout
+    owner = None
+    pids = {pid: i for i, pid in live}
+    for line in out.splitlines():
+        if line.startswith("p"):
+            owner = pids.get(int(line[1:]))
+        elif line.startswith("n") and owner is not None and "->" in line:
+            local, remote = line[1:].split("->")
+            lport = int(local.rsplit(":", 1)[1])
+            rport = int(remote.rsplit(":", 1)[1])
+            if rport in ports and lport not in ports:
+                key = f"{owner}->{ports.index(rport)}"
+                counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def metrics(port):
@@ -137,11 +168,11 @@ def total(rows, field):
     return sum(row.get(field, 0) for row in rows.values())
 
 
-def loadgen(args, ports, loadgen_args, count):
+def loadgen(args, ports, loadgen_args, count, concurrency=1):
     """Drive node 0 with the native load generator, one request at a time."""
     command = [
         args.loadgen, "--base", f"http://127.0.0.1:{ports[0]}",
-        "--concurrency", "1", "--count", str(count),
+        "--concurrency", str(concurrency), "--count", str(count),
     ] + loadgen_args
     done = subprocess.run(command, capture_output=True, text=True, timeout=120)
     if done.returncode != 0:
@@ -237,16 +268,32 @@ def run_cluster(args, replication):
          ["--path", "/bench/_changes?limit=100"], n),
     ]
     rows = []
+    # The most connections any node held to any one peer after an operation.
+    peak = {}
+
+    def sample():
+        for key, value in peer_connections(ports, procs).items():
+            peak[key] = max(peak.get(key, 0), value)
+
     for label, route, extra, count in ops:
         rows.append(measure(args, ports, label, route,
                             lambda: loadgen(args, ports, extra, count), count))
+        sample()
         print(f"  {label}: {rows[-1]['calls']} calls, {rows[-1]['rounds']} rounds",
               file=sys.stderr)
+    # Many requests at once: HTTP/1.1 needs a connection per request in
+    # flight, HTTP/2 multiplexes them over one. Its mean is wall time per
+    # request, so only the percentiles and the connection count mean much.
+    extra = ["--method", "PUT", "--path", "/bench/conc-{id}", "--body", '{"n": "{id}"}']
+    rows.append(measure(args, ports, "PUT doc, 16 at once", doc,
+                        lambda: loadgen(args, ports, extra, n * 3, 16), n * 3))
+    sample()
     # Cluster writes cache their validator set for a second (validate.rs), so
     # a burst of writes pays the validator fan-out only about once a second,
     # while a write that comes later than that pays it every time.
     rows.append(measure(args, ports, "PUT doc, validators expired", doc,
                         lambda: paced_puts(ports[0], "sparse", 5, 1.1), 5))
+    sample()
     # Take node 2 down (by PID) and write through node 0. With fewer than
     # three copies some writes would simply fail, so only n=3 does this. The
     # dead node's counters are unreadable, so only the live nodes are compared.
@@ -258,7 +305,7 @@ def run_cluster(args, replication):
         rows.append(measure(args, ports[:2], "PUT doc, one node down", doc,
                             lambda: loadgen(args, ports, extra, n), n))
     cleanup()
-    return rows
+    return rows, peak
 
 
 def table(rows):
@@ -282,6 +329,8 @@ def main():
     parser.add_argument("--replication", default="3,1",
                         help="comma-separated n values, one cluster each")
     parser.add_argument("--max-seconds", type=int, default=540)
+    parser.add_argument("--node-arg", action="append", default=[],
+                        help="extra argument for every node (repeatable)")
     parser.add_argument("--json-out", default=None)
     args = parser.parse_args()
     args.bin = os.path.abspath(args.bin)
@@ -291,19 +340,24 @@ def main():
         signal.signal(name, die)
     signal.alarm(args.max_seconds)
     results = {}
+    connections = {}
     try:
         for replication in [int(v) for v in args.replication.split(",")]:
             print(f"n={replication}", file=sys.stderr)
-            results[replication] = run_cluster(args, replication)
+            results[replication], connections[replication] = run_cluster(args, replication)
     finally:
         signal.alarm(0)
         cleanup()
     for replication, rows in results.items():
         print(f"\n3 nodes, q=4, n={replication}; counts per request\n")
         print(table(rows))
+        peak = connections.get(replication, {})
+        pairs = ", ".join(f"{k}: {v}" for k, v in sorted(peak.items())) or "none"
+        print(f"\nestablished TCP connections per ordered node pair (peak after "
+              f"an operation): {pairs}")
     if args.json_out:
         with open(args.json_out, "w") as out:
-            json.dump(results, out, indent=2)
+            json.dump({"rows": results, "connections": connections}, out, indent=2)
 
 
 if __name__ == "__main__":
