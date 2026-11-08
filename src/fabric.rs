@@ -1136,14 +1136,29 @@ fn merge_replicated(
     for (node, slots, response) in responses {
         match response {
             Ok(results) => {
-                for (slot, result) in slots.into_iter().zip(results) {
-                    let (Some(reached), Some(out)) = (reached.get_mut(slot), out.get_mut(slot))
+                // A replica that took a `new_edits=false` write answers with
+                // the failures only, so the reply can be shorter than the
+                // batch. Answering at all is the acknowledgement; the failures
+                // are matched to their documents by id.
+                let full = results.len() == slots.len();
+                for (position, slot) in slots.iter().enumerate() {
+                    let (Some(reached), Some(out)) = (reached.get_mut(*slot), out.get_mut(*slot))
                     else {
                         continue;
                     };
                     *reached = true;
-                    if primaries.get(slot) == Some(&node) || out.is_null() {
-                        *out = result;
+                    let result = if full {
+                        results.get(position)
+                    } else {
+                        results.iter().find(|result| {
+                            result.get("id").and_then(Value::as_str)
+                                == ids.get(*slot).map(String::as_str)
+                        })
+                    };
+                    if let Some(result) = result {
+                        if primaries.get(*slot) == Some(&node) || out.is_null() {
+                            *out = result.clone();
+                        }
                     }
                 }
             }
