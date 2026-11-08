@@ -2576,6 +2576,22 @@ pub(crate) async fn cluster_seq_vectors(
     Ok((vector, marks, purge_seqs))
 }
 
+/// The `update_seq` and `purge_seq` that `GET /db` reports in a cluster, and
+/// that a query reports with `update_seq=true`: the opaque per-node vectors,
+/// one fan-out to the peers. A node that did not answer has no position to
+/// report; 0 makes a feed resumed from here replay it, never skip it.
+pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(String, String)> {
+    let (vector, marks, purge_vector) = cluster_seq_vectors(read).await?;
+    let vector: Vec<u64> = vector
+        .into_iter()
+        .map(|seq| if seq == UNKNOWN_SEQ { 0 } else { seq })
+        .collect();
+    Ok((
+        encode_token(&vector, &marks),
+        encode_token(&purge_vector, &[]),
+    ))
+}
+
 pub(crate) fn encode_since(vector: &[u64]) -> String {
     encode_token(vector, &[])
 }

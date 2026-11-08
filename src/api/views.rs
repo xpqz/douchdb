@@ -492,8 +492,9 @@ pub(super) async fn view_request(
     match result {
         Ok(mut value) => {
             if query.update_seq {
-                if let Ok(info) = db.info().await {
-                    value["update_seq"] = info["update_seq"].clone();
+                match query_update_seq(st, db, dbname, headers).await {
+                    Ok(update_seq) => value["update_seq"] = update_seq,
+                    Err(error) => return fail(error),
                 }
             }
             json(StatusCode::OK, value)

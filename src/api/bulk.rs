@@ -601,14 +601,26 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
 
 /// The reply once the rows are known: re-check access (a security change may
 /// have landed while the query ran) and add `update_seq` when asked for.
-fn all_docs_reply(req: &DbRequest<'_>, result: DbResult<Value>, update_seq: Value) -> Response {
+/// `fixed` is the `update_seq` to report instead of the database's.
+async fn all_docs_reply(
+    req: &DbRequest<'_>,
+    result: DbResult<Value>,
+    fixed: Option<Value>,
+) -> Response {
     if !still_allowed(req.st, req.db, req.headers) {
         return access_denied(&req.st.principal(req.headers));
     }
     match result {
         Ok(mut value) => {
             if flag(req.q, "update_seq") {
-                value["update_seq"] = update_seq;
+                let update_seq = match fixed {
+                    Some(update_seq) => Ok(update_seq),
+                    None => query_update_seq(req.st, req.db, req.name, req.headers).await,
+                };
+                match update_seq {
+                    Ok(update_seq) => value["update_seq"] = update_seq,
+                    Err(error) => return fail(error),
+                }
             }
             json(StatusCode::OK, value)
         }
@@ -631,7 +643,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         return stream_all_docs(&req, &opts).await;
     }
     let result = run_all_docs(&req, &opts).await;
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, None).await
 }
 
 /// Rows are encoded into chunks of about this size as they are read.
@@ -767,7 +779,7 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
             Err(error) => result = Err(error),
         }
     }
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, None).await
 }
 
 /// `GET|POST /{db}/_local_docs`: the `_local/` documents, which live outside
@@ -783,5 +795,5 @@ pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
     let result = req.db.local_docs(&opts).await;
-    all_docs_reply(&req, result, Value::Null)
+    all_docs_reply(&req, result, Some(Value::Null)).await
 }
