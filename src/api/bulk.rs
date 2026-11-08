@@ -90,11 +90,10 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
-        let functions =
-            match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await {
-                Ok(functions) => functions,
-                Err(error) => return fail(error),
-            };
+        let functions = match db.validation_functions().await {
+            Ok(functions) => functions,
+            Err(error) => return fail(error),
+        };
         match crate::validate::validate_docs_with(&functions, db, &mut docs, &principal).await {
             Ok(errors) => errors,
             Err(error) => return fail(error),
@@ -194,13 +193,11 @@ pub(super) fn require_design_admin(
 pub(super) async fn validate_write(
     st: &AppState,
     db: &Db,
-    dbname: &str,
     doc: &mut Value,
     headers: &HeaderMap,
 ) -> Option<Response> {
     let principal = st.principal(headers);
-    let functions = match crate::validate::validation_functions(&st.ctx, db, dbname, headers).await
-    {
+    let functions = match db.validation_functions().await {
         Ok(functions) => functions,
         Err(error) => return Some(fail(error)),
     };
@@ -328,7 +325,9 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                 (slots, result)
             }
         });
-        for (slots, result) in futures::future::join_all(requests).await {
+        for (slots, result) in
+            crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
+        {
             match result {
                 Ok(mut value) => {
                     let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
@@ -406,7 +405,9 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
                 (slots, result)
             }
         });
-        for (slots, result) in futures::future::join_all(requests).await {
+        for (slots, result) in
+            crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
+        {
             match result {
                 Ok(value) => {
                     if let Some(obj) = value.as_object() {

@@ -2,7 +2,7 @@
 
 use crate::auth::Auth;
 use crate::cluster::Cluster;
-use crate::cluster_http::internal_request_raw;
+use crate::cluster_http::{internal_request_raw, send_peer};
 use crate::db::Db;
 use crate::state::AppState;
 use anyhow::{anyhow, Result};
@@ -143,7 +143,7 @@ impl PullCtx<'_> {
         if let Some(auth) = self.auth {
             changes = changes.basic_auth(&auth.user, Some(&auth.pass));
         }
-        Ok(changes.send().await?.error_for_status()?.json().await?)
+        Ok(send_peer(changes).await?.error_for_status()?.json().await?)
     }
 
     /// A node only stores the shards it replicates. Filter before the
@@ -201,7 +201,7 @@ impl PullCtx<'_> {
         if let Some(auth) = self.auth {
             bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
         }
-        let got: Value = bulk.send().await?.error_for_status()?.json().await?;
+        let got: Value = send_peer(bulk).await?.error_for_status()?.json().await?;
         let result_rows = got
             .get("results")
             .and_then(Value::as_array)
@@ -372,6 +372,10 @@ fn sweep_order(
     (order, next)
 }
 
+/// Route label under which the peer calls of anti-entropy metadata sync are
+/// counted in the metrics (`peer_calls` per route, one request per pass).
+const ANTI_ENTROPY_ROUTE: &str = "_background/anti_entropy";
+
 /// Run one anti-entropy pass over the databases and peers. Returns false when
 /// a pass is already in flight.
 ///
@@ -405,13 +409,17 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         names = order;
     }
 
+    // Anti-entropy runs outside any client request, so its metadata calls
+    // are counted in a scope of their own, one per pass, under a fixed route
+    // label (never derived from a path).
+    let metadata_stats = crate::cluster_http::PeerStats::new(ANTI_ENTROPY_ROUTE.to_string(), false);
+    crate::cluster_http::with_stats(metadata_stats, crate::fabric::sync_metadata(&state, &names))
+        .await;
     let mut error: Option<String> = None;
     for name in names {
         let Ok(db) = state.db_cold(&name).await else {
             continue;
         };
-        crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
-        crate::fabric::reconcile_security(&state.ctx, &db).await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();

@@ -483,6 +483,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--wasm-runtime` | `wasmi` | WASM host runtime: `wasmi` (lean interpreter) or `wasmtime` (Cranelift JIT; build with `--features wasmtime`, which needs Rust 1.97+) |
 | `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
+| `--peer-http2` | off | Send node-to-node requests over HTTP/2 (see [Node-to-node transport](#node-to-node-transport)) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
 | `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
@@ -563,6 +564,15 @@ router; there is no coordinator role.
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
   internal calls. This is non-client-induced replication: it catches up after
   missed writes, restarts and offline periods without a client request.
+- `validate_doc_update` functions come from the coordinating node's own design
+  documents (cached, dropped on any design-document write), so a write makes no
+  peer call to find validators, with or without a peer down. Design documents
+  are written to every node; a node that missed such a write (it was down)
+  enforces the validator once anti-entropy has pulled the document: at startup
+  and then at most one `--sync-secs` interval (plus the pass itself) after a
+  peer holding it is reachable. Until then writes it coordinates are not
+  checked by that validator. A corrupt or unreadable local design document
+  fails writes rather than being skipped.
 - Cluster management is exposed at `/_node/_local/_cluster`,
   `/_node/_local/_replication` and in the console. Discovery probes configured
   nodes, `--seed-nodes` and the memberships they report, marking reachable
@@ -596,6 +606,30 @@ $BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 3 \
 
 Clients can talk to any node. Create the database through any node (it is
 broadcast) and then write normally.
+
+### Node-to-node transport
+
+Every node's listener accepts HTTP/1.1 and cleartext HTTP/2 (h2c, prior
+knowledge) on the same port, so clients see no difference. With
+`--peer-http2` a node sends its requests to other nodes over HTTP/2: one
+multiplexed, header-compressed connection per peer instead of one HTTP/1.1
+connection per request in flight (to `https://` peers h2 is negotiated by ALPN
+instead). Flow control is sized so a large `_bulk_docs` or `_changes` body
+does not stall small requests on the same connection: 1 MiB per stream, 8 MiB
+per connection, 64 KiB frames, 256 concurrent streams per connection, and a
+keep-alive ping every 30 s (dead peer after 10 s). The 2 s connect and 60 s
+request timeouts are unchanged.
+
+The flag is **off by default** so a rolling upgrade is safe: a node that has
+`--peer-http2` cannot talk to a peer from before this release, whose listener
+is HTTP/1.1 only (the request fails like an unreachable peer; there is no
+automatic fallback). Upgrade every node to this release first, still without
+the flag, then restart them with `--peer-http2` one at a time; nodes with and
+without the flag work together in any mix, because every upgraded listener
+accepts both protocols. Once all nodes are upgraded, `--peer-http2` can be
+enabled everywhere. A node reports how many requests from other nodes it
+served per protocol under `http.internal_requests` in
+`/_node/_local/_metrics`.
 
 ### Cluster limits
 
@@ -789,6 +823,20 @@ cargo build --release --bin loadgen
 python3 scripts/perf_cluster.py --docs 6000 --spread --native
 python3 scripts/perf_isolated.py --nodes 1,2,3
 ```
+
+Peer round trips per client request (calls, sequential rounds, and the share
+of latency spent waiting on peers) are measured on a local three-node cluster
+without Docker. Each node process is tracked and killed on exit, and the run is
+bounded:
+
+```sh
+cargo build --release --bins
+timeout 600 python3 scripts/bench_peer_trips.py
+```
+
+The counts come from the coordinator's metrics (`peer_calls`, `peer_rounds`,
+`peer_wait_ms` per route in `/_node/_local/_metrics`; `nested_*` are the calls
+made by the nodes it reached) and are exact. Latencies are indicative only.
 
 JavaScript sandbox throughput is measured separately in
 [docs/performance.md](docs/performance.md#javascript-sandbox-throughput) and

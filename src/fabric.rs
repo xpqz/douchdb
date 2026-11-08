@@ -3,7 +3,8 @@
 
 use crate::cluster::ShardMask;
 use crate::cluster_http::{
-    forward_client_auth, internal_request, internal_request_raw, ClusterCtx,
+    forward_client_auth, in_request_scope, internal_request, internal_request_raw, send_peer,
+    ClusterCtx,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
@@ -52,40 +53,43 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
     map.node_count == cluster_size.max(1) && map.version >= version
 }
 
-/// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
-/// older peers receive the local or pending map. This runs from anti-entropy,
-/// so a metadata update that missed a peer is repaired after that peer returns.
-pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
-    if !ctx.cluster.is_clustered() {
-        return;
-    }
+/// Reconcile versioned shard-map metadata of one database with `peers`, one
+/// GET and at most one PUT each. Newer maps are pulled; older peers receive
+/// the local or pending map. `known_acks` is the number of nodes (this one
+/// included) already known to hold the map, from peers handled elsewhere.
+///
+/// This is the per-database protocol that anti-entropy used before the
+/// batched exchange (`sync_metadata`). It stays for peers that predate that
+/// endpoint, so a rolling upgrade keeps converging.
+async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], known_acks: usize) {
+    let mut known_acks = known_acks;
     let local = db.shard_map();
     let mut desired = db
         .pending_shard_map()
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let reported = join_all(ctx.cluster.peers().map(|peer| async move {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::GET,
-            peer,
-            &["_node", "_local", "_dbs", &db.name],
-            None,
-        );
-        let map = async {
-            request
-                .send()
-                .await
-                .ok()?
-                .json::<crate::cluster::ShardMap>()
-                .await
-                .ok()
-        }
+    let reported =
+        crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::GET,
+                peer,
+                &["_node", "_local", "_dbs", &db.name],
+                None,
+            );
+            let map = async {
+                send_peer(request)
+                    .await
+                    .ok()?
+                    .json::<crate::cluster::ShardMap>()
+                    .await
+                    .ok()
+            }
+            .await;
+            (peer.clone(), map)
+        })))
         .await;
-        (peer.clone(), map)
-    }))
-    .await;
 
     for map in reported.iter().filter_map(|(_, map)| map.clone()) {
         if adoptable_peer_map(&map, desired.version, ctx.cluster.nodes.len())
@@ -101,6 +105,8 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
                 }
             }
             desired = map;
+            // What the other peers hold was counted against the older map.
+            known_acks = 1;
         }
     }
 
@@ -114,7 +120,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         .into_iter()
         .partition(|(_, map)| map.as_ref() == Some(&desired));
     let peers: Vec<String> = stale.into_iter().map(|(peer, _)| peer).collect();
-    let responses = join_all(peers.into_iter().map(|peer| {
+    let responses = crate::cluster_http::in_one_round(join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
             let request = internal_request(
@@ -126,15 +132,15 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
             )
             .header("content-type", "application/json")
             .body(payload);
-            request
-                .send()
+            send_peer(request)
                 .await
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
         }
-    }))
+    })))
     .await;
-    let acknowledgements = 1 + current.len() + responses.into_iter().filter(|ok| *ok).count();
+    let acknowledgements =
+        known_acks + current.len() + responses.into_iter().filter(|ok| *ok).count();
     if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
         if let Err(error) = db.clear_pending_shard_map() {
             tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
@@ -156,33 +162,32 @@ fn security_supersedes(
             && crate::db::canonical_json(security) > crate::db::canonical_json(current))
 }
 
-/// Reconcile the versioned `_security` object with peers: adopt the newest
-/// one any peer reports, then push it to the peers that hold something else.
-/// This is what brings a restored, new or rollback-missed node up to date.
-pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
-    if !ctx.cluster.is_clustered() {
-        return;
-    }
-    let fetched = join_all(ctx.cluster.peers().map(|peer| async move {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::GET,
-            peer,
-            &["_node", "_local", "_dbs", &db.name, "security"],
-            None,
-        );
-        let envelope = request
-            .send()
-            .await
-            .ok()?
-            .json::<serde_json::Value>()
-            .await
-            .ok()?;
-        let version = envelope.get("version")?.as_u64()?;
-        let security = envelope.get("security")?.clone();
-        Some((peer.clone(), version, security))
-    }))
-    .await;
+/// Reconcile the versioned `_security` object of one database with `peers`:
+/// adopt the newest one any peer reports, then push it to the peers that hold
+/// something else. This is what brings a restored, new or rollback-missed
+/// node up to date. Per-database protocol for peers without the batched
+/// exchange, like `reconcile_shard_map`.
+async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String]) {
+    let fetched =
+        crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::GET,
+                peer,
+                &["_node", "_local", "_dbs", &db.name, "security"],
+                None,
+            );
+            let envelope = send_peer(request)
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
+            let version = envelope.get("version")?.as_u64()?;
+            let security = envelope.get("security")?.clone();
+            Some((peer.clone(), version, security))
+        })))
+        .await;
     let fetched: Vec<(String, u64, serde_json::Value)> = fetched.into_iter().flatten().collect();
 
     let (mut version, mut security) = db.security_versioned();
@@ -198,7 +203,7 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
     }
 
     let envelope = serde_json::json!({"version": version, "security": security});
-    join_all(
+    crate::cluster_http::in_one_round(join_all(
         fetched
             .iter()
             .filter(|(_, peer_version, peer_security)| {
@@ -214,11 +219,409 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
                 )
                 .json(&envelope);
                 async move {
-                    let _ = request.send().await;
+                    let _ = send_peer(request).await;
                 }
             }),
-    )
+    ))
     .await;
+}
+
+// ---- Batched metadata anti-entropy -----------------------------------------
+//
+// One exchange per peer covers every database of a pass. The sender posts a
+// summary, `{db: (shard map version + placement fingerprint, security version
+// + object fingerprint)}`; the peer answers with the entries it holds that
+// differ, so a converged cluster costs one request per peer however many
+// databases there are. Anti-entropy then applies what came back with the same
+// setters as the per-database protocol (`set_shard_map`,
+// `set_security_versioned`), so the version and tiebreak rules of the shard
+// map and security reconciliation are untouched. Entries the peer is behind
+// on are pushed in one more request to that peer, only when there are any.
+
+/// Databases per exchange, to bound the size of one request body. A pass over
+/// more databases than this makes one exchange per peer per batch.
+const METADATA_BATCH: usize = 1000;
+
+/// A metadata version and a fingerprint of its content.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Stamp {
+    version: u64,
+    fingerprint: String,
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn shard_map_stamp(map: &crate::cluster::ShardMap) -> Stamp {
+    let content = serde_json::to_vec(&(map.q, map.node_count, &map.replicas)).unwrap_or_default();
+    Stamp {
+        version: map.version,
+        fingerprint: fingerprint(&content),
+    }
+}
+
+pub(crate) fn security_stamp(version: u64, security: &Value) -> Stamp {
+    Stamp {
+        version,
+        fingerprint: fingerprint(crate::db::canonical_json(security).as_bytes()),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DbSummary {
+    shard_map: Stamp,
+    security: Stamp,
+}
+
+/// A security object with its cluster version, as stored.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SecurityEntry {
+    pub version: u64,
+    pub security: Value,
+}
+
+/// Metadata of one database: what a peer holds that differs from a summary,
+/// or what is pushed to a peer that is behind.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DbEntries {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_map: Option<crate::cluster::ShardMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityEntry>,
+}
+
+/// Which pushed entries the receiver stored.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Accepted {
+    pub shard_map: bool,
+    pub security: bool,
+}
+
+/// Body of `POST /_node/_local/_metadata_sync`: a summary to compare with,
+/// and entries to apply. Either may be empty.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MetadataSync {
+    #[serde(default)]
+    pub summary: BTreeMap<String, DbSummary>,
+    #[serde(default)]
+    pub push: BTreeMap<String, DbEntries>,
+}
+
+/// Answer to [`MetadataSync`]: the receiver's own entries that differ from the
+/// summary, the databases it does not have, and what became of the pushes.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MetadataSyncReply {
+    #[serde(default)]
+    pub differs: BTreeMap<String, DbEntries>,
+    #[serde(default)]
+    pub missing: BTreeSet<String>,
+    #[serde(default)]
+    pub accepted: BTreeMap<String, Accepted>,
+}
+
+/// The shard map anti-entropy spreads for `db`: the pending one if it is at
+/// least as new as the stored one, else the stored one.
+fn desired_shard_map(db: &Db) -> crate::cluster::ShardMap {
+    let local = db.shard_map();
+    db.pending_shard_map()
+        .filter(|pending| pending.version >= local.version)
+        .unwrap_or(local)
+}
+
+/// The receiver's side of the exchange: compare `summary` with what the local
+/// databases hold. Returns the entries that differ and the databases that do
+/// not exist here.
+pub(crate) async fn metadata_differences(
+    state: &AppState,
+    summary: &BTreeMap<String, DbSummary>,
+) -> (BTreeMap<String, DbEntries>, BTreeSet<String>) {
+    let mut differs = BTreeMap::new();
+    let mut missing = BTreeSet::new();
+    for (name, theirs) in summary {
+        let Ok(db) = state.db_cold(name).await else {
+            missing.insert(name.clone());
+            continue;
+        };
+        let mut entries = DbEntries::default();
+        let map = db.shard_map();
+        if shard_map_stamp(&map) != theirs.shard_map {
+            entries.shard_map = Some(map);
+        }
+        let (version, security) = db.security_versioned();
+        if security_stamp(version, &security) != theirs.security {
+            entries.security = Some(SecurityEntry { version, security });
+        }
+        if entries.shard_map.is_some() || entries.security.is_some() {
+            differs.insert(name.clone(), entries);
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+    (differs, missing)
+}
+
+/// How a peer took part in the exchange.
+enum PeerReply {
+    Answered(MetadataSyncReply),
+    /// 404: the peer predates the endpoint (a rolling upgrade). It is
+    /// reconciled database by database with the old GET/PUT protocol.
+    Legacy,
+    /// Unreachable or failed; tried again on the next pass.
+    Unavailable,
+}
+
+async fn metadata_exchange(ctx: &ClusterCtx, peer: &str, body: &MetadataSync) -> PeerReply {
+    let request = internal_request(
+        ctx,
+        reqwest::Method::POST,
+        peer,
+        &["_node", "_local", "_metadata_sync"],
+        None,
+    )
+    .json(body);
+    let Ok(response) = send_peer(request).await else {
+        return PeerReply::Unavailable;
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return PeerReply::Legacy;
+    }
+    if !response.status().is_success() {
+        return PeerReply::Unavailable;
+    }
+    match response.json::<MetadataSyncReply>().await {
+        Ok(reply) => PeerReply::Answered(reply),
+        Err(_) => PeerReply::Unavailable,
+    }
+}
+
+/// Reconcile shard maps and security objects of `names` with every peer: one
+/// exchange per peer per batch of databases, plus one push to each peer that
+/// is behind on something. Replaces running `reconcile_shard_map` and
+/// `reconcile_security` per database, which cost 2-4 requests per peer per
+/// database.
+pub(crate) async fn sync_metadata(state: &Arc<AppState>, names: &[String]) {
+    if !state.ctx.cluster.is_clustered() {
+        return;
+    }
+    for batch in names.chunks(METADATA_BATCH) {
+        sync_metadata_batch(state, batch).await;
+    }
+}
+
+async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
+    let ctx = &state.ctx;
+    let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
+
+    let mut sent = MetadataSync::default();
+    for name in names {
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        let (version, security) = db.security_versioned();
+        sent.summary.insert(
+            name.clone(),
+            DbSummary {
+                shard_map: shard_map_stamp(&desired_shard_map(&db)),
+                security: security_stamp(version, &security),
+            },
+        );
+        drop(db);
+        state.release_cold().await;
+    }
+    if sent.summary.is_empty() {
+        return;
+    }
+
+    let replies = crate::cluster_http::in_one_round(join_all(
+        peers
+            .iter()
+            .map(|peer| async { (peer.clone(), metadata_exchange(ctx, peer, &sent).await) }),
+    ))
+    .await;
+    let mut answered = Vec::new();
+    let mut legacy = Vec::new();
+    for (peer, reply) in replies {
+        match reply {
+            PeerReply::Answered(reply) => answered.push((peer, reply)),
+            PeerReply::Legacy => legacy.push(peer),
+            PeerReply::Unavailable => {}
+        }
+    }
+
+    // Adopt what the peers hold, and work out who is behind.
+    let mut pushes: BTreeMap<String, MetadataSync> = BTreeMap::new();
+    let mut pending: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, mine) in &sent.summary {
+        if answered.is_empty() {
+            break;
+        }
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        let holders: Vec<(&String, &MetadataSyncReply)> = answered
+            .iter()
+            .filter(|(_, reply)| !reply.missing.contains(name))
+            .map(|(peer, reply)| (peer, reply))
+            .collect();
+
+        let mut desired = desired_shard_map(&db);
+        for (_, reply) in &holders {
+            let Some(map) = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.shard_map.as_ref())
+            else {
+                continue;
+            };
+            if adoptable_peer_map(map, desired.version, ctx.cluster.nodes.len())
+                && db.set_shard_map(map.clone()).unwrap_or(false)
+            {
+                if db
+                    .pending_shard_map()
+                    .is_some_and(|pending| pending.version <= map.version)
+                {
+                    // The adopted map supersedes (or beat the tiebreak against) ours.
+                    if let Err(error) = db.clear_pending_shard_map() {
+                        tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+                    }
+                }
+                desired = map.clone();
+            }
+        }
+        let desired_stamp = shard_map_stamp(&desired);
+        let mut current = 1usize;
+        for (peer, reply) in &holders {
+            // A peer that sent no map holds the one we summarised.
+            let held = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.shard_map.as_ref())
+                .map(shard_map_stamp)
+                .unwrap_or_else(|| mine.shard_map.clone());
+            if held == desired_stamp {
+                current += 1;
+            } else {
+                pushes
+                    .entry((*peer).clone())
+                    .or_default()
+                    .push
+                    .entry(name.clone())
+                    .or_default()
+                    .shard_map = Some(desired.clone());
+            }
+        }
+        if db.pending_shard_map().is_some() {
+            pending.insert(name.clone(), current);
+        }
+
+        let (mut version, mut security) = db.security_versioned();
+        for (_, reply) in &holders {
+            let Some(entry) = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.security.as_ref())
+            else {
+                continue;
+            };
+            if security_supersedes(entry.version, &entry.security, version, &security)
+                && db
+                    .set_security_versioned(entry.version, entry.security.clone())
+                    .unwrap_or(false)
+            {
+                version = entry.version;
+                security = entry.security.clone();
+            }
+        }
+        let security_now = security_stamp(version, &security);
+        for (peer, reply) in &holders {
+            let held = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.security.as_ref())
+                .map(|entry| security_stamp(entry.version, &entry.security))
+                .unwrap_or_else(|| mine.security.clone());
+            if held != security_now {
+                pushes
+                    .entry((*peer).clone())
+                    .or_default()
+                    .push
+                    .entry(name.clone())
+                    .or_default()
+                    .security = Some(SecurityEntry {
+                    version,
+                    security: security.clone(),
+                });
+            }
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+
+    // Push to the peers that are behind; each one that stores a pending map
+    // counts as an acknowledgement of it.
+    let pushed =
+        crate::cluster_http::in_one_round(join_all(pushes.iter().map(|(peer, body)| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::POST,
+                peer,
+                &["_node", "_local", "_metadata_sync"],
+                None,
+            )
+            .json(body);
+            let reply = match send_peer(request).await {
+                Ok(response) if response.status().is_success() => {
+                    response.json::<MetadataSyncReply>().await.ok()
+                }
+                _ => None,
+            };
+            (peer.clone(), reply)
+        })))
+        .await;
+    for (_, reply) in &pushed {
+        for (name, accepted) in reply.iter().flat_map(|reply| reply.accepted.iter()) {
+            if accepted.shard_map {
+                if let Some(count) = pending.get_mut(name) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let quorum_floor = ctx.cluster.nodes.len().max(1) / 2;
+    for (name, acknowledgements) in &pending {
+        if *acknowledgements <= quorum_floor {
+            continue;
+        }
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        if let Err(error) = db.clear_pending_shard_map() {
+            tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+
+    // Peers without the endpoint get the per-database protocol, counting the
+    // acknowledgements the others already gave.
+    if !legacy.is_empty() {
+        for name in sent.summary.keys() {
+            let Ok(db) = state.db_cold(name).await else {
+                continue;
+            };
+            let known = pending.get(name).copied().unwrap_or(1);
+            reconcile_shard_map(ctx, &db, &legacy, known).await;
+            reconcile_security(ctx, &db, &legacy).await;
+            drop(db);
+            state.release_cold().await;
+        }
+    }
 }
 
 /// Ask every replica for a document. With `open_all`, each peer returns all
@@ -257,7 +660,7 @@ pub(crate) async fn replica_docs(
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
-    let responses = join_all(replicas.into_iter().map(|node| {
+    let responses = crate::cluster_http::in_one_round(join_all(replicas.into_iter().map(|node| {
         let inner = inner.clone();
         let opts = opts.clone();
         async move {
@@ -279,7 +682,7 @@ pub(crate) async fn replica_docs(
             )
             .header("x-douchdb-quorum-read", "1")
             .query(&inner);
-            match request.send().await {
+            match send_peer(request).await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
                         Ok(value) => (true, Some(value)),
@@ -291,7 +694,7 @@ pub(crate) async fn replica_docs(
                 Err(_) => (false, None),
             }
         }
-    }))
+    })))
     .await;
 
     let reachable = responses.iter().filter(|(reachable, _)| *reachable).count();
@@ -543,6 +946,9 @@ async fn spawn_quorum_writes(
 ) -> FuturesUnordered<tokio::task::JoinHandle<NodeReply>> {
     let ctx = &st.ctx;
     let pending = FuturesUnordered::new();
+    // One round for all the replica writes, however far apart they start or
+    // finish; each remote task keeps it open until its call is done.
+    let round = crate::cluster_http::peer_round();
     for (node, group) in groups {
         let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
         let slot = st.admission.acquire_detached().await;
@@ -562,8 +968,9 @@ async fn spawn_quorum_writes(
             let dbname = dbname.to_string();
             let headers = headers.clone();
             let gate = gate.clone();
+            let round = round.clone();
             pending.push(spawn_node_write(node, slots, async move {
-                let (_gate, _slot) = (gate, slot);
+                let (_gate, _slot, _round) = (gate, slot, round);
                 forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await
             }));
         }
@@ -581,6 +988,8 @@ fn spawn_node_write(
     write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
 ) -> tokio::task::JoinHandle<NodeReply> {
     use futures::FutureExt;
+    // The task keeps counting its peer calls against the client request.
+    let write = in_request_scope(write);
     tokio::spawn(async move {
         let result = std::panic::AssertUnwindSafe(write)
             .catch_unwind()
@@ -746,22 +1155,24 @@ async fn replicate_to_all(
         let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
         responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
     }
-    let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
-        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-        let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-        let client = ctx.client.clone();
-        let secret = ctx.cluster.secret.clone();
-        let peer = ctx.cluster.nodes[node].clone();
-        let dbname = dbname.to_string();
-        let headers = headers.clone();
-        async move {
-            (
-                node,
-                slots,
-                forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
-            )
-        }
-    }))
+    let remote = crate::cluster_http::in_one_round(futures::future::join_all(
+        groups.into_iter().map(|(node, group)| {
+            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+            let client = ctx.client.clone();
+            let secret = ctx.cluster.secret.clone();
+            let peer = ctx.cluster.nodes[node].clone();
+            let dbname = dbname.to_string();
+            let headers = headers.clone();
+            async move {
+                (
+                    node,
+                    slots,
+                    forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
+                )
+            }
+        }),
+    ))
     .await;
     responses.extend(remote);
     responses
@@ -830,8 +1241,7 @@ where
         new_edits,
     });
     let request = forward_client_auth(request, &headers);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
     if !response.status().is_success() {
@@ -872,8 +1282,7 @@ pub(crate) async fn forward_json(
     )
     .query(&params)
     .json(body);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
     if !response.status().is_success() {
@@ -960,6 +1369,11 @@ enum Round {
 /// `(node, round, value)` for every request, owner results first. A failed
 /// fallback request fails the read; `what` names the read in the 502 returned
 /// when no request succeeds.
+///
+/// A peer that discovery found unreachable is not called: its shards go to a
+/// replica in the first round, together with the other requests. If that
+/// leaves some shard without a live copy the mark is distrusted (it may be
+/// stale) and the node is tried like any other.
 async fn scatter<T, F, Fut>(
     read: ClusterRead<'_>,
     owned_by_node: &[ShardMask],
@@ -970,49 +1384,108 @@ where
     F: Fn(usize, ShardMask, Round) -> Fut,
     Fut: std::future::Future<Output = DbResult<T>>,
 {
+    scatter_nodes(read, owned_by_node, what, false, fetch).await
+}
+
+/// [`scatter`], optionally also asking the nodes that own no shard (with an
+/// empty mask), so that one round both reads the shards and learns which
+/// nodes answer.
+async fn scatter_nodes<T, F, Fut>(
+    read: ClusterRead<'_>,
+    owned_by_node: &[ShardMask],
+    what: &str,
+    include_idle: bool,
+    fetch: F,
+) -> DbResult<Vec<(usize, Round, T)>>
+where
+    F: Fn(usize, ShardMask, Round) -> Fut,
+    Fut: std::future::Future<Output = DbResult<T>>,
+{
     let ClusterRead { ctx, db, .. } = read;
-    let requests: Vec<(usize, ShardMask)> = owned_by_node
+    let nodes = ctx.cluster.nodes.len();
+
+    let known_down: Vec<usize> = (0..nodes)
+        .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
+        .collect();
+    let mut excluded: Vec<usize> = Vec::new();
+    let mut rerouted: Vec<(usize, ShardMask, Round)> = Vec::new();
+    if !known_down.is_empty() {
+        let alive: Vec<usize> = (0..nodes)
+            .filter(|node| !known_down.contains(node))
+            .collect();
+        if let Ok(groups) = fallback_shard_masks(db, owned_by_node, &known_down, &alive) {
+            if !groups.is_empty() {
+                crate::telemetry::record_degraded_read();
+            }
+            rerouted = groups
+                .into_iter()
+                .map(|(node, mask)| (node, mask, Round::Fallback))
+                .collect();
+            excluded = known_down;
+        }
+    }
+    let mut requests: Vec<(usize, ShardMask, Round)> = owned_by_node
         .iter()
         .cloned()
         .enumerate()
-        .filter(|(_, mask)| !mask.is_empty())
+        .filter(|(node, mask)| !excluded.contains(node) && (include_idle || !mask.is_empty()))
+        .map(|(node, mask)| (node, mask, Round::Owner))
         .collect();
+    requests.extend(rerouted);
     crate::telemetry::record_fanout(requests.len() as u64);
-    let responses = join_all(requests.into_iter().map(|(node, mask)| {
-        let response = fetch(node, mask, Round::Owner);
-        async move { (node, response.await) }
-    }))
-    .await;
 
     let mut values = Vec::new();
-    let mut failed = Vec::new();
-    for (node, response) in responses {
-        match response {
-            Ok(value) => values.push((node, Round::Owner, value)),
-            Err(error) => {
-                tracing::warn!(
-                    "{what} read from node {node} failed: {} {}",
-                    error.status,
-                    error.reason
-                );
-                failed.push(node);
+    // Only the first dispatch may fail over: a failed fallback fails the read.
+    let mut first = true;
+    loop {
+        let responses = crate::cluster_http::in_one_round(join_all(requests.into_iter().map(
+            |(node, mask, round)| {
+                let response = fetch(node, mask.clone(), round);
+                async move { (node, mask, round, response.await) }
+            },
+        )))
+        .await;
+
+        let mut lost = vec![ShardMask::none(db.q); nodes];
+        let mut failed: Vec<usize> = Vec::new();
+        for (node, mask, round, response) in responses {
+            match response {
+                Ok(value) => values.push((node, round, value)),
+                Err(error) if first => {
+                    tracing::warn!(
+                        "{what} read from node {node} failed: {} {}",
+                        error.status,
+                        error.reason
+                    );
+                    if !failed.contains(&node) {
+                        failed.push(node);
+                    }
+                    if let Some(slot) = lost.get_mut(node) {
+                        for shard in mask.shards() {
+                            slot.select(shard);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
-    }
-    if !failed.is_empty() {
-        crate::telemetry::record_degraded_read();
-        let alive: Vec<usize> = (0..ctx.cluster.nodes.len())
-            .filter(|node| !failed.contains(node))
-            .collect();
-        let groups = fallback_shard_masks(db, owned_by_node, &failed, &alive)?;
-        let fallbacks = join_all(groups.into_iter().map(|(node, mask)| {
-            let response = fetch(node, mask, Round::Fallback);
-            async move { (node, response.await) }
-        }))
-        .await;
-        for (node, response) in fallbacks {
-            values.push((node, Round::Fallback, response?));
+        if failed.is_empty() {
+            break;
         }
+        first = false;
+        if lost.iter().any(|mask| !mask.is_empty()) {
+            crate::telemetry::record_degraded_read();
+        }
+        excluded.extend(failed.iter().copied());
+        let alive: Vec<usize> = (0..nodes).filter(|node| !excluded.contains(node)).collect();
+        let groups = fallback_shard_masks(db, &lost, &failed, &alive)?;
+        if groups.is_empty() {
+            break;
+        }
+        requests = groups
+            .into_iter()
+            .map(|(node, mask)| (node, mask, Round::Fallback))
+            .collect();
     }
     if values.is_empty() {
         return Err(ApiError::new(
@@ -1190,8 +1663,7 @@ pub(crate) async fn fetch_all_docs(
     )
     .query(&query)
     .json(&body);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
     if !response.status().is_success() {
@@ -1297,8 +1769,7 @@ async fn fetch_view_mask(
         Some(headers),
     )
     .query(&params);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {
@@ -1488,8 +1959,7 @@ async fn fetch_reduce_mask(
         Some(headers),
     )
     .query(&params);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {
@@ -1617,7 +2087,7 @@ pub(crate) async fn fetch_ddoc_from_replica(
             &[dbname, ddoc],
             Some(headers),
         );
-        if let Ok(response) = request.send().await {
+        if let Ok(response) = send_peer(request).await {
             if response.status().is_success() {
                 if let Ok(value) = response.json::<Value>().await {
                     return Ok(value);
@@ -1666,7 +2136,15 @@ pub(crate) async fn cluster_changes(
     let ClusterRead { ctx, db, .. } = read;
     let n = ctx.cluster.nodes.len();
     let raw_since = q.get("since").map(String::as_str);
-    let (mut since, marks) = if raw_since == Some("now") {
+    let limit = num(q, "limit");
+    // `since=now` is resolved by the nodes themselves, in the same round that
+    // reads their changes: each answers for its own sequence space, so no
+    // separate round has to learn the vector first. `limit=0` reads nothing,
+    // so only the vector is needed.
+    let now = raw_since == Some("now") && limit != Some(0);
+    let (mut since, marks) = if now {
+        (vec![0; n], Vec::new())
+    } else if raw_since == Some("now") {
         cluster_update_vector(read).await?
     } else if let Some(raw) = raw_since {
         let vector = match decode_since(raw, n) {
@@ -1689,7 +2167,6 @@ pub(crate) async fn cluster_changes(
         filter: change_filter.as_ref(),
         q,
     };
-    let limit = num(q, "limit");
     if limit == Some(0) {
         return Ok(json!({
             "results": [],
@@ -1701,15 +2178,29 @@ pub(crate) async fn cluster_changes(
     let node_limit = if change_filter.is_some() { None } else { limit };
     let since_ref = &since;
     let marks_ref = &marks;
-    let responses = scatter(
+    let responses = scatter_nodes(
         read,
         &owned_by_node,
         "changes",
+        now,
         |node, mask, round| async move {
+            let shards = mask.shards();
+            if now {
+                if mask.is_empty() {
+                    // Owns no shard: only its sequence is wanted, for its
+                    // slot in the vector.
+                    let seq = fetch_update_seq(read, node).await?;
+                    let empty = json!({"results": [], "last_seq": seq, "pending": 0});
+                    return Ok((shards, None, empty));
+                }
+                let start = ChangesStart::Now;
+                let value =
+                    fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
+                return Ok((shards, None, value));
+            }
             // Shards reassigned from a failed owner resume from the mark this
             // node left for exactly this set of shards, else from the start;
             // preferred masks are disjoint, so ids do not overlap.
-            let shards = mask.shards();
             let since = match round {
                 Round::Owner => since_ref[node],
                 Round::Fallback => marks_ref
@@ -1717,8 +2208,9 @@ pub(crate) async fn cluster_changes(
                     .find(|mark| mark.node == node && mark.shards == shards)
                     .map_or(0, |mark| mark.seq),
             };
-            let value = fetch_node_changes(read, changes, node, &mask, since, node_limit).await?;
-            Ok((shards, since, value))
+            let start = ChangesStart::At(since);
+            let value = fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
+            Ok((shards, Some(since), value))
         },
     )
     .await?;
@@ -1729,8 +2221,25 @@ pub(crate) async fn cluster_changes(
     let mut pending = 0;
     for (node, round, (shards, lane_since, mut value)) in responses {
         pending += node_pending(&value);
+        let mut rows: Vec<Value> = match value.get_mut("results").map(std::mem::take) {
+            Some(Value::Array(rows)) => rows,
+            _ => Vec::new(),
+        };
+        rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
+        let last = last_seq_for_node(&value, node, n);
+        // A node that resolved `since=now` itself started just before its
+        // first row, or where it reports having stopped when there is none.
+        let lane_since = lane_since.unwrap_or_else(|| match rows.first() {
+            Some(row) => row["seq"].as_u64().unwrap_or(0).saturating_sub(1),
+            None => last.unwrap_or(0),
+        });
         let mark = match round {
-            Round::Owner => None,
+            Round::Owner => {
+                if let Some(slot) = progress.get_mut(node) {
+                    *slot = (*slot).max(lane_since);
+                }
+                None
+            }
             Round::Fallback => {
                 fallbacks.push(FallbackMark {
                     node,
@@ -1740,16 +2249,11 @@ pub(crate) async fn cluster_changes(
                 Some(fallbacks.len() - 1)
             }
         };
-        let mut rows: Vec<Value> = match value.get_mut("results").map(std::mem::take) {
-            Some(Value::Array(rows)) => rows,
-            _ => Vec::new(),
-        };
-        rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
         lanes.push(ChangeLane {
             node,
             mark,
             rows: rows.into(),
-            last: last_seq_for_node(&value, node, n),
+            last,
         });
     }
 
@@ -1804,12 +2308,20 @@ fn node_pending(response: &Value) -> u64 {
     response.get("pending").and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Where a node starts reading changes.
+#[derive(Clone, Copy)]
+pub(crate) enum ChangesStart {
+    At(u64),
+    /// The node's current sequence, as it is when the node handles the call.
+    Now,
+}
+
 pub(crate) async fn fetch_node_changes(
     read: ClusterRead<'_>,
     changes: ChangesFetch<'_>,
     node: usize,
     mask: &ShardMask,
-    since: u64,
+    start: ChangesStart,
     limit: Option<usize>,
 ) -> DbResult<Value> {
     let ClusterRead {
@@ -1826,6 +2338,10 @@ pub(crate) async fn fetch_node_changes(
         q,
     } = changes;
     if node == ctx.cluster.me {
+        let since = match start {
+            ChangesStart::At(since) => since,
+            ChangesStart::Now => db.update_seq(),
+        };
         return db
             .changes(&ChangesOpts {
                 since,
@@ -1844,7 +2360,13 @@ pub(crate) async fn fetch_node_changes(
 
     let peer = &ctx.cluster.nodes[node];
     let selected = mask.query_value();
-    let mut params: Vec<(&str, String)> = vec![("since", since.to_string()), ("shards", selected)];
+    // A peer reads `since=now` against its own sequence, with or without this
+    // change: the forwarded form of the request has always accepted it.
+    let since = match start {
+        ChangesStart::At(since) => since.to_string(),
+        ChangesStart::Now => "now".to_string(),
+    };
+    let mut params: Vec<(&str, String)> = vec![("since", since), ("shards", selected)];
     if let Some(limit) = limit {
         params.push(("limit", limit.to_string()));
     }
@@ -1903,8 +2425,7 @@ pub(crate) async fn fetch_node_changes(
     } else {
         request
     };
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
     if !response.status().is_success() {
@@ -1916,6 +2437,37 @@ pub(crate) async fn fetch_node_changes(
         .json::<Value>()
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+}
+
+/// One node's current update sequence: its own, or what the peer reports.
+async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
+    let ClusterRead {
+        ctx,
+        db,
+        dbname,
+        headers,
+    } = read;
+    if node == ctx.cluster.me {
+        return Ok(db.update_seq());
+    }
+    let peer = &ctx.cluster.nodes[node];
+    let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
+        .header("x-douchdb-update-seq", "1");
+    let bad = |detail: String| ApiError::new(502, "bad_gateway", detail);
+    let response = send_peer(request).await.map_err(|e| bad(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(bad(format!(
+            "{peer}: update_seq returned {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|e| bad(e.to_string()))?;
+    body["update_seq"]
+        .as_u64()
+        .ok_or_else(|| bad(format!("{peer}: no update_seq")))
 }
 
 /// Current per-node update_seq vector, plus fallback marks for the shards of
@@ -1931,37 +2483,39 @@ pub(crate) async fn fetch_node_changes(
 pub(crate) async fn cluster_update_vector(
     read: ClusterRead<'_>,
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
-    let ClusterRead {
-        ctx,
-        db,
-        dbname,
-        headers,
-    } = read;
-    let seqs = futures::future::join_all((0..ctx.cluster.nodes.len()).map(|node| async move {
-        if node == ctx.cluster.me {
-            return Some(db.update_seq());
-        }
-        let peer = &ctx.cluster.nodes[node];
-        let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
-            .header("x-douchdb-update-seq", "1");
-        let response = request.send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        response.json::<Value>().await.ok()?["update_seq"].as_u64()
-    }))
-    .await;
-    let failed: Vec<usize> = (0..seqs.len())
-        .filter(|node| seqs[*node].is_none())
+    let ClusterRead { ctx, db, .. } = read;
+    let nodes = ctx.cluster.nodes.len();
+    // A peer discovery found unreachable is not asked, as long as the shards
+    // it prefers can be read from another node. The mark may be stale, so when
+    // they cannot, it is asked after all.
+    let mut held_back: Vec<usize> = (0..nodes)
+        .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
         .collect();
-    let alive: Vec<usize> = (0..seqs.len())
-        .filter(|node| seqs[*node].is_some())
+    let mut seqs: Vec<Option<u64>> = vec![None; nodes];
+    let mut to_ask: Vec<usize> = (0..nodes)
+        .filter(|node| !held_back.contains(node))
         .collect();
-    let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
-    if failed.is_empty() {
-        return Ok((vector, Vec::new()));
-    }
-    let groups = fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive)?;
+    let (vector, groups) = loop {
+        let answers = crate::cluster_http::in_one_round(futures::future::join_all(
+            to_ask
+                .iter()
+                .map(|&node| async move { fetch_update_seq(read, node).await.ok() }),
+        ))
+        .await;
+        for (&node, seq) in to_ask.iter().zip(answers) {
+            seqs[node] = seq;
+        }
+        let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
+        let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
+        let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
+        if failed.is_empty() {
+            return Ok((vector, Vec::new()));
+        }
+        match fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive) {
+            Err(_) if !held_back.is_empty() => to_ask = std::mem::take(&mut held_back),
+            groups => break (vector, groups?),
+        }
+    };
     let marks = groups
         .into_iter()
         .map(|(node, mask)| FallbackMark {
@@ -2318,8 +2872,7 @@ async fn fetch_search_mask(
         Some(headers),
     )
     .query(&params);
-    let response = outgoing
-        .send()
+    let response = send_peer(outgoing)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {

@@ -274,7 +274,7 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
             Err(e) => fail(e),
         };
     }
-    if let Some(response) = validate_write(st, db, name, &mut doc, headers).await {
+    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
     }
     // `commit_docs` routes the generated id to every replica in its
@@ -341,7 +341,7 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
                     &[name, "_partition", partition],
                     Some(headers),
                 );
-                return match request.send().await {
+                return match send_peer(request).await {
                     Ok(response) => {
                         let status = response.status();
                         let value = response.json::<Value>().await.unwrap_or_else(
@@ -705,16 +705,23 @@ async fn fan_out_db(
     name: &str,
     layout: &[(&str, String)],
 ) -> Vec<Option<StatusCode>> {
-    futures::future::join_all(st.ctx.cluster.peers().map(|peer| {
-        let request = st
-            .ctx
-            .client
-            .request(method.clone(), peer_url(peer, &[name]))
-            .query(layout)
-            .header("x-douchdb-local-db", "1")
-            .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
-        let request = forward_client_auth(request, headers);
-        async move { request.send().await.ok().map(|response| response.status()) }
-    }))
+    crate::cluster_http::in_one_round(futures::future::join_all(st.ctx.cluster.peers().map(
+        |peer| {
+            let request = st
+                .ctx
+                .client
+                .request(method.clone(), peer_url(peer, &[name]))
+                .query(layout)
+                .header("x-douchdb-local-db", "1")
+                .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
+            let request = forward_client_auth(request, headers);
+            async move {
+                send_peer(request)
+                    .await
+                    .ok()
+                    .map(|response| response.status())
+            }
+        },
+    )))
     .await
 }

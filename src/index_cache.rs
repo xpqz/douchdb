@@ -13,6 +13,7 @@
 //! use the registry runs over the cap until they are released, then comes
 //! back down on the next insert.
 
+use crate::error::{ApiError, DbResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,6 +186,107 @@ impl<V: Slot> Default for Registry<V> {
 }
 
 impl Slot for tokio::sync::RwLock<()> {}
+
+/// A database's gate for its index directories, with the signal that the
+/// database is being deleted.
+///
+/// Queries and builds hold the read side (a `Permit`) while they use an index;
+/// anything that removes index files takes the write side. `forget_db` fires
+/// the signal before it takes the write side, so a build or a queued query
+/// ends at its next check with `not_found` and drops its permit, instead of
+/// the delete waiting for it. CouchDB does the same: `couch_server` closes a
+/// deleted database and its `couch_index` processes are shut down with it, so
+/// a query in flight fails.
+///
+/// A gate that has been signalled never serves again. `forget_db` removes it
+/// from its registry, so a database created afterwards under the same name is
+/// given a fresh, unsignalled gate; a reader holding the old one still sees
+/// the signal and cannot touch the new database's indexes.
+#[derive(Default)]
+pub struct Gate {
+    lock: Arc<tokio::sync::RwLock<()>>,
+    deleted: tokio_util::sync::CancellationToken,
+}
+
+impl Slot for Gate {}
+
+fn deleted_error() -> ApiError {
+    ApiError::not_found("Database does not exist.")
+}
+
+impl Gate {
+    /// Take the read side, or fail with `not_found` if the database is being
+    /// deleted, including while waiting behind the deleting writer.
+    pub async fn read(self: &Arc<Self>) -> DbResult<Permit> {
+        let guard = self.until(self.lock.clone().read_owned()).await?;
+        let permit = Permit {
+            _guard: guard,
+            gate: self.clone(),
+        };
+        permit.check()?;
+        Ok(permit)
+    }
+
+    /// Take the write side, or fail with `not_found` if the database is being
+    /// deleted.
+    pub async fn write(&self) -> DbResult<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let guard = self.until(self.lock.clone().write_owned()).await?;
+        self.check()?;
+        Ok(guard)
+    }
+
+    /// Signal the deletion, then take the write side. The readers notice the
+    /// signal and release their permits, so this waits only for them to reach
+    /// their next check.
+    pub async fn forget(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.deleted.cancel();
+        self.lock.clone().write_owned().await
+    }
+
+    /// `not_found` once the database is being deleted.
+    pub fn check(&self) -> DbResult<()> {
+        if self.deleted.is_cancelled() {
+            Err(deleted_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Await `work`, giving it up with `not_found` as soon as the database is
+    /// being deleted.
+    pub async fn until<T>(&self, work: impl std::future::Future<Output = T>) -> DbResult<T> {
+        tokio::select! {
+            biased;
+            () = self.deleted.cancelled() => Err(deleted_error()),
+            value = work => Ok(value),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_held(&self) -> bool {
+        self.lock.clone().try_write_owned().is_err()
+    }
+}
+
+/// The read side of a `Gate`, held while an index is in use.
+pub struct Permit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    gate: Arc<Gate>,
+}
+
+impl Permit {
+    /// `not_found` once the database is being deleted. Builders call this
+    /// between batches.
+    pub fn check(&self) -> DbResult<()> {
+        self.gate.check()
+    }
+
+    /// Await `work`, giving it up with `not_found` as soon as the database is
+    /// being deleted.
+    pub async fn until<T>(&self, work: impl std::future::Future<Output = T>) -> DbResult<T> {
+        self.gate.until(work).await
+    }
+}
 
 impl<T> Slot for tokio::sync::Mutex<Option<T>> {}
 

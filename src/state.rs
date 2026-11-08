@@ -550,6 +550,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
                 secret: String::new(),
             },
             client: reqwest::Client::new(),
+            health: Default::default(),
         },
         db_updates: Default::default(),
         cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),

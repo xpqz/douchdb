@@ -111,6 +111,34 @@ pub fn record_http(method: &str, status: u16, duration_ms: f64) {
     metrics.duration.record(duration_ms, &attributes);
 }
 
+struct PeerMetrics {
+    calls: Counter<u64>,
+    rounds: Histogram<u64>,
+    wait: Histogram<f64>,
+}
+
+/// One finished client request's peer calls, sequential rounds and wait,
+/// labelled by route template only.
+pub fn record_peer(route: &str, internal: bool, calls: u64, rounds: u64, wait_ms: f64) {
+    crate::metrics::record_peer(route, internal, calls, rounds, wait_ms);
+    static METRICS: OnceLock<PeerMetrics> = OnceLock::new();
+    let metrics = METRICS.get_or_init(|| {
+        let meter = global::meter("douchdb");
+        PeerMetrics {
+            calls: meter.u64_counter("cluster.peer.calls").build(),
+            rounds: meter.u64_histogram("cluster.peer.rounds").build(),
+            wait: meter.f64_histogram("cluster.peer.wait.ms").build(),
+        }
+    });
+    let attributes = [
+        KeyValue::new("http.route", route.to_string()),
+        KeyValue::new("peer.origin", if internal { "internal" } else { "client" }),
+    ];
+    metrics.calls.add(calls, &attributes);
+    metrics.rounds.record(rounds, &attributes);
+    metrics.wait.record(wait_ms, &attributes);
+}
+
 struct FabricMetrics {
     local_reads: Counter<u64>,
     remote_reads: Counter<u64>,

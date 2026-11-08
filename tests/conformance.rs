@@ -14,23 +14,70 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// Wait until `port` accepts connections. Returns false as soon as the child
-/// exits, which is how a port collision shows up. A live child is never given
-/// up on early: with `--wasm-runtime wasmtime` it compiles the runner before
-/// it listens, which can take tens of seconds in a debug build on a loaded CI
-/// runner, and killing it to retry would only pay that cost again.
-fn wait_for_listener(child: &mut Child, port: u16) -> bool {
+/// Who answers on a port the harness is waiting for.
+enum Listener {
+    /// The child itself holds the port.
+    Ours,
+    /// The child exited before it listened. A bind that lost a race shows up
+    /// this way.
+    Exited,
+    /// Another process listens on the port, so the child can never serve it.
+    Foreign(String),
+}
+
+/// Process ids listening on TCP `port`, or `None` when `lsof` is unavailable.
+fn listener_pids(port: u16) -> Option<Vec<u32>> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-t", "-sTCP:LISTEN"])
+        .arg(format!("-iTCP:{port}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect(),
+    )
+}
+
+/// Wait until `child` itself is listening on `port`. Accepting a connection
+/// is not enough: a process that took the port while it was free accepts too,
+/// and the child then dies on its failed bind. So once something accepts, the
+/// listening socket's owner must be the child; another owner is reported at
+/// once rather than waited out. A live child is never given up on early: with
+/// `--wasm-runtime wasmtime` it compiles the runner before it listens, which
+/// can take tens of seconds in a debug build on a loaded CI runner, and
+/// killing it to retry would only pay that cost again. The deadline is a
+/// failsafe against a hang.
+fn wait_for_listener(child: &mut Child, port: u16) -> Listener {
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
         if let Ok(Some(_)) = child.try_wait() {
-            return false;
+            return Listener::Exited;
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            match listener_pids(port) {
+                Some(pids) if pids.contains(&child.id()) => return Listener::Ours,
+                Some(pids) if !pids.is_empty() => {
+                    return Listener::Foreign(format!("pid {pids:?}"));
+                }
+                // Nothing listed yet: the connection may have reached the
+                // child's own socket as it came up. Look again.
+                Some(_) => {}
+                // No `lsof`: all that can be checked is that the child lives.
+                None => {
+                    return match child.try_wait() {
+                        Ok(Some(_)) => Listener::Exited,
+                        _ => Listener::Ours,
+                    };
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    false
+    Listener::Exited
 }
 
 /// Whether to exercise the given `--js-sandbox` mode. Set
@@ -104,17 +151,9 @@ impl Server {
             .unwrap();
         let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
         let base = format!("http://127.0.0.1:{port}");
-        if wait_for_listener(&mut child, port) {
-            // A colliding process can win the port after `free_port` checked
-            // it; the child then exits while our connect succeeds against the
-            // other listener. Give the bind a moment and confirm the child is
-            // still the one serving.
-            std::thread::sleep(Duration::from_millis(30));
-            if let Ok(Some(_)) = child.try_wait() {
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&dir);
-                return None;
-            }
+        // A colliding process can win the port after `free_port` checked it;
+        // the caller then retries on another port.
+        if let Listener::Ours = wait_for_listener(&mut child, port) {
             return Some(Server {
                 child,
                 base,
@@ -155,10 +194,27 @@ impl Server {
         if self.admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        self.child = spawn_locked(&mut cmd).expect("restart douchdb");
-        if wait_for_listener(&mut self.child, self.port) {
-            std::thread::sleep(Duration::from_millis(50));
-            return;
+        // The port was free from `kill()` until now. A child that exits
+        // before listening lost a bind to something transient, such as an
+        // outgoing connection's source port, so spawn it again; a process
+        // that listens on the port cannot be waited out.
+        for _ in 0..50 {
+            self.child = spawn_locked(&mut cmd).expect("restart douchdb");
+            match wait_for_listener(&mut self.child, self.port) {
+                Listener::Ours => return,
+                Listener::Foreign(owner) => {
+                    self.kill();
+                    panic!(
+                        "port {} is held by another process ({owner}); \
+                         douchdb could not restart on it",
+                        self.port
+                    );
+                }
+                Listener::Exited => {
+                    let _ = self.child.wait();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         panic!("douchdb did not restart on port {}", self.port);
     }
@@ -336,10 +392,16 @@ fn free_port() -> u16 {
     // Tests run in parallel threads. The kernel's ephemeral-port pool can hand
     // the same released port to two tests, so assign ports from a process-wide
     // counter and confirm each one is free.
+    //
+    // The range sits below every OS's ephemeral range (macOS 49152 and up,
+    // Linux 32768 and up). Inside it, any outgoing connection, from a test
+    // server or any other process, can be given a source port equal to a
+    // test server's port, and while a node is killed its port is free for
+    // such a connection or a listener to take.
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(0);
     loop {
         let n = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-        let candidate = 31000 + ((std::process::id() as usize + n * 37) % 20000);
+        let candidate = 20000 + ((std::process::id() as usize + n * 37) % 12000);
         let _guard = SPAWN_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -403,6 +465,21 @@ fn start_cluster_full(
     replication: usize,
     admin: bool,
 ) -> Vec<Server> {
+    // Cluster tests run with HTTP/2 between nodes, so the whole suite
+    // exercises h2c. The product default is HTTP/1.1; see `--peer-http2`.
+    start_cluster_nodes(n, q, sync_secs, replication, admin, &vec![true; n])
+}
+
+/// Like `start_cluster_full`, with `peer_http2[i]` choosing whether node `i`
+/// speaks HTTP/2 to its peers.
+fn start_cluster_nodes(
+    n: usize,
+    q: u32,
+    sync_secs: &str,
+    replication: usize,
+    admin: bool,
+    peer_http2: &[bool],
+) -> Vec<Server> {
     for attempt in 0..5 {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let nodes = ports
@@ -430,6 +507,10 @@ fn start_cluster_full(
                 "--session-secret".to_string(),
                 "test-session-secret".to_string(),
             ];
+            let mut extra = extra;
+            if peer_http2[i] {
+                extra.push("--peer-http2".to_string());
+            }
             match Server::spawn_on(port, &extra, admin, attempt) {
                 Some(server) => servers.push(server),
                 None => {
@@ -1635,9 +1716,8 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    // Only node 0 stores the design document, as if node 1 missed the write
-    // and anti-entropy (off here) has not repaired it. Node 1 must still apply
-    // the validator when it coordinates a write.
+    // Only node 0 stores the design document, as if node 1 missed the write.
+    // Node 1 applies the validator once anti-entropy has pulled it.
     let (status, body) = nodes[0]
         .req_with(
             Method::POST,
@@ -1661,21 +1741,15 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
         "node 1 must not hold the design doc"
     );
 
+    wait_until_enforces(&nodes[1], "clvalidate", "rejected", true).await;
     let (status, body) = nodes[1]
         .put("/clvalidate/accepted", json!({"ok": true}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let (status, body) = nodes[1]
-        .put("/clvalidate/rejected", json!({"ok": false}))
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason"], "need ok");
-    let (status, _) = nodes[0].get("/clvalidate/rejected").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
+async fn cluster_bulk_docs_use_the_same_validators_as_single_writes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("clvalbulk").await;
@@ -1700,8 +1774,9 @@ async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    // A batch coordinated by node 1 must see the same validators as a
-    // single-document write does.
+    // Once node 1 has pulled the design document, a batch it coordinates sees
+    // the same validators as a single-document write does.
+    wait_until_enforces(&nodes[1], "clvalbulk", "probe", true).await;
     let (status, body) = nodes[1]
         .post(
             "/clvalbulk/_bulk_docs",
@@ -1752,8 +1827,93 @@ async fn cluster_validation_still_applies_with_a_peer_down() {
     assert_eq!(body[0]["error"], "forbidden", "{body}");
 }
 
+const NEED_OK: &str = "function (doc) { \
+    if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
+}";
+
+/// Write documents that a validator rejecting `{"ok": false}` should reject to
+/// `node` until one is rejected with `reason`, asking it for an anti-entropy
+/// pass before each attempt when `sync` is set. Every attempt before then is
+/// accepted or rejected for an older reason, so each uses a new id. Waits on
+/// the condition, with a generous deadline against a hang.
+async fn wait_until_rejected_with(node: &Server, db: &str, tag: &str, reason: &str, sync: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    for attempt in 0.. {
+        if sync {
+            let (status, body) = node.post("/_node/_local/_replication/run", json!({})).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        let (status, body) = node
+            .put(&format!("/{db}/{tag}{attempt}"), json!({"ok": false}))
+            .await;
+        match status {
+            StatusCode::FORBIDDEN if body["reason"] == reason => return,
+            StatusCode::FORBIDDEN | StatusCode::CREATED => {}
+            _ => panic!("unexpected {status}: {body}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never enforced the validator with reason {reason}: {body}",
+            node.base
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_until_enforces(node: &Server, db: &str, tag: &str, sync: bool) {
+    wait_until_rejected_with(node, db, tag, "need ok", sync).await;
+}
+
+/// A design document written through one node is enforced by writes
+/// coordinated on every node, with validators read from each node's own
+/// copy.
 #[tokio::test]
-async fn cluster_validators_are_cached_until_a_design_doc_changes() {
+async fn cluster_design_doc_is_enforced_by_every_coordinator() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clvalall").await;
+    }
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalall/_design/validate",
+            json!({"validate_doc_update": NEED_OK}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        // The write may return before the last replica has applied it.
+        wait_until_enforces(node, "clvalall", &format!("rej{i}-"), false).await;
+        let (status, body) = node
+            .put(&format!("/clvalall/ok{i}"), json!({"ok": true}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+}
+
+/// A node that was down when a validating design document was written holds
+/// no validator until anti-entropy pulls the document. That bounds how long
+/// it coordinates writes without it: a restart pulls at once, then every
+/// `--sync-secs`. The test asks for passes so it does not wait for the timer.
+#[tokio::test]
+async fn cluster_node_that_missed_a_design_doc_enforces_it_after_anti_entropy() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clvalmiss").await;
+    }
+    nodes[2].kill();
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalmiss/_design/validate",
+            json!({"validate_doc_update": NEED_OK}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[2].restart();
+    wait_until_enforces(&nodes[2], "clvalmiss", "rej", true).await;
+}
+
+#[tokio::test]
+async fn cluster_validators_follow_design_doc_changes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("clvalcache").await;
@@ -1782,8 +1942,8 @@ async fn cluster_validators_are_cached_until_a_design_doc_changes() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["reason"], "first");
 
-    // A change only node 0 receives, as if node 1 missed it, still reaches
-    // node 1's writes once the cached set expires.
+    // A change only node 0 receives, as if node 1 missed it, reaches node 1's
+    // writes once anti-entropy has pulled it.
     let internal = [
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
@@ -1801,25 +1961,7 @@ async fn cluster_validators_are_cached_until_a_design_doc_changes() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    // Node 1 keeps its cached set until the cache expires, so it still says
-    // "first" for a while. A rejected write changes nothing, so retry it
-    // until the new validator shows.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let (status, body) = nodes[1]
-            .put("/clvalcache/rejected", json!({"ok": false}))
-            .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        if body["reason"] == "second" {
-            break;
-        }
-        assert_eq!(body["reason"], "first", "{body}");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "node 1 never dropped its cached validator: {body}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until_rejected_with(&nodes[1], "clvalcache", "later", "second", true).await;
 }
 
 #[tokio::test]
@@ -1854,11 +1996,10 @@ async fn cluster_validation_uses_the_newest_design_doc_revision() {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
-    for node in &nodes {
-        let (status, body) = node.put("/clvalnew/rejected", json!({"ok": false})).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["reason"], "new", "{body}");
-    }
+    // Node 0 holds the newest revision. Node 1 gets it from node 0 by
+    // anti-entropy, and the older revision does not replace it.
+    wait_until_rejected_with(&nodes[0], "clvalnew", "r0-", "new", false).await;
+    wait_until_rejected_with(&nodes[1], "clvalnew", "r1-", "new", true).await;
 }
 
 #[tokio::test]
@@ -4958,6 +5099,443 @@ async fn cluster_routes_writes_and_merges_all_docs() {
 
     let (_, body) = nodes[0].get("/cluster/_all_docs").await;
     assert_eq!(body["total_rows"], 7);
+}
+
+/// One node's peer-call counters, summed over every route: `(calls its own
+/// client requests made, their sequential rounds, calls that requests sent by
+/// other nodes made)`, from its local metrics.
+async fn peer_counters(node: &Server) -> (u64, u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let mut totals = (0, 0, 0);
+    for row in metrics["http"]["routes"].as_array().into_iter().flatten() {
+        totals.0 += row["peer_calls"].as_u64().unwrap_or(0);
+        totals.1 += row["peer_rounds"].as_u64().unwrap_or(0);
+        totals.2 += row["nested_calls"].as_u64().unwrap_or(0);
+    }
+    totals
+}
+
+/// Every node's counters once all of them are idle: no request has peer
+/// accounting open, which includes replica writes that outlive the response
+/// and streamed bodies still being produced.
+async fn peer_snapshot(nodes: &[Server]) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for node in nodes {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, metrics) = node.get("/_node/_local/_metrics").await;
+            let Some(open) = metrics["http"]["peer_open"].as_u64() else {
+                panic!("the metrics report no http.peer_open gauge");
+            };
+            if open == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer accounting never closed: {open} requests still open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        out.push(peer_counters(node).await);
+    }
+    out
+}
+
+/// What one client request sent to `nodes[0]` cost in node-to-node traffic:
+/// `(peer calls the coordinator made, its sequential rounds, peer calls the
+/// nodes it reached made in turn)`. The difference of the counters around the
+/// request. `nodes` are the live nodes.
+async fn measure_peer_trips(
+    nodes: &[Server],
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (u64, u64, u64) {
+    let before = peer_snapshot(nodes).await;
+    let (status, response) = nodes[0].req(method, path, body).await;
+    assert!(status.is_success(), "{path}: {status} {response}");
+    let after = peer_snapshot(nodes).await;
+    let nested: u64 = (0..nodes.len()).map(|i| after[i].2 - before[i].2).sum();
+    (after[0].0 - before[0].0, after[0].1 - before[0].1, nested)
+}
+
+/// A database `trips` on a fresh three-node cluster (`q=4`) holding 40
+/// documents and a design document with a map view and a reduce view, both
+/// already queried so their indexes exist.
+async fn peer_trip_cluster(replication: usize) -> Vec<Server> {
+    let nodes = start_cluster_with(3, "3600", replication);
+    for node in &nodes {
+        node.fresh_db("trips").await;
+    }
+    let docs: Vec<Value> = (0..40)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/trips/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = nodes[0]
+        .put(
+            "/trips/_design/v",
+            json!({
+                "views": {
+                    "by_n": {"map": "function (doc) { emit(doc.n, 1); }"},
+                    "total": {
+                        "map": "function (doc) { emit(doc.n, 1); }",
+                        "reduce": "_count"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for path in [PEER_TRIPS_MAP_VIEW, PEER_TRIPS_REDUCE_VIEW] {
+        let (status, body) = nodes[0].get(path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    nodes
+}
+
+const PEER_TRIPS_MAP_VIEW: &str = "/trips/_design/v/_view/by_n";
+const PEER_TRIPS_REDUCE_VIEW: &str = "/trips/_design/v/_view/total?group=true";
+
+/// The read operations of the baseline, in a fixed order.
+async fn peer_trip_reads(nodes: &[Server]) -> Vec<(&'static str, (u64, u64, u64))> {
+    let mut out = Vec::new();
+    let reads = [
+        ("get_doc", "/trips/d10"),
+        ("all_docs_limit_100", "/trips/_all_docs?limit=100"),
+        ("map_view", PEER_TRIPS_MAP_VIEW),
+        ("reduce_view", PEER_TRIPS_REDUCE_VIEW),
+        ("changes_since_now", "/trips/_changes?since=now"),
+    ];
+    for (label, path) in reads {
+        out.push((
+            label,
+            measure_peer_trips(nodes, Method::GET, path, None).await,
+        ));
+    }
+    out
+}
+
+/// Baseline for the epic on node-to-node round trips: how many peer calls and
+/// sequential rounds each client request costs on a healthy three-node
+/// cluster with `q=4`, `n=3`. These are the numbers later changes lower; when
+/// one does, update the expectation in the same commit.
+///
+/// A round is a period with at least one peer call in flight (see
+/// `cluster_http`), so concurrent calls count once. Each result is
+/// `(coordinator calls, coordinator rounds, calls made by the nodes it
+/// reached)`, for a request sent to node 0.
+#[tokio::test]
+async fn cluster_peer_round_trip_baseline() {
+    let nodes = peer_trip_cluster(3).await;
+    // Writes first. Validators come from the coordinator's own design
+    // documents, so the only peer calls are the writes to the other replicas
+    // (one call per other node, one round), whatever the age of any cache.
+    let put = measure_peer_trips(&nodes, Method::PUT, "/trips/new1", Some(json!({"n": 1}))).await;
+    assert_eq!(put, (2, 1, 0), "single-doc PUT");
+    // Every node holds a copy of every shard, so a read, a listing or a view
+    // is served from local data without a scatter. A document read still asks
+    // a second replica (`r=2`) and `since=now` still asks every peer for its
+    // sequence.
+    assert_eq!(
+        peer_trip_reads(&nodes).await,
+        vec![
+            ("get_doc", (2, 1, 0)),
+            ("all_docs_limit_100", (0, 0, 0)),
+            ("map_view", (0, 0, 0)),
+            ("reduce_view", (0, 0, 0)),
+            ("changes_since_now", (2, 1, 0)),
+        ]
+    );
+}
+
+/// How many requests marked as sent by another node this node has served, by
+/// protocol: `(HTTP/1.x, HTTP/2)`, from its local metrics.
+async fn internal_request_versions(node: &Server) -> (u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let counts = &metrics["http"]["internal_requests"];
+    (
+        counts["http1"].as_u64().unwrap_or(0),
+        counts["http2"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Writes through `nodes[via]` and reads every one of them back from every
+/// node, so each node sends peer traffic and each one serves some.
+async fn exercise_peer_traffic(nodes: &[Server], tag: &str) {
+    for (via, node) in nodes.iter().enumerate() {
+        for i in 0..6 {
+            let id = format!("{tag}-{via}-{i}");
+            let (status, body) = node.put(&format!("/trips/{id}"), json!({"via": via})).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+    }
+    for node in nodes {
+        for (via, _) in nodes.iter().enumerate() {
+            for i in 0..6 {
+                let (status, body) = node.get(&format!("/trips/{tag}-{via}-{i}")).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["via"], via);
+            }
+        }
+        let (status, body) = node.get("/trips/_changes?since=now").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+async fn trips_cluster_nodes(peer_http2: &[bool], replication: usize) -> Vec<Server> {
+    let nodes = start_cluster_nodes(peer_http2.len(), 4, "3600", replication, false, peer_http2);
+    for node in &nodes {
+        node.fresh_db("trips").await;
+    }
+    nodes
+}
+
+/// With `--peer-http2` on every node, node-to-node requests arrive as HTTP/2
+/// and none as HTTP/1.x.
+#[tokio::test]
+async fn cluster_peer_traffic_uses_http2() {
+    let nodes = trips_cluster_nodes(&[true, true, true], 3).await;
+    exercise_peer_traffic(&nodes, "h2").await;
+    for (i, node) in nodes.iter().enumerate() {
+        let (http1, http2) = internal_request_versions(node).await;
+        assert!(http2 > 0, "node {i} served no HTTP/2 peer request");
+        assert_eq!(http1, 0, "node {i} served an HTTP/1.x peer request");
+    }
+}
+
+/// Without the flag peers keep speaking HTTP/1.1, so a rolling upgrade can
+/// start with the new binary on every node and switch the flag on afterwards.
+#[tokio::test]
+async fn cluster_peer_traffic_defaults_to_http1() {
+    let nodes = trips_cluster_nodes(&[false, false, false], 3).await;
+    exercise_peer_traffic(&nodes, "h1").await;
+    for (i, node) in nodes.iter().enumerate() {
+        let (http1, http2) = internal_request_versions(node).await;
+        assert!(http1 > 0, "node {i} served no HTTP/1.x peer request");
+        assert_eq!(http2, 0, "node {i} served an HTTP/2 peer request");
+    }
+}
+
+/// Node 1 speaks HTTP/1.1 to its peers while 0 and 2 speak HTTP/2. Every node
+/// accepts both on one port, so every write and read still works from every
+/// coordinator, and each side sees the protocol its peers chose.
+#[tokio::test]
+async fn cluster_with_mixed_peer_protocols_works() {
+    let nodes = trips_cluster_nodes(&[true, false, true], 3).await;
+    exercise_peer_traffic(&nodes, "mix").await;
+    // (A node's requests to itself use its own protocol, so node 1 may count
+    // some HTTP/1.x requests of its own.)
+    let (_, http2) = internal_request_versions(&nodes[1]).await;
+    assert!(http2 > 0, "node 1 got no HTTP/2 peer request");
+    for i in [0, 2] {
+        let (http1, http2) = internal_request_versions(&nodes[i]).await;
+        assert!(http1 > 0, "node {i} got no HTTP/1.x request from node 1");
+        assert!(
+            http2 > 0,
+            "node {i} got no HTTP/2 request from the other node"
+        );
+    }
+}
+
+/// With one copy of each shard the coordinator must scatter to the nodes
+/// that own shards. Which nodes those are depends on placement, so the
+/// assertions are relations that hold for any placement: a listing, a map view
+/// and a reduce view cost one scatter round (none if the node owns every
+/// shard), and `since=now` is one round that asks every peer once.
+#[tokio::test]
+async fn cluster_peer_scatter_baseline_with_one_replica() {
+    let nodes = peer_trip_cluster(1).await;
+    let reads = peer_trip_reads(&nodes).await;
+    let trips = |label: &str| {
+        reads
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, trips)| *trips)
+            .unwrap_or_default()
+    };
+    let scatter = trips("all_docs_limit_100");
+    assert_eq!(scatter.1, u64::from(scatter.0 > 0), "{reads:?}");
+    assert_eq!(trips("map_view"), scatter, "{reads:?}");
+    assert_eq!(trips("reduce_view"), scatter, "{reads:?}");
+    // Each peer is asked once, in the same round: a peer that owns shards
+    // answers `since=now` for them and reports its own sequence in that reply,
+    // and a peer that owns none is only asked for its sequence.
+    assert_eq!(trips("changes_since_now"), (2, 1, 0), "{reads:?}");
+}
+
+/// With a node down, a write makes no validator calls: the calls are the
+/// replica writes only, the dead node's included, and reads route around it.
+#[tokio::test]
+async fn cluster_peer_round_trip_baseline_with_a_node_down() {
+    let mut nodes = peer_trip_cluster(3).await;
+    nodes[2].kill();
+    let dead = nodes[2].base.clone();
+    nodes.truncate(2);
+    // Discovery is what tells the coordinator the node is down; settle it so
+    // the counts below do not depend on when a startup probe pass runs.
+    wait_until_known_down(&nodes[0], &dead).await;
+    // The write path does not consult it: calls to the dead node count too,
+    // they are issued and fail. Only the two live nodes' counters can be
+    // read, and the dead node makes no nested calls.
+    for id in ["down1", "down2"] {
+        let put = measure_peer_trips(
+            &nodes,
+            Method::PUT,
+            &format!("/trips/{id}"),
+            Some(json!({"n": 1})),
+        )
+        .await;
+        assert_eq!(put, (2, 1, 0), "PUT {id} with a node down");
+    }
+    assert_eq!(
+        peer_trip_reads(&nodes).await,
+        vec![
+            ("get_doc", (2, 1, 0)),
+            ("all_docs_limit_100", (0, 0, 0)),
+            ("map_view", (0, 0, 0)),
+            ("reduce_view", (0, 0, 0)),
+            // The node discovery reports down is not asked for its sequence.
+            ("changes_since_now", (1, 1, 0)),
+        ]
+    );
+}
+
+/// A node discovery reports down is routed around in the first scatter round,
+/// not tried and then replaced, and it is used again once discovery sees it
+/// back. Two copies of each shard, so every shard has a live replica.
+#[tokio::test]
+async fn cluster_scatter_skips_a_node_discovery_reports_down() {
+    let mut nodes = peer_trip_cluster(2).await;
+    let (status, expected) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{expected}");
+    nodes[2].kill();
+    let url = nodes[2].base.clone();
+    wait_until_known_down(&nodes[0], &url).await;
+
+    let live = &nodes[..2];
+    let (status, body) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, expected, "the listing changed with a node down");
+    let listing = measure_peer_trips(live, Method::GET, "/trips/_all_docs?limit=100", None).await;
+    assert!(listing.1 <= 1, "listing with a node down: {listing:?}");
+    let reduce = measure_peer_trips(live, Method::GET, PEER_TRIPS_REDUCE_VIEW, None).await;
+    assert!(reduce.1 <= 1, "reduce with a node down: {reduce:?}");
+    let (status, rows) = nodes[0].get(PEER_TRIPS_REDUCE_VIEW).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"].as_array().map(Vec::len), Some(40), "{rows}");
+
+    // Back up: the next discovery pass that reaches it clears the mark.
+    nodes[2].restart();
+    wait_until_known_up(&nodes[0], &url).await;
+    let (status, body) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"], expected["rows"]);
+    let since_now =
+        measure_peer_trips(&nodes, Method::GET, "/trips/_changes?since=now", None).await;
+    assert_eq!(since_now, (2, 1, 0), "the recovered node is asked again");
+}
+
+/// Between `kill()` and `restart()` the node's port is free for anyone to
+/// bind. When a foreign process takes it, `restart()` must say so at once
+/// rather than report a restart that never happened because the squatter
+/// accepts the connection the harness uses to wait for the listener.
+#[test]
+#[should_panic(expected = "held by another process")]
+fn restart_fails_at_once_when_a_foreign_process_holds_the_port() {
+    let mut server = Server::start(false);
+    server.kill();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", server.port)).expect("squat");
+    server.restart();
+    drop(squatter);
+}
+
+/// Run discovery passes on `node` until one that started after this call
+/// reports the peer at `url` unreachable.
+async fn wait_until_known_down(node: &Server, url: &str) {
+    wait_for_discovery(node, url, false).await;
+}
+
+/// Run discovery passes on `node` until one that started after this call
+/// reports the peer at `url` reachable again.
+async fn wait_until_known_up(node: &Server, url: &str) {
+    wait_for_discovery(node, url, true).await;
+}
+
+/// Trigger discovery passes on `node` one at a time and judge only passes
+/// that started after the trigger: a pass already running may have probed
+/// the peer before it went down or came back. A new pass is requested only
+/// when none is running, so a slow pass on a loaded machine is waited for
+/// rather than overlapped forever.
+async fn wait_for_discovery(node: &Server, url: &str, reachable: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let state = if reachable { "up" } else { "down" };
+    let snapshot = || async {
+        let (status, body) = node.get("/_node/_local/_cluster").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
+    loop {
+        // Wait for any pass in progress to finish, then note when the last
+        // one finished: every pass that finishes later started after now.
+        let mut body = snapshot().await;
+        while body["discovery"]["running"] == true {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a discovery pass never finished: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            body = snapshot().await;
+        }
+        let before = body["discovery"]["last_finished"].clone();
+        let (status, reply) = node
+            .post("/_node/_local/_cluster/discover", json!({}))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+        // Wait for a pass that finished after the trigger. If the request
+        // was turned away (the node was busy), none starts; ask again.
+        loop {
+            body = snapshot().await;
+            let discovery = &body["discovery"];
+            if discovery["running"] == false && discovery["last_finished"] != before {
+                let probe = discovery["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|peer| peer["url"] == url).cloned());
+                if probe.is_some_and(|peer| peer["reachable"] == reachable) {
+                    return;
+                }
+                break;
+            }
+            if discovery["running"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery never reported {url} {state}; last probe of it: {}; snapshot: {body}",
+                peer_probe(discovery, url)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery never reported {url} {state}; last probe of it: {}; snapshot: {body}",
+            peer_probe(&body["discovery"], url)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The discovery snapshot's entry for the peer at `url`, including the probe
+/// error, for a failed wait to print.
+fn peer_probe(discovery: &Value, url: &str) -> String {
+    discovery["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|peer| peer["url"] == url))
+        .map_or_else(|| format!("{url} is not listed"), Value::to_string)
 }
 
 #[tokio::test]
@@ -13922,6 +14500,299 @@ async fn cluster_security_without_quorum_is_accepted_and_converges() {
 
     nodes[1].restart();
     wait_for_security(&nodes[1], "secpend", &security).await;
+}
+
+/// Headers that mark a request as sent by another node of the test cluster.
+fn node_headers() -> [(&'static str, String); 2] {
+    [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ]
+}
+
+/// Run one anti-entropy pass on `node` and wait until it, and the peer
+/// accounting of its calls, are done. Returns the metadata traffic that pass
+/// (and any other pass finished meanwhile) generated: `(passes, peer calls)`
+/// from the `_background/anti_entropy` route. Waits on conditions only.
+async fn metadata_pass(node: &Server) -> (u64, u64) {
+    let before = anti_entropy_counters(node).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (_, status) = node.get("/_node/_local/_replication").await;
+        let runs = status["runs"].as_u64().unwrap_or(0);
+        let (code, body) = node.post("/_node/_local/_replication/run", json!({})).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+        loop {
+            let (_, status) = node.get("/_node/_local/_replication").await;
+            let (_, metrics) = node.get("/_node/_local/_metrics").await;
+            if status["running"] == false
+                && metrics["http"]["peer_open"] == 0
+                && status["runs"].as_u64().unwrap_or(0) > runs
+            {
+                let after = anti_entropy_counters(node).await;
+                return (after.0 - before.0, after.1 - before.1);
+            }
+            if status["running"] == false && metrics["http"]["peer_open"] == 0 {
+                // The run request found a pass already finished or skipped.
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pass never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(std::time::Instant::now() < deadline, "pass never started");
+    }
+}
+
+/// `(passes, peer calls)` counted so far under the anti-entropy route.
+async fn anti_entropy_counters(node: &Server) -> (u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    metrics["http"]["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["route"] == "_background/anti_entropy")
+        .map(|row| {
+            (
+                row["peer_requests"].as_u64().unwrap_or(0),
+                row["peer_calls"].as_u64().unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Peer calls per anti-entropy pass on a converged cluster, after a warm-up
+/// pass. Every pass of a converged cluster makes the same calls.
+async fn calls_per_pass(node: &Server) -> u64 {
+    metadata_pass(node).await;
+    let (passes, calls) = metadata_pass(node).await;
+    assert!(passes >= 1, "no pass was counted");
+    assert_eq!(
+        calls % passes,
+        0,
+        "passes differ: {calls} calls in {passes}"
+    );
+    calls / passes
+}
+
+#[tokio::test]
+async fn cluster_metadata_sync_cost_does_not_grow_with_database_count() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for i in 0..2 {
+        for node in &nodes {
+            node.fresh_db(&format!("meta{i}")).await;
+        }
+    }
+    let few = calls_per_pass(&nodes[0]).await;
+    for i in 2..20 {
+        for node in &nodes {
+            node.fresh_db(&format!("meta{i}")).await;
+        }
+    }
+    let many = calls_per_pass(&nodes[0]).await;
+    // One exchange per peer, however many databases there are.
+    assert_eq!(few, 2, "2 databases");
+    assert_eq!(many, 2, "20 databases");
+}
+
+/// Wait until `check` holds, running an anti-entropy pass on every node
+/// between attempts.
+async fn converge_with_passes<F, Fut>(nodes: &[Server], what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match check().await {
+            Ok(()) => return,
+            Err(why) => assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not converge: {why}"
+            ),
+        }
+        for node in nodes {
+            metadata_pass(node).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_metadata_sync_settles_equal_version_shard_maps_and_security() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("tie").await;
+        node.fresh_db("other").await;
+    }
+    let internal = node_headers();
+    // Competing placements that share a version, on two nodes; the third
+    // node has neither. The greater placement wins everywhere.
+    for (node, target) in [(0, 0), (1, 1)] {
+        let mut map = all_shards_on(target);
+        map["version"] = json!(5);
+        let (status, body) = nodes[node]
+            .req_with(Method::PUT, "/_node/_local/_dbs/tie", Some(map), &internal)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // The same for the security object, with a newer version on one node of
+    // another database.
+    for (node, name) in [(0, "alice"), (1, "bob")] {
+        let envelope = json!({"version": 7, "security": {
+            "admins": {"names": [], "roles": []},
+            "members": {"names": [name], "roles": []}
+        }});
+        let (status, body) = nodes[node]
+            .req_with(
+                Method::PUT,
+                "/_node/_local/_dbs/tie/security",
+                Some(envelope),
+                &internal,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let newer = json!({"version": 9, "security": {
+        "admins": {"names": [], "roles": []},
+        "members": {"names": ["carol"], "roles": []}
+    }});
+    let (status, body) = nodes[2]
+        .req_with(
+            Method::PUT,
+            "/_node/_local/_dbs/other/security",
+            Some(newer.clone()),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    converge_with_passes(&nodes, "metadata", || async {
+        for node in &nodes {
+            let (_, map) = node
+                .req_with(Method::GET, "/_node/_local/_dbs/tie", None, &internal)
+                .await;
+            if map["version"] != 5 || map["replicas"] != all_shards_on(1)["replicas"] {
+                return Err(format!("{} shard map {map}", node.base));
+            }
+            let (_, security) = node
+                .req_with(
+                    Method::GET,
+                    "/_node/_local/_dbs/tie/security",
+                    None,
+                    &internal,
+                )
+                .await;
+            if security["version"] != 7
+                || security["security"]["members"]["names"] != json!(["bob"])
+            {
+                return Err(format!("{} security {security}", node.base));
+            }
+            let (_, security) = node
+                .req_with(
+                    Method::GET,
+                    "/_node/_local/_dbs/other/security",
+                    None,
+                    &internal,
+                )
+                .await;
+            if security != newer {
+                return Err(format!("{} other security {security}", node.base));
+            }
+        }
+        Ok(())
+    })
+    .await;
+}
+
+/// A peer that predates the batched metadata exchange: it answers every
+/// request with 404, as a node without the endpoint does, and logs the
+/// request lines it saw. Returns its port and the log.
+async fn legacy_peer() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Only the request line matters; the body is not read.
+                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&buffer).to_string();
+                let line = text.lines().next().unwrap_or("");
+                let mut words = line.split(' ');
+                let entry = format!(
+                    "{} {}",
+                    words.next().unwrap_or(""),
+                    words.next().unwrap_or("")
+                );
+                log.lock().unwrap().push(entry);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn cluster_metadata_sync_falls_back_to_per_database_reconcile_for_old_peers() {
+    let (stub_port, seen) = legacy_peer().await;
+    let port = free_port();
+    let nodes = format!("http://127.0.0.1:{port},http://127.0.0.1:{stub_port}");
+    let extra: Vec<String> = [
+        "--q",
+        "4",
+        "--n",
+        "1",
+        "--nodes",
+        &nodes,
+        "--me",
+        "0",
+        "--cluster-secret",
+        "test-cluster-secret",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let node = Server::spawn_on(port, &extra, false, 0).expect("node starts");
+    for name in ["old0", "old1"] {
+        // Accepted without a quorum: the other node is the stub.
+        let (status, body) = node.put(&format!("/{name}"), json!({})).await;
+        assert!(status.is_success(), "create {name}: {status} {body}");
+    }
+    let (passes, calls) = metadata_pass(&node).await;
+    assert!(passes >= 1);
+
+    let seen = seen.lock().unwrap().clone();
+    let count = |entry: &str| seen.iter().filter(|line| line.as_str() == entry).count();
+    // One probe of the new endpoint, then the old per-database GETs.
+    assert!(count("POST /_node/_local/_metadata_sync") >= 1, "{seen:?}");
+    for name in ["old0", "old1"] {
+        assert!(
+            count(&format!("GET /_node/_local/_dbs/{name}")) >= 1,
+            "{seen:?}"
+        );
+        assert!(
+            count(&format!("GET /_node/_local/_dbs/{name}/security")) >= 1,
+            "{seen:?}"
+        );
+    }
+    assert!(calls > 2 * 2, "{calls} calls");
 }
 
 #[tokio::test]

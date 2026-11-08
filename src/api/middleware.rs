@@ -56,9 +56,40 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     let span = tracing::info_span!(
         "http.request",
         "http.method" = %method,
-        "http.url" = %uri
+        "http.url" = %uri,
+        "peer.calls" = tracing::field::Empty,
+        "peer.rounds" = tracing::field::Empty,
+        "peer.wait_ms" = tracing::field::Empty,
     );
-    let response = next.run(req).instrument(span).await;
+    // Peer calls made for this request are counted here and added to the route
+    // metrics when the request, and any replica task it left running, is done.
+    let internal = req.headers().contains_key("x-douchdb-forwarded")
+        || req.headers().contains_key("x-douchdb-secret");
+    if internal {
+        crate::metrics::record_internal_request(req.version());
+    }
+    let peer_stats = crate::metrics::peer_route(&path)
+        .map(|route| crate::cluster_http::PeerStats::new(route, internal));
+    let handler = next.run(req).instrument(span.clone());
+    let response = match &peer_stats {
+        Some(stats) => crate::cluster_http::with_stats(stats.clone(), handler).await,
+        None => handler.await,
+    };
+    let response = match peer_stats {
+        Some(stats) => {
+            // Streamed bodies do part of their peer work after this point, so
+            // the span only carries what the handler itself used.
+            let (calls, rounds, wait) = stats.totals();
+            if calls > 0 {
+                span.record("peer.calls", calls);
+                span.record("peer.rounds", rounds);
+                span.record("peer.wait_ms", wait.as_secs_f64() * 1000.0);
+            }
+            let (parts, body) = response.into_parts();
+            Response::from_parts(parts, crate::cluster_http::scope_body(stats, body))
+        }
+        None => response,
+    };
     let status = response.status().as_u16();
     let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     crate::metrics::record_http(method.as_str(), status, duration_ms, &path);

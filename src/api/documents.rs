@@ -304,7 +304,7 @@ async fn copy_doc(
     if let Some(rev) = destination_rev {
         copy["_rev"] = json!(rev);
     }
-    if let Some(response) = validate_write(st, db, dbname, &mut copy, headers).await {
+    if let Some(response) = validate_write(st, db, &mut copy, headers).await {
         return response;
     }
     match commit_docs(
@@ -389,7 +389,7 @@ async fn put_doc(
         .get("_deleted")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(response) = validate_write(st, db, dbname, &mut doc, headers).await {
+    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
     }
     match commit_docs(
@@ -464,7 +464,7 @@ async fn delete_doc(
         return fail(ApiError::conflict());
     };
     let mut doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
-    if let Some(response) = validate_write(st, db, dbname, &mut doc, headers).await {
+    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
     }
     match commit_docs(

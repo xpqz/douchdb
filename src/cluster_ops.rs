@@ -2,7 +2,7 @@
 //! updates, rebalance and security-object propagation.
 
 use crate::cluster::ShardMap;
-use crate::cluster_http::{internal_request, ClusterCtx};
+use crate::cluster_http::{internal_request, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -29,7 +29,7 @@ pub(crate) async fn set_security_everywhere(
         return Ok(true);
     }
     let envelope = json!({"version": version, "security": value});
-    let responses = join_all(ctx.cluster.peers().map(|peer| {
+    let responses = crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| {
         let request = internal_request(
             ctx,
             reqwest::Method::PUT,
@@ -39,13 +39,12 @@ pub(crate) async fn set_security_everywhere(
         )
         .json(&envelope);
         async move {
-            request
-                .send()
+            send_peer(request)
                 .await
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
         }
-    }))
+    })))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
     Ok(acknowledgements > ctx.cluster.nodes.len().max(1) / 2)
@@ -94,21 +93,26 @@ pub(crate) async fn apply_shard_map(
         .filter(|(index, _)| *index != ctx.cluster.me)
         .map(|(_, peer)| peer.clone())
         .collect();
-    let responses = futures::future::join_all(peers.into_iter().map(|peer| {
-        let payload = payload.clone();
-        async move {
-            let request = internal_request(
-                ctx,
-                reqwest::Method::PUT,
-                &peer,
-                &["_node", "_local", "_dbs", name],
-                Some(headers),
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(payload);
-            request.send().await.ok().map(|response| response.status())
-        }
-    }))
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        peers.into_iter().map(|peer| {
+            let payload = payload.clone();
+            async move {
+                let request = internal_request(
+                    ctx,
+                    reqwest::Method::PUT,
+                    &peer,
+                    &["_node", "_local", "_dbs", name],
+                    Some(headers),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(payload);
+                send_peer(request)
+                    .await
+                    .ok()
+                    .map(|response| response.status())
+            }
+        }),
+    ))
     .await;
     let mut acknowledgements = 1usize; // local write
     let mut rejected = false;
@@ -157,7 +161,7 @@ async fn fetch_shard_states(
     } else {
         request
     };
-    let value = request.send().await.ok()?.json::<Value>().await.ok()?;
+    let value = send_peer(request).await.ok()?.json::<Value>().await.ok()?;
     let mut out = Vec::new();
     for row in value["shards"].as_array()? {
         out.push(ShardState {
@@ -191,11 +195,11 @@ async fn fetch_states(
     headers: &HeaderMap,
     with_digest: bool,
 ) -> Vec<Option<Vec<ShardState>>> {
-    let fetched = futures::future::join_all(
+    let fetched = crate::cluster_http::in_one_round(futures::future::join_all(
         nodes
             .iter()
             .map(|node| fetch_shard_states(ctx, db, *node, headers, with_digest)),
-    )
+    ))
     .await;
     let mut states = vec![None; ctx.cluster.nodes.len().max(1)];
     for (node, state) in nodes.iter().zip(fetched) {
@@ -396,32 +400,33 @@ async fn cleanup_all_replicas(
     db: &Arc<Db>,
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
-    let responses = futures::future::join_all(ctx.cluster.nodes.iter().map(|peer| {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::POST,
-            peer,
-            &["_node", "_local", "_dbs", &db.name, "cleanup"],
-            Some(headers),
-        );
-        async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
-            if !response.status().is_success() {
-                return Err(ApiError::new(
-                    response.status().as_u16(),
-                    "cleanup_failed",
-                    response.text().await.unwrap_or_default(),
-                ));
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        ctx.cluster.nodes.iter().map(|peer| {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::POST,
+                peer,
+                &["_node", "_local", "_dbs", &db.name, "cleanup"],
+                Some(headers),
+            );
+            async move {
+                let response = send_peer(request).await.map_err(|error| {
+                    ApiError::new(502, "bad_gateway", format!("{peer}: {error}"))
+                })?;
+                if !response.status().is_success() {
+                    return Err(ApiError::new(
+                        response.status().as_u16(),
+                        "cleanup_failed",
+                        response.text().await.unwrap_or_default(),
+                    ));
+                }
+                response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
             }
-            response
-                .json::<Value>()
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
-        }
-    }))
+        }),
+    ))
     .await;
     let mut out = Vec::new();
     for response in responses {
@@ -480,7 +485,7 @@ async fn send_migration(
         Some(map) => request.json(map),
         None => request,
     };
-    match request.send().await {
+    match send_peer(request).await {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(MigrationRefused {
             conflict: response.status() == reqwest::StatusCode::CONFLICT,
@@ -575,7 +580,7 @@ async fn activate_map_everywhere(
             Some(headers),
         )
         .json(map);
-        match request.send().await {
+        match send_peer(request).await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => failures.push(format!("{peer}: HTTP {}", response.status())),
             Err(error) => failures.push(format!("{peer}: {error}")),
@@ -599,7 +604,7 @@ async fn activate_map_everywhere(
             Some(headers),
         )
         .json(&rollback);
-        if let Err(error) = request.send().await {
+        if let Err(error) = send_peer(request).await {
             tracing::warn!("rebalance rollback on {peer} failed: {error}");
         }
     }
@@ -785,6 +790,7 @@ mod tests {
             },
             client: reqwest::Client::new(),
             auth: None,
+            health: Default::default(),
         };
         activate_map_everywhere(&ctx, &db, "activate", &target, &HeaderMap::new())
             .await
