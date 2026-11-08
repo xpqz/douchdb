@@ -111,13 +111,8 @@ pub(crate) async fn quorum_read(
     let open_all = requested_rev.is_none();
     let (reachable, docs) = replica_docs(ctx, db, dbname, docid, q, headers, open_all).await;
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        return fail(ApiError::new(
-            503,
-            "quorum_not_met",
-            format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        ));
+    if let Some(error) = read_quorum_failure(reachable, r, q) {
+        return fail(error);
     }
     if docs.is_empty() {
         return fail(ApiError::not_found("missing"));
@@ -202,14 +197,56 @@ pub(crate) async fn quorum_reachable(
 ) -> Option<Response> {
     let (reachable, _) = replica_docs(ctx, db, dbname, docid, q, headers, false).await;
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
-    if reachable < r {
-        crate::telemetry::record_quorum_failure();
-        Some(fail(ApiError::new(
+    read_quorum_failure(reachable, r, q).map(fail)
+}
+
+/// The error for a read that reached fewer than `r` replicas. When some
+/// replica answered, CouchDB's `fabric_doc_open` would still serve the best
+/// document it received; douchdb deliberately keeps the read strict (the
+/// linearizability checks depend on it) and answers 503 `quorum_not_met`.
+/// When none answered, the error is fabric's own.
+fn read_quorum_failure(
+    reachable: usize,
+    r: usize,
+    q: &HashMap<String, String>,
+) -> Option<ApiError> {
+    if reachable >= r {
+        return None;
+    }
+    crate::telemetry::record_quorum_failure();
+    Some(if reachable == 0 {
+        no_replica_answered(reads_revisions(q))
+    } else {
+        ApiError::new(
             503,
             "quorum_not_met",
             format!("read quorum {r} not met: {reachable} replica(s) answered"),
-        )))
+        )
+    })
+}
+
+/// True when chttpd serves the read through `fabric:open_revs`: an
+/// `open_revs` query or an explicit `rev` (`chttpd_db:couch_doc_open`).
+fn reads_revisions(q: &HashMap<String, String>) -> bool {
+    q.contains_key("open_revs") || q.contains_key("rev")
+}
+
+/// The error for a read that no replica answered. A plain read or
+/// `revs_info` goes through `fabric:open_doc`, which answers
+/// `{error, read_failure}`; chttpd's `error_info` has no clause for it, so
+/// `maybe_handle_error` renders 500 `error`/`read_failure`. A read of
+/// specific revisions goes through `fabric:open_revs`, whose
+/// `format_reply` answers `all_workers_died` when no worker replied, and
+/// `error_info(all_workers_died)` is 503 `service unavailable`
+/// (chttpd.erl 3.5.0).
+fn no_replica_answered(open_revs: bool) -> ApiError {
+    if open_revs {
+        ApiError::new(
+            503,
+            "service unavailable",
+            "Nodes are unable to service this request due to overloading or maintenance mode.",
+        )
     } else {
-        None
+        ApiError::new(500, "error", "read_failure")
     }
 }
