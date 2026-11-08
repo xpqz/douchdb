@@ -1874,6 +1874,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Whether a query holds the read side of the database's gate.
+    fn gate_is_held(db: &Db) -> bool {
+        build_gate(db).try_write_owned().is_err()
+    }
+
+    /// Deleting a database must not wait for a search build: the build is
+    /// cancelled and its query fails with not_found, as CouchDB shuts the
+    /// index processes down with the database. The build is held at the index
+    /// entry's lock, where it waits with the gate's read permit; nothing here
+    /// depends on timing, and the timeout only turns a hang into a failure.
+    #[tokio::test]
+    async fn forget_db_does_not_wait_for_a_search_build() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-search-cancel-{}", crate::util::uuid()));
+        let config = || crate::db::DbConfig {
+            q: 1,
+            revs_limit: 1000,
+            shard_map: crate::cluster::ShardMap::single(1),
+            partitioned: false,
+        };
+        let ddoc = json!({"_id": "_design/s", "indexes": {"idx": {
+            "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}});
+        let db = Arc::new(Db::open(&root, "searchcancel", config()).unwrap());
+        db.put_docs(
+            vec![json!({"_id": "a", "name": "apple"}), ddoc.clone()],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:apple".to_string(),
+            limit: 10,
+            ..SearchRequest::default()
+        };
+        let held = index_entry(&index_dir(&db, "_design/s", "idx"))
+            .lock_owned()
+            .await;
+        let build = {
+            let (db, request) = (db.clone(), request.clone());
+            tokio::spawn(async move { query(&db, "_design/s", "idx", &request, limits).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !gate_is_held(&db) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the build never took the gate");
+
+        let path = db.path.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(120), forget_db(&path))
+            .await
+            .expect("forget_db waited for a search build in flight");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(120), build)
+            .await
+            .expect("the build did not end")
+            .unwrap()
+            .expect_err("the database was deleted under the query");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        assert_eq!(error.error, "not_found");
+        drop(held);
+        assert_eq!(gates().count_under(&path), 0, "gate outlived its database");
+
+        // A database recreated under the name has a fresh gate and serves.
+        drop(db);
+        std::fs::remove_dir_all(&root).unwrap();
+        let db = Db::open(&root, "searchcancel", config()).unwrap();
+        db.put_docs(vec![json!({"_id": "b", "name": "apple"}), ddoc], true)
+            .await
+            .unwrap();
+        let result = query(&db, "_design/s", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(result["total_rows"], 1, "{result}");
+        assert_eq!(result["rows"][0]["id"], "b", "{result}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A small deterministic generator, so a failing sequence can be replayed.
     struct Lcg(u64);
 
