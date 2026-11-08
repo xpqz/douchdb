@@ -340,6 +340,23 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                         if candidates[slot].len() > 1 {
                             candidates[slot].remove(0);
                             pending.push(slot);
+                        } else if peer_unreachable(&error) {
+                            // chttpd_db:bulk_get_docs_batched turns a failed
+                            // fabric:open_revs into a per-doc error.
+                            let id = reqs[slot].get("id").and_then(Value::as_str).unwrap_or("");
+                            let rev = reqs[slot]
+                                .get("rev")
+                                .and_then(Value::as_str)
+                                .unwrap_or("undefined");
+                            out[slot] = json!({
+                                "id": id,
+                                "docs": [{"error": {
+                                    "id": id,
+                                    "rev": rev,
+                                    "error": "internal_fabric_error",
+                                    "reason": "all_workers_died",
+                                }}]
+                            });
                         } else {
                             return fail(error);
                         }
@@ -421,6 +438,16 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
                         if candidates[slot].len() > 1 {
                             candidates[slot].remove(0);
                             pending.push(slot);
+                        } else if peer_unreachable(&error) {
+                            // fabric_doc_missing_revs ignores workers that
+                            // went down: what nobody answered for is missing.
+                            let (id, revs) = &entries[slot];
+                            let missing = if revs.is_array() {
+                                revs.clone()
+                            } else {
+                                json!([])
+                            };
+                            out.insert(id.clone(), json!({ "missing": missing }));
                         } else {
                             return fail(error);
                         }

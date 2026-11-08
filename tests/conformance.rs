@@ -6003,6 +6003,119 @@ async fn cluster_reads_fail_with_nodedown_when_a_shard_has_no_live_copy() {
     assert_eq!(body["reason"], "progress not possible", "{body}");
 }
 
+/// A 3-node cluster, one copy per shard, every shard pinned to node 2 and
+/// holding a few documents; node 2 is killed. Node 0 is the coordinator and
+/// holds nothing, so every read has to reach the dead node.
+async fn cluster_with_only_copy_dead(db: &str, partitioned: bool) -> Vec<Server> {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    let suffix = if partitioned { "?partitioned=true" } else { "" };
+    let (status, _) = nodes[0].put(&format!("/{db}{suffix}"), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = nodes[0]
+        .put(&format!("/_node/_local/_dbs/{db}"), all_shards_on(2))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let docs: Vec<Value> = (0..4).map(|i| json!({"_id": format!("p:d{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post(&format!("/{db}/_bulk_docs"), json!({"docs": docs}))
+        .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::ACCEPTED,
+        "{status}"
+    );
+    nodes[2].kill();
+    nodes
+}
+
+#[tokio::test]
+async fn cluster_doc_get_fails_with_read_failure_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("cldocgone", false).await;
+    // CouchDB: fabric_doc_open answers {error, read_failure}, which chttpd's
+    // error_info renders through maybe_handle_error as 500 error/read_failure.
+    let (status, body) = nodes[0].get("/cldocgone/p:d1").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "error", "{body}");
+    assert_eq!(body["reason"], "read_failure", "{body}");
+}
+
+#[tokio::test]
+async fn cluster_bulk_get_reports_per_doc_errors_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("clbulkgetgone", false).await;
+    // CouchDB: chttpd_db:bulk_get_docs_batched maps a failed
+    // fabric:open_revs to a per-doc internal_fabric_error.
+    let (status, body) = nodes[0]
+        .post(
+            "/clbulkgetgone/_bulk_get",
+            json!({"docs": [{"id": "p:d1"}, {"id": "p:d2"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{body}");
+    for row in results {
+        let error = &row["docs"][0]["error"];
+        assert_eq!(error["error"], "internal_fabric_error", "{body}");
+        assert_eq!(error["reason"], "all_workers_died", "{body}");
+        assert_eq!(error["id"], row["id"], "{body}");
+        assert_eq!(error["rev"], "undefined", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn cluster_revs_diff_reports_revisions_missing_when_no_replica_is_reachable() {
+    let nodes = cluster_with_only_copy_dead("clrevsgone", false).await;
+    // CouchDB: fabric_doc_missing_revs ignores workers that went down, so
+    // revisions nobody answered for are reported missing.
+    let (status, body) = nodes[0]
+        .post(
+            "/clrevsgone/_revs_diff",
+            json!({"p:d1": ["1-aaa"], "p:d2": ["1-bbb", "2-ccc"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["p:d1"], json!({"missing": ["1-aaa"]}), "{body}");
+    assert_eq!(
+        body["p:d2"],
+        json!({"missing": ["1-bbb", "2-ccc"]}),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_partition_info_fails_with_nodedown_when_the_owner_is_unreachable() {
+    let nodes = cluster_with_only_copy_dead("clpartgone", true).await;
+    // CouchDB: fabric_db_partition_info answers {error, {nodedown, <<"progress
+    // not possible">>}}, which chttpd maps to 412.
+    let (status, body) = nodes[0].get("/clpartgone/_partition/p").await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
+#[tokio::test]
+async fn cluster_scatter_fallback_to_a_dead_replica_fails_with_nodedown() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clfallgone").await;
+    }
+    // Every shard on nodes 1 and 2, neither of which answers: the owner
+    // round fails, and the substitute node chosen for the fallback round has
+    // not been asked yet but is dead as well.
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/clfallgone",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    nodes[1].kill();
+    nodes[2].kill();
+    let (status, body) = nodes[0].get("/clfallgone/_all_docs").await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert_eq!(body["error"], "nodedown", "{body}");
+    assert_eq!(body["reason"], "progress not possible", "{body}");
+}
+
 #[tokio::test]
 async fn cluster_changes_forward_filter_query_args_to_every_shard() {
     let nodes = start_cluster_with(3, "3600", 1);

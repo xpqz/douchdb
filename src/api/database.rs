@@ -332,8 +332,8 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
     }
     if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
         let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
-        if !replicas.contains(&st.ctx.cluster.me) {
-            if let Some(node) = replicas.first() {
+        if !replicas.contains(&st.ctx.cluster.me) && !replicas.is_empty() {
+            for node in &replicas {
                 let request = internal_request(
                     &st.ctx,
                     reqwest::Method::GET,
@@ -341,21 +341,17 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
                     &[name, "_partition", partition],
                     Some(headers),
                 );
-                return match send_peer(request).await {
-                    Ok(response) => {
-                        let status = response.status();
-                        let value = response.json::<Value>().await.unwrap_or_else(
-                            |error| json!({"error": "bad_gateway", "reason": error.to_string()}),
-                        );
-                        json(status, value)
-                    }
-                    Err(error) => fail(ApiError::new(
-                        502,
-                        "bad_gateway",
-                        format!("{}: {error}", st.ctx.cluster.nodes[*node]),
-                    )),
-                };
+                if let Ok(response) = send_peer(request).await {
+                    let status = response.status();
+                    let value = response.json::<Value>().await.unwrap_or_else(
+                        |error| json!({"error": "bad_gateway", "reason": error.to_string()}),
+                    );
+                    return json(status, value);
+                }
             }
+            // No replica answered: fabric_db_partition_info answers
+            // {error, {nodedown, <<"progress not possible">>}} (412).
+            return fail(nodedown());
         }
     }
     match db.partition_counts(partition).await {

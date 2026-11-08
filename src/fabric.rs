@@ -1296,6 +1296,18 @@ pub(crate) async fn forward_json(
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
+/// CouchDB's `{error, {nodedown, <<"progress not possible">>}}`, which chttpd
+/// maps to 412 (`error_info({error, {nodedown, Reason}})`).
+pub(crate) fn nodedown() -> ApiError {
+    ApiError::new(412, "nodedown", "progress not possible")
+}
+
+/// True when a peer request failed because the peer could not be reached (or
+/// is unhealthy), rather than because the peer rejected the request.
+pub(crate) fn peer_unreachable(error: &ApiError) -> bool {
+    matches!(error.status, 502..=504)
+}
+
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
 /// copy is CouchDB's `{error, {nodedown, <<"progress not possible">>}}`
 /// (fabric_streams, fabric_view:check_down_shards), which chttpd maps to 412.
@@ -1318,7 +1330,7 @@ fn fallback_shard_masks(
                 .replicas_of_shard(shard)
                 .into_iter()
                 .find(|candidate| alive.contains(candidate))
-                .ok_or_else(|| ApiError::new(412, "nodedown", "progress not possible"))?;
+                .ok_or_else(nodedown)?;
             groups
                 .entry(target)
                 .or_insert_with(|| ShardMask::none(db.q))
@@ -1466,6 +1478,9 @@ where
                         }
                     }
                 }
+                // The substitute node failed too: no copy of these shards
+                // answered, which is nodedown, not the transport error.
+                Err(error) if peer_unreachable(&error) => return Err(nodedown()),
                 Err(error) => return Err(error),
             }
         }
