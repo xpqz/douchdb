@@ -1650,11 +1650,14 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
             .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
             .collect();
         assert_eq!(got, want, "limit {limit}");
-        assert_eq!(
-            body["last_seq"],
-            **got.last().map(|(seq, _)| seq).unwrap(),
-            "limit {limit}"
-        );
+        // A feed that stopped at its limit ends at its last row; one that ran
+        // out of documents ends at the last one it scanned.
+        let want_seq = if limit < expected.len() {
+            (**got.last().map(|(seq, _)| seq).unwrap()).clone()
+        } else {
+            all.last().unwrap()["seq"].clone()
+        };
+        assert_eq!(body["last_seq"], want_seq, "limit {limit}");
     }
 
     // Starting after the second match leaves the other two.
