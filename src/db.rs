@@ -1377,14 +1377,25 @@ impl Db {
         // next global sequence when its shard stages it, so the order the
         // shards run in is the order of `_changes` for this batch.
         let mut shard_error = None;
+        // A design document's functions compile here, outside any shard job,
+        // so the compile never holds a shard's writer.
+        let mut compile_errors = if touches_design {
+            compile_design_docs(&self.shards, &grouped, new_edits).await?
+        } else {
+            HashMap::new()
+        };
         for (shard_idx, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
             let seq = self.seq.clone();
             let reserved = self.reserved_seq[shard_idx].clone();
+            let verdicts: HashMap<usize, ApiError> = batch
+                .iter()
+                .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
+                .collect();
             let results = match self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, &seq, &reserved)))
+                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts, &seq, &reserved)))
                 .await
             {
                 Ok(results) => results,
@@ -2880,6 +2891,10 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
 /// is compiled at save time. It runs after the revision check, on every write
 /// path including replication. `obj` is the document without its `_`
 /// metadata members.
+///
+/// This is only the structural half, which is cheap. The compile runs in
+/// [`compile_design_docs`] before the write reaches its shard, and `Stage`
+/// raises its verdict right after this check passes.
 fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbResult<()> {
     let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
     if !id.starts_with("_design/") || deleted {
@@ -2935,8 +2950,97 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
         }
         Some(_) => return Err(wrong("views", "object")),
     }
-    compile_views(obj)
+    Ok(())
 }
+
+/// Compile the design documents among `grouped` (per shard: index, document),
+/// keeping the compile off the shard writer. Returns the compile error of each
+/// document that has one. A document that fails the structural check is
+/// skipped: that error wins, so its compile would be wasted. With
+/// `new_edits=false`, a document whose revision the shard already stores is
+/// skipped too, as `Stage::stage_replicated` never validates it.
+async fn compile_design_docs(
+    shards: &[crate::store::ShardHandle],
+    grouped: &[Vec<(usize, Value)>],
+    new_edits: bool,
+) -> DbResult<HashMap<usize, ApiError>> {
+    let mut pending: Vec<(usize, usize, Map<String, Value>)> = Vec::new();
+    for (shard_idx, batch) in grouped.iter().enumerate() {
+        for (i, doc) in batch {
+            let Some(obj) = doc.as_object() else { continue };
+            let Some(id) = obj.get("_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let deleted = obj.get("_deleted") == Some(&Value::Bool(true));
+            if id.starts_with("_design/")
+                && compile_needed(obj)
+                && validate_design_doc(id, deleted, obj).is_ok()
+            {
+                pending.push((*i, shard_idx, obj.clone()));
+            }
+        }
+    }
+    if !new_edits {
+        for (shard_idx, shard) in shards.iter().enumerate() {
+            let candidates: Vec<(usize, Value)> = pending
+                .iter()
+                .filter(|(_, owner, _)| *owner == shard_idx)
+                .map(|(i, _, doc)| (*i, Value::Object(doc.clone())))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let stored = shard
+                .call(move |shard| {
+                    Ok(candidates
+                        .into_iter()
+                        .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
+                        .map(|(i, _)| i)
+                        .collect::<Vec<usize>>())
+                })
+                .await?;
+            pending.retain(|(i, _, _)| !stored.contains(i));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(HashMap::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        pending
+            .into_iter()
+            .filter_map(|(i, _, doc)| compile_views(&doc).err().map(|error| (i, error)))
+            .collect()
+    })
+    .await
+    .map_err(ApiError::internal)
+}
+
+/// Whether the document has anything for [`compile_views`] to compile.
+fn compile_needed(obj: &Map<String, Value>) -> bool {
+    matches!(obj.get("views"), Some(Value::Object(views)) if !views.is_empty())
+}
+
+/// Whether `Stage::stage_replicated` would find this replicated revision
+/// already stored, and so never validate it. Anything malformed is "not
+/// stored": the stage reports its own error for it.
+fn replicated_is_stored(shard: &mut crate::store::Shard, doc: Value) -> bool {
+    let Ok(SplitDoc {
+        id, rev, revisions, ..
+    }) = split_doc(doc)
+    else {
+        return false;
+    };
+    let Ok((rev, _)) = revisions_path(rev, revisions.as_ref()) else {
+        return false;
+    };
+    matches!(shard.get_meta(&id), Ok(Some(meta)) if meta.tree.contains(&rev))
+}
+
+/// Every compile of a view function with the name of the thread that ran it,
+/// for the tests that check where the compile happens.
+#[cfg(test)]
+static COMPILE_LOG: std::sync::Mutex<Vec<(String, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// CouchDB's `try_compile`. A design document in another language is saved
 /// unchecked: there is no query server to compile it.
@@ -2962,6 +3066,14 @@ fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
             if member == "reduce" && source.starts_with('_') {
                 continue;
             }
+            #[cfg(test)]
+            COMPILE_LOG
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((
+                    source.clone(),
+                    std::thread::current().name().map(str::to_string),
+                ));
             if let Err(message) = check_compiles(function, source, limits) {
                 return Err(ApiError::new(
                     400,
@@ -3075,6 +3187,7 @@ fn put_many(
     shard: &mut crate::store::Shard,
     docs: Vec<(usize, Value)>,
     new_edits: bool,
+    mut compile_errors: HashMap<usize, ApiError>,
     seq: &Arc<AtomicU64>,
     reserved: &Arc<AtomicU64>,
 ) -> Vec<(usize, DbResult<Value>)> {
@@ -3094,7 +3207,7 @@ fn put_many(
             seq,
             reserved,
         };
-        match ctx.stage(doc, new_edits) {
+        match ctx.stage(doc, new_edits, compile_errors.remove(&i)) {
             Ok(value) => results.push((i, Ok(value))),
             Err(e) => {
                 ops.truncate(mark);
@@ -3192,11 +3305,18 @@ impl Stage<'_> {
         self.staged.insert(id.to_string(), meta.clone());
     }
 
-    fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
+    /// `compile_error` is the design document's compile verdict, computed
+    /// before the shard job; it is raised where the structural check is.
+    fn stage(
+        &mut self,
+        doc: Value,
+        new_edits: bool,
+        compile_error: Option<ApiError>,
+    ) -> DbResult<Value> {
         let doc = split_doc(doc)?;
         let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
-            return self.stage_replicated(doc, meta);
+            return self.stage_replicated(doc, meta, compile_error);
         }
         let SplitDoc {
             id,
@@ -3231,6 +3351,9 @@ impl Stage<'_> {
         // to be the right one: a conflict wins over a malformed member.
         if let Value::Object(members) = &body {
             validate_design_doc(&id, deleted, members)?;
+            if let Some(error) = compile_error {
+                return Err(error);
+            }
         }
 
         let parent_path = match parent.as_ref() {
@@ -3291,7 +3414,12 @@ impl Stage<'_> {
         Ok(json!({"ok": true, "id": id, "rev": rev}))
     }
 
-    fn stage_replicated(&mut self, doc: SplitDoc, mut meta: DocMeta) -> DbResult<Value> {
+    fn stage_replicated(
+        &mut self,
+        doc: SplitDoc,
+        mut meta: DocMeta,
+        compile_error: Option<ApiError>,
+    ) -> DbResult<Value> {
         let SplitDoc {
             id,
             rev,
@@ -3310,6 +3438,9 @@ impl Stage<'_> {
         if !known {
             if let Value::Object(members) = &body {
                 validate_design_doc(&id, deleted, members)?;
+                if let Some(error) = compile_error {
+                    return Err(error);
+                }
             }
         }
 
@@ -4301,7 +4432,7 @@ mod tests {
         let seq = Arc::new(AtomicU64::new(shard.seq()));
         let reserved = Arc::new(AtomicU64::new(0));
         let docs = docs.into_iter().enumerate().collect();
-        for (_, result) in put_many(shard, docs, true, &seq, &reserved) {
+        for (_, result) in put_many(shard, docs, true, HashMap::new(), &seq, &reserved) {
             result.unwrap();
         }
         (
@@ -5959,6 +6090,82 @@ mod tests {
         )
         .unwrap();
         (db, root)
+    }
+
+    /// The threads a given map function was compiled on.
+    fn compiled_on(source: &str) -> Vec<Option<String>> {
+        COMPILE_LOG
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|(compiled, _)| compiled == source)
+            .map(|(_, thread)| thread.clone())
+            .collect()
+    }
+
+    fn design_doc_with_map(map: &str) -> Value {
+        json!({"_id": "_design/d", "views": {"v": {"map": map}}})
+    }
+
+    /// Saving a design document must not hold its shard's writer while the
+    /// functions compile: the check runs before the shard job, never on the
+    /// shard thread, and once per save.
+    #[tokio::test]
+    async fn design_doc_compile_runs_outside_the_shard_thread() {
+        let (db, root) = purge_test_db("compile-outside", ShardMap::single(1));
+        let map = "function(doc){ /* outside-shard */ emit(doc._id, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(map)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+        let threads = compiled_on(map);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert!(
+            threads
+                .iter()
+                .flatten()
+                .all(|name| !name.starts_with("shard-")),
+            "compiled on the shard thread: {threads:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A revision conflict still wins over a compile error, and a replicated
+    /// design document that is already stored is not compiled again.
+    #[tokio::test]
+    async fn compile_verdict_keeps_conflict_first_and_skips_stored_docs() {
+        let (db, root) = purge_test_db("compile-order", ShardMap::single(1));
+        let good = "function(doc){ /* order-good */ emit(1, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(good)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+
+        let bad = "function(doc){ /* order-bad */ emit(";
+        let conflict = db
+            .put_docs(vec![design_doc_with_map(bad)], true)
+            .await
+            .unwrap();
+        assert_eq!(conflict[0]["error"], "conflict", "{conflict:?}");
+
+        let replicated_map = "function(doc){ /* order-replicated */ emit(1, 1); }";
+        let hash = "b".repeat(32);
+        let replicated = json!({
+            "_id": "_design/r",
+            "_rev": format!("1-{hash}"),
+            "_revisions": {"start": 1, "ids": [hash]},
+            "views": {"v": {"map": replicated_map}},
+        });
+        for _ in 0..2 {
+            let out = db.put_docs(vec![replicated.clone()], false).await.unwrap();
+            assert_eq!(out[0]["ok"], true, "{out:?}");
+        }
+        assert_eq!(compiled_on(replicated_map).len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A purge info another copy recorded is applied once: replaying it
