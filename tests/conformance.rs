@@ -2637,6 +2637,36 @@ async fn plus_in_paths_and_query_strings_decodes_as_space() {
 /// The database segment is decoded like any other path segment, so `a+b` is
 /// the name "a b", which CouchDB 3.5 refuses on create with
 /// `illegal_database_name` and reports as missing everywhere else. Only
+/// A missing database answers with CouchDB's exact reason on every path that
+/// can discover it, whatever layer notices first.
+#[tokio::test]
+async fn missing_database_reason_is_couchdb_text() {
+    let s = Server::start(false);
+    for (method, path) in [
+        ("GET", "/missing"),
+        ("DELETE", "/missing"),
+        ("GET", "/missing/doc"),
+        ("PUT", "/missing/doc"),
+        ("GET", "/missing/_changes"),
+        ("GET", "/missing/_all_docs"),
+        ("GET", "/missing/_security"),
+        ("POST", "/missing/_bulk_docs"),
+    ] {
+        let (status, body) = match method {
+            "GET" => s.get(path).await,
+            "DELETE" => s.delete(path).await,
+            "POST" => s.post(path, json!({"docs": []})).await,
+            _ => s.put(path, json!({})).await,
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {body}");
+        assert_eq!(body["error"], "not_found", "{method} {path}: {body}");
+        assert_eq!(
+            body["reason"], "Database does not exist.",
+            "{method} {path}: {body}"
+        );
+    }
+}
+
 /// `a%2Bb` names the legal database "a+b".
 #[tokio::test]
 async fn plus_in_database_names_decodes_as_space() {
