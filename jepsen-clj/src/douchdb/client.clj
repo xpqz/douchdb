@@ -7,6 +7,7 @@
   (:require [cheshire.core :as json]
             [douchdb.db :as db]
             [douchdb.http :as http]
+            [douchdb.liveness :as liveness]
             [jepsen.client :as client]
             [jepsen.independent :as independent]))
 
@@ -38,13 +39,25 @@
                    :body (json/generate-string body)})))
 
 (defn- classify-write
+  "A write that provably never reached the server failed; one that may have
+  reached it is indeterminate."
   [response]
   (case (:status response)
     (200 201) {:type :ok}
     202 {:type :info :error :quorum-not-met}
     (409 412) {:type :conflict}
-    nil {:type :info :error (str (:error response))}
+    nil (if (http/not-sent? response)
+          {:type :fail :error (str "not sent: " (:error response))}
+          {:type :info :error (str (:error response))})
     {:type :info :error (str "unexpected status " (:status response))}))
+
+(defn- read-failed
+  "A failed read changes nothing, and neither does a write or CAS whose
+  preliminary read failed, because the PUT was never sent. Both are :fail."
+  [what response]
+  {:type :fail
+   :error (str what " failed: "
+               (or (:status response) (:error response)))})
 
 (defn- write-register
   "Writes the register as a conditional update from the revision we just read.
@@ -53,7 +66,7 @@
   [c key value]
   (let [{:keys [ok doc response]} (fetch c key)]
     (if-not ok
-      {:type :info :error (str "read-before-write failed: " (:status response))}
+      (read-failed "read-before-write" response)
       (let [rev (get doc :_rev)
             result (classify-write (put-doc! c key value rev false))]
         (if (= :conflict (:type result))
@@ -65,13 +78,13 @@
   (let [{:keys [ok doc response]} (fetch c key)]
     (if ok
       {:type :ok :value (get doc :value)}
-      {:type :info :error (str "read failed: " (:status response))})))
+      (read-failed "read" response))))
 
 (defn- cas-register
   [c key expected new-value]
   (let [{:keys [ok doc response]} (fetch c key)]
     (if-not ok
-      {:type :info :error (str "read-before-cas failed: " (:status response))}
+      (read-failed "read-before-cas" response)
       (let [current (get doc :value)
             rev (get doc :_rev)]
         (cond
@@ -98,7 +111,7 @@
   [c key new-value]
   (let [{:keys [ok doc response]} (fetch c key)]
     (if-not ok
-      {:type :info :error (str "read-before-cas failed: " (:status response))}
+      (read-failed "read-before-cas" response)
       (let [rev (get doc :_rev)]
         (if (nil? doc)
           (let [result (classify-write (put-doc! c key new-value nil false))]
@@ -113,6 +126,7 @@
 (defrecord DouchClient [node db-name read-quorum write-quorum]
   client/Client
   (open! [_ test node]
+    (liveness/mark-origin!)
     (->DouchClient node (:db-name test)
                    (:read-quorum test 2)
                    (:write-quorum test 2)))

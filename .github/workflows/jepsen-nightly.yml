@@ -27,12 +27,19 @@ jobs:
         run: |
           ./jepsen-clj/run.sh --fault partition --time-limit 600 \
             --seed 2002 --nemesis-interval 10 --liveness-interval-ms 500
+      # Jepsen names run directories by timestamp, with colons that
+      # upload-artifact rejects, so upload one archive instead.
+      - name: Pack Jepsen results
+        if: always()
+        run: |
+          dirs=$(cd jepsen-clj && ls -d store logs 2>/dev/null || true)
+          if [ -n "$dirs" ]; then
+            tar -czf jepsen-nightly-results.tgz -C jepsen-clj $dirs
+          fi
       - name: Upload Jepsen results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jepsen-nightly-results
-          path: |
-            jepsen-clj/store/
-            jepsen-clj/logs/
+          path: jepsen-nightly-results.tgz
           if-no-files-found: ignore
