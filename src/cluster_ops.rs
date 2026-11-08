@@ -518,15 +518,18 @@ async fn clear_migration_everywhere(ctx: &ClusterCtx, db: &Db, name: &str, heade
     }
 }
 
+/// Activate the placement of `target` on every node and return the map as
+/// stored, at the version the local Db picked under its lock (the version
+/// `target` carries is ignored).
 async fn activate_map_everywhere(
     ctx: &ClusterCtx,
     db: &Db,
     name: &str,
-    map: &ShardMap,
+    target: &ShardMap,
     headers: &HeaderMap,
-) -> DbResult<()> {
+) -> DbResult<ShardMap> {
     let old = db.shard_map();
-    db.set_shard_map(map.clone())?;
+    let map = &db.set_next_shard_map(target.clone())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
@@ -545,14 +548,14 @@ async fn activate_map_everywhere(
         }
     }
     if failures.is_empty() {
-        return Ok(());
+        return Ok(map.clone());
     }
 
     // Roll back with a strictly newer version so peers that already accepted
     // the target map also accept the old placement again.
-    let mut rollback = old;
-    rollback.version = map.version.saturating_add(1);
-    let _ = db.set_shard_map(rollback.clone());
+    let rollback = db
+        .set_next_shard_map(old)
+        .unwrap_or_else(|_| db.shard_map());
     for peer in &peers {
         let request = internal_request(
             ctx,
@@ -621,11 +624,14 @@ async fn migrate(
         return Err(error);
     }
 
-    if let Err(error) = activate_map_everywhere(ctx, db, name, map, headers).await {
-        clear_migration_everywhere(ctx, db, name, headers).await;
-        db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
+    let map = match activate_map_everywhere(ctx, db, name, map, headers).await {
+        Ok(activated) => activated,
+        Err(error) => {
+            clear_migration_everywhere(ctx, db, name, headers).await;
+            db.set_rebalance_in_progress(false);
+            return Err(error);
+        }
+    };
     clear_migration_everywhere(ctx, db, name, headers).await;
     db.set_rebalance_in_progress(false);
 
@@ -672,10 +678,7 @@ pub(crate) async fn rebalance(
         value["pending"] = json!(false);
         value
     } else {
-        let map = ShardMap {
-            version: old_map.version.saturating_add(1),
-            ..map
-        };
+        // The activation picks the version under the Db lock.
         migrate(ctx, db, name, &old_map, &map, headers, timeout_ms).await?
     };
     if !cleanup {
@@ -691,4 +694,68 @@ pub(crate) async fn rebalance(
     crate::telemetry::record_rebalance_completed(cleared);
     value["cleaned"] = json!(cleaned);
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::Cluster;
+    use crate::db::DbConfig;
+
+    /// The activation version is picked under the Db lock, not carried in from
+    /// whatever `rebalance` read earlier: a map change that lands between the
+    /// read and the activation must not make the activation lose to it.
+    #[tokio::test]
+    async fn activation_picks_its_version_under_the_lock() {
+        let root = std::env::temp_dir().join(format!("douchdb-activate-{}", crate::util::uuid()));
+        let active = ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas: vec![vec![0], vec![0]],
+            version: 1,
+        };
+        let db = Db::open(
+            &root,
+            "activate",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: active.clone(),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        // What rebalance proposed from the map it read: old version + 1.
+        let target = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            version: active.version + 1,
+            ..active.clone()
+        };
+        // Another update lands before the activation.
+        let interloper = ShardMap {
+            replicas: vec![vec![0, 1], vec![0, 1]],
+            ..active.clone()
+        };
+        let current = db.set_next_shard_map(interloper).unwrap();
+        assert_eq!(current.version, 2);
+
+        let ctx = ClusterCtx {
+            cluster: Cluster {
+                nodes: vec!["http://127.0.0.1:1".to_string()],
+                me: 0,
+                n: 1,
+                secret: "test-secret".to_string(),
+            },
+            client: reqwest::Client::new(),
+            auth: None,
+        };
+        activate_map_everywhere(&ctx, &db, "activate", &target, &HeaderMap::new())
+            .await
+            .unwrap();
+
+        let stored = db.shard_map();
+        assert_eq!(stored.replicas, target.replicas);
+        assert_eq!(stored.version, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
 }
