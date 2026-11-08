@@ -86,7 +86,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
     }
 
     let principal = st.principal(headers);
-    let mut validation: Vec<Option<ApiError>> = if is_forwarded(st, headers) {
+    let validation: Vec<Option<ApiError>> = if is_forwarded(st, headers) {
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
@@ -99,16 +99,6 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
             Err(error) => return fail(error),
         }
     };
-
-    // A malformed design document fails its own row, not the request; a
-    // replicated batch (`new_edits: false`) is stored as sent.
-    if new_edits && !is_forwarded(st, headers) {
-        for (slot, doc) in validation.iter_mut().zip(&docs) {
-            if slot.is_none() {
-                *slot = validate_design_doc(doc).err();
-            }
-        }
-    }
 
     // `_local` documents live outside the shard/replica machinery. Split them
     // out so a mixed bulk request still writes ordinary documents through the

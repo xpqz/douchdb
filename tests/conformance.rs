@@ -8870,7 +8870,7 @@ async fn views_map_reduce_collation_and_query_options() {
         "custom": {"map": map, "reduce": "function(keys, values, rereduce){ return rereduce ? sum(values) : sum(values) * 2; }"},
         "by_type_city": {"map": "function(doc){ emit([doc.type, doc.city], 1); }", "reduce": "_count"},
         "meta": {"map": "function(doc){ emit(doc._id, doc._rev); }"},
-        "bad": {"map": "function(doc){ emit(; }"}
+        "bad": {"map": "function(doc){ throw new Error(\"boom\"); }"}
     }});
     let (status, body) = s.put("/shop/_design/shop", ddoc).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -9100,7 +9100,7 @@ async fn views_map_reduce_collation_and_query_options() {
         .await;
     assert!(body["update_seq"].is_number() || body["update_seq"].is_string());
 
-    // A map-only view rejects reduce=true, and a broken map is a view error.
+    // A map-only view rejects reduce=true, and a map that throws is a view error.
     let (status, body) = s.get("/shop/_design/shop/_view/by_city?reduce=true").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "query_parse_error");

@@ -2782,16 +2782,16 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
     Ok(())
 }
 
-/// The structural checks CouchDB applies to a design document before storing
-/// it (couch_mrview_util and the design-doc validator): wrong member types are
-/// `invalid_design_doc`, not a stored document that fails later.
-pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
+/// What CouchDB checks when a design document is saved
+/// (`couch_mrview:validate/2`): wrong member types are `invalid_design_doc`,
+/// and every map and reduce function of a JavaScript design document must
+/// compile (`compilation_error`), not fail later at query time. Nothing else
+/// is compiled at save time. It runs after the revision check, on every write
+/// path including replication. `obj` is the document without its `_`
+/// metadata members.
+fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbResult<()> {
     let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
-    let Some(obj) = doc.as_object() else {
-        return Ok(());
-    };
-    let is_design = matches!(obj.get("_id"), Some(Value::String(id)) if id.starts_with("_design/"));
-    if !is_design || obj.get("_deleted") == Some(&Value::Bool(true)) {
+    if !id.starts_with("_design/") || deleted {
         return Ok(());
     }
     let wrong = |field: &str, kind: &str| invalid(format!("`{field}` field must have {kind} type"));
@@ -2850,6 +2850,44 @@ pub fn validate_design_doc(doc: &Value) -> DbResult<()> {
             }
         }
         Some(_) => return Err(wrong("views", "object")),
+    }
+    compile_views(obj)
+}
+
+/// CouchDB's `try_compile`. A design document in another language is saved
+/// unchecked: there is no query server to compile it.
+fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
+    use crate::view::{check_compiles, ViewFunction};
+    if obj
+        .get("language")
+        .and_then(Value::as_str)
+        .is_some_and(|language| language != "javascript")
+    {
+        return Ok(());
+    }
+    let Some(Value::Object(views)) = obj.get("views") else {
+        return Ok(());
+    };
+    let limits = crate::view::ViewLimits::default();
+    for (name, view) in views {
+        let functions = [(ViewFunction::Map, "map"), (ViewFunction::Reduce, "reduce")];
+        for (function, member) in functions {
+            let Some(Value::String(source)) = view.get(member) else {
+                continue;
+            };
+            if member == "reduce" && source.starts_with('_') {
+                continue;
+            }
+            if let Err(message) = check_compiles(function, source, limits) {
+                return Err(ApiError::new(
+                    400,
+                    "compilation_error",
+                    format!(
+                        "Compilation of the {member} function in the '{name}' view failed: {message} ({source})"
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -3105,6 +3143,12 @@ impl Stage<'_> {
             },
         };
 
+        // CouchDB validates a design document only once its revision is known
+        // to be the right one: a conflict wins over a malformed member.
+        if let Value::Object(members) = &body {
+            validate_design_doc(&id, deleted, members)?;
+        }
+
         let parent_path = match parent.as_ref() {
             Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
             None => Vec::new(),
@@ -3176,6 +3220,13 @@ impl Stage<'_> {
         let known = meta.tree.contains(&rev);
         if known && meta.atts.contains_key(&rev) {
             return Ok(json!({"ok": true, "id": id, "rev": rev}));
+        }
+        // A replicated design document is validated too (couch_db:
+        // prep_and_validate_replicated_updates), unless it is already stored.
+        if !known {
+            if let Value::Object(members) = &body {
+                validate_design_doc(&id, deleted, members)?;
+            }
         }
 
         let parent = meta
