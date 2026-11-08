@@ -413,16 +413,13 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     // are counted in a scope of their own, one per pass, under a fixed route
     // label (never derived from a path).
     let metadata_stats = crate::cluster_http::PeerStats::new(ANTI_ENTROPY_ROUTE.to_string(), false);
+    crate::cluster_http::with_stats(metadata_stats, crate::fabric::sync_metadata(&state, &names))
+        .await;
     let mut error: Option<String> = None;
     for name in names {
         let Ok(db) = state.db_cold(&name).await else {
             continue;
         };
-        crate::cluster_http::with_stats(metadata_stats.clone(), async {
-            crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
-            crate::fabric::reconcile_security(&state.ctx, &db).await;
-        })
-        .await;
         let pulls = peers.iter().map(|peer| {
             let db = db.clone();
             let peer = peer.clone();
@@ -472,7 +469,6 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         drop(db);
         state.release_cold().await;
     }
-    drop(metadata_stats);
     state.cluster_state.finish_replication(error);
     true
 }
