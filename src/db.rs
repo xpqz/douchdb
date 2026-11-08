@@ -401,12 +401,11 @@ pub struct ClosedMeta {
     pub pending_shard_map: bool,
 }
 
-/// A rebalance target and the id of the coordinator that announced it. The id
-/// is absent when an older coordinator announced it.
+/// A rebalance target and the id of the coordinator that announced it.
 #[derive(PartialEq)]
 struct Migration {
     map: ShardMap,
-    id: Option<String>,
+    id: String,
 }
 
 pub struct Db {
@@ -1024,7 +1023,7 @@ impl Db {
         self.replication_map().replicas_of(shard).contains(&node)
     }
 
-    pub fn set_migration_map(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn set_migration_map(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1039,7 +1038,7 @@ impl Db {
     /// different migration while one is in progress is refused, so two
     /// coordinators cannot run at once and one cannot unfreeze the other;
     /// repeating the same one is harmless.
-    pub fn begin_migration(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn begin_migration(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1077,10 +1076,9 @@ impl Db {
 
     /// Clear the migration on behalf of the coordinator that announced it with
     /// `id`. Returns false, leaving the migration and its freeze in place, when
-    /// another coordinator's migration is in progress. Nothing to clear, an
-    /// expired freeze (the coordinator vanished) and a migration announced
-    /// without an id (an older coordinator) are all cleared by any caller.
-    pub fn clear_migration_if(&self, id: Option<&str>) -> bool {
+    /// another coordinator's migration is in progress. Nothing to clear and an
+    /// expired freeze (the coordinator vanished) are cleared by any caller.
+    pub fn clear_migration_if(&self, id: &str) -> bool {
         let mut current = self
             .migration_map
             .write()
@@ -1088,7 +1086,7 @@ impl Db {
         let Some(migration) = current.as_ref() else {
             return true;
         };
-        if self.rebalance_in_progress() && migration.id.is_some() && migration.id.as_deref() != id {
+        if self.rebalance_in_progress() && migration.id != id {
             return false;
         }
         *current = None;
@@ -5459,7 +5457,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.set_migration_map(target.clone(), None).unwrap();
+        db.set_migration_map(target.clone(), "a".into()).unwrap();
         db.set_rebalance_in_progress(true);
         assert!(db.is_replica_of("doc", 1) && !db.is_replica_of("doc", 0));
         assert_eq!(db.replication_map().replicas, target.replicas);
@@ -5478,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_clears_only_for_its_own_id_unless_expired_or_unnamed() {
+    fn migration_clears_only_for_its_own_id_unless_expired() {
         let root = std::env::temp_dir().join(format!("douchdb-mig-id-{}", crate::util::uuid()));
         let active = ShardMap {
             q: 2,
@@ -5502,24 +5500,19 @@ mod tests {
         )
         .unwrap();
         // Nothing to clear is fine.
-        assert!(db.clear_migration_if(Some("a")));
-        db.begin_migration(target.clone(), Some("a".into()))
-            .unwrap();
-        assert!(!db.clear_migration_if(Some("b")));
-        assert!(!db.clear_migration_if(None));
+        assert!(db.clear_migration_if("a"));
+        db.begin_migration(target.clone(), "a".into()).unwrap();
+        assert!(!db.clear_migration_if("b"));
         assert!(db.rebalance_in_progress());
-        assert!(db.clear_migration_if(Some("a")));
+        assert!(db.clear_migration_if("a"));
         assert!(!db.rebalance_in_progress());
-        // A migration from a coordinator without ids is cleared by anyone.
-        db.begin_migration(target.clone(), None).unwrap();
-        assert!(db.clear_migration_if(Some("b")));
         // An expired freeze no longer protects the stale map.
-        db.begin_migration(target, Some("a".into())).unwrap();
+        db.begin_migration(target, "a".into()).unwrap();
         while now_millis() < 1 {
             std::thread::yield_now();
         }
         db.rebalance_until.store(1, Ordering::SeqCst);
-        assert!(db.clear_migration_if(Some("b")));
+        assert!(db.clear_migration_if("b"));
         std::fs::remove_dir_all(root).ok();
     }
 

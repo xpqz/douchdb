@@ -506,7 +506,7 @@ async fn set_migration_everywhere(
     id: &str,
     headers: &HeaderMap,
 ) -> DbResult<()> {
-    db.set_migration_map(map.clone(), Some(id.to_string()))?;
+    db.set_migration_map(map.clone(), id.to_string())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that

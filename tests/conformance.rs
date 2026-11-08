@@ -16716,7 +16716,7 @@ fn internal_headers() -> Vec<(&'static str, String)> {
 async fn migration_put_rejects_a_conflicting_migration() {
     let nodes = start_cluster_with(3, "3600", 1);
     nodes[0].fresh_db("migconflict").await;
-    let path = "/_node/_local/_dbs/migconflict/migration";
+    let path = "/_node/_local/_dbs/migconflict/migration?id=coordinator-a";
     let internal = internal_headers();
 
     let (status, body) = nodes[0]
@@ -16760,18 +16760,24 @@ async fn migration_delete_requires_the_migration_id() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // A rival coordinator, or a clear without an id, must not unfreeze it.
-    for wrong in [rival.as_str(), path] {
-        let (status, body) = nodes[0]
-            .req_with(Method::DELETE, wrong, None, &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-        // Still frozen: a different migration is still refused.
-        let (status, body) = nodes[0]
-            .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-    }
+    // A rival coordinator must not unfreeze it, and a clear needs an id.
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, &rival, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, path, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // Still frozen: a different migration is still refused.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // The owner clears it, and clearing again is harmless.
     for _ in 0..2 {
@@ -16824,7 +16830,10 @@ async fn migration_freeze_waits_for_detached_replica_writes() {
     // otherwise it can arrive after the final digest check.
     let freeze = tokio::spawn({
         let client = nodes[0].client.clone();
-        let url = format!("{}/_node/_local/_dbs/migdrain/migration", nodes[0].base);
+        let url = format!(
+            "{}/_node/_local/_dbs/migdrain/migration?id=drain",
+            nodes[0].base
+        );
         async move {
             client
                 .put(url)
