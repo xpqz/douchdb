@@ -52,3 +52,12 @@ arm64 Docker restart.
 
 Re-run a large ARM64 import plus concurrent changes/repair against the exact
 existing volumes before treating the storage layer as fully signed off.
+
+## Local clean-volume follow-up
+
+At `eac74f5`, a fresh ARM64 release cluster loaded all 337,455 aviation records
+without a recurrence of the stack overflow. Every document body and complete
+changes-feed replay matched on all three replicas after restart. A separate
+live changes-consumption gap was reproduced during overlapping writes. See
+`docs/bugs/2026-11-02-storage-cache-0.2.5-validation.md` for the clean-start
+procedure, scope, results and the distinct feed issue.

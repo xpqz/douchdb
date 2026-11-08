@@ -2858,7 +2858,7 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
                     }
                 }
                 if let Some(Value::String(reduce)) = view.get("reduce") {
-                    crate::view::check_reduce_name(reduce).map_err(&invalid)?;
+                    crate::view::check_reduce_name(reduce).map_err(invalid)?;
                 }
             }
         }
