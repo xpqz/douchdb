@@ -86,11 +86,11 @@
         (do (doseq [node nodes] (connect-node! network node))
             (db/wait-ready nodes 60000)
             (info "healed network")
-            (assoc op :value :healed))
+            (assoc op :value [:healed nodes]))
 
         :stop
         (do (doseq [node nodes] (connect-node! network node))
-            (assoc op :value :healed))
+            (assoc op :value [:healed nodes]))
 
         (assoc op :value [:ignored (:f op)]))))
 
