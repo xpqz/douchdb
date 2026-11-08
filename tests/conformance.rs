@@ -6885,6 +6885,89 @@ async fn cluster_changes_limit_pages_make_progress_with_a_node_down() {
     );
 }
 
+/// A peer that discovery marked down and that has since come back is still
+/// marked down until the next pass. A read routes around it, sending its
+/// shards to their other copy; if that copy is the node that really is down,
+/// the failed substitute used to leave no live copy and the read answered 412
+/// `nodedown`, though the marked node could have served the shards itself.
+#[tokio::test]
+async fn cluster_changes_reach_a_node_wrongly_marked_down_when_its_other_copy_is_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clchstale").await;
+    }
+    let ids: Vec<String> = (0..12).map(|i| format!("st{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clchstale/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // `stale` and `victim` hold the same shard; `reader` holds no copy of it.
+    let (reader, victim) = fallback_pair(&nodes, "clchstale", &ids).await;
+    let (_, map) = nodes[0].get("/_node/_local/_dbs/clchstale").await;
+    let q = map["q"].as_u64().unwrap() as u32;
+    let stale = map["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(shard, _)| ids.iter().any(|id| douchdb::shard_index(id, q) == *shard))
+        .filter_map(|(_, replicas)| {
+            let replicas: Vec<usize> = replicas
+                .as_array()?
+                .iter()
+                .filter_map(|node| node.as_u64().map(|node| node as usize))
+                .collect();
+            (!replicas.contains(&reader) && replicas.contains(&victim))
+                .then(|| replicas.into_iter().find(|node| *node != victim))
+                .flatten()
+        })
+        .next()
+        .expect("a shard held by the victim and one other node");
+
+    // Make the reader believe `stale` is down while it is up. Discovery runs
+    // on its own only in the first seconds after start, so retry if one of
+    // those passes cleared the mark before the read.
+    let url = nodes[stale].base.clone();
+    loop {
+        nodes[stale].kill();
+        wait_until_known_down(&nodes[reader], &url).await;
+        nodes[stale].restart();
+        let (_, cluster) = nodes[reader].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+    }
+    nodes[victim].kill();
+
+    let mut since = "0".to_string();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..30 {
+        let (status, body) = nodes[reader]
+            .get(&format!("/clchstale/_changes?since={since}&limit=2"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let results = body["results"].as_array().unwrap();
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            seen.insert(row["id"].as_str().unwrap().to_string());
+        }
+        since = body["last_seq"].as_str().unwrap().to_string();
+    }
+    assert_eq!(
+        seen.len(),
+        ids.len(),
+        "paged feed skipped changes: {seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn cluster_changes_since_now_with_a_node_down_uses_another_replica() {
     let mut nodes = start_cluster_with(3, "3600", 2);

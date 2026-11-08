@@ -1422,6 +1422,9 @@ where
     crate::telemetry::record_fanout(requests.len() as u64);
 
     let mut values = Vec::new();
+    // The nodes that were asked and failed, as against `excluded`, which also
+    // holds nodes only skipped because discovery marked them down.
+    let mut failed_nodes: Vec<usize> = Vec::new();
     // Only the first dispatch may fail over: a failed fallback fails the read.
     let mut first = true;
     loop {
@@ -1467,8 +1470,21 @@ where
             crate::telemetry::record_degraded_read();
         }
         excluded.extend(failed.iter().copied());
+        // Prefer a node nothing says is down. A node skipped only because
+        // discovery marked it down may be wrongly marked (the mark lasts until
+        // the next pass), so when the unmarked nodes hold no copy it is asked
+        // after all; only a node that actually failed is out for good.
+        failed_nodes.extend(failed.iter().copied());
         let alive: Vec<usize> = (0..nodes).filter(|node| !excluded.contains(node)).collect();
-        let groups = fallback_shard_masks(db, &lost, &failed, &alive)?;
+        let groups = match fallback_shard_masks(db, &lost, &failed, &alive) {
+            Err(_) => {
+                let alive: Vec<usize> = (0..nodes)
+                    .filter(|node| !failed_nodes.contains(node))
+                    .collect();
+                fallback_shard_masks(db, &lost, &failed, &alive)?
+            }
+            groups => groups?,
+        };
         if groups.is_empty() {
             break;
         }
