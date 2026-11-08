@@ -251,15 +251,13 @@ impl AppState {
 
     async fn open_db(&self, name: &str, hot: bool) -> DbResult<Arc<Db>> {
         if !valid_db_name(name) {
-            return Err(ApiError::not_found("Database does not exist."));
+            return Err(ApiError::db_not_found());
         }
         if let Some(open) = self.dbs.read().await.get(name) {
             return Ok(if hot { open.touch() } else { open.db.clone() });
         }
         if !Db::exists(&self.root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         }
         // Concurrent first requests for one name share a single open, and a
         // drop that won the race leaves nothing to open.
@@ -293,7 +291,7 @@ impl AppState {
     /// when the directory cannot say (a legacy database with no shard map).
     pub(crate) async fn placement(&self, name: &str) -> DbResult<Placement> {
         if !valid_db_name(name) {
-            return Err(ApiError::not_found("Database does not exist."));
+            return Err(ApiError::db_not_found());
         }
         if let Some(db) = self.open_db_if_cached(name).await {
             return Placement::of_open(db);
@@ -435,7 +433,7 @@ impl AppState {
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
         if !valid_db_name(name) {
-            return Err(ApiError::not_found("Database does not exist."));
+            return Err(ApiError::db_not_found());
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
