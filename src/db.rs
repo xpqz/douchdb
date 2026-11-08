@@ -174,6 +174,14 @@ fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option
     }
 }
 
+fn clear_error(path: &Path, error: &dyn std::fmt::Display) -> ApiError {
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("{}: {error}", file_name(path)),
+    )
+}
+
 /// Serialize `value` and replace `path` with it atomically; see
 /// [`write_atomic`].
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
@@ -1225,8 +1233,17 @@ impl Db {
         write_json_atomic(&self.path.join("pending-shard-map.json"), map)
     }
 
-    pub fn clear_pending_shard_map(&self) {
-        let _ = std::fs::remove_file(self.path.join("pending-shard-map.json"));
+    /// Remove the pending shard map and make the removal durable. Already
+    /// gone is fine; any other failure is an error, since the map would
+    /// otherwise reappear or be retried as if still pending.
+    pub fn clear_pending_shard_map(&self) -> DbResult<()> {
+        let path = self.path.join("pending-shard-map.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(clear_error(&path, &error)),
+        }
+        sync_parent(&path).map_err(|error| clear_error(&path, &error))
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
