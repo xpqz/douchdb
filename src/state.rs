@@ -214,6 +214,31 @@ pub(crate) fn valid_db_name(name: &str) -> bool {
     regex_match || SYSTEM_DB_NAMES.contains(&name)
 }
 
+/// The name rule douchdb applied before it followed CouchDB's: any non-empty
+/// run of `a-z0-9_$()+-/` that does not start with `_` or `/`, end with `/`
+/// or contain `//`.
+fn legacy_db_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('_')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("//")
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
+        })
+}
+
+/// Whether an existing database may be addressed by `name`. CouchDB checks a
+/// name only when it creates a database (`valid_db_name`); this also accepts
+/// what earlier douchdb versions allowed (a leading digit or '-'), a
+/// deliberate departure so that databases already on disk under such a name
+/// stay readable, writable and deletable.
+pub(crate) fn openable_db_name(name: &str) -> bool {
+    valid_db_name(name) || legacy_db_name(name)
+}
+
 // ---------------------------------------------------------------------------
 // state
 
@@ -250,7 +275,7 @@ impl AppState {
     }
 
     async fn open_db(&self, name: &str, hot: bool) -> DbResult<Arc<Db>> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(open) = self.dbs.read().await.get(name) {
@@ -292,7 +317,7 @@ impl AppState {
     /// is open, from its directory when it is not, and by opening it only
     /// when the directory cannot say (a legacy database with no shard map).
     pub(crate) async fn placement(&self, name: &str) -> DbResult<Placement> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(db) = self.open_db_if_cached(name).await {
@@ -372,7 +397,7 @@ impl AppState {
     /// a database does not open it. `None` when there is no such database or
     /// its security cannot be read.
     pub async fn db_security(&self, name: &str) -> Option<Value> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return None;
         }
         if let Some(open) = self.dbs.read().await.get(name) {
@@ -434,7 +459,7 @@ impl AppState {
     }
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         let lock = self.name_lock(name);
