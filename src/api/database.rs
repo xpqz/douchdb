@@ -245,9 +245,6 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     if let Err(e) = validate_doc(&doc) {
         return fail(e);
     }
-    if let Err(e) = validate_design_doc(&doc) {
-        return fail(e);
-    }
     if doc.get("_id").is_none() {
         doc["_id"] = json!(crate::util::uuid());
     }
