@@ -959,30 +959,32 @@ pub async fn metrics_status(
         .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
-    let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
-        let started = std::time::Instant::now();
-        let request = internal_request(
-            &st.ctx,
-            reqwest::Method::GET,
-            &url,
-            &["_node", "_local", "_metrics"],
-            Some(&headers),
-        )
-        .query(&[("local", "1")]);
-        async move {
-            let result = match send_peer(request).await {
-                Ok(response) if response.status().is_success() => {
-                    match response.json::<Value>().await {
-                        Ok(value) => Ok(value),
-                        Err(error) => Err(format!("invalid metrics JSON: {error}")),
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        peers.into_iter().map(|(index, url)| {
+            let started = std::time::Instant::now();
+            let request = internal_request(
+                &st.ctx,
+                reqwest::Method::GET,
+                &url,
+                &["_node", "_local", "_metrics"],
+                Some(&headers),
+            )
+            .query(&[("local", "1")]);
+            async move {
+                let result = match send_peer(request).await {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<Value>().await {
+                            Ok(value) => Ok(value),
+                            Err(error) => Err(format!("invalid metrics JSON: {error}")),
+                        }
                     }
-                }
-                Ok(response) => Err(format!("HTTP {}", response.status())),
-                Err(error) => Err(error.to_string()),
-            };
-            (index, url, started.elapsed().as_millis() as u64, result)
-        }
-    }))
+                    Ok(response) => Err(format!("HTTP {}", response.status())),
+                    Err(error) => Err(error.to_string()),
+                };
+                (index, url, started.elapsed().as_millis() as u64, result)
+            }
+        }),
+    ))
     .await;
 
     let mut snapshots = vec![local.clone()];
@@ -1086,27 +1088,29 @@ pub async fn health_status(
         .filter(|(index, _)| *index != st.ctx.cluster.me)
         .map(|(index, url)| (index, url.clone()))
         .collect();
-    let responses = futures::future::join_all(peers.into_iter().map(|(index, url)| {
-        let request = internal_request(
-            &st.ctx,
-            reqwest::Method::GET,
-            &url,
-            &["_node", "_local", "_health"],
-            Some(&headers),
-        )
-        .query(&[("local", "1")]);
-        async move {
-            let result = match send_peer(request).await {
-                Ok(response) if response.status().is_success() => response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| error.to_string()),
-                Ok(response) => Err(format!("HTTP {}", response.status())),
-                Err(error) => Err(error.to_string()),
-            };
-            (index, url, result)
-        }
-    }))
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        peers.into_iter().map(|(index, url)| {
+            let request = internal_request(
+                &st.ctx,
+                reqwest::Method::GET,
+                &url,
+                &["_node", "_local", "_health"],
+                Some(&headers),
+            )
+            .query(&[("local", "1")]);
+            async move {
+                let result = match send_peer(request).await {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<Value>()
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Ok(response) => Err(format!("HTTP {}", response.status())),
+                    Err(error) => Err(error.to_string()),
+                };
+                (index, url, result)
+            }
+        }),
+    ))
     .await;
     let mut worst = health_rank(local["status"].as_str().unwrap_or("ok"));
     let mut nodes = vec![json!({

@@ -66,26 +66,27 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         .filter(|pending| pending.version >= local.version)
         .unwrap_or_else(|| local.clone());
 
-    let reported = join_all(ctx.cluster.peers().map(|peer| async move {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::GET,
-            peer,
-            &["_node", "_local", "_dbs", &db.name],
-            None,
-        );
-        let map = async {
-            send_peer(request)
-                .await
-                .ok()?
-                .json::<crate::cluster::ShardMap>()
-                .await
-                .ok()
-        }
+    let reported =
+        crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::GET,
+                peer,
+                &["_node", "_local", "_dbs", &db.name],
+                None,
+            );
+            let map = async {
+                send_peer(request)
+                    .await
+                    .ok()?
+                    .json::<crate::cluster::ShardMap>()
+                    .await
+                    .ok()
+            }
+            .await;
+            (peer.clone(), map)
+        })))
         .await;
-        (peer.clone(), map)
-    }))
-    .await;
 
     for map in reported.iter().filter_map(|(_, map)| map.clone()) {
         if adoptable_peer_map(&map, desired.version, ctx.cluster.nodes.len())
@@ -114,7 +115,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         .into_iter()
         .partition(|(_, map)| map.as_ref() == Some(&desired));
     let peers: Vec<String> = stale.into_iter().map(|(peer, _)| peer).collect();
-    let responses = join_all(peers.into_iter().map(|peer| {
+    let responses = crate::cluster_http::in_one_round(join_all(peers.into_iter().map(|peer| {
         let payload = payload.clone();
         async move {
             let request = internal_request(
@@ -131,7 +132,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
         }
-    }))
+    })))
     .await;
     let acknowledgements = 1 + current.len() + responses.into_iter().filter(|ok| *ok).count();
     if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
@@ -162,25 +163,26 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
     if !ctx.cluster.is_clustered() {
         return;
     }
-    let fetched = join_all(ctx.cluster.peers().map(|peer| async move {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::GET,
-            peer,
-            &["_node", "_local", "_dbs", &db.name, "security"],
-            None,
-        );
-        let envelope = send_peer(request)
-            .await
-            .ok()?
-            .json::<serde_json::Value>()
-            .await
-            .ok()?;
-        let version = envelope.get("version")?.as_u64()?;
-        let security = envelope.get("security")?.clone();
-        Some((peer.clone(), version, security))
-    }))
-    .await;
+    let fetched =
+        crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::GET,
+                peer,
+                &["_node", "_local", "_dbs", &db.name, "security"],
+                None,
+            );
+            let envelope = send_peer(request)
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
+            let version = envelope.get("version")?.as_u64()?;
+            let security = envelope.get("security")?.clone();
+            Some((peer.clone(), version, security))
+        })))
+        .await;
     let fetched: Vec<(String, u64, serde_json::Value)> = fetched.into_iter().flatten().collect();
 
     let (mut version, mut security) = db.security_versioned();
@@ -196,7 +198,7 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
     }
 
     let envelope = serde_json::json!({"version": version, "security": security});
-    join_all(
+    crate::cluster_http::in_one_round(join_all(
         fetched
             .iter()
             .filter(|(_, peer_version, peer_security)| {
@@ -215,7 +217,7 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
                     let _ = send_peer(request).await;
                 }
             }),
-    )
+    ))
     .await;
 }
 
@@ -255,7 +257,7 @@ pub(crate) async fn replica_docs(
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
-    let responses = join_all(replicas.into_iter().map(|node| {
+    let responses = crate::cluster_http::in_one_round(join_all(replicas.into_iter().map(|node| {
         let inner = inner.clone();
         let opts = opts.clone();
         async move {
@@ -289,7 +291,7 @@ pub(crate) async fn replica_docs(
                 Err(_) => (false, None),
             }
         }
-    }))
+    })))
     .await;
 
     let reachable = responses.iter().filter(|(reachable, _)| *reachable).count();
@@ -541,6 +543,9 @@ async fn spawn_quorum_writes(
 ) -> FuturesUnordered<tokio::task::JoinHandle<NodeReply>> {
     let ctx = &st.ctx;
     let pending = FuturesUnordered::new();
+    // One round for all the replica writes, however far apart they start or
+    // finish; each remote task keeps it open until its call is done.
+    let round = crate::cluster_http::peer_round();
     for (node, group) in groups {
         let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
         let slot = st.admission.acquire_detached().await;
@@ -560,8 +565,9 @@ async fn spawn_quorum_writes(
             let dbname = dbname.to_string();
             let headers = headers.clone();
             let gate = gate.clone();
+            let round = round.clone();
             pending.push(spawn_node_write(node, slots, async move {
-                let (_gate, _slot) = (gate, slot);
+                let (_gate, _slot, _round) = (gate, slot, round);
                 forward_bulk_owned(client, secret, peer, dbname, subdocs, true, headers).await
             }));
         }
@@ -746,22 +752,24 @@ async fn replicate_to_all(
         let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
         responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
     }
-    let remote = futures::future::join_all(groups.into_iter().map(|(node, group)| {
-        let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-        let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
-        let client = ctx.client.clone();
-        let secret = ctx.cluster.secret.clone();
-        let peer = ctx.cluster.nodes[node].clone();
-        let dbname = dbname.to_string();
-        let headers = headers.clone();
-        async move {
-            (
-                node,
-                slots,
-                forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
-            )
-        }
-    }))
+    let remote = crate::cluster_http::in_one_round(futures::future::join_all(
+        groups.into_iter().map(|(node, group)| {
+            let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
+            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+            let client = ctx.client.clone();
+            let secret = ctx.cluster.secret.clone();
+            let peer = ctx.cluster.nodes[node].clone();
+            let dbname = dbname.to_string();
+            let headers = headers.clone();
+            async move {
+                (
+                    node,
+                    slots,
+                    forward_bulk_owned(client, secret, peer, dbname, subdocs, false, headers).await,
+                )
+            }
+        }),
+    ))
     .await;
     responses.extend(remote);
     responses
@@ -1027,10 +1035,12 @@ where
     // Only the first dispatch may fail over: a failed fallback fails the read.
     let mut first = true;
     loop {
-        let responses = join_all(requests.into_iter().map(|(node, mask, round)| {
-            let response = fetch(node, mask.clone(), round);
-            async move { (node, mask, round, response.await) }
-        }))
+        let responses = crate::cluster_http::in_one_round(join_all(requests.into_iter().map(
+            |(node, mask, round)| {
+                let response = fetch(node, mask.clone(), round);
+                async move { (node, mask, round, response.await) }
+            },
+        )))
         .await;
 
         let mut lost = vec![ShardMask::none(db.q); nodes];
@@ -2083,11 +2093,11 @@ pub(crate) async fn cluster_update_vector(
         .filter(|node| !held_back.contains(node))
         .collect();
     let (vector, groups) = loop {
-        let answers = futures::future::join_all(
+        let answers = crate::cluster_http::in_one_round(futures::future::join_all(
             to_ask
                 .iter()
                 .map(|&node| async move { fetch_update_seq(read, node).await.ok() }),
-        )
+        ))
         .await;
         for (&node, seq) in to_ask.iter().zip(answers) {
             seqs[node] = seq;

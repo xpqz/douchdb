@@ -328,7 +328,9 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                 (slots, result)
             }
         });
-        for (slots, result) in futures::future::join_all(requests).await {
+        for (slots, result) in
+            crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
+        {
             match result {
                 Ok(mut value) => {
                     let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
@@ -406,7 +408,9 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
                 (slots, result)
             }
         });
-        for (slots, result) in futures::future::join_all(requests).await {
+        for (slots, result) in
+            crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
+        {
             match result {
                 Ok(value) => {
                     if let Some(obj) = value.as_object() {
