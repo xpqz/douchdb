@@ -2,7 +2,7 @@
 //! updates, rebalance and security-object propagation.
 
 use crate::cluster::ShardMap;
-use crate::cluster_http::{internal_request, ClusterCtx};
+use crate::cluster_http::{internal_request, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db, DbResult};
 use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -39,8 +39,7 @@ pub(crate) async fn set_security_everywhere(
         )
         .json(&envelope);
         async move {
-            request
-                .send()
+            send_peer(request)
                 .await
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
@@ -106,7 +105,10 @@ pub(crate) async fn apply_shard_map(
             )
             .header(header::CONTENT_TYPE, "application/json")
             .body(payload);
-            request.send().await.ok().map(|response| response.status())
+            send_peer(request)
+                .await
+                .ok()
+                .map(|response| response.status())
         }
     }))
     .await;
@@ -157,7 +159,7 @@ async fn fetch_shard_states(
     } else {
         request
     };
-    let value = request.send().await.ok()?.json::<Value>().await.ok()?;
+    let value = send_peer(request).await.ok()?.json::<Value>().await.ok()?;
     let mut out = Vec::new();
     for row in value["shards"].as_array()? {
         out.push(ShardState {
@@ -405,8 +407,7 @@ async fn cleanup_all_replicas(
             Some(headers),
         );
         async move {
-            let response = request
-                .send()
+            let response = send_peer(request)
                 .await
                 .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
             if !response.status().is_success() {
@@ -480,7 +481,7 @@ async fn send_migration(
         Some(map) => request.json(map),
         None => request,
     };
-    match request.send().await {
+    match send_peer(request).await {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(MigrationRefused {
             conflict: response.status() == reqwest::StatusCode::CONFLICT,
@@ -575,7 +576,7 @@ async fn activate_map_everywhere(
             Some(headers),
         )
         .json(map);
-        match request.send().await {
+        match send_peer(request).await {
             Ok(response) if response.status().is_success() => {}
             Ok(response) => failures.push(format!("{peer}: HTTP {}", response.status())),
             Err(error) => failures.push(format!("{peer}: {error}")),
@@ -599,7 +600,7 @@ async fn activate_map_everywhere(
             Some(headers),
         )
         .json(&rollback);
-        if let Err(error) = request.send().await {
+        if let Err(error) = send_peer(request).await {
             tracing::warn!("rebalance rollback on {peer} failed: {error}");
         }
     }

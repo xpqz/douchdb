@@ -3,7 +3,8 @@
 
 use crate::cluster::ShardMask;
 use crate::cluster_http::{
-    forward_client_auth, internal_request, internal_request_raw, ClusterCtx,
+    forward_client_auth, in_request_scope, internal_request, internal_request_raw, send_peer,
+    ClusterCtx,
 };
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
@@ -74,8 +75,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
             None,
         );
         let map = async {
-            request
-                .send()
+            send_peer(request)
                 .await
                 .ok()?
                 .json::<crate::cluster::ShardMap>()
@@ -126,8 +126,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
             )
             .header("content-type", "application/json")
             .body(payload);
-            request
-                .send()
+            send_peer(request)
                 .await
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
@@ -171,8 +170,7 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
             &["_node", "_local", "_dbs", &db.name, "security"],
             None,
         );
-        let envelope = request
-            .send()
+        let envelope = send_peer(request)
             .await
             .ok()?
             .json::<serde_json::Value>()
@@ -214,7 +212,7 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
                 )
                 .json(&envelope);
                 async move {
-                    let _ = request.send().await;
+                    let _ = send_peer(request).await;
                 }
             }),
     )
@@ -279,7 +277,7 @@ pub(crate) async fn replica_docs(
             )
             .header("x-douchdb-quorum-read", "1")
             .query(&inner);
-            match request.send().await {
+            match send_peer(request).await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
                         Ok(value) => (true, Some(value)),
@@ -581,6 +579,8 @@ fn spawn_node_write(
     write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
 ) -> tokio::task::JoinHandle<NodeReply> {
     use futures::FutureExt;
+    // The task keeps counting its peer calls against the client request.
+    let write = in_request_scope(write);
     tokio::spawn(async move {
         let result = std::panic::AssertUnwindSafe(write)
             .catch_unwind()
@@ -830,8 +830,7 @@ where
         new_edits,
     });
     let request = forward_client_auth(request, &headers);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
     if !response.status().is_success() {
@@ -872,8 +871,7 @@ pub(crate) async fn forward_json(
     )
     .query(&params)
     .json(body);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
     if !response.status().is_success() {
@@ -1190,8 +1188,7 @@ pub(crate) async fn fetch_all_docs(
     )
     .query(&query)
     .json(&body);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
     if !response.status().is_success() {
@@ -1297,8 +1294,7 @@ async fn fetch_view_mask(
         Some(headers),
     )
     .query(&params);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {
@@ -1488,8 +1484,7 @@ async fn fetch_reduce_mask(
         Some(headers),
     )
     .query(&params);
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {
@@ -1617,7 +1612,7 @@ pub(crate) async fn fetch_ddoc_from_replica(
             &[dbname, ddoc],
             Some(headers),
         );
-        if let Ok(response) = request.send().await {
+        if let Ok(response) = send_peer(request).await {
             if response.status().is_success() {
                 if let Ok(value) = response.json::<Value>().await {
                     return Ok(value);
@@ -1903,8 +1898,7 @@ pub(crate) async fn fetch_node_changes(
     } else {
         request
     };
-    let response = request
-        .send()
+    let response = send_peer(request)
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))?;
     if !response.status().is_success() {
@@ -1944,7 +1938,7 @@ pub(crate) async fn cluster_update_vector(
         let peer = &ctx.cluster.nodes[node];
         let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
             .header("x-douchdb-update-seq", "1");
-        let response = request.send().await.ok()?;
+        let response = send_peer(request).await.ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -2318,8 +2312,7 @@ async fn fetch_search_mask(
         Some(headers),
     )
     .query(&params);
-    let response = outgoing
-        .send()
+    let response = send_peer(outgoing)
         .await
         .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
     if !response.status().is_success() {

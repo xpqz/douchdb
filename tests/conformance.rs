@@ -4960,6 +4960,222 @@ async fn cluster_routes_writes_and_merges_all_docs() {
     assert_eq!(body["total_rows"], 7);
 }
 
+/// One node's peer-call counters, summed over every route: `(calls its own
+/// client requests made, their sequential rounds, calls that requests sent by
+/// other nodes made)`, from its local metrics.
+async fn peer_counters(node: &Server) -> (u64, u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let mut totals = (0, 0, 0);
+    for row in metrics["http"]["routes"].as_array().into_iter().flatten() {
+        totals.0 += row["peer_calls"].as_u64().unwrap_or(0);
+        totals.1 += row["peer_rounds"].as_u64().unwrap_or(0);
+        totals.2 += row["nested_calls"].as_u64().unwrap_or(0);
+    }
+    totals
+}
+
+/// Every node's counters once all of them are idle: no request has peer
+/// accounting open, which includes replica writes that outlive the response
+/// and streamed bodies still being produced.
+async fn peer_snapshot(nodes: &[Server]) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for node in nodes {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, metrics) = node.get("/_node/_local/_metrics").await;
+            let Some(open) = metrics["http"]["peer_open"].as_u64() else {
+                panic!("the metrics report no http.peer_open gauge");
+            };
+            if open == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer accounting never closed: {open} requests still open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        out.push(peer_counters(node).await);
+    }
+    out
+}
+
+/// What one client request sent to `nodes[0]` cost in node-to-node traffic:
+/// `(peer calls the coordinator made, its sequential rounds, peer calls the
+/// nodes it reached made in turn)`. The difference of the counters around the
+/// request. `nodes` are the live nodes.
+async fn measure_peer_trips(
+    nodes: &[Server],
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (u64, u64, u64) {
+    let before = peer_snapshot(nodes).await;
+    let (status, response) = nodes[0].req(method, path, body).await;
+    assert!(status.is_success(), "{path}: {status} {response}");
+    let after = peer_snapshot(nodes).await;
+    let nested: u64 = (0..nodes.len()).map(|i| after[i].2 - before[i].2).sum();
+    (after[0].0 - before[0].0, after[0].1 - before[0].1, nested)
+}
+
+/// A database `trips` on a fresh three-node cluster (`q=4`) holding 40
+/// documents and a design document with a map view and a reduce view, both
+/// already queried so their indexes exist.
+async fn peer_trip_cluster(replication: usize) -> Vec<Server> {
+    let nodes = start_cluster_with(3, "3600", replication);
+    for node in &nodes {
+        node.fresh_db("trips").await;
+    }
+    let docs: Vec<Value> = (0..40)
+        .map(|i| json!({"_id": format!("d{i:02}"), "n": i}))
+        .collect();
+    let (status, body) = nodes[0]
+        .post("/trips/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = nodes[0]
+        .put(
+            "/trips/_design/v",
+            json!({
+                "views": {
+                    "by_n": {"map": "function (doc) { emit(doc.n, 1); }"},
+                    "total": {
+                        "map": "function (doc) { emit(doc.n, 1); }",
+                        "reduce": "_count"
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for path in [PEER_TRIPS_MAP_VIEW, PEER_TRIPS_REDUCE_VIEW] {
+        let (status, body) = nodes[0].get(path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    nodes
+}
+
+const PEER_TRIPS_MAP_VIEW: &str = "/trips/_design/v/_view/by_n";
+const PEER_TRIPS_REDUCE_VIEW: &str = "/trips/_design/v/_view/total?group=true";
+
+/// The read operations of the baseline, in a fixed order.
+async fn peer_trip_reads(nodes: &[Server]) -> Vec<(&'static str, (u64, u64, u64))> {
+    let mut out = Vec::new();
+    let reads = [
+        ("get_doc", "/trips/d10"),
+        ("all_docs_limit_100", "/trips/_all_docs?limit=100"),
+        ("map_view", PEER_TRIPS_MAP_VIEW),
+        ("reduce_view", PEER_TRIPS_REDUCE_VIEW),
+        ("changes_since_now", "/trips/_changes?since=now"),
+    ];
+    for (label, path) in reads {
+        out.push((
+            label,
+            measure_peer_trips(nodes, Method::GET, path, None).await,
+        ));
+    }
+    out
+}
+
+/// Baseline for the epic on node-to-node round trips: how many peer calls and
+/// sequential rounds each client request costs on a healthy three-node
+/// cluster with `q=4`, `n=3`. These are the numbers later changes lower; when
+/// one does, update the expectation in the same commit.
+///
+/// A round is a period with at least one peer call in flight (see
+/// `cluster_http`), so concurrent calls count once. Each result is
+/// `(coordinator calls, coordinator rounds, calls made by the nodes it
+/// reached)`, for a request sent to node 0.
+#[tokio::test]
+async fn cluster_peer_round_trip_baseline() {
+    let nodes = peer_trip_cluster(3).await;
+    // Writes first. A node with no cached validators pays a validator
+    // fan-out (one call per peer, one round) before the write itself (one call
+    // per other replica, one round); the cache lasts a second, so the second
+    // figure is the cached case unless the machine stalled for longer.
+    let put = measure_peer_trips(&nodes, Method::PUT, "/trips/new1", Some(json!({"n": 1}))).await;
+    assert!(
+        put == (2, 1, 0) || put == (4, 2, 0),
+        "single-doc PUT: {put:?}"
+    );
+    // Every node holds a copy of every shard, so a read, a listing or a view
+    // is served from local data without a scatter. A document read still asks
+    // a second replica (`r=2`) and `since=now` still asks every peer for its
+    // sequence.
+    assert_eq!(
+        peer_trip_reads(&nodes).await,
+        vec![
+            ("get_doc", (2, 1, 0)),
+            ("all_docs_limit_100", (0, 0, 0)),
+            ("map_view", (0, 0, 0)),
+            ("reduce_view", (0, 0, 0)),
+            ("changes_since_now", (2, 1, 0)),
+        ]
+    );
+}
+
+/// With one copy of each shard the coordinator must scatter to the nodes
+/// that own shards. Which nodes those are depends on placement, so the
+/// assertions are relations that hold for any placement: a listing, a map view
+/// and a reduce view cost one scatter round (none if the node owns every
+/// shard), and `since=now` adds a round for the sequence vector before its own
+/// scatter.
+#[tokio::test]
+async fn cluster_peer_scatter_baseline_with_one_replica() {
+    let nodes = peer_trip_cluster(1).await;
+    let reads = peer_trip_reads(&nodes).await;
+    let trips = |label: &str| {
+        reads
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, trips)| *trips)
+            .unwrap_or_default()
+    };
+    let scatter = trips("all_docs_limit_100");
+    assert_eq!(scatter.1, u64::from(scatter.0 > 0), "{reads:?}");
+    assert_eq!(trips("map_view"), scatter, "{reads:?}");
+    assert_eq!(trips("reduce_view"), scatter, "{reads:?}");
+    // The vector round asks both peers, then the scatter goes out again.
+    assert_eq!(
+        trips("changes_since_now"),
+        (2 + scatter.0, 1 + scatter.1, 0),
+        "{reads:?}"
+    );
+}
+
+/// With a node down, a write pays the validator fan-out every time (a partial
+/// answer is never cached) and reads route around the dead node.
+#[tokio::test]
+async fn cluster_peer_round_trip_baseline_with_a_node_down() {
+    let mut nodes = peer_trip_cluster(3).await;
+    nodes[2].kill();
+    nodes.truncate(2);
+    // Calls to the dead node count too: they are issued and fail. Only the
+    // two live nodes' counters can be read, and the dead node makes no nested
+    // calls.
+    for id in ["down1", "down2"] {
+        let put = measure_peer_trips(
+            &nodes,
+            Method::PUT,
+            &format!("/trips/{id}"),
+            Some(json!({"n": 1})),
+        )
+        .await;
+        assert_eq!(put, (4, 2, 0), "PUT {id} with a node down");
+    }
+    assert_eq!(
+        peer_trip_reads(&nodes).await,
+        vec![
+            ("get_doc", (2, 1, 0)),
+            ("all_docs_limit_100", (0, 0, 0)),
+            ("map_view", (0, 0, 0)),
+            ("reduce_view", (0, 0, 0)),
+            ("changes_since_now", (2, 1, 0)),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn cluster_changes_use_an_opaque_version_vector() {
     let nodes = start_cluster_with(2, "3600", 2);

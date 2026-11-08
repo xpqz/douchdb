@@ -46,7 +46,7 @@ pub async fn all_dbs(
                 .header("x-douchdb-local-db", "1")
                 .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
             let request = forward_client_auth(request, &headers);
-            if let Ok(response) = request.send().await {
+            if let Ok(response) = send_peer(request).await {
                 if let Ok(Value::Array(remote)) = response.json::<Value>().await {
                     for name in remote {
                         if let Some(name) = name.as_str() {

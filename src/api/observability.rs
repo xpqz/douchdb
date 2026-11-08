@@ -3,7 +3,7 @@
 //! This module owns the observability handlers; the HTTP router in `api`
 //! re-exports them so route registration stays in one place.
 
-use super::{flag, internal_request, query, AdminOnly, AppState};
+use super::{flag, internal_request, query, send_peer, AdminOnly, AppState};
 use crate::db::Db;
 use crate::state::FsHealth;
 use axum::extract::State;
@@ -458,7 +458,21 @@ struct RouteAgg {
     total_ms: f64,
     max_ms: f64,
     buckets: Vec<u64>,
+    /// Peer-call totals, summed field by field (see `cluster_http`).
+    peer: [u64; 6],
+    peer_wait_ms: f64,
+    nested_wait_ms: f64,
 }
+
+/// The per-route peer counters that are plain sums across nodes.
+const PEER_FIELDS: [&str; 6] = [
+    "peer_requests",
+    "peer_calls",
+    "peer_rounds",
+    "nested_requests",
+    "nested_calls",
+    "nested_rounds",
+];
 
 #[derive(Default)]
 struct EngineAgg {
@@ -543,6 +557,11 @@ fn aggregate_http(snapshots: &[Value]) -> Value {
                 entry.errors += item["errors"].as_u64().unwrap_or(0);
                 entry.total_ms += item["total_ms"].as_f64().unwrap_or(0.0);
                 entry.max_ms = entry.max_ms.max(item["max_ms"].as_f64().unwrap_or(0.0));
+                for (slot, field) in entry.peer.iter_mut().zip(PEER_FIELDS) {
+                    *slot += item[field].as_u64().unwrap_or(0);
+                }
+                entry.peer_wait_ms += item["peer_wait_ms"].as_f64().unwrap_or(0.0);
+                entry.nested_wait_ms += item["nested_wait_ms"].as_f64().unwrap_or(0.0);
                 if let Some(counts) = item["latency_buckets"].as_array() {
                     for (index, count) in counts.iter().enumerate() {
                         if let Some(slot) = entry.buckets.get_mut(index) {
@@ -578,6 +597,14 @@ fn aggregate_http(snapshots: &[Value]) -> Value {
                 "p95_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 95.0, stat.max_ms),
                 "p99_ms": crate::metrics::percentile(&stat.buckets, stat.requests, 99.0, stat.max_ms),
                 "max_ms": stat.max_ms,
+                "peer_requests": stat.peer[0],
+                "peer_calls": stat.peer[1],
+                "peer_rounds": stat.peer[2],
+                "peer_wait_ms": stat.peer_wait_ms,
+                "nested_requests": stat.peer[3],
+                "nested_calls": stat.peer[4],
+                "nested_rounds": stat.peer[5],
+                "nested_wait_ms": stat.nested_wait_ms,
                 "latency_buckets": stat.buckets,
             })
         })
@@ -943,7 +970,7 @@ pub async fn metrics_status(
         )
         .query(&[("local", "1")]);
         async move {
-            let result = match request.send().await {
+            let result = match send_peer(request).await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
                         Ok(value) => Ok(value),
@@ -1069,7 +1096,7 @@ pub async fn health_status(
         )
         .query(&[("local", "1")]);
         async move {
-            let result = match request.send().await {
+            let result = match send_peer(request).await {
                 Ok(response) if response.status().is_success() => response
                     .json::<Value>()
                     .await

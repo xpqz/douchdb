@@ -85,6 +85,17 @@ struct RouteStat {
     total_ms: f64,
     max_ms: f64,
     buckets: [u64; LATENCY_BOUNDS.len()],
+    /// Requests that made at least one peer call, and their totals. See the
+    /// definitions in `cluster_http`.
+    peer_requests: u64,
+    peer_calls: u64,
+    peer_rounds: u64,
+    peer_wait_ms: f64,
+    /// The same totals for requests sent by another node.
+    nested_requests: u64,
+    nested_calls: u64,
+    nested_rounds: u64,
+    nested_wait_ms: f64,
 }
 
 impl RouteStat {
@@ -112,6 +123,14 @@ impl RouteStat {
             "p95_ms": self.percentile(95.0),
             "p99_ms": self.percentile(99.0),
             "max_ms": self.max_ms,
+            "peer_requests": self.peer_requests,
+            "peer_calls": self.peer_calls,
+            "peer_rounds": self.peer_rounds,
+            "peer_wait_ms": self.peer_wait_ms,
+            "nested_requests": self.nested_requests,
+            "nested_calls": self.nested_calls,
+            "nested_rounds": self.nested_rounds,
+            "nested_wait_ms": self.nested_wait_ms,
             // Raw buckets let a cluster coordinator merge percentiles exactly.
             "latency_buckets": self.buckets.to_vec(),
         })
@@ -311,6 +330,32 @@ pub fn record_http(method: &str, status: u16, duration_ms: f64, path: &str) {
         .unwrap_or(false)
     {
         state.history.pop_front();
+    }
+}
+
+/// Route label under which a request's peer calls are accounted, or `None`
+/// for probes and the metrics scrape itself, so reading the counters never
+/// disturbs them.
+pub fn peer_route(path: &str) -> Option<String> {
+    let route = route_label(path);
+    (!is_probe(&route) && route != "/_node/*/_metrics").then_some(route)
+}
+
+/// Add one finished request's peer totals to its route. `route` is always a
+/// `route_label` value, so the label set stays bounded.
+pub fn record_peer(route: &str, internal: bool, calls: u64, rounds: u64, wait_ms: f64) {
+    let mut state = state();
+    let stat = state.routes.entry(route.to_string()).or_default();
+    if internal {
+        stat.nested_requests += 1;
+        stat.nested_calls += calls;
+        stat.nested_rounds += rounds;
+        stat.nested_wait_ms += wait_ms;
+    } else {
+        stat.peer_requests += 1;
+        stat.peer_calls += calls;
+        stat.peer_rounds += rounds;
+        stat.peer_wait_ms += wait_ms;
     }
 }
 
@@ -585,6 +630,8 @@ pub fn snapshot() -> Value {
         "http": {
             "total": state.requests,
             "in_flight": IN_FLIGHT.load(Ordering::Relaxed),
+            // Requests whose peer accounting is still open (see cluster_http).
+            "peer_open": crate::cluster_http::open_scopes(),
             "errors": state.errors,
             "error_rate_pct": pct(state.errors, state.requests),
             "status_classes": status_classes,

@@ -2,7 +2,7 @@
 //! that owns a document, and `?r=N` quorum reads answered as responses.
 
 use super::{doc_response, etag_matches, fail};
-use crate::cluster_http::{forward_client_auth, peer_url, percent_encode, ClusterCtx};
+use crate::cluster_http::{forward_client_auth, peer_url, percent_encode, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db};
 use crate::fabric::{reconcile_leaves, replica_docs};
 use crate::params::flag;
@@ -58,7 +58,7 @@ pub(crate) async fn proxy(ctx: &ClusterCtx, request: &ForwardRequest<'_>, peer: 
     if !body.is_empty() {
         request = request.body(body.to_vec());
     }
-    match request.send().await {
+    match send_peer(request).await {
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
