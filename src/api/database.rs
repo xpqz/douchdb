@@ -341,7 +341,7 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
                     &[name, "_partition", partition],
                     Some(headers),
                 );
-                return match request.send().await {
+                return match send_peer(request).await {
                     Ok(response) => {
                         let status = response.status();
                         let value = response.json::<Value>().await.unwrap_or_else(
@@ -714,7 +714,12 @@ async fn fan_out_db(
             .header("x-douchdb-local-db", "1")
             .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
         let request = forward_client_auth(request, headers);
-        async move { request.send().await.ok().map(|response| response.status()) }
+        async move {
+            send_peer(request)
+                .await
+                .ok()
+                .map(|response| response.status())
+        }
     }))
     .await
 }

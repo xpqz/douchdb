@@ -2,7 +2,7 @@
 
 use crate::auth::Auth;
 use crate::cluster::Cluster;
-use crate::cluster_http::internal_request_raw;
+use crate::cluster_http::{internal_request_raw, send_peer};
 use crate::db::Db;
 use crate::state::AppState;
 use anyhow::{anyhow, Result};
@@ -143,7 +143,7 @@ impl PullCtx<'_> {
         if let Some(auth) = self.auth {
             changes = changes.basic_auth(&auth.user, Some(&auth.pass));
         }
-        Ok(changes.send().await?.error_for_status()?.json().await?)
+        Ok(send_peer(changes).await?.error_for_status()?.json().await?)
     }
 
     /// A node only stores the shards it replicates. Filter before the
@@ -201,7 +201,7 @@ impl PullCtx<'_> {
         if let Some(auth) = self.auth {
             bulk = bulk.basic_auth(&auth.user, Some(&auth.pass));
         }
-        let got: Value = bulk.send().await?.error_for_status()?.json().await?;
+        let got: Value = send_peer(bulk).await?.error_for_status()?.json().await?;
         let result_rows = got
             .get("results")
             .and_then(Value::as_array)
