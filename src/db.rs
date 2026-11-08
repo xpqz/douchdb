@@ -2566,6 +2566,19 @@ impl Db {
 
     // ----- maintenance -----------------------------------------------------
 
+    /// Documents purged from this node's shards, summed.
+    pub async fn purge_seq(&self) -> DbResult<u64> {
+        let counts = futures::future::join_all(
+            self.shards
+                .iter()
+                .map(|shard| shard.call(|s| Ok(s.purge_seq()?))),
+        )
+        .await;
+        counts
+            .into_iter()
+            .try_fold(0u64, |sum, count| Ok(sum.saturating_add(count?)))
+    }
+
     pub async fn purge(&self, body: &Value) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));

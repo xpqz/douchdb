@@ -179,7 +179,14 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             .and_then(|value| value.to_str().ok())
             == Some("1")
     {
-        return json(StatusCode::OK, json!({"update_seq": db.update_seq()}));
+        let purge_seq = match db.purge_seq().await {
+            Ok(purge_seq) => purge_seq,
+            Err(e) => return fail(e),
+        };
+        return json(
+            StatusCode::OK,
+            json!({"update_seq": db.update_seq(), "purge_seq": purge_seq}),
+        );
     }
     match db.info().await {
         Ok(mut info) => {
@@ -187,7 +194,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             // the changes feed returns, so clients that use it as
             // `since` do not skip another node's changes.
             if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
-                let (vector, marks) = match cluster_update_vector(ClusterRead {
+                let (vector, marks, purge_vector) = match cluster_seq_vectors(ClusterRead {
                     ctx: &st.ctx,
                     db,
                     dbname: name,
@@ -213,6 +220,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                 let seq = encode_token(&vector, &marks);
                 info["update_seq"] = json!(seq);
                 info["committed_update_seq"] = json!(seq);
+                info["purge_seq"] = json!(encode_token(&purge_vector, &[]));
             }
             json(StatusCode::OK, info)
         }
