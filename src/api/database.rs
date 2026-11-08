@@ -501,6 +501,7 @@ pub async fn db_rest(
         "_changes" => Some(&["GET", "POST", "HEAD"]),
         "_index_info" => Some(&["GET", "HEAD"]),
         "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
+        "_peer_purged_infos" => Some(&["GET"]),
         _ => None,
     };
     if let Some(response) = allowed.and_then(|allowed| require_method(&method, allowed)) {
@@ -516,6 +517,7 @@ pub async fn db_rest(
         "_changes" => return changes(st.clone(), db.clone(), req).await,
         "_revs_diff" => return revs_diff(req).await,
         "_purge" => return purge(req).await,
+        "_peer_purged_infos" => return purged_infos(req).await,
         "_compact" => return compact(req).await,
         "_ensure_full_commit" => return ensure_full_commit(req).await,
         "_revs_limit" => return revs_limit(req).await,
@@ -604,6 +606,31 @@ async fn purge(req: DbRequest<'_>) -> Response {
         return fail(e);
     }
     response
+}
+
+/// `GET /{db}/_peer_purged_infos?since=<seq>,<seq>,...`: this node's purge infos
+/// per shard after the given purge sequences, for a peer's anti-entropy.
+/// Internal only: CouchDB has no such endpoint, its shard copies exchange
+/// purge infos inside mem3_rep.
+async fn purged_infos(req: DbRequest<'_>) -> Response {
+    if !is_forwarded(req.st, req.headers) {
+        return fail(ApiError::not_found("missing"));
+    }
+    let since: Vec<u64> = req
+        .q
+        .get("since")
+        .map(|list| list.split(',').filter_map(|seq| seq.parse().ok()).collect())
+        .unwrap_or_default();
+    match req.db.purged_infos(&since).await {
+        Ok(shards) => {
+            let shards: Vec<Value> = shards
+                .into_iter()
+                .map(|(purge_seq, infos)| json!({"purge_seq": purge_seq, "infos": infos}))
+                .collect();
+            json(StatusCode::OK, json!({"shards": shards}))
+        }
+        Err(e) => fail(e),
+    }
 }
 
 /// `purge_results_to_json` (chttpd_db.erl): 201, raised to 202 when an entry

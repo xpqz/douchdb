@@ -22,8 +22,42 @@ const BODY_SWEEP_BATCH: usize = 1000;
 #[cfg(test)]
 const BODY_SWEEP_BATCH: usize = 3;
 
-/// Count of purged documents, big-endian like the other `z/` counters.
+/// Sequence of the newest purge info, big-endian like the other `z/`
+/// counters. Every purge info takes the next number, so it is also a count.
 const PURGE_SEQ_KEY: &[u8] = b"z/purge_seq";
+
+/// How many purge infos a shard keeps (CouchDB's `purged_infos_limit`
+/// default); the oldest go first.
+#[cfg(not(test))]
+const PURGED_INFOS_LIMIT: u64 = 1000;
+#[cfg(test)]
+const PURGED_INFOS_LIMIT: u64 = 3;
+
+/// One purge request for one document: what CouchDB stores as a purge info
+/// (`{PurgeSeq, UUID, DocId, Revs}`) so replicas can learn of the purge.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PurgeInfo {
+    pub uuid: String,
+    pub id: String,
+    pub revs: Vec<String>,
+}
+
+/// `p/<seq>`: the purge info with that sequence.
+fn purge_key(seq: u64) -> Vec<u8> {
+    let mut out = b"p/".to_vec();
+    out.extend_from_slice(&seq.to_be_bytes());
+    out
+}
+
+/// `pu/<uuid>`: the sequence of the purge info with that uuid.
+fn purge_uuid_key(uuid: &str) -> Vec<u8> {
+    key(b"pu/", uuid)
+}
+
+/// `pr/<docid>/<rev>`: the sequence of the purge info that lists the revision.
+fn purged_rev_key(docid: &str, rev: &str) -> Vec<u8> {
+    key(b"pr/", &format!("{docid}/{rev}"))
+}
 
 pub fn meta_key(docid: &str) -> Vec<u8> {
     key(b"m/", docid)
@@ -863,7 +897,8 @@ impl Shard {
         Ok(value.map(|bytes| bytes.to_vec()))
     }
 
-    /// How many documents have been purged from this shard.
+    /// Sequence of the newest purge info of this shard: how many have been
+    /// recorded.
     pub fn purge_seq(&mut self) -> Result<u64> {
         Ok(self
             .get_checked(PURGE_SEQ_KEY)?
@@ -876,11 +911,76 @@ impl Shard {
             .unwrap_or(0))
     }
 
-    /// Count one more purged document in `tx`.
-    pub fn count_purge(&mut self, tx: &mut Tx) -> Result<()> {
-        let next = self.purge_seq()?.saturating_add(1);
-        tx.put(PURGE_SEQ_KEY, &next.to_be_bytes());
+    /// Record `info` in `tx` under the next purge sequence, and drop the info
+    /// that falls out of the `PURGED_INFOS_LIMIT` window. One call per `tx`.
+    pub fn record_purge(&mut self, tx: &mut Tx, info: &PurgeInfo) -> Result<()> {
+        let seq = self.purge_seq()?.saturating_add(1);
+        let seq_bytes = seq.to_be_bytes();
+        tx.put_json(&purge_key(seq), info)?;
+        tx.put(&purge_uuid_key(&info.uuid), &seq_bytes);
+        for rev in &info.revs {
+            tx.put(&purged_rev_key(&info.id, rev), &seq_bytes);
+        }
+        tx.put(PURGE_SEQ_KEY, &seq_bytes);
+        let Some(old) = seq.checked_sub(PURGED_INFOS_LIMIT).filter(|old| *old > 0) else {
+            return Ok(());
+        };
+        if let Some(bytes) = self.get_checked(&purge_key(old))? {
+            let gone: PurgeInfo = serde_json::from_slice(&bytes)?;
+            tx.delete(&purge_key(old));
+            tx.delete(&purge_uuid_key(&gone.uuid));
+            for rev in &gone.revs {
+                // A later info may list the same revision again.
+                let key = purged_rev_key(&gone.id, rev);
+                if self.get_checked(&key)?.as_deref() == Some(old.to_be_bytes().as_slice()) {
+                    tx.delete(&key);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The purge infos after sequence `since`, with the shard's purge sequence
+    /// read at the same point.
+    pub fn purged_since(&mut self, since: u64) -> Result<(u64, Vec<PurgeInfo>)> {
+        let seq = self.purge_seq()?;
+        let mut infos = Vec::new();
+        let mut corrupt = false;
+        self.scan_range_while(
+            b"p/",
+            Some(&purge_key(since.saturating_add(1))),
+            false,
+            |_, value| match serde_json::from_slice(value) {
+                Ok(info) => {
+                    infos.push(info);
+                    true
+                }
+                Err(_) => {
+                    corrupt = true;
+                    false
+                }
+            },
+        )?;
+        if corrupt {
+            anyhow::bail!("an unreadable purge info");
+        }
+        Ok((seq, infos))
+    }
+
+    /// Whether the purge info `uuid` was already recorded here.
+    pub fn has_purge(&mut self, uuid: &str) -> Result<bool> {
+        Ok(self.get_checked(&purge_uuid_key(uuid))?.is_some())
+    }
+
+    /// The revisions of `id` that a recorded purge info lists.
+    pub fn purged_revs(&mut self, id: &str, revs: &[String]) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for rev in revs {
+            if self.get_checked(&purged_rev_key(id, rev))?.is_some() {
+                out.push(rev.clone());
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {

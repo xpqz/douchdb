@@ -11,7 +11,7 @@ pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
     blob_prefix, body_key, local_key, meta_key, meta_state, seq_key, AttMeta, DocMeta, LiveDoc,
-    MetaState, ShardHandle, Tx,
+    MetaState, PurgeInfo, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -2579,6 +2579,85 @@ impl Db {
             .try_fold(0u64, |sum, count| Ok(sum.saturating_add(count?)))
     }
 
+    /// Per shard: its purge sequence and the purge infos after `since[shard]`
+    /// (a missing entry reads as 0).
+    pub async fn purged_infos(&self, since: &[u64]) -> DbResult<Vec<(u64, Vec<PurgeInfo>)>> {
+        let reads = self.shards.iter().enumerate().map(|(index, shard)| {
+            let after = since.get(index).copied().unwrap_or(0);
+            shard.call(move |s| Ok(s.purged_since(after)?))
+        });
+        futures::future::join_all(reads).await.into_iter().collect()
+    }
+
+    /// Record purge infos another copy of `shard` made and purge what they
+    /// list. Infos already recorded here are skipped. Whether any revision was
+    /// removed.
+    pub async fn apply_purge_infos(&self, shard: usize, infos: Vec<PurgeInfo>) -> DbResult<bool> {
+        let Some(handle) = self.shards.get(shard) else {
+            return Ok(false);
+        };
+        let seq_counter = self.seq.clone();
+        let reserved = self.reserved_seq[shard].clone();
+        handle
+            .call(move |s| {
+                let mut removed = false;
+                for info in infos {
+                    if s.has_purge(&info.uuid)? {
+                        continue;
+                    }
+                    let gone = purge_one(
+                        s,
+                        &info.id,
+                        &info.revs,
+                        Some(&info.uuid),
+                        &seq_counter,
+                        &reserved,
+                    )?;
+                    removed |= !gone.is_empty();
+                }
+                Ok(removed)
+            })
+            .await
+    }
+
+    /// The `(id, rev)` pairs among `pairs` that a purge info lists.
+    pub async fn purged_among(
+        &self,
+        pairs: &std::collections::BTreeSet<(String, String)>,
+    ) -> DbResult<std::collections::BTreeSet<(String, String)>> {
+        let mut grouped: Vec<std::collections::BTreeMap<&str, Vec<String>>> =
+            (0..self.q).map(|_| Default::default()).collect();
+        for (id, rev) in pairs {
+            grouped[self.shard_index(id)]
+                .entry(id)
+                .or_default()
+                .push(rev.clone());
+        }
+        let mut found = std::collections::BTreeSet::new();
+        for (index, docs) in grouped.into_iter().enumerate() {
+            if docs.is_empty() {
+                continue;
+            }
+            let docs: Vec<(String, Vec<String>)> = docs
+                .into_iter()
+                .map(|(id, revs)| (id.to_string(), revs))
+                .collect();
+            let hits = self.shards[index]
+                .call(move |s| {
+                    let mut hits = Vec::new();
+                    for (id, revs) in docs {
+                        for rev in s.purged_revs(&id, &revs)? {
+                            hits.push((id.clone(), rev));
+                        }
+                    }
+                    Ok(hits)
+                })
+                .await?;
+            found.extend(hits);
+        }
+        Ok(found)
+    }
+
     pub async fn purge(&self, body: &Value) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
@@ -2614,7 +2693,7 @@ impl Db {
                         batch
                             .into_iter()
                             .map(|(slot, id, requested)| {
-                                purge_one(s, &id, &requested, &seq_counter, &reserved)
+                                purge_one(s, &id, &requested, None, &seq_counter, &reserved)
                                     .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
@@ -2712,17 +2791,33 @@ fn revs_diff_one(
 }
 
 /// Purge the requested leaf revisions of one document; the revisions removed.
+///
+/// The purge is recorded as a purge info in the same transaction. A fresh
+/// purge records the revisions it removed, under a new uuid, and nothing when
+/// it removed none. A `replayed` uuid is a purge another copy of the shard
+/// already recorded: it is recorded here as received, even when this copy
+/// holds none of the revisions, so they cannot be copied back in.
 fn purge_one(
     s: &mut crate::store::Shard,
     id: &str,
     requested: &[String],
+    replayed: Option<&str>,
     seq_counter: &AtomicU64,
     reserved: &AtomicU64,
 ) -> DbResult<Vec<String>> {
+    let mut tx = Tx::new();
     let Some(mut meta) = s.get_meta(id)? else {
+        if let Some(uuid) = replayed {
+            let info = PurgeInfo {
+                uuid: uuid.to_string(),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            };
+            s.record_purge(&mut tx, &info)?;
+            s.commit(tx)?;
+        }
         return Ok(Vec::new());
     };
-    let mut tx = Tx::new();
     let mut removed = Vec::new();
     // Like CouchDB, purge leaves only: each takes its unshared
     // ancestors with it, and a listed non-leaf revision is
@@ -2739,8 +2834,22 @@ fn purge_one(
         }
         removed.push(rev.clone());
     }
+    if replayed.is_some() || !removed.is_empty() {
+        let info = match replayed {
+            Some(uuid) => PurgeInfo {
+                uuid: uuid.to_string(),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            },
+            None => PurgeInfo {
+                uuid: uuid(),
+                id: id.to_string(),
+                revs: removed.clone(),
+            },
+        };
+        s.record_purge(&mut tx, &info)?;
+    }
     if !removed.is_empty() {
-        s.count_purge(&mut tx)?;
         if meta.tree.is_empty() {
             tx.delete(&meta_key(id));
             if meta.seq != 0 {
@@ -5923,5 +6032,78 @@ mod tests {
                 shard_index_for(&second, q, true)
             );
         }
+    }
+
+    fn purge_test_db(name: &str) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            name,
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        (db, root)
+    }
+
+    /// A purge info another copy recorded is applied once: replaying it
+    /// neither counts again nor purges a revision that was added back since.
+    #[tokio::test]
+    async fn a_purge_info_is_applied_once() {
+        let (db, root) = purge_test_db("purge-once");
+        let hash = "a".repeat(32);
+        let rev = format!("1-{hash}");
+        let doc = json!({"_id": "a", "_rev": rev, "_revisions": {"start": 1, "ids": [hash]}});
+        db.put_docs(vec![doc.clone()], false).await.unwrap();
+        let info = PurgeInfo {
+            uuid: "u1".to_string(),
+            id: "a".to_string(),
+            revs: vec![rev.clone()],
+        };
+
+        assert!(db.apply_purge_infos(0, vec![info.clone()]).await.unwrap());
+        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_err());
+
+        db.put_docs(vec![doc], false).await.unwrap();
+        assert!(!db.apply_purge_infos(0, vec![info]).await.unwrap());
+        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A shard keeps only the newest `PURGED_INFOS_LIMIT` purge infos, and
+    /// forgets the revisions of the ones it drops.
+    #[tokio::test]
+    async fn old_purge_infos_are_trimmed_at_the_limit() {
+        let (db, root) = purge_test_db("purge-trim");
+        let mut revs = std::collections::BTreeSet::new();
+        for n in 0..5 {
+            let id = format!("d{n}");
+            let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+            let rev = written[0]["rev"].as_str().unwrap().to_string();
+            db.purge(&json!({ id.clone(): [rev.clone()] }))
+                .await
+                .unwrap();
+            revs.insert((id, rev));
+        }
+        let shards = db.purged_infos(&[0]).await.unwrap();
+        let (purge_seq, infos) = &shards[0];
+        assert_eq!(*purge_seq, 5);
+        let kept: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(kept, ["d2", "d3", "d4"]);
+
+        let listed = db.purged_among(&revs).await.unwrap();
+        let listed: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(listed, ["d2", "d3", "d4"]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
