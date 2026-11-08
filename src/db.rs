@@ -41,7 +41,6 @@ struct DbFile {
     q: u32,
     uuid: String,
     instance_start_time: String,
-    #[serde(default)]
     partitioned: bool,
 }
 

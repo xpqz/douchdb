@@ -108,7 +108,6 @@ pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
     /// revision -> attachments in document order (order is part of the hash)
-    #[serde(default)]
     pub atts: BTreeMap<String, Vec<(String, AttMeta)>>,
 }
 
