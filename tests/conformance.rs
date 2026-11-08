@@ -16047,6 +16047,62 @@ async fn cluster_security_without_quorum_is_accepted_and_converges() {
     wait_for_security(&nodes[1], "secpend", &security).await;
 }
 
+// CouchDB's fabric:set_revs_limit and fabric:set_purge_infos_limit set the
+// limit on every shard copy (fabric_db_meta.erl), so any node reads it back.
+#[tokio::test]
+async fn cluster_revs_and_purged_infos_limits_apply_to_every_node() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("climits").await;
+    }
+    for (endpoint, limit) in [("_revs_limit", 7), ("_purged_infos_limit", 11)] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climits/{endpoint}"), json!(limit))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+        assert_eq!(body, json!({"ok": true}));
+        for (i, node) in nodes.iter().enumerate() {
+            let (status, body) = node.get(&format!("/climits/{endpoint}")).await;
+            assert_eq!(status, StatusCode::OK, "{endpoint} on node {i}: {body}");
+            assert_eq!(body, json!(limit), "{endpoint} on node {i}");
+        }
+    }
+}
+
+// fabric_db_meta collects an ok from every worker and fails the request when
+// one errors or is down, while the copies that did apply it keep the new
+// value; nothing syncs the limit to the node that missed it, so the client
+// repeats the request once the node is back.
+#[tokio::test]
+async fn cluster_limit_put_fails_while_a_node_is_down_and_succeeds_on_retry() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("climitdown").await;
+    }
+    nodes[2].kill();
+    for endpoint in ["_revs_limit", "_purged_infos_limit"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climitdown/{endpoint}"), json!(5))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{endpoint}: {body}"
+        );
+        let (_, limit) = nodes[1].get(&format!("/climitdown/{endpoint}")).await;
+        assert_eq!(limit, json!(5), "{endpoint} on the reachable peer");
+    }
+    nodes[2].restart();
+    for endpoint in ["_revs_limit", "_purged_infos_limit"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climitdown/{endpoint}"), json!(5))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+        let (_, limit) = nodes[2].get(&format!("/climitdown/{endpoint}")).await;
+        assert_eq!(limit, json!(5), "{endpoint} on the returned node");
+    }
+}
+
 /// Headers that mark a request as sent by another node of the test cluster.
 fn node_headers() -> [(&'static str, String); 2] {
     [
