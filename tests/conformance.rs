@@ -17031,6 +17031,33 @@ async fn revision_shaped_reads_do_not_bypass_the_read_quorum() {
 }
 
 #[tokio::test]
+async fn quorum_read_with_no_answering_replica_fails_like_fabric() {
+    let nodes = cluster_with_only_copy_dead("clqgone", false).await;
+    // fabric_doc_open answers {error, read_failure} when no replica replied;
+    // chttpd renders it through maybe_handle_error as 500 error/read_failure.
+    // revs_info also goes through fabric:open_doc.
+    for query in ["r=2", "r=2&revs_info=true"] {
+        let (status, body) = nodes[0].get(&format!("/clqgone/p:d1?{query}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{query}: {body}");
+        assert_eq!(body["error"], "error", "{query}: {body}");
+        assert_eq!(body["reason"], "read_failure", "{query}: {body}");
+    }
+    // fabric_doc_open_revs answers all_workers_died, which chttpd error_info
+    // maps to 503 "service unavailable". An explicit rev reads through
+    // fabric:open_revs as well.
+    for query in ["r=2&open_revs=all", "r=2&rev=1-abc"] {
+        let (status, body) = nodes[0].get(&format!("/clqgone/p:d1?{query}")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{query}: {body}");
+        assert_eq!(body["error"], "service unavailable", "{query}: {body}");
+        assert_eq!(
+            body["reason"],
+            "Nodes are unable to service this request due to overloading or maintenance mode.",
+            "{query}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn quorum_merges_ancestry_across_replicas_with_different_history_lengths() {
     let nodes = start_cluster_with(3, "3600", 3);
     for node in &nodes {
