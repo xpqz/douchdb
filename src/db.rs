@@ -4856,6 +4856,58 @@ mod tests {
     }
 
     #[test]
+    fn open_removes_stale_temporary_files_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+        let config = || DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::single(1),
+            partitioned: false,
+        };
+        let db = Db::open(&root, "stale", config()).unwrap();
+        let dir = db.path.clone();
+        drop(db);
+
+        // Temporary files an interrupted write_atomic left behind, from
+        // another process and from one that happened to share our pid.
+        let foreign = format!(".db.json.{}.7.tmp", std::process::id().wrapping_add(1));
+        let same_pid = format!(".shard-map.json.{}.0.tmp", std::process::id());
+        let search = dir.join("_search_indexes").join("abc");
+        std::fs::create_dir_all(&search).unwrap();
+        let stale_search = search.join(".douchdb-search-meta.json.1.2.tmp");
+        for stale in [dir.join(&foreign), dir.join(&same_pid), stale_search.clone()] {
+            std::fs::write(stale, b"partial").unwrap();
+        }
+        // Names that merely resemble the pattern are left alone.
+        let keep = [
+            "db.json.1.2.tmp",
+            ".db.json.x.2.tmp",
+            ".db.json.1.tmp",
+            ".db.json.1.2.tmp.bak",
+            ".notes.tmp",
+        ];
+        for name in keep {
+            std::fs::write(dir.join(name), b"keep").unwrap();
+        }
+        let before = names_in(&dir);
+
+        let db = Db::open(&root, "stale", config()).unwrap();
+        drop(db);
+
+        let mut expected: Vec<String> = before
+            .into_iter()
+            .filter(|name| *name != foreign && *name != same_pid)
+            .collect();
+        expected.sort();
+        assert_eq!(names_in(&dir), expected);
+        assert!(!stale_search.exists());
+        for name in keep {
+            assert!(dir.join(name).exists(), "{name} was removed");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn failed_atomic_write_shows_no_partial_file() {
         let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
