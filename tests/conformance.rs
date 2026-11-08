@@ -465,6 +465,21 @@ fn start_cluster_full(
     replication: usize,
     admin: bool,
 ) -> Vec<Server> {
+    // Cluster tests run with HTTP/2 between nodes, so the whole suite
+    // exercises h2c. The product default is HTTP/1.1; see `--peer-http2`.
+    start_cluster_nodes(n, q, sync_secs, replication, admin, &vec![false; n])
+}
+
+/// Like `start_cluster_full`, with `peer_http2[i]` choosing whether node `i`
+/// speaks HTTP/2 to its peers.
+fn start_cluster_nodes(
+    n: usize,
+    q: u32,
+    sync_secs: &str,
+    replication: usize,
+    admin: bool,
+    peer_http2: &[bool],
+) -> Vec<Server> {
     for attempt in 0..5 {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let nodes = ports
@@ -492,6 +507,10 @@ fn start_cluster_full(
                 "--session-secret".to_string(),
                 "test-session-secret".to_string(),
             ];
+            let mut extra = extra;
+            if peer_http2[i] {
+                extra.push("--peer-http2".to_string());
+            }
             match Server::spawn_on(port, &extra, admin, attempt) {
                 Some(server) => servers.push(server),
                 None => {
@@ -5231,6 +5250,95 @@ async fn cluster_peer_round_trip_baseline() {
             ("changes_since_now", (2, 1, 0)),
         ]
     );
+}
+
+/// How many requests marked as sent by another node this node has served, by
+/// protocol: `(HTTP/1.x, HTTP/2)`, from its local metrics.
+async fn internal_request_versions(node: &Server) -> (u64, u64) {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let counts = &metrics["http"]["internal_requests"];
+    (
+        counts["http1"].as_u64().unwrap_or(0),
+        counts["http2"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Writes through `nodes[via]` and reads every one of them back from every
+/// node, so each node sends peer traffic and each one serves some.
+async fn exercise_peer_traffic(nodes: &[Server], tag: &str) {
+    for (via, node) in nodes.iter().enumerate() {
+        for i in 0..6 {
+            let id = format!("{tag}-{via}-{i}");
+            let (status, body) = node.put(&format!("/trips/{id}"), json!({"via": via})).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+    }
+    for node in nodes {
+        for (via, _) in nodes.iter().enumerate() {
+            for i in 0..6 {
+                let (status, body) = node.get(&format!("/trips/{tag}-{via}-{i}")).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["via"], via);
+            }
+        }
+        let (status, body) = node.get("/trips/_changes?since=now").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+async fn trips_cluster_nodes(peer_http2: &[bool], replication: usize) -> Vec<Server> {
+    let nodes = start_cluster_nodes(peer_http2.len(), 4, "3600", replication, false, peer_http2);
+    for node in &nodes {
+        node.fresh_db("trips").await;
+    }
+    nodes
+}
+
+/// With `--peer-http2` on every node, node-to-node requests arrive as HTTP/2
+/// and none as HTTP/1.x.
+#[tokio::test]
+async fn cluster_peer_traffic_uses_http2() {
+    let nodes = trips_cluster_nodes(&[true, true, true], 3).await;
+    exercise_peer_traffic(&nodes, "h2").await;
+    for (i, node) in nodes.iter().enumerate() {
+        let (http1, http2) = internal_request_versions(node).await;
+        assert!(http2 > 0, "node {i} served no HTTP/2 peer request");
+        assert_eq!(http1, 0, "node {i} served an HTTP/1.x peer request");
+    }
+}
+
+/// Without the flag peers keep speaking HTTP/1.1, so a rolling upgrade can
+/// start with the new binary on every node and switch the flag on afterwards.
+#[tokio::test]
+async fn cluster_peer_traffic_defaults_to_http1() {
+    let nodes = trips_cluster_nodes(&[false, false, false], 3).await;
+    exercise_peer_traffic(&nodes, "h1").await;
+    for (i, node) in nodes.iter().enumerate() {
+        let (http1, http2) = internal_request_versions(node).await;
+        assert!(http1 > 0, "node {i} served no HTTP/1.x peer request");
+        assert_eq!(http2, 0, "node {i} served an HTTP/2 peer request");
+    }
+}
+
+/// Node 1 speaks HTTP/1.1 to its peers while 0 and 2 speak HTTP/2. Every node
+/// accepts both on one port, so every write and read still works from every
+/// coordinator, and each side sees the protocol its peers chose.
+#[tokio::test]
+async fn cluster_with_mixed_peer_protocols_works() {
+    let nodes = trips_cluster_nodes(&[true, false, true], 3).await;
+    exercise_peer_traffic(&nodes, "mix").await;
+    let (http1, http2) = internal_request_versions(&nodes[1]).await;
+    assert_eq!(http1, 0, "node 1 got HTTP/1.x from peers that chose HTTP/2");
+    assert!(http2 > 0, "node 1 got no HTTP/2 peer request");
+    for i in [0, 2] {
+        let (http1, http2) = internal_request_versions(&nodes[i]).await;
+        assert!(http1 > 0, "node {i} got no HTTP/1.x request from node 1");
+        assert!(
+            http2 > 0,
+            "node {i} got no HTTP/2 request from the other node"
+        );
+    }
 }
 
 /// With one copy of each shard the coordinator must scatter to the nodes
