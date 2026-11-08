@@ -579,21 +579,56 @@ pub async fn db_rest(
 /// `POST /{db}/_purge`. A fully purged document is removed from `_changes`
 /// entirely, so the view and search indexes cannot be updated incrementally;
 /// they are rebuilt on the next query.
+///
+/// In a cluster the coordinator sends each document's purge to every copy of
+/// its shard and answers per `purge_results_to_json` (chttpd_db.erl); a
+/// forwarded request purges this node's copy only.
 async fn purge(req: DbRequest<'_>) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    let purged = match req.db.purge(&request).await {
-        Ok(purged) => purged,
-        Err(e) => return fail(e),
+    let response = if !req.st.ctx.cluster.is_clustered() || is_forwarded(req.st, req.headers) {
+        match req.db.purge(&request).await {
+            Ok(purged) => json(StatusCode::CREATED, purged),
+            Err(e) => return fail(e),
+        }
+    } else {
+        let Some(map) = request.as_object() else {
+            return fail(ApiError::bad_request("Request body must be a JSON object"));
+        };
+        let w = num(req.q, "w").unwrap_or(0);
+        let results = purge_docs(req.st, req.db, req.name, map, w, req.headers).await;
+        purge_results_to_json(results)
     };
     if let Err(e) = invalidate_indexes(req.db).await {
         return fail(e);
     }
-    // purge_results_to_json (chttpd_db.erl) answers 201, or 202 when a
-    // result was only accepted without a quorum. The purge is applied on
-    // this node alone and is never forwarded, so nothing is "accepted".
-    json(StatusCode::CREATED, purged)
+    response
+}
+
+/// `purge_results_to_json` (chttpd_db.erl): 201, raised to 202 when an entry
+/// was only accepted and to an entry's own status when it failed.
+fn purge_results_to_json(results: Vec<(String, PurgeOutcome)>) -> Response {
+    let mut code = 201;
+    let mut purged = Map::new();
+    for (id, outcome) in results {
+        let entry = match outcome {
+            PurgeOutcome::Ok(revs) => json!(revs),
+            PurgeOutcome::Accepted(revs) => {
+                code = code.max(202);
+                json!(revs)
+            }
+            PurgeOutcome::Error(e) => {
+                code = code.max(e.status);
+                json!({"error": e.error, "reason": e.reason})
+            }
+        };
+        purged.insert(id, entry);
+    }
+    json(
+        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        json!({"purge_seq": Value::Null, "purged": purged}),
+    )
 }
 
 async fn invalidate_indexes(db: &Db) -> DbResult<()> {
