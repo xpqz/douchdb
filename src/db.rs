@@ -1343,13 +1343,13 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// Current allocated sequence counter. This is the same database-wide
-    /// counter used for `update_seq`, without asking every shard actor. A
-    /// write in flight has already taken its sequence, so this can be ahead
-    /// of what `changes` returns; indexes bound themselves with
-    /// `changes_watermark` instead.
+    /// The update sequence a client may be shown: the changes watermark, so
+    /// every write at or below it is committed. The allocated counter can be
+    /// ahead of it (a write in flight has already taken its sequence); a
+    /// client that resumed `_changes` from the counter would skip that write
+    /// once it commits.
     pub fn update_seq(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
+        self.changes_watermark(0, None)
     }
 
     /// A receiver that changes whenever a write commits on this node. Mark it
@@ -1388,21 +1388,21 @@ impl Db {
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
+        // Taken before reading the shards: the highest committed sequence of
+        // any one shard can sit above another shard's uncommitted write.
+        let update_seq = self.update_seq();
         let mut doc_count = 0;
         let mut deleted_count = 0;
-        let mut update_seq = 0;
-        let counts = futures::future::join_all(self.shards.iter().map(|shard| {
-            shard.call(|s| {
-                let (docs, deleted) = s.counts();
-                Ok((docs, deleted, s.seq()))
-            })
-        }))
+        let counts = futures::future::join_all(
+            self.shards
+                .iter()
+                .map(|shard| shard.call(|s| Ok(s.counts()))),
+        )
         .await;
         for counted in counts {
-            let (docs, deleted, seq) = counted?;
+            let (docs, deleted) = counted?;
             doc_count += docs;
             deleted_count += deleted;
-            update_seq = update_seq.max(seq);
         }
         let mut info = json!({
             "db_name": self.name,
@@ -5620,6 +5620,45 @@ mod tests {
         let (rows, _, _) = db.changes_rows(&resumed).await.unwrap();
         assert!(rows.iter().any(|row| row.id == later));
         assert!(rows.iter().all(|row| row.seq > last_seq));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn client_visible_update_seq_excludes_uncommitted_allocations() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-updseq-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "updseq",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+
+        db.put_docs(vec![json!({"_id": doc_id_for_shard(&db, 0)})], true)
+            .await
+            .unwrap();
+        // Shard 1 has allocated a sequence it has not committed, and shard 0
+        // then commits a higher one.
+        let held = db.start_in_flight_write(1);
+        let later = doc_id_for_shard(&db, 0) + "-later";
+        db.put_docs(vec![json!({"_id": later})], true)
+            .await
+            .unwrap();
+
+        // Neither the `update_seq` reported by GET /db and `since=now` nor
+        // the one in the database info may reach the held sequence, or a
+        // feed resumed from it would skip that write when it commits.
+        assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
+        let info = db.info().await.unwrap();
+        let reported = info["update_seq"].as_u64().unwrap();
+        assert!(reported < held, "info update_seq {reported}");
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
