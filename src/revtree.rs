@@ -336,6 +336,25 @@ mod tests {
         format!("{n:02x}").repeat(16)
     }
 
+    /// A damaged stored tree whose parent links loop: `x` and `y` are each
+    /// other's parent and the leaf `z` hangs off the loop.
+    fn cyclic_tree() -> RevTree {
+        serde_json::from_str(r#"{"edges":{"x":"y","y":"x","z":"x"},"deleted":[]}"#).unwrap()
+    }
+
+    #[test]
+    fn path_on_a_cyclic_tree_terminates() {
+        let tree = cyclic_tree();
+        assert_eq!(tree.leaves(), vec!["z".to_string()]);
+        let _ = tree.path("z");
+    }
+
+    #[test]
+    fn prune_on_a_cyclic_tree_terminates() {
+        let mut tree = cyclic_tree();
+        tree.prune(2);
+    }
+
     #[test]
     fn winner_ignores_an_unparsable_leaf() {
         let mut tree = RevTree::default();
