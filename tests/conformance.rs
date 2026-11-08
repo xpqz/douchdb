@@ -14,23 +14,70 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// Wait until `port` accepts connections. Returns false as soon as the child
-/// exits, which is how a port collision shows up. A live child is never given
-/// up on early: with `--wasm-runtime wasmtime` it compiles the runner before
-/// it listens, which can take tens of seconds in a debug build on a loaded CI
-/// runner, and killing it to retry would only pay that cost again.
-fn wait_for_listener(child: &mut Child, port: u16) -> bool {
+/// Who answers on a port the harness is waiting for.
+enum Listener {
+    /// The child itself holds the port.
+    Ours,
+    /// The child exited before it listened. A bind that lost a race shows up
+    /// this way.
+    Exited,
+    /// Another process listens on the port, so the child can never serve it.
+    Foreign(String),
+}
+
+/// Process ids listening on TCP `port`, or `None` when `lsof` is unavailable.
+fn listener_pids(port: u16) -> Option<Vec<u32>> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-t", "-sTCP:LISTEN"])
+        .arg(format!("-iTCP:{port}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect(),
+    )
+}
+
+/// Wait until `child` itself is listening on `port`. Accepting a connection
+/// is not enough: a process that took the port while it was free accepts too,
+/// and the child then dies on its failed bind. So once something accepts, the
+/// listening socket's owner must be the child; another owner is reported at
+/// once rather than waited out. A live child is never given up on early: with
+/// `--wasm-runtime wasmtime` it compiles the runner before it listens, which
+/// can take tens of seconds in a debug build on a loaded CI runner, and
+/// killing it to retry would only pay that cost again. The deadline is a
+/// failsafe against a hang.
+fn wait_for_listener(child: &mut Child, port: u16) -> Listener {
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
         if let Ok(Some(_)) = child.try_wait() {
-            return false;
+            return Listener::Exited;
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            match listener_pids(port) {
+                Some(pids) if pids.contains(&child.id()) => return Listener::Ours,
+                Some(pids) if !pids.is_empty() => {
+                    return Listener::Foreign(format!("pid {pids:?}"));
+                }
+                // Nothing listed yet: the connection may have reached the
+                // child's own socket as it came up. Look again.
+                Some(_) => {}
+                // No `lsof`: all that can be checked is that the child lives.
+                None => {
+                    return match child.try_wait() {
+                        Ok(Some(_)) => Listener::Exited,
+                        _ => Listener::Ours,
+                    };
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    false
+    Listener::Exited
 }
 
 /// Whether to exercise the given `--js-sandbox` mode. Set
@@ -104,17 +151,9 @@ impl Server {
             .unwrap();
         let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
         let base = format!("http://127.0.0.1:{port}");
-        if wait_for_listener(&mut child, port) {
-            // A colliding process can win the port after `free_port` checked
-            // it; the child then exits while our connect succeeds against the
-            // other listener. Give the bind a moment and confirm the child is
-            // still the one serving.
-            std::thread::sleep(Duration::from_millis(30));
-            if let Ok(Some(_)) = child.try_wait() {
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&dir);
-                return None;
-            }
+        // A colliding process can win the port after `free_port` checked it;
+        // the caller then retries on another port.
+        if let Listener::Ours = wait_for_listener(&mut child, port) {
             return Some(Server {
                 child,
                 base,
@@ -155,10 +194,27 @@ impl Server {
         if self.admin {
             cmd.arg("--admin").arg("admin:douchdb");
         }
-        self.child = spawn_locked(&mut cmd).expect("restart douchdb");
-        if wait_for_listener(&mut self.child, self.port) {
-            std::thread::sleep(Duration::from_millis(50));
-            return;
+        // The port was free from `kill()` until now. A child that exits
+        // before listening lost a bind to something transient, such as an
+        // outgoing connection's source port, so spawn it again; a process
+        // that listens on the port cannot be waited out.
+        for _ in 0..50 {
+            self.child = spawn_locked(&mut cmd).expect("restart douchdb");
+            match wait_for_listener(&mut self.child, self.port) {
+                Listener::Ours => return,
+                Listener::Foreign(owner) => {
+                    self.kill();
+                    panic!(
+                        "port {} is held by another process ({owner}); \
+                         douchdb could not restart on it",
+                        self.port
+                    );
+                }
+                Listener::Exited => {
+                    let _ = self.child.wait();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         panic!("douchdb did not restart on port {}", self.port);
     }
