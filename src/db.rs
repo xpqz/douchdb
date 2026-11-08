@@ -746,15 +746,15 @@ impl Db {
             q: file.q.max(1),
             partitioned: file.partitioned,
             shard_map,
-            pending_shard_map: Db::has_pending_shard_map(root, name),
+            pending_shard_map: Db::has_pending_shard_map(root, name)?,
         }))
     }
 
     /// Whether a shard map this node has not acknowledged is waiting on disk.
-    pub fn has_pending_shard_map(root: &Path, name: &str) -> bool {
-        matches!(
-            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json")),
-            Ok(Some(_))
+    pub fn has_pending_shard_map(root: &Path, name: &str) -> DbResult<bool> {
+        Ok(
+            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json"))?
+                .is_some(),
         )
     }
 
@@ -787,8 +787,13 @@ impl Db {
     }
 
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
-        std::fs::remove_dir_all(db_path(root, name))
-            .map_err(|_| ApiError::not_found(format!("Database does not exist: {name}")))
+        match std::fs::remove_dir_all(db_path(root, name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::not_found(
+                format!("Database does not exist: {name}"),
+            )),
+            Err(error) => Err(metadata_error(&db_path(root, name), error)),
+        }
     }
 
     pub fn shard_index(&self, docid: &str) -> usize {
@@ -1254,8 +1259,10 @@ impl Db {
         changes_watermark_from(&committed, &reserved, since, owned).min(allocated)
     }
 
-    pub fn pending_shard_map(&self) -> Option<ShardMap> {
-        read_metadata(&self.path.join("pending-shard-map.json")).unwrap_or(None)
+    /// The shard map this node has not acknowledged yet. `None` when there is
+    /// none; one that cannot be read or parsed is an error.
+    pub fn pending_shard_map(&self) -> DbResult<Option<ShardMap>> {
+        read_metadata(&self.path.join("pending-shard-map.json"))
     }
 
     pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
@@ -5080,6 +5087,62 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_pending_shard_map_is_an_error_not_none() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-pending-bad-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+        let is_err = |text: String| text.starts_with("Err");
+
+        // Missing is the legitimate "nothing pending".
+        assert_eq!(format!("{:?}", db.pending_shard_map()), "Ok(None)");
+        assert_eq!(
+            format!("{:?}", Db::has_pending_shard_map(&root, "pending")),
+            "Ok(false)"
+        );
+
+        // Content that does not parse.
+        std::fs::write(&pending, b"{not json").unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+
+        // A read error that is not NotFound: a directory in place of the file.
+        std::fs::remove_file(&pending).unwrap();
+        std::fs::create_dir(&pending).unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn destroy_answers_not_found_only_for_a_missing_database() {
+        let root = std::env::temp_dir().join(format!("douchdb-destroy-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(Db::destroy(&root, "gone").unwrap_err().status, 404);
+
+        // A path that exists but is not a directory cannot be removed as one.
+        std::fs::write(db_path(&root, "stuck"), b"not a directory").unwrap();
+        assert_eq!(Db::destroy(&root, "stuck").unwrap_err().status, 500);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn clear_pending_shard_map_reports_what_it_cannot_remove() {
         let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let db = Db::open(
@@ -5099,9 +5162,9 @@ mod tests {
         db.clear_pending_shard_map().unwrap();
 
         db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
-        assert!(db.pending_shard_map().is_some());
+        assert!(db.pending_shard_map().unwrap().is_some());
         db.clear_pending_shard_map().unwrap();
-        assert!(db.pending_shard_map().is_none());
+        assert!(db.pending_shard_map().unwrap().is_none());
 
         // A path that cannot be unlinked is an error, not a silent success.
         std::fs::create_dir(&pending).unwrap();
