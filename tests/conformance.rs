@@ -6321,6 +6321,92 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
 }
 
+/// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
+/// as a peer would answer it.
+async fn local_rev_status(node: &Server, db: &str, id: &str, rev: &str) -> StatusCode {
+    let headers = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    node.req_with(
+        Method::GET,
+        &format!("/{db}/{id}?rev={rev}"),
+        None,
+        &headers,
+    )
+    .await
+    .0
+}
+
+// CouchDB's `fabric:purge_docs` sends each document's purge to every copy of
+// its shard (fabric_doc_purge.erl), so no replica keeps the purged revision.
+#[tokio::test]
+async fn cluster_purge_reaches_every_replica() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurgeall").await;
+    }
+    let (status, r) = nodes[0].put("/clpurgeall/a", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{r}");
+    let rev = r["rev"].as_str().unwrap().to_string();
+    for node in &nodes {
+        assert_eq!(
+            local_rev_status(node, "clpurgeall", "a", &rev).await,
+            StatusCode::OK,
+            "every replica holds the revision before the purge"
+        );
+    }
+
+    let (status, body) = nodes[1]
+        .post("/clpurgeall/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["purged"]["a"], json!([rev]), "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_rev_status(node, "clpurgeall", "a", &rev).await,
+            StatusCode::NOT_FOUND,
+            "node {i} still holds the purged revision"
+        );
+    }
+}
+
+// purge_results_to_json (chttpd_db.erl) answers 202 when an entry reached
+// fewer than `w` copies (format_resps in fabric_doc_purge.erl marks it
+// `accepted`); the copies that were reached still purge.
+#[tokio::test]
+async fn cluster_purge_answers_202_when_a_replica_is_down() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurge202").await;
+    }
+    let (_, r) = nodes[0].put("/clpurge202/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    nodes[2].kill();
+
+    // Two of three copies meet the default write quorum.
+    let (status, body) = nodes[0]
+        .post("/clpurge202/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["purged"]["a"], json!([rev]), "{body}");
+
+    // Every copy was asked for, and one is down.
+    let (_, r) = nodes[0].put("/clpurge202/b", json!({"v": 1})).await;
+    let rev_b = r["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[0]
+        .post("/clpurge202/_purge?w=3", json!({"b": [rev_b]}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["purged"]["b"], json!([rev_b]), "{body}");
+    for node in &nodes[..2] {
+        assert_eq!(
+            local_rev_status(node, "clpurge202", "b", &rev_b).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
 #[tokio::test]
 async fn cluster_changes_report_pending_like_a_single_node() {
     // n=1 fans out to every node; n=3 lets the coordinator read every shard
