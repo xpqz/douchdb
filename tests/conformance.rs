@@ -6506,6 +6506,47 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
 }
 
+// A peer that discovery marked down and that has since come back stays marked
+// until the next pass. `GET /db` must still ask it: its slot in the vectors is
+// its real position, not 0, or a feed resumed from the token replays it all.
+#[tokio::test]
+async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
+    let mut nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clinfostale").await;
+    }
+    let (_, r) = nodes[0].put("/clinfostale/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .post("/clinfostale/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, expected) = nodes[0].get("/clinfostale").await;
+    assert_eq!(expected["purge_seq"], json!("v1:1,1"), "{expected}");
+
+    // Make node 0 believe node 1 is down while it is up. Discovery runs on its
+    // own only in the first seconds after start, so retry if one of those
+    // passes cleared the mark before the read.
+    let url = nodes[1].base.clone();
+    loop {
+        nodes[1].kill();
+        wait_until_known_down(&nodes[0], &url).await;
+        nodes[1].restart();
+        let (_, cluster) = nodes[0].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+    }
+    let (_, info) = nodes[0].get("/clinfostale").await;
+    assert_eq!(info["update_seq"], expected["update_seq"], "{info}");
+    assert_eq!(info["purge_seq"], expected["purge_seq"], "{info}");
+}
+
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
 /// as a peer would answer it.
 async fn local_rev_status(node: &Server, db: &str, id: &str, rev: &str) -> StatusCode {
