@@ -685,7 +685,18 @@ async fn revs_limit(req: DbRequest<'_>) -> Response {
         },
         Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
     };
-    match req.db.set_revs_limit(limit).await {
+    if let Err(e) = req.db.set_revs_limit(limit).await {
+        return fail(e);
+    }
+    match crate::cluster_ops::set_limit_on_peers(
+        &req.st.ctx,
+        req.name,
+        "_revs_limit",
+        limit,
+        req.headers,
+    )
+    .await
+    {
         Ok(()) => ok(),
         Err(e) => fail(e),
     }
@@ -711,7 +722,18 @@ async fn purged_infos_limit(req: DbRequest<'_>) -> Response {
         },
         Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
     };
-    match req.db.set_purged_infos_limit(limit).await {
+    if let Err(e) = req.db.set_purged_infos_limit(limit).await {
+        return fail(e);
+    }
+    match crate::cluster_ops::set_limit_on_peers(
+        &req.st.ctx,
+        req.name,
+        "_purged_infos_limit",
+        limit,
+        req.headers,
+    )
+    .await
+    {
         Ok(()) => ok(),
         Err(e) => fail(e),
     }
