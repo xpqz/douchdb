@@ -1650,11 +1650,14 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
             .map(|row| (&row["seq"], row["id"].as_str().unwrap()))
             .collect();
         assert_eq!(got, want, "limit {limit}");
-        assert_eq!(
-            body["last_seq"],
-            **got.last().map(|(seq, _)| seq).unwrap(),
-            "limit {limit}"
-        );
+        // A feed that stopped at its limit ends at its last row; one that ran
+        // out of documents ends at the last one it scanned.
+        let want_seq = if limit < expected.len() {
+            (**got.last().map(|(seq, _)| seq).unwrap()).clone()
+        } else {
+            all.last().unwrap()["seq"].clone()
+        };
+        assert_eq!(body["last_seq"], want_seq, "limit {limit}");
     }
 
     // Starting after the second match leaves the other two.
@@ -1665,6 +1668,83 @@ async fn filtered_changes_with_a_limit_finds_sparse_matches_beyond_one_page() {
         ))
         .await;
     assert_eq!(body["results"][0]["id"], json!(expected[2].1));
+}
+
+#[tokio::test]
+async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() {
+    // CouchDB (couch_changes:changes_enumerator) advances the feed's `seq` for
+    // every document it scans, matching or not, so a filter that matches
+    // nothing still ends at the last scanned sequence. Every feed mode must
+    // say the same.
+    let s = Server::start(false);
+    s.fresh_db("chscanned").await;
+    let docs = vec![
+        json!({"_id": "a"}),
+        json!({"_id": "b"}),
+        json!({"_id": "c"}),
+        json!({"_id": "_design/f",
+        "filters": {
+            "none": "function (doc) { return false; }",
+            "first": "function (doc) { return doc._id === 'a'; }"
+        }}),
+    ];
+    let (status, body) = s
+        .post("/chscanned/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, all) = s.get("/chscanned/_changes").await;
+    assert_eq!(all["last_seq"], 4, "{all}");
+
+    let lines = |text: &str| -> Vec<Value> {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("line is JSON"))
+            .collect()
+    };
+    // `none` matches nothing; `first` matches only the first document, so the
+    // documents scanned after the last match still count.
+    for (filter, since, matched) in [("none", 0, 0), ("none", 2, 0), ("first", 0, 1)] {
+        let query = format!("filter=f/{filter}&since={since}");
+        for feed in ["normal", "longpoll"] {
+            for extra in ["", "&heartbeat=1000"] {
+                let (status, body) = s
+                    .get(&format!(
+                        "/chscanned/_changes?{query}&feed={feed}&timeout=1{extra}"
+                    ))
+                    .await;
+                let label = format!("{filter} {feed}{extra} since {since}: {body}");
+                assert_eq!(status, StatusCode::OK, "{label}");
+                assert_eq!(
+                    body["results"].as_array().map(Vec::len),
+                    Some(matched),
+                    "{label}"
+                );
+                assert_eq!(body["last_seq"], 4, "{label}");
+            }
+        }
+        let text = s
+            .client
+            .get(format!(
+                "{}/chscanned/_changes?{query}&feed=continuous&timeout=1",
+                s.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let rows = lines(&text);
+        assert_eq!(
+            rows.last(),
+            Some(&json!({"last_seq": 4, "pending": 0})),
+            "{filter} continuous since {since}: {text}"
+        );
+    }
+
+    // A feed already at the head has scanned nothing and stays there.
+    let (_, body) = s.get("/chscanned/_changes?filter=f/none&since=4").await;
+    assert_eq!(body["last_seq"], 4, "{body}");
 }
 
 #[tokio::test]
@@ -5689,6 +5769,42 @@ async fn cluster_changes_report_pending_like_a_single_node() {
             let (_, all) = node.get("/clpending/_changes").await;
             assert_eq!(all["pending"], 0, "{all}");
         }
+    }
+}
+
+#[tokio::test]
+async fn cluster_changes_report_the_scanned_position_when_nothing_matches() {
+    // As on a single node (couch_changes:changes_enumerator), a filter that
+    // matches nothing still ends where the scan did: the same position an
+    // unfiltered read reaches.
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("clscanned").await;
+    }
+    let mut docs: Vec<Value> = (0..20)
+        .map(|i| json!({"_id": format!("s{i:02}")}))
+        .collect();
+    docs.push(json!({"_id": "_design/f",
+        "filters": {"none": "function (doc) { return false; }"}}));
+    let (status, body) = nodes[0]
+        .post("/clscanned/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, all) = nodes[0].get("/clscanned/_changes").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["results"].as_array().map(Vec::len), Some(21), "{all}");
+    let (_, start) = nodes[0].get("/clscanned/_changes?limit=0").await;
+    for feed in ["normal", "longpoll"] {
+        let (status, body) = nodes[0]
+            .get(&format!(
+                "/clscanned/_changes?filter=f/none&feed={feed}&timeout=1"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["results"], json!([]), "{feed}: {body}");
+        assert_eq!(body["last_seq"], all["last_seq"], "{feed}: {body}");
+        assert_ne!(body["last_seq"], start["last_seq"], "{feed}: {body}");
     }
 }
 

@@ -2290,6 +2290,27 @@ pub(crate) async fn cluster_changes(
             break;
         }
     }
+    // A lane whose rows were all returned has also scanned past them: a filter
+    // may have discarded documents after its last row, or all of them, and
+    // CouchDB's feed position covers every document scanned
+    // (`couch_changes:changes_enumerator`).
+    for lane in lanes.iter().filter(|lane| lane.rows.is_empty()) {
+        let Some(last) = lane.last else {
+            continue;
+        };
+        match lane.mark {
+            None => {
+                if let Some(slot) = progress.get_mut(lane.node) {
+                    *slot = (*slot).max(last);
+                }
+            }
+            Some(mark) => {
+                if let Some(mark) = fallbacks.get_mut(mark) {
+                    mark.seq = mark.seq.max(last);
+                }
+            }
+        }
+    }
     // Rows fetched but not returned are still to come.
     pending += lanes.iter().map(|lane| lane.rows.len() as u64).sum::<u64>();
 

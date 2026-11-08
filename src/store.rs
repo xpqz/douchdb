@@ -432,6 +432,15 @@ pub(crate) fn meta_parses() -> usize {
     META_PARSES.with(std::cell::Cell::get)
 }
 
+/// The document id in a `m/<id>` metadata key. A key too short to hold the
+/// prefix is corruption, not a reason to panic.
+fn doc_id_from_meta_key(key: &[u8]) -> Result<&str> {
+    let id = key
+        .get(2..)
+        .ok_or_else(|| anyhow::anyhow!("corrupt metadata key of {} bytes", key.len()))?;
+    std::str::from_utf8(id).map_err(|error| anyhow::anyhow!("doc id is not UTF-8: {error}"))
+}
+
 /// Decode a stored metadata record. A record that does not parse is
 /// corruption: point reads and writes fail on it, and listings skip it
 /// through `ShardName::report_corrupt`.
@@ -597,8 +606,7 @@ impl Shard {
             if !key.starts_with(b"m/") {
                 break;
             }
-            let id = std::str::from_utf8(&key[2..])
-                .map_err(|error| anyhow::anyhow!("doc id is not UTF-8: {error}"))?;
+            let id = doc_id_from_meta_key(key)?;
             let meta: DocMeta = serde_json::from_slice(value.as_ref())?;
             hasher.update(b"doc");
             hasher.update(id.as_bytes());
@@ -1061,7 +1069,7 @@ impl Shard {
                     None => {}
                 }
                 if let Some(live) = self.live.as_mut() {
-                    if let Ok(id) = std::str::from_utf8(&key[2..]) {
+                    if let Ok(id) = doc_id_from_meta_key(&key) {
                         let (was_live, is_live) = match new_state {
                             Some((rev, true, has_attachments)) => {
                                 let old = live.insert(
@@ -1499,6 +1507,15 @@ mod tests {
         assert!(meta_key("Z") < meta_key("a"));
         assert!(meta_key("a") < meta_key("aa"));
         assert!(meta_key("_design/x") < meta_key("a"));
+    }
+
+    #[test]
+    fn a_short_metadata_key_is_an_error_not_a_panic() {
+        assert_eq!(doc_id_from_meta_key(&meta_key("abc")).unwrap(), "abc");
+        assert_eq!(doc_id_from_meta_key(b"m/").unwrap(), "");
+        assert!(doc_id_from_meta_key(b"m").is_err());
+        assert!(doc_id_from_meta_key(b"").is_err());
+        assert!(doc_id_from_meta_key(b"m/\xff").is_err());
     }
 
     #[test]

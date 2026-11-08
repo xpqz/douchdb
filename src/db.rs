@@ -1992,11 +1992,18 @@ impl Db {
         if let Some(limit) = opts.limit {
             rows.truncate(limit);
         }
-        let last_seq = rows
-            .last()
-            .map(|r| r.seq)
-            .or(scanned_last)
-            .unwrap_or(opts.since);
+        // CouchDB's feed position is the last document scanned, matching or
+        // not (`couch_changes:changes_enumerator`), except that a feed which
+        // stopped at its limit ends at its last row.
+        let at_limit = opts
+            .limit
+            .is_some_and(|limit| limit > 0 && rows.len() >= limit);
+        let last_seq = if at_limit {
+            rows.last().map(|r| r.seq)
+        } else {
+            scanned_last.or(rows.last().map(|r| r.seq))
+        }
+        .unwrap_or(opts.since);
         let pending = self
             .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
             .await?;
@@ -2161,7 +2168,7 @@ impl Db {
     pub(crate) fn changes_stream_arc(
         db: Arc<Db>,
         opts: ChangesOpts,
-    ) -> impl futures::Stream<Item = DbResult<ChangeRow>> + 'static {
+    ) -> impl futures::Stream<Item = DbResult<ChangesItem>> + 'static {
         async_stream::stream! {
             use std::collections::VecDeque;
 
@@ -2259,11 +2266,14 @@ impl Db {
                     }
                 }
                 let Some(slot) = best else {
+                    // Every shard is exhausted: report how far the scan got.
+                    let scanned = cursors.iter().copied().max().unwrap_or(opts.since);
+                    yield Ok(ChangesItem::Scanned(scanned));
                     break;
                 };
                 let row = buffers[slot].pop_front().expect("buffered row");
                 emitted += 1;
-                yield Ok(row);
+                yield Ok(ChangesItem::Row(row));
                 if opts.limit.map(|limit| emitted >= limit).unwrap_or(false) {
                     break;
                 }
@@ -3411,6 +3421,16 @@ impl ChangeFilter {
     fn needs_doc(&self) -> bool {
         matches!(self, ChangeFilter::Js { .. })
     }
+}
+
+/// What a changes stream yields: the rows, then, when the scan ran to the end
+/// rather than stopping at the limit, the last sequence it scanned. A filter
+/// may have discarded rows after the last one yielded, and CouchDB's feed
+/// position (`couch_changes:changes_enumerator`) covers them too.
+#[derive(Debug)]
+pub(crate) enum ChangesItem {
+    Row(ChangeRow),
+    Scanned(u64),
 }
 
 #[derive(Debug)]

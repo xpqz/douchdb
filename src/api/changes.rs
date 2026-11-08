@@ -1,6 +1,7 @@
 //! The `_changes` feed and its filters.
 
 use super::*;
+use crate::db::ChangesItem;
 
 /// `limit` for `_changes`, with CouchDB's own messages for a bad value.
 fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
@@ -424,7 +425,14 @@ async fn changes_normal_raw(
         let mut last_seq = initial_seq;
         while let Some(item) = rows.next().await {
             let row = match item {
-                Ok(row) => row,
+                Ok(ChangesItem::Row(row)) => row,
+                Ok(ChangesItem::Scanned(seq)) => {
+                    last_seq = seq;
+                    if rewrite {
+                        progress[me] = seq;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     yield Err(std::io::Error::other(format!("{}: {}", error.error, error.reason)));
                     return;
