@@ -332,6 +332,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(api::security_headers))
         .layer(axum::middleware::from_fn(api::request_id))
         .layer(axum::middleware::from_fn(api::head_only))
+        .layer(axum::middleware::from_fn(api::couch_reason_phrase))
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }

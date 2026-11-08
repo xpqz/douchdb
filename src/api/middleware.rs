@@ -16,6 +16,22 @@ pub async fn request_id(req: axum::extract::Request, next: axum::middleware::Nex
     response
 }
 
+/// CouchDB's HTTP/1 status lines use the reason phrases of Erlang's
+/// `httpd_util:reason_phrase/1` (through mochiweb), which says "Object Not
+/// Found" for 404 where `http` says "Not Found". HTTP/2 has no reason phrase.
+pub async fn couch_reason_phrase(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    if response.status() == StatusCode::NOT_FOUND {
+        response
+            .extensions_mut()
+            .insert(hyper::ext::ReasonPhrase::from_static(b"Object Not Found"));
+    }
+    response
+}
+
 pub async fn head_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let head = req.method() == Method::HEAD;
     let mut response = next.run(req).await;
