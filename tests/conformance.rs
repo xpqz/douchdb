@@ -5091,6 +5091,84 @@ async fn document_writes_validate_like_couchdb() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB 3.5 accepts a reduce by prefix: anything starting with `_sum`,
+/// `_count`, `_stats`, `_approx_count_distinct`, `_first` or `_last`, and
+/// `_top_N` / `_bottom_N` with N in 1..=100 (couch_mrview:validate/2 and
+/// check_rank/1). Any other `_` name is not supported. This holds on every
+/// write path, including replication (`new_edits=false`).
+#[tokio::test]
+async fn design_doc_reduce_names_match_couchdb_prefix_rule() {
+    let s = Server::start(false);
+    s.fresh_db("rn").await;
+    let map = "function(d){ emit(d._id, 1); }";
+    let accepted = [
+        "_sum",
+        "_sum_foo",
+        "_count",
+        "_count_x",
+        "_stats",
+        "_stats2",
+        "_approx_count_distinct",
+        "_approx_count_distinct_x",
+        "_first",
+        "_firstfoo",
+        "_last",
+        "_last_x",
+        "_top_1",
+        "_top_100",
+        "_top_05",
+        "_top_+7",
+        "_bottom_1",
+        "_bottom_100",
+    ];
+    for (i, reduce) in accepted.iter().enumerate() {
+        let doc = json!({"views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s.put(&format!("/rn/_design/put{i}"), doc).await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let doc = json!({"_id": format!("_design/rep{i}"), "_rev": "1-abc",
+            "views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s
+            .post("/rn/_bulk_docs", json!({"new_edits": false, "docs": [doc]}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let (status, body) = s.get(&format!("/rn/_design/rep{i}")).await;
+        assert_eq!(status, StatusCode::OK, "{reduce}: {body}");
+    }
+
+    let rank_range = "rank value must be between 1 and 100";
+    let rejected = [
+        ("_nope", "`_nope` is not a supported reduce function."),
+        ("_top", "`_top` is not a supported reduce function."),
+        ("_bottom", "`_bottom` is not a supported reduce function."),
+        ("_Sum", "`_Sum` is not a supported reduce function."),
+        ("_top_0", rank_range),
+        ("_top_101", rank_range),
+        ("_top_-3", rank_range),
+        ("_bottom_0", rank_range),
+        ("_bottom_99999999999999999999", rank_range),
+        ("_top_", "invalid rank reducer"),
+        ("_top_x", "invalid rank reducer"),
+        ("_top_1_0", "invalid rank reducer"),
+        ("_top_1.5", "invalid rank reducer"),
+        ("_bottom_ 5", "invalid rank reducer"),
+    ];
+    for (i, (reduce, reason)) in rejected.iter().enumerate() {
+        let doc = json!({"views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s.put(&format!("/rn/_design/bad{i}"), doc).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reduce}: {body}");
+        assert_eq!(body["error"], "invalid_design_doc", "{reduce}: {body}");
+        assert_eq!(body["reason"], *reason, "{reduce}");
+        let doc = json!({"_id": format!("_design/badrep{i}"), "_rev": "1-abc",
+            "views": {"v": {"map": map, "reduce": reduce}}});
+        let (status, body) = s
+            .post("/rn/_bulk_docs", json!({"new_edits": false, "docs": [doc]}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{reduce}: {body}");
+        let (status, body) = s.get(&format!("/rn/_design/badrep{i}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{reduce}: {body}");
+    }
+}
+
 /// CouchDB 3.5 compiles every map and reduce function of a design document
 /// when it is saved (couch_mrview:validate/2 and
 /// couch_query_servers:try_compile/4), on every write path including
@@ -10078,6 +10156,132 @@ async fn couchdb_builtin_reduce_ports() {
     assert_eq!(body["rows"][0]["value"]["sum"], 10);
     let (_, body) = s.get("/couchreduce/_design/r/_view/distinct").await;
     assert_eq!(body["rows"][0]["value"], 4);
+}
+
+/// Builtin reduces CouchDB 3.5 runs by name prefix (`_sum_foo` is `_sum`) and
+/// the rank/extreme builtins `_first`, `_last`, `_top_N`, `_bottom_N`
+/// (couch_query_servers:builtin_reduce/4). `_first` and `_last` pick the
+/// value of the row with the smallest or largest `[key, docid]`; `_top_N` and
+/// `_bottom_N` list the N largest or smallest distinct values.
+const RANK_DOCS: [(&str, &str, i64); 6] = [
+    ("a1", "a", 5),
+    ("a2", "a", 3),
+    ("a3", "a", 5),
+    ("b1", "b", 9),
+    ("b2", "b", 1),
+    ("c1", "c", 7),
+];
+
+fn rank_ddoc() -> Value {
+    let map = "function(d){ emit(d.k, d.v); }";
+    json!({"views": {
+        "sum_x": {"map": map, "reduce": "_sum_foo"},
+        "count_x": {"map": map, "reduce": "_count_x"},
+        "stats_x": {"map": map, "reduce": "_stats_x"},
+        "first": {"map": map, "reduce": "_first"},
+        "last": {"map": map, "reduce": "_lastly"},
+        "top2": {"map": map, "reduce": "_top_2"},
+        "top100": {"map": map, "reduce": "_top_100"},
+        "bottom2": {"map": map, "reduce": "_bottom_2"}
+    }})
+}
+
+async fn assert_rank_reduces(node: &Server, db: &str) {
+    let rows = |view: &'static str, query: &'static str| {
+        let path = format!("/{db}/_design/d/_view/{view}{query}");
+        async move {
+            let (status, body) = node.get(&path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            body["rows"].clone()
+        }
+    };
+    assert_eq!(rows("sum_x", "").await, json!([{"key": null, "value": 30}]));
+    assert_eq!(rows("count_x", "").await, json!([{"key": null, "value": 6}]));
+    let stats = rows("stats_x", "").await;
+    assert_eq!(stats[0]["value"]["count"], 6, "{stats}");
+    assert_eq!(stats[0]["value"]["sum"], 30, "{stats}");
+
+    assert_eq!(rows("first", "").await, json!([{"key": null, "value": 5}]));
+    assert_eq!(
+        rows("first", "?group=true").await,
+        json!([{"key": "a", "value": 5}, {"key": "b", "value": 9}, {"key": "c", "value": 7}])
+    );
+    assert_eq!(rows("last", "").await, json!([{"key": null, "value": 7}]));
+    assert_eq!(
+        rows("last", "?group=true").await,
+        json!([{"key": "a", "value": 5}, {"key": "b", "value": 1}, {"key": "c", "value": 7}])
+    );
+    assert_eq!(
+        rows("first", "?startkey=%22b%22").await,
+        json!([{"key": null, "value": 9}])
+    );
+
+    assert_eq!(
+        rows("top2", "").await,
+        json!([{"key": null, "value": [9, 7]}])
+    );
+    assert_eq!(
+        rows("top2", "?group=true").await,
+        json!([
+            {"key": "a", "value": [5, 3]},
+            {"key": "b", "value": [9, 1]},
+            {"key": "c", "value": [7]}
+        ])
+    );
+    assert_eq!(
+        rows("top100", "").await,
+        json!([{"key": null, "value": [9, 7, 5, 3, 1]}])
+    );
+    assert_eq!(
+        rows("bottom2", "").await,
+        json!([{"key": null, "value": [1, 3]}])
+    );
+    assert_eq!(
+        rows("bottom2", "?group=true").await,
+        json!([
+            {"key": "a", "value": [3, 5]},
+            {"key": "b", "value": [1, 9]},
+            {"key": "c", "value": [7]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn couchdb_prefixed_and_ranked_builtin_reduces() {
+    let s = Server::start(false);
+    s.fresh_db("rank").await;
+    let docs: Vec<Value> = RANK_DOCS
+        .iter()
+        .map(|(id, k, v)| json!({"_id": id, "k": k, "v": v}))
+        .collect();
+    let (status, _) = s.post("/rank/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.put("/rank/_design/d", rank_ddoc()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_rank_reduces(&s, "rank").await;
+}
+
+/// Owners reduce their shards and the coordinator rereduces the partials, so
+/// every builtin must combine across shards and nodes.
+#[tokio::test]
+async fn cluster_prefixed_and_ranked_builtin_reduces() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clrank").await;
+    }
+    let docs: Vec<Value> = RANK_DOCS
+        .iter()
+        .map(|(id, k, v)| json!({"_id": id, "k": k, "v": v}))
+        .collect();
+    let (status, _) = nodes[0]
+        .post("/clrank/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = nodes[0].put("/clrank/_design/d", rank_ddoc()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for node in &nodes {
+        assert_rank_reduces(node, "clrank").await;
+    }
 }
 
 #[tokio::test]
