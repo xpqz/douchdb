@@ -197,7 +197,27 @@ pub(crate) fn illegal_db_name(name: &str) -> ApiError {
     )
 }
 
+/// The system databases CouchDB's `couch_db:validate_dbname` accepts although
+/// they do not match the name regex.
+const SYSTEM_DB_NAMES: [&str; 3] = ["_users", "_replicator", "_global_changes"];
+
+/// CouchDB's `^[a-z][a-z0-9_$()+/-]*$` (`DBNAME_REGEX` in `couch_db.erl`), or
+/// one of the system databases. Doubled and trailing slashes are legal.
 pub(crate) fn valid_db_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let regex_match = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
+        });
+    regex_match || SYSTEM_DB_NAMES.contains(&name)
+}
+
+/// The name rule douchdb applied before it followed CouchDB's: any non-empty
+/// run of `a-z0-9_$()+-/` that does not start with `_` or `/`, end with `/`
+/// or contain `//`.
+fn legacy_db_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('_')
         && !name.starts_with('/')
@@ -208,6 +228,15 @@ pub(crate) fn valid_db_name(name: &str) -> bool {
                 || b.is_ascii_digit()
                 || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
         })
+}
+
+/// Whether an existing database may be addressed by `name`. CouchDB checks a
+/// name only when it creates a database (`valid_db_name`); this also accepts
+/// what earlier douchdb versions allowed (a leading digit or '-'), a
+/// deliberate departure so that databases already on disk under such a name
+/// stay readable, writable and deletable.
+pub(crate) fn openable_db_name(name: &str) -> bool {
+    valid_db_name(name) || legacy_db_name(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +275,7 @@ impl AppState {
     }
 
     async fn open_db(&self, name: &str, hot: bool) -> DbResult<Arc<Db>> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(open) = self.dbs.read().await.get(name) {
@@ -288,7 +317,7 @@ impl AppState {
     /// is open, from its directory when it is not, and by opening it only
     /// when the directory cannot say (a legacy database with no shard map).
     pub(crate) async fn placement(&self, name: &str) -> DbResult<Placement> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(db) = self.open_db_if_cached(name).await {
@@ -368,7 +397,7 @@ impl AppState {
     /// a database does not open it. `None` when there is no such database or
     /// its security cannot be read.
     pub async fn db_security(&self, name: &str) -> Option<Value> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return None;
         }
         if let Some(open) = self.dbs.read().await.get(name) {
@@ -430,7 +459,7 @@ impl AppState {
     }
 
     pub async fn drop_db(&self, name: &str) -> DbResult<()> {
-        if !valid_db_name(name) {
+        if !openable_db_name(name) {
             return Err(ApiError::not_found("Database does not exist."));
         }
         let lock = self.name_lock(name);
@@ -567,6 +596,44 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A database an earlier douchdb created under a name CouchDB refuses (a
+    /// leading digit or '-') stays listed, readable, writable and deletable;
+    /// only creating such a name is refused.
+    #[tokio::test]
+    async fn legacy_database_names_stay_reachable() {
+        let root = std::env::temp_dir().join(format!("douchdb-legacy-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 4);
+        let legacy = ["1abc", "-abc"];
+        for name in legacy {
+            assert!(!valid_db_name(name));
+            assert!(st.create_db(name, false, None, None).await.is_err());
+            // As an earlier version left it: opened without the name check.
+            let db = crate::db::Db::open(
+                &root,
+                name,
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    shard_map: st.ctx.cluster.shard_map_n(1, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap();
+            drop(db);
+        }
+        assert_eq!(st.db_names().await, ["-abc", "1abc"]);
+        for name in legacy {
+            let db = st.db(name).await.unwrap();
+            db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+            assert!(st.db_security(name).await.is_some());
+            assert!(st.placement(name).await.is_ok());
+            drop(db);
+            st.drop_db(name).await.unwrap();
+        }
+        assert!(st.db_names().await.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// Every database ever opened used to stay open, with its shard actors and
     /// stores, until it was deleted.

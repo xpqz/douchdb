@@ -2697,6 +2697,52 @@ async fn plus_in_database_names_decodes_as_space() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// CouchDB's `couch_db:validate_dbname` accepts `^[a-z][a-z0-9_$()+/-]*$` and
+/// the system databases `_users`, `_replicator` and `_global_changes`.
+#[tokio::test]
+async fn database_names_follow_the_couchdb_rule() {
+    let s = Server::start(false);
+    let reason = |name: &str| {
+        format!(
+            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+        )
+    };
+    for (path, name) in [
+        ("/1abc", "1abc"),
+        ("/-abc", "-abc"),
+        ("/$abc", "$abc"),
+        ("/(abc", "(abc"),
+        ("/_other", "_other"),
+        ("/_dbs", "_dbs"),
+        ("/aBc", "aBc"),
+        ("/ab.c", "ab.c"),
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
+        assert_eq!(body["reason"], reason(name), "{path}: {body}");
+    }
+
+    // The slash is legal anywhere after the first letter, doubled or trailing.
+    for path in [
+        "/_users",
+        "/_replicator",
+        "/_global_changes",
+        "/a-1",
+        "/a$()%2B_-9",
+        "/a%2F%2Fb",
+        "/a%2Fb%2F",
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let (status, body) = s.put("/_users/org.couchdb.user:bob", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 /// Stop the server for good, then start it again on the same data directory.
 /// `restart` alone leaves the old process running, and the pooled HTTP
 /// connections point at it, so a test of what a fresh process reads from disk
