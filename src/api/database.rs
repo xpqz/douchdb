@@ -582,7 +582,10 @@ async fn purge(req: DbRequest<'_>) -> Response {
     if let Err(e) = invalidate_indexes(req.db).await {
         return fail(e);
     }
-    json(StatusCode::OK, purged)
+    // purge_results_to_json (chttpd_db.erl) answers 201, or 202 when a
+    // result was only accepted without a quorum. The purge is applied on
+    // this node alone and is never forwarded, so nothing is "accepted".
+    json(StatusCode::CREATED, purged)
 }
 
 async fn invalidate_indexes(db: &Db) -> DbResult<()> {

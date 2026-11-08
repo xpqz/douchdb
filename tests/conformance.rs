@@ -4507,7 +4507,7 @@ async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     let rev3 = r3["rev"].as_str().unwrap().to_string();
 
     let (status, body) = s.post("/purge/_purge", json!({"a": [rev2]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["purged"]["a"], json!([]), "interior revs are ignored");
     let (status, body) = s.get(&format!("/purge/a?rev={rev2}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -8543,7 +8543,7 @@ async fn purge_invalidates_view_indexes() {
     assert_eq!(body["total_rows"], 1);
 
     let (status, _) = s.post("/purgeview/_purge", json!({"a": [rev]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     let (_, body) = s.get("/purgeview/_design/v/_view/cities").await;
     assert_eq!(body["total_rows"], 0);
 }
@@ -10892,7 +10892,7 @@ async fn purged_documents_leave_search_results() {
     let (_, doc) = s.get("/searchpurge/apple").await;
     let rev = doc["_rev"].as_str().unwrap().to_string();
     let (status, body) = s.post("/searchpurge/_purge", json!({"apple": [rev]})).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     // A later write moves the database on, so the index must catch up from
     // its changes, where a fully purged document no longer appears.
     let (status, _) = s.put("/searchpurge/egg", json!({"item": "egg"})).await;
