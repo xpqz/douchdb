@@ -518,15 +518,18 @@ async fn clear_migration_everywhere(ctx: &ClusterCtx, db: &Db, name: &str, heade
     }
 }
 
+/// Activate the placement of `target` on every node and return the map as
+/// stored, at the version the local Db picked under its lock (the version
+/// `target` carries is ignored).
 async fn activate_map_everywhere(
     ctx: &ClusterCtx,
     db: &Db,
     name: &str,
-    map: &ShardMap,
+    target: &ShardMap,
     headers: &HeaderMap,
-) -> DbResult<()> {
+) -> DbResult<ShardMap> {
     let old = db.shard_map();
-    db.set_shard_map(map.clone())?;
+    let map = &db.set_next_shard_map(target.clone())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
@@ -545,14 +548,14 @@ async fn activate_map_everywhere(
         }
     }
     if failures.is_empty() {
-        return Ok(());
+        return Ok(map.clone());
     }
 
     // Roll back with a strictly newer version so peers that already accepted
     // the target map also accept the old placement again.
-    let mut rollback = old;
-    rollback.version = map.version.saturating_add(1);
-    let _ = db.set_shard_map(rollback.clone());
+    let rollback = db
+        .set_next_shard_map(old)
+        .unwrap_or_else(|_| db.shard_map());
     for peer in &peers {
         let request = internal_request(
             ctx,
@@ -621,11 +624,14 @@ async fn migrate(
         return Err(error);
     }
 
-    if let Err(error) = activate_map_everywhere(ctx, db, name, map, headers).await {
-        clear_migration_everywhere(ctx, db, name, headers).await;
-        db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
+    let map = match activate_map_everywhere(ctx, db, name, map, headers).await {
+        Ok(activated) => activated,
+        Err(error) => {
+            clear_migration_everywhere(ctx, db, name, headers).await;
+            db.set_rebalance_in_progress(false);
+            return Err(error);
+        }
+    };
     clear_migration_everywhere(ctx, db, name, headers).await;
     db.set_rebalance_in_progress(false);
 
@@ -672,10 +678,7 @@ pub(crate) async fn rebalance(
         value["pending"] = json!(false);
         value
     } else {
-        let map = ShardMap {
-            version: old_map.version.saturating_add(1),
-            ..map
-        };
+        // The activation picks the version under the Db lock.
         migrate(ctx, db, name, &old_map, &map, headers, timeout_ms).await?
     };
     if !cleanup {
