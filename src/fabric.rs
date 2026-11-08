@@ -1322,10 +1322,14 @@ pub(crate) fn nodedown() -> ApiError {
     ApiError::new(412, "nodedown", "progress not possible")
 }
 
-/// True when a peer request failed because the peer could not be reached (or
-/// is unhealthy), rather than because the peer rejected the request.
+/// True when a peer request failed in transport (connect, timeout, reset, or
+/// no usable response), rather than because the peer answered with an error.
+/// Every such failure is built as 502 `bad_gateway`; a peer's own error
+/// response keeps its status under another name (`request_failed`,
+/// `all_docs_failed`, ...), so a 503 or 504 the peer produced is an answer,
+/// not a node that is down.
 pub(crate) fn peer_unreachable(error: &ApiError) -> bool {
-    matches!(error.status, 502..=504)
+    error.status == 502 && error.error == "bad_gateway"
 }
 
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
@@ -3012,6 +3016,98 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A one-shot HTTP peer that answers every request with `status`.
+    fn peer_answering(status: u16) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peer = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the request head and body before answering.
+                while let Ok(read) = socket.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if seen.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                );
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        peer
+    }
+
+    async fn forward_to(peer: &str) -> ApiError {
+        let ctx = ClusterCtx {
+            cluster: crate::cluster::Cluster {
+                nodes: vec![peer.to_string()],
+                me: 0,
+                n: 1,
+                secret: "test-secret".to_string(),
+            },
+            client: reqwest::Client::new(),
+            auth: None,
+            health: Default::default(),
+        };
+        forward_json(
+            &ctx,
+            peer,
+            "db",
+            "_all_docs",
+            "",
+            &json!({}),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("the peer does not answer successfully")
+    }
+
+    /// A peer that answers 503 or 504 itself is reachable: its own error is
+    /// not a transport failure, so callers must not treat it as nodedown.
+    #[tokio::test]
+    async fn a_peer_answering_5xx_itself_is_not_unreachable() {
+        for status in [502, 503, 504] {
+            let error = forward_to(&peer_answering(status)).await;
+            assert_eq!(error.status, status);
+            assert!(
+                !peer_unreachable(&error),
+                "a peer that answered {status} was classified as unreachable"
+            );
+        }
+    }
+
+    /// A refused connection is the genuine transport failure.
+    #[tokio::test]
+    async fn a_refused_connection_is_unreachable() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}", listener.local_addr().expect("addr"))
+        };
+        let error = forward_to(&closed).await;
+        assert!(
+            peer_unreachable(&error),
+            "{} {}",
+            error.status,
+            error.reason
+        );
+    }
 
     /// A fan-out task that panics must still count as that node's reply.
     /// Slot 0 is a design document on nodes 0 and 1, so it is owed a reply

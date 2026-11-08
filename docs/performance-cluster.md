@@ -259,7 +259,10 @@ go to every replica.
 Clustered point GET/HEAD now defaults to CouchDB’s read quorum,
 `r = (n / 2) + 1`. The coordinator reads **all** replicas, counts reachable
 answers including explicit not-found/tombstone responses, and returns `503
-quorum_not_met` if fewer than `r` answer. Deleted winners participate in the
+quorum_not_met` if fewer than `r` answer (a deliberate departure from CouchDB's
+`fabric_doc_open`, which serves the best document it received). If none answer,
+the error is CouchDB's: `500 read_failure` (`503 service unavailable` for
+`open_revs` or `rev`). Deleted winners participate in the
 comparison, so a stale live replica cannot beat a newer tombstone. `?r=1` is the
 local fast path.
 
