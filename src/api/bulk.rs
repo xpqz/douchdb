@@ -599,15 +599,34 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     }
 }
 
+/// The `update_seq` to report, when the request asks for one. It must be
+/// taken before the rows are read: a client that follows `_changes` from it
+/// then sees every write the rows missed, while a token taken after could
+/// include a write the rows do not show, which the client would never see.
+async fn requested_update_seq(req: &DbRequest<'_>) -> DbResult<Option<Value>> {
+    if flag(req.q, "update_seq") {
+        query_update_seq(req.st, req.db, req.name, req.headers)
+            .await
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// The reply once the rows are known: re-check access (a security change may
-/// have landed while the query ran) and add `update_seq` when asked for.
-fn all_docs_reply(req: &DbRequest<'_>, result: DbResult<Value>, update_seq: Value) -> Response {
+/// have landed while the query ran) and add the `update_seq` taken before the
+/// rows were read.
+fn all_docs_reply(
+    req: &DbRequest<'_>,
+    result: DbResult<Value>,
+    update_seq: Option<Value>,
+) -> Response {
     if !still_allowed(req.st, req.db, req.headers) {
         return access_denied(&req.st.principal(req.headers));
     }
     match result {
         Ok(mut value) => {
-            if flag(req.q, "update_seq") {
+            if let Some(update_seq) = update_seq {
                 value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
@@ -624,14 +643,18 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(opts) => opts,
         Err(error) => return fail(error),
     };
+    let update_seq = match requested_update_seq(&req).await {
+        Ok(update_seq) => update_seq,
+        Err(error) => return fail(error),
+    };
     if opts.keys.is_none()
         && !req.st.ctx.cluster.is_clustered()
         && !is_forwarded(req.st, req.headers)
     {
-        return stream_all_docs(&req, &opts).await;
+        return stream_all_docs(&req, &opts, update_seq).await;
     }
     let result = run_all_docs(&req, &opts).await;
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, update_seq)
 }
 
 /// Rows are encoded into chunks of about this size as they are read.
@@ -642,7 +665,11 @@ const STREAM_CHUNK: usize = 64 * 1024;
 /// first bytes leave before the last row is read. The bytes are those of the
 /// buffered reply. An error on the first page still gets its status; one
 /// after that can only end the connection early. A HEAD reads no rows.
-async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
+async fn stream_all_docs(
+    req: &DbRequest<'_>,
+    opts: &AllDocsOpts,
+    update_seq: Option<Value>,
+) -> Response {
     let (head, rows) = match Db::all_docs_stream(req.db.clone(), opts).await {
         Ok(stream) => stream,
         Err(error) => return fail(error),
@@ -661,8 +688,6 @@ async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
             return fail(error);
         }
         let rows = futures::stream::iter(first_row).chain(rows);
-        let db = req.db.clone();
-        let with_update_seq = flag(req.q, "update_seq");
         let stream = async_stream::stream! {
             let mut rows = Box::pin(rows);
             let mut buffer = format!(
@@ -696,10 +721,8 @@ async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
                 }
             }
             buffer.push(b']');
-            if with_update_seq {
-                buffer.extend_from_slice(
-                    format!(",\"update_seq\":{}", db.update_seq()).as_bytes(),
-                );
+            if let Some(update_seq) = update_seq {
+                buffer.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
             }
             buffer.push(b'}');
             yield Ok(Bytes::from(buffer));
@@ -749,6 +772,10 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
             }
         }
     }
+    let update_seq = match requested_update_seq(&req).await {
+        Ok(update_seq) => update_seq,
+        Err(error) => return fail(error),
+    };
     let mut result = run_all_docs(&req, &opts).await;
     if let Ok(value) = &mut result {
         let everything = AllDocsOpts {
@@ -767,7 +794,7 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
             Err(error) => result = Err(error),
         }
     }
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, update_seq)
 }
 
 /// `GET|POST /{db}/_local_docs`: the `_local/` documents, which live outside
@@ -783,5 +810,9 @@ pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
     let result = req.db.local_docs(&opts).await;
-    all_docs_reply(&req, result, Value::Null)
+    all_docs_reply(
+        &req,
+        result,
+        flag(req.q, "update_seq").then_some(Value::Null),
+    )
 }

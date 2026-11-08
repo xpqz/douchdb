@@ -6260,6 +6260,39 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows[0]["deleted"], true);
 }
 
+// With `update_seq=true`, `_all_docs`, `_design_docs` and view queries report
+// the same opaque vector `GET /db` does, as CouchDB sends a sequence string
+// in all of them (fabric_view_all_docs.erl, fabric_view_map.erl,
+// fabric_view_reduce.erl), so a client can use it as a `_changes` since.
+#[tokio::test]
+async fn cluster_query_update_seq_is_the_opaque_vector() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clqseq").await;
+    }
+    let docs = json!({"docs": [
+        {"_id": "a"},
+        {"_id": "b"},
+        {"_id": "_design/d", "views": {"v": {"map": "function(doc) { emit(doc._id, 1); }", "reduce": "_count"}}},
+    ]});
+    let (status, _) = nodes[0].post("/clqseq/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, info) = nodes[0].get("/clqseq").await;
+    let expected = info["update_seq"].as_str().expect("vector update_seq");
+    for path in [
+        "/clqseq/_all_docs?update_seq=true",
+        "/clqseq/_all_docs?update_seq=true&keys=%5B%22a%22%5D",
+        "/clqseq/_design_docs?update_seq=true",
+        "/clqseq/_design/d/_view/v?update_seq=true&reduce=false",
+        "/clqseq/_design/d/_view/v?update_seq=true",
+    ] {
+        let (status, body) = nodes[0].get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["update_seq"], expected, "{path}");
+    }
+}
+
 // In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
 // per-node token (CouchDB packs per-shard purge seqs with
 // `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
