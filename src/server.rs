@@ -234,6 +234,7 @@ fn build_state(
                 .timeout(Duration::from_secs(60))
                 .build()?,
             auth,
+            health: Default::default(),
         },
         db_updates: api::DbUpdates::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),

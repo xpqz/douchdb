@@ -786,6 +786,7 @@ mod tests {
             },
             client: reqwest::Client::new(),
             auth: None,
+            health: Default::default(),
         };
         activate_map_everywhere(&ctx, &db, "activate", &target, &HeaderMap::new())
             .await

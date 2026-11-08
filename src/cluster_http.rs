@@ -15,6 +15,37 @@ pub struct ClusterCtx {
     pub cluster: Cluster,
     pub client: reqwest::Client,
     pub auth: Option<Auth>,
+    /// Which peers discovery last found unreachable.
+    pub health: NodeHealth,
+}
+
+/// What the last discovery pass found out about each peer. Reads use it to
+/// send a down node's shards to a replica in the first round instead of
+/// failing against the node first. It is a hint: a stale "down" costs a
+/// detour, never a wrong answer, and the next pass that reaches the node
+/// clears it.
+#[derive(Default)]
+pub struct NodeHealth {
+    down: Mutex<Vec<bool>>,
+}
+
+impl NodeHealth {
+    pub fn set_down(&self, node: usize, down: bool) {
+        let mut flags = self.down.lock().unwrap_or_else(|p| p.into_inner());
+        if flags.len() <= node {
+            flags.resize(node + 1, false);
+        }
+        flags[node] = down;
+    }
+
+    pub fn is_down(&self, node: usize) -> bool {
+        self.down
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
