@@ -1,7 +1,7 @@
 //! Tantivy-backed CouchDB search indexes.
 
 use crate::db::{ApiError, Db, DbResult};
-use crate::index_cache::Registry;
+use crate::index_cache::{Gate, Permit, Registry};
 use crate::js::JsError;
 use crate::util::hex;
 use md5::{Digest, Md5};
@@ -24,7 +24,7 @@ use tantivy::schema::{
     Field, FieldType, OwnedValue, Schema, TantivyDocument, FAST, INDEXED, STORED, STRING, TEXT,
 };
 use tantivy::{Index, IndexReader, IndexSettings, ReloadPolicy, Searcher, Term};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const SEARCH_VERSION: u8 = 3;
 const PAGE_LIMIT: usize = 2000;
@@ -412,14 +412,15 @@ async fn build_index(
     index_name: &str,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
-    gate: OwnedRwLockReadGuard<()>,
+    gate: Permit,
     mut entry: OwnedMutexGuard<Option<Cached>>,
-) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
+) -> DbResult<(Snapshot, Permit)> {
     // Capture the bound before reading the snapshot. A write that lands
     // while the index is being built then leaves the database ahead of the
     // recorded sequence, so the next query rebuilds instead of trusting a
     // snapshot that may have missed it. The bound is the changes watermark: a
     // write in flight has taken a sequence but is not readable yet.
+    gate.check()?;
     let last_seq = db.changes_watermark(0, None);
     let docs = db.map_docs(None).await?;
     let path = index_dir(db, ddoc, index_name);
@@ -443,7 +444,7 @@ async fn build_index(
         // permit is returned so a query can keep it for its whole lifetime.
         // The old index's files are about to be removed, so forget it first.
         *entry = None;
-        let result = build_index_files(path, docs, &source, meta, placement, limits)
+        let result = build_index_files(path, docs, &source, meta, placement, limits, &gate)
             .and_then(|(index, meta)| Cached::open(index, meta))
             .map(|cached| {
                 let snapshot = cached.snapshot.clone();
@@ -457,6 +458,31 @@ async fn build_index(
     Ok((result?, gate))
 }
 
+/// Documents indexed between checks that the database still exists.
+const INDEX_BATCH: usize = 1000;
+
+/// The index function over `docs` a batch at a time, so a build notices that
+/// its database was deleted between batches, not after the last document.
+fn index_in_batches(
+    source: &str,
+    docs: &[(String, String)],
+    limits: crate::view::ViewLimits,
+    gate: &Permit,
+) -> DbResult<Vec<IndexedDoc>> {
+    let mut indexed = Vec::new();
+    for batch in docs.chunks(INDEX_BATCH) {
+        gate.check()?;
+        indexed.extend(run_index_json(source, batch, limits).map_err(|reason| {
+            ApiError::new(
+                500,
+                "search_index_error",
+                format!("index function failed: {reason}"),
+            )
+        })?);
+    }
+    Ok(indexed)
+}
+
 /// Build the index at `path` and write `meta` with the indexed documents.
 fn build_index_files(
     path: PathBuf,
@@ -465,14 +491,9 @@ fn build_index_files(
     mut meta: SearchMeta,
     placement: (u32, bool),
     limits: crate::view::ViewLimits,
+    gate: &Permit,
 ) -> DbResult<(Index, SearchMeta)> {
-    let indexed = run_index_json(source, &docs, limits).map_err(|reason| {
-        ApiError::new(
-            500,
-            "search_index_error",
-            format!("index function failed: {reason}"),
-        )
-    })?;
+    let indexed = index_in_batches(source, &docs, limits, gate)?;
     let indexed: Vec<Arc<SearchDoc>> = indexed
         .into_iter()
         .map(|doc| Arc::new(SearchDoc::new(doc.id, doc.fields, placement)))
@@ -510,7 +531,10 @@ fn build_index_files(
         .writer(50_000_000)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
 
-    for doc in &indexed {
+    for (at, doc) in indexed.iter().enumerate() {
+        if at.is_multiple_of(INDEX_BATCH) {
+            gate.check()?;
+        }
         writer
             .add_document(tantivy_doc(
                 &doc.id,
@@ -520,6 +544,7 @@ fn build_index_files(
             ))
             .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
     }
+    gate.check()?;
     finish_writer(writer, meta.last_seq)?;
 
     meta.docs = indexed
@@ -588,10 +613,10 @@ fn finish_writer(mut writer: tantivy::IndexWriter, last_seq: u64) -> DbResult<()
 
 /// The result of bringing an index up to date from its changes.
 enum Update {
-    Done(Snapshot, OwnedRwLockReadGuard<()>),
+    Done(Snapshot, Permit),
     /// Field types inferred over the updated documents differ from the
     /// index's schema, which only a rebuild can change.
-    Rebuild(OwnedRwLockReadGuard<()>, OwnedMutexGuard<Option<Cached>>),
+    Rebuild(Permit, OwnedMutexGuard<Option<Cached>>),
 }
 
 /// Bring the cached index up to date with the changes since its
@@ -600,7 +625,7 @@ async fn update_index(
     db: &Db,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
-    gate: OwnedRwLockReadGuard<()>,
+    gate: Permit,
     mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<Update> {
     let since = entry
@@ -641,19 +666,14 @@ async fn update_index(
     tokio::task::spawn_blocking(move || {
         // Taken out while it changes: if anything below fails, the next query
         // finds no cached index and reloads it from disk.
+        gate.check()?;
         let Some(Cached { reader, snapshot }) = entry.take() else {
             return Ok(Update::Rebuild(gate, entry));
         };
         let tantivy_index = snapshot.index;
         // Free of copying unless a query still holds the previous snapshot.
         let mut meta = Arc::unwrap_or_clone(snapshot.meta);
-        let indexed = run_index_json(&source, &live, limits).map_err(|reason| {
-            ApiError::new(
-                500,
-                "search_index_error",
-                format!("index function failed: {reason}"),
-            )
-        })?;
+        let indexed = index_in_batches(&source, &live, limits, &gate)?;
         for id in &changed {
             if let Some(old) = meta.docs.remove(id) {
                 meta.kinds.remove(&old);
@@ -706,7 +726,10 @@ async fn update_index(
         for id in &changed {
             writer.delete_term(Term::from_field_text(id_field, id));
         }
-        for doc in &added {
+        for (at, doc) in added.iter().enumerate() {
+            if at.is_multiple_of(INDEX_BATCH) {
+                gate.check()?;
+            }
             writer
                 .add_document(tantivy_doc(
                     &doc.id,
@@ -829,12 +852,12 @@ impl Directory for UnsyncedDirectory {
     }
 }
 
-fn build_gate(db: &Db) -> Arc<RwLock<()>> {
+fn build_gate(db: &Db) -> Arc<Gate> {
     gates().get(&db.path)
 }
 
-fn gates() -> &'static Registry<RwLock<()>> {
-    static GATES: Registry<RwLock<()>> = Registry::new();
+fn gates() -> &'static Registry<Gate> {
+    static GATES: Registry<Gate> = Registry::new();
     &GATES
 }
 
@@ -939,11 +962,11 @@ fn index_entry(path: &Path) -> Entry {
 }
 
 /// Drop cached indexes when a database is deleted or recreated, and the
-/// database's gate with them. Takes the write side of the gate, so it waits
-/// for a build or query in flight; see `view::forget_db`.
+/// database's gate with them. Signals the gate, so a build or query in flight
+/// fails with not_found, then takes its write side; see `view::forget_db`.
 pub async fn forget_db(db_path: &Path) {
     let gate = gates().get(db_path);
-    let _gate = gate.write_owned().await;
+    let _gate = gate.forget().await;
     drop_cached(db_path);
     gates().retain(|path| path != db_path);
 }
@@ -960,11 +983,12 @@ async fn ensure_index(
     index_name: &str,
     spec: &SearchSpec,
     limits: crate::view::ViewLimits,
-    gate: OwnedRwLockReadGuard<()>,
-) -> DbResult<(Snapshot, OwnedRwLockReadGuard<()>)> {
+    gate: Permit,
+) -> DbResult<(Snapshot, Permit)> {
     let path = index_dir(db, ddoc, index_name);
     let signature = design_signature(spec);
-    let mut entry = index_entry(&path).lock_owned().await;
+    // A query queued behind a long build leaves when the database is deleted.
+    let mut entry = gate.until(index_entry(&path).lock_owned()).await?;
     // Check after acquiring the per-index lock: another request may have
     // completed an update or rebuild while this one waited.
     if entry.is_none() {
@@ -1298,7 +1322,7 @@ pub async fn query(
     // Hold the read permit for the whole query, not just the rebuild, so a
     // concurrent `_search_cleanup` cannot remove the index under an open
     // searcher.
-    let gate = build_gate(db).read_owned().await;
+    let gate = build_gate(db).read().await?;
     let (snapshot, gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     if started.elapsed().as_millis() as u64 > request.timeout_ms {
         return Err(timeout_error());
@@ -1311,12 +1335,15 @@ pub async fn query(
     // Scanning the hits is CPU-bound and can be long, so it runs on the
     // blocking pool, which keeps the permit as a rebuild does.
     let scan_request = request.clone();
-    let (scanned, _gate) = tokio::task::spawn_blocking(move || {
+    let (scanned, gate) = tokio::task::spawn_blocking(move || {
         let scanned = scan(&snapshot, &scan_request, &*query, deadline);
         (scanned, gate)
     })
     .await
     .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    // The scan is over and the snapshot with it: reading the documents for the
+    // page does not use the index files, so a delete need not wait for it.
+    drop(gate);
     let Scan {
         total_rows,
         offset,
@@ -1614,7 +1641,7 @@ pub async fn info(
     limits: crate::view::ViewLimits,
 ) -> DbResult<Value> {
     let spec = load_spec(db, ddoc, index_name).await?;
-    let gate = build_gate(db).read_owned().await;
+    let gate = build_gate(db).read().await?;
     let (snapshot, _gate) = ensure_index(db, ddoc, index_name, &spec, limits, gate).await?;
     let meta = &snapshot.meta;
     let copies = db.replicas_of_shard(0).len().max(1);
@@ -1637,7 +1664,7 @@ pub async fn info(
 pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Wait for in-flight builds (including builds whose request was cancelled)
     // before removing their directories.
-    let _gate = build_gate(db).write_owned().await;
+    let _gate = build_gate(db).write().await?;
     drop_cached(&db.path);
     let directory = db.path.join("_search_indexes");
     if directory.exists() {
@@ -1846,7 +1873,7 @@ mod tests {
         assert_eq!(registry().count_under(&prefix), 1);
 
         // A build or query holds the read side of the gate.
-        let reader = build_gate(&db).read_owned().await;
+        let reader = build_gate(&db).read().await.unwrap();
         let path = db.path.clone();
         let forget = forget_db(&path);
         tokio::pin!(forget);
@@ -1876,7 +1903,7 @@ mod tests {
 
     /// Whether a query holds the read side of the database's gate.
     fn gate_is_held(db: &Db) -> bool {
-        build_gate(db).try_write_owned().is_err()
+        build_gate(db).is_held()
     }
 
     /// Deleting a database must not wait for a search build: the build is
@@ -1952,6 +1979,41 @@ mod tests {
         assert_eq!(result["rows"][0]["id"], "b", "{result}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A build running when its database is deleted stops at its next batch
+    /// check instead of indexing the rest of the documents.
+    #[tokio::test]
+    async fn a_build_stops_between_batches_once_the_database_is_deleted() {
+        let path = std::env::temp_dir().join(format!("douchdb-batches-{}", crate::util::uuid()));
+        let gate = gates().get(&path);
+        let permit = gate.read().await.unwrap();
+        let docs = vec![("a".to_string(), r#"{"_id":"a","name":"x"}"#.to_string())];
+        let source = "function(doc){ index('name', doc.name); }";
+        let limits = crate::view::ViewQuery::default().limits;
+        assert_eq!(
+            index_in_batches(source, &docs, limits, &permit)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The first poll signals the deletion; it then waits for the permit.
+        let forget = gate.forget();
+        tokio::pin!(forget);
+        let done = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(forget.as_mut(), cx).is_ready())
+        })
+        .await;
+        assert!(!done, "the delete finished under a permit");
+        let error = index_in_batches(source, &docs, limits, &permit)
+            .map(|indexed| indexed.len())
+            .expect_err("the build went on after the delete");
+        assert_eq!(error.status, 404);
+        // Readers of the signalled gate are refused, and so are queued ones.
+        assert_eq!(gate.read().await.err().map(|error| error.status), Some(404));
+        drop(permit);
+        drop(forget.await);
     }
 
     /// A small deterministic generator, so a failing sequence can be replayed.
@@ -2171,7 +2233,7 @@ mod tests {
             .await
             .unwrap();
         let spec = load_spec(&db, "_design/a", "idx").await.unwrap();
-        let gate = build_gate(&db).read_owned().await;
+        let gate = build_gate(&db).read().await.unwrap();
         let (snapshot, _gate) = ensure_index(&db, "_design/a", "idx", &spec, limits, gate)
             .await
             .unwrap();
