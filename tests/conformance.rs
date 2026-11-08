@@ -6318,7 +6318,7 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
+    assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
 }
 
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,

@@ -900,6 +900,121 @@ pub(crate) async fn commit_docs(
     Ok((out, met))
 }
 
+/// What `_purge` reports for one document (`fabric_doc_purge:format_resps`).
+pub(crate) enum PurgeOutcome {
+    /// At least `w` copies answered and they agree on the revisions purged.
+    Ok(Vec<String>),
+    /// Some copy purged, but fewer than `w` did or the copies disagree.
+    Accepted(Vec<String>),
+    /// No copy purged: the first failure.
+    Error(ApiError),
+}
+
+/// `fabric:purge_docs`: send each document's purge to every copy of its
+/// shard and judge each document by the write quorum. The coordinator's own
+/// copy is purged in-process and the others through the forwarded `_purge`
+/// call, which only applies to the receiving node. A copy that is down or
+/// fails counts against the quorum but does not stop the others.
+pub(crate) async fn purge_docs(
+    st: &AppState,
+    db: &Db,
+    dbname: &str,
+    request: &serde_json::Map<String, Value>,
+    w: usize,
+    headers: &HeaderMap,
+) -> Vec<(String, PurgeOutcome)> {
+    let ctx = &st.ctx;
+    let mut groups: HashMap<usize, serde_json::Map<String, Value>> = HashMap::new();
+    let mut copies: Vec<usize> = Vec::new();
+    for (id, revs) in request {
+        let (_, replicas) = db.placement_of_doc(id);
+        copies.push(replicas.len());
+        for node in replicas {
+            groups
+                .entry(node)
+                .or_default()
+                .insert(id.clone(), revs.clone());
+        }
+    }
+    crate::telemetry::record_fanout(groups.len() as u64);
+
+    let replies = crate::cluster_http::in_one_round(join_all(groups.into_iter().map(
+        |(node, sub)| async move {
+            let body = Value::Object(sub);
+            let reply = if node == ctx.cluster.me {
+                db.purge(&body).await
+            } else {
+                match ctx.cluster.nodes.get(node) {
+                    Some(peer) => {
+                        forward_json(ctx, peer, dbname, "_purge", "", &body, headers).await
+                    }
+                    None => Err(nodedown()),
+                }
+            };
+            (body, reply)
+        },
+    )))
+    .await;
+
+    let mut tallies: HashMap<&str, (Vec<Vec<String>>, Option<ApiError>)> = HashMap::new();
+    for (body, reply) in &replies {
+        let ids = body.as_object().into_iter().flat_map(|sub| sub.keys());
+        for id in ids {
+            let (oks, failure) = tallies.entry(id.as_str()).or_default();
+            match reply {
+                Ok(reply) => match purged_revs(reply, id) {
+                    Some(revs) => oks.push(revs),
+                    None => {
+                        failure.get_or_insert_with(|| {
+                            ApiError::internal("replica sent a malformed _purge reply")
+                        });
+                    }
+                },
+                Err(e) => {
+                    failure
+                        .get_or_insert_with(|| ApiError::new(e.status, e.error, e.reason.clone()));
+                }
+            }
+        }
+    }
+
+    request
+        .keys()
+        .zip(copies)
+        .map(|(id, copies)| {
+            let (oks, failure) = tallies.remove(id.as_str()).unwrap_or_default();
+            let outcome = if oks.is_empty() {
+                PurgeOutcome::Error(
+                    failure.unwrap_or_else(|| ApiError::internal("no replica answered the purge")),
+                )
+            } else {
+                let all: BTreeSet<&String> = oks.iter().flatten().collect();
+                let all = all.into_iter().cloned().collect();
+                let agree = oks.windows(2).all(|pair| pair[0] == pair[1]);
+                if oks.len() >= write_quorum(w, copies) && agree {
+                    PurgeOutcome::Ok(all)
+                } else {
+                    PurgeOutcome::Accepted(all)
+                }
+            };
+            (id.clone(), outcome)
+        })
+        .collect()
+}
+
+/// The sorted revisions one copy reports purged for `id`.
+fn purged_revs(reply: &Value, id: &str) -> Option<Vec<String>> {
+    let mut revs: Vec<String> = reply
+        .get("purged")?
+        .get(id)?
+        .as_array()?
+        .iter()
+        .map(|rev| rev.as_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    revs.sort();
+    Some(revs)
+}
+
 /// Routing needs ids, so generate them before grouping. `Db::put_docs` would
 /// otherwise assign them per replica and the copies would diverge.
 fn assign_ids(docs: &mut [Value]) -> Vec<String> {
