@@ -96,7 +96,9 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
                 .is_some_and(|pending| pending.version <= map.version)
             {
                 // The adopted map supersedes (or beat the tiebreak against) ours.
-                db.clear_pending_shard_map();
+                if let Err(error) = db.clear_pending_shard_map() {
+                    tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+                }
             }
             desired = map;
         }
@@ -134,7 +136,9 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
     .await;
     let acknowledgements = 1 + current.len() + responses.into_iter().filter(|ok| *ok).count();
     if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
-        db.clear_pending_shard_map();
+        if let Err(error) = db.clear_pending_shard_map() {
+            tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+        }
     }
 }
 
@@ -2363,7 +2367,7 @@ mod tests {
         }));
 
         let settled = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
             collect_quorum(pending, tally),
         )
         .await

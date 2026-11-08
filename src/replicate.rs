@@ -333,7 +333,52 @@ async fn ensure_all_accounted(
     Ok(())
 }
 
-/// Run one anti-entropy pass over every database and peer. Returns false when a
+/// How many databases that are not open an anti-entropy pass opens: a quarter
+/// of `--max-open-dbs`, at least one.
+fn cold_budget(max_open_dbs: usize) -> usize {
+    (max_open_dbs / 4).max(1)
+}
+
+/// The databases one anti-entropy pass works through, and where the next
+/// pass resumes.
+///
+/// Every open database is included: it costs nothing to reach. Of the closed
+/// ones, at most `budget` are taken in name order starting after `cursor`
+/// and wrapping around, so successive passes visit every database and no
+/// pass opens more than `budget` of them. `names` is sorted.
+fn sweep_order(
+    names: &[String],
+    open: &std::collections::HashSet<String>,
+    cursor: Option<&str>,
+    budget: usize,
+) -> (Vec<String>, Option<String>) {
+    let (hot, cold): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|name| open.contains(*name));
+    let start = cursor.map_or(0, |after| {
+        cold.partition_point(|name| name.as_str() <= after)
+    });
+    let taken: Vec<&String> = cold
+        .iter()
+        .skip(start)
+        .chain(cold.iter().take(start))
+        .take(budget)
+        .copied()
+        .collect();
+    let next = taken
+        .last()
+        .map(|name| name.to_string())
+        .or_else(|| cursor.map(str::to_string));
+    let order = hot.into_iter().chain(taken).cloned().collect();
+    (order, next)
+}
+
+/// Run one anti-entropy pass over the databases and peers. Returns false when
+/// a pass is already in flight.
+///
+/// A pass covers the open databases and a bounded share of the closed ones
+/// (see `sweep_order`), going through the cache as least recently used so
+/// that it neither opens nor closes the whole set when there are more
+/// databases than `--max-open-dbs`. A named database is always processed. Returns false when a
 /// pass is already in flight.
 pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     let Ok(_background) = state.admission.try_background() else {
@@ -347,11 +392,22 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
     names.sort();
     if let Some(only) = only_db {
         names.retain(|name| name == &only);
+    } else {
+        let open = state.open_db_names().await;
+        let budget = cold_budget(state.config.max_open_dbs);
+        let (order, cursor) = sweep_order(
+            &names,
+            &open,
+            state.cluster_state.sweep_cursor().as_deref(),
+            budget,
+        );
+        state.cluster_state.set_sweep_cursor(cursor);
+        names = order;
     }
 
     let mut error: Option<String> = None;
     for name in names {
-        let Ok(db) = state.db(&name).await else {
+        let Ok(db) = state.db_cold(&name).await else {
             continue;
         };
         crate::fabric::reconcile_shard_map(&state.ctx, &db).await;
@@ -402,6 +458,8 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                 }
             }
         }
+        drop(db);
+        state.release_cold().await;
     }
     state.cluster_state.finish_replication(error);
     true
@@ -656,6 +714,54 @@ mod tests {
 
         server.abort();
         drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Successive passes reach every closed database, each pass takes at
+    /// most the budget of them, and the open ones are in every pass.
+    #[test]
+    fn sweep_order_visits_every_database_eventually() {
+        let names: Vec<String> = (0..10).map(|n| format!("db{n}")).collect();
+        let open: std::collections::HashSet<String> =
+            ["db2", "db7"].iter().map(|n| n.to_string()).collect();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let (order, next) = sweep_order(&names, &open, cursor.as_deref(), 2);
+            let cold = order.iter().filter(|n| !open.contains(*n)).count();
+            assert!(cold <= 2, "{cold} closed databases in one pass");
+            assert!(order.contains(&"db2".to_string()) && order.contains(&"db7".to_string()));
+            seen.extend(order);
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 10, "{seen:?}");
+        // With nothing closed there is nothing to resume from.
+        let all: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let (order, next) = sweep_order(&names, &all, Some("db3"), 2);
+        assert_eq!(order.len(), 10);
+        assert_eq!(next.as_deref(), Some("db3"));
+    }
+
+    /// A pass used to open every database through the cache, so with more
+    /// databases than `--max-open-dbs` each pass closed and reopened them all.
+    #[tokio::test]
+    async fn anti_entropy_pass_opens_a_bounded_number_of_databases() {
+        let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 4);
+        for n in 0..20 {
+            st.create_db(&format!("db{n:02}"), false, None, None)
+                .await
+                .unwrap();
+        }
+        let before = st.db_opens.load(Ordering::Relaxed);
+        assert!(sync_once(st.clone(), None).await);
+        let opened = st.db_opens.load(Ordering::Relaxed) - before;
+        let budget = cold_budget(4) as u64;
+        assert!(
+            opened <= budget,
+            "a pass opened {opened} databases, budget is {budget}"
+        );
+        st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
     }
 }

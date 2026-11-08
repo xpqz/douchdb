@@ -137,7 +137,11 @@ async function pageTest({ remoteBase, user, pass, dbName }) {
     ok(sync.push.ok && sync.pull.ok, "two-way sync succeeded");
     // The two directions of one sync() run concurrently and PouchDB's result
     // can reflect only part of the exchange, so settle with a second round
-    // before comparing the sides.
+    // before comparing the sides. (Issue #145: one early run saw the two sides
+    // disagree after a single sync. Node PouchDB 9 against couchdb:3.5.3
+    // reproduced it once in 1300 runs, with the same shape: the local side held
+    // both revisions and the remote only its own; against douchdb 0 in 1000.
+    // So it is PouchDB's push/pull interleaving, not a douchdb race.)
     await local.sync(remote);
     const l = await local.get("conflict", { conflicts: true });
     const r = await remote.get("conflict", { conflicts: true });

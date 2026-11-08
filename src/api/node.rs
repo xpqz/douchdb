@@ -25,22 +25,28 @@ pub async fn cluster_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Re
     };
     let mut databases = Vec::new();
     for name in st.db_names().await {
-        let Ok(db) = st.db(&name).await else {
+        let Ok(placed) = st.placement(&name).await else {
             continue;
         };
-        let map = db.shard_map();
-        let counts = db.shard_counts().await.unwrap_or_default();
+        let map = placed.shard_map;
+        // Counts only for an open database; a closed one is not opened here.
+        let counts = match &placed.open {
+            Some(db) => db.shard_counts().await.ok(),
+            None => None,
+        };
         let shards: Vec<Value> = (0..map.q)
             .map(|shard| {
                 let replicas = map.replicas_of(shard).to_vec();
-                let (docs, deleted) = counts.get(shard as usize).copied().unwrap_or((0, 0));
+                let count = counts
+                    .as_ref()
+                    .and_then(|counts| counts.get(shard as usize).copied());
                 json!({
                     "shard": shard,
                     "replicas": replicas,
                     "owner": map.owner_of(shard),
                     "local": replicas.contains(&st.ctx.cluster.me),
-                    "docs": docs,
-                    "deleted": deleted,
+                    "docs": count.map(|(docs, _)| docs),
+                    "deleted": count.map(|(_, deleted)| deleted),
                 })
             })
             .collect();
@@ -127,8 +133,8 @@ pub async fn replication_resume(State(st): State<Arc<AppState>>, _: AdminOnly) -
 pub async fn dbs_metadata(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
     let mut out = Map::new();
     for name in st.db_names().await {
-        if let Ok(db) = st.db(&name).await {
-            out.insert(name, json!(db.shard_map()));
+        if let Ok(placed) = st.placement(&name).await {
+            out.insert(name, json!(placed.shard_map));
         }
     }
     json(StatusCode::OK, Value::Object(out))
@@ -139,8 +145,8 @@ pub async fn db_metadata(
     DbName(name): DbName,
     _: AdminOnly,
 ) -> Response {
-    match st.db(&name).await {
-        Ok(db) => json(StatusCode::OK, json!(db.shard_map())),
+    match st.placement(&name).await {
+        Ok(placed) => json(StatusCode::OK, json!(placed.shard_map)),
         Err(error) => fail(error),
     }
 }
@@ -149,6 +155,7 @@ pub async fn db_metadata(
 pub async fn db_migration_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -170,12 +177,12 @@ pub async fn db_migration_put(
         ));
     }
     // Freezes client writes on this peer for the verification window.
-    if let Err(error) = db.begin_migration(map) {
+    if let Err(error) = db.begin_migration(map, query.get("id").cloned()) {
         return fail(error);
     }
     // Writes accepted before the freeze may still be fanning out to replicas.
     // Do not report the freeze until they have landed.
-    if !db.drain_writes(crate::cluster_ops::WRITE_DRAIN).await {
+    if !db.drain_writes(crate::cluster_ops::write_drain()).await {
         return fail(ApiError::new(
             503,
             "rebalance_in_progress",
@@ -185,9 +192,14 @@ pub async fn db_migration_put(
     ok()
 }
 
+/// Clears the migration announced with the same `id`. A different id, or none
+/// while the migration has one, is a 409 and leaves the freeze in place, so a
+/// stale or rival coordinator cannot unfreeze another's rebalance. Clearing
+/// when there is nothing to clear succeeds.
 pub async fn db_migration_delete(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
@@ -196,9 +208,15 @@ pub async fn db_migration_delete(
     }
     match st.db(&name).await {
         Ok(db) => {
-            db.clear_migration_map();
-            db.set_rebalance_in_progress(false);
-            ok()
+            if db.clear_migration_if(query.get("id").map(String::as_str)) {
+                ok()
+            } else {
+                fail(ApiError::new(
+                    409,
+                    "rebalance_in_progress",
+                    "the migration in progress belongs to another coordinator",
+                ))
+            }
         }
         Err(error) => fail(error),
     }

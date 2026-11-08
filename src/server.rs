@@ -207,6 +207,7 @@ fn build_state(
         root: args.data.clone(),
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
+        db_opens: Default::default(),
         fs_health: Default::default(),
         config,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -367,6 +368,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     validate_config(&args)?;
     crate::index_cache::set_max_open(args.max_open_indexes);
+    crate::cluster_ops::set_write_drain_ms(args.rebalance_write_drain_ms);
+    crate::cluster_ops::set_stable_wait_ms(args.rebalance_stable_wait_ms);
+    crate::db::set_rebalance_freeze_ms(args.rebalance_freeze_ms);
+    crate::js::set_worker_startup_ms(args.js_worker_startup_ms);
     let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
     let result = serve(&args).await;
     if let Some(telemetry) = telemetry {

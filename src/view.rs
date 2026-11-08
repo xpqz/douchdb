@@ -1264,15 +1264,29 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<RwLock<()>> {
-    static GATES: Registry<RwLock<()>> = Registry::new();
-    GATES.get(&db.path)
+    gates().get(&db.path)
 }
 
-/// Drop cached index handles when a database is deleted or recreated. The
-/// LevelDB files live under the database directory.
-pub fn forget_db(db_path: &Path) {
+fn gates() -> &'static Registry<RwLock<()>> {
+    static GATES: Registry<RwLock<()>> = Registry::new();
+    &GATES
+}
+
+/// Drop cached index handles when a database is deleted or recreated, and the
+/// database's gate with them. The LevelDB files live under the database
+/// directory.
+///
+/// Takes the write side of the gate, so it waits for a query that is using an
+/// index and no query starts against a half-forgotten one. The gate leaves the
+/// registry while the write side is held: a caller that already cloned it
+/// queues behind this call, and one that asks afterwards gets a fresh gate,
+/// which is the one the recreated database uses.
+pub async fn forget_db(db_path: &Path) {
+    let gate = gates().get(db_path);
+    let _gate = gate.write_owned().await;
     let prefix = db_path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&prefix));
+    gates().retain(|path| path != db_path);
 }
 
 impl ViewIndex {
@@ -3411,15 +3425,11 @@ mod tests {
 
     #[test]
     fn unique_keys_scales_with_the_number_of_keys() {
-        // A pairwise scan needs about 12 million ICU comparisons here.
-        let keys: Vec<Value> = (0..5_000).map(|n| json!(format!("key-{n:06}"))).collect();
-        let started = std::time::Instant::now();
+        // A pairwise scan needs over a billion ICU comparisons here, which
+        // no machine finishes; sorting needs under a million. No clock is
+        // involved: the pairwise version would not return.
+        let keys: Vec<Value> = (0..50_000).map(|n| json!(format!("key-{n:06}"))).collect();
         assert_eq!(unique_keys(&keys).len(), keys.len());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "unique_keys took {:?}",
-            started.elapsed()
-        );
     }
 
     // The expected values below were captured from CouchDB 3.5.
@@ -3560,7 +3570,9 @@ mod tests {
             let (db, spec) = (db.clone(), spec.clone());
             async move { ensure_rows(&db, "_design/v", "v", &spec, limits).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         // The holder catches the index up with writes that land meanwhile.
         db.put_docs(vec![write("b"), write("c")], true)
             .await
@@ -4291,15 +4303,17 @@ mod tests {
 
     #[test]
     fn js_reducer_gives_every_call_the_full_timeout() {
+        // Three calls of 1.5 s need more than one 4 s budget between them,
+        // but each fits its own with a wide margin for a loaded machine.
         let limits = ViewLimits {
-            timeout: Duration::from_millis(300),
+            timeout: Duration::from_secs(4),
             ..ViewLimits::default()
         };
         let mut reducer = JsReducer::new(
-            "function(k, v, re){ var end = Date.now() + 150; while (Date.now() < end) {} return 1; }",
+            "function(k, v, re){ var end = Date.now() + 1500; while (Date.now() < end) {} return 1; }",
             limits,
         );
-        for _ in 0..4 {
+        for _ in 0..3 {
             assert_eq!(reducer.call(&[], &[json!(1)], false).unwrap(), json!(1));
         }
         let mut endless = JsReducer::new("function(k, v, re){ while (true) {} }", limits);
@@ -4706,20 +4720,22 @@ mod tests {
             ),
             partitioned: false,
         };
+        // A task that does nothing but yield counts how often the runtime got
+        // to run it. A call that blocks the runtime leaves it a handful of
+        // turns; one that runs on the blocking pool leaves it thousands.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let ticker = tokio::spawn(async move {
-            let mut longest = Duration::ZERO;
-            let mut last = std::time::Instant::now();
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-                let now = std::time::Instant::now();
-                longest = longest.max(now - last);
-                last = now;
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let (flag, ticks) = (stop.clone(), ticks.clone());
+            async move {
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            longest
         });
         tokio::task::yield_now().await;
+        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
@@ -4727,12 +4743,13 @@ mod tests {
         let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
             .unwrap();
+        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let longest = ticker.await.unwrap();
+        ticker.await.unwrap();
         assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
         assert!(
-            longest < Duration::from_millis(300),
-            "the reduce blocked the runtime for {longest:?}"
+            ticks_during > 1_000,
+            "the reduce blocked the runtime: {ticks_during} turns while it ran"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -4779,6 +4796,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Deleting or recreating a database must wait for a query that is using
+    /// its indexes, and must leave no gate behind for the deleted database.
+    #[tokio::test]
+    async fn forget_db_waits_for_a_query_in_flight() {
+        let root = std::env::temp_dir().join(format!("douchdb-forget-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "forget",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(open_indexes_under(&db.path), 1);
+
+        // A query holds the read side of the gate while it uses an index.
+        let reader = index_gate(&db).read_owned().await;
+        let path = db.path.clone();
+        let forget = forget_db(&path);
+        tokio::pin!(forget);
+        // One poll is enough: the only thing forget_db awaits is the gate.
+        let done = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(forget.as_mut(), cx).is_ready())
+        })
+        .await;
+        assert!(!done, "forget_db finished while a query held the gate");
+        assert_eq!(
+            open_indexes_under(&db.path),
+            1,
+            "index dropped under a reader"
+        );
+
+        drop(reader);
+        forget.await;
+        assert_eq!(open_indexes_under(&db.path), 0);
+        assert_eq!(
+            gates().count_under(&db.path),
+            0,
+            "gate outlived its database"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn builtin_reduces_work() {
         assert_eq!(
@@ -4820,20 +4899,22 @@ mod tests {
             reduce: None,
             partitioned: false,
         };
+        // A task that does nothing but yield counts how often the runtime got
+        // to run it. A call that blocks the runtime leaves it a handful of
+        // turns; one that runs on the blocking pool leaves it thousands.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let ticker = tokio::spawn(async move {
-            let mut longest = Duration::ZERO;
-            let mut last = std::time::Instant::now();
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-                let now = std::time::Instant::now();
-                longest = longest.max(now - last);
-                last = now;
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let (flag, ticks) = (stop.clone(), ticks.clone());
+            async move {
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            longest
         });
         tokio::task::yield_now().await;
+        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
@@ -4841,12 +4922,13 @@ mod tests {
         let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
             .unwrap();
+        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let longest = ticker.await.unwrap();
+        ticker.await.unwrap();
         assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
         assert!(
-            longest < Duration::from_millis(300),
-            "the map blocked the runtime for {longest:?}"
+            ticks_during > 1_000,
+            "the map blocked the runtime: {ticks_during} turns while it ran"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);

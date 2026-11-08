@@ -174,6 +174,14 @@ fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option
     }
 }
 
+fn clear_error(path: &Path, error: &dyn std::fmt::Display) -> ApiError {
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("{}: {error}", file_name(path)),
+    )
+}
+
 /// Serialize `value` and replace `path` with it atomically; see
 /// [`write_atomic`].
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
@@ -189,17 +197,96 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()
     write_atomic(path, &bytes).map_err(|error| write_error(&error))
 }
 
+/// Temporary files of writes in flight in this process. Cleanup of stale
+/// temporary files must not remove one of these.
+static LIVE_TEMPS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+fn live_temps() -> std::sync::MutexGuard<'static, Option<std::collections::HashSet<PathBuf>>> {
+    LIVE_TEMPS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// A temporary file being written; it counts as in flight until dropped,
+/// which is after the caller has renamed or removed it.
+struct LiveTemp(PathBuf);
+
+impl LiveTemp {
+    fn register(path: PathBuf) -> LiveTemp {
+        live_temps()
+            .get_or_insert_with(Default::default)
+            .insert(path.clone());
+        LiveTemp(path)
+    }
+}
+
+impl Drop for LiveTemp {
+    fn drop(&mut self) {
+        if let Some(set) = live_temps().as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Whether `name` is one `write_temp` produces: `.<name>.<pid>.<n>.tmp`.
+fn is_temp_name(name: &str) -> bool {
+    let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, '.');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (counter, pid, target) = (parts.next(), parts.next(), parts.next());
+    numeric(counter) && numeric(pid) && target.is_some_and(|t| !t.is_empty())
+}
+
+/// Remove the temporary files of interrupted writes from `dir` (not its
+/// subdirectories). Only names matching [`is_temp_name`] go, and never one a
+/// write in this process is still using, so this is safe while the directory
+/// is in use; whether the pid in a name is alive is not considered. A file
+/// that cannot be removed is logged, not an error.
+pub(crate) fn remove_stale_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_temp_name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        // Hold the registry while removing: a write registers its file before
+        // creating it, so a file that is not registered here is not in use.
+        let live = live_temps();
+        if live.as_ref().is_some_and(|set| set.contains(&path)) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file = %path.display(), "removed stale temporary file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(file = %path.display(), %error, "cannot remove stale temporary file")
+            }
+        }
+    }
+}
+
 /// Write `bytes` to a temporary file next to `path` and fsync it. A crash
 /// before the caller publishes it leaves only the temporary file behind.
-fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
+fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveTemp> {
     use std::io::Write;
     static TEMPS: AtomicU64 = AtomicU64::new(0);
-    let temp = path.with_file_name(format!(
+    let temp = LiveTemp::register(path.with_file_name(format!(
         ".{}.{}.{}.tmp",
         file_name(path),
         std::process::id(),
         TEMPS.fetch_add(1, Ordering::Relaxed)
-    ));
+    )));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -209,14 +296,14 @@ fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathB
     }
     #[cfg(not(unix))]
     let _ = private;
-    let written = options.open(&temp).and_then(|mut file| {
+    let written = options.open(&temp.0).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()
     });
     match written {
         Ok(()) => Ok(temp),
         Err(error) => {
-            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_file(&temp.0);
             Err(error)
         }
     }
@@ -245,8 +332,8 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 /// then fsync the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, false)?;
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
+    if let Err(error) = std::fs::rename(&temp.0, path) {
+        let _ = std::fs::remove_file(&temp.0);
         return Err(error);
     }
     sync_parent(path)
@@ -257,8 +344,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// all: it is written to a temporary file and hard-linked into place.
 pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, true)?;
-    let linked = std::fs::hard_link(&temp, path);
-    let _ = std::fs::remove_file(&temp);
+    let linked = std::fs::hard_link(&temp.0, path);
+    let _ = std::fs::remove_file(&temp.0);
     linked?;
     sync_parent(path)
 }
@@ -308,6 +395,22 @@ pub(crate) fn canonical_json(value: &Value) -> String {
     }
 }
 
+/// The placement metadata of a database that is not open.
+pub struct ClosedMeta {
+    pub q: u32,
+    pub partitioned: bool,
+    pub shard_map: ShardMap,
+    pub pending_shard_map: bool,
+}
+
+/// A rebalance target and the id of the coordinator that announced it. The id
+/// is absent when an older coordinator announced it.
+#[derive(PartialEq)]
+struct Migration {
+    map: ShardMap,
+    id: Option<String>,
+}
+
 pub struct Db {
     pub name: String,
     pub path: PathBuf,
@@ -323,7 +426,7 @@ pub struct Db {
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
     /// seed the target replicas.
-    migration_map: std::sync::RwLock<Option<ShardMap>>,
+    migration_map: std::sync::RwLock<Option<Migration>>,
     /// Held shared by every cluster write for its full duration, including
     /// detached replica fan-out, and taken exclusively to drain them when a
     /// rebalance freezes the database.
@@ -372,7 +475,16 @@ pub struct DbConfig {
 
 /// Upper bound for a cluster-wide rebalance write freeze. If the coordinator
 /// disappears, peers resume writes after this window instead of staying frozen.
-const REBALANCE_FREEZE_MS: u64 = 420_000;
+/// Default for `--rebalance-freeze-ms`.
+pub const DEFAULT_REBALANCE_FREEZE_MS: u64 = 420_000;
+
+static REBALANCE_FREEZE_MS: AtomicU64 = AtomicU64::new(DEFAULT_REBALANCE_FREEZE_MS);
+
+/// Set the freeze bound (`--rebalance-freeze-ms`). Every freeze on this node,
+/// whether it started the rebalance or accepted a peer's announcement, uses it.
+pub fn set_rebalance_freeze_ms(ms: u64) {
+    REBALANCE_FREEZE_MS.store(ms.max(1), Ordering::SeqCst);
+}
 
 fn now_millis() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -487,6 +599,12 @@ pub fn migrate_nested_dbs(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String
 impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
+        remove_stale_temps(&path);
+        if let Ok(indexes) = std::fs::read_dir(path.join("_search_indexes")) {
+            for index in indexes.flatten() {
+                remove_stale_temps(&index.path());
+            }
+        }
         let db_file = path.join("db.json");
         let file: DbFile = match read_metadata(&db_file)? {
             Some(file) => file,
@@ -609,6 +727,36 @@ impl Db {
             )));
         }
         load_security(&db_path(root, name)).map(|(_, security)| security)
+    }
+
+    /// What `open` would settle on for placement, read from the directory
+    /// without opening the database. `None` when `open` would have to rewrite
+    /// the shard map (none stored, or one for a different cluster size), so
+    /// the caller must open the database instead.
+    pub fn read_closed_meta(
+        root: &Path,
+        name: &str,
+        node_count: usize,
+    ) -> DbResult<Option<ClosedMeta>> {
+        let path = db_path(root, name);
+        let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
+            return Err(ApiError::not_found(format!(
+                "Database does not exist: {name}"
+            )));
+        };
+        let map_path = path.join("shard-map.json");
+        let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
+            return Ok(None);
+        };
+        if shard_map.node_count != node_count || !shard_map.is_valid(file.q, shard_map.node_count) {
+            return Ok(None);
+        }
+        Ok(Some(ClosedMeta {
+            q: file.q.max(1),
+            partitioned: file.partitioned,
+            shard_map,
+            pending_shard_map: Db::has_pending_shard_map(root, name),
+        }))
     }
 
     /// Whether a shard map this node has not acknowledged is waiting on disk.
@@ -947,7 +1095,8 @@ impl Db {
         self.migration_map
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
+            .as_ref()
+            .map(|migration| migration.map.clone())
     }
 
     /// Placement targeted by an in-progress rebalance. Falls back to the
@@ -969,14 +1118,14 @@ impl Db {
         self.replication_map().replicas_of(shard).contains(&node)
     }
 
-    pub fn set_migration_map(&self, map: ShardMap) -> DbResult<()> {
+    pub fn set_migration_map(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
         *self
             .migration_map
             .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(map);
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Migration { map, id });
         Ok(())
     }
 
@@ -984,7 +1133,7 @@ impl Db {
     /// different migration while one is in progress is refused, so two
     /// coordinators cannot run at once and one cannot unfreeze the other;
     /// repeating the same one is harmless.
-    pub fn begin_migration(&self, map: ShardMap) -> DbResult<()> {
+    pub fn begin_migration(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -992,14 +1141,15 @@ impl Db {
             .migration_map
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        if self.rebalance_in_progress() && current.as_ref() != Some(&map) {
+        let incoming = Migration { map, id };
+        if self.rebalance_in_progress() && current.as_ref() != Some(&incoming) {
             return Err(ApiError::new(
                 409,
                 "rebalance_in_progress",
                 "another migration is already in progress for this database",
             ));
         }
-        *current = Some(map);
+        *current = Some(incoming);
         self.set_rebalance_in_progress(true);
         Ok(())
     }
@@ -1019,6 +1169,27 @@ impl Db {
             .is_ok()
     }
 
+    /// Clear the migration on behalf of the coordinator that announced it with
+    /// `id`. Returns false, leaving the migration and its freeze in place, when
+    /// another coordinator's migration is in progress. Nothing to clear, an
+    /// expired freeze (the coordinator vanished) and a migration announced
+    /// without an id (an older coordinator) are all cleared by any caller.
+    pub fn clear_migration_if(&self, id: Option<&str>) -> bool {
+        let mut current = self
+            .migration_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(migration) = current.as_ref() else {
+            return true;
+        };
+        if self.rebalance_in_progress() && migration.id.is_some() && migration.id.as_deref() != id {
+            return false;
+        }
+        *current = None;
+        self.set_rebalance_in_progress(false);
+        true
+    }
+
     pub fn clear_migration_map(&self) {
         *self
             .migration_map
@@ -1034,7 +1205,7 @@ impl Db {
     /// Claim the single rebalance slot for this database and freeze writes for
     /// a bounded verification window.
     pub fn try_start_rebalance(&self) -> bool {
-        let deadline = now_millis().saturating_add(REBALANCE_FREEZE_MS);
+        let deadline = now_millis().saturating_add(REBALANCE_FREEZE_MS.load(Ordering::SeqCst));
         loop {
             let current = self.rebalance_until.load(Ordering::SeqCst);
             if current != 0 && now_millis() < current {
@@ -1053,7 +1224,7 @@ impl Db {
     pub fn set_rebalance_in_progress(&self, in_progress: bool) {
         self.rebalance_until.store(
             if in_progress {
-                now_millis().saturating_add(REBALANCE_FREEZE_MS)
+                now_millis().saturating_add(REBALANCE_FREEZE_MS.load(Ordering::SeqCst))
             } else {
                 0
             },
@@ -1102,8 +1273,17 @@ impl Db {
         write_json_atomic(&self.path.join("pending-shard-map.json"), map)
     }
 
-    pub fn clear_pending_shard_map(&self) {
-        let _ = std::fs::remove_file(self.path.join("pending-shard-map.json"));
+    /// Remove the pending shard map and make the removal durable. Already
+    /// gone is fine; any other failure is an error, since the map would
+    /// otherwise reappear or be retried as if still pending.
+    pub fn clear_pending_shard_map(&self) -> DbResult<()> {
+        let path = self.path.join("pending-shard-map.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(clear_error(&path, &error)),
+        }
+        sync_parent(&path).map_err(|error| clear_error(&path, &error))
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
@@ -2761,6 +2941,11 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     })
 }
 
+/// A stored revision tree whose parent links loop, reported as corruption.
+fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
+    ApiError::corrupt(format!("corrupt revision tree for {id}: {error}"))
+}
+
 fn put_many(
     shard: &mut crate::store::Shard,
     docs: Vec<(usize, Value)>,
@@ -2800,7 +2985,17 @@ fn put_many(
     // Each document's record is written once, here, in its final form.
     let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
     for (id, meta) in staged.iter_mut() {
-        meta.tree.prune(limit);
+        // The batch's bodies and sequence numbers are already staged, so a
+        // tree that cannot be pruned fails the whole batch rather than being
+        // written back as if it were valid.
+        if let Err(e) = meta.tree.prune(limit) {
+            let message = corrupt_tree(id, e).reason;
+            shard.invalidate_latest();
+            return results
+                .into_iter()
+                .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
+                .collect();
+        }
         meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = meta_bytes(meta) {
             let old = origin.get(id).cloned().flatten();
@@ -2907,10 +3102,10 @@ impl Stage<'_> {
             },
         };
 
-        let parent_path = parent
-            .as_ref()
-            .map(|p| meta.tree.path(p))
-            .unwrap_or_default();
+        let parent_path = match parent.as_ref() {
+            Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
+            None => Vec::new(),
+        };
         let pos = parent
             .as_ref()
             .and_then(|p| Rev::parse(p).map(|r| r.pos))
@@ -3389,7 +3584,7 @@ fn read_doc_rev(
         }
     }
     if opts.revs {
-        let mut path = meta.tree.path(rev);
+        let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
         let limit = shard.revs_limit().max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
@@ -3406,7 +3601,7 @@ fn read_doc_rev(
         map.insert("_local_seq".into(), json!(meta.seq));
     }
     if opts.revs_info {
-        let mut path = meta.tree.path(rev);
+        let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
         let limit = shard.revs_limit().max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
@@ -4803,6 +4998,109 @@ mod tests {
     }
 
     #[test]
+    fn open_removes_stale_temporary_files_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+        let config = || DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::single(1),
+            partitioned: false,
+        };
+        let db = Db::open(&root, "stale", config()).unwrap();
+        let dir = db.path.clone();
+        drop(db);
+
+        // Temporary files an interrupted write_atomic left behind, from
+        // another process and from one that happened to share our pid.
+        let foreign = format!(".db.json.{}.7.tmp", std::process::id().wrapping_add(1));
+        let same_pid = format!(".shard-map.json.{}.0.tmp", std::process::id());
+        let search = dir.join("_search_indexes").join("abc");
+        std::fs::create_dir_all(&search).unwrap();
+        let stale_search = search.join(".douchdb-search-meta.json.1.2.tmp");
+        for stale in [
+            dir.join(&foreign),
+            dir.join(&same_pid),
+            stale_search.clone(),
+        ] {
+            std::fs::write(stale, b"partial").unwrap();
+        }
+        // Names that merely resemble the pattern are left alone.
+        let keep = [
+            "db.json.1.2.tmp",
+            ".db.json.x.2.tmp",
+            ".db.json.1.tmp",
+            ".db.json.1.2.tmp.bak",
+            ".notes.tmp",
+        ];
+        for name in keep {
+            std::fs::write(dir.join(name), b"keep").unwrap();
+        }
+        let before = names_in(&dir);
+
+        let db = Db::open(&root, "stale", config()).unwrap();
+        drop(db);
+
+        let mut expected: Vec<String> = before
+            .into_iter()
+            .filter(|name| *name != foreign && *name != same_pid)
+            .collect();
+        expected.sort();
+        assert_eq!(names_in(&dir), expected);
+        assert!(!stale_search.exists());
+        for name in keep {
+            assert!(dir.join(name).exists(), "{name} was removed");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cleanup_spares_a_temporary_file_a_write_is_using() {
+        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("meta.json");
+        let live = write_temp(&target, b"partial", false).unwrap();
+        let stale = dir.join(".meta.json.1.1.tmp");
+        std::fs::write(&stale, b"old").unwrap();
+        remove_stale_temps(&dir);
+        assert!(live.0.exists(), "a temporary file in use was removed");
+        assert!(!stale.exists());
+        std::fs::remove_file(&live.0).unwrap();
+        drop(live);
+        remove_stale_temps(&dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn clear_pending_shard_map_reports_what_it_cannot_remove() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+
+        // Nothing pending is not an error.
+        db.clear_pending_shard_map().unwrap();
+
+        db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
+        assert!(db.pending_shard_map().is_some());
+        db.clear_pending_shard_map().unwrap();
+        assert!(db.pending_shard_map().is_none());
+
+        // A path that cannot be unlinked is an error, not a silent success.
+        std::fs::create_dir(&pending).unwrap();
+        assert!(db.clear_pending_shard_map().is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn failed_atomic_write_shows_no_partial_file() {
         let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4959,17 +5257,67 @@ mod tests {
             },
         )
         .unwrap();
-        db.set_migration_map(target.clone()).unwrap();
+        db.set_migration_map(target.clone(), None).unwrap();
         db.set_rebalance_in_progress(true);
         assert!(db.is_replica_of("doc", 1) && !db.is_replica_of("doc", 0));
         assert_eq!(db.replication_map().replicas, target.replicas);
 
         // The freeze window ends without the coordinator clearing the map.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The clock counts from its first reading, so "expired" (an end of 1)
+        // only holds once it has reached 1.
+        while now_millis() < 1 {
+            std::thread::yield_now();
+        }
         db.rebalance_until.store(1, Ordering::SeqCst);
         assert!(!db.rebalance_in_progress());
         assert!(db.is_replica_of("doc", 0) && !db.is_replica_of("doc", 1));
         assert_eq!(db.replication_map().replicas, active.replicas);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn migration_clears_only_for_its_own_id_unless_expired_or_unnamed() {
+        let root = std::env::temp_dir().join(format!("douchdb-mig-id-{}", crate::util::uuid()));
+        let active = ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas: vec![vec![0], vec![0]],
+            version: 1,
+        };
+        let target = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            ..active.clone()
+        };
+        let db = Db::open(
+            &root,
+            "mig-id",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: active,
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        // Nothing to clear is fine.
+        assert!(db.clear_migration_if(Some("a")));
+        db.begin_migration(target.clone(), Some("a".into()))
+            .unwrap();
+        assert!(!db.clear_migration_if(Some("b")));
+        assert!(!db.clear_migration_if(None));
+        assert!(db.rebalance_in_progress());
+        assert!(db.clear_migration_if(Some("a")));
+        assert!(!db.rebalance_in_progress());
+        // A migration from a coordinator without ids is cleared by anyone.
+        db.begin_migration(target.clone(), None).unwrap();
+        assert!(db.clear_migration_if(Some("b")));
+        // An expired freeze no longer protects the stale map.
+        db.begin_migration(target, Some("a".into())).unwrap();
+        while now_millis() < 1 {
+            std::thread::yield_now();
+        }
+        db.rebalance_until.store(1, Ordering::SeqCst);
+        assert!(db.clear_migration_if(Some("b")));
         std::fs::remove_dir_all(root).ok();
     }
 

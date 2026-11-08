@@ -110,47 +110,67 @@ async fn local_metrics(st: &AppState) -> Value {
     let mut total_docs = 0u64;
     let mut total_deleted = 0u64;
     let mut failed = Vec::new();
+    let mut counted = 0usize;
     for name in &names {
-        match st.db(name).await {
-            Ok(db) => {
-                let info = db.info().await.unwrap_or(Value::Null);
-                let counts = db.shard_counts().await.unwrap_or_default();
-                let map = db.shard_map();
+        match st.placement(name).await {
+            Ok(placed) => {
+                // Counts and sequences live in the shard stores, so they are
+                // reported only for open databases; a closed one is not
+                // opened for a scrape. Everything else comes from its files.
+                let counts = match &placed.open {
+                    Some(db) => db.shard_counts().await.ok(),
+                    None => None,
+                };
+                let update_seq = match &placed.open {
+                    Some(db) => db
+                        .info()
+                        .await
+                        .map_or(Value::Null, |info| info["update_seq"].clone()),
+                    None => Value::Null,
+                };
+                let map = &placed.shard_map;
                 let local_shards = (0..map.q)
                     .filter(|shard| map.replicas_of(*shard).contains(&st.ctx.cluster.me))
                     .count();
-                let docs: u64 = counts.iter().map(|(docs, _)| *docs).sum();
-                let deleted: u64 = counts.iter().map(|(_, deleted)| *deleted).sum();
+                let docs = counts
+                    .as_ref()
+                    .map(|c| c.iter().map(|(docs, _)| *docs).sum::<u64>());
+                let deleted = counts
+                    .as_ref()
+                    .map(|c| c.iter().map(|(_, deleted)| *deleted).sum::<u64>());
                 let db_path = crate::db::db_path(&st.root, name);
                 let bytes = tokio::task::spawn_blocking(move || dir_size(&db_path))
                     .await
                     .unwrap_or(0);
                 total_bytes += bytes;
-                total_docs += docs;
-                total_deleted += deleted;
-                let shards: Vec<Value> = counts
-                    .iter()
-                    .enumerate()
-                    .map(|(shard, (docs, deleted))| {
+                if let (Some(docs), Some(deleted)) = (docs, deleted) {
+                    total_docs += docs;
+                    total_deleted += deleted;
+                    counted += 1;
+                }
+                let shards: Vec<Value> = (0..map.q)
+                    .map(|shard| {
+                        let count = counts.as_ref().and_then(|c| c.get(shard as usize));
                         json!({
                             "shard": shard,
-                            "docs": docs,
-                            "deleted": deleted,
-                            "replicas": map.replicas_of(shard as u32),
-                            "owner": map.owner_of(shard as u32),
-                            "local": map.replicas_of(shard as u32).contains(&st.ctx.cluster.me),
+                            "docs": count.map(|(docs, _)| docs),
+                            "deleted": count.map(|(_, deleted)| deleted),
+                            "replicas": map.replicas_of(shard),
+                            "owner": map.owner_of(shard),
+                            "local": map.replicas_of(shard).contains(&st.ctx.cluster.me),
                         })
                     })
                     .collect();
                 databases.push(json!({
                     "name": name,
-                    "partitioned": db.partitioned,
-                    "q": db.q,
+                    "open": placed.open.is_some(),
+                    "partitioned": placed.partitioned,
+                    "q": placed.q,
                     "doc_count": docs,
                     "doc_del_count": deleted,
-                    "update_seq": info["update_seq"],
+                    "update_seq": update_seq,
                     "shard_map_version": map.version,
-                    "pending_shard_map": db.pending_shard_map().is_some(),
+                    "pending_shard_map": placed.pending_shard_map,
                     "local_shards": local_shards,
                     "disk_bytes": bytes,
                     "shards": shards,
@@ -168,6 +188,10 @@ async fn local_metrics(st: &AppState) -> Value {
         "disk_mb": total_bytes as f64 / (1024.0 * 1024.0),
         "doc_count": total_docs,
         "doc_del_count": total_deleted,
+        // Document counts cover only the databases that were open; a closed
+        // one is not opened to be counted.
+        "counted_databases": counted,
+        "db_opens": st.db_opens.load(std::sync::atomic::Ordering::Relaxed),
         "failed_databases": failed,
     });
     metrics["databases"] = json!(databases);
@@ -1156,5 +1180,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(health.readable && health.writable);
         assert_eq!(health.unreadable, 1);
+    }
+
+    /// A scrape used to open every database, evicting and re-opening all but
+    /// `--max-open-dbs` of them each time.
+    #[tokio::test]
+    async fn metrics_scrape_does_not_open_closed_databases() {
+        let root = std::env::temp_dir().join(format!("douchdb-metrics-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 4);
+        for n in 0..20 {
+            st.create_db(&format!("db{n:02}"), false, None, None)
+                .await
+                .unwrap();
+        }
+        let before = st.db_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let metrics = local_metrics(&st).await;
+        let opened = st.db_opens.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(metrics["databases"].as_array().map(Vec::len), Some(20));
+        assert_eq!(opened, 0, "a scrape opened {opened} databases");
+        let closed: Vec<&Value> = metrics["databases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|db| db["open"] == false)
+            .collect();
+        assert_eq!(closed.len(), 16);
+        assert!(closed
+            .iter()
+            .all(|db| db["doc_count"].is_null() && db["shards"][0]["replicas"].is_array()));
+        assert_eq!(metrics["storage"]["counted_databases"], 4);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -8,6 +8,7 @@ use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
 use futures::future::join_all;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Apply a security object locally and push it to every peer.
@@ -79,7 +80,7 @@ pub(crate) async fn apply_shard_map(
         map = db.set_next_shard_map(map)?;
     }
     if internal {
-        db.clear_pending_shard_map();
+        db.clear_pending_shard_map()?;
         return Ok((map, false));
     }
 
@@ -128,7 +129,7 @@ pub(crate) async fn apply_shard_map(
     if pending {
         db.set_pending_shard_map(&map)?;
     } else {
-        db.clear_pending_shard_map();
+        db.clear_pending_shard_map()?;
     }
     crate::telemetry::record_shard_map_update(pending);
     Ok((map, pending))
@@ -430,7 +431,27 @@ async fn cleanup_all_replicas(
 }
 
 /// Time to wait for in-flight writes to finish once writes are frozen.
-pub(crate) const WRITE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) fn write_drain() -> std::time::Duration {
+    std::time::Duration::from_millis(WRITE_DRAIN_MS.load(Ordering::SeqCst))
+}
+
+/// Default for `--rebalance-write-drain-ms`.
+pub const DEFAULT_WRITE_DRAIN_MS: u64 = 15_000;
+/// Default for `--rebalance-stable-wait-ms`.
+pub const DEFAULT_STABLE_WAIT_MS: u64 = 10_000;
+
+static WRITE_DRAIN_MS: AtomicU64 = AtomicU64::new(DEFAULT_WRITE_DRAIN_MS);
+static STABLE_WAIT_MS: AtomicU64 = AtomicU64::new(DEFAULT_STABLE_WAIT_MS);
+
+/// Set the write-drain wait (`--rebalance-write-drain-ms`).
+pub fn set_write_drain_ms(ms: u64) {
+    WRITE_DRAIN_MS.store(ms.max(1), Ordering::SeqCst);
+}
+
+/// Set the wait for the old owners to settle (`--rebalance-stable-wait-ms`).
+pub fn set_stable_wait_ms(ms: u64) {
+    STABLE_WAIT_MS.store(ms.max(1), Ordering::SeqCst);
+}
 
 /// A peer's refusal of a migration. `conflict` marks a different migration
 /// already owning the peer, which must be left alone.
@@ -444,14 +465,20 @@ async fn send_migration(
     peer: &str,
     name: &str,
     map: Option<&ShardMap>,
+    id: &str,
     headers: &HeaderMap,
 ) -> Result<(), MigrationRefused> {
     let segments = ["_node", "_local", "_dbs", name, "migration"];
+    let method = if map.is_some() {
+        reqwest::Method::PUT
+    } else {
+        reqwest::Method::DELETE
+    };
+    let request =
+        internal_request(ctx, method, peer, &segments, Some(headers)).query(&[("id", id)]);
     let request = match map {
-        Some(map) => {
-            internal_request(ctx, reqwest::Method::PUT, peer, &segments, Some(headers)).json(map)
-        }
-        None => internal_request(ctx, reqwest::Method::DELETE, peer, &segments, Some(headers)),
+        Some(map) => request.json(map),
+        None => request,
     };
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
@@ -471,20 +498,21 @@ async fn set_migration_everywhere(
     db: &Db,
     name: &str,
     map: &ShardMap,
+    id: &str,
     headers: &HeaderMap,
 ) -> DbResult<()> {
-    db.set_migration_map(map.clone())?;
+    db.set_migration_map(map.clone(), Some(id.to_string()))?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that
     // migration; clearing them would unfreeze the other coordinator.
     let mut foreign = Vec::new();
-    if !db.drain_writes(WRITE_DRAIN).await {
+    if !db.drain_writes(write_drain()).await {
         failures.push("local writes did not finish before the freeze".to_string());
     }
     if failures.is_empty() {
         for peer in &peers {
-            if let Err(refused) = send_migration(ctx, peer, name, Some(map), headers).await {
+            if let Err(refused) = send_migration(ctx, peer, name, Some(map), id, headers).await {
                 if refused.conflict {
                     foreign.push(peer.clone());
                 }
@@ -497,7 +525,7 @@ async fn set_migration_everywhere(
     }
     db.clear_migration_map();
     for peer in peers.iter().filter(|peer| !foreign.contains(peer)) {
-        let _ = send_migration(ctx, peer, name, None, headers).await;
+        let _ = send_migration(ctx, peer, name, None, id, headers).await;
     }
     Err(ApiError::new(
         502,
@@ -509,24 +537,33 @@ async fn set_migration_everywhere(
     ))
 }
 
-async fn clear_migration_everywhere(ctx: &ClusterCtx, db: &Db, name: &str, headers: &HeaderMap) {
+async fn clear_migration_everywhere(
+    ctx: &ClusterCtx,
+    db: &Db,
+    name: &str,
+    id: &str,
+    headers: &HeaderMap,
+) {
     db.clear_migration_map();
     for peer in ctx.cluster.peers() {
-        if let Err(error) = send_migration(ctx, peer, name, None, headers).await {
+        if let Err(error) = send_migration(ctx, peer, name, None, id, headers).await {
             tracing::warn!("migration map clear on {}", error.message);
         }
     }
 }
 
+/// Activate the placement of `target` on every node and return the map as
+/// stored, at the version the local Db picked under its lock (the version
+/// `target` carries is ignored).
 async fn activate_map_everywhere(
     ctx: &ClusterCtx,
     db: &Db,
     name: &str,
-    map: &ShardMap,
+    target: &ShardMap,
     headers: &HeaderMap,
-) -> DbResult<()> {
+) -> DbResult<ShardMap> {
     let old = db.shard_map();
-    db.set_shard_map(map.clone())?;
+    let map = &db.set_next_shard_map(target.clone())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
@@ -545,14 +582,14 @@ async fn activate_map_everywhere(
         }
     }
     if failures.is_empty() {
-        return Ok(());
+        return Ok(map.clone());
     }
 
     // Roll back with a strictly newer version so peers that already accepted
     // the target map also accept the old placement again.
-    let mut rollback = old;
-    rollback.version = map.version.saturating_add(1);
-    let _ = db.set_shard_map(rollback.clone());
+    let rollback = db
+        .set_next_shard_map(old)
+        .unwrap_or_else(|_| db.shard_map());
     for peer in &peers {
         let request = internal_request(
             ctx,
@@ -587,10 +624,13 @@ async fn migrate(
     headers: &HeaderMap,
     timeout_ms: u64,
 ) -> DbResult<Value> {
+    // Identifies this coordinator's migration: only a clear carrying it may
+    // unfreeze the peers, so a rival or stale coordinator cannot.
+    let migration_id = crate::util::uuid();
     // Broadcast the migration map first: it freezes writes on every peer and
     // lets anti-entropy seed the target replicas while reads stay on the old
     // active map.
-    if let Err(error) = set_migration_everywhere(ctx, db, name, map, headers).await {
+    if let Err(error) = set_migration_everywhere(ctx, db, name, map, &migration_id, headers).await {
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
@@ -601,11 +641,11 @@ async fn migrate(
         old_map,
         headers,
         // Allow slow digest scans plus any in-flight write to settle.
-        std::time::Duration::from_millis(10_000),
+        std::time::Duration::from_millis(STABLE_WAIT_MS.load(Ordering::SeqCst)),
     )
     .await
     {
-        clear_migration_everywhere(ctx, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
@@ -613,7 +653,7 @@ async fn migrate(
     if let Err(error) = wait_for_rebalance(ctx, db, old_map, map, headers, timeout_ms).await {
         // The active map never changed, so reads continued on the old owners
         // throughout the migration attempt.
-        clear_migration_everywhere(ctx, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
         db.set_rebalance_in_progress(false);
         if error.status == 504 {
             crate::telemetry::record_rebalance_timeout();
@@ -621,12 +661,15 @@ async fn migrate(
         return Err(error);
     }
 
-    if let Err(error) = activate_map_everywhere(ctx, db, name, map, headers).await {
-        clear_migration_everywhere(ctx, db, name, headers).await;
-        db.set_rebalance_in_progress(false);
-        return Err(error);
-    }
-    clear_migration_everywhere(ctx, db, name, headers).await;
+    let map = match activate_map_everywhere(ctx, db, name, map, headers).await {
+        Ok(activated) => activated,
+        Err(error) => {
+            clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
+            db.set_rebalance_in_progress(false);
+            return Err(error);
+        }
+    };
+    clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
     db.set_rebalance_in_progress(false);
 
     let mut value = json!(map);
@@ -672,10 +715,7 @@ pub(crate) async fn rebalance(
         value["pending"] = json!(false);
         value
     } else {
-        let map = ShardMap {
-            version: old_map.version.saturating_add(1),
-            ..map
-        };
+        // The activation picks the version under the Db lock.
         migrate(ctx, db, name, &old_map, &map, headers, timeout_ms).await?
     };
     if !cleanup {
@@ -691,4 +731,68 @@ pub(crate) async fn rebalance(
     crate::telemetry::record_rebalance_completed(cleared);
     value["cleaned"] = json!(cleaned);
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::Cluster;
+    use crate::db::DbConfig;
+
+    /// The activation version is picked under the Db lock, not carried in from
+    /// whatever `rebalance` read earlier: a map change that lands between the
+    /// read and the activation must not make the activation lose to it.
+    #[tokio::test]
+    async fn activation_picks_its_version_under_the_lock() {
+        let root = std::env::temp_dir().join(format!("douchdb-activate-{}", crate::util::uuid()));
+        let active = ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas: vec![vec![0], vec![0]],
+            version: 1,
+        };
+        let db = Db::open(
+            &root,
+            "activate",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: active.clone(),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        // What rebalance proposed from the map it read: old version + 1.
+        let target = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            version: active.version + 1,
+            ..active.clone()
+        };
+        // Another update lands before the activation.
+        let interloper = ShardMap {
+            replicas: vec![vec![0, 1], vec![0, 1]],
+            ..active.clone()
+        };
+        let current = db.set_next_shard_map(interloper).unwrap();
+        assert_eq!(current.version, 2);
+
+        let ctx = ClusterCtx {
+            cluster: Cluster {
+                nodes: vec!["http://127.0.0.1:1".to_string()],
+                me: 0,
+                n: 1,
+                secret: "test-secret".to_string(),
+            },
+            client: reqwest::Client::new(),
+            auth: None,
+        };
+        activate_map_everywhere(&ctx, &db, "activate", &target, &HeaderMap::new())
+            .await
+            .unwrap();
+
+        let stored = db.shard_map();
+        assert_eq!(stored.replicas, target.replicas);
+        assert_eq!(stored.version, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
 }

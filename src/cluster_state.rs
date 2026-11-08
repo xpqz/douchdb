@@ -68,9 +68,26 @@ pub struct ClusterState {
     discovery_running: AtomicBool,
     replication_running: AtomicBool,
     replication_paused: AtomicBool,
+    /// The last closed database an anti-entropy pass reached; the next pass
+    /// continues after it.
+    sweep_cursor: Mutex<Option<String>>,
 }
 
 impl ClusterState {
+    pub fn sweep_cursor(&self) -> Option<String> {
+        self.sweep_cursor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub fn set_sweep_cursor(&self, cursor: Option<String>) {
+        *self
+            .sweep_cursor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = cursor;
+    }
+
     pub fn new() -> ClusterState {
         ClusterState::default()
     }

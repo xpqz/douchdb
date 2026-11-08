@@ -34,6 +34,10 @@ pub struct Args {
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     pub max_request_mb: usize,
+    pub rebalance_write_drain_ms: u64,
+    pub rebalance_stable_wait_ms: u64,
+    pub rebalance_freeze_ms: u64,
+    pub js_worker_startup_ms: u64,
     pub max_open_indexes: usize,
     pub max_open_dbs: usize,
     pub cluster_secret: String,
@@ -55,6 +59,8 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--cors-headers HEADER,HEADER] [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
+                     \x20       [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]\n\
+                     \x20       [--rebalance-freeze-ms N] [--js-worker-startup-ms N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
                      \x20       [--otel-endpoint URL]       (or OTEL_EXPORTER_OTLP_ENDPOINT)";
 
@@ -176,6 +182,10 @@ pub fn parse_from(
         view_timeout_ms: 5000,
         view_memory_mb: 64,
         max_request_mb: 64,
+        rebalance_write_drain_ms: crate::cluster_ops::DEFAULT_WRITE_DRAIN_MS,
+        rebalance_stable_wait_ms: crate::cluster_ops::DEFAULT_STABLE_WAIT_MS,
+        rebalance_freeze_ms: crate::db::DEFAULT_REBALANCE_FREEZE_MS,
+        js_worker_startup_ms: crate::js::DEFAULT_WORKER_STARTUP_MS,
         max_open_indexes: crate::index_cache::DEFAULT_MAX_OPEN,
         max_open_dbs: crate::state::DEFAULT_MAX_OPEN_DBS,
         cluster_secret: environment(&env, "DOUCHDB_CLUSTER_SECRET")?.unwrap_or_default(),
@@ -246,6 +256,18 @@ pub fn parse_from(
             "--view-timeout-ms" => args.view_timeout_ms = number(&mut it, flag, 1, u64::MAX)?,
             "--view-memory-mb" => args.view_memory_mb = number(&mut it, flag, 1, u32::MAX.into())?,
             "--max-request-mb" => args.max_request_mb = number(&mut it, flag, 1, u32::MAX.into())?,
+            "--rebalance-write-drain-ms" => {
+                args.rebalance_write_drain_ms = number(&mut it, flag, 1, u64::MAX)?
+            }
+            "--rebalance-stable-wait-ms" => {
+                args.rebalance_stable_wait_ms = number(&mut it, flag, 1, u64::MAX)?
+            }
+            "--rebalance-freeze-ms" => {
+                args.rebalance_freeze_ms = number(&mut it, flag, 1, u64::MAX)?
+            }
+            "--js-worker-startup-ms" => {
+                args.js_worker_startup_ms = number(&mut it, flag, 1, u64::MAX)?
+            }
             "--max-open-indexes" => {
                 args.max_open_indexes = number(&mut it, flag, 1, u32::MAX.into())?
             }
@@ -307,6 +329,10 @@ mod tests {
         "--sync-secs",
         "--js-workers",
         "--view-timeout-ms",
+        "--rebalance-write-drain-ms",
+        "--rebalance-stable-wait-ms",
+        "--rebalance-freeze-ms",
+        "--js-worker-startup-ms",
         "--view-memory-mb",
         "--max-request-mb",
         "--max-open-indexes",
@@ -400,6 +426,47 @@ mod tests {
             "--sync-secs",
         ] {
             assert!(parse(&[flag, "0"]).is_ok(), "{flag} 0");
+        }
+    }
+
+    #[test]
+    fn wall_clock_limits_default_parse_and_reject_invalid() {
+        let defaults = parse(&[]).unwrap().unwrap();
+        assert_eq!(defaults.view_timeout_ms, 5000);
+        assert_eq!(defaults.rebalance_write_drain_ms, 15_000);
+        assert_eq!(defaults.rebalance_stable_wait_ms, 10_000);
+        assert_eq!(defaults.js_worker_startup_ms, 10_000);
+        assert_eq!(defaults.rebalance_freeze_ms, 420_000);
+        let args = parse(&[
+            "--view-timeout-ms",
+            "9000",
+            "--rebalance-write-drain-ms",
+            "31000",
+            "--rebalance-stable-wait-ms",
+            "22000",
+            "--js-worker-startup-ms",
+            "45000",
+            "--rebalance-freeze-ms",
+            "900000",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(args.view_timeout_ms, 9000);
+        assert_eq!(args.rebalance_write_drain_ms, 31_000);
+        assert_eq!(args.rebalance_stable_wait_ms, 22_000);
+        assert_eq!(args.js_worker_startup_ms, 45_000);
+        assert_eq!(args.rebalance_freeze_ms, 900_000);
+        for flag in [
+            "--view-timeout-ms",
+            "--rebalance-write-drain-ms",
+            "--rebalance-stable-wait-ms",
+            "--js-worker-startup-ms",
+            "--rebalance-freeze-ms",
+        ] {
+            assert!(error(&[flag, "0"]).contains(flag), "{flag} 0");
+            assert!(error(&[flag, "soon"]).contains(flag), "{flag} soon");
+            assert!(error(&[flag, "-5"]).contains(flag), "{flag} -5");
+            assert!(error(&[flag]).contains(flag), "{flag} missing value");
         }
     }
 
