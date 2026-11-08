@@ -29,7 +29,7 @@ pub(crate) async fn set_security_everywhere(
         return Ok(true);
     }
     let envelope = json!({"version": version, "security": value});
-    let responses = join_all(ctx.cluster.peers().map(|peer| {
+    let responses = crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| {
         let request = internal_request(
             ctx,
             reqwest::Method::PUT,
@@ -44,7 +44,7 @@ pub(crate) async fn set_security_everywhere(
                 .map(|response| response.status().is_success())
                 .unwrap_or(false)
         }
-    }))
+    })))
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
     Ok(acknowledgements > ctx.cluster.nodes.len().max(1) / 2)
@@ -93,24 +93,26 @@ pub(crate) async fn apply_shard_map(
         .filter(|(index, _)| *index != ctx.cluster.me)
         .map(|(_, peer)| peer.clone())
         .collect();
-    let responses = futures::future::join_all(peers.into_iter().map(|peer| {
-        let payload = payload.clone();
-        async move {
-            let request = internal_request(
-                ctx,
-                reqwest::Method::PUT,
-                &peer,
-                &["_node", "_local", "_dbs", name],
-                Some(headers),
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(payload);
-            send_peer(request)
-                .await
-                .ok()
-                .map(|response| response.status())
-        }
-    }))
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        peers.into_iter().map(|peer| {
+            let payload = payload.clone();
+            async move {
+                let request = internal_request(
+                    ctx,
+                    reqwest::Method::PUT,
+                    &peer,
+                    &["_node", "_local", "_dbs", name],
+                    Some(headers),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(payload);
+                send_peer(request)
+                    .await
+                    .ok()
+                    .map(|response| response.status())
+            }
+        }),
+    ))
     .await;
     let mut acknowledgements = 1usize; // local write
     let mut rejected = false;
@@ -193,11 +195,11 @@ async fn fetch_states(
     headers: &HeaderMap,
     with_digest: bool,
 ) -> Vec<Option<Vec<ShardState>>> {
-    let fetched = futures::future::join_all(
+    let fetched = crate::cluster_http::in_one_round(futures::future::join_all(
         nodes
             .iter()
             .map(|node| fetch_shard_states(ctx, db, *node, headers, with_digest)),
-    )
+    ))
     .await;
     let mut states = vec![None; ctx.cluster.nodes.len().max(1)];
     for (node, state) in nodes.iter().zip(fetched) {
@@ -398,31 +400,33 @@ async fn cleanup_all_replicas(
     db: &Arc<Db>,
     headers: &HeaderMap,
 ) -> DbResult<Vec<Value>> {
-    let responses = futures::future::join_all(ctx.cluster.nodes.iter().map(|peer| {
-        let request = internal_request(
-            ctx,
-            reqwest::Method::POST,
-            peer,
-            &["_node", "_local", "_dbs", &db.name, "cleanup"],
-            Some(headers),
-        );
-        async move {
-            let response = send_peer(request)
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", format!("{peer}: {error}")))?;
-            if !response.status().is_success() {
-                return Err(ApiError::new(
-                    response.status().as_u16(),
-                    "cleanup_failed",
-                    response.text().await.unwrap_or_default(),
-                ));
+    let responses = crate::cluster_http::in_one_round(futures::future::join_all(
+        ctx.cluster.nodes.iter().map(|peer| {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::POST,
+                peer,
+                &["_node", "_local", "_dbs", &db.name, "cleanup"],
+                Some(headers),
+            );
+            async move {
+                let response = send_peer(request).await.map_err(|error| {
+                    ApiError::new(502, "bad_gateway", format!("{peer}: {error}"))
+                })?;
+                if !response.status().is_success() {
+                    return Err(ApiError::new(
+                        response.status().as_u16(),
+                        "cleanup_failed",
+                        response.text().await.unwrap_or_default(),
+                    ));
+                }
+                response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
             }
-            response
-                .json::<Value>()
-                .await
-                .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))
-        }
-    }))
+        }),
+    ))
     .await;
     let mut out = Vec::new();
     for response in responses {
@@ -786,6 +790,7 @@ mod tests {
             },
             client: reqwest::Client::new(),
             auth: None,
+            health: Default::default(),
         };
         activate_map_everywhere(&ctx, &db, "activate", &target, &HeaderMap::new())
             .await

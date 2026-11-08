@@ -15,6 +15,37 @@ pub struct ClusterCtx {
     pub cluster: Cluster,
     pub client: reqwest::Client,
     pub auth: Option<Auth>,
+    /// Which peers discovery last found unreachable.
+    pub health: NodeHealth,
+}
+
+/// What the last discovery pass found out about each peer. Reads use it to
+/// send a down node's shards to a replica in the first round instead of
+/// failing against the node first. It is a hint: a stale "down" costs a
+/// detour, never a wrong answer, and the next pass that reaches the node
+/// clears it.
+#[derive(Default)]
+pub struct NodeHealth {
+    down: Mutex<Vec<bool>>,
+}
+
+impl NodeHealth {
+    pub fn set_down(&self, node: usize, down: bool) {
+        let mut flags = self.down.lock().unwrap_or_else(|p| p.into_inner());
+        if flags.len() <= node {
+            flags.resize(node + 1, false);
+        }
+        flags[node] = down;
+    }
+
+    pub fn is_down(&self, node: usize) -> bool {
+        self.down
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// Internal cluster calls must keep the caller's credentials. Basic auth and
@@ -95,12 +126,13 @@ pub(crate) fn internal_request(
 // * peer call: one HTTP request sent to another node with `send_peer`. Retries
 //   and fallback requests each count. Background work (anti-entropy, discovery)
 //   runs outside any request scope and is not counted.
-// * round: a maximal period during which at least one peer call of the request
-//   is in flight. A group of calls issued concurrently and awaited together is
-//   one round; a call issued after every earlier call finished starts a new
-//   one. Detached tasks that keep running after the response head is decided
-//   (slow replica writes) still belong to the request and extend the round
-//   they are part of.
+// * round: a maximal period during which a peer call of the request is in
+//   flight or a `PeerRound` guard is held. A fan-out holds a guard while its
+//   calls are issued and awaited together, so it is one round however fast
+//   each call finishes; a call outside any guard is a round of its own unless
+//   another call is in flight. Detached tasks that keep running after the
+//   response head is decided (slow replica writes) hold a clone of the
+//   fan-out's guard and so extend the round they are part of.
 // * peer wait: total time during which a round was open. It runs from issuing
 //   the request until the response head arrives; reading the body is not
 //   included, so it slightly understates the network share for large replies.
@@ -167,15 +199,20 @@ impl PeerStats {
         (tally.calls, tally.rounds, tally.wait + open)
     }
 
-    fn begin(self: &Arc<Self>) -> PeerCall {
+    /// Mark one more holder as in flight; the first one opens a round.
+    fn enter(self: &Arc<Self>) -> InFlight {
         let mut tally = self.tally();
-        tally.calls += 1;
         if tally.in_flight == 0 {
             tally.rounds += 1;
             tally.round_started = Some(Instant::now());
         }
         tally.in_flight += 1;
-        PeerCall(self.clone())
+        InFlight(self.clone())
+    }
+
+    fn begin(self: &Arc<Self>) -> InFlight {
+        self.tally().calls += 1;
+        self.enter()
     }
 }
 
@@ -190,10 +227,11 @@ impl Drop for PeerStats {
     }
 }
 
-/// One peer call in flight; ends on drop, so a cancelled call is closed too.
-struct PeerCall(Arc<PeerStats>);
+/// One holder in flight (a peer call, or a [`PeerRound`]); ends on drop, so a
+/// cancelled call is closed too.
+struct InFlight(Arc<PeerStats>);
 
-impl Drop for PeerCall {
+impl Drop for InFlight {
     fn drop(&mut self) {
         let mut tally = self.0.tally();
         tally.in_flight = tally.in_flight.saturating_sub(1);
@@ -203,6 +241,30 @@ impl Drop for PeerCall {
             }
         }
     }
+}
+
+/// Holds one round of the current request open. Hold it across a fan-out,
+/// from before its first call is issued until its last is done: every call
+/// made meanwhile belongs to that round, however quickly each one finishes.
+/// A clone keeps the round open too, so a detached task that outlives the
+/// fan-out takes one before it is spawned. Dropping closes it, so a round
+/// cannot leak open. Outside a request scope it does nothing.
+pub(crate) struct PeerRound(Option<InFlight>);
+
+impl Clone for PeerRound {
+    fn clone(&self) -> Self {
+        PeerRound(self.0.as_ref().map(|held| held.0.enter()))
+    }
+}
+
+/// Run `future`, a fan-out, as one round: see [`PeerRound`].
+pub(crate) async fn in_one_round<F: Future>(future: F) -> F::Output {
+    let _round = peer_round();
+    future.await
+}
+
+pub(crate) fn peer_round() -> PeerRound {
+    PeerRound(PEER_SCOPE.try_with(|stats| stats.enter()).ok())
 }
 
 /// Run `future` with `stats` as the current request's peer accounting.
@@ -285,6 +347,24 @@ mod tests {
         drop(fourth);
         let (calls, rounds, _) = stats.totals();
         assert_eq!((calls, rounds), (4, 2));
+    }
+
+    #[test]
+    fn a_guard_makes_a_fan_out_one_round_however_fast_its_calls_finish() {
+        let stats = PeerStats::new("/{db}/doc".to_string(), false);
+        let guard = PeerRound(Some(stats.enter()));
+        // Each call ends before the next starts.
+        drop(stats.begin());
+        drop(stats.begin());
+        let detached = guard.clone();
+        drop(guard);
+        // Still one round while a detached holder remains.
+        drop(stats.begin());
+        assert_eq!((stats.totals().0, stats.totals().1), (3, 1));
+        drop(detached);
+        drop(stats.begin());
+        assert_eq!((stats.totals().0, stats.totals().1), (4, 2));
+        assert_eq!(stats.tally().in_flight, 0);
     }
 
     #[tokio::test]

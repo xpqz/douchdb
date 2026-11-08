@@ -5119,8 +5119,7 @@ async fn cluster_peer_round_trip_baseline() {
 /// that own shards. Which nodes those are depends on placement, so the
 /// assertions are relations that hold for any placement: a listing, a map view
 /// and a reduce view cost one scatter round (none if the node owns every
-/// shard), and `since=now` adds a round for the sequence vector before its own
-/// scatter.
+/// shard), and `since=now` is one round that asks every peer once.
 #[tokio::test]
 async fn cluster_peer_scatter_baseline_with_one_replica() {
     let nodes = peer_trip_cluster(1).await;
@@ -5136,12 +5135,10 @@ async fn cluster_peer_scatter_baseline_with_one_replica() {
     assert_eq!(scatter.1, u64::from(scatter.0 > 0), "{reads:?}");
     assert_eq!(trips("map_view"), scatter, "{reads:?}");
     assert_eq!(trips("reduce_view"), scatter, "{reads:?}");
-    // The vector round asks both peers, then the scatter goes out again.
-    assert_eq!(
-        trips("changes_since_now"),
-        (2 + scatter.0, 1 + scatter.1, 0),
-        "{reads:?}"
-    );
+    // Each peer is asked once, in the same round: a peer that owns shards
+    // answers `since=now` for them and reports its own sequence in that reply,
+    // and a peer that owns none is only asked for its sequence.
+    assert_eq!(trips("changes_since_now"), (2, 1, 0), "{reads:?}");
 }
 
 /// With a node down, a write pays the validator fan-out every time (a partial
@@ -5150,10 +5147,14 @@ async fn cluster_peer_scatter_baseline_with_one_replica() {
 async fn cluster_peer_round_trip_baseline_with_a_node_down() {
     let mut nodes = peer_trip_cluster(3).await;
     nodes[2].kill();
+    let dead = nodes[2].base.clone();
     nodes.truncate(2);
-    // Calls to the dead node count too: they are issued and fail. Only the
-    // two live nodes' counters can be read, and the dead node makes no nested
-    // calls.
+    // Discovery is what tells the coordinator the node is down; settle it so
+    // the counts below do not depend on when a startup probe pass runs.
+    wait_until_known_down(&nodes[0], &dead).await;
+    // The write path does not consult it: calls to the dead node count too,
+    // they are issued and fail. Only the two live nodes' counters can be
+    // read, and the dead node makes no nested calls.
     for id in ["down1", "down2"] {
         let put = measure_peer_trips(
             &nodes,
@@ -5171,9 +5172,100 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
-            ("changes_since_now", (2, 1, 0)),
+            // The node discovery reports down is not asked for its sequence.
+            ("changes_since_now", (1, 1, 0)),
         ]
     );
+}
+
+/// A node discovery reports down is routed around in the first scatter round,
+/// not tried and then replaced, and it is used again once discovery sees it
+/// back. Two copies of each shard, so every shard has a live replica.
+#[tokio::test]
+async fn cluster_scatter_skips_a_node_discovery_reports_down() {
+    let mut nodes = peer_trip_cluster(2).await;
+    let (status, expected) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{expected}");
+    nodes[2].kill();
+    let url = nodes[2].base.clone();
+    wait_until_known_down(&nodes[0], &url).await;
+
+    let live = &nodes[..2];
+    let (status, body) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, expected, "the listing changed with a node down");
+    let listing = measure_peer_trips(live, Method::GET, "/trips/_all_docs?limit=100", None).await;
+    assert!(listing.1 <= 1, "listing with a node down: {listing:?}");
+    let reduce = measure_peer_trips(live, Method::GET, PEER_TRIPS_REDUCE_VIEW, None).await;
+    assert!(reduce.1 <= 1, "reduce with a node down: {reduce:?}");
+    let (status, rows) = nodes[0].get(PEER_TRIPS_REDUCE_VIEW).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"].as_array().map(Vec::len), Some(40), "{rows}");
+
+    // Back up: the next discovery pass that reaches it clears the mark.
+    nodes[2].restart();
+    wait_until_known_up(&nodes[0], &url).await;
+    let (status, body) = nodes[0].get("/trips/_all_docs?limit=100").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"], expected["rows"]);
+    let since_now =
+        measure_peer_trips(&nodes, Method::GET, "/trips/_changes?since=now", None).await;
+    assert_eq!(since_now, (2, 1, 0), "the recovered node is asked again");
+}
+
+/// Run discovery passes on `node` until its snapshot reports the peer at
+/// `url` unreachable. A pass already running when the peer died may still
+/// report it up, so ask again until one reports it down.
+async fn wait_until_known_down(node: &Server, url: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, body) = node
+            .post("/_node/_local/_cluster/discover", json!({}))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (_, body) = node.get("/_node/_local/_cluster").await;
+        let discovery = &body["discovery"];
+        let down = discovery["nodes"].as_array().is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|peer| peer["url"] == url && peer["reachable"] == false)
+        });
+        if down && discovery["running"] == false {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery never reported {url} down: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Run discovery passes on `node` until its snapshot reports the peer at
+/// `url` reachable again.
+async fn wait_until_known_up(node: &Server, url: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, body) = node
+            .post("/_node/_local/_cluster/discover", json!({}))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (_, body) = node.get("/_node/_local/_cluster").await;
+        let discovery = &body["discovery"];
+        let up = discovery["nodes"].as_array().is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|peer| peer["url"] == url && peer["reachable"] == true)
+        });
+        if up && discovery["running"] == false {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery never reported {url} up: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

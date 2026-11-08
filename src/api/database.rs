@@ -705,21 +705,23 @@ async fn fan_out_db(
     name: &str,
     layout: &[(&str, String)],
 ) -> Vec<Option<StatusCode>> {
-    futures::future::join_all(st.ctx.cluster.peers().map(|peer| {
-        let request = st
-            .ctx
-            .client
-            .request(method.clone(), peer_url(peer, &[name]))
-            .query(layout)
-            .header("x-douchdb-local-db", "1")
-            .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
-        let request = forward_client_auth(request, headers);
-        async move {
-            send_peer(request)
-                .await
-                .ok()
-                .map(|response| response.status())
-        }
-    }))
+    crate::cluster_http::in_one_round(futures::future::join_all(st.ctx.cluster.peers().map(
+        |peer| {
+            let request = st
+                .ctx
+                .client
+                .request(method.clone(), peer_url(peer, &[name]))
+                .query(layout)
+                .header("x-douchdb-local-db", "1")
+                .header("x-douchdb-secret", st.ctx.cluster.secret.as_str());
+            let request = forward_client_auth(request, headers);
+            async move {
+                send_peer(request)
+                    .await
+                    .ok()
+                    .map(|response| response.status())
+            }
+        },
+    )))
     .await
 }

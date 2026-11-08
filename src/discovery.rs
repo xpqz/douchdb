@@ -155,6 +155,16 @@ pub async fn discover_once(state: Arc<AppState>) {
     } else {
         None
     };
+    // Tell the read path which configured peers did not answer; a later pass
+    // that reaches the node is what clears the mark.
+    for (node, url) in configured.iter().enumerate() {
+        if node == state.ctx.cluster.me {
+            continue;
+        }
+        if let Some(probe) = probes.iter().find(|probe| &probe.url == url) {
+            state.ctx.health.set_down(node, !probe.reachable);
+        }
+    }
     state.cluster_state.finish_discovery(probes, error);
 }
 
@@ -287,6 +297,7 @@ mod tests {
                     secret: "cluster-secret".to_string(),
                 },
                 client: reqwest::Client::new(),
+                health: Default::default(),
             },
             db_updates: Default::default(),
             cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
