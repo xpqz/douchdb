@@ -5080,6 +5080,62 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_pending_shard_map_is_an_error_not_none() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-pending-bad-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+        let is_err = |text: String| text.starts_with("Err");
+
+        // Missing is the legitimate "nothing pending".
+        assert_eq!(format!("{:?}", db.pending_shard_map()), "Ok(None)");
+        assert_eq!(
+            format!("{:?}", Db::has_pending_shard_map(&root, "pending")),
+            "Ok(false)"
+        );
+
+        // Content that does not parse.
+        std::fs::write(&pending, b"{not json").unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+
+        // A read error that is not NotFound: a directory in place of the file.
+        std::fs::remove_file(&pending).unwrap();
+        std::fs::create_dir(&pending).unwrap();
+        assert!(is_err(format!("{:?}", db.pending_shard_map())));
+        assert!(is_err(format!(
+            "{:?}",
+            Db::has_pending_shard_map(&root, "pending")
+        )));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn destroy_answers_not_found_only_for_a_missing_database() {
+        let root = std::env::temp_dir().join(format!("douchdb-destroy-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(Db::destroy(&root, "gone").unwrap_err().status, 404);
+
+        // A path that exists but is not a directory cannot be removed as one.
+        std::fs::write(db_path(&root, "stuck"), b"not a directory").unwrap();
+        assert_eq!(Db::destroy(&root, "stuck").unwrap_err().status, 500);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn clear_pending_shard_map_reports_what_it_cannot_remove() {
         let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let db = Db::open(
