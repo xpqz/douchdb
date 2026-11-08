@@ -197,17 +197,21 @@ pub(crate) fn illegal_db_name(name: &str) -> ApiError {
     )
 }
 
+/// The system databases CouchDB's `couch_db:validate_dbname` accepts although
+/// they do not match the name regex.
+const SYSTEM_DB_NAMES: [&str; 3] = ["_users", "_replicator", "_global_changes"];
+
+/// CouchDB's `^[a-z][a-z0-9_$()+/-]*$` (`DBNAME_REGEX` in `couch_db.erl`), or
+/// one of the system databases. Doubled and trailing slashes are legal.
 pub(crate) fn valid_db_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('_')
-        && !name.starts_with('/')
-        && !name.ends_with('/')
-        && !name.contains("//")
-        && name.bytes().all(|b| {
+    let mut bytes = name.bytes();
+    let regex_match = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| {
             b.is_ascii_lowercase()
                 || b.is_ascii_digit()
                 || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
-        })
+        });
+    regex_match || SYSTEM_DB_NAMES.contains(&name)
 }
 
 // ---------------------------------------------------------------------------

@@ -2730,7 +2730,7 @@ async fn database_names_follow_the_couchdb_rule() {
         "/_replicator",
         "/_global_changes",
         "/a-1",
-        "/a$()+_-9",
+        "/a$()%2B_-9",
         "/a%2F%2Fb",
         "/a%2Fb%2F",
     ] {
