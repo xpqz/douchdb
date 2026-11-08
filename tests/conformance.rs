@@ -572,6 +572,36 @@ async fn welcome_and_database_lifecycle() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The first line of the raw HTTP/1.1 response to `GET path`.
+fn raw_status_line(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// CouchDB answers through mochiweb, which takes reason phrases from
+/// `httpd_util:reason_phrase/1`; for 404 that is "Object Not Found".
+#[tokio::test]
+async fn not_found_status_line_says_object_not_found() {
+    let s = Server::start(false);
+    assert_eq!(
+        raw_status_line(s.port, "/no-such-db"),
+        "HTTP/1.1 404 Object Not Found"
+    );
+    assert_eq!(raw_status_line(s.port, "/"), "HTTP/1.1 200 OK");
+}
+
 /// Status of `GET /{db}` answered from `node`'s own copy only, as a peer
 /// would: the coordinator's cluster-wide `update_seq` would also need every
 /// other node to have the database.
