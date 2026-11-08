@@ -3693,6 +3693,37 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
 }
 
+/// CouchDB's `chttpd_db:parse_changes_query` rewrites `feed=live` to
+/// `continuous` ("sugar for continuous"), so it streams one JSON line per
+/// change and closes with the `last_seq` line, not a single `results` object.
+#[tokio::test]
+async fn changes_feed_live_is_continuous() {
+    let s = Server::start(false);
+    s.fresh_db("livefeed").await;
+    let (status, _) = s.put("/livefeed/a", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = s
+        .client
+        .get(format!(
+            "{}/livefeed/_changes?feed=live&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("line is JSON"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows[0]["id"], "a", "{text}");
+    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 0}), "{text}");
+}
+
 #[tokio::test]
 async fn changes_supports_sse_eventsource_feed() {
     let s = Server::start(false);
