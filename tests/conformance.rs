@@ -4507,7 +4507,7 @@ async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     let rev3 = r3["rev"].as_str().unwrap().to_string();
 
     let (status, body) = s.post("/purge/_purge", json!({"a": [rev2]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["purged"]["a"], json!([]), "interior revs are ignored");
     let (status, body) = s.get(&format!("/purge/a?rev={rev2}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -4524,6 +4524,41 @@ async fn purge_ignores_interior_revisions_and_removes_whole_branches() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = s.get(&format!("/purge/a?rev={rev1}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// CouchDB answers `_purge` with `"purge_seq": null` (chttpd_db `db_req` for
+// `_purge`) and reports the database's purge sequence in `GET /db`, where it
+// advances once per purged document.
+#[tokio::test]
+async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
+    let s = Server::start(false);
+    s.fresh_db("purgeseq").await;
+    let (_, r) = s.put("/purgeseq/a", json!({"v": 1})).await;
+    let rev_a = r["rev"].as_str().unwrap().to_string();
+    let (_, r) = s.put("/purgeseq/b", json!({"v": 1})).await;
+    let rev_b = r["rev"].as_str().unwrap().to_string();
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(0), "{info}");
+
+    let (status, body) = s
+        .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
+        .await;
+    // purge_results_to_json (chttpd_db.erl) answers 201 unless a result was
+    // only accepted or failed.
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body.as_object().unwrap().contains_key("purge_seq"),
+        "{body}"
+    );
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(2), "{info}");
+
+    // A purge that removes nothing does not advance it.
+    let (_, body) = s.post("/purgeseq/_purge", json!({"a": ["1-x"]})).await;
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = s.get("/purgeseq").await;
+    assert_eq!(info["purge_seq"], json!(2), "{info}");
 }
 
 #[tokio::test]
@@ -6264,6 +6299,26 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "v1");
     assert_eq!(rows[0]["deleted"], true);
+}
+
+// In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
+// per-node token (CouchDB packs per-shard purge seqs with
+// `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
+#[tokio::test]
+async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clpurge").await;
+    }
+    let (_, r) = nodes[0].put("/clpurge/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:0,0"), "{info}");
+
+    let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
+    assert_eq!(body["purge_seq"], Value::Null, "{body}");
+    let (_, info) = nodes[0].get("/clpurge").await;
+    assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
 }
 
 #[tokio::test]
@@ -8508,7 +8563,7 @@ async fn purge_invalidates_view_indexes() {
     assert_eq!(body["total_rows"], 1);
 
     let (status, _) = s.post("/purgeview/_purge", json!({"a": [rev]})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     let (_, body) = s.get("/purgeview/_design/v/_view/cities").await;
     assert_eq!(body["total_rows"], 0);
 }
@@ -10857,7 +10912,7 @@ async fn purged_documents_leave_search_results() {
     let (_, doc) = s.get("/searchpurge/apple").await;
     let rev = doc["_rev"].as_str().unwrap().to_string();
     let (status, body) = s.post("/searchpurge/_purge", json!({"apple": [rev]})).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     // A later write moves the database on, so the index must catch up from
     // its changes, where a fully purged document no longer appears.
     let (status, _) = s.put("/searchpurge/egg", json!({"item": "egg"})).await;

@@ -2245,7 +2245,7 @@ pub(crate) async fn cluster_changes(
                 if mask.is_empty() {
                     // Owns no shard: only its sequence is wanted, for its
                     // slot in the vector.
-                    let seq = fetch_update_seq(read, node).await?;
+                    let (seq, _) = fetch_node_seqs(read, node).await?;
                     let empty = json!({"results": [], "last_seq": seq, "pending": 0});
                     return Ok((shards, None, empty));
                 }
@@ -2538,8 +2538,9 @@ pub(crate) async fn fetch_node_changes(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
-/// One node's current update sequence: its own, or what the peer reports.
-async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
+/// One node's current update sequence and purge sequence: its own, or what
+/// the peer reports in the same answer.
+async fn fetch_node_seqs(read: ClusterRead<'_>, node: usize) -> DbResult<(u64, u64)> {
     let ClusterRead {
         ctx,
         db,
@@ -2547,7 +2548,7 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
         headers,
     } = read;
     if node == ctx.cluster.me {
-        return Ok(db.update_seq());
+        return Ok((db.update_seq(), db.purge_seq().await?));
     }
     let peer = &ctx.cluster.nodes[node];
     let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
@@ -2564,9 +2565,13 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
         .json::<Value>()
         .await
         .map_err(|e| bad(e.to_string()))?;
-    body["update_seq"]
+    let update_seq = body["update_seq"]
         .as_u64()
-        .ok_or_else(|| bad(format!("{peer}: no update_seq")))
+        .ok_or_else(|| bad(format!("{peer}: no update_seq")))?;
+    let purge_seq = body["purge_seq"]
+        .as_u64()
+        .ok_or_else(|| bad(format!("{peer}: no purge_seq")))?;
+    Ok((update_seq, purge_seq))
 }
 
 /// Current per-node update_seq vector, plus fallback marks for the shards of
@@ -2582,6 +2587,15 @@ async fn fetch_update_seq(read: ClusterRead<'_>, node: usize) -> DbResult<u64> {
 pub(crate) async fn cluster_update_vector(
     read: ClusterRead<'_>,
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
+    let (vector, marks, _) = cluster_seq_vectors(read).await?;
+    Ok((vector, marks))
+}
+
+/// [`cluster_update_vector`] plus the per-node purge sequence vector, which
+/// the same peer answers carry; a node that did not answer counts as 0.
+pub(crate) async fn cluster_seq_vectors(
+    read: ClusterRead<'_>,
+) -> DbResult<(Vec<u64>, Vec<FallbackMark>, Vec<u64>)> {
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
     // A peer discovery found unreachable is not asked, as long as the shards
@@ -2591,6 +2605,7 @@ pub(crate) async fn cluster_update_vector(
         .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
         .collect();
     let mut seqs: Vec<Option<u64>> = vec![None; nodes];
+    let mut purge_seqs: Vec<u64> = vec![0; nodes];
     let mut to_ask: Vec<usize> = (0..nodes)
         .filter(|node| !held_back.contains(node))
         .collect();
@@ -2598,17 +2613,18 @@ pub(crate) async fn cluster_update_vector(
         let answers = crate::cluster_http::in_one_round(futures::future::join_all(
             to_ask
                 .iter()
-                .map(|&node| async move { fetch_update_seq(read, node).await.ok() }),
+                .map(|&node| async move { fetch_node_seqs(read, node).await.ok() }),
         ))
         .await;
-        for (&node, seq) in to_ask.iter().zip(answers) {
-            seqs[node] = seq;
+        for (&node, answer) in to_ask.iter().zip(answers) {
+            seqs[node] = answer.map(|(seq, _)| seq);
+            purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
         }
         let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
         let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
         let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
         if failed.is_empty() {
-            return Ok((vector, Vec::new()));
+            return Ok((vector, Vec::new(), purge_seqs));
         }
         match fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive) {
             Err(_) if !held_back.is_empty() => to_ask = std::mem::take(&mut held_back),
@@ -2628,7 +2644,7 @@ pub(crate) async fn cluster_update_vector(
         .zip(&seqs)
         .map(|(seq, answer)| answer.map_or(UNKNOWN_SEQ, |_| seq))
         .collect();
-    Ok((vector, marks))
+    Ok((vector, marks, purge_seqs))
 }
 
 pub(crate) fn encode_since(vector: &[u64]) -> String {
