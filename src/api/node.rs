@@ -176,8 +176,11 @@ pub async fn db_migration_put(
             "migration shard map does not match database q or cluster node count",
         ));
     }
+    let Some(id) = query.get("id").cloned() else {
+        return fail(ApiError::bad_request("migration id required"));
+    };
     // Freezes client writes on this peer for the verification window.
-    if let Err(error) = db.begin_migration(map, query.get("id").cloned()) {
+    if let Err(error) = db.begin_migration(map, id) {
         return fail(error);
     }
     // Writes accepted before the freeze may still be fanning out to replicas.
@@ -192,10 +195,10 @@ pub async fn db_migration_put(
     ok()
 }
 
-/// Clears the migration announced with the same `id`. A different id, or none
-/// while the migration has one, is a 409 and leaves the freeze in place, so a
-/// stale or rival coordinator cannot unfreeze another's rebalance. Clearing
-/// when there is nothing to clear succeeds.
+/// Clears the migration announced with the same `id`. A different id is a 409
+/// and leaves the freeze in place, so a stale or rival coordinator cannot
+/// unfreeze another's rebalance. Clearing when there is nothing to clear
+/// succeeds.
 pub async fn db_migration_delete(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
@@ -206,9 +209,12 @@ pub async fn db_migration_delete(
         let principal = st.principal(&headers);
         return access_denied(&principal);
     }
+    let Some(id) = query.get("id") else {
+        return fail(ApiError::bad_request("migration id required"));
+    };
     match st.db(&name).await {
         Ok(db) => {
-            if db.clear_migration_if(query.get("id").map(String::as_str)) {
+            if db.clear_migration_if(id) {
                 ok()
             } else {
                 fail(ApiError::new(

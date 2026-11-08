@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Apply a security object locally and push it to every peer.
 ///
 /// The object is versioned, so the local write is kept even when peers are
-/// unreachable: anti-entropy (`fabric::reconcile_security`) delivers it later
+/// unreachable: anti-entropy (`fabric::sync_metadata`) delivers it later
 /// and peers never move back to an older version. Returns whether a majority
 /// of the cluster, this node included, holds the object now.
 pub(crate) async fn set_security_everywhere(
@@ -506,7 +506,7 @@ async fn set_migration_everywhere(
     id: &str,
     headers: &HeaderMap,
 ) -> DbResult<()> {
-    db.set_migration_map(map.clone(), Some(id.to_string()))?;
+    db.set_migration_map(map.clone(), id.to_string())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that

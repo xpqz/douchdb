@@ -288,7 +288,7 @@ impl AppState {
 
     /// Placement of a database for the management views: from memory when it
     /// is open, from its directory when it is not, and by opening it only
-    /// when the directory cannot say (a legacy database with no shard map).
+    /// when the directory cannot say (no shard map yet, or one for another cluster size).
     pub(crate) async fn placement(&self, name: &str) -> DbResult<Placement> {
         if !valid_db_name(name) {
             return Err(ApiError::db_not_found());

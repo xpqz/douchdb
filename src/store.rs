@@ -108,7 +108,6 @@ pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
     /// revision -> attachments in document order (order is part of the hash)
-    #[serde(default)]
     pub atts: BTreeMap<String, Vec<(String, AttMeta)>>,
 }
 
@@ -551,9 +550,9 @@ impl Shard {
             .map(u64::from_be_bytes)
             .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT);
 
-        // Counters are new in this version. Existing databases get them
-        // backfilled once on first open, then every metadata write keeps them
-        // in sync.
+        // A shard without counters (a new one, or one whose counters were
+        // lost) counts its metadata once on open; every metadata write then
+        // keeps them in sync.
         let stored = read_counter(&mut db, b"z/doc_count")?
             .zip(read_counter(&mut db, b"z/doc_deleted_count")?);
         let (docs, deleted) = match stored {
@@ -2051,8 +2050,8 @@ mod scan_tests {
         let mut shard = Shard::open(&dir, 1000).unwrap();
         assert_eq!(shard.counts(), (0, 2), "counters survive reopen");
 
-        // Simulate a database written before counters existed: open must
-        // backfill them from the metadata.
+        // A shard whose counters are missing: open must recount them from the
+        // metadata.
         shard.db.delete(b"z/doc_count").unwrap();
         shard.db.delete(b"z/doc_deleted_count").unwrap();
         shard.db.flush().unwrap();

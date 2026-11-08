@@ -41,7 +41,6 @@ struct DbFile {
     q: u32,
     uuid: String,
     instance_start_time: String,
-    #[serde(default)]
     partitioned: bool,
 }
 
@@ -350,10 +349,9 @@ pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     sync_parent(path)
 }
 
-/// Read the stored security object. Databases written before security was
-/// versioned keep a bare object in `security.json`; that is version 0. Neither
-/// file existing is an empty object; a file that is there but unusable is an
-/// error, since falling back to `{}` would make the database public.
+/// Read the stored security object. No file is an empty object; a file that
+/// is there but unusable is an error, since falling back to `{}` would make
+/// the database public.
 fn load_security(path: &Path) -> DbResult<(u64, Value)> {
     let versioned = path.join("security-versioned.json");
     if let Some(stored) = read_metadata::<Value>(&versioned)? {
@@ -368,8 +366,7 @@ fn load_security(path: &Path) -> DbResult<(u64, Value)> {
             )),
         };
     }
-    let legacy = read_metadata::<Value>(&path.join("security.json"))?;
-    Ok((0, legacy.unwrap_or_else(|| json!({}))))
+    Ok((0, json!({})))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -403,12 +400,11 @@ pub struct ClosedMeta {
     pub pending_shard_map: bool,
 }
 
-/// A rebalance target and the id of the coordinator that announced it. The id
-/// is absent when an older coordinator announced it.
+/// A rebalance target and the id of the coordinator that announced it.
 #[derive(PartialEq)]
 struct Migration {
     map: ShardMap,
-    id: Option<String>,
+    id: String,
 }
 
 pub struct Db {
@@ -507,86 +503,6 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
     (!name.contains('%')).then_some(name)
 }
 
-/// Whether `segment` could be one '/'-separated part of a database name.
-fn is_db_name_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && !segment.starts_with('_')
-        && segment.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')')
-        })
-}
-
-fn collect_nested_dbs(dir: &Path, rel: &[String], found: &mut Vec<(Vec<String>, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(segment) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_db_name_segment(&segment) || !path.is_dir() {
-            continue;
-        }
-        let mut parts = rel.to_vec();
-        parts.push(segment);
-        if parts.len() > 1 && path.join("db.json").is_file() {
-            found.push((parts.clone(), path.clone()));
-        }
-        collect_nested_dbs(&path, &parts, found);
-    }
-}
-
-/// Move databases that an older version stored as nested directories
-/// (`<root>/a/b`) to their flat directory (`<root>/a%2Fb`). Deepest first, so
-/// moving `a/b` never carries `a/b/c` along unmoved. Every target is checked
-/// before anything moves, and an existing target is never overwritten: the
-/// error names both directories and the data root is left as it was. Returns
-/// the moves made as `(from, to)`.
-pub fn migrate_nested_dbs(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let mut found = Vec::new();
-    collect_nested_dbs(root, &[], &mut found);
-    found.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-    let mut plan = Vec::new();
-    for (parts, from) in found {
-        let to = db_path(root, &parts.join("/"));
-        if to.exists() {
-            return Err(format!(
-                "cannot migrate database {}: {} is already there; move one of {} or {} away",
-                parts.join("/"),
-                to.display(),
-                from.display(),
-                to.display()
-            ));
-        }
-        plan.push((from, to));
-    }
-    let mut moved = Vec::new();
-    for (from, to) in plan {
-        std::fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "cannot move database directory {} to {}: {e}",
-                from.display(),
-                to.display()
-            )
-        })?;
-        tracing::info!(from = %from.display(), to = %to.display(), "migrated nested database directory");
-        // Drop the parent directories the move left empty; one that still
-        // holds anything (a database, another file) is not ours to remove.
-        let mut parent = from.parent();
-        while let Some(dir) = parent.filter(|dir| *dir != root) {
-            if std::fs::remove_dir(dir).is_err() {
-                break;
-            }
-            parent = dir.parent();
-        }
-        moved.push((from, to));
-    }
-    Ok(moved)
-}
-
 impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
@@ -627,9 +543,10 @@ impl Db {
         let shard_map = match stored_map {
             Some(map) if map.node_count == config.shard_map.node_count => map,
             stored => {
-                // A legacy database has no shard map yet, and one stored for a
-                // different cluster size no longer applies: start from the
-                // configured placement and persist it.
+                // A database without a shard map yet (a new one, or one
+                // interrupted before the map was written), and one stored for a
+                // different cluster size, start from the configured placement,
+                // which is then persisted.
                 if stored.is_some() {
                     tracing::warn!(
                         file = %map_path.display(),
@@ -1106,7 +1023,7 @@ impl Db {
         self.replication_map().replicas_of(shard).contains(&node)
     }
 
-    pub fn set_migration_map(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn set_migration_map(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1121,7 +1038,7 @@ impl Db {
     /// different migration while one is in progress is refused, so two
     /// coordinators cannot run at once and one cannot unfreeze the other;
     /// repeating the same one is harmless.
-    pub fn begin_migration(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn begin_migration(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1159,10 +1076,9 @@ impl Db {
 
     /// Clear the migration on behalf of the coordinator that announced it with
     /// `id`. Returns false, leaving the migration and its freeze in place, when
-    /// another coordinator's migration is in progress. Nothing to clear, an
-    /// expired freeze (the coordinator vanished) and a migration announced
-    /// without an id (an older coordinator) are all cleared by any caller.
-    pub fn clear_migration_if(&self, id: Option<&str>) -> bool {
+    /// another coordinator's migration is in progress. Nothing to clear and an
+    /// expired freeze (the coordinator vanished) are cleared by any caller.
+    pub fn clear_migration_if(&self, id: &str) -> bool {
         let mut current = self
             .migration_map
             .write()
@@ -1170,7 +1086,7 @@ impl Db {
         let Some(migration) = current.as_ref() else {
             return true;
         };
-        if self.rebalance_in_progress() && migration.id.is_some() && migration.id.as_deref() != id {
+        if self.rebalance_in_progress() && migration.id != id {
             return false;
         }
         *current = None;
@@ -4446,38 +4362,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_db_migration_never_overwrites() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-{}", uuid()));
-        for dir in ["a/b", "a%2Fb"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let err = migrate_nested_dbs(&root).unwrap_err();
-        assert!(err.contains("already there"), "{err}");
-        assert!(root.join("a/b/db.json").is_file());
-        assert!(root.join("a%2Fb/db.json").is_file());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn nested_db_migration_moves_deepest_first_and_prunes_empty_parents() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-ok-{}", uuid()));
-        for dir in ["a/b/c", "a/b", "x/y", "top"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let moved = migrate_nested_dbs(&root).unwrap();
-        assert_eq!(moved.len(), 3);
-        for dir in ["a%2Fb%2Fc", "a%2Fb", "x%2Fy", "top"] {
-            assert!(root.join(dir).join("db.json").is_file(), "{dir}");
-        }
-        assert!(!root.join("a").exists());
-        assert!(!root.join("x").exists());
-        assert!(migrate_nested_dbs(&root).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn uuids_do_not_repeat_in_a_tight_loop() {
         let ids: std::collections::HashSet<String> = (0..100_000).map(|_| uuid()).collect();
         assert_eq!(ids.len(), 100_000);
@@ -5136,19 +5020,6 @@ mod tests {
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (0, json!({})));
 
-        // A legacy bare object is version 0.
-        std::fs::write(
-            db.path.join("security.json"),
-            br#"{"members":{"names":["old"]}}"#,
-        )
-        .unwrap();
-        drop(db);
-        let db = Db::open(&root, "sec", config()).unwrap();
-        assert_eq!(
-            db.security_versioned(),
-            (0, json!({"members": {"names": ["old"]}}))
-        );
-
         assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
         assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
         // Older versions are rejected; equal ones are ordered by canonical form.
@@ -5198,7 +5069,6 @@ mod tests {
             ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
             ("security-versioned.json", b"{ not json"),
             ("security-versioned.json", br#"{"version":1}"#),
-            ("security.json", b"{ not json"),
         ] {
             let error = open_error(file, contents);
             assert_eq!(error.status, 500, "{file}: {}", error.reason);
@@ -5587,7 +5457,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.set_migration_map(target.clone(), None).unwrap();
+        db.set_migration_map(target.clone(), "a".into()).unwrap();
         db.set_rebalance_in_progress(true);
         assert!(db.is_replica_of("doc", 1) && !db.is_replica_of("doc", 0));
         assert_eq!(db.replication_map().replicas, target.replicas);
@@ -5606,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_clears_only_for_its_own_id_unless_expired_or_unnamed() {
+    fn migration_clears_only_for_its_own_id_unless_expired() {
         let root = std::env::temp_dir().join(format!("douchdb-mig-id-{}", crate::util::uuid()));
         let active = ShardMap {
             q: 2,
@@ -5630,24 +5500,19 @@ mod tests {
         )
         .unwrap();
         // Nothing to clear is fine.
-        assert!(db.clear_migration_if(Some("a")));
-        db.begin_migration(target.clone(), Some("a".into()))
-            .unwrap();
-        assert!(!db.clear_migration_if(Some("b")));
-        assert!(!db.clear_migration_if(None));
+        assert!(db.clear_migration_if("a"));
+        db.begin_migration(target.clone(), "a".into()).unwrap();
+        assert!(!db.clear_migration_if("b"));
         assert!(db.rebalance_in_progress());
-        assert!(db.clear_migration_if(Some("a")));
+        assert!(db.clear_migration_if("a"));
         assert!(!db.rebalance_in_progress());
-        // A migration from a coordinator without ids is cleared by anyone.
-        db.begin_migration(target.clone(), None).unwrap();
-        assert!(db.clear_migration_if(Some("b")));
         // An expired freeze no longer protects the stale map.
-        db.begin_migration(target, Some("a".into())).unwrap();
+        db.begin_migration(target, "a".into()).unwrap();
         while now_millis() < 1 {
             std::thread::yield_now();
         }
         db.rebalance_until.store(1, Ordering::SeqCst);
-        assert!(db.clear_migration_if(Some("b")));
+        assert!(db.clear_migration_if("b"));
         std::fs::remove_dir_all(root).ok();
     }
 

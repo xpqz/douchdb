@@ -2881,47 +2881,6 @@ async fn slash_database_and_parent_name_coexist() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// A data directory written by an older version keeps "a/b" at `a/b/`. On
-/// startup it is moved to its flat directory, once, and the parent database
-/// "a" that shared the tree is left intact.
-#[tokio::test]
-async fn nested_slash_database_directories_are_migrated_on_startup() {
-    let mut s = Server::start(false);
-    // The database name is not stored in the directory, so flat databases can
-    // be moved into the old nested layout while the server is stopped.
-    for name in ["mig", "migb", "migc"] {
-        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
-        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
-        s.put(&format!("/{name}/doc"), json!({"v": name})).await;
-    }
-    s.kill();
-    std::fs::rename(s.dir.join("migb"), s.dir.join("mig").join("b")).expect("nest b");
-    std::fs::rename(s.dir.join("migc"), s.dir.join("mig/b/c")).expect("nest c");
-
-    s.restart();
-    let (_, body) = s.get("/_all_dbs").await;
-    let listed: Vec<&str> = body
-        .as_array()
-        .expect("array")
-        .iter()
-        .filter_map(|n| n.as_str())
-        .filter(|n| n.starts_with("mig"))
-        .collect();
-    assert_eq!(listed, ["mig", "mig/b", "mig/b/c"], "{body}");
-    for (name, value) in [("mig", "mig"), ("mig%2Fb", "migb"), ("mig%2Fb%2Fc", "migc")] {
-        let (status, body) = s.get(&format!("/{name}/doc")).await;
-        assert_eq!(status, StatusCode::OK, "{name}: {body}");
-        assert_eq!(body["v"], value);
-    }
-    assert!(!s.dir.join("mig/b").exists(), "old nested dir left behind");
-    assert!(s.dir.join("mig%2Fb").join("db.json").is_file());
-
-    // A second startup has nothing left to move.
-    s.restart();
-    let (status, body) = s.get("/mig%2Fb%2Fc/doc").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-}
-
 /// A db.json that does not parse is a server-side fault, not a missing
 /// database: the client gets 500 and the file is left for the operator.
 #[tokio::test]
@@ -15995,97 +15954,6 @@ async fn cluster_metadata_sync_settles_equal_version_shard_maps_and_security() {
     .await;
 }
 
-/// A peer that predates the batched metadata exchange: it answers every
-/// request with 404, as a node without the endpoint does, and logs the
-/// request lines it saw. Returns its port and the log.
-async fn legacy_peer() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = seen.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let log = log.clone();
-            tokio::spawn(async move {
-                let mut buffer = Vec::new();
-                let mut chunk = [0u8; 4096];
-                // Only the request line matters; the body is not read.
-                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                    }
-                }
-                let text = String::from_utf8_lossy(&buffer).to_string();
-                let line = text.lines().next().unwrap_or("");
-                let mut words = line.split(' ');
-                let entry = format!(
-                    "{} {}",
-                    words.next().unwrap_or(""),
-                    words.next().unwrap_or("")
-                );
-                log.lock().unwrap().push(entry);
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                    )
-                    .await;
-            });
-        }
-    });
-    (port, seen)
-}
-
-#[tokio::test]
-async fn cluster_metadata_sync_falls_back_to_per_database_reconcile_for_old_peers() {
-    let (stub_port, seen) = legacy_peer().await;
-    let port = free_port();
-    let nodes = format!("http://127.0.0.1:{port},http://127.0.0.1:{stub_port}");
-    let extra: Vec<String> = [
-        "--q",
-        "4",
-        "--n",
-        "1",
-        "--nodes",
-        &nodes,
-        "--me",
-        "0",
-        "--cluster-secret",
-        "test-cluster-secret",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect();
-    let node = Server::spawn_on(port, &extra, false, 0).expect("node starts");
-    for name in ["old0", "old1"] {
-        // Accepted without a quorum: the other node is the stub.
-        let (status, body) = node.put(&format!("/{name}"), json!({})).await;
-        assert!(status.is_success(), "create {name}: {status} {body}");
-    }
-    let (passes, calls) = metadata_pass(&node).await;
-    assert!(passes >= 1);
-
-    let seen = seen.lock().unwrap().clone();
-    let count = |entry: &str| seen.iter().filter(|line| line.as_str() == entry).count();
-    // One probe of the new endpoint, then the old per-database GETs.
-    assert!(count("POST /_node/_local/_metadata_sync") >= 1, "{seen:?}");
-    for name in ["old0", "old1"] {
-        assert!(
-            count(&format!("GET /_node/_local/_dbs/{name}")) >= 1,
-            "{seen:?}"
-        );
-        assert!(
-            count(&format!("GET /_node/_local/_dbs/{name}/security")) >= 1,
-            "{seen:?}"
-        );
-    }
-    assert!(calls > 2 * 2, "{calls} calls");
-}
-
 #[tokio::test]
 async fn cluster_rebalance_requires_explicit_cleanup() {
     let nodes = start_cluster_with(3, "1", 1);
@@ -16848,7 +16716,7 @@ fn internal_headers() -> Vec<(&'static str, String)> {
 async fn migration_put_rejects_a_conflicting_migration() {
     let nodes = start_cluster_with(3, "3600", 1);
     nodes[0].fresh_db("migconflict").await;
-    let path = "/_node/_local/_dbs/migconflict/migration";
+    let path = "/_node/_local/_dbs/migconflict/migration?id=coordinator-a";
     let internal = internal_headers();
 
     let (status, body) = nodes[0]
@@ -16892,18 +16760,24 @@ async fn migration_delete_requires_the_migration_id() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // A rival coordinator, or a clear without an id, must not unfreeze it.
-    for wrong in [rival.as_str(), path] {
-        let (status, body) = nodes[0]
-            .req_with(Method::DELETE, wrong, None, &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-        // Still frozen: a different migration is still refused.
-        let (status, body) = nodes[0]
-            .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-    }
+    // A rival coordinator must not unfreeze it, and a clear needs an id.
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, &rival, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, path, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // Still frozen: a different migration is still refused.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // The owner clears it, and clearing again is harmless.
     for _ in 0..2 {
@@ -16956,7 +16830,10 @@ async fn migration_freeze_waits_for_detached_replica_writes() {
     // otherwise it can arrive after the final digest check.
     let freeze = tokio::spawn({
         let client = nodes[0].client.clone();
-        let url = format!("{}/_node/_local/_dbs/migdrain/migration", nodes[0].base);
+        let url = format!(
+            "{}/_node/_local/_dbs/migdrain/migration?id=drain",
+            nodes[0].base
+        );
         async move {
             client
                 .put(url)
@@ -17384,28 +17261,6 @@ fn grafana_dashboards_are_valid_and_provisioned() {
     assert!(provider.contains("/otel-lgtm/grafana-dashboards"));
     let compose = std::fs::read_to_string("docker-compose.yml").expect("compose file");
     assert!(compose.contains("./docker/grafana/dashboards:/otel-lgtm/grafana-dashboards:ro"));
-}
-
-#[tokio::test]
-async fn changes_since_with_huge_node_index_does_not_abort() {
-    let s = Server::start(false);
-    s.fresh_db("hugesince").await;
-    s.put("/hugesince/a", json!({"v": 1})).await;
-
-    // base64url({"99999999999":1}) is a legacy cluster token naming a node far
-    // outside the cluster. It must be treated as a malformed since (a 400, as
-    // in CouchDB), not allocated as a vector.
-    let (status, body) = s
-        .get("/hugesince/_changes?since=eyI5OTk5OTk5OTk5OSI6MX0")
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["reason"],
-        "Malformed sequence supplied in 'since' parameter."
-    );
-
-    let (status, _) = s.get("/hugesince").await;
-    assert_eq!(status, StatusCode::OK);
 }
 
 // couch_httpd_db:db_req(#httpd{method='POST'}) and chttpd_db:db_req(POST) feed
