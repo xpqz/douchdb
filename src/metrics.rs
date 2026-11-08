@@ -438,7 +438,14 @@ fn route_label(path: &str) -> String {
         "_membership",
         "_session",
     ];
-    const NODE: [&str; 5] = ["_dbs", "_cluster", "_metrics", "_health", "_replication"];
+    const NODE: [&str; 6] = [
+        "_dbs",
+        "_cluster",
+        "_metrics",
+        "_health",
+        "_replication",
+        "_metadata_sync",
+    ];
     const DB: [&str; 15] = [
         "_all_docs",
         "_design_docs",

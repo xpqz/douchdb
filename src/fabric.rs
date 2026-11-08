@@ -53,13 +53,16 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
     map.node_count == cluster_size.max(1) && map.version >= version
 }
 
-/// Reconcile versioned shard-map metadata with peers. Newer maps are pulled;
-/// older peers receive the local or pending map. This runs from anti-entropy,
-/// so a metadata update that missed a peer is repaired after that peer returns.
-pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
-    if !ctx.cluster.is_clustered() {
-        return;
-    }
+/// Reconcile versioned shard-map metadata of one database with `peers`, one
+/// GET and at most one PUT each. Newer maps are pulled; older peers receive
+/// the local or pending map. `known_acks` is the number of nodes (this one
+/// included) already known to hold the map, from peers handled elsewhere.
+///
+/// This is the per-database protocol that anti-entropy used before the
+/// batched exchange (`sync_metadata`). It stays for peers that predate that
+/// endpoint, so a rolling upgrade keeps converging.
+async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], known_acks: usize) {
+    let mut known_acks = known_acks;
     let local = db.shard_map();
     let mut desired = db
         .pending_shard_map()
@@ -67,7 +70,7 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         .unwrap_or_else(|| local.clone());
 
     let reported =
-        crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| async move {
+        crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
             let request = internal_request(
                 ctx,
                 reqwest::Method::GET,
@@ -102,6 +105,8 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
                 }
             }
             desired = map;
+            // What the other peers hold was counted against the older map.
+            known_acks = 1;
         }
     }
 
@@ -134,7 +139,8 @@ pub(crate) async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>) {
         }
     })))
     .await;
-    let acknowledgements = 1 + current.len() + responses.into_iter().filter(|ok| *ok).count();
+    let acknowledgements =
+        known_acks + current.len() + responses.into_iter().filter(|ok| *ok).count();
     if acknowledgements > ctx.cluster.nodes.len().max(1) / 2 {
         if let Err(error) = db.clear_pending_shard_map() {
             tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
@@ -156,15 +162,14 @@ fn security_supersedes(
             && crate::db::canonical_json(security) > crate::db::canonical_json(current))
 }
 
-/// Reconcile the versioned `_security` object with peers: adopt the newest
-/// one any peer reports, then push it to the peers that hold something else.
-/// This is what brings a restored, new or rollback-missed node up to date.
-pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
-    if !ctx.cluster.is_clustered() {
-        return;
-    }
+/// Reconcile the versioned `_security` object of one database with `peers`:
+/// adopt the newest one any peer reports, then push it to the peers that hold
+/// something else. This is what brings a restored, new or rollback-missed
+/// node up to date. Per-database protocol for peers without the batched
+/// exchange, like `reconcile_shard_map`.
+async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String]) {
     let fetched =
-        crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| async move {
+        crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
             let request = internal_request(
                 ctx,
                 reqwest::Method::GET,
@@ -219,6 +224,404 @@ pub(crate) async fn reconcile_security(ctx: &ClusterCtx, db: &Arc<Db>) {
             }),
     ))
     .await;
+}
+
+// ---- Batched metadata anti-entropy -----------------------------------------
+//
+// One exchange per peer covers every database of a pass. The sender posts a
+// summary, `{db: (shard map version + placement fingerprint, security version
+// + object fingerprint)}`; the peer answers with the entries it holds that
+// differ, so a converged cluster costs one request per peer however many
+// databases there are. Anti-entropy then applies what came back with the same
+// setters as the per-database protocol (`set_shard_map`,
+// `set_security_versioned`), so the version and tiebreak rules of the shard
+// map and security reconciliation are untouched. Entries the peer is behind
+// on are pushed in one more request to that peer, only when there are any.
+
+/// Databases per exchange, to bound the size of one request body. A pass over
+/// more databases than this makes one exchange per peer per batch.
+const METADATA_BATCH: usize = 1000;
+
+/// A metadata version and a fingerprint of its content.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Stamp {
+    version: u64,
+    fingerprint: String,
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn shard_map_stamp(map: &crate::cluster::ShardMap) -> Stamp {
+    let content = serde_json::to_vec(&(map.q, map.node_count, &map.replicas)).unwrap_or_default();
+    Stamp {
+        version: map.version,
+        fingerprint: fingerprint(&content),
+    }
+}
+
+pub(crate) fn security_stamp(version: u64, security: &Value) -> Stamp {
+    Stamp {
+        version,
+        fingerprint: fingerprint(crate::db::canonical_json(security).as_bytes()),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DbSummary {
+    shard_map: Stamp,
+    security: Stamp,
+}
+
+/// A security object with its cluster version, as stored.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SecurityEntry {
+    pub version: u64,
+    pub security: Value,
+}
+
+/// Metadata of one database: what a peer holds that differs from a summary,
+/// or what is pushed to a peer that is behind.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DbEntries {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_map: Option<crate::cluster::ShardMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityEntry>,
+}
+
+/// Which pushed entries the receiver stored.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Accepted {
+    pub shard_map: bool,
+    pub security: bool,
+}
+
+/// Body of `POST /_node/_local/_metadata_sync`: a summary to compare with,
+/// and entries to apply. Either may be empty.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MetadataSync {
+    #[serde(default)]
+    pub summary: BTreeMap<String, DbSummary>,
+    #[serde(default)]
+    pub push: BTreeMap<String, DbEntries>,
+}
+
+/// Answer to [`MetadataSync`]: the receiver's own entries that differ from the
+/// summary, the databases it does not have, and what became of the pushes.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MetadataSyncReply {
+    #[serde(default)]
+    pub differs: BTreeMap<String, DbEntries>,
+    #[serde(default)]
+    pub missing: BTreeSet<String>,
+    #[serde(default)]
+    pub accepted: BTreeMap<String, Accepted>,
+}
+
+/// The shard map anti-entropy spreads for `db`: the pending one if it is at
+/// least as new as the stored one, else the stored one.
+fn desired_shard_map(db: &Db) -> crate::cluster::ShardMap {
+    let local = db.shard_map();
+    db.pending_shard_map()
+        .filter(|pending| pending.version >= local.version)
+        .unwrap_or(local)
+}
+
+/// The receiver's side of the exchange: compare `summary` with what the local
+/// databases hold. Returns the entries that differ and the databases that do
+/// not exist here.
+pub(crate) async fn metadata_differences(
+    state: &AppState,
+    summary: &BTreeMap<String, DbSummary>,
+) -> (BTreeMap<String, DbEntries>, BTreeSet<String>) {
+    let mut differs = BTreeMap::new();
+    let mut missing = BTreeSet::new();
+    for (name, theirs) in summary {
+        let Ok(db) = state.db_cold(name).await else {
+            missing.insert(name.clone());
+            continue;
+        };
+        let mut entries = DbEntries::default();
+        let map = db.shard_map();
+        if shard_map_stamp(&map) != theirs.shard_map {
+            entries.shard_map = Some(map);
+        }
+        let (version, security) = db.security_versioned();
+        if security_stamp(version, &security) != theirs.security {
+            entries.security = Some(SecurityEntry { version, security });
+        }
+        if entries.shard_map.is_some() || entries.security.is_some() {
+            differs.insert(name.clone(), entries);
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+    (differs, missing)
+}
+
+/// How a peer took part in the exchange.
+enum PeerReply {
+    Answered(MetadataSyncReply),
+    /// 404: the peer predates the endpoint (a rolling upgrade). It is
+    /// reconciled database by database with the old GET/PUT protocol.
+    Legacy,
+    /// Unreachable or failed; tried again on the next pass.
+    Unavailable,
+}
+
+async fn metadata_exchange(ctx: &ClusterCtx, peer: &str, body: &MetadataSync) -> PeerReply {
+    let request = internal_request(
+        ctx,
+        reqwest::Method::POST,
+        peer,
+        &["_node", "_local", "_metadata_sync"],
+        None,
+    )
+    .json(body);
+    let Ok(response) = send_peer(request).await else {
+        return PeerReply::Unavailable;
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return PeerReply::Legacy;
+    }
+    if !response.status().is_success() {
+        return PeerReply::Unavailable;
+    }
+    match response.json::<MetadataSyncReply>().await {
+        Ok(reply) => PeerReply::Answered(reply),
+        Err(_) => PeerReply::Unavailable,
+    }
+}
+
+/// Reconcile shard maps and security objects of `names` with every peer: one
+/// exchange per peer per batch of databases, plus one push to each peer that
+/// is behind on something. Replaces running `reconcile_shard_map` and
+/// `reconcile_security` per database, which cost 2-4 requests per peer per
+/// database.
+pub(crate) async fn sync_metadata(state: &Arc<AppState>, names: &[String]) {
+    if !state.ctx.cluster.is_clustered() {
+        return;
+    }
+    for batch in names.chunks(METADATA_BATCH) {
+        sync_metadata_batch(state, batch).await;
+    }
+}
+
+async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
+    let ctx = &state.ctx;
+    let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
+
+    let mut sent = MetadataSync::default();
+    for name in names {
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        let (version, security) = db.security_versioned();
+        sent.summary.insert(
+            name.clone(),
+            DbSummary {
+                shard_map: shard_map_stamp(&desired_shard_map(&db)),
+                security: security_stamp(version, &security),
+            },
+        );
+        drop(db);
+        state.release_cold().await;
+    }
+    if sent.summary.is_empty() {
+        return;
+    }
+
+    let replies = crate::cluster_http::in_one_round(join_all(
+        peers
+            .iter()
+            .map(|peer| async { (peer.clone(), metadata_exchange(ctx, peer, &sent).await) }),
+    ))
+    .await;
+    let mut answered = Vec::new();
+    let mut legacy = Vec::new();
+    for (peer, reply) in replies {
+        match reply {
+            PeerReply::Answered(reply) => answered.push((peer, reply)),
+            PeerReply::Legacy => legacy.push(peer),
+            PeerReply::Unavailable => {}
+        }
+    }
+
+    // Adopt what the peers hold, and work out who is behind.
+    let mut pushes: BTreeMap<String, MetadataSync> = BTreeMap::new();
+    let mut pending: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, mine) in &sent.summary {
+        if answered.is_empty() {
+            break;
+        }
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        let holders: Vec<(&String, &MetadataSyncReply)> = answered
+            .iter()
+            .filter(|(_, reply)| !reply.missing.contains(name))
+            .map(|(peer, reply)| (peer, reply))
+            .collect();
+
+        let mut desired = desired_shard_map(&db);
+        for (_, reply) in &holders {
+            let Some(map) = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.shard_map.as_ref())
+            else {
+                continue;
+            };
+            if adoptable_peer_map(map, desired.version, ctx.cluster.nodes.len())
+                && db.set_shard_map(map.clone()).unwrap_or(false)
+            {
+                if db
+                    .pending_shard_map()
+                    .is_some_and(|pending| pending.version <= map.version)
+                {
+                    // The adopted map supersedes (or beat the tiebreak against) ours.
+                    if let Err(error) = db.clear_pending_shard_map() {
+                        tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+                    }
+                }
+                desired = map.clone();
+            }
+        }
+        let desired_stamp = shard_map_stamp(&desired);
+        let mut current = 1usize;
+        for (peer, reply) in &holders {
+            // A peer that sent no map holds the one we summarised.
+            let held = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.shard_map.as_ref())
+                .map(shard_map_stamp)
+                .unwrap_or_else(|| mine.shard_map.clone());
+            if held == desired_stamp {
+                current += 1;
+            } else {
+                pushes
+                    .entry((*peer).clone())
+                    .or_default()
+                    .push
+                    .entry(name.clone())
+                    .or_default()
+                    .shard_map = Some(desired.clone());
+            }
+        }
+        if db.pending_shard_map().is_some() {
+            pending.insert(name.clone(), current);
+        }
+
+        let (mut version, mut security) = db.security_versioned();
+        for (_, reply) in &holders {
+            let Some(entry) = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.security.as_ref())
+            else {
+                continue;
+            };
+            if security_supersedes(entry.version, &entry.security, version, &security)
+                && db
+                    .set_security_versioned(entry.version, entry.security.clone())
+                    .unwrap_or(false)
+            {
+                version = entry.version;
+                security = entry.security.clone();
+            }
+        }
+        let security_now = security_stamp(version, &security);
+        for (peer, reply) in &holders {
+            let held = reply
+                .differs
+                .get(name)
+                .and_then(|entries| entries.security.as_ref())
+                .map(|entry| security_stamp(entry.version, &entry.security))
+                .unwrap_or_else(|| mine.security.clone());
+            if held != security_now {
+                pushes
+                    .entry((*peer).clone())
+                    .or_default()
+                    .push
+                    .entry(name.clone())
+                    .or_default()
+                    .security = Some(SecurityEntry {
+                    version,
+                    security: security.clone(),
+                });
+            }
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+
+    // Push to the peers that are behind; each one that stores a pending map
+    // counts as an acknowledgement of it.
+    let pushed =
+        crate::cluster_http::in_one_round(join_all(pushes.iter().map(|(peer, body)| async move {
+            let request = internal_request(
+                ctx,
+                reqwest::Method::POST,
+                peer,
+                &["_node", "_local", "_metadata_sync"],
+                None,
+            )
+            .json(body);
+            let reply = match send_peer(request).await {
+                Ok(response) if response.status().is_success() => {
+                    response.json::<MetadataSyncReply>().await.ok()
+                }
+                _ => None,
+            };
+            (peer.clone(), reply)
+        })))
+        .await;
+    for (_, reply) in &pushed {
+        for (name, accepted) in reply.iter().flat_map(|reply| reply.accepted.iter()) {
+            if accepted.shard_map {
+                if let Some(count) = pending.get_mut(name) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let quorum_floor = ctx.cluster.nodes.len().max(1) / 2;
+    for (name, acknowledgements) in &pending {
+        if *acknowledgements <= quorum_floor {
+            continue;
+        }
+        let Ok(db) = state.db_cold(name).await else {
+            continue;
+        };
+        if let Err(error) = db.clear_pending_shard_map() {
+            tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
+        }
+        drop(db);
+        state.release_cold().await;
+    }
+
+    // Peers without the endpoint get the per-database protocol, counting the
+    // acknowledgements the others already gave.
+    if !legacy.is_empty() {
+        for name in sent.summary.keys() {
+            let Ok(db) = state.db_cold(name).await else {
+                continue;
+            };
+            let known = pending.get(name).copied().unwrap_or(1);
+            reconcile_shard_map(ctx, &db, &legacy, known).await;
+            reconcile_security(ctx, &db, &legacy).await;
+            drop(db);
+            state.release_cold().await;
+        }
+    }
 }
 
 /// Ask every replica for a document. With `open_all`, each peer returns all

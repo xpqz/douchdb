@@ -275,6 +275,10 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
             axum::routing::post(api::replication_resume),
         )
         .route(
+            "/_node/_local/_metadata_sync",
+            axum::routing::post(api::metadata_sync),
+        )
+        .route(
             "/_node/_local/_dbs/{db}",
             get(api::db_metadata).put(api::db_metadata_put),
         )

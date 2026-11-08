@@ -402,3 +402,49 @@ pub async fn db_cleanup(
         Err(error) => fail(error),
     }
 }
+
+/// Internal batched metadata exchange for anti-entropy: compares the sender's
+/// summary of shard-map and security versions with what this node holds and
+/// returns the entries that differ, and applies the entries the sender pushes
+/// (through the same setters as the per-database PUTs, so version and
+/// tiebreak rules are the same).
+pub async fn metadata_sync(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use crate::fabric::{Accepted, MetadataSync, MetadataSyncReply};
+    if !st.ctx.cluster.is_internal(&headers) {
+        let principal = st.principal(&headers);
+        return access_denied(&principal);
+    }
+    let request: MetadataSync = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return fail(ApiError::bad_request("invalid metadata sync request")),
+    };
+    let mut reply = MetadataSyncReply::default();
+    (reply.differs, reply.missing) =
+        crate::fabric::metadata_differences(&st, &request.summary).await;
+    for (name, entries) in request.push {
+        let Ok(db) = st.db_cold(&name).await else {
+            continue;
+        };
+        let mut accepted = Accepted::default();
+        if let Some(map) = entries.shard_map {
+            accepted.shard_map =
+                crate::cluster_ops::apply_shard_map(&st.ctx, &db, &name, map, &headers)
+                    .await
+                    .is_ok();
+        }
+        if let Some(entry) = entries.security {
+            accepted.security = validate_security(&entry.security).is_ok()
+                && db
+                    .set_security_versioned(entry.version, entry.security)
+                    .unwrap_or(false);
+        }
+        reply.accepted.insert(name, accepted);
+        drop(db);
+        st.release_cold().await;
+    }
+    json(StatusCode::OK, json!(reply))
+}
