@@ -211,7 +211,7 @@ pub struct Gate {
 impl Slot for Gate {}
 
 fn deleted_error() -> ApiError {
-    ApiError::not_found("Database does not exist.")
+    ApiError::db_not_found()
 }
 
 impl Gate {

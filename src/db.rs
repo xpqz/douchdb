@@ -697,9 +697,7 @@ impl Db {
     /// drop cannot bring the database back.
     pub fn open_existing(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         if !Db::exists(root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         }
         Db::open(root, name, config)
     }
@@ -713,9 +711,7 @@ impl Db {
     /// it is written before it is installed.
     pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
         if !Db::exists(root, name) {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         }
         load_security(&db_path(root, name)).map(|(_, security)| security)
     }
@@ -731,9 +727,7 @@ impl Db {
     ) -> DbResult<Option<ClosedMeta>> {
         let path = db_path(root, name);
         let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
-            return Err(ApiError::not_found(format!(
-                "Database does not exist: {name}"
-            )));
+            return Err(ApiError::db_not_found());
         };
         let map_path = path.join("shard-map.json");
         let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
@@ -780,7 +774,7 @@ impl Db {
     /// request for a database that is gone (`couch_server`).
     pub fn check_live(&self) -> DbResult<()> {
         if self.deleted.load(Ordering::SeqCst) {
-            Err(ApiError::not_found("Database does not exist."))
+            Err(ApiError::db_not_found())
         } else {
             Ok(())
         }
@@ -789,9 +783,9 @@ impl Db {
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
         match std::fs::remove_dir_all(db_path(root, name)) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::not_found(
-                format!("Database does not exist: {name}"),
-            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ApiError::db_not_found())
+            }
             Err(error) => Err(metadata_error(&db_path(root, name), error)),
         }
     }

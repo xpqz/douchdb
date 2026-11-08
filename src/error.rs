@@ -42,6 +42,11 @@ impl ApiError {
         ApiError::new(404, "not_found", reason)
     }
 
+    /// A request for a database that does not exist (`couch_httpd_db`).
+    pub fn db_not_found() -> ApiError {
+        ApiError::not_found("Database does not exist.")
+    }
+
     pub fn conflict() -> ApiError {
         ApiError::new(409, "conflict", "Document update conflict.")
     }

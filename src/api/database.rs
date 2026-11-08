@@ -147,9 +147,7 @@ async fn delete_db(st: &AppState, name: &str, headers: &HeaderMap, local_only: b
     }
     if deleted + missing == st.ctx.cluster.nodes.len() {
         if deleted == 0 {
-            return fail(local.err().unwrap_or_else(|| {
-                ApiError::not_found(format!("Database does not exist: {name}"))
-            }));
+            return fail(local.err().unwrap_or_else(ApiError::db_not_found));
         }
         ok()
     } else if deleted > 0 {
