@@ -444,14 +444,20 @@ async fn send_migration(
     peer: &str,
     name: &str,
     map: Option<&ShardMap>,
+    id: &str,
     headers: &HeaderMap,
 ) -> Result<(), MigrationRefused> {
     let segments = ["_node", "_local", "_dbs", name, "migration"];
+    let method = if map.is_some() {
+        reqwest::Method::PUT
+    } else {
+        reqwest::Method::DELETE
+    };
+    let request =
+        internal_request(ctx, method, peer, &segments, Some(headers)).query(&[("id", id)]);
     let request = match map {
-        Some(map) => {
-            internal_request(ctx, reqwest::Method::PUT, peer, &segments, Some(headers)).json(map)
-        }
-        None => internal_request(ctx, reqwest::Method::DELETE, peer, &segments, Some(headers)),
+        Some(map) => request.json(map),
+        None => request,
     };
     match request.send().await {
         Ok(response) if response.status().is_success() => Ok(()),
@@ -471,9 +477,10 @@ async fn set_migration_everywhere(
     db: &Db,
     name: &str,
     map: &ShardMap,
+    id: &str,
     headers: &HeaderMap,
 ) -> DbResult<()> {
-    db.set_migration_map(map.clone())?;
+    db.set_migration_map(map.clone(), Some(id.to_string()))?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that
@@ -484,7 +491,7 @@ async fn set_migration_everywhere(
     }
     if failures.is_empty() {
         for peer in &peers {
-            if let Err(refused) = send_migration(ctx, peer, name, Some(map), headers).await {
+            if let Err(refused) = send_migration(ctx, peer, name, Some(map), id, headers).await {
                 if refused.conflict {
                     foreign.push(peer.clone());
                 }
@@ -497,7 +504,7 @@ async fn set_migration_everywhere(
     }
     db.clear_migration_map();
     for peer in peers.iter().filter(|peer| !foreign.contains(peer)) {
-        let _ = send_migration(ctx, peer, name, None, headers).await;
+        let _ = send_migration(ctx, peer, name, None, id, headers).await;
     }
     Err(ApiError::new(
         502,
@@ -509,10 +516,16 @@ async fn set_migration_everywhere(
     ))
 }
 
-async fn clear_migration_everywhere(ctx: &ClusterCtx, db: &Db, name: &str, headers: &HeaderMap) {
+async fn clear_migration_everywhere(
+    ctx: &ClusterCtx,
+    db: &Db,
+    name: &str,
+    id: &str,
+    headers: &HeaderMap,
+) {
     db.clear_migration_map();
     for peer in ctx.cluster.peers() {
-        if let Err(error) = send_migration(ctx, peer, name, None, headers).await {
+        if let Err(error) = send_migration(ctx, peer, name, None, id, headers).await {
             tracing::warn!("migration map clear on {}", error.message);
         }
     }
@@ -590,10 +603,13 @@ async fn migrate(
     headers: &HeaderMap,
     timeout_ms: u64,
 ) -> DbResult<Value> {
+    // Identifies this coordinator's migration: only a clear carrying it may
+    // unfreeze the peers, so a rival or stale coordinator cannot.
+    let migration_id = crate::util::uuid();
     // Broadcast the migration map first: it freezes writes on every peer and
     // lets anti-entropy seed the target replicas while reads stay on the old
     // active map.
-    if let Err(error) = set_migration_everywhere(ctx, db, name, map, headers).await {
+    if let Err(error) = set_migration_everywhere(ctx, db, name, map, &migration_id, headers).await {
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
@@ -608,7 +624,7 @@ async fn migrate(
     )
     .await
     {
-        clear_migration_everywhere(ctx, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
         db.set_rebalance_in_progress(false);
         return Err(error);
     }
@@ -616,7 +632,7 @@ async fn migrate(
     if let Err(error) = wait_for_rebalance(ctx, db, old_map, map, headers, timeout_ms).await {
         // The active map never changed, so reads continued on the old owners
         // throughout the migration attempt.
-        clear_migration_everywhere(ctx, db, name, headers).await;
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
         db.set_rebalance_in_progress(false);
         if error.status == 504 {
             crate::telemetry::record_rebalance_timeout();
@@ -627,12 +643,12 @@ async fn migrate(
     let map = match activate_map_everywhere(ctx, db, name, map, headers).await {
         Ok(activated) => activated,
         Err(error) => {
-            clear_migration_everywhere(ctx, db, name, headers).await;
+            clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
             db.set_rebalance_in_progress(false);
             return Err(error);
         }
     };
-    clear_migration_everywhere(ctx, db, name, headers).await;
+    clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
     db.set_rebalance_in_progress(false);
 
     let mut value = json!(map);

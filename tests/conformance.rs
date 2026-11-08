@@ -14717,6 +14717,46 @@ async fn migration_put_rejects_a_conflicting_migration() {
 }
 
 #[tokio::test]
+async fn migration_delete_requires_the_migration_id() {
+    let nodes = start_cluster_with(3, "3600", 1);
+    nodes[0].fresh_db("migowner").await;
+    let path = "/_node/_local/_dbs/migowner/migration";
+    let mine = format!("{path}?id=coordinator-a");
+    let rival = format!("{path}?id=coordinator-b");
+    let internal = internal_headers();
+
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &mine, Some(all_shards_on(1)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A rival coordinator, or a clear without an id, must not unfreeze it.
+    for wrong in [rival.as_str(), path] {
+        let (status, body) = nodes[0]
+            .req_with(Method::DELETE, wrong, None, &internal)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
+        // Still frozen: a different migration is still refused.
+        let (status, body) = nodes[0]
+            .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
+    }
+
+    // The owner clears it, and clearing again is harmless.
+    for _ in 0..2 {
+        let (status, body) = nodes[0]
+            .req_with(Method::DELETE, &mine, None, &internal)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn migration_freeze_waits_for_detached_replica_writes() {
     let nodes = start_cluster_with(3, "3600", 3);
     for node in &nodes {
