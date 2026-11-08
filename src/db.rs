@@ -10,8 +10,8 @@ use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Attachment, Rev};
 use crate::store::{
-    blob_prefix, body_key, local_key, meta_key, meta_state, seq_key, AttMeta, DocMeta, LiveDoc,
-    MetaState, ShardHandle, Tx,
+    blob_prefix, body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, AttMeta,
+    DocMeta, LiveDoc, MetaState, PurgeInfo, Shard, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
 use base64::Engine;
@@ -41,7 +41,6 @@ struct DbFile {
     q: u32,
     uuid: String,
     instance_start_time: String,
-    #[serde(default)]
     partitioned: bool,
 }
 
@@ -350,10 +349,9 @@ pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     sync_parent(path)
 }
 
-/// Read the stored security object. Databases written before security was
-/// versioned keep a bare object in `security.json`; that is version 0. Neither
-/// file existing is an empty object; a file that is there but unusable is an
-/// error, since falling back to `{}` would make the database public.
+/// Read the stored security object. No file is an empty object; a file that
+/// is there but unusable is an error, since falling back to `{}` would make
+/// the database public.
 fn load_security(path: &Path) -> DbResult<(u64, Value)> {
     let versioned = path.join("security-versioned.json");
     if let Some(stored) = read_metadata::<Value>(&versioned)? {
@@ -368,8 +366,7 @@ fn load_security(path: &Path) -> DbResult<(u64, Value)> {
             )),
         };
     }
-    let legacy = read_metadata::<Value>(&path.join("security.json"))?;
-    Ok((0, legacy.unwrap_or_else(|| json!({}))))
+    Ok((0, json!({})))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -403,12 +400,11 @@ pub struct ClosedMeta {
     pub pending_shard_map: bool,
 }
 
-/// A rebalance target and the id of the coordinator that announced it. The id
-/// is absent when an older coordinator announced it.
+/// A rebalance target and the id of the coordinator that announced it.
 #[derive(PartialEq)]
 struct Migration {
     map: ShardMap,
-    id: Option<String>,
+    id: String,
 }
 
 pub struct Db {
@@ -507,86 +503,6 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
     (!name.contains('%')).then_some(name)
 }
 
-/// Whether `segment` could be one '/'-separated part of a database name.
-fn is_db_name_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && !segment.starts_with('_')
-        && segment.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')')
-        })
-}
-
-fn collect_nested_dbs(dir: &Path, rel: &[String], found: &mut Vec<(Vec<String>, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(segment) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_db_name_segment(&segment) || !path.is_dir() {
-            continue;
-        }
-        let mut parts = rel.to_vec();
-        parts.push(segment);
-        if parts.len() > 1 && path.join("db.json").is_file() {
-            found.push((parts.clone(), path.clone()));
-        }
-        collect_nested_dbs(&path, &parts, found);
-    }
-}
-
-/// Move databases that an older version stored as nested directories
-/// (`<root>/a/b`) to their flat directory (`<root>/a%2Fb`). Deepest first, so
-/// moving `a/b` never carries `a/b/c` along unmoved. Every target is checked
-/// before anything moves, and an existing target is never overwritten: the
-/// error names both directories and the data root is left as it was. Returns
-/// the moves made as `(from, to)`.
-pub fn migrate_nested_dbs(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let mut found = Vec::new();
-    collect_nested_dbs(root, &[], &mut found);
-    found.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-    let mut plan = Vec::new();
-    for (parts, from) in found {
-        let to = db_path(root, &parts.join("/"));
-        if to.exists() {
-            return Err(format!(
-                "cannot migrate database {}: {} is already there; move one of {} or {} away",
-                parts.join("/"),
-                to.display(),
-                from.display(),
-                to.display()
-            ));
-        }
-        plan.push((from, to));
-    }
-    let mut moved = Vec::new();
-    for (from, to) in plan {
-        std::fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "cannot move database directory {} to {}: {e}",
-                from.display(),
-                to.display()
-            )
-        })?;
-        tracing::info!(from = %from.display(), to = %to.display(), "migrated nested database directory");
-        // Drop the parent directories the move left empty; one that still
-        // holds anything (a database, another file) is not ours to remove.
-        let mut parent = from.parent();
-        while let Some(dir) = parent.filter(|dir| *dir != root) {
-            if std::fs::remove_dir(dir).is_err() {
-                break;
-            }
-            parent = dir.parent();
-        }
-        moved.push((from, to));
-    }
-    Ok(moved)
-}
-
 impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
@@ -627,9 +543,10 @@ impl Db {
         let shard_map = match stored_map {
             Some(map) if map.node_count == config.shard_map.node_count => map,
             stored => {
-                // A legacy database has no shard map yet, and one stored for a
-                // different cluster size no longer applies: start from the
-                // configured placement and persist it.
+                // A database without a shard map yet (a new one, or one
+                // interrupted before the map was written), and one stored for a
+                // different cluster size, start from the configured placement,
+                // which is then persisted.
                 if stored.is_some() {
                     tracing::warn!(
                         file = %map_path.display(),
@@ -1106,7 +1023,7 @@ impl Db {
         self.replication_map().replicas_of(shard).contains(&node)
     }
 
-    pub fn set_migration_map(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn set_migration_map(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1121,7 +1038,7 @@ impl Db {
     /// different migration while one is in progress is refused, so two
     /// coordinators cannot run at once and one cannot unfreeze the other;
     /// repeating the same one is harmless.
-    pub fn begin_migration(&self, map: ShardMap, id: Option<String>) -> DbResult<()> {
+    pub fn begin_migration(&self, map: ShardMap, id: String) -> DbResult<()> {
         if !map.is_valid(self.q, map.node_count) {
             return Err(ApiError::bad_request("invalid migration shard map"));
         }
@@ -1159,10 +1076,9 @@ impl Db {
 
     /// Clear the migration on behalf of the coordinator that announced it with
     /// `id`. Returns false, leaving the migration and its freeze in place, when
-    /// another coordinator's migration is in progress. Nothing to clear, an
-    /// expired freeze (the coordinator vanished) and a migration announced
-    /// without an id (an older coordinator) are all cleared by any caller.
-    pub fn clear_migration_if(&self, id: Option<&str>) -> bool {
+    /// another coordinator's migration is in progress. Nothing to clear and an
+    /// expired freeze (the coordinator vanished) are cleared by any caller.
+    pub fn clear_migration_if(&self, id: &str) -> bool {
         let mut current = self
             .migration_map
             .write()
@@ -1170,7 +1086,7 @@ impl Db {
         let Some(migration) = current.as_ref() else {
             return true;
         };
-        if self.rebalance_in_progress() && migration.id.is_some() && migration.id.as_deref() != id {
+        if self.rebalance_in_progress() && migration.id != id {
             return false;
         }
         *current = None;
@@ -1438,7 +1354,18 @@ impl Db {
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
+        let mut locals: Vec<(usize, Value)> = Vec::new();
         for (i, doc) in docs.into_iter().enumerate() {
+            // `_local/` documents have no revision tree and no sequence; they
+            // are applied to the shard of their id further down.
+            if doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("_local/"))
+            {
+                locals.push((i, doc));
+                continue;
+            }
             match doc_id(&doc) {
                 Ok(id) => match self.validate_doc_id(&id) {
                     Ok(()) => {
@@ -1461,14 +1388,25 @@ impl Db {
         // next global sequence when its shard stages it, so the order the
         // shards run in is the order of `_changes` for this batch.
         let mut shard_error = None;
+        // A design document's functions compile here, outside any shard job,
+        // so the compile never holds a shard's writer.
+        let mut compile_errors = if touches_design {
+            compile_design_docs(&self.shards, &grouped, new_edits).await?
+        } else {
+            HashMap::new()
+        };
         for (shard_idx, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
             let seq = self.seq.clone();
             let reserved = self.reserved_seq[shard_idx].clone();
+            let verdicts: HashMap<usize, ApiError> = batch
+                .iter()
+                .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
+                .collect();
             let results = match self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, &seq, &reserved)))
+                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts, &seq, &reserved)))
                 .await
             {
                 Ok(results) => results,
@@ -1485,6 +1423,10 @@ impl Db {
                     }),
                 });
             }
+        }
+
+        for (slot, result) in self.put_local_docs(locals).await {
+            out[slot] = Some(result);
         }
 
         if touches_design {
@@ -2467,17 +2409,144 @@ impl Db {
 
     // ----- local documents -------------------------------------------------
 
+    /// The shard that holds `_local/{id}`: the same hash as any document, so
+    /// a local document lives on the replicas of the shard its id falls in.
+    fn local_shard(&self, id: &str) -> &ShardHandle {
+        &self.shards[self.shard_index(&format!("_local/{id}"))]
+    }
+
     pub async fn local_get(&self, id: &str) -> DbResult<Option<Value>> {
         let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| read_local(s, &id))
+            .await
+    }
+
+    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<Value> {
+        let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| write_local(s, &id, body))
+            .await
+    }
+
+    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
+        let id = id.to_string();
+        self.local_shard(&id)
+            .call(move |s| delete_local(s, &id))
+            .await
+    }
+
+    /// Apply the `_local/` documents of a `_bulk_docs` batch, each on the
+    /// shard of its id. A delete of a missing document is a success at rev
+    /// 0-0, unlike `DELETE /db/_local/id`, as in CouchDB.
+    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
+        let mut out = Vec::with_capacity(docs.len());
+        for (slot, doc) in docs {
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
+            let deleted = doc
+                .get("_deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = if deleted {
+                match self.local_delete(&name).await {
+                    Err(error) if error.status == 404 => {
+                        Ok(json!({"ok": true, "id": id, "rev": "0-0"}))
+                    }
+                    other => other,
+                }
+            } else {
+                self.local_put(&name, doc).await
+            };
+            out.push((
+                slot,
+                result.unwrap_or_else(
+                    |error| json!({"id": id, "error": error.error, "reason": error.reason}),
+                ),
+            ));
+        }
+        out
+    }
+
+    /// Store `_local/` documents exactly as given, `_rev` included, unless
+    /// this node already holds a newer one. A rebalance uses it to hand a
+    /// shard's local documents to a new replica; a normal write would number
+    /// the copy one higher.
+    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<Value> {
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let id = doc
+                .get("_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
+            let result = self
+                .local_shard(&name)
+                .call(move |s| install_local(s, &name, doc))
+                .await;
+            out.push(result.unwrap_or_else(
+                |error| json!({"id": id, "error": error.error, "reason": error.reason}),
+            ));
+        }
+        out
+    }
+
+    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
+    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
+    /// CouchDB reports neither `total_rows` nor `offset` for them.
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+        self.local_docs_filtered(opts, None).await
+    }
+
+    /// Like `local_docs`, but only the shards whose `owned` entry is true.
+    /// A cluster coordinator asks each node for one copy of every shard.
+    pub async fn local_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+        self.local_docs_filtered(opts, Some(owned)).await
+    }
+
+    async fn local_docs_filtered(
+        &self,
+        opts: &AllDocsOpts,
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Value> {
+        let listed = futures::future::join_all(
+            self.shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| shard_owned(owned, *index))
+                .map(|(_, shard)| shard.call(list_local)),
+        )
+        .await;
+        let mut docs: Vec<(String, Value)> = Vec::new();
+        for shard_docs in listed {
+            docs.extend(shard_docs?);
+        }
+        docs.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows = local_doc_rows(docs, opts);
+        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+    }
+
+    /// A node-local record that is not a document: the replication
+    /// checkpoints of anti-entropy. They belong to this node and one peer,
+    /// so they are neither shared with the cluster nor listed by
+    /// `_local_docs`, and they live on the first shard whatever the
+    /// placement.
+    pub async fn checkpoint_get(&self, id: &str) -> DbResult<Option<Value>> {
+        let key = checkpoint_key(id);
         self.shards[0]
-            .call(move |s| match s.get_checked(&local_key(&id))? {
+            .call(move |s| match s.get_checked(&key)? {
                 Some(bytes) => serde_json::from_slice::<Value>(&bytes)
                     .map(Some)
                     .map_err(|error| {
                         ApiError::new(
                             500,
                             "internal_server_error",
-                            format!("corrupt local document {id}: {error}"),
+                            format!("corrupt checkpoint: {error}"),
                         )
                     }),
                 None => Ok(None),
@@ -2485,83 +2554,17 @@ impl Db {
             .await
     }
 
-    pub async fn local_put(&self, id: &str, mut body: Value) -> DbResult<Value> {
-        let id = id.to_string();
+    pub async fn checkpoint_put(&self, id: &str, value: &Value) -> DbResult<()> {
+        let key = checkpoint_key(id);
+        let value = value.clone();
         self.shards[0]
             .call(move |s| {
-                let key = local_key(&id);
-                // CouchDB (couch_db_updater:update_local_docs/2) numbers a
-                // local write from the supplied `_rev`, absent meaning 0, and
-                // never conflicts: the stored revision is not consulted.
-                let supplied = match body.get("_rev") {
-                    None => 0,
-                    Some(rev) => rev
-                        .as_str()
-                        .and_then(|r| r.strip_prefix("0-"))
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
-                };
-                let next = supplied.saturating_add(1);
-                let rev = format!("0-{next}");
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("_id".into(), json!(format!("_local/{id}")));
-                    obj.insert("_rev".into(), json!(rev));
-                }
                 let mut tx = Tx::new();
-                tx.put_json(&key, &body)?;
+                tx.put_json(&key, &value)?;
                 s.commit(tx)?;
-                Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+                Ok(())
             })
             .await
-    }
-
-    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
-        let id = id.to_string();
-        self.shards[0]
-            .call(move |s| {
-                if s.get_checked(&local_key(&id))?.is_none() {
-                    return Err(ApiError::not_found("missing"));
-                }
-                let mut tx = Tx::new();
-                tx.delete(&local_key(&id));
-                s.commit(tx)?;
-                Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
-            })
-            .await
-    }
-
-    /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
-    /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
-    /// CouchDB reports neither `total_rows` nor `offset` for them.
-    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
-        let opts = opts.clone();
-        let rows = self.shards[0]
-            .call(move |s| {
-                let mut docs: Vec<(String, Value)> = Vec::new();
-                let mut corrupt = None;
-                s.scan_range_while(b"l/", None, false, |key, value| {
-                    let Some(id) = key
-                        .strip_prefix(b"l/")
-                        .and_then(|id| std::str::from_utf8(id).ok())
-                    else {
-                        return true;
-                    };
-                    match serde_json::from_slice::<Value>(value) {
-                        Ok(doc) => docs.push((format!("_local/{id}"), doc)),
-                        Err(error) => {
-                            corrupt = Some(format!("corrupt local document {id}: {error}"));
-                            return false;
-                        }
-                    }
-                    true
-                })?;
-                if let Some(reason) = corrupt {
-                    return Err(ApiError::new(500, "internal_server_error", reason));
-                }
-                Ok(local_doc_rows(docs, &opts))
-            })
-            .await?;
-        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
     }
 
     // ----- maintenance -----------------------------------------------------
@@ -2579,7 +2582,117 @@ impl Db {
             .try_fold(0u64, |sum, count| Ok(sum.saturating_add(count?)))
     }
 
-    pub async fn purge(&self, body: &Value) -> DbResult<Value> {
+    /// The replicas of `shard` other than node `me`: the peers whose purge
+    /// checkpoints hold back trimming of the shard's purge infos.
+    fn purge_peers(&self, shard: usize, me: usize) -> Vec<usize> {
+        let shard = u32::try_from(shard).unwrap_or(u32::MAX);
+        self.replication_map()
+            .replicas_of(shard)
+            .iter()
+            .copied()
+            .filter(|node| *node != me)
+            .collect()
+    }
+
+    /// Per shard: its purge sequence and the purge infos after `since[shard]`
+    /// (a missing entry reads as 0). `reader` is the replica asking, if any;
+    /// it has confirmed everything up to `since`, so the shard may trim up to
+    /// there once the other replicas have too.
+    pub async fn purged_infos(
+        &self,
+        since: &[u64],
+        reader: Option<usize>,
+    ) -> DbResult<Vec<(u64, Vec<PurgeInfo>)>> {
+        let reads = self.shards.iter().enumerate().map(|(index, shard)| {
+            let after = since.get(index).copied().unwrap_or(0);
+            shard.call(move |s| {
+                if let Some(node) = reader {
+                    s.report_purge_checkpoint(node, after)?;
+                }
+                Ok(s.purged_since(after)?)
+            })
+        });
+        futures::future::join_all(reads).await.into_iter().collect()
+    }
+
+    /// Record purge infos another copy of `shard` made and purge what they
+    /// list. Infos already recorded here are skipped. Whether any revision was
+    /// removed.
+    pub async fn apply_purge_infos(
+        &self,
+        shard: usize,
+        infos: Vec<PurgeInfo>,
+        me: usize,
+    ) -> DbResult<bool> {
+        let Some(handle) = self.shards.get(shard) else {
+            return Ok(false);
+        };
+        let peers = self.purge_peers(shard, me);
+        let seq_counter = self.seq.clone();
+        let reserved = self.reserved_seq[shard].clone();
+        handle
+            .call(move |s| {
+                let mut removed = false;
+                for info in infos {
+                    if s.has_purge(&info.uuid)? {
+                        continue;
+                    }
+                    let gone = purge_one(
+                        s,
+                        &info.id,
+                        &info.revs,
+                        Some(&info.uuid),
+                        &peers,
+                        &seq_counter,
+                        &reserved,
+                    )?;
+                    removed |= !gone.is_empty();
+                }
+                Ok(removed)
+            })
+            .await
+    }
+
+    /// The `(id, rev)` pairs among `pairs` that a purge info lists.
+    pub async fn purged_among(
+        &self,
+        pairs: &std::collections::BTreeSet<(String, String)>,
+    ) -> DbResult<std::collections::BTreeSet<(String, String)>> {
+        let mut grouped: Vec<std::collections::BTreeMap<&str, Vec<String>>> =
+            (0..self.q).map(|_| Default::default()).collect();
+        for (id, rev) in pairs {
+            grouped[self.shard_index(id)]
+                .entry(id)
+                .or_default()
+                .push(rev.clone());
+        }
+        let mut found = std::collections::BTreeSet::new();
+        for (index, docs) in grouped.into_iter().enumerate() {
+            if docs.is_empty() {
+                continue;
+            }
+            let docs: Vec<(String, Vec<String>)> = docs
+                .into_iter()
+                .map(|(id, revs)| (id.to_string(), revs))
+                .collect();
+            let hits = self.shards[index]
+                .call(move |s| {
+                    let mut hits = Vec::new();
+                    for (id, revs) in docs {
+                        for rev in s.purged_revs(&id, &revs)? {
+                            hits.push((id.clone(), rev));
+                        }
+                    }
+                    Ok(hits)
+                })
+                .await?;
+            found.extend(hits);
+        }
+        Ok(found)
+    }
+
+    /// Purge on this node, which is replica `me`.
+    pub async fn purge(&self, body: &Value, me: usize) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
@@ -2608,13 +2721,14 @@ impl Db {
             }
             let seq_counter = self.seq.clone();
             let reserved = self.reserved_seq[index].clone();
+            let peers = self.purge_peers(index, me);
             done.push(
                 self.shards[index]
                     .call(move |s| {
                         batch
                             .into_iter()
                             .map(|(slot, id, requested)| {
-                                purge_one(s, &id, &requested, &seq_counter, &reserved)
+                                purge_one(s, &id, &requested, None, &peers, &seq_counter, &reserved)
                                     .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
@@ -2658,6 +2772,19 @@ impl Db {
 
     pub async fn get_revs_limit(&self) -> DbResult<u64> {
         self.shards[0].call(|s| Ok(s.revs_limit())).await
+    }
+
+    pub async fn get_purged_infos_limit(&self) -> DbResult<u64> {
+        self.shards[0].call(|s| Ok(s.purged_infos_limit())).await
+    }
+
+    pub async fn set_purged_infos_limit(&self, limit: u64) -> DbResult<()> {
+        for shard in &self.shards {
+            shard
+                .call(move |s| s.set_purged_infos_limit(limit).map_err(ApiError::from))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn set_revs_limit(&self, limit: u64) -> DbResult<()> {
@@ -2712,17 +2839,34 @@ fn revs_diff_one(
 }
 
 /// Purge the requested leaf revisions of one document; the revisions removed.
+///
+/// The purge is recorded as a purge info in the same transaction. A fresh
+/// purge records the revisions it removed, under a new uuid, and nothing when
+/// it removed none. A `replayed` uuid is a purge another copy of the shard
+/// already recorded: it is recorded here as received, even when this copy
+/// holds none of the revisions, so they cannot be copied back in.
 fn purge_one(
     s: &mut crate::store::Shard,
     id: &str,
     requested: &[String],
+    replayed: Option<&str>,
+    peers: &[usize],
     seq_counter: &AtomicU64,
     reserved: &AtomicU64,
 ) -> DbResult<Vec<String>> {
+    let mut tx = Tx::new();
     let Some(mut meta) = s.get_meta(id)? else {
+        if let Some(uuid) = replayed {
+            let info = PurgeInfo {
+                uuid: uuid.to_string(),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            };
+            s.record_purge(&mut tx, &info, peers)?;
+            s.commit(tx)?;
+        }
         return Ok(Vec::new());
     };
-    let mut tx = Tx::new();
     let mut removed = Vec::new();
     // Like CouchDB, purge leaves only: each takes its unshared
     // ancestors with it, and a listed non-leaf revision is
@@ -2739,8 +2883,22 @@ fn purge_one(
         }
         removed.push(rev.clone());
     }
+    if replayed.is_some() || !removed.is_empty() {
+        let info = match replayed {
+            Some(uuid) => PurgeInfo {
+                uuid: uuid.to_string(),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            },
+            None => PurgeInfo {
+                uuid: uuid(),
+                id: id.to_string(),
+                revs: removed.clone(),
+            },
+        };
+        s.record_purge(&mut tx, &info, peers)?;
+    }
     if !removed.is_empty() {
-        s.count_purge(&mut tx)?;
         if meta.tree.is_empty() {
             tx.delete(&meta_key(id));
             if meta.seq != 0 {
@@ -2809,6 +2967,10 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
 /// is compiled at save time. It runs after the revision check, on every write
 /// path including replication. `obj` is the document without its `_`
 /// metadata members.
+///
+/// This is only the structural half, which is cheap. The compile runs in
+/// [`compile_design_docs`] before the write reaches its shard, and `Stage`
+/// raises its verdict right after this check passes.
 fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbResult<()> {
     let invalid = |reason: String| ApiError::new(400, "invalid_design_doc", reason);
     if !id.starts_with("_design/") || deleted {
@@ -2864,8 +3026,97 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
         }
         Some(_) => return Err(wrong("views", "object")),
     }
-    compile_views(obj)
+    Ok(())
 }
+
+/// Compile the design documents among `grouped` (per shard: index, document),
+/// keeping the compile off the shard writer. Returns the compile error of each
+/// document that has one. A document that fails the structural check is
+/// skipped: that error wins, so its compile would be wasted. With
+/// `new_edits=false`, a document whose revision the shard already stores is
+/// skipped too, as `Stage::stage_replicated` never validates it.
+async fn compile_design_docs(
+    shards: &[crate::store::ShardHandle],
+    grouped: &[Vec<(usize, Value)>],
+    new_edits: bool,
+) -> DbResult<HashMap<usize, ApiError>> {
+    let mut pending: Vec<(usize, usize, Map<String, Value>)> = Vec::new();
+    for (shard_idx, batch) in grouped.iter().enumerate() {
+        for (i, doc) in batch {
+            let Some(obj) = doc.as_object() else { continue };
+            let Some(id) = obj.get("_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let deleted = obj.get("_deleted") == Some(&Value::Bool(true));
+            if id.starts_with("_design/")
+                && compile_needed(obj)
+                && validate_design_doc(id, deleted, obj).is_ok()
+            {
+                pending.push((*i, shard_idx, obj.clone()));
+            }
+        }
+    }
+    if !new_edits {
+        for (shard_idx, shard) in shards.iter().enumerate() {
+            let candidates: Vec<(usize, Value)> = pending
+                .iter()
+                .filter(|(_, owner, _)| *owner == shard_idx)
+                .map(|(i, _, doc)| (*i, Value::Object(doc.clone())))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let stored = shard
+                .call(move |shard| {
+                    Ok(candidates
+                        .into_iter()
+                        .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
+                        .map(|(i, _)| i)
+                        .collect::<Vec<usize>>())
+                })
+                .await?;
+            pending.retain(|(i, _, _)| !stored.contains(i));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(HashMap::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        pending
+            .into_iter()
+            .filter_map(|(i, _, doc)| compile_views(&doc).err().map(|error| (i, error)))
+            .collect()
+    })
+    .await
+    .map_err(ApiError::internal)
+}
+
+/// Whether the document has anything for [`compile_views`] to compile.
+fn compile_needed(obj: &Map<String, Value>) -> bool {
+    matches!(obj.get("views"), Some(Value::Object(views)) if !views.is_empty())
+}
+
+/// Whether `Stage::stage_replicated` would find this replicated revision
+/// already stored, and so never validate it. Anything malformed is "not
+/// stored": the stage reports its own error for it.
+fn replicated_is_stored(shard: &mut crate::store::Shard, doc: Value) -> bool {
+    let Ok(SplitDoc {
+        id, rev, revisions, ..
+    }) = split_doc(doc)
+    else {
+        return false;
+    };
+    let Ok((rev, _)) = revisions_path(rev, revisions.as_ref()) else {
+        return false;
+    };
+    matches!(shard.get_meta(&id), Ok(Some(meta)) if meta.tree.contains(&rev))
+}
+
+/// Every compile of a view function with the name of the thread that ran it,
+/// for the tests that check where the compile happens.
+#[cfg(test)]
+static COMPILE_LOG: std::sync::Mutex<Vec<(String, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// CouchDB's `try_compile`. A design document in another language is saved
 /// unchecked: there is no query server to compile it.
@@ -2891,6 +3142,14 @@ fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
             if member == "reduce" && source.starts_with('_') {
                 continue;
             }
+            #[cfg(test)]
+            COMPILE_LOG
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((
+                    source.clone(),
+                    std::thread::current().name().map(str::to_string),
+                ));
             if let Err(message) = check_compiles(function, source, limits) {
                 return Err(ApiError::new(
                     400,
@@ -3004,6 +3263,7 @@ fn put_many(
     shard: &mut crate::store::Shard,
     docs: Vec<(usize, Value)>,
     new_edits: bool,
+    mut compile_errors: HashMap<usize, ApiError>,
     seq: &Arc<AtomicU64>,
     reserved: &Arc<AtomicU64>,
 ) -> Vec<(usize, DbResult<Value>)> {
@@ -3023,7 +3283,7 @@ fn put_many(
             seq,
             reserved,
         };
-        match ctx.stage(doc, new_edits) {
+        match ctx.stage(doc, new_edits, compile_errors.remove(&i)) {
             Ok(value) => results.push((i, Ok(value))),
             Err(e) => {
                 ops.truncate(mark);
@@ -3121,11 +3381,18 @@ impl Stage<'_> {
         self.staged.insert(id.to_string(), meta.clone());
     }
 
-    fn stage(&mut self, doc: Value, new_edits: bool) -> DbResult<Value> {
+    /// `compile_error` is the design document's compile verdict, computed
+    /// before the shard job; it is raised where the structural check is.
+    fn stage(
+        &mut self,
+        doc: Value,
+        new_edits: bool,
+        compile_error: Option<ApiError>,
+    ) -> DbResult<Value> {
         let doc = split_doc(doc)?;
         let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
-            return self.stage_replicated(doc, meta);
+            return self.stage_replicated(doc, meta, compile_error);
         }
         let SplitDoc {
             id,
@@ -3160,6 +3427,9 @@ impl Stage<'_> {
         // to be the right one: a conflict wins over a malformed member.
         if let Value::Object(members) = &body {
             validate_design_doc(&id, deleted, members)?;
+            if let Some(error) = compile_error {
+                return Err(error);
+            }
         }
 
         let parent_path = match parent.as_ref() {
@@ -3220,7 +3490,12 @@ impl Stage<'_> {
         Ok(json!({"ok": true, "id": id, "rev": rev}))
     }
 
-    fn stage_replicated(&mut self, doc: SplitDoc, mut meta: DocMeta) -> DbResult<Value> {
+    fn stage_replicated(
+        &mut self,
+        doc: SplitDoc,
+        mut meta: DocMeta,
+        compile_error: Option<ApiError>,
+    ) -> DbResult<Value> {
         let SplitDoc {
             id,
             rev,
@@ -3239,6 +3514,9 @@ impl Stage<'_> {
         if !known {
             if let Value::Object(members) = &body {
                 validate_design_doc(&id, deleted, members)?;
+                if let Some(error) = compile_error {
+                    return Err(error);
+                }
             }
         }
 
@@ -3975,6 +4253,107 @@ fn all_docs_key_row(
     Ok(Some(row))
 }
 
+fn corrupt_local(id: &str, error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("corrupt local document {id}: {error}"),
+    )
+}
+
+/// The revision number of a `0-N` local revision.
+fn local_rev_number(doc: &Value) -> Option<u64> {
+    doc.get("_rev")?
+        .as_str()?
+        .strip_prefix("0-")?
+        .parse::<u64>()
+        .ok()
+}
+
+fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
+    match s.get_checked(&local_key(id))? {
+        Some(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map(Some)
+            .map_err(|error| corrupt_local(id, error)),
+        None => Ok(None),
+    }
+}
+
+fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
+    // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
+    // from the supplied `_rev`, absent meaning 0, and never conflicts: the
+    // stored revision is not consulted.
+    let supplied = match body.get("_rev") {
+        None => 0,
+        Some(rev) => rev
+            .as_str()
+            .and_then(|r| r.strip_prefix("0-"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| ApiError::bad_request("Invalid rev format"))?,
+    };
+    let next = supplied.saturating_add(1);
+    let rev = format!("0-{next}");
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("_id".into(), json!(format!("_local/{id}")));
+        obj.insert("_rev".into(), json!(rev));
+    }
+    let mut tx = Tx::new();
+    tx.put_json(&local_key(id), &body)?;
+    s.commit(tx)?;
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+}
+
+fn delete_local(s: &mut Shard, id: &str) -> DbResult<Value> {
+    if s.get_checked(&local_key(id))?.is_none() {
+        return Err(ApiError::not_found("missing"));
+    }
+    let mut tx = Tx::new();
+    tx.delete(&local_key(id));
+    s.commit(tx)?;
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
+}
+
+/// Keep a copy of a local document as it is, unless a newer one is stored.
+fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<Value> {
+    let Some(incoming) = local_rev_number(&doc) else {
+        return Err(ApiError::bad_request("Invalid rev format"));
+    };
+    let held = read_local(s, id)?.as_ref().and_then(local_rev_number);
+    let rev = doc.get("_rev").cloned().unwrap_or(Value::Null);
+    if held.is_none_or(|held| held < incoming) {
+        let mut tx = Tx::new();
+        tx.put_json(&local_key(id), &doc)?;
+        s.commit(tx)?;
+    }
+    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+}
+
+/// Every local document of one shard, with its `_local/` id.
+fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
+    let mut docs: Vec<(String, Value)> = Vec::new();
+    let mut corrupt = None;
+    s.scan_range_while(b"l/", None, false, |key, value| {
+        let Some(id) = key
+            .strip_prefix(b"l/")
+            .and_then(|id| std::str::from_utf8(id).ok())
+        else {
+            return true;
+        };
+        match serde_json::from_slice::<Value>(value) {
+            Ok(doc) => docs.push((format!("_local/{id}"), doc)),
+            Err(error) => {
+                corrupt = Some(corrupt_local(id, error));
+                return false;
+            }
+        }
+        true
+    })?;
+    match corrupt {
+        Some(error) => Err(error),
+        None => Ok(docs),
+    }
+}
+
 /// Select and render `_local_docs` rows from every local document, which
 /// arrive in id order.
 fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
@@ -4230,7 +4609,7 @@ mod tests {
         let seq = Arc::new(AtomicU64::new(shard.seq()));
         let reserved = Arc::new(AtomicU64::new(0));
         let docs = docs.into_iter().enumerate().collect();
-        for (_, result) in put_many(shard, docs, true, &seq, &reserved) {
+        for (_, result) in put_many(shard, docs, true, HashMap::new(), &seq, &reserved) {
             result.unwrap();
         }
         (
@@ -4288,38 +4667,6 @@ mod tests {
         assert_ne!(db_dir_name("a/b"), db_dir_name("a"));
         assert_eq!(dir_name_to_db_name("a%2fb"), None);
         assert_eq!(dir_name_to_db_name("a%b"), None);
-    }
-
-    #[test]
-    fn nested_db_migration_never_overwrites() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-{}", uuid()));
-        for dir in ["a/b", "a%2Fb"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let err = migrate_nested_dbs(&root).unwrap_err();
-        assert!(err.contains("already there"), "{err}");
-        assert!(root.join("a/b/db.json").is_file());
-        assert!(root.join("a%2Fb/db.json").is_file());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn nested_db_migration_moves_deepest_first_and_prunes_empty_parents() {
-        let root = std::env::temp_dir().join(format!("douchdb-nest-ok-{}", uuid()));
-        for dir in ["a/b/c", "a/b", "x/y", "top"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("db.json"), b"{}").unwrap();
-        }
-        let moved = migrate_nested_dbs(&root).unwrap();
-        assert_eq!(moved.len(), 3);
-        for dir in ["a%2Fb%2Fc", "a%2Fb", "x%2Fy", "top"] {
-            assert!(root.join(dir).join("db.json").is_file(), "{dir}");
-        }
-        assert!(!root.join("a").exists());
-        assert!(!root.join("x").exists());
-        assert!(migrate_nested_dbs(&root).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4542,6 +4889,61 @@ mod tests {
         let error = db.get_doc("a", &DocOpts::default()).await.unwrap_err();
         assert_eq!(error.status, 500, "{error}");
         assert!(error.corrupt, "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn local_docs_spread_over_shards_and_checkpoints_stay_out_of_the_listing() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-local-shards-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "local-shards",
+            DbConfig {
+                q: 4,
+                revs_limit: 100,
+                shard_map: ShardMap::single(4),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..16).map(|i| format!("doc{i:02}")).collect();
+        for id in &ids {
+            db.local_put(id, json!({"v": id})).await.unwrap();
+        }
+        let holding: std::collections::BTreeSet<usize> = ids
+            .iter()
+            .map(|id| db.shard_index(&format!("_local/{id}")))
+            .collect();
+        assert!(holding.len() > 1, "the ids should not share one shard");
+
+        db.checkpoint_put("ae2:peer", &json!({"seq": 3}))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.checkpoint_get("ae2:peer").await.unwrap(),
+            Some(json!({"seq": 3}))
+        );
+        assert_eq!(db.local_get("ae2:peer").await.unwrap(), None);
+
+        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap();
+        let listed: Vec<&str> = listing["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        let expected: Vec<String> = ids.iter().map(|id| format!("_local/{id}")).collect();
+        assert_eq!(listed, expected);
+
+        // A copy keeps its revision and never replaces a newer one.
+        let copy = json!({"_id": "_local/doc00", "_rev": "0-5", "v": "copy"});
+        db.install_local_docs(vec![copy]).await;
+        assert_eq!(db.local_get("doc00").await.unwrap().unwrap()["_rev"], "0-5");
+        let stale = json!({"_id": "_local/doc00", "_rev": "0-2", "v": "stale"});
+        db.install_local_docs(vec![stale]).await;
+        assert_eq!(db.local_get("doc00").await.unwrap().unwrap()["v"], "copy");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4981,19 +5383,6 @@ mod tests {
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (0, json!({})));
 
-        // A legacy bare object is version 0.
-        std::fs::write(
-            db.path.join("security.json"),
-            br#"{"members":{"names":["old"]}}"#,
-        )
-        .unwrap();
-        drop(db);
-        let db = Db::open(&root, "sec", config()).unwrap();
-        assert_eq!(
-            db.security_versioned(),
-            (0, json!({"members": {"names": ["old"]}}))
-        );
-
         assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
         assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
         // Older versions are rejected; equal ones are ordered by canonical form.
@@ -5043,7 +5432,6 @@ mod tests {
             ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
             ("security-versioned.json", b"{ not json"),
             ("security-versioned.json", br#"{"version":1}"#),
-            ("security.json", b"{ not json"),
         ] {
             let error = open_error(file, contents);
             assert_eq!(error.status, 500, "{file}: {}", error.reason);
@@ -5432,7 +5820,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.set_migration_map(target.clone(), None).unwrap();
+        db.set_migration_map(target.clone(), "a".into()).unwrap();
         db.set_rebalance_in_progress(true);
         assert!(db.is_replica_of("doc", 1) && !db.is_replica_of("doc", 0));
         assert_eq!(db.replication_map().replicas, target.replicas);
@@ -5451,7 +5839,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_clears_only_for_its_own_id_unless_expired_or_unnamed() {
+    fn migration_clears_only_for_its_own_id_unless_expired() {
         let root = std::env::temp_dir().join(format!("douchdb-mig-id-{}", crate::util::uuid()));
         let active = ShardMap {
             q: 2,
@@ -5475,24 +5863,19 @@ mod tests {
         )
         .unwrap();
         // Nothing to clear is fine.
-        assert!(db.clear_migration_if(Some("a")));
-        db.begin_migration(target.clone(), Some("a".into()))
-            .unwrap();
-        assert!(!db.clear_migration_if(Some("b")));
-        assert!(!db.clear_migration_if(None));
+        assert!(db.clear_migration_if("a"));
+        db.begin_migration(target.clone(), "a".into()).unwrap();
+        assert!(!db.clear_migration_if("b"));
         assert!(db.rebalance_in_progress());
-        assert!(db.clear_migration_if(Some("a")));
+        assert!(db.clear_migration_if("a"));
         assert!(!db.rebalance_in_progress());
-        // A migration from a coordinator without ids is cleared by anyone.
-        db.begin_migration(target.clone(), None).unwrap();
-        assert!(db.clear_migration_if(Some("b")));
         // An expired freeze no longer protects the stale map.
-        db.begin_migration(target, Some("a".into())).unwrap();
+        db.begin_migration(target, "a".into()).unwrap();
         while now_millis() < 1 {
             std::thread::yield_now();
         }
         db.rebalance_until.store(1, Ordering::SeqCst);
-        assert!(db.clear_migration_if(Some("b")));
+        assert!(db.clear_migration_if("b"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -5643,7 +6026,7 @@ mod tests {
         for (position, id) in ids.iter().enumerate().take(6) {
             purge.insert(id.clone(), json!([written[position]["rev"], "9-nope"]));
         }
-        let purged = db.purge(&Value::Object(purge)).await.unwrap();
+        let purged = db.purge(&Value::Object(purge), 0).await.unwrap();
         for (position, id) in ids.iter().enumerate().take(6) {
             assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
         }
@@ -5923,5 +6306,185 @@ mod tests {
                 shard_index_for(&second, q, true)
             );
         }
+    }
+
+    fn purge_test_db(name: &str, shard_map: ShardMap) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            name,
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map,
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        (db, root)
+    }
+
+    /// The threads a given map function was compiled on.
+    fn compiled_on(source: &str) -> Vec<Option<String>> {
+        COMPILE_LOG
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|(compiled, _)| compiled == source)
+            .map(|(_, thread)| thread.clone())
+            .collect()
+    }
+
+    fn design_doc_with_map(map: &str) -> Value {
+        json!({"_id": "_design/d", "views": {"v": {"map": map}}})
+    }
+
+    /// Saving a design document must not hold its shard's writer while the
+    /// functions compile: the check runs before the shard job, never on the
+    /// shard thread, and once per save.
+    #[tokio::test]
+    async fn design_doc_compile_runs_outside_the_shard_thread() {
+        let (db, root) = purge_test_db("compile-outside", ShardMap::single(1));
+        let map = "function(doc){ /* outside-shard */ emit(doc._id, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(map)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+        let threads = compiled_on(map);
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert!(
+            threads
+                .iter()
+                .flatten()
+                .all(|name| !name.starts_with("shard-")),
+            "compiled on the shard thread: {threads:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A revision conflict still wins over a compile error, and a replicated
+    /// design document that is already stored is not compiled again.
+    #[tokio::test]
+    async fn compile_verdict_keeps_conflict_first_and_skips_stored_docs() {
+        let (db, root) = purge_test_db("compile-order", ShardMap::single(1));
+        let good = "function(doc){ /* order-good */ emit(1, 1); }";
+        let put = db
+            .put_docs(vec![design_doc_with_map(good)], true)
+            .await
+            .unwrap();
+        assert!(put[0].get("rev").is_some(), "{put:?}");
+
+        let bad = "function(doc){ /* order-bad */ emit(";
+        let conflict = db
+            .put_docs(vec![design_doc_with_map(bad)], true)
+            .await
+            .unwrap();
+        assert_eq!(conflict[0]["error"], "conflict", "{conflict:?}");
+
+        let replicated_map = "function(doc){ /* order-replicated */ emit(1, 1); }";
+        let hash = "b".repeat(32);
+        let replicated = json!({
+            "_id": "_design/r",
+            "_rev": format!("1-{hash}"),
+            "_revisions": {"start": 1, "ids": [hash]},
+            "views": {"v": {"map": replicated_map}},
+        });
+        for _ in 0..2 {
+            let out = db.put_docs(vec![replicated.clone()], false).await.unwrap();
+            assert_eq!(out[0]["ok"], true, "{out:?}");
+        }
+        assert_eq!(compiled_on(replicated_map).len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge info another copy recorded is applied once: replaying it
+    /// neither counts again nor purges a revision that was added back since.
+    #[tokio::test]
+    async fn a_purge_info_is_applied_once() {
+        let (db, root) = purge_test_db("purge-once", ShardMap::single(1));
+        let hash = "a".repeat(32);
+        let rev = format!("1-{hash}");
+        let doc = json!({"_id": "a", "_rev": rev, "_revisions": {"start": 1, "ids": [hash]}});
+        db.put_docs(vec![doc.clone()], false).await.unwrap();
+        let info = PurgeInfo {
+            uuid: "u1".to_string(),
+            id: "a".to_string(),
+            revs: vec![rev.clone()],
+        };
+
+        assert!(db
+            .apply_purge_infos(0, vec![info.clone()], 0)
+            .await
+            .unwrap());
+        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_err());
+
+        db.put_docs(vec![doc], false).await.unwrap();
+        assert!(!db.apply_purge_infos(0, vec![info], 0).await.unwrap());
+        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Purge `n` fresh documents on node 0; the `(id, rev)` pairs purged.
+    async fn purge_docs_on(db: &Db, n: usize) -> std::collections::BTreeSet<(String, String)> {
+        let mut revs = std::collections::BTreeSet::new();
+        for _ in 0..n {
+            let id = uuid();
+            let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+            let rev = written[0]["rev"].as_str().unwrap().to_string();
+            db.purge(&json!({ id.clone(): [rev.clone()] }), 0)
+                .await
+                .unwrap();
+            revs.insert((id, rev));
+        }
+        revs
+    }
+
+    /// A shard keeps only the newest `purged_infos_limit` purge infos, and
+    /// forgets the revisions of the ones it drops.
+    #[tokio::test]
+    async fn old_purge_infos_are_trimmed_at_the_limit() {
+        let (db, root) = purge_test_db("purge-trim", ShardMap::single(1));
+        db.set_purged_infos_limit(3).await.unwrap();
+        assert_eq!(db.get_purged_infos_limit().await.unwrap(), 3);
+        let revs = purge_docs_on(&db, 5).await;
+        let (purge_seq, infos) = db.purged_infos(&[0], None).await.unwrap().remove(0);
+        assert_eq!(purge_seq, 5);
+        assert_eq!(infos.len(), 3);
+        let kept: std::collections::BTreeSet<(String, String)> = infos
+            .into_iter()
+            .map(|info| (info.id, info.revs[0].clone()))
+            .collect();
+        assert_eq!(db.purged_among(&revs).await.unwrap(), kept);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Infos a replica has not confirmed are never trimmed, whatever the
+    /// limit; once every other replica has confirmed them they can go.
+    #[tokio::test]
+    async fn purge_infos_are_kept_until_the_peers_confirm_them() {
+        let (db, root) = purge_test_db("purge-hold", ShardMap::balanced(1, 2, 2));
+        db.set_purged_infos_limit(2).await.unwrap();
+        purge_docs_on(&db, 5).await;
+        let infos = db.purged_infos(&[0], None).await.unwrap().remove(0).1;
+        assert_eq!(infos.len(), 5, "node 1 never reported");
+
+        // Node 1 confirms the first four; they stay until the next purge.
+        db.purged_infos(&[4], Some(1)).await.unwrap();
+        assert_eq!(db.purged_infos(&[0], None).await.unwrap()[0].1.len(), 5);
+        purge_docs_on(&db, 1).await;
+        let infos = db.purged_infos(&[0], None).await.unwrap().remove(0).1;
+        assert_eq!(infos.len(), 2, "below the limit and confirmed: trimmed");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

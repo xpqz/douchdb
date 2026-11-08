@@ -22,7 +22,7 @@ fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
 /// CouchDB's `_changes` rejects a malformed `since` rather than reading it as
 /// 0: it must be `now`, a non-negative integer or an opaque sequence token
 /// (`N-<base64>`). douchdb's own cluster tokens decode through `decode_since`.
-fn validate_since(raw: &str, nodes: usize) -> DbResult<()> {
+fn validate_since(raw: &str) -> DbResult<()> {
     let opaque = raw.split_once('-').is_some_and(|(seq, token)| {
         !seq.is_empty()
             && seq.bytes().all(|b| b.is_ascii_digit())
@@ -31,7 +31,7 @@ fn validate_since(raw: &str, nodes: usize) -> DbResult<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     });
-    if raw == "now" || raw.parse::<u64>().is_ok() || opaque || decode_since(raw, nodes).is_some() {
+    if raw == "now" || raw.parse::<u64>().is_ok() || opaque || decode_since(raw).is_some() {
         return Ok(());
     }
     Err(ApiError::bad_request(
@@ -100,7 +100,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
         ));
     }
     if let Some(raw) = q.get("since") {
-        if let Err(error) = validate_since(raw, st.ctx.cluster.nodes.len().max(1)) {
+        if let Err(error) = validate_since(raw) {
             return fail(error);
         }
     }
@@ -510,12 +510,12 @@ async fn changes_options(
             vector
         }
     } else if let Some(raw) = raw_since {
-        match decode_since(raw, n) {
+        match decode_since(raw) {
             Some(mut vector) => {
                 vector.resize(n.max(vector.len()), 0);
                 vector
             }
-            None => vec![since_component(Some(raw), st.ctx.cluster.me, n); n],
+            None => vec![since_component(Some(raw), st.ctx.cluster.me); n],
         }
     } else {
         vec![0; n]

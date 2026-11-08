@@ -5,6 +5,7 @@ use crate::cluster::Cluster;
 use crate::cluster_http::{internal_request_raw, send_peer};
 use crate::db::Db;
 use crate::state::AppState;
+use crate::store::PurgeInfo;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use md5::{Digest, Md5};
@@ -44,9 +45,10 @@ pub async fn pull(
         cluster,
         auth,
     };
+    ctx.sync_purges().await?;
     let checkpoint_id = checkpoint_id(db, peer);
     let mut since = db
-        .local_get(&checkpoint_id)
+        .checkpoint_get(&checkpoint_id)
         .await
         .ok()
         .flatten()
@@ -64,7 +66,8 @@ pub async fn pull(
             break;
         }
 
-        let (requested, reqs) = ctx.revisions_to_request(results)?;
+        let (mut requested, mut reqs) = ctx.revisions_to_request(results)?;
+        ctx.drop_purged(&mut requested, &mut reqs).await?;
         let (received, unavailable) = ctx.fetch_missing_docs(&reqs).await?;
         total += write_batch(db, &received).await?;
         ensure_all_accounted(db, &requested, &received, &unavailable).await?;
@@ -79,7 +82,7 @@ pub async fn pull(
         if last == since {
             break;
         }
-        db.local_put(&checkpoint_id, json!({ "seq": last }))
+        db.checkpoint_put(&checkpoint_id, &json!({ "seq": last }))
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         since = last;
@@ -117,7 +120,111 @@ fn checkpoint_id(db: &Db, peer: &str) -> String {
     format!("ae{CHECKPOINT_VERSION}:{}:{}", peer, map_tag)
 }
 
+/// Where this node remembers how far it has read the peer's purge infos.
+fn purge_checkpoint_id(db: &Db, peer: &str) -> String {
+    format!("purge-{}", checkpoint_id(db, peer))
+}
+
 impl PullCtx<'_> {
+    /// Learn of the purges the peer knows of (CouchDB's
+    /// `mem3_rep:replicate_purges`): record and apply every purge info the
+    /// peer holds past this node's checkpoint, for the shards this node
+    /// replicates. Runs before any document is pulled, so a revision purged
+    /// here is already known as purged when the peer offers it.
+    async fn sync_purges(&self) -> Result<()> {
+        let checkpoint = purge_checkpoint_id(self.db, self.peer);
+        let since: Vec<u64> = self
+            .db
+            .checkpoint_get(&checkpoint)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|doc| serde_json::from_value(doc.get("seqs")?.clone()).ok())
+            .unwrap_or_default();
+        let me = self.cluster.me.to_string();
+        let list = since
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut request = internal_request_raw(
+            self.client,
+            &self.cluster.secret,
+            reqwest::Method::GET,
+            self.peer,
+            &[&self.db.name, "_peer_purged_infos"],
+        )
+        .query(&[("since", list.as_str()), ("node", me.as_str())]);
+        if let Some(auth) = self.auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
+        }
+        let reply: Value = send_peer(request).await?.error_for_status()?.json().await?;
+        let shards = reply
+            .get("shards")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("_peer_purged_infos response has no shards array"))?;
+        let mut seqs = Vec::with_capacity(shards.len());
+        let mut removed = false;
+        for (shard, entry) in shards.iter().enumerate() {
+            seqs.push(
+                entry
+                    .get("purge_seq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("_peer_purged_infos shard has no purge_seq"))?,
+            );
+            let infos: Vec<PurgeInfo> =
+                serde_json::from_value(entry.get("infos").cloned().unwrap_or_else(|| json!([])))?;
+            let infos: Vec<PurgeInfo> = infos
+                .into_iter()
+                .filter(|info| crate::fabric::is_replica_of(self.db, &info.id, self.cluster.me))
+                .collect();
+            removed |= self
+                .db
+                .apply_purge_infos(shard, infos, self.cluster.me)
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+        }
+        if removed {
+            // A purge leaves no change row, so the indexes cannot follow it.
+            crate::view::invalidate(self.db)
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+            crate::search::cleanup(self.db)
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+        }
+        if seqs != since {
+            self.db
+                .checkpoint_put(&checkpoint, &json!({ "seqs": seqs }))
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Leave out the revisions a local purge info lists: internal replication
+    /// must not bring a purged revision back. (Client writes with
+    /// `new_edits=false` may, as in CouchDB.)
+    async fn drop_purged(&self, requested: &mut RevPairs, reqs: &mut Vec<Value>) -> Result<()> {
+        let purged = self
+            .db
+            .purged_among(requested)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        if purged.is_empty() {
+            return Ok(());
+        }
+        requested.retain(|pair| !purged.contains(pair));
+        reqs.retain(|req| {
+            let field = |name: &str| req.get(name).and_then(Value::as_str).map(str::to_string);
+            match (field("id"), field("rev")) {
+                (Some(id), Some(rev)) => !purged.contains(&(id, rev)),
+                _ => true,
+            }
+        });
+        Ok(())
+    }
+
     /// One `_changes` page from the peer.
     async fn fetch_changes_batch(&self, since: &Value) -> Result<Value> {
         const BATCH: usize = 1000;
@@ -517,6 +624,10 @@ mod tests {
         }))
     }
 
+    async fn no_purges() -> Json<Value> {
+        Json(json!({"shards": []}))
+    }
+
     async fn bulk_get(State(stub): State<Stub>) -> Json<Value> {
         let a = json!({"id": "a", "docs": [{"ok": {
             "_id": "a",
@@ -590,6 +701,7 @@ mod tests {
             partial_sent: Arc::new(AtomicBool::new(false)),
         };
         let app = Router::new()
+            .route("/ae/_peer_purged_infos", get(no_purges))
             .route("/ae/_changes", get(changes))
             .route("/ae/_bulk_get", post(bulk_get))
             .with_state(stub);
@@ -610,7 +722,7 @@ mod tests {
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
         let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
-            db.local_get(&checkpoint_id).await.unwrap().is_none(),
+            db.checkpoint_get(&checkpoint_id).await.unwrap().is_none(),
             "checkpoint advanced past a missing revision"
         );
 
@@ -623,7 +735,7 @@ mod tests {
             .await
             .is_ok());
         let checkpoint = db
-            .local_get(&checkpoint_id)
+            .checkpoint_get(&checkpoint_id)
             .await
             .unwrap()
             .expect("checkpoint");
@@ -655,6 +767,9 @@ mod tests {
                 header("authorization"),
                 header("x-douchdb-secret"),
             ));
+            if uri.path().ends_with("_peer_purged_infos") {
+                return Json(json!({"shards": []}));
+            }
             if uri.path().ends_with("_changes") {
                 return Json(json!({
                     "results": [{"seq": 1, "id": "a",
@@ -687,6 +802,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let seen: Seen = Arc::default();
         let app = Router::new()
+            .route("/ae/_peer_purged_infos", get(record))
             .route("/ae/_changes", get(record))
             .route("/ae/_bulk_get", post(record))
             .with_state(seen.clone());

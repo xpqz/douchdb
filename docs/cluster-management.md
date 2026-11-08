@@ -54,8 +54,9 @@ request:
 3. Keep documents whose shard this node replicates, and always keep
    `_design/` documents so every node can evaluate local views and search.
 4. Write them with `_bulk_docs?new_edits=false`.
-5. Store a checkpoint in a `_local` document keyed by a checkpoint-namespace
-   version, peer and shard-map hash.
+5. Store a checkpoint keyed by a checkpoint-namespace version, peer and
+   shard-map hash. Checkpoints are node-local records, not `_local` documents:
+   they are never listed by `_local_docs`, shared or moved with a shard.
 
 Checkpoints are advanced only after every requested revision has reached a
 terminal state: applied locally, already present locally, or explicitly
@@ -237,6 +238,16 @@ metadata. Live counts alone are never proof. If old replicas disagree or an
 old owner is unreachable, the request fails with `502` before migration. If a
 target does not match before `timeout_ms`, the migration map is cleared and the
 active map is unchanged; the request fails with `504`.
+
+`_local` documents are sharded like any other document: `/{db}/_local/{id}`
+and `_local_docs` read and write the copies of the shard the id hashes to
+(write quorum as for documents; reads take the highest `0-N` revision any copy
+holds and do not need a read quorum, as `fabric_doc_open` does for them).
+They take no sequence, so anti-entropy does not carry them and never
+repairs a copy that missed one. A rebalance copies them itself, after the
+digests match and before activation, from the old copies (newest revision
+wins) to the replicas a shard gains, keeping each revision. A direct placement
+`PUT` does not move them.
 
 Only after every digest matches does the node activate the new map on every
 peer. A cutover failure rolls the active map back to the old placement. Client

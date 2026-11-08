@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Apply a security object locally and push it to every peer.
 ///
 /// The object is versioned, so the local write is kept even when peers are
-/// unreachable: anti-entropy (`fabric::reconcile_security`) delivers it later
+/// unreachable: anti-entropy (`fabric::sync_metadata`) delivers it later
 /// and peers never move back to an older version. Returns whether a majority
 /// of the cluster, this node included, holds the object now.
 pub(crate) async fn set_security_everywhere(
@@ -48,6 +48,52 @@ pub(crate) async fn set_security_everywhere(
     .await;
     let acknowledgements = 1 + responses.into_iter().filter(|ok| *ok).count();
     Ok(acknowledgements > ctx.cluster.nodes.len().max(1) / 2)
+}
+
+/// Set `_revs_limit` or `_purged_infos_limit` on every node.
+///
+/// CouchDB's `fabric_db_meta:set_revs_limit/3` and `set_purge_infos_limit/3`
+/// submit the change to every shard copy and answer `ok` only when all of
+/// them did; any failed or unreachable worker fails the request (500) while
+/// the copies that already applied it keep the new value, and nothing syncs
+/// the limit to a node that missed it. The same here: the caller writes the
+/// local copy, `endpoint` is the path segment after the database.
+pub(crate) async fn set_limit_on_peers(
+    ctx: &ClusterCtx,
+    name: &str,
+    endpoint: &str,
+    limit: u64,
+    headers: &HeaderMap,
+) -> DbResult<()> {
+    if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
+        return Ok(());
+    }
+    let responses = crate::cluster_http::in_one_round(join_all(ctx.cluster.peers().map(|peer| {
+        let request = internal_request(
+            ctx,
+            reqwest::Method::PUT,
+            peer,
+            &[name, endpoint],
+            Some(headers),
+        )
+        .json(&limit);
+        async move {
+            send_peer(request)
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+        }
+    })))
+    .await;
+    if responses.into_iter().all(|ok| ok) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            500,
+            "internal_server_error",
+            format!("`{endpoint}` was not set on every node"),
+        ))
+    }
 }
 
 fn shard_map_rejected() -> ApiError {
@@ -506,7 +552,7 @@ async fn set_migration_everywhere(
     id: &str,
     headers: &HeaderMap,
 ) -> DbResult<()> {
-    db.set_migration_map(map.clone(), Some(id.to_string()))?;
+    db.set_migration_map(map.clone(), id.to_string())?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     // Peers that refused because another migration owns them keep that
@@ -663,6 +709,20 @@ async fn migrate(
         if error.status == 504 {
             crate::telemetry::record_rebalance_timeout();
         }
+        return Err(error);
+    }
+
+    // Local documents are not carried by anti-entropy; hand them over while
+    // writes are still frozen and the old copies are the source of truth.
+    let read = crate::fabric::ClusterRead {
+        ctx,
+        db,
+        dbname: name,
+        headers,
+    };
+    if let Err(error) = crate::fabric::copy_local_docs(read, old_map, map).await {
+        clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
+        db.set_rebalance_in_progress(false);
         return Err(error);
     }
 

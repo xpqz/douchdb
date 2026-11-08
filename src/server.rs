@@ -403,7 +403,6 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
         );
     }
     std::fs::create_dir_all(&args.data)?;
-    crate::db::migrate_nested_dbs(&args.data).map_err(anyhow::Error::msg)?;
 
     let advertise = advertise_url(args);
     let auth = build_auth(args)?;

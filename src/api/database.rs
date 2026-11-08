@@ -194,7 +194,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             // the changes feed returns, so clients that use it as
             // `since` do not skip another node's changes.
             if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
-                let (vector, marks, purge_vector) = match cluster_seq_vectors(ClusterRead {
+                let (seq, purge_seq) = match cluster_seq_tokens(ClusterRead {
                     ctx: &st.ctx,
                     db,
                     dbname: name,
@@ -202,25 +202,12 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                 })
                 .await
                 {
-                    Ok(token) => token,
+                    Ok(tokens) => tokens,
                     Err(e) => return fail(e),
                 };
-                // A node that did not answer has no position to report; 0
-                // makes a feed resumed from here replay it, never skip it.
-                let vector: Vec<u64> = vector
-                    .into_iter()
-                    .map(|seq| {
-                        if seq == crate::fabric::UNKNOWN_SEQ {
-                            0
-                        } else {
-                            seq
-                        }
-                    })
-                    .collect();
-                let seq = encode_token(&vector, &marks);
                 info["update_seq"] = json!(seq);
                 info["committed_update_seq"] = json!(seq);
-                info["purge_seq"] = json!(encode_token(&purge_vector, &[]));
+                info["purge_seq"] = json!(purge_seq);
             }
             json(StatusCode::OK, info)
         }
@@ -279,15 +266,6 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     }
     if let Some(response) = require_design_admin(st, db, headers, std::slice::from_ref(&doc)) {
         return response;
-    }
-    if id.starts_with("_local/") {
-        // Local documents bypass the shard path and validation, as
-        // with `PUT /{db}/_local/{id}`.
-        let local = id.strip_prefix("_local/").unwrap_or(&id);
-        return match db.local_put(local, doc).await {
-            Ok(v) => json(StatusCode::CREATED, v),
-            Err(e) => fail(e),
-        };
     }
     if let Some(response) = validate_write(st, db, &mut doc, headers).await {
         return response;
@@ -500,7 +478,8 @@ pub async fn db_rest(
         | "_search_cleanup" => Some(&["POST"]),
         "_changes" => Some(&["GET", "POST", "HEAD"]),
         "_index_info" => Some(&["GET", "HEAD"]),
-        "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
+        "_revs_limit" | "_purged_infos_limit" | "_security" => Some(&["PUT", "GET"]),
+        "_peer_purged_infos" => Some(&["GET"]),
         _ => None,
     };
     if let Some(response) = allowed.and_then(|allowed| require_method(&method, allowed)) {
@@ -516,9 +495,11 @@ pub async fn db_rest(
         "_changes" => return changes(st.clone(), db.clone(), req).await,
         "_revs_diff" => return revs_diff(req).await,
         "_purge" => return purge(req).await,
+        "_peer_purged_infos" => return purged_infos(req).await,
         "_compact" => return compact(req).await,
         "_ensure_full_commit" => return ensure_full_commit(req).await,
         "_revs_limit" => return revs_limit(req).await,
+        "_purged_infos_limit" => return purged_infos_limit(req).await,
         "_security" => return security(req).await,
         "_view_cleanup" => return view_cleanup(req).await,
         "_search_cleanup" => return search_cleanup(req).await,
@@ -541,7 +522,7 @@ pub async fn db_rest(
         .to_string();
 
     if let Some(id) = raw_rest.strip_prefix("_local/") {
-        return local_doc(&db, &percent_decode(id), &method, &body).await;
+        return local_doc(req, &percent_decode(id)).await;
     }
 
     if let Some((ddoc, index, info)) = search_path(&rest) {
@@ -579,21 +560,82 @@ pub async fn db_rest(
 /// `POST /{db}/_purge`. A fully purged document is removed from `_changes`
 /// entirely, so the view and search indexes cannot be updated incrementally;
 /// they are rebuilt on the next query.
+///
+/// In a cluster the coordinator sends each document's purge to every copy of
+/// its shard and answers per `purge_results_to_json` (chttpd_db.erl); a
+/// forwarded request purges this node's copy only.
 async fn purge(req: DbRequest<'_>) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    let purged = match req.db.purge(&request).await {
-        Ok(purged) => purged,
-        Err(e) => return fail(e),
+    let response = if !req.st.ctx.cluster.is_clustered() || is_forwarded(req.st, req.headers) {
+        match req.db.purge(&request, req.st.ctx.cluster.me).await {
+            Ok(purged) => json(StatusCode::CREATED, purged),
+            Err(e) => return fail(e),
+        }
+    } else {
+        let Some(map) = request.as_object() else {
+            return fail(ApiError::bad_request("Request body must be a JSON object"));
+        };
+        let w = num(req.q, "w").unwrap_or(0);
+        let results = purge_docs(req.st, req.db, req.name, map, w, req.headers).await;
+        purge_results_to_json(results)
     };
     if let Err(e) = invalidate_indexes(req.db).await {
         return fail(e);
     }
-    // purge_results_to_json (chttpd_db.erl) answers 201, or 202 when a
-    // result was only accepted without a quorum. The purge is applied on
-    // this node alone and is never forwarded, so nothing is "accepted".
-    json(StatusCode::CREATED, purged)
+    response
+}
+
+/// `GET /{db}/_peer_purged_infos?since=<seq>,<seq>,...`: this node's purge infos
+/// per shard after the given purge sequences, for a peer's anti-entropy.
+/// Internal only: CouchDB has no such endpoint, its shard copies exchange
+/// purge infos inside mem3_rep.
+async fn purged_infos(req: DbRequest<'_>) -> Response {
+    if !is_forwarded(req.st, req.headers) {
+        return fail(ApiError::not_found("missing"));
+    }
+    let since: Vec<u64> = req
+        .q
+        .get("since")
+        .map(|list| list.split(',').filter_map(|seq| seq.parse().ok()).collect())
+        .unwrap_or_default();
+    let reader = req.q.get("node").and_then(|node| node.parse().ok());
+    match req.db.purged_infos(&since, reader).await {
+        Ok(shards) => {
+            let shards: Vec<Value> = shards
+                .into_iter()
+                .map(|(purge_seq, infos)| json!({"purge_seq": purge_seq, "infos": infos}))
+                .collect();
+            json(StatusCode::OK, json!({"shards": shards}))
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// `purge_results_to_json` (chttpd_db.erl): 201, raised to 202 when an entry
+/// was only accepted and to an entry's own status when it failed.
+fn purge_results_to_json(results: Vec<(String, PurgeOutcome)>) -> Response {
+    let mut code = 201;
+    let mut purged = Map::new();
+    for (id, outcome) in results {
+        let entry = match outcome {
+            PurgeOutcome::Ok(revs) => json!(revs),
+            PurgeOutcome::Accepted(revs) => {
+                code = code.max(202);
+                json!(revs)
+            }
+            PurgeOutcome::Error(e) => {
+                code = code.max(e.status);
+                json!({"error": e.error, "reason": e.reason})
+            }
+        };
+        purged.insert(id, entry);
+    }
+    json(
+        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        json!({"purge_seq": Value::Null, "purged": purged}),
+    )
 }
 
 async fn invalidate_indexes(db: &Db) -> DbResult<()> {
@@ -643,7 +685,55 @@ async fn revs_limit(req: DbRequest<'_>) -> Response {
         },
         Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
     };
-    match req.db.set_revs_limit(limit).await {
+    if let Err(e) = req.db.set_revs_limit(limit).await {
+        return fail(e);
+    }
+    match crate::cluster_ops::set_limit_on_peers(
+        &req.st.ctx,
+        req.name,
+        "_revs_limit",
+        limit,
+        req.headers,
+    )
+    .await
+    {
+        Ok(()) => ok(),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET` or `PUT /{db}/_purged_infos_limit`: how many purge infos each shard
+/// keeps (chttpd_db.erl, default 1000).
+async fn purged_infos_limit(req: DbRequest<'_>) -> Response {
+    if *req.method == Method::GET {
+        return match req.db.get_purged_infos_limit().await {
+            Ok(n) => json(StatusCode::OK, json!(n)),
+            Err(e) => fail(e),
+        };
+    }
+    let limit = match serde_json::from_slice::<Value>(req.body) {
+        Ok(value) => match value.as_u64().filter(|limit| *limit > 0) {
+            Some(limit) => limit,
+            None => {
+                return fail(ApiError::bad_request(
+                    "`_purged_infos_limit` must be a positive integer",
+                ))
+            }
+        },
+        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+    };
+    if let Err(e) = req.db.set_purged_infos_limit(limit).await {
+        return fail(e);
+    }
+    match crate::cluster_ops::set_limit_on_peers(
+        &req.st.ctx,
+        req.name,
+        "_purged_infos_limit",
+        limit,
+        req.headers,
+    )
+    .await
+    {
         Ok(()) => ok(),
         Err(e) => fail(e),
     }

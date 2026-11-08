@@ -272,6 +272,28 @@ pub(crate) fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
     st.ctx.cluster.is_internal(headers)
 }
 
+/// The `update_seq` a query reports with `update_seq=true`. In a cluster it is
+/// the opaque vector `GET /db` reports, so it works as a `_changes` since;
+/// otherwise it is this node's sequence, as `GET /db` reports it.
+async fn query_update_seq(
+    st: &AppState,
+    db: &Arc<Db>,
+    name: &str,
+    headers: &HeaderMap,
+) -> DbResult<Value> {
+    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+        let (seq, _) = cluster_seq_tokens(ClusterRead {
+            ctx: &st.ctx,
+            db,
+            dbname: name,
+            headers,
+        })
+        .await?;
+        return Ok(json!(seq));
+    }
+    Ok(json!(db.update_seq()))
+}
+
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.
 fn key_param(q: &HashMap<String, String>, key: &str) -> Option<String> {
     let raw = q.get(key)?;

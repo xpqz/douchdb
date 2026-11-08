@@ -2803,6 +2803,64 @@ async fn database_names_follow_the_couchdb_rule() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// CouchDB's `validate_dbname` drops one trailing `.couch` before applying the
+/// regex, which also allows a `.` plus ten or more digits at the end (the
+/// shard timestamp). `fabric_db_create` runs the same check, so the clustered
+/// `PUT /foo.couch` creates the database literally named `foo.couch`, not
+/// `foo`, and `foo.1234567890` is an ordinary name.
+#[tokio::test]
+async fn database_names_allow_couch_extension_and_shard_timestamp() {
+    let s = Server::start(false);
+    for name in [
+        "ext.couch",
+        "ts.1234567890",
+        "ts2.12345678901234",
+        "both.1234567890.couch",
+        "_users.couch",
+    ] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        let (status, body) = s.get(&format!("/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["db_name"], name, "{body}");
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{name}: {body}");
+        assert_eq!(body["error"], "file_exists", "{name}: {body}");
+    }
+    let (status, body) = s.put("/ext.couch/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The extension is part of the name: `ext` was never created.
+    let (status, body) = s.get("/ext").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = s.get("/ts").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (_, body) = s.get("/_all_dbs").await;
+    let listed: Vec<&str> = body
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for name in ["ext.couch", "ts.1234567890", "both.1234567890.couch"] {
+        assert!(listed.contains(&name), "{name}: {body}");
+    }
+    assert!(!listed.contains(&"ext"), "{body}");
+
+    // Only one `.couch` is dropped, and nine digits are not a timestamp.
+    for name in [
+        "dbl.couch.couch",
+        ".couch",
+        "short.123456789",
+        "ts.1234567890.1234567890",
+        "ts.1234567890x",
+        "digits.couch.1234567890",
+    ] {
+        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{name}: {body}");
+    }
+}
+
 /// Stop the server for good, then start it again on the same data directory.
 /// `restart` alone leaves the old process running, and the pooled HTTP
 /// connections point at it, so a test of what a fresh process reads from disk
@@ -2879,47 +2937,6 @@ async fn slash_database_and_parent_name_coexist() {
     assert_eq!(body["v"], "parent2");
     let (status, _) = s.get("/coex%2Fb").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-/// A data directory written by an older version keeps "a/b" at `a/b/`. On
-/// startup it is moved to its flat directory, once, and the parent database
-/// "a" that shared the tree is left intact.
-#[tokio::test]
-async fn nested_slash_database_directories_are_migrated_on_startup() {
-    let mut s = Server::start(false);
-    // The database name is not stored in the directory, so flat databases can
-    // be moved into the old nested layout while the server is stopped.
-    for name in ["mig", "migb", "migc"] {
-        let (status, body) = s.put(&format!("/{name}"), json!({})).await;
-        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
-        s.put(&format!("/{name}/doc"), json!({"v": name})).await;
-    }
-    s.kill();
-    std::fs::rename(s.dir.join("migb"), s.dir.join("mig").join("b")).expect("nest b");
-    std::fs::rename(s.dir.join("migc"), s.dir.join("mig/b/c")).expect("nest c");
-
-    s.restart();
-    let (_, body) = s.get("/_all_dbs").await;
-    let listed: Vec<&str> = body
-        .as_array()
-        .expect("array")
-        .iter()
-        .filter_map(|n| n.as_str())
-        .filter(|n| n.starts_with("mig"))
-        .collect();
-    assert_eq!(listed, ["mig", "mig/b", "mig/b/c"], "{body}");
-    for (name, value) in [("mig", "mig"), ("mig%2Fb", "migb"), ("mig%2Fb%2Fc", "migc")] {
-        let (status, body) = s.get(&format!("/{name}/doc")).await;
-        assert_eq!(status, StatusCode::OK, "{name}: {body}");
-        assert_eq!(body["v"], value);
-    }
-    assert!(!s.dir.join("mig/b").exists(), "old nested dir left behind");
-    assert!(s.dir.join("mig%2Fb").join("db.json").is_file());
-
-    // A second startup has nothing left to move.
-    s.restart();
-    let (status, body) = s.get("/mig%2Fb%2Fc/doc").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// A db.json that does not parse is a server-side fault, not a missing
@@ -5668,6 +5685,141 @@ async fn uuids_are_unique_in_a_tight_loop() {
     }));
 }
 
+/// `_local` documents are sharded like any other document (CouchDB routes
+/// them through `fabric:update_docs` and `fabric:open_doc` by document id), so
+/// every node sees every one however it was written.
+#[tokio::test]
+async fn cluster_local_docs_are_shared_by_every_node() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("cllocal").await;
+    }
+    let ids: Vec<String> = (0..12).map(|i| format!("cp{i:02}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let (status, body) = nodes[i % 3]
+            .put(&format!("/cllocal/_local/{id}?w=2"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["rev"], "0-1", "{body}");
+    }
+    let expected: Vec<String> = ids.iter().map(|id| format!("_local/{id}")).collect();
+
+    for (index, node) in nodes.iter().enumerate() {
+        for id in &ids {
+            let (status, doc) = node.get(&format!("/cllocal/_local/{id}")).await;
+            assert_eq!(status, StatusCode::OK, "{id} via node {index}: {doc}");
+            assert_eq!(doc["v"], *id);
+        }
+        let (status, body) = node.get("/cllocal/_local_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["total_rows"].is_null(), "{body}");
+        assert!(body["offset"].is_null(), "{body}");
+        let listed: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, expected, "every doc exactly once via node {index}");
+    }
+
+    // The listing's own options apply across nodes.
+    let (_, body) = nodes[2]
+        .get("/cllocal/_local_docs?include_docs=true&descending=true&skip=1&limit=2")
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(rows[0]["id"], "_local/cp10", "{body}");
+    assert_eq!(rows[0]["doc"]["_rev"], "0-1", "{body}");
+    let (_, body) = nodes[1]
+        .post(
+            "/cllocal/_local_docs",
+            json!({"keys": ["_local/cp03", "cp04", "_local/nope", "_local/cp00"]}),
+        )
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows[0]["id"], "_local/cp03", "{body}");
+    assert_eq!(rows[1]["error"], "not_found", "{body}");
+    assert_eq!(rows[2]["id"], "_local/cp00", "{body}");
+
+    // A rev through another node updates every copy; a delete through a
+    // third removes it everywhere.
+    let (status, body) = nodes[1]
+        .put(
+            "/cllocal/_local/cp00?w=2",
+            json!({"v": "again", "_rev": "0-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "0-2", "{body}");
+    let (status, doc) = nodes[2].get("/cllocal/_local/cp00").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["v"], "again");
+    assert_eq!(doc["_rev"], "0-2");
+
+    let (status, body) = nodes[2].delete("/cllocal/_local/cp00?w=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "_local/cp00", "rev": "0-0"}));
+    for node in &nodes {
+        let (status, _) = node.get("/cllocal/_local/cp00").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, body) = node.get("/cllocal/_local_docs").await;
+        assert_eq!(body["rows"].as_array().unwrap().len(), 11, "{body}");
+    }
+    let (status, body) = nodes[0].delete("/cllocal/_local/cp00").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // `_bulk_docs` places them the same way.
+    let (status, body) = nodes[0]
+        .post(
+            "/cllocal/_bulk_docs?w=2",
+            json!({"docs": [{"_id": "_local/bulk", "v": 1}, {"_id": "plain"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, doc) = nodes[1].get("/cllocal/_local/bulk").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+}
+
+/// With two copies and one node down, `_local` reads still answer from the
+/// copy that is up: `fabric_doc_open` falls back to whatever documents came
+/// back (local documents are not read-repaired) rather than failing the
+/// read quorum.
+#[tokio::test]
+async fn cluster_local_docs_stay_readable_with_a_replica_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("cllocaldown").await;
+    }
+    // Node 0 coordinates and holds nothing; nodes 1 and 2 hold the copies.
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/cllocaldown",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for id in ["a", "b", "c"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/cllocaldown/_local/{id}?w=2"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    nodes[2].kill();
+    for id in ["a", "b", "c"] {
+        let (status, doc) = nodes[0].get(&format!("/cllocaldown/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {doc}");
+        assert_eq!(doc["v"], id);
+    }
+    let (status, body) = nodes[0].get("/cllocaldown/_local_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3, "{body}");
+    let (status, _) = nodes[0].get("/cllocaldown/_local/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn cluster_routes_writes_and_merges_all_docs() {
     let nodes = start_cluster(2);
@@ -6301,6 +6453,39 @@ async fn cluster_changes_use_an_opaque_version_vector() {
     assert_eq!(rows[0]["deleted"], true);
 }
 
+// With `update_seq=true`, `_all_docs`, `_design_docs` and view queries report
+// the same opaque vector `GET /db` does, as CouchDB sends a sequence string
+// in all of them (fabric_view_all_docs.erl, fabric_view_map.erl,
+// fabric_view_reduce.erl), so a client can use it as a `_changes` since.
+#[tokio::test]
+async fn cluster_query_update_seq_is_the_opaque_vector() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clqseq").await;
+    }
+    let docs = json!({"docs": [
+        {"_id": "a"},
+        {"_id": "b"},
+        {"_id": "_design/d", "views": {"v": {"map": "function(doc) { emit(doc._id, 1); }", "reduce": "_count"}}},
+    ]});
+    let (status, _) = nodes[0].post("/clqseq/_bulk_docs", docs).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (_, info) = nodes[0].get("/clqseq").await;
+    let expected = info["update_seq"].as_str().expect("vector update_seq");
+    for path in [
+        "/clqseq/_all_docs?update_seq=true",
+        "/clqseq/_all_docs?update_seq=true&keys=%5B%22a%22%5D",
+        "/clqseq/_design_docs?update_seq=true",
+        "/clqseq/_design/d/_view/v?update_seq=true&reduce=false",
+        "/clqseq/_design/d/_view/v?update_seq=true",
+    ] {
+        let (status, body) = nodes[0].get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["update_seq"], expected, "{path}");
+    }
+}
+
 // In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
 // per-node token (CouchDB packs per-shard purge seqs with
 // `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
@@ -6318,7 +6503,213 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!("v1:1,0"), "{info}");
+    assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
+}
+
+/// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
+/// as a peer would answer it.
+async fn local_rev_status(node: &Server, db: &str, id: &str, rev: &str) -> StatusCode {
+    let headers = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    node.req_with(
+        Method::GET,
+        &format!("/{db}/{id}?rev={rev}"),
+        None,
+        &headers,
+    )
+    .await
+    .0
+}
+
+// CouchDB's `fabric:purge_docs` sends each document's purge to every copy of
+// its shard (fabric_doc_purge.erl), so no replica keeps the purged revision.
+#[tokio::test]
+async fn cluster_purge_reaches_every_replica() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurgeall").await;
+    }
+    let (status, r) = nodes[0].put("/clpurgeall/a", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{r}");
+    let rev = r["rev"].as_str().unwrap().to_string();
+    for node in &nodes {
+        assert_eq!(
+            local_rev_status(node, "clpurgeall", "a", &rev).await,
+            StatusCode::OK,
+            "every replica holds the revision before the purge"
+        );
+    }
+
+    let (status, body) = nodes[1]
+        .post("/clpurgeall/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["purged"]["a"], json!([rev]), "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_rev_status(node, "clpurgeall", "a", &rev).await,
+            StatusCode::NOT_FOUND,
+            "node {i} still holds the purged revision"
+        );
+    }
+}
+
+// purge_results_to_json (chttpd_db.erl) answers 202 when an entry reached
+// fewer than `w` copies (format_resps in fabric_doc_purge.erl marks it
+// `accepted`); the copies that were reached still purge.
+#[tokio::test]
+async fn cluster_purge_answers_202_when_a_replica_is_down() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurge202").await;
+    }
+    let (_, r) = nodes[0].put("/clpurge202/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    nodes[2].kill();
+
+    // Two of three copies meet the default write quorum.
+    let (status, body) = nodes[0]
+        .post("/clpurge202/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["purged"]["a"], json!([rev]), "{body}");
+
+    // Every copy was asked for, and one is down.
+    let (_, r) = nodes[0].put("/clpurge202/b", json!({"v": 1})).await;
+    let rev_b = r["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[0]
+        .post("/clpurge202/_purge?w=3", json!({"b": [rev_b]}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["purged"]["b"], json!([rev_b]), "{body}");
+    for node in &nodes[..2] {
+        assert_eq!(
+            local_rev_status(node, "clpurge202", "b", &rev_b).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+/// Run an anti-entropy pass of `db` on `node` that starts after this call and
+/// wait for it to finish. A pass already in flight is not replaced, so the
+/// request is repeated until a new one has started; the status is only polled
+/// in between.
+async fn sync_node(node: &Server, db: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let runs_of = |status: &Value| status["runs"].as_u64().unwrap_or(0);
+    let (_, status) = node.get("/_node/_local/_replication").await;
+    let before = runs_of(&status);
+    loop {
+        let (_, status) = node.get("/_node/_local/_replication").await;
+        if status["running"] == false {
+            if runs_of(&status) > before {
+                return;
+            }
+            let (code, body) = node
+                .post(
+                    &format!("/_node/_local/_replication/run?db={db}"),
+                    json!({}),
+                )
+                .await;
+            assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pass never finished: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// A replica that was down during `_purge` still holds the revision. When it
+// rejoins, anti-entropy must neither bring the revision back to the nodes
+// that purged it nor keep it on the stale node. CouchDB exchanges purge infos
+// between shard copies for this (mem3_rep:replicate_purges).
+#[tokio::test]
+async fn cluster_purge_stays_purged_when_a_down_replica_rejoins() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurgeback").await;
+    }
+    let (_, r) = nodes[0].put("/clpurgeback/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    nodes[2].kill();
+    let (status, body) = nodes[0]
+        .post("/clpurgeback/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[2].restart();
+
+    // The stale node learns of the purge from its peers.
+    sync_node(&nodes[2], "clpurgeback").await;
+    assert_eq!(
+        local_rev_status(&nodes[2], "clpurgeback", "a", &rev).await,
+        StatusCode::NOT_FOUND,
+        "the stale node still holds the purged revision"
+    );
+    // And the nodes that purged it never get it back.
+    for _ in 0..2 {
+        for node in &nodes {
+            sync_node(node, "clpurgeback").await;
+        }
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_rev_status(node, "clpurgeback", "a", &rev).await,
+            StatusCode::NOT_FOUND,
+            "node {i} holds the purged revision again"
+        );
+    }
+}
+
+// A node that misses more purges than `_purged_infos_limit` keeps must still
+// learn of all of them: a shard does not trim purge infos a replica has not
+// confirmed (CouchDB keeps them back to the lowest purge checkpoint).
+#[tokio::test]
+async fn cluster_purge_infos_are_not_trimmed_past_a_lagging_replica() {
+    let mut nodes = start_cluster_sharded(3, 1, 3);
+    for node in &nodes {
+        node.fresh_db("clpurgelag").await;
+    }
+    for node in &nodes {
+        let (status, body) = node.put("/clpurgelag/_purged_infos_limit", json!(2)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, limit) = node.get("/clpurgelag/_purged_infos_limit").await;
+        assert_eq!(limit, json!(2));
+    }
+    let mut purged = Vec::new();
+    for n in 0..5 {
+        let id = format!("d{n}");
+        let (_, r) = nodes[0]
+            .put(&format!("/clpurgelag/{id}"), json!({"v": n}))
+            .await;
+        purged.push((id, r["rev"].as_str().unwrap().to_string()));
+    }
+    nodes[2].kill();
+    for (id, rev) in &purged {
+        let (status, body) = nodes[0]
+            .post("/clpurgelag/_purge", json!({ id: [rev] }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    nodes[2].restart();
+
+    for _ in 0..2 {
+        for node in &nodes {
+            sync_node(node, "clpurgelag").await;
+        }
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        for (id, rev) in &purged {
+            assert_eq!(
+                local_rev_status(node, "clpurgelag", id, rev).await,
+                StatusCode::NOT_FOUND,
+                "node {i} holds {id} again"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -7171,6 +7562,75 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
     let (status, body) = nodes[0].get("/autoreb/_all_docs").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 9);
+}
+
+/// `_local` documents move with their shard on a rebalance. They take no
+/// sequence, so `_changes`-driven anti-entropy never carries them; the
+/// rebalance copies them before the new placement goes live and the cleanup
+/// clears the old owners.
+#[tokio::test]
+async fn cluster_rebalance_keeps_local_docs() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("localreb").await;
+    }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/localreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/localreb", all_shards_on(pin))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Enough ids that every shard holds at least two.
+    let mut per_shard = [0usize; 4];
+    let mut ids = Vec::new();
+    for i in 0.. {
+        let id = format!("cp{i}");
+        let shard = douchdb::shard_index(&format!("_local/{id}"), 4);
+        if per_shard[shard] < 2 {
+            per_shard[shard] += 1;
+            ids.push(id);
+        }
+        if per_shard.iter().all(|count| *count >= 2) {
+            break;
+        }
+    }
+    for id in &ids {
+        let (status, body) = nodes[1]
+            .put(&format!("/localreb/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/localreb/rebalance?timeout_ms=20000&cleanup=true",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pending"], false, "{body}");
+
+    let mut sorted = ids.clone();
+    sorted.sort();
+    let expected: Vec<String> = sorted.iter().map(|id| format!("_local/{id}")).collect();
+    for (index, node) in nodes.iter().enumerate() {
+        for id in &ids {
+            let (status, doc) = node.get(&format!("/localreb/_local/{id}")).await;
+            assert_eq!(status, StatusCode::OK, "{id} via node {index}: {doc}");
+            assert_eq!(doc["v"], *id);
+            assert_eq!(doc["_rev"], "0-1", "the copy keeps the revision: {doc}");
+        }
+        let (status, body) = node.get("/localreb/_local_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Vec<String> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, expected, "via node {index}");
+    }
 }
 
 #[tokio::test]
@@ -15587,6 +16047,62 @@ async fn cluster_security_without_quorum_is_accepted_and_converges() {
     wait_for_security(&nodes[1], "secpend", &security).await;
 }
 
+// CouchDB's fabric:set_revs_limit and fabric:set_purge_infos_limit set the
+// limit on every shard copy (fabric_db_meta.erl), so any node reads it back.
+#[tokio::test]
+async fn cluster_revs_and_purged_infos_limits_apply_to_every_node() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("climits").await;
+    }
+    for (endpoint, limit) in [("_revs_limit", 7), ("_purged_infos_limit", 11)] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climits/{endpoint}"), json!(limit))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+        assert_eq!(body, json!({"ok": true}));
+        for (i, node) in nodes.iter().enumerate() {
+            let (status, body) = node.get(&format!("/climits/{endpoint}")).await;
+            assert_eq!(status, StatusCode::OK, "{endpoint} on node {i}: {body}");
+            assert_eq!(body, json!(limit), "{endpoint} on node {i}");
+        }
+    }
+}
+
+// fabric_db_meta collects an ok from every worker and fails the request when
+// one errors or is down, while the copies that did apply it keep the new
+// value; nothing syncs the limit to the node that missed it, so the client
+// repeats the request once the node is back.
+#[tokio::test]
+async fn cluster_limit_put_fails_while_a_node_is_down_and_succeeds_on_retry() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("climitdown").await;
+    }
+    nodes[2].kill();
+    for endpoint in ["_revs_limit", "_purged_infos_limit"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climitdown/{endpoint}"), json!(5))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{endpoint}: {body}"
+        );
+        let (_, limit) = nodes[1].get(&format!("/climitdown/{endpoint}")).await;
+        assert_eq!(limit, json!(5), "{endpoint} on the reachable peer");
+    }
+    nodes[2].restart();
+    for endpoint in ["_revs_limit", "_purged_infos_limit"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/climitdown/{endpoint}"), json!(5))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+        let (_, limit) = nodes[2].get(&format!("/climitdown/{endpoint}")).await;
+        assert_eq!(limit, json!(5), "{endpoint} on the returned node");
+    }
+}
+
 /// Headers that mark a request as sent by another node of the test cluster.
 fn node_headers() -> [(&'static str, String); 2] {
     [
@@ -15787,97 +16303,6 @@ async fn cluster_metadata_sync_settles_equal_version_shard_maps_and_security() {
         Ok(())
     })
     .await;
-}
-
-/// A peer that predates the batched metadata exchange: it answers every
-/// request with 404, as a node without the endpoint does, and logs the
-/// request lines it saw. Returns its port and the log.
-async fn legacy_peer() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = seen.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let log = log.clone();
-            tokio::spawn(async move {
-                let mut buffer = Vec::new();
-                let mut chunk = [0u8; 4096];
-                // Only the request line matters; the body is not read.
-                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                    }
-                }
-                let text = String::from_utf8_lossy(&buffer).to_string();
-                let line = text.lines().next().unwrap_or("");
-                let mut words = line.split(' ');
-                let entry = format!(
-                    "{} {}",
-                    words.next().unwrap_or(""),
-                    words.next().unwrap_or("")
-                );
-                log.lock().unwrap().push(entry);
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                    )
-                    .await;
-            });
-        }
-    });
-    (port, seen)
-}
-
-#[tokio::test]
-async fn cluster_metadata_sync_falls_back_to_per_database_reconcile_for_old_peers() {
-    let (stub_port, seen) = legacy_peer().await;
-    let port = free_port();
-    let nodes = format!("http://127.0.0.1:{port},http://127.0.0.1:{stub_port}");
-    let extra: Vec<String> = [
-        "--q",
-        "4",
-        "--n",
-        "1",
-        "--nodes",
-        &nodes,
-        "--me",
-        "0",
-        "--cluster-secret",
-        "test-cluster-secret",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect();
-    let node = Server::spawn_on(port, &extra, false, 0).expect("node starts");
-    for name in ["old0", "old1"] {
-        // Accepted without a quorum: the other node is the stub.
-        let (status, body) = node.put(&format!("/{name}"), json!({})).await;
-        assert!(status.is_success(), "create {name}: {status} {body}");
-    }
-    let (passes, calls) = metadata_pass(&node).await;
-    assert!(passes >= 1);
-
-    let seen = seen.lock().unwrap().clone();
-    let count = |entry: &str| seen.iter().filter(|line| line.as_str() == entry).count();
-    // One probe of the new endpoint, then the old per-database GETs.
-    assert!(count("POST /_node/_local/_metadata_sync") >= 1, "{seen:?}");
-    for name in ["old0", "old1"] {
-        assert!(
-            count(&format!("GET /_node/_local/_dbs/{name}")) >= 1,
-            "{seen:?}"
-        );
-        assert!(
-            count(&format!("GET /_node/_local/_dbs/{name}/security")) >= 1,
-            "{seen:?}"
-        );
-    }
-    assert!(calls > 2 * 2, "{calls} calls");
 }
 
 #[tokio::test]
@@ -16642,7 +17067,7 @@ fn internal_headers() -> Vec<(&'static str, String)> {
 async fn migration_put_rejects_a_conflicting_migration() {
     let nodes = start_cluster_with(3, "3600", 1);
     nodes[0].fresh_db("migconflict").await;
-    let path = "/_node/_local/_dbs/migconflict/migration";
+    let path = "/_node/_local/_dbs/migconflict/migration?id=coordinator-a";
     let internal = internal_headers();
 
     let (status, body) = nodes[0]
@@ -16686,18 +17111,24 @@ async fn migration_delete_requires_the_migration_id() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // A rival coordinator, or a clear without an id, must not unfreeze it.
-    for wrong in [rival.as_str(), path] {
-        let (status, body) = nodes[0]
-            .req_with(Method::DELETE, wrong, None, &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-        // Still frozen: a different migration is still refused.
-        let (status, body) = nodes[0]
-            .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
-            .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{wrong}: {body}");
-    }
+    // A rival coordinator must not unfreeze it, and a clear needs an id.
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, &rival, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::DELETE, path, None, &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, path, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // Still frozen: a different migration is still refused.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &rival, Some(all_shards_on(2)), &internal)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // The owner clears it, and clearing again is harmless.
     for _ in 0..2 {
@@ -16750,7 +17181,10 @@ async fn migration_freeze_waits_for_detached_replica_writes() {
     // otherwise it can arrive after the final digest check.
     let freeze = tokio::spawn({
         let client = nodes[0].client.clone();
-        let url = format!("{}/_node/_local/_dbs/migdrain/migration", nodes[0].base);
+        let url = format!(
+            "{}/_node/_local/_dbs/migdrain/migration?id=drain",
+            nodes[0].base
+        );
         async move {
             client
                 .put(url)
@@ -17065,7 +17499,15 @@ async fn quorum_merges_ancestry_across_replicas_with_different_history_lengths()
     }
     // Node 1 keeps only the newest revision, so its tombstone history is
     // shorter than node 2's for the identical leaf.
-    let (status, body) = nodes[1].put("/histories/_revs_limit", json!(1)).await;
+    // A request marked as internal is applied to this node alone.
+    let (status, body) = nodes[1]
+        .req_with(
+            Method::PUT,
+            "/histories/_revs_limit",
+            Some(json!(1)),
+            &node_headers(),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, limit) = nodes[1].get("/histories/_revs_limit").await;
     assert_eq!(limit, 1);
@@ -17178,28 +17620,6 @@ fn grafana_dashboards_are_valid_and_provisioned() {
     assert!(provider.contains("/otel-lgtm/grafana-dashboards"));
     let compose = std::fs::read_to_string("docker-compose.yml").expect("compose file");
     assert!(compose.contains("./docker/grafana/dashboards:/otel-lgtm/grafana-dashboards:ro"));
-}
-
-#[tokio::test]
-async fn changes_since_with_huge_node_index_does_not_abort() {
-    let s = Server::start(false);
-    s.fresh_db("hugesince").await;
-    s.put("/hugesince/a", json!({"v": 1})).await;
-
-    // base64url({"99999999999":1}) is a legacy cluster token naming a node far
-    // outside the cluster. It must be treated as a malformed since (a 400, as
-    // in CouchDB), not allocated as a vector.
-    let (status, body) = s
-        .get("/hugesince/_changes?since=eyI5OTk5OTk5OTk5OSI6MX0")
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["reason"],
-        "Malformed sequence supplied in 'since' parameter."
-    );
-
-    let (status, _) = s.get("/hugesince").await;
-    assert_eq!(status, StatusCode::OK);
 }
 
 // couch_httpd_db:db_req(#httpd{method='POST'}) and chttpd_db:db_req(POST) feed

@@ -435,6 +435,18 @@ pub(super) async fn view_request(
         None
     };
 
+    // Taken before any index catch-up or row read, on this node and on the
+    // owners it asks: a client that follows `_changes` from this token then
+    // sees every write the rows missed. A token taken after could include a
+    // write the rows do not show, which the client would never see.
+    let update_seq = if query.update_seq {
+        match query_update_seq(st, db, dbname, headers).await {
+            Ok(update_seq) => Some(update_seq),
+            Err(error) => return fail(error),
+        }
+    } else {
+        None
+    };
     let started = std::time::Instant::now();
     let result = if let Some(reducer) = combine_reduce.as_deref() {
         cluster_reduce(
@@ -491,10 +503,8 @@ pub(super) async fn view_request(
 
     match result {
         Ok(mut value) => {
-            if query.update_seq {
-                if let Ok(info) = db.info().await {
-                    value["update_seq"] = info["update_seq"].clone();
-                }
+            if let Some(update_seq) = update_seq {
+                value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
         }

@@ -100,13 +100,9 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         }
     };
 
-    // `_local` documents live outside the shard/replica machinery. Split them
-    // out so a mixed bulk request still writes ordinary documents through the
-    // normal cluster path and returns results in request order.
     let mut results = vec![Value::Null; docs.len()];
-    let mut local_slots: Vec<(usize, Value)> = Vec::new();
-    let mut ordinary_slots: Vec<usize> = Vec::new();
-    let mut ordinary_docs: Vec<Value> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut writable: Vec<Value> = Vec::new();
     for (slot, doc) in docs.into_iter().enumerate() {
         if let Some(error) = &validation[slot] {
             results[slot] = json!({
@@ -114,41 +110,31 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
                 "error": error.error,
                 "reason": error.reason,
             });
-        } else if doc
-            .get("_id")
-            .and_then(Value::as_str)
-            .map(|id| id.starts_with("_local/"))
-            .unwrap_or(false)
-        {
-            local_slots.push((slot, doc));
         } else {
-            ordinary_slots.push(slot);
-            ordinary_docs.push(doc);
+            slots.push(slot);
+            writable.push(doc);
         }
     }
 
-    let (ordinary_results, accepted) = if ordinary_docs.is_empty() {
+    let (written, accepted) = if writable.is_empty() {
         (Vec::new(), false)
     } else if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
         // A forwarded batch has already been placed by its coordinator; write
         // it to this node's shards and let the coordinator count the ack.
-        match db.put_docs(ordinary_docs, new_edits).await {
+        match put_on_this_node(db, writable, new_edits, is_forwarded(st, headers)).await {
             Ok(results) => (results, false),
             Err(e) => return fail(e),
         }
     } else {
         let w = num(q, "w").unwrap_or(0);
-        match commit_docs(st, db, dbname, ordinary_docs, new_edits, w, headers).await {
+        match commit_docs(st, db, dbname, writable, new_edits, w, headers).await {
             Ok((results, quorum)) => (results, !quorum),
             Err(e) => return fail(e),
         }
     };
 
-    for (slot, result) in ordinary_slots.into_iter().zip(ordinary_results) {
+    for (slot, result) in slots.into_iter().zip(written) {
         results[slot] = result;
-    }
-    for (slot, doc) in local_slots {
-        results[slot] = put_local_bulk(db, doc).await;
     }
     let mut response = bulk_response(new_edits, results);
     if accepted {
@@ -199,31 +185,57 @@ pub(super) async fn validate_write(
     }
 }
 
-async fn put_local_bulk(db: &Db, doc: Value) -> Value {
-    let id = doc
-        .get("_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let name = id.strip_prefix("_local/").unwrap_or(&id).to_string();
-    let deleted = doc
-        .get("_deleted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let result = if deleted {
-        // Unlike DELETE /db/_local/id, CouchDB's _bulk_docs reports a delete
-        // of a missing local doc as a success at rev 0-0.
-        match db.local_delete(&name).await {
-            Err(error) if error.status == 404 => Ok(json!({"ok": true, "id": id, "rev": "0-0"})),
-            other => other,
-        }
-    } else {
-        db.local_put(&name, doc).await
-    };
-    match result {
-        Ok(value) => value,
-        Err(error) => json!({"id": id, "error": error.error, "reason": error.reason}),
+/// Write a batch to this node's shards. Replicated edits from a peer
+/// (`internal` with `new_edits=false`) install `_local` documents exactly as
+/// sent: that is how a rebalance hands a shard's local documents to a new
+/// replica without numbering the copy one higher. Every other `_local` write
+/// is an ordinary one.
+async fn put_on_this_node(
+    db: &Db,
+    docs: Vec<Value>,
+    new_edits: bool,
+    internal: bool,
+) -> DbResult<Vec<Value>> {
+    if new_edits || !internal {
+        return db.put_docs(docs, new_edits).await;
     }
+    let is_local = |doc: &Value| {
+        doc.get("_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("_local/"))
+    };
+    let mut results = vec![Value::Null; docs.len()];
+    let mut local_slots = Vec::new();
+    let mut locals = Vec::new();
+    let mut other_slots = Vec::new();
+    let mut others = Vec::new();
+    for (slot, doc) in docs.into_iter().enumerate() {
+        if is_local(&doc) {
+            local_slots.push(slot);
+            locals.push(doc);
+        } else {
+            other_slots.push(slot);
+            others.push(doc);
+        }
+    }
+    let installed = if locals.is_empty() {
+        Vec::new()
+    } else {
+        db.install_local_docs(locals).await
+    };
+    let written = if others.is_empty() {
+        Vec::new()
+    } else {
+        db.put_docs(others, false).await?
+    };
+    for (slot, result) in local_slots
+        .into_iter()
+        .zip(installed)
+        .chain(other_slots.into_iter().zip(written))
+    {
+        results[slot] = result;
+    }
+    Ok(results)
 }
 
 fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
@@ -599,15 +611,34 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
     }
 }
 
+/// The `update_seq` to report, when the request asks for one. It must be
+/// taken before the rows are read: a client that follows `_changes` from it
+/// then sees every write the rows missed, while a token taken after could
+/// include a write the rows do not show, which the client would never see.
+async fn requested_update_seq(req: &DbRequest<'_>) -> DbResult<Option<Value>> {
+    if flag(req.q, "update_seq") {
+        query_update_seq(req.st, req.db, req.name, req.headers)
+            .await
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// The reply once the rows are known: re-check access (a security change may
-/// have landed while the query ran) and add `update_seq` when asked for.
-fn all_docs_reply(req: &DbRequest<'_>, result: DbResult<Value>, update_seq: Value) -> Response {
+/// have landed while the query ran) and add the `update_seq` taken before the
+/// rows were read.
+fn all_docs_reply(
+    req: &DbRequest<'_>,
+    result: DbResult<Value>,
+    update_seq: Option<Value>,
+) -> Response {
     if !still_allowed(req.st, req.db, req.headers) {
         return access_denied(&req.st.principal(req.headers));
     }
     match result {
         Ok(mut value) => {
-            if flag(req.q, "update_seq") {
+            if let Some(update_seq) = update_seq {
                 value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
@@ -624,14 +655,18 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(opts) => opts,
         Err(error) => return fail(error),
     };
+    let update_seq = match requested_update_seq(&req).await {
+        Ok(update_seq) => update_seq,
+        Err(error) => return fail(error),
+    };
     if opts.keys.is_none()
         && !req.st.ctx.cluster.is_clustered()
         && !is_forwarded(req.st, req.headers)
     {
-        return stream_all_docs(&req, &opts).await;
+        return stream_all_docs(&req, &opts, update_seq).await;
     }
     let result = run_all_docs(&req, &opts).await;
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, update_seq)
 }
 
 /// Rows are encoded into chunks of about this size as they are read.
@@ -642,7 +677,11 @@ const STREAM_CHUNK: usize = 64 * 1024;
 /// first bytes leave before the last row is read. The bytes are those of the
 /// buffered reply. An error on the first page still gets its status; one
 /// after that can only end the connection early. A HEAD reads no rows.
-async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
+async fn stream_all_docs(
+    req: &DbRequest<'_>,
+    opts: &AllDocsOpts,
+    update_seq: Option<Value>,
+) -> Response {
     let (head, rows) = match Db::all_docs_stream(req.db.clone(), opts).await {
         Ok(stream) => stream,
         Err(error) => return fail(error),
@@ -661,8 +700,6 @@ async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
             return fail(error);
         }
         let rows = futures::stream::iter(first_row).chain(rows);
-        let db = req.db.clone();
-        let with_update_seq = flag(req.q, "update_seq");
         let stream = async_stream::stream! {
             let mut rows = Box::pin(rows);
             let mut buffer = format!(
@@ -696,10 +733,8 @@ async fn stream_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> Response {
                 }
             }
             buffer.push(b']');
-            if with_update_seq {
-                buffer.extend_from_slice(
-                    format!(",\"update_seq\":{}", db.update_seq()).as_bytes(),
-                );
+            if let Some(update_seq) = update_seq {
+                buffer.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
             }
             buffer.push(b'}');
             yield Ok(Bytes::from(buffer));
@@ -749,6 +784,10 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
             }
         }
     }
+    let update_seq = match requested_update_seq(&req).await {
+        Ok(update_seq) => update_seq,
+        Err(error) => return fail(error),
+    };
     let mut result = run_all_docs(&req, &opts).await;
     if let Ok(value) = &mut result {
         let everything = AllDocsOpts {
@@ -767,13 +806,13 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
             Err(error) => result = Err(error),
         }
     }
-    all_docs_reply(&req, result, json!(req.db.update_seq()))
+    all_docs_reply(&req, result, update_seq)
 }
 
-/// `GET|POST /{db}/_local_docs`: the `_local/` documents, which live outside
-/// the sharded document store. Like CouchDB, `total_rows` and `offset` are
-/// null. They belong to this node (replication checkpoints), so a cluster
-/// coordinator lists its own.
+/// `GET|POST /{db}/_local_docs`: the `_local/` documents. Like CouchDB,
+/// `total_rows` and `offset` are null. In a cluster the coordinator lists one
+/// copy of every shard; a request a peer already routed answers for the
+/// shards it names, or all of its own.
 pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
     if let Some(response) = require_method(req.method, &["GET", "HEAD", "POST"]) {
         return response;
@@ -782,6 +821,33 @@ pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
         Ok(opts) => opts,
         Err(error) => return fail(error),
     };
-    let result = req.db.local_docs(&opts).await;
-    all_docs_reply(&req, result, Value::Null)
+    let (st, db, headers) = (req.st, req.db, req.headers);
+    let result = if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+        cluster_local_docs(
+            ClusterRead {
+                ctx: &st.ctx,
+                db,
+                dbname: req.name,
+                headers,
+            },
+            &opts,
+        )
+        .await
+    } else if let Some(mask) = is_forwarded(st, headers)
+        .then(|| {
+            req.q
+                .get("shards")
+                .and_then(|raw| parse_shard_mask(raw, db.q))
+        })
+        .flatten()
+    {
+        db.local_docs_owned(&opts, &mask).await
+    } else {
+        db.local_docs(&opts).await
+    };
+    all_docs_reply(
+        &req,
+        result,
+        flag(req.q, "update_seq").then_some(Value::Null),
+    )
 }
