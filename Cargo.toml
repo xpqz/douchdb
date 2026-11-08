@@ -25,7 +25,10 @@ axum = "0.8"
 hmac = "0.12"
 getrandom = "0.3"
 md-5 = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "http2"] }
+# The node listener runs hyper-util's HTTP/1 + HTTP/2 connection builder
+# itself (axum::serve cannot set HTTP/2 window sizes or stream limits).
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 sha2 = "0.10"
 rusty-leveldb = "4"
 serde = { version = "1", features = ["derive", "rc"] }

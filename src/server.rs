@@ -8,7 +8,6 @@ use crate::cluster::Cluster;
 use crate::cluster_http::ClusterCtx;
 use crate::{admission, cluster_state, discovery, js, replicate, telemetry, ui};
 use axum::routing::{any, get};
-use axum::serve::ListenerExt;
 use axum::Router;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -229,10 +228,13 @@ fn build_state(
                 n: args.n.max(1),
                 secret: args.cluster_secret.clone(),
             },
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(60))
-                .build()?,
+            client: crate::cluster_http::peer_client(
+                args.peer_http2,
+                args.nodes
+                    .iter()
+                    .chain(&args.seed_nodes)
+                    .any(|node| node.starts_with("https://")),
+            )?,
             auth,
             health: Default::default(),
         },
@@ -418,28 +420,17 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
 
     let app = build_router(args, state.clone());
 
-    // Streamed responses are written in several pieces. With Nagle's algorithm
-    // a later piece waits for the client's delayed ACK of the first, adding
-    // about 40 ms to every such response.
-    let listener = tokio::net::TcpListener::bind(&args.listen)
-        .await?
-        .tap_io(|stream| {
-            if let Err(error) = stream.set_nodelay(true) {
-                tracing::debug!("could not set TCP_NODELAY: {error}");
-            }
-        });
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!("douchdb listening on {}", args.listen);
     let graceful = async {
-        let served = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-            .await;
+        crate::listener::serve(listener, app, shutdown.clone()).await;
         // Also stops the tasks and feeds when the server failed on its own.
         shutdown.cancel();
         for task in tasks {
             let _ = task.await;
         }
         close_databases(&state).await;
-        served.map_err(anyhow::Error::from)
+        Ok(())
     };
     tokio::select! {
         result = graceful => result,

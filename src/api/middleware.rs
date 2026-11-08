@@ -65,6 +65,9 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     // metrics when the request, and any replica task it left running, is done.
     let internal = req.headers().contains_key("x-douchdb-forwarded")
         || req.headers().contains_key("x-douchdb-secret");
+    if internal {
+        crate::metrics::record_internal_request(req.version());
+    }
     let peer_stats = crate::metrics::peer_route(&path)
         .map(|route| crate::cluster_http::PeerStats::new(route, internal));
     let handler = next.run(req).instrument(span.clone());

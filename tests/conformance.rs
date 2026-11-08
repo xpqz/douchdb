@@ -467,7 +467,7 @@ fn start_cluster_full(
 ) -> Vec<Server> {
     // Cluster tests run with HTTP/2 between nodes, so the whole suite
     // exercises h2c. The product default is HTTP/1.1; see `--peer-http2`.
-    start_cluster_nodes(n, q, sync_secs, replication, admin, &vec![false; n])
+    start_cluster_nodes(n, q, sync_secs, replication, admin, &vec![true; n])
 }
 
 /// Like `start_cluster_full`, with `peer_http2[i]` choosing whether node `i`
@@ -5328,8 +5328,9 @@ async fn cluster_peer_traffic_defaults_to_http1() {
 async fn cluster_with_mixed_peer_protocols_works() {
     let nodes = trips_cluster_nodes(&[true, false, true], 3).await;
     exercise_peer_traffic(&nodes, "mix").await;
-    let (http1, http2) = internal_request_versions(&nodes[1]).await;
-    assert_eq!(http1, 0, "node 1 got HTTP/1.x from peers that chose HTTP/2");
+    // (A node's requests to itself use its own protocol, so node 1 may count
+    // some HTTP/1.x requests of its own.)
+    let (_, http2) = internal_request_versions(&nodes[1]).await;
     assert!(http2 > 0, "node 1 got no HTTP/2 peer request");
     for i in [0, 2] {
         let (http1, http2) = internal_request_versions(&nodes[i]).await;
