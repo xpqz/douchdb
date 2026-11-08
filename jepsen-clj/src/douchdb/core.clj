@@ -49,6 +49,10 @@
     :default 2
     :parse-fn #(Long/parseLong %)
     :validate [#(and (>= % 1) (<= % 3)) "must be 1, 2 or 3"]]
+   [nil "--ops-per-key N" "Operations per key before moving to a fresh key"
+    :default 200
+    :parse-fn #(Long/parseLong %)
+    :validate [#(pos? %) "must be positive"]]
    [nil "--no-final-reads" "Skip the final read of every key"]
    [nil "--liveness-interval-ms MS" "Container/health sample interval"
     :default 500
@@ -103,9 +107,14 @@
     [2 (gen/reserve 1 cas-write-op read-op)]))
 
 (defn- make-workload
-  [workload]
+  "Each key gets a bounded number of operations, then its group moves to a
+  fresh key. The linearizability checker's cost grows steeply with history
+  length and pending operations per key; an unbounded key over a long soak
+  exhausts its memory before it reaches a verdict."
+  [workload ops-per-key]
   (let [[group-size fgen] (workload-generator workload)]
-    (independent/concurrent-generator group-size (range) (fn [_key] fgen))))
+    (independent/concurrent-generator group-size (range)
+                                      (fn [_key] (gen/limit ops-per-key fgen)))))
 
 (defn- nemesis-generator
   [interval fault]
@@ -140,10 +149,10 @@
 
 (defn- test-map
   [{:keys [nodes time-limit concurrency nemesis-interval fault no-nemesis
-           network seed workload read-quorum write-quorum no-final-reads
+           network seed workload ops-per-key read-quorum write-quorum no-final-reads
            liveness max-indeterminate-pct liveness-interval-ms]
     db-name :db}]
-  (let [tracked (independent/track-keys (make-workload workload))
+  (let [tracked (independent/track-keys (make-workload workload ops-per-key))
         body (cond->> tracked
                (not no-nemesis)
                (gen/nemesis (nemesis-generator nemesis-interval fault)))
@@ -180,6 +189,24 @@
                         (checker))
              :time-limit time-limit}
       seed (assoc :seed seed))))
+
+(defn- verdict
+  "Names the checkers behind a result: liveness and linearizability are
+  composed, and either can fail or be unable to decide on its own."
+  [results]
+  (let [parts (if (contains? results :linearizable)
+                (select-keys results [:linearizable :liveness])
+                {:linearizable results})
+        named (fn [v] (->> parts
+                           (filter #(= v (:valid? (val %))))
+                           (map (comp name key))
+                           (str/join ", ")))]
+    (case (:valid? results)
+      true "VALID: all checkers passed."
+      false (str "INVALID: failed: " (named false)
+                 (when-let [u (not-empty (named :unknown))]
+                   (str "; no verdict: " u)))
+      (str "UNKNOWN: no verdict: " (named :unknown)))))
 
 (defn -main
   [& args]
@@ -225,11 +252,8 @@
             (println "Jepsen results:")
             (pp/pprint results)
             (println)
-            (println (case (:valid? results)
-                       true "VALID: no linearizability violations found."
-                       false "INVALID: linearizability violation found."
-                       "UNKNOWN: checker could not reach a verdict."))
-            (System/exit (if (true? (:valid? results)) 0 1)))
+            (println (verdict results))
+            (System/exit (case (:valid? results) true 0 false 1 3)))
           (catch Exception e
             (.printStackTrace e)
             (System/exit 1))

@@ -13,7 +13,21 @@
             [douchdb.db :as db]
             [douchdb.http :as http]
             [jepsen.checker :as checker]
-            [jepsen.store :as store]))
+            [jepsen.store :as store]
+            [jepsen.util :as util]))
+
+(defonce ^:private origin
+  ;; Jepsen history times are relative to an origin it fixes after database
+  ;; setup, so a clock started before the run would skew every sample against
+  ;; the nemesis history by the setup time.
+  (atom nil))
+
+(defn mark-origin!
+  "Records Jepsen's relative-time origin. Call it from code that runs inside
+  the test case, where the origin is bound (client open! does)."
+  []
+  (when-let [o util/*relative-time-origin*]
+    (compare-and-set! origin nil o)))
 
 (defn- docker-state
   [node]
@@ -42,13 +56,12 @@
   [nodes interval-ms]
   (let [samples (atom [])
         stop (atom false)
-        origin (System/nanoTime)
         future (future
                  (try
                    (while (not @stop)
-                     (let [now (System/nanoTime)]
+                     (let [now (util/linear-time-nanos)]
                        (swap! samples conj
-                              {:time (- now origin)
+                              {:nanos now
                                :nodes (into {}
                                             (map (fn [node]
                                                    [node (merge (docker-state node)
@@ -117,7 +130,12 @@
     (check [_ test history opts]
       (let [grace (* 2 1000 1000 1000)
             history-end (if (seq history) (apply max (map :time history)) 0)
-            samples (filter #(<= (:time %) (+ history-end grace)) @samples)
+            base @origin
+            samples (when base
+                      (->> @samples
+                           (map #(-> % (assoc :time (- (:nanos %) base))
+                                     (dissoc :nanos)))
+                           (filter #(<= 0 (:time %) (+ history-end grace)))))
             nodes (:nodes test)
             intervals (fault-intervals history nodes)
             downs (for [{:keys [time nodes]} samples
@@ -155,18 +173,19 @@
             throughput (if (pos? duration-ns)
                          (* 1e9 (/ (count ok-ops) duration-ns))
                          0.0)
-            valid? (and (seq samples)
-                        (empty? downs)
-                        (empty? unexpected-restarts)
-                        (<= indeterminate-pct max-indeterminate-pct))]
+            valid? (boolean (and (seq samples)
+                                 (empty? downs)
+                                 (empty? unexpected-restarts)
+                                 (<= indeterminate-pct max-indeterminate-pct)))]
         (store/with-out-file test ["liveness.edn"]
           (pp/pprint {:interval-ms liveness-interval-ms
                       :samples samples}))
-        {:valid? valid?
-         :unexpected-down downs
-         :unexpected-restarts unexpected-restarts
-         :samples (count samples)
-         :indeterminate-pct indeterminate-pct
-         :max-indeterminate-pct max-indeterminate-pct
-         :throughput-ops-per-sec throughput
-         :max-ok-gap-ms (/ max-gap-ns 1e6)}))))
+        (cond-> {:valid? valid?
+                 :unexpected-down downs
+                 :unexpected-restarts unexpected-restarts
+                 :samples (count samples)
+                 :indeterminate-pct indeterminate-pct
+                 :max-indeterminate-pct max-indeterminate-pct
+                 :throughput-ops-per-sec throughput
+                 :max-ok-gap-ms (/ max-gap-ns 1e6)}
+          (nil? base) (assoc :error "Jepsen's time origin was never recorded"))))))
