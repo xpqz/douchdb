@@ -1,7 +1,8 @@
 # Base images are pinned by exact version and digest. To update, pick the new
 # tag, run `docker buildx imagetools inspect <image>:<tag>` and paste its
-# digest. The Rust version matches wasm/build.sh.
-FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+# digest. The Rust version matches rust-toolchain.toml (wasm/build.sh keeps its
+# own pin: the checked-in wasm bytes depend on it).
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

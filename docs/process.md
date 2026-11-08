@@ -5,7 +5,9 @@
 2. **Branch from `main` as `{issue-id}-{slug}`**, for example
    `21-opentelemetry`.
 3. Implement the issue, add tests, and run `cargo test` and
-   `cargo clippy --all-targets -- -D warnings`.
+   `cargo clippy --all-targets -- -D warnings`. The Rust toolchain is pinned in
+   `rust-toolchain.toml`; CI (`ci.yml`, `weekly.yml`) and the Dockerfile use the
+   same version, so local clippy matches CI. Bump all of them together.
 4. Commit on the branch and merge with `--no-ff` so the merge commit is a
    rollback point:
    ```sh

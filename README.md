@@ -867,6 +867,9 @@ python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
 
 ## Tests
 
+The Rust toolchain is pinned in `rust-toolchain.toml` (rustup installs it on
+first use); CI and the Dockerfile use the same version.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
