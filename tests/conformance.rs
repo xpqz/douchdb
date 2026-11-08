@@ -16469,6 +16469,31 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
 }
 
 #[tokio::test]
+async fn new_edits_false_write_to_remote_replica_is_acknowledged() {
+    // Every shard lives on node 1 and the write is coordinated by node 0, so
+    // the only copy is a forwarded one. A replication-style write answers with
+    // the errors only, and an empty error list from the replica is an ack.
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("remoteack").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/remoteack", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = nodes[0]
+        .post(
+            "/remoteack/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "x", "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "v": 1
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body, json!([]));
+}
+
+#[tokio::test]
 async fn rebalance_verifies_conflict_leaves_before_cleanup() {
     // Background anti-entropy is off, so the target replica only changes when
     // the test triggers a pass.
