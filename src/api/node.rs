@@ -182,7 +182,7 @@ pub async fn db_migration_put(
     }
     // Writes accepted before the freeze may still be fanning out to replicas.
     // Do not report the freeze until they have landed.
-    if !db.drain_writes(crate::cluster_ops::WRITE_DRAIN).await {
+    if !db.drain_writes(crate::cluster_ops::write_drain()).await {
         return fail(ApiError::new(
             503,
             "rebalance_in_progress",

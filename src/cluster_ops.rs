@@ -8,6 +8,7 @@ use crate::store::ShardState;
 use axum::http::{header, HeaderMap, StatusCode};
 use futures::future::join_all;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Apply a security object locally and push it to every peer.
@@ -430,7 +431,27 @@ async fn cleanup_all_replicas(
 }
 
 /// Time to wait for in-flight writes to finish once writes are frozen.
-pub(crate) const WRITE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) fn write_drain() -> std::time::Duration {
+    std::time::Duration::from_millis(WRITE_DRAIN_MS.load(Ordering::SeqCst))
+}
+
+/// Default for `--rebalance-write-drain-ms`.
+pub const DEFAULT_WRITE_DRAIN_MS: u64 = 15_000;
+/// Default for `--rebalance-stable-wait-ms`.
+pub const DEFAULT_STABLE_WAIT_MS: u64 = 10_000;
+
+static WRITE_DRAIN_MS: AtomicU64 = AtomicU64::new(DEFAULT_WRITE_DRAIN_MS);
+static STABLE_WAIT_MS: AtomicU64 = AtomicU64::new(DEFAULT_STABLE_WAIT_MS);
+
+/// Set the write-drain wait (`--rebalance-write-drain-ms`).
+pub fn set_write_drain_ms(ms: u64) {
+    WRITE_DRAIN_MS.store(ms.max(1), Ordering::SeqCst);
+}
+
+/// Set the wait for the old owners to settle (`--rebalance-stable-wait-ms`).
+pub fn set_stable_wait_ms(ms: u64) {
+    STABLE_WAIT_MS.store(ms.max(1), Ordering::SeqCst);
+}
 
 /// A peer's refusal of a migration. `conflict` marks a different migration
 /// already owning the peer, which must be left alone.
@@ -486,7 +507,7 @@ async fn set_migration_everywhere(
     // Peers that refused because another migration owns them keep that
     // migration; clearing them would unfreeze the other coordinator.
     let mut foreign = Vec::new();
-    if !db.drain_writes(WRITE_DRAIN).await {
+    if !db.drain_writes(write_drain()).await {
         failures.push("local writes did not finish before the freeze".to_string());
     }
     if failures.is_empty() {
@@ -620,7 +641,7 @@ async fn migrate(
         old_map,
         headers,
         // Allow slow digest scans plus any in-flight write to settle.
-        std::time::Duration::from_millis(10_000),
+        std::time::Duration::from_millis(STABLE_WAIT_MS.load(Ordering::SeqCst)),
     )
     .await
     {

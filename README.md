@@ -451,6 +451,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--cors-credentials] [--cors-headers HEADER,HEADER]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--max-open-indexes N] [--max-open-dbs N]
+        [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]
+        [--rebalance-freeze-ms N] [--js-worker-startup-ms N]
         [--otel-endpoint URL]
 ```
 
@@ -484,9 +486,13 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
 | `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
-| `--view-timeout-ms` | `5000` | Wall-clock limit for one view query |
+| `--view-timeout-ms` | `5000` | Wall-clock limit for one view query. Matches CouchDB's `[couchdb] os_process_timeout` (5000 ms). Slow or heavily loaded hosts may need a larger value |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
+| `--rebalance-write-drain-ms` | `15000` | How long a rebalance waits, once writes are frozen, for in-flight writes to finish (on the coordinator and on each peer). Slow or heavily loaded hosts may need a larger value |
+| `--rebalance-stable-wait-ms` | `10000` | How long a rebalance waits for the frozen old replicas to agree on one content digest per shard. Slow or heavily loaded hosts may need a larger value |
+| `--rebalance-freeze-ms` | `420000` | Upper bound on a rebalance write freeze; if the coordinator disappears, writes resume after this long. It also bounds the whole rebalance, so a slow or heavily loaded cluster may need a larger value. Set it the same on every node: each node applies its own value to the freeze it accepts from a peer |
+| `--js-worker-startup-ms` | `10000` | How long a `--js-sandbox process` worker may take to start before it is killed. Slow or heavily loaded hosts may need a larger value |
 | `--max-open-dbs` | `256` | Most databases kept open between requests (CouchDB's `max_dbs_open` is 500, but a database here costs a thread and several file descriptors per shard). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. |
 | `--max-open-indexes` | `256` | Most view indexes, and most search indexes, kept open between queries. Past it the least recently used index that no query is using is closed and reopened from disk on its next query. CouchDB keeps an index process per active view with no such cap; this bounds memory and file descriptors on nodes with many databases. |
 | `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |

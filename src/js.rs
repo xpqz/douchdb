@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -156,7 +156,14 @@ static SANDBOX: AtomicU8 = AtomicU8::new(0);
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
 /// A debug-build worker needs a moment to start; a hung one is killed after this.
-const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default for `--js-worker-startup-ms`.
+pub const DEFAULT_WORKER_STARTUP_MS: u64 = 10_000;
+static WORKER_STARTUP_MS: AtomicU64 = AtomicU64::new(DEFAULT_WORKER_STARTUP_MS);
+
+/// Set how long a starting worker may take (`--js-worker-startup-ms`).
+pub fn set_worker_startup_ms(ms: u64) {
+    WORKER_STARTUP_MS.store(ms.max(1), Ordering::SeqCst);
+}
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn configure(sandbox: Sandbox, workers: usize) {
@@ -666,7 +673,9 @@ impl Worker {
         command.arg("--js-worker");
         let mut worker = Worker::spawn_command(command)?;
         // The worker announces its confinement before it serves requests.
-        let hello = worker.await_hello(WORKER_STARTUP_TIMEOUT)?;
+        let hello = worker.await_hello(Duration::from_millis(
+            WORKER_STARTUP_MS.load(Ordering::SeqCst),
+        ))?;
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             let landlock = hello

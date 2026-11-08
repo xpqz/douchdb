@@ -475,7 +475,16 @@ pub struct DbConfig {
 
 /// Upper bound for a cluster-wide rebalance write freeze. If the coordinator
 /// disappears, peers resume writes after this window instead of staying frozen.
-const REBALANCE_FREEZE_MS: u64 = 420_000;
+/// Default for `--rebalance-freeze-ms`.
+pub const DEFAULT_REBALANCE_FREEZE_MS: u64 = 420_000;
+
+static REBALANCE_FREEZE_MS: AtomicU64 = AtomicU64::new(DEFAULT_REBALANCE_FREEZE_MS);
+
+/// Set the freeze bound (`--rebalance-freeze-ms`). Every freeze on this node,
+/// whether it started the rebalance or accepted a peer's announcement, uses it.
+pub fn set_rebalance_freeze_ms(ms: u64) {
+    REBALANCE_FREEZE_MS.store(ms.max(1), Ordering::SeqCst);
+}
 
 fn now_millis() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -1196,7 +1205,7 @@ impl Db {
     /// Claim the single rebalance slot for this database and freeze writes for
     /// a bounded verification window.
     pub fn try_start_rebalance(&self) -> bool {
-        let deadline = now_millis().saturating_add(REBALANCE_FREEZE_MS);
+        let deadline = now_millis().saturating_add(REBALANCE_FREEZE_MS.load(Ordering::SeqCst));
         loop {
             let current = self.rebalance_until.load(Ordering::SeqCst);
             if current != 0 && now_millis() < current {
@@ -1215,7 +1224,7 @@ impl Db {
     pub fn set_rebalance_in_progress(&self, in_progress: bool) {
         self.rebalance_until.store(
             if in_progress {
-                now_millis().saturating_add(REBALANCE_FREEZE_MS)
+                now_millis().saturating_add(REBALANCE_FREEZE_MS.load(Ordering::SeqCst))
             } else {
                 0
             },
