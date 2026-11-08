@@ -1272,11 +1272,21 @@ fn gates() -> &'static Registry<RwLock<()>> {
     &GATES
 }
 
-/// Drop cached index handles when a database is deleted or recreated. The
-/// LevelDB files live under the database directory.
-pub fn forget_db(db_path: &Path) {
+/// Drop cached index handles when a database is deleted or recreated, and the
+/// database's gate with them. The LevelDB files live under the database
+/// directory.
+///
+/// Takes the write side of the gate, so it waits for a query that is using an
+/// index and no query starts against a half-forgotten one. The gate leaves the
+/// registry while the write side is held: a caller that already cloned it
+/// queues behind this call, and one that asks afterwards gets a fresh gate,
+/// which is the one the recreated database uses.
+pub async fn forget_db(db_path: &Path) {
+    let gate = gates().get(db_path);
+    let _gate = gate.write_owned().await;
     let prefix = db_path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&prefix));
+    gates().retain(|path| path != db_path);
 }
 
 impl ViewIndex {
@@ -4821,11 +4831,29 @@ mod tests {
 
         // A query holds the read side of the gate while it uses an index.
         let reader = index_gate(&db).read_owned().await;
-        forget_db(&db.path);
-        assert_eq!(open_indexes_under(&db.path), 1, "index dropped under a reader");
+        let path = db.path.clone();
+        let forget = forget_db(&path);
+        tokio::pin!(forget);
+        // One poll is enough: the only thing forget_db awaits is the gate.
+        let done = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(forget.as_mut(), cx).is_ready())
+        })
+        .await;
+        assert!(!done, "forget_db finished while a query held the gate");
+        assert_eq!(
+            open_indexes_under(&db.path),
+            1,
+            "index dropped under a reader"
+        );
 
         drop(reader);
-        assert_eq!(gates().count_under(&db.path), 0, "gate outlived its database");
+        forget.await;
+        assert_eq!(open_indexes_under(&db.path), 0);
+        assert_eq!(
+            gates().count_under(&db.path),
+            0,
+            "gate outlived its database"
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

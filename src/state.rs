@@ -396,8 +396,9 @@ impl AppState {
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
-        crate::view::forget_db(&crate::db::db_path(&self.root, name));
-        crate::search::forget_db(&crate::db::db_path(&self.root, name));
+        let path = crate::db::db_path(&self.root, name);
+        crate::view::forget_db(&path).await;
+        crate::search::forget_db(&path).await;
         if Db::exists(&self.root, name) {
             return Err(ApiError::new(
                 412,
@@ -435,8 +436,9 @@ impl AppState {
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
         self.dbs.write().await.remove(name);
-        crate::view::forget_db(&crate::db::db_path(&self.root, name));
-        crate::search::forget_db(&crate::db::db_path(&self.root, name));
+        let path = crate::db::db_path(&self.root, name);
+        crate::view::forget_db(&path).await;
+        crate::search::forget_db(&path).await;
         Db::destroy(&self.root, name)?;
         self.db_updates.record(name, "deleted");
         Ok(())
