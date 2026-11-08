@@ -63,11 +63,13 @@ fn adoptable_peer_map(map: &crate::cluster::ShardMap, version: u64, cluster_size
 /// endpoint, so a rolling upgrade keeps converging.
 async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], known_acks: usize) {
     let mut known_acks = known_acks;
-    let local = db.shard_map();
-    let mut desired = db
-        .pending_shard_map()
-        .filter(|pending| pending.version >= local.version)
-        .unwrap_or_else(|| local.clone());
+    let mut desired = match desired_shard_map(db) {
+        Ok(desired) => desired,
+        Err(error) => {
+            tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+            return;
+        }
+    };
 
     let reported =
         crate::cluster_http::in_one_round(join_all(peers.iter().map(|peer| async move {
@@ -97,6 +99,8 @@ async fn reconcile_shard_map(ctx: &ClusterCtx, db: &Arc<Db>, peers: &[String], k
         {
             if db
                 .pending_shard_map()
+                .ok()
+                .flatten()
                 .is_some_and(|pending| pending.version <= map.version)
             {
                 // The adopted map supersedes (or beat the tiebreak against) ours.
@@ -327,11 +331,12 @@ pub(crate) struct MetadataSyncReply {
 
 /// The shard map anti-entropy spreads for `db`: the pending one if it is at
 /// least as new as the stored one, else the stored one.
-fn desired_shard_map(db: &Db) -> crate::cluster::ShardMap {
+fn desired_shard_map(db: &Db) -> DbResult<crate::cluster::ShardMap> {
     let local = db.shard_map();
-    db.pending_shard_map()
+    Ok(db
+        .pending_shard_map()?
         .filter(|pending| pending.version >= local.version)
-        .unwrap_or(local)
+        .unwrap_or(local))
 }
 
 /// The receiver's side of the exchange: compare `summary` with what the local
@@ -424,10 +429,17 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             continue;
         };
         let (version, security) = db.security_versioned();
+        let desired = match desired_shard_map(&db) {
+            Ok(desired) => desired,
+            Err(error) => {
+                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+                continue;
+            }
+        };
         sent.summary.insert(
             name.clone(),
             DbSummary {
-                shard_map: shard_map_stamp(&desired_shard_map(&db)),
+                shard_map: shard_map_stamp(&desired),
                 security: security_stamp(version, &security),
             },
         );
@@ -470,7 +482,13 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             .map(|(peer, reply)| (peer, reply))
             .collect();
 
-        let mut desired = desired_shard_map(&db);
+        let mut desired = match desired_shard_map(&db) {
+            Ok(desired) => desired,
+            Err(error) => {
+                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
+                continue;
+            }
+        };
         for (_, reply) in &holders {
             let Some(map) = reply
                 .differs
@@ -484,6 +502,8 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             {
                 if db
                     .pending_shard_map()
+                    .ok()
+                    .flatten()
                     .is_some_and(|pending| pending.version <= map.version)
                 {
                     // The adopted map supersedes (or beat the tiebreak against) ours.
@@ -516,7 +536,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
                     .shard_map = Some(desired.clone());
             }
         }
-        if db.pending_shard_map().is_some() {
+        if !matches!(db.pending_shard_map(), Ok(None)) {
             pending.insert(name.clone(), current);
         }
 

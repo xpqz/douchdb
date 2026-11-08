@@ -121,14 +121,14 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    fn of_open(db: Arc<Db>) -> Self {
-        Placement {
+    fn of_open(db: Arc<Db>) -> DbResult<Self> {
+        Ok(Placement {
             q: db.q,
             partitioned: db.partitioned,
             shard_map: db.shard_map(),
-            pending_shard_map: db.pending_shard_map().is_some(),
+            pending_shard_map: db.pending_shard_map()?.is_some(),
             open: Some(db),
-        }
+        })
     }
 }
 
@@ -292,7 +292,7 @@ impl AppState {
             return Err(ApiError::not_found("Database does not exist."));
         }
         if let Some(db) = self.open_db_if_cached(name).await {
-            return Ok(Placement::of_open(db));
+            return Placement::of_open(db);
         }
         let root = self.root.clone();
         let owned = name.to_string();
@@ -309,7 +309,7 @@ impl AppState {
                 pending_shard_map: meta.pending_shard_map,
                 open: None,
             }),
-            None => Ok(Placement::of_open(self.db(name).await?)),
+            None => Placement::of_open(self.db(name).await?),
         }
     }
 
