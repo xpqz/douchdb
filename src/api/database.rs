@@ -500,7 +500,8 @@ pub async fn db_rest(
         | "_search_cleanup" => Some(&["POST"]),
         "_changes" => Some(&["GET", "POST", "HEAD"]),
         "_index_info" => Some(&["GET", "HEAD"]),
-        "_revs_limit" | "_security" => Some(&["PUT", "GET"]),
+        "_revs_limit" | "_purged_infos_limit" | "_security" => Some(&["PUT", "GET"]),
+        "_peer_purged_infos" => Some(&["GET"]),
         _ => None,
     };
     if let Some(response) = allowed.and_then(|allowed| require_method(&method, allowed)) {
@@ -516,9 +517,11 @@ pub async fn db_rest(
         "_changes" => return changes(st.clone(), db.clone(), req).await,
         "_revs_diff" => return revs_diff(req).await,
         "_purge" => return purge(req).await,
+        "_peer_purged_infos" => return purged_infos(req).await,
         "_compact" => return compact(req).await,
         "_ensure_full_commit" => return ensure_full_commit(req).await,
         "_revs_limit" => return revs_limit(req).await,
+        "_purged_infos_limit" => return purged_infos_limit(req).await,
         "_security" => return security(req).await,
         "_view_cleanup" => return view_cleanup(req).await,
         "_search_cleanup" => return search_cleanup(req).await,
@@ -588,7 +591,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
         return fail(ApiError::bad_request("invalid JSON"));
     };
     let response = if !req.st.ctx.cluster.is_clustered() || is_forwarded(req.st, req.headers) {
-        match req.db.purge(&request).await {
+        match req.db.purge(&request, req.st.ctx.cluster.me).await {
             Ok(purged) => json(StatusCode::CREATED, purged),
             Err(e) => return fail(e),
         }
@@ -604,6 +607,32 @@ async fn purge(req: DbRequest<'_>) -> Response {
         return fail(e);
     }
     response
+}
+
+/// `GET /{db}/_peer_purged_infos?since=<seq>,<seq>,...`: this node's purge infos
+/// per shard after the given purge sequences, for a peer's anti-entropy.
+/// Internal only: CouchDB has no such endpoint, its shard copies exchange
+/// purge infos inside mem3_rep.
+async fn purged_infos(req: DbRequest<'_>) -> Response {
+    if !is_forwarded(req.st, req.headers) {
+        return fail(ApiError::not_found("missing"));
+    }
+    let since: Vec<u64> = req
+        .q
+        .get("since")
+        .map(|list| list.split(',').filter_map(|seq| seq.parse().ok()).collect())
+        .unwrap_or_default();
+    let reader = req.q.get("node").and_then(|node| node.parse().ok());
+    match req.db.purged_infos(&since, reader).await {
+        Ok(shards) => {
+            let shards: Vec<Value> = shards
+                .into_iter()
+                .map(|(purge_seq, infos)| json!({"purge_seq": purge_seq, "infos": infos}))
+                .collect();
+            json(StatusCode::OK, json!({"shards": shards}))
+        }
+        Err(e) => fail(e),
+    }
 }
 
 /// `purge_results_to_json` (chttpd_db.erl): 201, raised to 202 when an entry
@@ -679,6 +708,32 @@ async fn revs_limit(req: DbRequest<'_>) -> Response {
         Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
     };
     match req.db.set_revs_limit(limit).await {
+        Ok(()) => ok(),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET` or `PUT /{db}/_purged_infos_limit`: how many purge infos each shard
+/// keeps (chttpd_db.erl, default 1000).
+async fn purged_infos_limit(req: DbRequest<'_>) -> Response {
+    if *req.method == Method::GET {
+        return match req.db.get_purged_infos_limit().await {
+            Ok(n) => json(StatusCode::OK, json!(n)),
+            Err(e) => fail(e),
+        };
+    }
+    let limit = match serde_json::from_slice::<Value>(req.body) {
+        Ok(value) => match value.as_u64().filter(|limit| *limit > 0) {
+            Some(limit) => limit,
+            None => {
+                return fail(ApiError::bad_request(
+                    "`_purged_infos_limit` must be a positive integer",
+                ))
+            }
+        },
+        Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
+    };
+    match req.db.set_purged_infos_limit(limit).await {
         Ok(()) => ok(),
         Err(e) => fail(e),
     }

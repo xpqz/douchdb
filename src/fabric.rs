@@ -942,7 +942,7 @@ pub(crate) async fn purge_docs(
         |(node, sub)| async move {
             let body = Value::Object(sub);
             let reply = if node == ctx.cluster.me {
-                db.purge(&body).await
+                db.purge(&body, ctx.cluster.me).await
             } else {
                 match ctx.cluster.nodes.get(node) {
                     Some(peer) => {
