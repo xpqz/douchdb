@@ -79,7 +79,7 @@ pub(crate) async fn apply_shard_map(
         map = db.set_next_shard_map(map)?;
     }
     if internal {
-        db.clear_pending_shard_map();
+        db.clear_pending_shard_map()?;
         return Ok((map, false));
     }
 
@@ -128,7 +128,7 @@ pub(crate) async fn apply_shard_map(
     if pending {
         db.set_pending_shard_map(&map)?;
     } else {
-        db.clear_pending_shard_map();
+        db.clear_pending_shard_map()?;
     }
     crate::telemetry::record_shard_map_update(pending);
     Ok((map, pending))

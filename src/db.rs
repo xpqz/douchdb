@@ -174,6 +174,14 @@ fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option
     }
 }
 
+fn clear_error(path: &Path, error: &dyn std::fmt::Display) -> ApiError {
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("{}: {error}", file_name(path)),
+    )
+}
+
 /// Serialize `value` and replace `path` with it atomically; see
 /// [`write_atomic`].
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
@@ -189,17 +197,96 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()
     write_atomic(path, &bytes).map_err(|error| write_error(&error))
 }
 
+/// Temporary files of writes in flight in this process. Cleanup of stale
+/// temporary files must not remove one of these.
+static LIVE_TEMPS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+fn live_temps() -> std::sync::MutexGuard<'static, Option<std::collections::HashSet<PathBuf>>> {
+    LIVE_TEMPS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// A temporary file being written; it counts as in flight until dropped,
+/// which is after the caller has renamed or removed it.
+struct LiveTemp(PathBuf);
+
+impl LiveTemp {
+    fn register(path: PathBuf) -> LiveTemp {
+        live_temps()
+            .get_or_insert_with(Default::default)
+            .insert(path.clone());
+        LiveTemp(path)
+    }
+}
+
+impl Drop for LiveTemp {
+    fn drop(&mut self) {
+        if let Some(set) = live_temps().as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Whether `name` is one `write_temp` produces: `.<name>.<pid>.<n>.tmp`.
+fn is_temp_name(name: &str) -> bool {
+    let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, '.');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (counter, pid, target) = (parts.next(), parts.next(), parts.next());
+    numeric(counter) && numeric(pid) && target.is_some_and(|t| !t.is_empty())
+}
+
+/// Remove the temporary files of interrupted writes from `dir` (not its
+/// subdirectories). Only names matching [`is_temp_name`] go, and never one a
+/// write in this process is still using, so this is safe while the directory
+/// is in use; whether the pid in a name is alive is not considered. A file
+/// that cannot be removed is logged, not an error.
+pub(crate) fn remove_stale_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_temp_name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        // Hold the registry while removing: a write registers its file before
+        // creating it, so a file that is not registered here is not in use.
+        let live = live_temps();
+        if live.as_ref().is_some_and(|set| set.contains(&path)) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file = %path.display(), "removed stale temporary file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(file = %path.display(), %error, "cannot remove stale temporary file")
+            }
+        }
+    }
+}
+
 /// Write `bytes` to a temporary file next to `path` and fsync it. A crash
 /// before the caller publishes it leaves only the temporary file behind.
-fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
+fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveTemp> {
     use std::io::Write;
     static TEMPS: AtomicU64 = AtomicU64::new(0);
-    let temp = path.with_file_name(format!(
+    let temp = LiveTemp::register(path.with_file_name(format!(
         ".{}.{}.{}.tmp",
         file_name(path),
         std::process::id(),
         TEMPS.fetch_add(1, Ordering::Relaxed)
-    ));
+    )));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -209,14 +296,14 @@ fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathB
     }
     #[cfg(not(unix))]
     let _ = private;
-    let written = options.open(&temp).and_then(|mut file| {
+    let written = options.open(&temp.0).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()
     });
     match written {
         Ok(()) => Ok(temp),
         Err(error) => {
-            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_file(&temp.0);
             Err(error)
         }
     }
@@ -245,8 +332,8 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 /// then fsync the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, false)?;
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
+    if let Err(error) = std::fs::rename(&temp.0, path) {
+        let _ = std::fs::remove_file(&temp.0);
         return Err(error);
     }
     sync_parent(path)
@@ -257,8 +344,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// all: it is written to a temporary file and hard-linked into place.
 pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, true)?;
-    let linked = std::fs::hard_link(&temp, path);
-    let _ = std::fs::remove_file(&temp);
+    let linked = std::fs::hard_link(&temp.0, path);
+    let _ = std::fs::remove_file(&temp.0);
     linked?;
     sync_parent(path)
 }
@@ -495,6 +582,12 @@ pub fn migrate_nested_dbs(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String
 impl Db {
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
+        remove_stale_temps(&path);
+        if let Ok(indexes) = std::fs::read_dir(path.join("_search_indexes")) {
+            for index in indexes.flatten() {
+                remove_stale_temps(&index.path());
+            }
+        }
         let db_file = path.join("db.json");
         let file: DbFile = match read_metadata(&db_file)? {
             Some(file) => file,
@@ -1140,8 +1233,17 @@ impl Db {
         write_json_atomic(&self.path.join("pending-shard-map.json"), map)
     }
 
-    pub fn clear_pending_shard_map(&self) {
-        let _ = std::fs::remove_file(self.path.join("pending-shard-map.json"));
+    /// Remove the pending shard map and make the removal durable. Already
+    /// gone is fine; any other failure is an error, since the map would
+    /// otherwise reappear or be retried as if still pending.
+    pub fn clear_pending_shard_map(&self) -> DbResult<()> {
+        let path = self.path.join("pending-shard-map.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(clear_error(&path, &error)),
+        }
+        sync_parent(&path).map_err(|error| clear_error(&path, &error))
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
@@ -4853,6 +4955,109 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"second");
         assert_eq!(names_in(&dir), ["meta.json"]);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn open_removes_stale_temporary_files_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+        let config = || DbConfig {
+            q: 1,
+            revs_limit: 100,
+            shard_map: ShardMap::single(1),
+            partitioned: false,
+        };
+        let db = Db::open(&root, "stale", config()).unwrap();
+        let dir = db.path.clone();
+        drop(db);
+
+        // Temporary files an interrupted write_atomic left behind, from
+        // another process and from one that happened to share our pid.
+        let foreign = format!(".db.json.{}.7.tmp", std::process::id().wrapping_add(1));
+        let same_pid = format!(".shard-map.json.{}.0.tmp", std::process::id());
+        let search = dir.join("_search_indexes").join("abc");
+        std::fs::create_dir_all(&search).unwrap();
+        let stale_search = search.join(".douchdb-search-meta.json.1.2.tmp");
+        for stale in [
+            dir.join(&foreign),
+            dir.join(&same_pid),
+            stale_search.clone(),
+        ] {
+            std::fs::write(stale, b"partial").unwrap();
+        }
+        // Names that merely resemble the pattern are left alone.
+        let keep = [
+            "db.json.1.2.tmp",
+            ".db.json.x.2.tmp",
+            ".db.json.1.tmp",
+            ".db.json.1.2.tmp.bak",
+            ".notes.tmp",
+        ];
+        for name in keep {
+            std::fs::write(dir.join(name), b"keep").unwrap();
+        }
+        let before = names_in(&dir);
+
+        let db = Db::open(&root, "stale", config()).unwrap();
+        drop(db);
+
+        let mut expected: Vec<String> = before
+            .into_iter()
+            .filter(|name| *name != foreign && *name != same_pid)
+            .collect();
+        expected.sort();
+        assert_eq!(names_in(&dir), expected);
+        assert!(!stale_search.exists());
+        for name in keep {
+            assert!(dir.join(name).exists(), "{name} was removed");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cleanup_spares_a_temporary_file_a_write_is_using() {
+        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("meta.json");
+        let live = write_temp(&target, b"partial", false).unwrap();
+        let stale = dir.join(".meta.json.1.1.tmp");
+        std::fs::write(&stale, b"old").unwrap();
+        remove_stale_temps(&dir);
+        assert!(live.0.exists(), "a temporary file in use was removed");
+        assert!(!stale.exists());
+        std::fs::remove_file(&live.0).unwrap();
+        drop(live);
+        remove_stale_temps(&dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn clear_pending_shard_map_reports_what_it_cannot_remove() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+
+        // Nothing pending is not an error.
+        db.clear_pending_shard_map().unwrap();
+
+        db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
+        assert!(db.pending_shard_map().is_some());
+        db.clear_pending_shard_map().unwrap();
+        assert!(db.pending_shard_map().is_none());
+
+        // A path that cannot be unlinked is an error, not a silent success.
+        std::fs::create_dir(&pending).unwrap();
+        assert!(db.clear_pending_shard_map().is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
