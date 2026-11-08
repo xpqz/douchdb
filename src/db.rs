@@ -5014,6 +5014,36 @@ mod tests {
     }
 
     #[test]
+    fn clear_pending_shard_map_reports_what_it_cannot_remove() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pending",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let pending = db.path.join("pending-shard-map.json");
+
+        // Nothing pending is not an error.
+        db.clear_pending_shard_map().unwrap();
+
+        db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
+        assert!(db.pending_shard_map().is_some());
+        db.clear_pending_shard_map().unwrap();
+        assert!(db.pending_shard_map().is_none());
+
+        // A path that cannot be unlinked is an error, not a silent success.
+        std::fs::create_dir(&pending).unwrap();
+        assert!(db.clear_pending_shard_map().is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn failed_atomic_write_shows_no_partial_file() {
         let dir = std::env::temp_dir().join(format!("douchdb-atomicfail-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
