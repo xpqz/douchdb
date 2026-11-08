@@ -1697,9 +1697,8 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    // Only node 0 stores the design document, as if node 1 missed the write
-    // and anti-entropy (off here) has not repaired it. Node 1 must still apply
-    // the validator when it coordinates a write.
+    // Only node 0 stores the design document, as if node 1 missed the write.
+    // Node 1 applies the validator once anti-entropy has pulled it.
     let (status, body) = nodes[0]
         .req_with(
             Method::POST,
@@ -1723,21 +1722,15 @@ async fn cluster_validation_functions_follow_design_docs_across_shards() {
         "node 1 must not hold the design doc"
     );
 
+    wait_until_enforces(&nodes[1], "clvalidate", "rejected", true).await;
     let (status, body) = nodes[1]
         .put("/clvalidate/accepted", json!({"ok": true}))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let (status, body) = nodes[1]
-        .put("/clvalidate/rejected", json!({"ok": false}))
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason"], "need ok");
-    let (status, _) = nodes[0].get("/clvalidate/rejected").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
+async fn cluster_bulk_docs_use_the_same_validators_as_single_writes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("clvalbulk").await;
@@ -1762,8 +1755,9 @@ async fn cluster_bulk_docs_use_the_cluster_merged_validators() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    // A batch coordinated by node 1 must see the same validators as a
-    // single-document write does.
+    // Once node 1 has pulled the design document, a batch it coordinates sees
+    // the same validators as a single-document write does.
+    wait_until_enforces(&nodes[1], "clvalbulk", "probe", true).await;
     let (status, body) = nodes[1]
         .post(
             "/clvalbulk/_bulk_docs",
@@ -1814,8 +1808,93 @@ async fn cluster_validation_still_applies_with_a_peer_down() {
     assert_eq!(body[0]["error"], "forbidden", "{body}");
 }
 
+const NEED_OK: &str = "function (doc) { \
+    if (doc.ok !== true) { throw {forbidden: 'need ok'}; } \
+}";
+
+/// Write documents that a validator rejecting `{"ok": false}` should reject to
+/// `node` until one is rejected with `reason`, asking it for an anti-entropy
+/// pass before each attempt when `sync` is set. Every attempt before then is
+/// accepted or rejected for an older reason, so each uses a new id. Waits on
+/// the condition, with a generous deadline against a hang.
+async fn wait_until_rejected_with(node: &Server, db: &str, tag: &str, reason: &str, sync: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    for attempt in 0.. {
+        if sync {
+            let (status, body) = node.post("/_node/_local/_replication/run", json!({})).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        let (status, body) = node
+            .put(&format!("/{db}/{tag}{attempt}"), json!({"ok": false}))
+            .await;
+        match status {
+            StatusCode::FORBIDDEN if body["reason"] == reason => return,
+            StatusCode::FORBIDDEN | StatusCode::CREATED => {}
+            _ => panic!("unexpected {status}: {body}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never enforced the validator with reason {reason}: {body}",
+            node.base
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_until_enforces(node: &Server, db: &str, tag: &str, sync: bool) {
+    wait_until_rejected_with(node, db, tag, "need ok", sync).await;
+}
+
+/// A design document written through one node is enforced by writes
+/// coordinated on every node, with validators read from each node's own
+/// copy.
 #[tokio::test]
-async fn cluster_validators_are_cached_until_a_design_doc_changes() {
+async fn cluster_design_doc_is_enforced_by_every_coordinator() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clvalall").await;
+    }
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalall/_design/validate",
+            json!({"validate_doc_update": NEED_OK}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for (i, node) in nodes.iter().enumerate() {
+        // The write may return before the last replica has applied it.
+        wait_until_enforces(node, "clvalall", &format!("rej{i}-"), false).await;
+        let (status, body) = node
+            .put(&format!("/clvalall/ok{i}"), json!({"ok": true}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+}
+
+/// A node that was down when a validating design document was written holds
+/// no validator until anti-entropy pulls the document. That bounds how long
+/// it coordinates writes without it: a restart pulls at once, then every
+/// `--sync-secs`. The test asks for passes so it does not wait for the timer.
+#[tokio::test]
+async fn cluster_node_that_missed_a_design_doc_enforces_it_after_anti_entropy() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clvalmiss").await;
+    }
+    nodes[2].kill();
+    let (status, body) = nodes[0]
+        .put(
+            "/clvalmiss/_design/validate",
+            json!({"validate_doc_update": NEED_OK}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[2].restart();
+    wait_until_enforces(&nodes[2], "clvalmiss", "rej", true).await;
+}
+
+#[tokio::test]
+async fn cluster_validators_follow_design_doc_changes() {
     let nodes = start_cluster_with(2, "3600", 2);
     for node in &nodes {
         node.fresh_db("clvalcache").await;
@@ -1844,8 +1923,8 @@ async fn cluster_validators_are_cached_until_a_design_doc_changes() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["reason"], "first");
 
-    // A change only node 0 receives, as if node 1 missed it, still reaches
-    // node 1's writes once the cached set expires.
+    // A change only node 0 receives, as if node 1 missed it, reaches node 1's
+    // writes once anti-entropy has pulled it.
     let internal = [
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
@@ -1863,25 +1942,7 @@ async fn cluster_validators_are_cached_until_a_design_doc_changes() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    // Node 1 keeps its cached set until the cache expires, so it still says
-    // "first" for a while. A rejected write changes nothing, so retry it
-    // until the new validator shows.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let (status, body) = nodes[1]
-            .put("/clvalcache/rejected", json!({"ok": false}))
-            .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        if body["reason"] == "second" {
-            break;
-        }
-        assert_eq!(body["reason"], "first", "{body}");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "node 1 never dropped its cached validator: {body}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until_rejected_with(&nodes[1], "clvalcache", "later", "second", true).await;
 }
 
 #[tokio::test]
@@ -1916,11 +1977,10 @@ async fn cluster_validation_uses_the_newest_design_doc_revision() {
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
-    for node in &nodes {
-        let (status, body) = node.put("/clvalnew/rejected", json!({"ok": false})).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["reason"], "new", "{body}");
-    }
+    // Node 0 holds the newest revision. Node 1 gets it from node 0 by
+    // anti-entropy, and the older revision does not replace it.
+    wait_until_rejected_with(&nodes[0], "clvalnew", "r0-", "new", false).await;
+    wait_until_rejected_with(&nodes[1], "clvalnew", "r1-", "new", true).await;
 }
 
 #[tokio::test]
@@ -5152,15 +5212,11 @@ async fn peer_trip_reads(nodes: &[Server]) -> Vec<(&'static str, (u64, u64, u64)
 #[tokio::test]
 async fn cluster_peer_round_trip_baseline() {
     let nodes = peer_trip_cluster(3).await;
-    // Writes first. A node with no cached validators pays a validator
-    // fan-out (one call per peer, one round) before the write itself (one call
-    // per other replica, one round); the cache lasts a second, so the second
-    // figure is the cached case unless the machine stalled for longer.
+    // Writes first. Validators come from the coordinator's own design
+    // documents, so the only peer calls are the writes to the other replicas
+    // (one call per other node, one round), whatever the age of any cache.
     let put = measure_peer_trips(&nodes, Method::PUT, "/trips/new1", Some(json!({"n": 1}))).await;
-    assert!(
-        put == (2, 1, 0) || put == (4, 2, 0),
-        "single-doc PUT: {put:?}"
-    );
+    assert_eq!(put, (2, 1, 0), "single-doc PUT");
     // Every node holds a copy of every shard, so a read, a listing or a view
     // is served from local data without a scatter. A document read still asks
     // a second replica (`r=2`) and `since=now` still asks every peer for its
@@ -5203,8 +5259,8 @@ async fn cluster_peer_scatter_baseline_with_one_replica() {
     assert_eq!(trips("changes_since_now"), (2, 1, 0), "{reads:?}");
 }
 
-/// With a node down, a write pays the validator fan-out every time (a partial
-/// answer is never cached) and reads route around the dead node.
+/// With a node down, a write makes no validator calls: the calls are the
+/// replica writes only, the dead node's included, and reads route around it.
 #[tokio::test]
 async fn cluster_peer_round_trip_baseline_with_a_node_down() {
     let mut nodes = peer_trip_cluster(3).await;
@@ -5225,7 +5281,7 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             Some(json!({"n": 1})),
         )
         .await;
-        assert_eq!(put, (4, 2, 0), "PUT {id} with a node down");
+        assert_eq!(put, (2, 1, 0), "PUT {id} with a node down");
     }
     assert_eq!(
         peer_trip_reads(&nodes).await,

@@ -452,17 +452,6 @@ pub struct Db {
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
     design_generation: AtomicU64,
-    /// Validators merged from every node by a cluster coordinator, with the
-    /// design generation and time they were loaded.
-    cluster_validation: std::sync::RwLock<Option<ClusterValidators>>,
-}
-
-/// Cluster-merged validators with the design generation and time they were
-/// loaded.
-struct ClusterValidators {
-    generation: u64,
-    loaded: std::time::Instant,
-    functions: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -697,7 +686,6 @@ impl Db {
             commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
-            cluster_validation: std::sync::RwLock::new(None),
         })
     }
 
@@ -863,6 +851,17 @@ impl Db {
     /// Loading is cached until a design document is written. The scan is a
     /// range over the shards' `_design/` metadata keys, so it reads neither
     /// ordinary documents nor the changes index.
+    ///
+    /// This is the validator set of every write, clustered or not: a write
+    /// makes no peer call to find validators, as CouchDB's `ddoc_cache`
+    /// serves them without reading every design document per write. Design
+    /// documents are written to every node, so the local set is complete
+    /// unless this node missed such a write. Anti-entropy (`--sync-secs`)
+    /// pulls every design document from every peer, on startup and then on
+    /// each pass, and a pull that applies one drops this cache; that is the
+    /// bound on how long a node that missed the write validates without it.
+    /// A corrupt or unreadable local design document is an error, never a
+    /// skipped validator.
     pub async fn validation_functions(&self) -> DbResult<Vec<String>> {
         if let Some(functions) = self
             .validation
@@ -926,37 +925,6 @@ impl Db {
     /// Generation of this node's design documents.
     pub(crate) fn design_generation(&self) -> u64 {
         self.design_generation.load(Ordering::SeqCst)
-    }
-
-    /// Cluster-merged validators loaded no longer than `ttl` ago and with no
-    /// design-document write on this node since.
-    pub(crate) fn cached_cluster_validators(
-        &self,
-        ttl: std::time::Duration,
-    ) -> Option<Vec<String>> {
-        let cached = self
-            .cluster_validation
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let cached = cached.as_ref()?;
-        (cached.generation == self.design_generation() && cached.loaded.elapsed() < ttl)
-            .then(|| cached.functions.clone())
-    }
-
-    /// Cache cluster-merged validators read since `generation` was taken,
-    /// unless a design document was written in the meantime.
-    pub(crate) fn cache_cluster_validators(&self, generation: u64, functions: Vec<String>) {
-        let mut cached = self
-            .cluster_validation
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if self.design_generation() == generation {
-            *cached = Some(ClusterValidators {
-                generation,
-                loaded: std::time::Instant::now(),
-                functions,
-            });
-        }
     }
 
     /// Replace the security object with a client-supplied one, one version

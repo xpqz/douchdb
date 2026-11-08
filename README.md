@@ -563,6 +563,15 @@ router; there is no coordinator role.
   `--admin` is set; a client's Basic auth or `_session` cookie is forwarded on
   internal calls. This is non-client-induced replication: it catches up after
   missed writes, restarts and offline periods without a client request.
+- `validate_doc_update` functions come from the coordinating node's own design
+  documents (cached, dropped on any design-document write), so a write makes no
+  peer call to find validators, with or without a peer down. Design documents
+  are written to every node; a node that missed such a write (it was down)
+  enforces the validator once anti-entropy has pulled the document: at startup
+  and then at most one `--sync-secs` interval (plus the pass itself) after a
+  peer holding it is reachable. Until then writes it coordinates are not
+  checked by that validator. A corrupt or unreadable local design document
+  fails writes rather than being skipped.
 - Cluster management is exposed at `/_node/_local/_cluster`,
   `/_node/_local/_replication` and in the console. Discovery probes configured
   nodes, `--seed-nodes` and the memberships they report, marking reachable
