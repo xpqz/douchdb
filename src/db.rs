@@ -2799,6 +2799,11 @@ fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     })
 }
 
+/// A stored revision tree whose parent links loop, reported as corruption.
+fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
+    ApiError::corrupt(format!("corrupt revision tree for {id}: {error}"))
+}
+
 fn put_many(
     shard: &mut crate::store::Shard,
     docs: Vec<(usize, Value)>,
@@ -2838,7 +2843,17 @@ fn put_many(
     // Each document's record is written once, here, in its final form.
     let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
     for (id, meta) in staged.iter_mut() {
-        meta.tree.prune(limit);
+        // The batch's bodies and sequence numbers are already staged, so a
+        // tree that cannot be pruned fails the whole batch rather than being
+        // written back as if it were valid.
+        if let Err(e) = meta.tree.prune(limit) {
+            let message = corrupt_tree(id, e).reason;
+            shard.invalidate_latest();
+            return results
+                .into_iter()
+                .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
+                .collect();
+        }
         meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = meta_bytes(meta) {
             let old = origin.get(id).cloned().flatten();
@@ -2945,10 +2960,10 @@ impl Stage<'_> {
             },
         };
 
-        let parent_path = parent
-            .as_ref()
-            .map(|p| meta.tree.path(p))
-            .unwrap_or_default();
+        let parent_path = match parent.as_ref() {
+            Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
+            None => Vec::new(),
+        };
         let pos = parent
             .as_ref()
             .and_then(|p| Rev::parse(p).map(|r| r.pos))
@@ -3427,7 +3442,7 @@ fn read_doc_rev(
         }
     }
     if opts.revs {
-        let mut path = meta.tree.path(rev);
+        let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
         let limit = shard.revs_limit().max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
@@ -3444,7 +3459,7 @@ fn read_doc_rev(
         map.insert("_local_seq".into(), json!(meta.seq));
     }
     if opts.revs_info {
-        let mut path = meta.tree.path(rev);
+        let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
         let limit = shard.revs_limit().max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
