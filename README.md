@@ -790,6 +790,20 @@ python3 scripts/perf_cluster.py --docs 6000 --spread --native
 python3 scripts/perf_isolated.py --nodes 1,2,3
 ```
 
+Peer round trips per client request (calls, sequential rounds, and the share
+of latency spent waiting on peers) are measured on a local three-node cluster
+without Docker. Each node process is tracked and killed on exit, and the run is
+bounded:
+
+```sh
+cargo build --release --bins
+timeout 600 python3 scripts/bench_peer_trips.py
+```
+
+The counts come from the coordinator's metrics (`peer_calls`, `peer_rounds`,
+`peer_wait_ms` per route in `/_node/_local/_metrics`; `nested_*` are the calls
+made by the nodes it reached) and are exact. Latencies are indicative only.
+
 JavaScript sandbox throughput is measured separately in
 [docs/performance.md](docs/performance.md#javascript-sandbox-throughput) and
 [docs/quickjs-sandbox.md](docs/quickjs-sandbox.md):
