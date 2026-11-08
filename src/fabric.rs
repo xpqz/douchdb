@@ -1322,10 +1322,14 @@ pub(crate) fn nodedown() -> ApiError {
     ApiError::new(412, "nodedown", "progress not possible")
 }
 
-/// True when a peer request failed because the peer could not be reached (or
-/// is unhealthy), rather than because the peer rejected the request.
+/// True when a peer request failed in transport (connect, timeout, reset, or
+/// no usable response), rather than because the peer answered with an error.
+/// Every such failure is built as 502 `bad_gateway`; a peer's own error
+/// response keeps its status under another name (`request_failed`,
+/// `all_docs_failed`, ...), so a 503 or 504 the peer produced is an answer,
+/// not a node that is down.
 pub(crate) fn peer_unreachable(error: &ApiError) -> bool {
-    matches!(error.status, 502..=504)
+    error.status == 502 && error.error == "bad_gateway"
 }
 
 /// Reassign the shards of failed nodes to live replicas. A shard with no live
