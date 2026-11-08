@@ -2768,6 +2768,9 @@ pub fn validate_doc(doc: &Value) -> DbResult<()> {
             ));
         }
     }
+    if let Some(revisions) = obj.get("_revisions") {
+        validate_revisions(revisions)?;
+    }
     // CouchDB (couch_doc.erl) accepts only a boolean `_deleted`.
     if obj.get("_deleted").is_some_and(|value| !value.is_boolean()) {
         return Err(ApiError::new(
@@ -3207,28 +3210,65 @@ impl Stage<'_> {
     }
 }
 
+/// Check a document's `_revisions` the way `couch_doc:transfer_fields/3` does,
+/// which runs for every document whatever `new_edits` says: `start` must be an
+/// integer, `ids` an array, then each id goes through `parse_revid/2`. Returns
+/// the validated start and ids.
+fn validate_revisions(revisions: &Value) -> DbResult<(i64, Vec<&str>)> {
+    let doc_validation = |reason: &str| ApiError::new(400, "doc_validation", reason);
+    // couch_doc.erl:302 (`_revisions` clause); a non-object value reaches the
+    // unknown special member clause at couch_doc.erl:378 instead.
+    let Some(props) = revisions.as_object() else {
+        return Err(doc_validation("Bad special document member: _revisions"));
+    };
+    // couch_doc.erl:307
+    let Some(start) = props.get("start").and_then(Value::as_i64) else {
+        return Err(doc_validation("_revisions.start isn't an integer."));
+    };
+    // couch_doc.erl:309
+    let Some(ids) = props.get("ids").and_then(Value::as_array) else {
+        return Err(doc_validation("_revisions.ids isn't a array."));
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match id.as_str() {
+            // parse_revid/2 (couch_doc.erl:191): past position 0 a 32-byte id
+            // must be hex; `binary:decode_hex` failing is couch_doc.erl:321.
+            Some(id) if start != 0 && id.len() == 32 => {
+                if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(doc_validation("RevId isn't a valid hexadecimal"));
+                }
+                out.push(id);
+            }
+            // couch_doc.erl:195
+            Some(id) if start >= 0 => out.push(id),
+            // No parse_revid/2 clause matches: couch_doc.erl:319.
+            _ => return Err(doc_validation("RevId isn't a string")),
+        }
+    }
+    Ok((start, out))
+}
+
 /// Reconstruct the root-to-leaf path of a replicated document and the revision
 /// it writes. Like CouchDB (`couch_doc:transfer_fields/3`), `_revisions`
 /// defines the revision when present and non-empty, even without or against
 /// `_rev`; otherwise `_rev` alone does.
 fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(String, Vec<Rev>)> {
     let mut path = Vec::new();
+    let mut named_ids = false;
     if let Some(revs) = revisions {
-        let Some(start) = revs.get("start").and_then(Value::as_u64) else {
-            return Err(ApiError::bad_request("_revisions.start is not an integer"));
-        };
-        let Some(ids) = revs.get("ids").and_then(Value::as_array) else {
-            return Err(ApiError::bad_request("_revisions.ids is not an array"));
-        };
-        for (i, id) in ids.iter().enumerate() {
-            let Some(id) = id.as_str() else {
-                return Err(ApiError::bad_request(
-                    "_revisions.ids contains a non-string",
-                ));
+        let (start, ids) = validate_revisions(revs)?;
+        named_ids = !ids.is_empty();
+        for (i, id) in ids.into_iter().enumerate() {
+            let Some(pos) = u64::try_from(start)
+                .ok()
+                .and_then(|start| start.checked_sub(i as u64))
+            else {
+                break;
             };
-            let pos = start
-                .checked_sub(i as u64)
-                .ok_or_else(|| ApiError::bad_request("_revisions is malformed"))?;
+            // Deliberate departure: CouchDB stores revisions at position 0
+            // (`_revisions` with `start: 0`), but nothing generates them, so
+            // the path stops before position 0 and `Rev::parse` refuses it.
             if pos == 0 {
                 break;
             }
@@ -3242,11 +3282,16 @@ fn revisions_path(rev: Option<String>, revisions: Option<&Value>) -> DbResult<(S
             return Ok((format!("{}-{}", leaf.pos, leaf.id_string()), path));
         }
     }
-    let rev = rev.ok_or_else(|| {
-        ApiError::bad_request(
-            "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
-        )
-    })?;
+    let rev = match rev {
+        Some(rev) => rev,
+        // Ids that all sit at position 0 or below name no revision.
+        None if named_ids => return Err(ApiError::bad_request("Invalid rev format")),
+        None => {
+            return Err(ApiError::bad_request(
+                "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
+            ))
+        }
+    };
     let leaf = Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
     Ok((rev, vec![leaf]))
 }
