@@ -5345,58 +5345,76 @@ fn restart_fails_at_once_when_a_foreign_process_holds_the_port() {
     drop(squatter);
 }
 
-/// Run discovery passes on `node` until its snapshot reports the peer at
-/// `url` unreachable. A pass already running when the peer died may still
-/// report it up, so ask again until one reports it down.
+/// Run discovery passes on `node` until one that started after this call
+/// reports the peer at `url` unreachable.
 async fn wait_until_known_down(node: &Server, url: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let (status, body) = node
-            .post("/_node/_local/_cluster/discover", json!({}))
-            .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let (_, body) = node.get("/_node/_local/_cluster").await;
-        let discovery = &body["discovery"];
-        let down = discovery["nodes"].as_array().is_some_and(|nodes| {
-            nodes
-                .iter()
-                .any(|peer| peer["url"] == url && peer["reachable"] == false)
-        });
-        if down && discovery["running"] == false {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "discovery never reported {url} down; last probe of it: {}; snapshot: {body}",
-            peer_probe(discovery, url)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_discovery(node, url, false).await;
 }
 
-/// Run discovery passes on `node` until its snapshot reports the peer at
-/// `url` reachable again.
+/// Run discovery passes on `node` until one that started after this call
+/// reports the peer at `url` reachable again.
 async fn wait_until_known_up(node: &Server, url: &str) {
+    wait_for_discovery(node, url, true).await;
+}
+
+/// Trigger discovery passes on `node` one at a time and judge only passes
+/// that started after the trigger: a pass already running may have probed
+/// the peer before it went down or came back. A new pass is requested only
+/// when none is running, so a slow pass on a loaded machine is waited for
+/// rather than overlapped forever.
+async fn wait_for_discovery(node: &Server, url: &str, reachable: bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let state = if reachable { "up" } else { "down" };
+    let snapshot = || async {
+        let (status, body) = node.get("/_node/_local/_cluster").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    };
     loop {
-        let (status, body) = node
+        // Wait for any pass in progress to finish, then note when the last
+        // one finished: every pass that finishes later started after now.
+        let mut body = snapshot().await;
+        while body["discovery"]["running"] == true {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a discovery pass never finished: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            body = snapshot().await;
+        }
+        let before = body["discovery"]["last_finished"].clone();
+        let (status, reply) = node
             .post("/_node/_local/_cluster/discover", json!({}))
             .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let (_, body) = node.get("/_node/_local/_cluster").await;
-        let discovery = &body["discovery"];
-        let up = discovery["nodes"].as_array().is_some_and(|nodes| {
-            nodes
-                .iter()
-                .any(|peer| peer["url"] == url && peer["reachable"] == true)
-        });
-        if up && discovery["running"] == false {
-            return;
+        assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+        // Wait for a pass that finished after the trigger. If the request
+        // was turned away (the node was busy), none starts; ask again.
+        loop {
+            body = snapshot().await;
+            let discovery = &body["discovery"];
+            if discovery["running"] == false && discovery["last_finished"] != before {
+                let probe = discovery["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|peer| peer["url"] == url).cloned());
+                if probe.is_some_and(|peer| peer["reachable"] == reachable) {
+                    return;
+                }
+                break;
+            }
+            if discovery["running"] == false {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery never reported {url} {state}; last probe of it: {}; snapshot: {body}",
+                peer_probe(discovery, url)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "discovery never reported {url} up; last probe of it: {}; snapshot: {body}",
-            peer_probe(discovery, url)
+            "discovery never reported {url} {state}; last probe of it: {}; snapshot: {body}",
+            peer_probe(&body["discovery"], url)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
