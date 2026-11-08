@@ -5213,6 +5213,20 @@ async fn cluster_scatter_skips_a_node_discovery_reports_down() {
     assert_eq!(since_now, (2, 1, 0), "the recovered node is asked again");
 }
 
+/// Between `kill()` and `restart()` the node's port is free for anyone to
+/// bind. When a foreign process takes it, `restart()` must say so at once
+/// rather than report a restart that never happened because the squatter
+/// accepts the connection the harness uses to wait for the listener.
+#[test]
+#[should_panic(expected = "held by another process")]
+fn restart_fails_at_once_when_a_foreign_process_holds_the_port() {
+    let mut server = Server::start(false);
+    server.kill();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", server.port)).expect("squat");
+    server.restart();
+    drop(squatter);
+}
+
 /// Run discovery passes on `node` until its snapshot reports the peer at
 /// `url` unreachable. A pass already running when the peer died may still
 /// report it up, so ask again until one reports it down.
