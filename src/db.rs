@@ -350,10 +350,9 @@ pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     sync_parent(path)
 }
 
-/// Read the stored security object. Databases written before security was
-/// versioned keep a bare object in `security.json`; that is version 0. Neither
-/// file existing is an empty object; a file that is there but unusable is an
-/// error, since falling back to `{}` would make the database public.
+/// Read the stored security object. No file is an empty object; a file that
+/// is there but unusable is an error, since falling back to `{}` would make
+/// the database public.
 fn load_security(path: &Path) -> DbResult<(u64, Value)> {
     let versioned = path.join("security-versioned.json");
     if let Some(stored) = read_metadata::<Value>(&versioned)? {
@@ -368,8 +367,7 @@ fn load_security(path: &Path) -> DbResult<(u64, Value)> {
             )),
         };
     }
-    let legacy = read_metadata::<Value>(&path.join("security.json"))?;
-    Ok((0, legacy.unwrap_or_else(|| json!({}))))
+    Ok((0, json!({})))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -5024,19 +5022,6 @@ mod tests {
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (0, json!({})));
 
-        // A legacy bare object is version 0.
-        std::fs::write(
-            db.path.join("security.json"),
-            br#"{"members":{"names":["old"]}}"#,
-        )
-        .unwrap();
-        drop(db);
-        let db = Db::open(&root, "sec", config()).unwrap();
-        assert_eq!(
-            db.security_versioned(),
-            (0, json!({"members": {"names": ["old"]}}))
-        );
-
         assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
         assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
         // Older versions are rejected; equal ones are ordered by canonical form.
@@ -5086,7 +5071,6 @@ mod tests {
             ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
             ("security-versioned.json", b"{ not json"),
             ("security-versioned.json", br#"{"version":1}"#),
-            ("security.json", b"{ not json"),
         ] {
             let error = open_error(file, contents);
             assert_eq!(error.status, 500, "{file}: {}", error.reason);
