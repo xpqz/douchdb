@@ -3816,6 +3816,28 @@ async fn changes_revs_diff_and_bulk_get() {
     assert_eq!(body["results"][1]["docs"][0]["error"]["error"], "not_found");
     assert_eq!(body["results"][1]["docs"][0]["error"]["rev"], "undefined");
 
+    // The rev an entry reports is the canonical lower-case form (CouchDB's
+    // couch_doc:parse_rev/1 decodes the hex id), not the string as requested.
+    let (_, body) = s
+        .post(
+            "/rep/_bulk_get",
+            json!({"docs": [
+                {"id": "a", "rev": "2-ABCDEF0123456789ABCDEF0123456789"},
+                {"id": "nope", "rev": "1-ABCDEF0123456789ABCDEF0123456789"}
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        body["results"][0]["docs"][0]["error"]["rev"],
+        "2-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
+    assert_eq!(
+        body["results"][1]["docs"][0]["error"]["rev"],
+        "1-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
+
     let (_, body) = s
         .post(
             "/rep/_bulk_get?revs=true",
