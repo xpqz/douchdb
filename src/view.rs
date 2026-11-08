@@ -7,7 +7,7 @@
 //! JavaScript view server.
 
 use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
-use crate::index_cache::{Registry, Slot};
+use crate::index_cache::{Gate, Registry, Slot};
 use crate::js::JsError;
 use crate::util::hex;
 use base64::Engine as _;
@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub use crate::js::ViewLimits;
 
@@ -1263,12 +1263,12 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// races with the removal. One gate per database keeps other databases
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
-fn index_gate(db: &Db) -> Arc<RwLock<()>> {
+fn index_gate(db: &Db) -> Arc<Gate> {
     gates().get(&db.path)
 }
 
-fn gates() -> &'static Registry<RwLock<()>> {
-    static GATES: Registry<RwLock<()>> = Registry::new();
+fn gates() -> &'static Registry<Gate> {
+    static GATES: Registry<Gate> = Registry::new();
     &GATES
 }
 
@@ -1276,14 +1276,16 @@ fn gates() -> &'static Registry<RwLock<()>> {
 /// database's gate with them. The LevelDB files live under the database
 /// directory.
 ///
-/// Takes the write side of the gate, so it waits for a query that is using an
-/// index and no query starts against a half-forgotten one. The gate leaves the
-/// registry while the write side is held: a caller that already cloned it
-/// queues behind this call, and one that asks afterwards gets a fresh gate,
-/// which is the one the recreated database uses.
+/// Signals the gate first, so a build in flight and a query waiting for the
+/// gate or the index fail with not_found at their next check, then takes the
+/// write side: this waits only for those to reach the check, and no query
+/// starts against a half-forgotten index. The gate leaves the registry while
+/// the write side is held: a caller that already cloned it is cancelled for
+/// good, and one that asks afterwards gets a fresh gate, which is the one the
+/// recreated database uses.
 pub async fn forget_db(db_path: &Path) {
     let gate = gates().get(db_path);
-    let _gate = gate.write_owned().await;
+    let _gate = gate.forget().await;
     let prefix = db_path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&prefix));
     gates().retain(|path| path != db_path);
@@ -1727,9 +1729,10 @@ async fn ensure_rows(
             spec.reduce.as_deref().unwrap_or_default()
         )
     };
-    let gate = index_gate(db).read_owned().await;
+    let gate = index_gate(db).read().await?;
     let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
-    let mut index = handle.lock_owned().await;
+    // A query queued behind a long build leaves when the database is deleted.
+    let mut index = gate.until(handle.lock_owned()).await?;
     index.set_placement((db.q, db.partitioned));
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
@@ -1750,10 +1753,15 @@ async fn ensure_rows(
         let bound = db.changes_watermark(0, None);
         let docs = db.map_docs(None).await?;
         return blocking(move || {
-            let _gate = gate;
-            let rows = run_map_json(&map, &docs, limits).map_err(|reason| {
-                ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-            })?;
+            // In batches, so a deleted database is noticed between them.
+            let mut rows = Vec::new();
+            for batch in docs.chunks(CHANGES_PAGE) {
+                gate.check()?;
+                rows.extend(run_map_json(&map, batch, limits).map_err(|reason| {
+                    ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+                })?);
+            }
+            gate.check()?;
             index
                 .rebuild(rows, bound, &design)
                 .and_then(|()| index.sorted_rows())
@@ -1768,6 +1776,7 @@ async fn ensure_rows(
         // page of documents and a failure keeps the pages already applied.
         let (mut gate, mut index) = (gate, index);
         loop {
+            gate.check()?;
             let (rows, _, _) = db
                 .changes_rows(&ChangesOpts {
                     since: index.last_seq,
@@ -1784,6 +1793,7 @@ async fn ensure_rows(
             };
             let (map, design) = (map.clone(), design.clone());
             (gate, index) = blocking(move || {
+                gate.check()?;
                 let mut changed = Vec::new();
                 let mut docs = Vec::new();
                 for row in rows {
@@ -1887,7 +1897,7 @@ pub(crate) async fn docs_by_ids(
 /// Drop every index for a database. Used by `_purge`, which can remove a
 /// document without advancing the database sequence.
 pub async fn invalidate(db: &Db) -> DbResult<()> {
-    let _gate = index_gate(db).write_owned().await;
+    let _gate = index_gate(db).write().await?;
     let directory = db.path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&directory));
     if let Ok(entries) = std::fs::read_dir(&directory) {
@@ -1905,7 +1915,7 @@ pub async fn invalidate(db: &Db) -> DbResult<()> {
 pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Before the live set is read, so a view queried meanwhile is not removed
     // as stale, and so no query holds an index being removed.
-    let _gate = index_gate(db).write_owned().await;
+    let _gate = index_gate(db).write().await?;
     let mut live = std::collections::HashSet::new();
     let mut all = db
         .all_docs(&AllDocsOpts {
@@ -4830,7 +4840,7 @@ mod tests {
         assert_eq!(open_indexes_under(&db.path), 1);
 
         // A query holds the read side of the gate while it uses an index.
-        let reader = index_gate(&db).read_owned().await;
+        let reader = index_gate(&db).read().await.unwrap();
         let path = db.path.clone();
         let forget = forget_db(&path);
         tokio::pin!(forget);
@@ -4854,6 +4864,84 @@ mod tests {
             0,
             "gate outlived its database"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Whether a query holds the read side of the database's gate.
+    fn gate_is_held(db: &Db) -> bool {
+        index_gate(db).is_held()
+    }
+
+    /// Deleting a database must not wait for a view build: the build is
+    /// cancelled and its query fails with not_found, as CouchDB's index
+    /// processes are shut down with the database. The build is held at the
+    /// index lock, where it waits with the gate's read permit; nothing here
+    /// depends on timing, and the timeout only turns a hang into a failure.
+    #[tokio::test]
+    async fn forget_db_does_not_wait_for_a_build() {
+        let root = std::env::temp_dir().join(format!("douchdb-cancel-{}", crate::util::uuid()));
+        let config = || crate::db::DbConfig {
+            q: 1,
+            revs_limit: 1000,
+            shard_map: crate::cluster::ShardMap::single(1),
+            partitioned: false,
+        };
+        let db = Arc::new(Db::open(&root, "cancel", config()).unwrap());
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let handle = index_handle(&index_path(&db, "_design/d", "v"))
+            .await
+            .unwrap();
+        let held = handle.lock_owned().await;
+        let build = {
+            let (db, spec, query) = (db.clone(), spec.clone(), query.clone());
+            tokio::spawn(async move { query_with_spec(&db, "_design/d", "v", &spec, &query).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !gate_is_held(&db) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the build never took the gate");
+
+        let path = db.path.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(120), forget_db(&path))
+            .await
+            .expect("forget_db waited for a view build in flight");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(120), build)
+            .await
+            .expect("the build did not end")
+            .unwrap()
+            .expect_err("the database was deleted under the query");
+        assert_eq!(error.status, 404, "{}", error.reason);
+        assert_eq!(error.error, "not_found");
+        drop(held);
+        assert_eq!(gates().count_under(&path), 0, "gate outlived its database");
+
+        // A database recreated under the name has a fresh gate and serves.
+        drop(db);
+        std::fs::remove_dir_all(&root).unwrap();
+        let db = Db::open(&root, "cancel", config()).unwrap();
+        db.put_docs(vec![json!({"_id": "b", "n": 2})], true)
+            .await
+            .unwrap();
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(result["total_rows"], 1, "{result}");
+        assert_eq!(result["rows"][0]["id"], "b", "{result}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
