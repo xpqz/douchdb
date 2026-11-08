@@ -830,8 +830,12 @@ impl Directory for UnsyncedDirectory {
 }
 
 fn build_gate(db: &Db) -> Arc<RwLock<()>> {
+    gates().get(&db.path)
+}
+
+fn gates() -> &'static Registry<RwLock<()>> {
     static GATES: Registry<RwLock<()>> = Registry::new();
-    GATES.get(&db.path)
+    &GATES
 }
 
 /// What a query reads from an index: replaced as a whole when the index
@@ -1789,6 +1793,60 @@ mod tests {
         let prefix = db.path.join("_search_indexes");
         let open = registry().count_under(&prefix);
         assert!(open <= 8, "{open} search indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Deleting or recreating a database must wait for a search build or query
+    /// that is using its indexes, and must leave no gate behind.
+    #[tokio::test]
+    async fn forget_db_waits_for_a_search_in_flight() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-search-forget-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "searchforget",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(
+            vec![
+                json!({"_id": "a", "name": "apple"}),
+                json!({"_id": "_design/s", "indexes": {"idx": {
+                    "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:apple".to_string(),
+            limit: 10,
+            ..SearchRequest::default()
+        };
+        query(&db, "_design/s", "idx", &request, limits)
+            .await
+            .unwrap();
+        let prefix = db.path.join("_search_indexes");
+        assert_eq!(registry().count_under(&prefix), 1);
+
+        // A build or query holds the read side of the gate.
+        let reader = build_gate(&db).read_owned().await;
+        forget_db(&db.path);
+        assert_eq!(
+            registry().count_under(&prefix),
+            1,
+            "index dropped under a reader"
+        );
+
+        drop(reader);
+        assert_eq!(gates().count_under(&db.path), 0, "gate outlived its database");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

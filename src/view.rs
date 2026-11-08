@@ -1264,8 +1264,12 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<RwLock<()>> {
+    gates().get(&db.path)
+}
+
+fn gates() -> &'static Registry<RwLock<()>> {
     static GATES: Registry<RwLock<()>> = Registry::new();
-    GATES.get(&db.path)
+    &GATES
 }
 
 /// Drop cached index handles when a database is deleted or recreated. The
@@ -4778,6 +4782,50 @@ mod tests {
         }
         let open = open_indexes_under(&db.path);
         assert!(open <= 8, "{open} view indexes are open, cap is 8");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Deleting or recreating a database must wait for a query that is using
+    /// its indexes, and must leave no gate behind for the deleted database.
+    #[tokio::test]
+    async fn forget_db_waits_for_a_query_in_flight() {
+        let root = std::env::temp_dir().join(format!("douchdb-forget-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "forget",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(open_indexes_under(&db.path), 1);
+
+        // A query holds the read side of the gate while it uses an index.
+        let reader = index_gate(&db).read_owned().await;
+        forget_db(&db.path);
+        assert_eq!(open_indexes_under(&db.path), 1, "index dropped under a reader");
+
+        drop(reader);
+        assert_eq!(gates().count_under(&db.path), 0, "gate outlived its database");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
