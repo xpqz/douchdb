@@ -14,16 +14,34 @@ pub async fn session_get(Caller(principal): Caller, headers: HeaderMap) -> Respo
         None if authenticated => json!("admin"),
         None => Value::Null,
     };
+    let mut info = json!({
+        "authentication_db": "_users",
+        "authentication_handlers": ["cookie", "default", "bearer"]
+    });
+    // CouchDB reports the handler that authenticated the request, and omits
+    // the key for an anonymous one (`couch_httpd_auth:handle_session_req/2`).
+    // An Authorization header takes precedence over a cookie, as in
+    // `Auth::principal`.
+    if authenticated {
+        let handler = match headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) if value.starts_with("Bearer ") => Some("bearer"),
+            Some(_) => Some("default"),
+            None if headers.contains_key(header::COOKIE) => Some("cookie"),
+            None => None,
+        };
+        if let Some(handler) = handler {
+            info["authenticated"] = json!(handler);
+        }
+    }
     json(
         StatusCode::OK,
         json!({
             "ok": true,
             "userCtx": { "name": name, "roles": principal.roles },
-            "info": {
-                "authenticated": authenticated,
-                "authentication_db": "_users",
-                "authentication_handlers": ["cookie", "default", "bearer"]
-            }
+            "info": info
         }),
     )
 }

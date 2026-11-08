@@ -572,6 +572,36 @@ async fn welcome_and_database_lifecycle() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The first line of the raw HTTP/1.1 response to `GET path`.
+fn raw_status_line(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// CouchDB answers through mochiweb, which takes reason phrases from
+/// `httpd_util:reason_phrase/1`; for 404 that is "Object Not Found".
+#[tokio::test]
+async fn not_found_status_line_says_object_not_found() {
+    let s = Server::start(false);
+    assert_eq!(
+        raw_status_line(s.port, "/no-such-db"),
+        "HTTP/1.1 404 Object Not Found"
+    );
+    assert_eq!(raw_status_line(s.port, "/"), "HTTP/1.1 200 OK");
+}
+
 /// Status of `GET /{db}` answered from `node`'s own copy only, as a peer
 /// would: the coordinator's cluster-wide `update_seq` would also need every
 /// other node to have the database.
@@ -3663,6 +3693,37 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
 }
 
+/// CouchDB's `chttpd_db:parse_changes_query` rewrites `feed=live` to
+/// `continuous` ("sugar for continuous"), so it streams one JSON line per
+/// change and closes with the `last_seq` line, not a single `results` object.
+#[tokio::test]
+async fn changes_feed_live_is_continuous() {
+    let s = Server::start(false);
+    s.fresh_db("livefeed").await;
+    let (status, _) = s.put("/livefeed/a", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = s
+        .client
+        .get(format!(
+            "{}/livefeed/_changes?feed=live&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("line is JSON"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{text}");
+    assert_eq!(rows[0]["id"], "a", "{text}");
+    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 0}), "{text}");
+}
+
 #[tokio::test]
 async fn changes_supports_sse_eventsource_feed() {
     let s = Server::start(false);
@@ -3754,6 +3815,26 @@ async fn changes_revs_diff_and_bulk_get() {
         .is_none());
     assert_eq!(body["results"][1]["docs"][0]["error"]["error"], "not_found");
     assert_eq!(body["results"][1]["docs"][0]["error"]["rev"], "undefined");
+
+    // The rev an entry reports is the canonical lower-case form (CouchDB's
+    // couch_doc:parse_rev/1 decodes the hex id), not the string as requested.
+    let (_, body) = s
+        .post(
+            "/rep/_bulk_get",
+            json!({"docs": [
+                {"id": "a", "rev": "2-ABCDEF0123456789ABCDEF0123456789"},
+                {"id": "nope", "rev": "1-ABCDEF0123456789ABCDEF0123456789"}
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        body["results"][0]["docs"][0]["error"]["rev"], "2-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
+    assert_eq!(
+        body["results"][1]["docs"][0]["error"]["rev"], "1-abcdef0123456789abcdef0123456789",
+        "{body}"
+    );
 
     let (_, body) = s
         .post(
@@ -5245,6 +5326,47 @@ async fn anonymous_session_user_name_is_null() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["userCtx"]["name"], Value::Null, "{body}");
     assert_eq!(body["userCtx"]["roles"], json!([]));
+}
+
+/// CouchDB's `GET /_session` `info.authenticated` is the name of the handler
+/// that authenticated the request (`couch_httpd_auth:handle_session_req/2`):
+/// "default" for basic auth, "cookie" for an AuthSession cookie. It is absent
+/// for an anonymous request. `authentication_db` is always reported.
+#[tokio::test]
+async fn session_info_authenticated_is_the_handler_name() {
+    let s = Server::start(true);
+    let (status, body) = s.get("/_session").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["info"].get("authenticated").is_none(), "{body}");
+    assert_eq!(body["info"]["authentication_db"], "_users", "{body}");
+
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "default", "{body}");
+
+    let response = s
+        .client
+        .post(format!("{}/_session", s.base))
+        .json(&json!({"name": "admin", "password": "douchdb"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("AuthSession cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, body) = s
+        .req_with(Method::GET, "/_session", None, &[("Cookie", cookie)])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["info"]["authenticated"], "cookie", "{body}");
 }
 
 /// An `AuthSession` cookie value for `name`, in the format the server issues:
