@@ -141,6 +141,7 @@ impl PullCtx<'_> {
             .flatten()
             .and_then(|doc| serde_json::from_value(doc.get("seqs")?.clone()).ok())
             .unwrap_or_default();
+        let me = self.cluster.me.to_string();
         let list = since
             .iter()
             .map(u64::to_string)
@@ -153,7 +154,7 @@ impl PullCtx<'_> {
             self.peer,
             &[&self.db.name, "_peer_purged_infos"],
         )
-        .query(&[("since", list.as_str())]);
+        .query(&[("since", list.as_str()), ("node", me.as_str())]);
         if let Some(auth) = self.auth {
             request = request.basic_auth(&auth.user, Some(&auth.pass));
         }
@@ -179,7 +180,7 @@ impl PullCtx<'_> {
                 .collect();
             removed |= self
                 .db
-                .apply_purge_infos(shard, infos)
+                .apply_purge_infos(shard, infos, self.cluster.me)
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;
         }

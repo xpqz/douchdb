@@ -459,7 +459,7 @@ fn route_label(path: &str) -> String {
         "_replication",
         "_metadata_sync",
     ];
-    const DB: [&str; 16] = [
+    const DB: [&str; 17] = [
         "_all_docs",
         "_design_docs",
         "_local_docs",
@@ -471,6 +471,7 @@ fn route_label(path: &str) -> String {
         "_index_info",
         "_purge",
         "_peer_purged_infos",
+        "_purged_infos_limit",
         "_revs_diff",
         "_revs_limit",
         "_search_cleanup",
