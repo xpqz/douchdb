@@ -435,7 +435,11 @@ impl AppState {
         }
         let lock = self.name_lock(name);
         let _guard = lock.lock().await;
-        self.dbs.write().await.remove(name);
+        // Marked before the gates are forgotten: a request holding the handle
+        // can no longer take a fresh gate and reach the index directories.
+        if let Some(open) = self.dbs.write().await.remove(name) {
+            open.db.mark_deleted();
+        }
         let path = crate::db::db_path(&self.root, name);
         crate::view::forget_db(&path).await;
         crate::search::forget_db(&path).await;

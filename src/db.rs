@@ -452,6 +452,8 @@ pub struct Db {
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
     design_generation: AtomicU64,
+    /// Set when the database is deleted; see `mark_deleted`.
+    deleted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -686,6 +688,7 @@ impl Db {
             commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
+            deleted: AtomicBool::new(false),
         })
     }
 
@@ -763,6 +766,24 @@ impl Db {
         !self.rebalance_in_progress()
             && !self.compact_running.load(Ordering::SeqCst)
             && self.write_gate.try_write().is_ok()
+    }
+
+    /// Record that the database is being deleted. A request that still holds
+    /// this handle then gets `not_found` from `check_live` instead of using
+    /// the index directories, which a gate registered by path cannot ensure:
+    /// it is dropped with the database, and the handle would take a fresh one.
+    pub fn mark_deleted(&self) {
+        self.deleted.store(true, Ordering::SeqCst);
+    }
+
+    /// `not_found` once the database has been deleted, as CouchDB answers a
+    /// request for a database that is gone (`couch_server`).
+    pub fn check_live(&self) -> DbResult<()> {
+        if self.deleted.load(Ordering::SeqCst) {
+            Err(ApiError::not_found("Database does not exist."))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
