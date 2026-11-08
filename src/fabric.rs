@@ -1136,14 +1136,29 @@ fn merge_replicated(
     for (node, slots, response) in responses {
         match response {
             Ok(results) => {
-                for (slot, result) in slots.into_iter().zip(results) {
-                    let (Some(reached), Some(out)) = (reached.get_mut(slot), out.get_mut(slot))
+                // A replica that took a `new_edits=false` write answers with
+                // the failures only, so the reply can be shorter than the
+                // batch. Answering at all is the acknowledgement; the failures
+                // are matched to their documents by id.
+                let full = results.len() == slots.len();
+                for (position, slot) in slots.iter().enumerate() {
+                    let (Some(reached), Some(out)) = (reached.get_mut(*slot), out.get_mut(*slot))
                     else {
                         continue;
                     };
                     *reached = true;
-                    if primaries.get(slot) == Some(&node) || out.is_null() {
-                        *out = result;
+                    let result = if full {
+                        results.get(position)
+                    } else {
+                        results.iter().find(|result| {
+                            result.get("id").and_then(Value::as_str)
+                                == ids.get(*slot).map(String::as_str)
+                        })
+                    };
+                    if let Some(result) = result {
+                        if primaries.get(*slot) == Some(&node) || out.is_null() {
+                            *out = result.clone();
+                        }
                     }
                 }
             }
@@ -1407,6 +1422,9 @@ where
     crate::telemetry::record_fanout(requests.len() as u64);
 
     let mut values = Vec::new();
+    // The nodes that were asked and failed, as against `excluded`, which also
+    // holds nodes only skipped because discovery marked them down.
+    let mut failed_nodes: Vec<usize> = Vec::new();
     // Only the first dispatch may fail over: a failed fallback fails the read.
     let mut first = true;
     loop {
@@ -1452,8 +1470,21 @@ where
             crate::telemetry::record_degraded_read();
         }
         excluded.extend(failed.iter().copied());
+        // Prefer a node nothing says is down. A node skipped only because
+        // discovery marked it down may be wrongly marked (the mark lasts until
+        // the next pass), so when the unmarked nodes hold no copy it is asked
+        // after all; only a node that actually failed is out for good.
+        failed_nodes.extend(failed.iter().copied());
         let alive: Vec<usize> = (0..nodes).filter(|node| !excluded.contains(node)).collect();
-        let groups = fallback_shard_masks(db, &lost, &failed, &alive)?;
+        let groups = match fallback_shard_masks(db, &lost, &failed, &alive) {
+            Err(_) => {
+                let alive: Vec<usize> = (0..nodes)
+                    .filter(|node| !failed_nodes.contains(node))
+                    .collect();
+                fallback_shard_masks(db, &lost, &failed, &alive)?
+            }
+            groups => groups?,
+        };
         if groups.is_empty() {
             break;
         }
@@ -2825,39 +2856,27 @@ pub(crate) async fn cluster_seq_vectors(
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>, Vec<u64>)> {
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
-    // A peer discovery found unreachable is not asked, as long as the shards
-    // it prefers can be read from another node. The mark may be stale, so when
-    // they cannot, it is asked after all.
-    let mut held_back: Vec<usize> = (0..nodes)
-        .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
-        .collect();
+    // Every node is asked, including one discovery marked down: the mark may
+    // be stale, and a node that is up must report its own position. Skipping
+    // it would put 0 in its slot of the vectors, though the shards it owns are
+    // readable from a replica.
     let mut seqs: Vec<Option<u64>> = vec![None; nodes];
     let mut purge_seqs: Vec<u64> = vec![0; nodes];
-    let mut to_ask: Vec<usize> = (0..nodes)
-        .filter(|node| !held_back.contains(node))
-        .collect();
-    let (vector, groups) = loop {
-        let answers = crate::cluster_http::in_one_round(futures::future::join_all(
-            to_ask
-                .iter()
-                .map(|&node| async move { fetch_node_seqs(read, node).await.ok() }),
-        ))
-        .await;
-        for (&node, answer) in to_ask.iter().zip(answers) {
-            seqs[node] = answer.map(|(seq, _)| seq);
-            purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
-        }
-        let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
-        let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
-        let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
-        if failed.is_empty() {
-            return Ok((vector, Vec::new(), purge_seqs));
-        }
-        match fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive) {
-            Err(_) if !held_back.is_empty() => to_ask = std::mem::take(&mut held_back),
-            groups => break (vector, groups?),
-        }
-    };
+    let answers = crate::cluster_http::in_one_round(futures::future::join_all(
+        (0..nodes).map(|node| async move { fetch_node_seqs(read, node).await.ok() }),
+    ))
+    .await;
+    for (node, answer) in answers.into_iter().enumerate() {
+        seqs[node] = answer.map(|(seq, _)| seq);
+        purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
+    }
+    let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
+    let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
+    let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
+    if failed.is_empty() {
+        return Ok((vector, Vec::new(), purge_seqs));
+    }
+    let groups = fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive)?;
     let marks = groups
         .into_iter()
         .map(|(node, mask)| FallbackMark {

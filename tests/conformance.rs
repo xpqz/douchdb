@@ -6220,8 +6220,10 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
-            // The node discovery reports down is not asked for its sequence.
-            ("changes_since_now", (1, 1, 0)),
+            // The sequence read asks the node discovery reports down too, in
+            // the same round: the mark may be stale, and a node that is up
+            // must report its own position.
+            ("changes_since_now", (2, 1, 0)),
         ]
     );
 }
@@ -6504,6 +6506,52 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
     assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
+}
+
+// A peer that discovery marked down and that has since come back stays marked
+// until the next pass. `GET /db` must still ask it: its slot in the vectors is
+// its real position, not 0, or a feed resumed from the token replays it all.
+#[tokio::test]
+async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
+    let mut nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clinfostale").await;
+    }
+    let (_, r) = nodes[0].put("/clinfostale/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .post("/clinfostale/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, expected) = nodes[0].get("/clinfostale").await;
+    assert_eq!(expected["purge_seq"], json!("v1:1,1"), "{expected}");
+
+    // Make node 0 believe node 1 is down while it is up. Discovery runs on its
+    // own only in the first seconds after start, so retry if one of those
+    // passes cleared the mark before the read.
+    let url = nodes[1].base.clone();
+    loop {
+        nodes[1].kill();
+        wait_until_known_down(&nodes[0], &url).await;
+        nodes[1].restart();
+        let (_, cluster) = nodes[0].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+    }
+    let (_, info) = nodes[0].get("/clinfostale").await;
+    assert_eq!(info["update_seq"], expected["update_seq"], "{info}");
+    // A restarted node may count its purge differently; it must not read 0.
+    let purge_seq = info["purge_seq"].as_str().unwrap_or_default();
+    assert!(
+        purge_seq.starts_with("v1:1,") && !purge_seq.ends_with(",0"),
+        "{info}"
+    );
 }
 
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
@@ -6878,6 +6926,89 @@ async fn cluster_changes_limit_pages_make_progress_with_a_node_down() {
         since = body["last_seq"].as_str().unwrap().to_string();
     }
     assert!(finished, "paged feed never reached the end: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        ids.len(),
+        "paged feed skipped changes: {seen:?}"
+    );
+}
+
+/// A peer that discovery marked down and that has since come back is still
+/// marked down until the next pass. A read routes around it, sending its
+/// shards to their other copy; if that copy is the node that really is down,
+/// the failed substitute used to leave no live copy and the read answered 412
+/// `nodedown`, though the marked node could have served the shards itself.
+#[tokio::test]
+async fn cluster_changes_reach_a_node_wrongly_marked_down_when_its_other_copy_is_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clchstale").await;
+    }
+    let ids: Vec<String> = (0..12).map(|i| format!("st{i}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let (status, _) = nodes[0]
+        .post("/clchstale/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // `stale` and `victim` hold the same shard; `reader` holds no copy of it.
+    let (reader, victim) = fallback_pair(&nodes, "clchstale", &ids).await;
+    let (_, map) = nodes[0].get("/_node/_local/_dbs/clchstale").await;
+    let q = map["q"].as_u64().unwrap() as u32;
+    let stale = map["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(shard, _)| ids.iter().any(|id| douchdb::shard_index(id, q) == *shard))
+        .filter_map(|(_, replicas)| {
+            let replicas: Vec<usize> = replicas
+                .as_array()?
+                .iter()
+                .filter_map(|node| node.as_u64().map(|node| node as usize))
+                .collect();
+            (!replicas.contains(&reader) && replicas.contains(&victim))
+                .then(|| replicas.into_iter().find(|node| *node != victim))
+                .flatten()
+        })
+        .next()
+        .expect("a shard held by the victim and one other node");
+
+    // Make the reader believe `stale` is down while it is up. Discovery runs
+    // on its own only in the first seconds after start, so retry if one of
+    // those passes cleared the mark before the read.
+    let url = nodes[stale].base.clone();
+    loop {
+        nodes[stale].kill();
+        wait_until_known_down(&nodes[reader], &url).await;
+        nodes[stale].restart();
+        let (_, cluster) = nodes[reader].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+    }
+    nodes[victim].kill();
+
+    let mut since = "0".to_string();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..30 {
+        let (status, body) = nodes[reader]
+            .get(&format!("/clchstale/_changes?since={since}&limit=2"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let results = body["results"].as_array().unwrap();
+        if results.is_empty() {
+            break;
+        }
+        for row in results {
+            seen.insert(row["id"].as_str().unwrap().to_string());
+        }
+        since = body["last_seq"].as_str().unwrap().to_string();
+    }
     assert_eq!(
         seen.len(),
         ids.len(),
@@ -7296,12 +7427,16 @@ fn all_shards_on(node: usize) -> Value {
 /// unless the planned placement already keeps every shard there. Default
 /// placement depends on the random ports.
 fn node_to_pin_away_from(planned: &Value) -> usize {
-    let all_on_zero = planned["replicas"]
+    usize::from(planned_keeps_every_shard_on(planned, 0))
+}
+
+/// Whether the planned placement keeps the first copy of every shard on `node`.
+fn planned_keeps_every_shard_on(planned: &Value, node: usize) -> bool {
+    planned["replicas"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|replicas| replicas[0] == 0);
-    usize::from(all_on_zero)
+        .all(|replicas| replicas[0] == node)
 }
 
 #[tokio::test]
@@ -7423,8 +7558,11 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         node.fresh_db("reb").await;
     }
     let (_, planned) = nodes[0].get("/_node/_local/_dbs/reb").await;
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/reb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // first rebalance always has shards to move.
+    let from = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/reb", all_shards_on(from))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7442,6 +7580,7 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::OK, "{map}");
     assert_eq!(map["replicas"], planned["replicas"], "{map}");
+    assert_ne!(map["version"], pinned["version"], "nothing moved: {map}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -7455,25 +7594,30 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Move everything to node1, wait for convergence, then clean node0's
-    // non-owned local shards.
+    // Move everything to another node, wait for convergence, then clean the
+    // first pin's non-owned local shards. The destination is neither the node
+    // that holds every shard of the first pin nor one the planned placement
+    // already keeps every shard on, so this move always happens.
+    let to = (0..nodes.len())
+        .find(|node| *node != from && !planned_keeps_every_shard_on(&planned, *node))
+        .unwrap();
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/reb", all_shards_on(1))
+        .put("/_node/_local/_dbs/reb", all_shards_on(to))
         .await;
     assert_eq!(status, StatusCode::OK);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let (status, body) = nodes[1].get("/reb/_all_docs").await;
+        let (status, body) = nodes[to].get("/reb/_all_docs").await;
         if status == StatusCode::OK && body["total_rows"] == 9 {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("shard move did not converge on node1: {status} {body}");
+            panic!("shard move did not converge on node {to}: {status} {body}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let (status, cleared) = nodes[0]
+    let (status, cleared) = nodes[from]
         .post("/_node/_local/_dbs/reb/cleanup", json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{cleared}");
@@ -7483,11 +7627,11 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (_, info) = nodes[0]
+    let (_, info) = nodes[from]
         .req_with(Method::GET, "/reb", None, &internal)
         .await;
     assert_eq!(info["doc_count"], 0, "old replica was not cleared");
-    let (_, info) = nodes[1]
+    let (_, info) = nodes[to]
         .req_with(Method::GET, "/reb", None, &internal)
         .await;
     assert_eq!(info["doc_count"], 9, "new replica lost data");
@@ -7503,8 +7647,12 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
     for node in &nodes {
         node.fresh_db("autoreb").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/autoreb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/autoreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/autoreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7524,6 +7672,7 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pending"], false);
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
     assert_eq!(body["cleaned"].as_array().unwrap().len(), 3);
     let map = body.as_object().unwrap();
     let replicas = map["replicas"].as_array().unwrap();
@@ -7639,8 +7788,13 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     for node in &nodes {
         node.fresh_db("timeoutreb").await;
     }
+    // Default placement depends on the random ports. Pinning to node 0 when the
+    // planned placement already keeps every shard there would leave nothing to
+    // move: the rebalance would succeed instead of timing out.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/timeoutreb").await;
+    let pin = node_to_pin_away_from(&planned);
     let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/timeoutreb", all_shards_on(0))
+        .put("/_node/_local/_dbs/timeoutreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)
@@ -7663,7 +7817,7 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (status, counts) = nodes[0]
+    let (status, counts) = nodes[pin]
         .req_with(
             Method::GET,
             "/_node/_local/_dbs/timeoutreb/shards",
@@ -7682,7 +7836,7 @@ async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     let (status, map) = nodes[0].get("/_node/_local/_dbs/timeoutreb").await;
     assert_eq!(status, StatusCode::OK, "{map}");
     for replicas in map["replicas"].as_array().unwrap() {
-        assert_eq!(replicas[0], 0, "timeout must restore the old shard map");
+        assert_eq!(replicas[0], pin, "timeout must restore the old shard map");
     }
 
     // The timeout also lifts the write freeze, and reads kept working.
@@ -16311,8 +16465,12 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
     for node in &nodes {
         node.fresh_db("noclean").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/noclean", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/noclean").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/noclean", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<Value> = (0..9)
@@ -16330,6 +16488,7 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
     assert!(body.get("cleaned").is_none(), "{body}");
 
     // The migration completed, but the old node keeps its local copies until
@@ -16338,7 +16497,7 @@ async fn cluster_rebalance_requires_explicit_cleanup() {
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let (status, counts) = nodes[0]
+    let (status, counts) = nodes[pin]
         .req_with(
             Method::GET,
             "/_node/_local/_dbs/noclean/shards",
@@ -16392,8 +16551,12 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
     for node in &nodes {
         node.fresh_db("delreb").await;
     }
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/delreb", all_shards_on(0))
+    // Default placement depends on the random ports: pin away from it, so the
+    // rebalance always has shards to move.
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/delreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, pinned) = nodes[0]
+        .put("/_node/_local/_dbs/delreb", all_shards_on(pin))
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -16425,6 +16588,7 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["version"], pinned["version"], "nothing moved: {body}");
 
     // Every tombstone must exist exactly once on the new owners; a deleted-only
     // shard has live count 0, so counts alone cannot establish this.
@@ -16466,6 +16630,31 @@ async fn rebalance_verifies_deleted_only_shards_before_cleanup() {
     for row in body["results"].as_array().unwrap() {
         assert_eq!(row["deleted"], true, "{row}");
     }
+}
+
+#[tokio::test]
+async fn new_edits_false_write_to_remote_replica_is_acknowledged() {
+    // Every shard lives on node 1 and the write is coordinated by node 0, so
+    // the only copy is a forwarded one. A replication-style write answers with
+    // the errors only, and an empty error list from the replica is an ack.
+    let nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("remoteack").await;
+    }
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/remoteack", all_shards_on(1))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = nodes[0]
+        .post(
+            "/remoteack/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "x", "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "v": 1
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body, json!([]));
 }
 
 #[tokio::test]
