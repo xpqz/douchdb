@@ -5685,6 +5685,141 @@ async fn uuids_are_unique_in_a_tight_loop() {
     }));
 }
 
+/// `_local` documents are sharded like any other document (CouchDB routes
+/// them through `fabric:update_docs` and `fabric:open_doc` by document id), so
+/// every node sees every one however it was written.
+#[tokio::test]
+async fn cluster_local_docs_are_shared_by_every_node() {
+    let nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("cllocal").await;
+    }
+    let ids: Vec<String> = (0..12).map(|i| format!("cp{i:02}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let (status, body) = nodes[i % 3]
+            .put(&format!("/cllocal/_local/{id}?w=2"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["rev"], "0-1", "{body}");
+    }
+    let expected: Vec<String> = ids.iter().map(|id| format!("_local/{id}")).collect();
+
+    for (index, node) in nodes.iter().enumerate() {
+        for id in &ids {
+            let (status, doc) = node.get(&format!("/cllocal/_local/{id}")).await;
+            assert_eq!(status, StatusCode::OK, "{id} via node {index}: {doc}");
+            assert_eq!(doc["v"], *id);
+        }
+        let (status, body) = node.get("/cllocal/_local_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["total_rows"].is_null(), "{body}");
+        assert!(body["offset"].is_null(), "{body}");
+        let listed: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, expected, "every doc exactly once via node {index}");
+    }
+
+    // The listing's own options apply across nodes.
+    let (_, body) = nodes[2]
+        .get("/cllocal/_local_docs?include_docs=true&descending=true&skip=1&limit=2")
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(rows[0]["id"], "_local/cp10", "{body}");
+    assert_eq!(rows[0]["doc"]["_rev"], "0-1", "{body}");
+    let (_, body) = nodes[1]
+        .post(
+            "/cllocal/_local_docs",
+            json!({"keys": ["_local/cp03", "cp04", "_local/nope", "_local/cp00"]}),
+        )
+        .await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows[0]["id"], "_local/cp03", "{body}");
+    assert_eq!(rows[1]["error"], "not_found", "{body}");
+    assert_eq!(rows[2]["id"], "_local/cp00", "{body}");
+
+    // A rev through another node updates every copy; a delete through a
+    // third removes it everywhere.
+    let (status, body) = nodes[1]
+        .put(
+            "/cllocal/_local/cp00?w=2",
+            json!({"v": "again", "_rev": "0-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["rev"], "0-2", "{body}");
+    let (status, doc) = nodes[2].get("/cllocal/_local/cp00").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["v"], "again");
+    assert_eq!(doc["_rev"], "0-2");
+
+    let (status, body) = nodes[2].delete("/cllocal/_local/cp00?w=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"ok": true, "id": "_local/cp00", "rev": "0-0"}));
+    for node in &nodes {
+        let (status, _) = node.get("/cllocal/_local/cp00").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, body) = node.get("/cllocal/_local_docs").await;
+        assert_eq!(body["rows"].as_array().unwrap().len(), 11, "{body}");
+    }
+    let (status, body) = nodes[0].delete("/cllocal/_local/cp00").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // `_bulk_docs` places them the same way.
+    let (status, body) = nodes[0]
+        .post(
+            "/cllocal/_bulk_docs?w=2",
+            json!({"docs": [{"_id": "_local/bulk", "v": 1}, {"_id": "plain"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, doc) = nodes[1].get("/cllocal/_local/bulk").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+}
+
+/// With two copies and one node down, `_local` reads still answer from the
+/// copy that is up: `fabric_doc_open` falls back to whatever documents came
+/// back (local documents are not read-repaired) rather than failing the
+/// read quorum.
+#[tokio::test]
+async fn cluster_local_docs_stay_readable_with_a_replica_down() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("cllocaldown").await;
+    }
+    // Node 0 coordinates and holds nothing; nodes 1 and 2 hold the copies.
+    let (status, _) = nodes[0]
+        .put(
+            "/_node/_local/_dbs/cllocaldown",
+            json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for id in ["a", "b", "c"] {
+        let (status, body) = nodes[0]
+            .put(&format!("/cllocaldown/_local/{id}?w=2"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    nodes[2].kill();
+    for id in ["a", "b", "c"] {
+        let (status, doc) = nodes[0].get(&format!("/cllocaldown/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {doc}");
+        assert_eq!(doc["v"], id);
+    }
+    let (status, body) = nodes[0].get("/cllocaldown/_local_docs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 3, "{body}");
+    let (status, _) = nodes[0].get("/cllocaldown/_local/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn cluster_routes_writes_and_merges_all_docs() {
     let nodes = start_cluster(2);
@@ -7427,6 +7562,75 @@ async fn cluster_rebalance_auto_cleans_old_replicas() {
     let (status, body) = nodes[0].get("/autoreb/_all_docs").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 9);
+}
+
+/// `_local` documents move with their shard on a rebalance. They take no
+/// sequence, so `_changes`-driven anti-entropy never carries them; the
+/// rebalance copies them before the new placement goes live and the cleanup
+/// clears the old owners.
+#[tokio::test]
+async fn cluster_rebalance_keeps_local_docs() {
+    let nodes = start_cluster_with(3, "1", 1);
+    for node in &nodes {
+        node.fresh_db("localreb").await;
+    }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/localreb").await;
+    let pin = node_to_pin_away_from(&planned);
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/localreb", all_shards_on(pin))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Enough ids that every shard holds at least two.
+    let mut per_shard = [0usize; 4];
+    let mut ids = Vec::new();
+    for i in 0.. {
+        let id = format!("cp{i}");
+        let shard = douchdb::shard_index(&format!("_local/{id}"), 4);
+        if per_shard[shard] < 2 {
+            per_shard[shard] += 1;
+            ids.push(id);
+        }
+        if per_shard.iter().all(|count| *count >= 2) {
+            break;
+        }
+    }
+    for id in &ids {
+        let (status, body) = nodes[1]
+            .put(&format!("/localreb/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = nodes[0]
+        .post(
+            "/_node/_local/_dbs/localreb/rebalance?timeout_ms=20000&cleanup=true",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pending"], false, "{body}");
+
+    let mut sorted = ids.clone();
+    sorted.sort();
+    let expected: Vec<String> = sorted.iter().map(|id| format!("_local/{id}")).collect();
+    for (index, node) in nodes.iter().enumerate() {
+        for id in &ids {
+            let (status, doc) = node.get(&format!("/localreb/_local/{id}")).await;
+            assert_eq!(status, StatusCode::OK, "{id} via node {index}: {doc}");
+            assert_eq!(doc["v"], *id);
+            assert_eq!(doc["_rev"], "0-1", "the copy keeps the revision: {doc}");
+        }
+        let (status, body) = node.get("/localreb/_local_docs").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Vec<String> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, expected, "via node {index}");
+    }
 }
 
 #[tokio::test]
