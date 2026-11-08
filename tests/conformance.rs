@@ -6220,8 +6220,10 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
-            // The node discovery reports down is not asked for its sequence.
-            ("changes_since_now", (1, 1, 0)),
+            // The sequence read asks the node discovery reports down too, in
+            // the same round: the mark may be stale, and a node that is up
+            // must report its own position.
+            ("changes_since_now", (2, 1, 0)),
         ]
     );
 }
@@ -6504,6 +6506,52 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
     assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
+}
+
+// A peer that discovery marked down and that has since come back stays marked
+// until the next pass. `GET /db` must still ask it: its slot in the vectors is
+// its real position, not 0, or a feed resumed from the token replays it all.
+#[tokio::test]
+async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
+    let mut nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clinfostale").await;
+    }
+    let (_, r) = nodes[0].put("/clinfostale/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (status, _) = nodes[0]
+        .post("/clinfostale/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, expected) = nodes[0].get("/clinfostale").await;
+    assert_eq!(expected["purge_seq"], json!("v1:1,1"), "{expected}");
+
+    // Make node 0 believe node 1 is down while it is up. Discovery runs on its
+    // own only in the first seconds after start, so retry if one of those
+    // passes cleared the mark before the read.
+    let url = nodes[1].base.clone();
+    loop {
+        nodes[1].kill();
+        wait_until_known_down(&nodes[0], &url).await;
+        nodes[1].restart();
+        let (_, cluster) = nodes[0].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+    }
+    let (_, info) = nodes[0].get("/clinfostale").await;
+    assert_eq!(info["update_seq"], expected["update_seq"], "{info}");
+    // A restarted node may count its purge differently; it must not read 0.
+    let purge_seq = info["purge_seq"].as_str().unwrap_or_default();
+    assert!(
+        purge_seq.starts_with("v1:1,") && !purge_seq.ends_with(",0"),
+        "{info}"
+    );
 }
 
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,

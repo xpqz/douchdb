@@ -2856,39 +2856,27 @@ pub(crate) async fn cluster_seq_vectors(
 ) -> DbResult<(Vec<u64>, Vec<FallbackMark>, Vec<u64>)> {
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
-    // A peer discovery found unreachable is not asked, as long as the shards
-    // it prefers can be read from another node. The mark may be stale, so when
-    // they cannot, it is asked after all.
-    let mut held_back: Vec<usize> = (0..nodes)
-        .filter(|&node| node != ctx.cluster.me && ctx.health.is_down(node))
-        .collect();
+    // Every node is asked, including one discovery marked down: the mark may
+    // be stale, and a node that is up must report its own position. Skipping
+    // it would put 0 in its slot of the vectors, though the shards it owns are
+    // readable from a replica.
     let mut seqs: Vec<Option<u64>> = vec![None; nodes];
     let mut purge_seqs: Vec<u64> = vec![0; nodes];
-    let mut to_ask: Vec<usize> = (0..nodes)
-        .filter(|node| !held_back.contains(node))
-        .collect();
-    let (vector, groups) = loop {
-        let answers = crate::cluster_http::in_one_round(futures::future::join_all(
-            to_ask
-                .iter()
-                .map(|&node| async move { fetch_node_seqs(read, node).await.ok() }),
-        ))
-        .await;
-        for (&node, answer) in to_ask.iter().zip(answers) {
-            seqs[node] = answer.map(|(seq, _)| seq);
-            purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
-        }
-        let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
-        let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
-        let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
-        if failed.is_empty() {
-            return Ok((vector, Vec::new(), purge_seqs));
-        }
-        match fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive) {
-            Err(_) if !held_back.is_empty() => to_ask = std::mem::take(&mut held_back),
-            groups => break (vector, groups?),
-        }
-    };
+    let answers = crate::cluster_http::in_one_round(futures::future::join_all(
+        (0..nodes).map(|node| async move { fetch_node_seqs(read, node).await.ok() }),
+    ))
+    .await;
+    for (node, answer) in answers.into_iter().enumerate() {
+        seqs[node] = answer.map(|(seq, _)| seq);
+        purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
+    }
+    let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
+    let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
+    let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
+    if failed.is_empty() {
+        return Ok((vector, Vec::new(), purge_seqs));
+    }
+    let groups = fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive)?;
     let marks = groups
         .into_iter()
         .map(|(node, mask)| FallbackMark {
