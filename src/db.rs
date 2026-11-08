@@ -1343,13 +1343,13 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// Current allocated sequence counter. This is the same database-wide
-    /// counter used for `update_seq`, without asking every shard actor. A
-    /// write in flight has already taken its sequence, so this can be ahead
-    /// of what `changes` returns; indexes bound themselves with
-    /// `changes_watermark` instead.
+    /// The update sequence a client may be shown: the changes watermark, so
+    /// every write at or below it is committed. The allocated counter can be
+    /// ahead of it (a write in flight has already taken its sequence); a
+    /// client that resumed `_changes` from the counter would skip that write
+    /// once it commits.
     pub fn update_seq(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
+        self.changes_watermark(0, None)
     }
 
     /// A receiver that changes whenever a write commits on this node. Mark it
@@ -1388,21 +1388,21 @@ impl Db {
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
+        // Taken before reading the shards: the highest committed sequence of
+        // any one shard can sit above another shard's uncommitted write.
+        let update_seq = self.update_seq();
         let mut doc_count = 0;
         let mut deleted_count = 0;
-        let mut update_seq = 0;
-        let counts = futures::future::join_all(self.shards.iter().map(|shard| {
-            shard.call(|s| {
-                let (docs, deleted) = s.counts();
-                Ok((docs, deleted, s.seq()))
-            })
-        }))
+        let counts = futures::future::join_all(
+            self.shards
+                .iter()
+                .map(|shard| shard.call(|s| Ok(s.counts()))),
+        )
         .await;
         for counted in counts {
-            let (docs, deleted, seq) = counted?;
+            let (docs, deleted) = counted?;
             doc_count += docs;
             deleted_count += deleted;
-            update_seq = update_seq.max(seq);
         }
         let mut info = json!({
             "db_name": self.name,
