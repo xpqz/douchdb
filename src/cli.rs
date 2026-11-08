@@ -404,6 +404,47 @@ mod tests {
     }
 
     #[test]
+    fn wall_clock_limits_default_parse_and_reject_invalid() {
+        let defaults = parse(&[]).unwrap().unwrap();
+        assert_eq!(defaults.view_timeout_ms, 5000);
+        assert_eq!(defaults.rebalance_write_drain_ms, 15_000);
+        assert_eq!(defaults.rebalance_stable_wait_ms, 10_000);
+        assert_eq!(defaults.js_worker_startup_ms, 10_000);
+        assert_eq!(defaults.rebalance_freeze_ms, 420_000);
+        let args = parse(&[
+            "--view-timeout-ms",
+            "9000",
+            "--rebalance-write-drain-ms",
+            "31000",
+            "--rebalance-stable-wait-ms",
+            "22000",
+            "--js-worker-startup-ms",
+            "45000",
+            "--rebalance-freeze-ms",
+            "900000",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(args.view_timeout_ms, 9000);
+        assert_eq!(args.rebalance_write_drain_ms, 31_000);
+        assert_eq!(args.rebalance_stable_wait_ms, 22_000);
+        assert_eq!(args.js_worker_startup_ms, 45_000);
+        assert_eq!(args.rebalance_freeze_ms, 900_000);
+        for flag in [
+            "--view-timeout-ms",
+            "--rebalance-write-drain-ms",
+            "--rebalance-stable-wait-ms",
+            "--js-worker-startup-ms",
+            "--rebalance-freeze-ms",
+        ] {
+            assert!(error(&[flag, "0"]).contains(flag), "{flag} 0");
+            assert!(error(&[flag, "soon"]).contains(flag), "{flag} soon");
+            assert!(error(&[flag, "-5"]).contains(flag), "{flag} -5");
+            assert!(error(&[flag]).contains(flag), "{flag} missing value");
+        }
+    }
+
+    #[test]
     fn me_must_index_the_node_list() {
         let message = error(&["--nodes", "a,b", "--me", "2"]);
         assert!(message.contains("--me"), "{message}");
