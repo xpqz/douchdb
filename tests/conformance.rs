@@ -6407,6 +6407,78 @@ async fn cluster_purge_answers_202_when_a_replica_is_down() {
     }
 }
 
+/// Run an anti-entropy pass of `db` on `node` that starts after this call and
+/// wait for it to finish. A pass already in flight is not replaced, so the
+/// request is repeated until a new one has started; the status is only polled
+/// in between.
+async fn sync_node(node: &Server, db: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let runs_of = |status: &Value| status["runs"].as_u64().unwrap_or(0);
+    let (_, status) = node.get("/_node/_local/_replication").await;
+    let before = runs_of(&status);
+    loop {
+        let (_, status) = node.get("/_node/_local/_replication").await;
+        if status["running"] == false {
+            if runs_of(&status) > before {
+                return;
+            }
+            let (code, body) = node
+                .post(
+                    &format!("/_node/_local/_replication/run?db={db}"),
+                    json!({}),
+                )
+                .await;
+            assert_eq!(code, StatusCode::ACCEPTED, "{body}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pass never finished: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// A replica that was down during `_purge` still holds the revision. When it
+// rejoins, anti-entropy must neither bring the revision back to the nodes
+// that purged it nor keep it on the stale node. CouchDB exchanges purge infos
+// between shard copies for this (mem3_rep:replicate_purges).
+#[tokio::test]
+async fn cluster_purge_stays_purged_when_a_down_replica_rejoins() {
+    let mut nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("clpurgeback").await;
+    }
+    let (_, r) = nodes[0].put("/clpurgeback/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    nodes[2].kill();
+    let (status, body) = nodes[0]
+        .post("/clpurgeback/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    nodes[2].restart();
+
+    // The stale node learns of the purge from its peers.
+    sync_node(&nodes[2], "clpurgeback").await;
+    assert_eq!(
+        local_rev_status(&nodes[2], "clpurgeback", "a", &rev).await,
+        StatusCode::NOT_FOUND,
+        "the stale node still holds the purged revision"
+    );
+    // And the nodes that purged it never get it back.
+    for _ in 0..2 {
+        for node in &nodes {
+            sync_node(node, "clpurgeback").await;
+        }
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_rev_status(node, "clpurgeback", "a", &rev).await,
+            StatusCode::NOT_FOUND,
+            "node {i} holds the purged revision again"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cluster_changes_report_pending_like_a_single_node() {
     // n=1 fans out to every node; n=3 lets the coordinator read every shard
