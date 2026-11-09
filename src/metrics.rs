@@ -440,7 +440,7 @@ fn is_probe(route: &str) -> bool {
 
 /// Low-cardinality route template. Every label comes from a fixed set; a path
 /// segment chosen by the client is never copied into it.
-fn route_label(path: &str) -> String {
+pub fn route_label(path: &str) -> String {
     const TOP: [&str; 8] = [
         "_up",
         "_health",
@@ -488,6 +488,15 @@ fn route_label(path: &str) -> String {
     };
     if first == "favicon.ico" {
         return "/favicon.ico".to_string();
+    }
+    // Node-to-node anti-entropy endpoints (see replicate.rs). Without this the
+    // literal `ae` segment would be taken for a database name.
+    if first == "ae" && segments.len() == 2 {
+        if let Some(endpoint @ ("_changes" | "_bulk_get" | "_peer_purged_infos")) =
+            segments.get(1).copied()
+        {
+            return format!("/ae/{endpoint}");
+        }
     }
     if first == "_utils" {
         return "/_utils/*".to_string();
@@ -764,6 +773,16 @@ mod tests {
         assert_eq!(route_label("/_node/_local/_nope"), "other");
         assert_eq!(method_label("GET"), "GET");
         assert_eq!(method_label("get"), "other");
+    }
+
+    #[test]
+    fn anti_entropy_routes_have_their_own_labels() {
+        assert_eq!(route_label("/ae/_changes"), "/ae/_changes");
+        assert_eq!(route_label("/ae/_bulk_get"), "/ae/_bulk_get");
+        assert_eq!(
+            route_label("/ae/_peer_purged_infos"),
+            "/ae/_peer_purged_infos"
+        );
     }
 
     #[test]
