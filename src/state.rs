@@ -226,6 +226,10 @@ pub struct AppState {
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
     pub db_opens: AtomicU64,
+    /// How many times a request's principal was resolved from its headers.
+    /// One per request is the goal; the local metrics report it so tests and
+    /// operators can count.
+    pub principal_resolutions: AtomicU64,
     pub config: Config,
     pub ctx: ClusterCtx,
     pub db_updates: DbUpdates,
@@ -539,6 +543,7 @@ impl AppState {
     /// requests without user credentials are service admins; peers are trusted
     /// by the shared cluster secret.
     pub fn principal(&self, headers: &HeaderMap) -> Principal {
+        self.principal_resolutions.fetch_add(1, Ordering::Relaxed);
         let Some(auth) = &self.ctx.auth else {
             return Principal::service_admin();
         };
@@ -561,6 +566,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         dbs: Default::default(),
         db_locks: Default::default(),
         db_opens: Default::default(),
+        principal_resolutions: Default::default(),
         fs_health: Default::default(),
         shutdown: Default::default(),
         config: Config {

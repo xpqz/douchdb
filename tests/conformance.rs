@@ -17162,6 +17162,147 @@ async fn cross_user_isolation_is_watertight() {
     assert_no_access(status, "anonymous bob-db");
 }
 
+/// How many principals this node has resolved, from its local metrics. The
+/// read resolves one itself, so the count includes it.
+async fn principal_resolutions(s: &Server) -> u64 {
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    metrics["auth"]["principal_resolutions"]
+        .as_u64()
+        .expect("principal_resolutions")
+}
+
+/// The principals resolved by the requests `issue` makes, not counting the
+/// two metrics reads around it.
+async fn resolutions_during<F: std::future::Future>(s: &Server, issue: F) -> (u64, F::Output) {
+    let before = principal_resolutions(s).await;
+    let out = issue.await;
+    let after = principal_resolutions(s).await;
+    (after - before - 1, out)
+}
+
+/// A long-poll at `url` that a PUT of `{}` at `wake` answers. Returns the
+/// principals resolved by the long-poll and the wake together. The long-poll
+/// is admitted (counted) before the wake, whether or not it is parked yet.
+async fn longpoll_resolutions(s: &Server, url: &str, wake: &str) -> u64 {
+    let baseline = principal_resolutions(s).await;
+    let poll = tokio::spawn({
+        let client = s.client.clone();
+        let url = format!("{}{url}", s.base);
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    });
+    let mut reads = 0;
+    loop {
+        let now = principal_resolutions(s).await;
+        reads += 1;
+        if now > baseline + reads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, body) = s.put(wake, json!({})).await;
+    assert!(status.is_success(), "{body}");
+    let body = poll.await.unwrap();
+    assert!(body["results"].is_array(), "{body}");
+    let after = principal_resolutions(s).await;
+    // Minus the `reads` polls of the counter and the final read.
+    after - baseline - reads - 1
+}
+
+/// Every request authenticates exactly once: the admission middleware's
+/// principal is passed down rather than resolved again from the headers.
+#[tokio::test]
+async fn every_request_resolves_its_principal_once() {
+    let s = Server::start(false);
+    s.fresh_db("onceauth").await;
+    let (status, _) = s.put("/onceauth/src", json!({"n": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/onceauth/_design/d",
+            json!({"views": {"v": {"map": "function(doc){ emit(doc.n, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut counts: Vec<(&str, u64)> = Vec::new();
+
+    let (used, (status, body)) = resolutions_during(
+        &s,
+        s.post("/onceauth/_bulk_docs", json!({"docs": [{"_id": "b1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    counts.push(("_bulk_docs", used));
+
+    let (used, (status, body)) = resolutions_during(&s, s.get("/onceauth/_changes")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    counts.push(("_changes normal", used));
+
+    let (used, (status, body)) =
+        resolutions_during(&s, s.get("/onceauth/_design/d/_view/v?reduce=false")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    counts.push(("view query", used));
+
+    // An internal-only node endpoint, reached as an ordinary client.
+    let (used, (status, _)) =
+        resolutions_during(&s, s.get("/_node/_local/_dbs/onceauth/security")).await;
+    assert!(status.is_client_error(), "{status}");
+    counts.push(("_node internal", used));
+
+    let (used, response) = resolutions_during(&s, async {
+        s.client
+            .request(
+                Method::from_bytes(b"COPY").unwrap(),
+                format!("{}/onceauth/src", s.base),
+            )
+            .header("destination", "copied")
+            .send()
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    counts.push(("COPY", used));
+
+    let (_, changes) = s.get("/onceauth/_changes").await;
+    let since = changes["last_seq"].as_str().unwrap().to_string();
+    // One for the long-poll, one for the write that wakes it.
+    let used = longpoll_resolutions(
+        &s,
+        &format!("/onceauth/_changes?feed=longpoll&timeout=300000&since={since}"),
+        "/onceauth/woken",
+    )
+    .await;
+    counts.push(("_changes longpoll + wake write", used));
+
+    let (_, baseline) = s.get("/_db_updates?since=0").await;
+    let since = baseline["last_seq"].as_str().unwrap().to_string();
+    let used = longpoll_resolutions(
+        &s,
+        &format!("/_db_updates?feed=longpoll&timeout=300000&since={since}"),
+        "/onceauth-wake",
+    )
+    .await;
+    counts.push(("_db_updates longpoll + wake create", used));
+
+    let got: Vec<u64> = counts.iter().map(|(_, used)| *used).collect();
+    assert_eq!(
+        got,
+        [1, 1, 1, 1, 1, 2, 2],
+        "resolutions per request: {counts:?}"
+    );
+}
+
 #[tokio::test]
 async fn longpoll_changes_stops_after_security_revocation() {
     let users = UsersFile::new(USERS);
