@@ -8,13 +8,12 @@
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
-use crate::rev::{new_revid, Attachment, Rev};
+use crate::rev::{new_revid, Rev};
 use crate::store::{
-    blob_prefix, body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, AttMeta,
-    DocMeta, LiveDoc, MetaState, PurgeInfo, Shard, ShardHandle, Tx,
+    body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, DocMeta, LiveDoc,
+    MetaState, PurgeInfo, Shard, ShardHandle, Tx,
 };
 use crate::util::{hex, uuid};
-use base64::Engine;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -1742,36 +1741,32 @@ impl Db {
                     // Build (or reuse) the live map, then read only bodies.
                     // This avoids decoding every full DocMeta record again for
                     // each cold view build.
-                    let metas: Vec<(String, String, bool)> = s
+                    let metas: Vec<(String, String)> = s
                         .live_docs()?
                         .iter()
                         .filter(|(id, _)| !id.starts_with("_design/") && !id.starts_with("_local/"))
-                        .map(|(id, doc)| (id.clone(), doc.rev.clone(), doc.has_attachments))
+                        .map(|(id, doc)| (id.clone(), doc.rev.clone()))
                         .collect();
 
                     let mut docs = Vec::with_capacity(metas.len());
-                    for (id, rev, has_attachments) in metas {
-                        if !has_attachments {
-                            if let Some(body) = s.get_body(&id, &rev)? {
-                                // The body is spliced into the map input as
-                                // text, so check it decodes here or one bad
-                                // body would fail the whole build.
-                                let decoded = serde_json::from_slice::<serde::de::IgnoredAny>(
-                                    &body,
-                                )
+                    for (id, rev) in metas {
+                        if let Some(body) = s.get_body(&id, &rev)? {
+                            // The body is spliced into the map input as
+                            // text, so check it decodes here or one bad
+                            // body would fail the whole build.
+                            let decoded = serde_json::from_slice::<serde::de::IgnoredAny>(&body)
                                 .map_err(|error| {
                                     ApiError::corrupt(format!(
                                         "corrupt body for {id} {rev}: {error}"
                                     ))
                                 });
-                                if skip_corrupt(s, &id, decoded)?.is_some() {
-                                    docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
-                                }
-                                continue;
+                            if skip_corrupt(s, &id, decoded)?.is_some() {
+                                docs.push((id.clone(), embed_doc_meta(&id, &rev, &body)));
                             }
+                            continue;
                         }
-                        // Attachments are rare; fall back to the full document
-                        // shape so map functions still see `_attachments`.
+                        // The body is gone: take the full read path, which
+                        // reports it the way every other read does.
                         let doc_opts = DocOpts {
                             rev: Some(rev),
                             ..Default::default()
@@ -2351,7 +2346,6 @@ impl Db {
     pub async fn bulk_get(
         &self,
         body: &Value,
-        attachments: bool,
         revs: bool,
         latest: bool,
     ) -> DbResult<BulkGetResults> {
@@ -2374,10 +2368,6 @@ impl Db {
             let opts = DocOpts {
                 rev,
                 revs: req.get("revs").and_then(Value::as_bool).unwrap_or(revs),
-                attachments: req
-                    .get("attachments")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(attachments),
                 latest: req.get("latest").and_then(Value::as_bool).unwrap_or(latest),
                 include_deleted: true,
                 ..Default::default()
@@ -2930,7 +2920,6 @@ fn purge_one(
         }
         for dead in &gone {
             tx.delete(&body_key(id, dead));
-            meta.atts.remove(dead);
         }
         removed.push(rev.clone());
     }
@@ -3361,7 +3350,6 @@ fn put_many(
                 .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
                 .collect();
         }
-        meta.atts.retain(|rev, _| meta.tree.contains(rev));
         if let Ok(bytes) = meta_bytes(meta) {
             let old = origin.get(id).cloned().flatten();
             metas.push(MetaWrite {
@@ -3486,29 +3474,10 @@ impl Stage<'_> {
             .unwrap_or(0)
             + 1;
 
-        let inherited = parent
-            .as_ref()
-            .and_then(|p| meta.atts.get(p).cloned())
-            .unwrap_or_default();
-        // Uploads are rejected, so a new revision only carries forward the
-        // attachments that older data already holds.
-        let atts = inherited;
-
-        let hashed = atts
-            .iter()
-            .map(|(name, a)| {
-                Ok(Attachment {
-                    name: name.clone(),
-                    content_type: a.content_type.clone(),
-                    md5: hex_to_16(&a.digest)?,
-                })
-            })
-            .collect::<DbResult<Vec<Attachment>>>()?;
         let rev_id = hex(&new_revid(
             deleted,
             parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
             &body,
-            &hashed,
         ));
         let rev = format!("{pos}-{rev_id}");
 
@@ -3519,7 +3488,6 @@ impl Stage<'_> {
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
-        meta.atts.insert(rev.clone(), atts);
 
         self.ops.push((
             body_key(&id, &rev),
@@ -3550,7 +3518,9 @@ impl Stage<'_> {
         let body = Value::Object(body);
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
         let known = meta.tree.contains(&rev);
-        if known && meta.atts.contains_key(&rev) {
+        // A revision that is only an ancestor on a stored path has no body
+        // yet; the replicated write supplies it.
+        if known && self.shard.get_body(&id, &rev)?.is_some() {
             return Ok(WriteOk::new(id, rev));
         }
         // A replicated design document is validated too (couch_db:
@@ -3563,13 +3533,6 @@ impl Stage<'_> {
                 }
             }
         }
-
-        let parent = meta
-            .tree
-            .parent(&rev)
-            .and_then(|p| meta.atts.get(p).cloned())
-            .unwrap_or_default();
-        let atts = parent;
 
         let changed = !known;
         if changed {
@@ -3584,7 +3547,6 @@ impl Stage<'_> {
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
-            meta.atts.insert(rev.clone(), atts);
             self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
             if old_seq != 0 {
                 self.ops.push((seq_key(old_seq), None));
@@ -3731,40 +3693,6 @@ fn commit_ops(
     shard.commit_at(tx, last_seq)
 }
 
-/// The raw bytes of a stored hex digest. The digest comes from disk, so one
-/// that is not well-formed hex is reported as corruption rather than guessed at.
-fn hex_bytes(hex: &str) -> DbResult<Vec<u8>> {
-    let corrupt = || ApiError::corrupt(format!("corrupt attachment digest {hex:?}"));
-    if !hex.len().is_multiple_of(2) {
-        return Err(corrupt());
-    }
-    hex.as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            std::str::from_utf8(pair)
-                .ok()
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(corrupt)
-        })
-        .collect()
-}
-
-fn hex_to_16(hex: &str) -> DbResult<[u8; 16]> {
-    hex_bytes(hex)?
-        .try_into()
-        .map_err(|_| ApiError::corrupt(format!("corrupt attachment digest {hex:?}")))
-}
-
-/// CouchDB writes attachment digests as `md5-<base64 of the raw digest>`, not
-/// hex. The wire format is not cosmetic: PouchDB uses it to decide whether an
-/// attachment has to be transferred.
-pub fn digest_to_wire(hex: &str) -> DbResult<String> {
-    Ok(format!(
-        "md5-{}",
-        base64::engine::general_purpose::STANDARD.encode(hex_bytes(hex)?)
-    ))
-}
-
 // ---------------------------------------------------------------------------
 // reads
 
@@ -3776,7 +3704,6 @@ pub struct DocOpts {
     pub local_seq: bool,
     pub conflicts: bool,
     pub deleted_conflicts: bool,
-    pub attachments: bool,
     pub open_revs: Option<Vec<String>>,
     /// Internal quorum reads need the winning tombstone instead of a 404 so
     /// deletion can participate in revision comparison.
@@ -3789,7 +3716,6 @@ pub struct AllDocsOpts {
     pub partition: Option<String>,
     pub include_docs: bool,
     pub conflicts: bool,
-    pub attachments: bool,
     pub keys: Option<Vec<Value>>,
     pub startkey: Option<String>,
     pub endkey: Option<String>,
@@ -3805,7 +3731,6 @@ impl Default for AllDocsOpts {
             partition: None,
             include_docs: false,
             conflicts: false,
-            attachments: false,
             keys: None,
             startkey: None,
             endkey: None,
@@ -4367,15 +4292,6 @@ fn read_doc_rev(
     if meta.tree.is_deleted(rev) {
         map.insert("_deleted".into(), json!(true));
     }
-    if let Some(atts) = meta.atts.get(rev) {
-        if !atts.is_empty() {
-            let mut out = Map::new();
-            for (name, att) in atts {
-                out.insert(name.clone(), attachment_json(shard, att, opts.attachments)?);
-            }
-            map.insert("_attachments".into(), Value::Object(out));
-        }
-    }
     if opts.revs {
         let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
         let limit = shard.revs_limit().max(1) as usize;
@@ -4430,46 +4346,6 @@ fn read_doc_rev(
         }
     }
     Ok(Value::Object(map))
-}
-
-fn attachment_json(
-    shard: &mut crate::store::Shard,
-    att: &AttMeta,
-    with_data: bool,
-) -> DbResult<Value> {
-    let mut out = json!({
-        "content_type": att.content_type,
-        "revpos": att.revpos,
-        "digest": digest_to_wire(&att.digest)?,
-        "length": att.length,
-    });
-    if with_data {
-        let mut data = Vec::new();
-        let mut chunk = 0u32;
-        while let Some(part) = shard.get_checked(&blob_prefix(&att.digest, chunk))? {
-            data.extend_from_slice(&part);
-            chunk += 1;
-        }
-        // A missing chunk ends the loop like the last one does, so the length
-        // recorded with the attachment is what tells them apart. Never serve
-        // a truncated body under the original digest.
-        if data.len() as u64 != att.length {
-            return Err(ApiError::new(
-                500,
-                "internal_server_error",
-                format!(
-                    "attachment {} is incomplete: {} of {} bytes stored",
-                    att.digest,
-                    data.len(),
-                    att.length
-                ),
-            ));
-        }
-        out["data"] = json!(base64::engine::general_purpose::STANDARD.encode(&data));
-    } else if let Some(obj) = out.as_object_mut() {
-        obj.insert("stub".into(), json!(true));
-    }
-    Ok(out)
 }
 
 /// Scan one shard for the live rows in the requested key range, stopping once
@@ -4579,7 +4455,6 @@ fn load_all_docs(
         let doc_opts = DocOpts {
             rev: Some(row.rev.clone()),
             conflicts: opts.conflicts,
-            attachments: opts.attachments,
             ..Default::default()
         };
         let doc = read_doc(shard, &row.id, &doc_opts);
@@ -4640,7 +4515,6 @@ fn all_docs_key_row(
             let doc_opts = DocOpts {
                 rev: Some(winner),
                 conflicts: opts.conflicts,
-                attachments: opts.attachments,
                 ..Default::default()
             };
             read_doc(shard, key, &doc_opts)?
@@ -5160,149 +5034,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_writes_do_not_keep_attachments_for_stemmed_revisions() {
-        let root = std::env::temp_dir().join(format!("douchdb-stem-atts-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "stematts",
-            DbConfig {
-                q: 1,
-                revs_limit: 2,
-                shard_map: ShardMap::single(1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-        let ids: Vec<String> = (1..=5).map(|n| format!("{n:032x}")).collect();
-        for n in 1..=5usize {
-            let chain: Vec<&String> = ids[..n].iter().rev().collect();
-            let rev = format!("{n}-{}", ids[n - 1]);
-            let doc = json!({
-                "_id": "a",
-                "_rev": rev,
-                "_revisions": {"start": n, "ids": chain},
-            });
-            db.put_docs(vec![doc], false).await.unwrap();
-            // The public write path rejects attachments, so plant one on each
-            // revision the way older data may carry them.
-            db.shards[0]
-                .call(move |shard| {
-                    let mut meta = shard.get_meta("a")?.unwrap();
-                    meta.atts.insert(
-                        rev,
-                        vec![(
-                            "f".to_string(),
-                            AttMeta {
-                                content_type: "text/plain".into(),
-                                digest: "5d41402abc4b2a76b9719d911017c592".into(),
-                                length: 5,
-                                revpos: n as u64,
-                            },
-                        )],
-                    );
-                    shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
-                    Ok(())
-                })
-                .await
-                .unwrap();
-        }
-        let meta = db.shards[0]
-            .call(|shard| Ok(shard.get_meta("a")?.unwrap()))
-            .await
-            .unwrap();
-        assert_eq!(meta.tree.revs().count(), 2);
-        let kept: Vec<&String> = meta.atts.keys().collect();
-        let tree: Vec<&String> = meta.tree.revs().collect();
-        assert_eq!(kept, tree, "atts only for revisions still in the tree");
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn a_missing_attachment_chunk_fails_the_read() {
-        let (db, root) = single_shard_db("att-chunk").await;
-        // Uploads are rejected at the API, so plant the attachment directly.
-        let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
-        db.shards[0]
-            .call(move |shard| {
-                let mut meta = shard.get_meta("a")?.unwrap();
-                meta.atts.insert(
-                    rev,
-                    vec![(
-                        "f.txt".to_string(),
-                        AttMeta {
-                            content_type: "text/plain".into(),
-                            digest: "5d41402abc4b2a76b9719d911017c592".into(),
-                            length: 5,
-                            revpos: 1,
-                        },
-                    )],
-                );
-                shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
-                shard.put_raw(
-                    &blob_prefix("5d41402abc4b2a76b9719d911017c592", 0),
-                    b"hello",
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let opts = DocOpts {
-            attachments: true,
-            ..Default::default()
-        };
-        let doc = db.get_doc("a", &opts).await.unwrap();
-        assert_eq!(doc["_attachments"]["f.txt"]["data"], "aGVsbG8=");
-
-        db.shards[0]
-            .call(|shard| {
-                shard.delete_raw(&blob_prefix("5d41402abc4b2a76b9719d911017c592", 0));
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let error = db.get_doc("a", &opts).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn a_non_ascii_attachment_digest_is_corruption_not_a_panic() {
-        let (db, root) = single_shard_db("att-digest").await;
-        let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
-        db.shards[0]
-            .call(move |shard| {
-                let mut meta = shard.get_meta("a")?.unwrap();
-                meta.atts.insert(
-                    rev,
-                    vec![(
-                        "f.txt".to_string(),
-                        AttMeta {
-                            content_type: "text/plain".into(),
-                            // The second character is two bytes wide, so a
-                            // byte-offset slice at 2 lands inside it.
-                            digest: "a\u{e9}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                            length: 5,
-                            revpos: 1,
-                        },
-                    )],
-                );
-                shard.put_raw(&meta_key("a"), &serde_json::to_vec(&meta).unwrap());
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let error = db.get_doc("a", &DocOpts::default()).await.unwrap_err();
-        assert_eq!(error.status, 500, "{error}");
-        assert!(error.corrupt, "{error}");
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn local_docs_spread_over_shards_and_checkpoints_stay_out_of_the_listing() {
         let root =
             std::env::temp_dir().join(format!("douchdb-local-shards-{}", crate::util::uuid()));
@@ -5408,7 +5139,7 @@ mod tests {
             {"id": "a", "rev": "1-00000000000000000000000000000000"},
             {"id": "a", "rev": "garbage"},
         ]});
-        let got = db.bulk_get(&body, false, false, false).await.unwrap();
+        let got = db.bulk_get(&body, false, false).await.unwrap();
         let text = serde_json::to_string(&serde_json::to_value(&got).unwrap()).unwrap();
         assert_eq!(
             text,

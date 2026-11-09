@@ -409,7 +409,6 @@ fn parse_view_query(
         group: group_level.is_none() && flag(q, "group"),
         group_level: group_level.unwrap_or(0),
         include_docs: flag(q, "include_docs"),
-        attachments: flag(q, "attachments"),
         update_seq: flag(q, "update_seq"),
         limits: crate::view::ViewLimits {
             timeout: std::time::Duration::from_millis(st.config.view_timeout_ms),

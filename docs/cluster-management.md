@@ -233,8 +233,7 @@ are frozen on every node during verification and return
 has a bounded deadline so a lost coordinator cannot leave peers read-only:
 `rebalance_in_progress` expires rather than persisting forever. Every target
 replica must have the **same revision-metadata digest** as the old replica:
-document ids, winning revisions, deleted flags, conflict leaves and attachment
-metadata. Live counts alone are never proof. If old replicas disagree or an
+document ids, winning revisions, deleted flags, conflict leaves. Live counts alone are never proof. If old replicas disagree or an
 old owner is unreachable, the request fails with `502` before migration. If a
 target does not match before `timeout_ms`, the migration map is cleared and the
 active map is unchanged; the request fails with `504`.

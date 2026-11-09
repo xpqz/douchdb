@@ -370,11 +370,6 @@ async fn copy_doc(
         Ok(doc) => doc,
         Err(error) => return fail(error),
     };
-    if source.get("_attachments").is_some() {
-        return fail(ApiError::bad_request(
-            "Attachments are not supported by douchdb",
-        ));
-    }
     let mut copy = source;
     if let Some(object) = copy.as_object_mut() {
         object.remove("_id");

@@ -4693,6 +4693,38 @@ async fn attachments_are_rejected_on_every_write_path_and_read_params_are_inert(
     assert!(!body.to_string().contains("_attachments"), "{body}");
 }
 
+// A replicated revision that only appeared as an ancestor on a stored path has
+// no body; replicating it afterwards supplies the body.
+#[tokio::test]
+async fn replicating_an_ancestor_revision_supplies_its_body() {
+    let s = Server::start(false);
+    s.fresh_db("ancbody").await;
+    let (status, body) = s
+        .post(
+            "/ancbody/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "d", "_rev": "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "v": 2,
+                "_revisions": {"start": 2, "ids": [
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rev1 = "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (status, _) = s.get(&format!("/ancbody/d?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = s
+        .post(
+            "/ancbody/_bulk_docs",
+            json!({"new_edits": false, "docs": [{"_id": "d", "_rev": rev1, "v": 1}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.get(&format!("/ancbody/d?rev={rev1}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 1);
+}
+
 // CouchDB's `_purge` acts on leaf revisions only: a leaf and the ancestors no
 // other branch shares go, and a listed non-leaf revision is ignored and not
 // reported. Verified against CouchDB 3.5.
