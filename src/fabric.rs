@@ -7,8 +7,8 @@ use crate::cluster_http::{
     ClusterCtx,
 };
 use crate::db::{
-    AllDocsOpts, ApiError, ChangeEntry, ChangesList, ChangesOpts, Db, DbResult, DocOpts, Seq,
-    WriteError, WriteResult,
+    AllDocsOpts, ApiError, ChangeEntry, ChangesList, ChangesOpts, Db, DbResult, DocList,
+    DocListRow, DocOpts, Seq, WriteError, WriteResult,
 };
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::AppState;
@@ -1507,7 +1507,10 @@ where
     Ok(values)
 }
 
-pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
+pub(crate) async fn cluster_all_docs(
+    read: ClusterRead<'_>,
+    opts: &AllDocsOpts,
+) -> DbResult<DocList> {
     let ClusterRead { ctx, db, .. } = read;
     let owned_by_node = preferred_shard_masks(ctx, db);
 
@@ -1531,18 +1534,18 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
         .await?;
 
         let mut total_rows = 0u64;
-        let mut found: HashMap<String, Value> = HashMap::new();
-        let mut errors: HashMap<String, Value> = HashMap::new();
-        for (_, _, mut response) in values {
-            total_rows += response["total_rows"].as_u64().unwrap_or(0);
-            for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
-                match row.get("id").and_then(Value::as_str) {
+        let mut found: HashMap<String, DocListRow> = HashMap::new();
+        let mut errors: HashMap<String, DocListRow> = HashMap::new();
+        for (_, _, response) in values {
+            total_rows += response.total_rows.unwrap_or(0);
+            for row in response.rows {
+                match row.id.clone() {
                     Some(id) => {
-                        found.insert(id.to_string(), row);
+                        found.insert(id, row);
                     }
                     None => {
-                        if let Some(key) = row.get("key").and_then(Value::as_str) {
-                            errors.entry(key.to_string()).or_insert(row);
+                        if let Some(key) = row.key.as_str().map(str::to_string) {
+                            errors.entry(key).or_insert(row);
                         }
                     }
                 }
@@ -1561,10 +1564,15 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
                 .and_then(|name| found.get(name).or_else(|| errors.get(name)));
             rows.push(
                 row.cloned()
-                    .unwrap_or_else(|| json!({"key": key, "error": "not_found"})),
+                    .unwrap_or_else(|| DocListRow::not_found(key.clone())),
             );
         }
-        return Ok(json!({"total_rows": total_rows, "offset": Value::Null, "rows": rows}));
+        return Ok(DocList {
+            total_rows: Some(total_rows),
+            offset: None,
+            rows,
+            update_seq: None,
+        });
     }
 
     let mut window = opts.clone();
@@ -1584,13 +1592,13 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
 
     let mut total_rows = 0u64;
     let mut before_start = 0usize;
-    let mut rows: Vec<(String, Value)> = Vec::new();
-    for (_, _, mut response) in values {
-        total_rows += response["total_rows"].as_u64().unwrap_or(0);
-        before_start += response["offset"].as_u64().unwrap_or(0) as usize;
-        for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
-            if let Some(id) = row.get("id").and_then(Value::as_str) {
-                rows.push((id.to_string(), row));
+    let mut rows: Vec<(String, DocListRow)> = Vec::new();
+    for (_, _, response) in values {
+        total_rows += response.total_rows.unwrap_or(0);
+        before_start += response.offset.unwrap_or(0) as usize;
+        for row in response.rows {
+            if let Some(id) = row.id.clone() {
+                rows.push((id, row));
             }
         }
     }
@@ -1598,13 +1606,18 @@ pub(crate) async fn cluster_all_docs(read: ClusterRead<'_>, opts: &AllDocsOpts) 
     if opts.descending {
         rows.reverse();
     }
-    let rows: Vec<Value> = rows
+    let rows: Vec<DocListRow> = rows
         .into_iter()
         .skip(opts.skip)
         .take(opts.limit)
         .map(|(_, row)| row)
         .collect();
-    Ok(json!({"total_rows": total_rows, "offset": before_start + opts.skip, "rows": rows}))
+    Ok(DocList {
+        total_rows: Some(total_rows),
+        offset: Some((before_start + opts.skip) as u64),
+        rows,
+        update_seq: None,
+    })
 }
 
 pub(crate) async fn fetch_all_docs(
@@ -1612,7 +1625,7 @@ pub(crate) async fn fetch_all_docs(
     node: usize,
     opts: &AllDocsOpts,
     shards: Option<&ShardMask>,
-) -> DbResult<Value> {
+) -> DbResult<DocList> {
     let ClusterRead { ctx, db, .. } = read;
     if node == ctx.cluster.me {
         if let Some(shards) = shards {
@@ -1631,7 +1644,7 @@ async fn fetch_remote_docs(
     endpoint: &str,
     opts: &AllDocsOpts,
     shards: Option<&ShardMask>,
-) -> DbResult<Value> {
+) -> DbResult<DocList> {
     let ClusterRead {
         ctx,
         dbname,
@@ -1700,7 +1713,7 @@ async fn fetch_remote_docs(
         return Err(ApiError::new(status, error, text));
     }
     response
-        .json::<Value>()
+        .json::<DocList>()
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
@@ -1768,9 +1781,8 @@ pub(crate) async fn copy_local_docs(
     .await;
     let mut newest: BTreeMap<String, Value> = BTreeMap::new();
     for listing in listings {
-        let mut listing = listing?;
-        for mut row in crate::json::take_array(&mut listing, "rows").unwrap_or_default() {
-            let Some(doc) = row.get_mut("doc").map(Value::take) else {
+        for row in listing?.rows {
+            let Some(doc) = row.doc else {
                 continue;
             };
             let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
@@ -1893,7 +1905,7 @@ pub(crate) async fn read_local_doc(read: ClusterRead<'_>, id: &str) -> DbResult<
 pub(crate) async fn cluster_local_docs(
     read: ClusterRead<'_>,
     opts: &AllDocsOpts,
-) -> DbResult<Value> {
+) -> DbResult<DocList> {
     let ClusterRead { ctx, db, .. } = read;
     let owned_by_node = preferred_shard_masks(ctx, db);
 
@@ -1920,11 +1932,11 @@ pub(crate) async fn cluster_local_docs(
             |node, mask, _| async move { fetch_local_docs(read, node, key_opts, &mask).await },
         )
         .await?;
-        let mut found: HashMap<String, Value> = HashMap::new();
-        for (_, _, mut response) in values {
-            for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
-                if let Some(id) = row.get("id").and_then(Value::as_str) {
-                    found.insert(id.to_string(), row);
+        let mut found: HashMap<String, DocListRow> = HashMap::new();
+        for (_, _, response) in values {
+            for row in response.rows {
+                if let Some(id) = row.id.clone() {
+                    found.insert(id, row);
                 }
             }
         }
@@ -1933,17 +1945,22 @@ pub(crate) async fn cluster_local_docs(
         } else {
             keys.iter().collect()
         };
-        let rows: Vec<Value> = ordered
+        let rows: Vec<DocListRow> = ordered
             .into_iter()
             .skip(opts.skip)
             .take(opts.limit)
             .map(|key| {
                 key.as_str()
                     .and_then(|name| found.get(name).cloned())
-                    .unwrap_or_else(|| json!({"key": key, "error": "not_found"}))
+                    .unwrap_or_else(|| DocListRow::not_found(key.clone()))
             })
             .collect();
-        return Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}));
+        return Ok(DocList {
+            total_rows: None,
+            offset: None,
+            rows,
+            update_seq: None,
+        });
     }
 
     let mut window = opts.clone();
@@ -1957,20 +1974,25 @@ pub(crate) async fn cluster_local_docs(
         |node, mask, _| async move { fetch_local_docs(read, node, window, &mask).await },
     )
     .await?;
-    let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
-    for (_, _, mut response) in values {
-        for row in crate::json::take_array(&mut response, "rows").unwrap_or_default() {
-            if let Some(id) = row.get("id").and_then(Value::as_str) {
-                by_id.entry(id.to_string()).or_insert(row);
+    let mut by_id: BTreeMap<String, DocListRow> = BTreeMap::new();
+    for (_, _, response) in values {
+        for row in response.rows {
+            if let Some(id) = row.id.clone() {
+                by_id.entry(id).or_insert(row);
             }
         }
     }
-    let mut rows: Vec<Value> = by_id.into_values().collect();
+    let mut rows: Vec<DocListRow> = by_id.into_values().collect();
     if opts.descending {
         rows.reverse();
     }
-    let rows: Vec<Value> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
-    Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+    let rows: Vec<DocListRow> = rows.into_iter().skip(opts.skip).take(opts.limit).collect();
+    Ok(DocList {
+        total_rows: None,
+        offset: None,
+        rows,
+        update_seq: None,
+    })
 }
 
 async fn fetch_local_docs(
@@ -1978,7 +2000,7 @@ async fn fetch_local_docs(
     node: usize,
     opts: &AllDocsOpts,
     shards: &ShardMask,
-) -> DbResult<Value> {
+) -> DbResult<DocList> {
     if node == read.ctx.cluster.me {
         return read.db.local_docs_owned(opts, shards).await;
     }

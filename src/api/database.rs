@@ -291,7 +291,7 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
         Ok((results, quorum)) => {
             let result = match single_write_result(results) {
                 Ok(result) => result,
-                Err(response) => return response,
+                Err(error) => return write_failed(&error),
             };
             if q.get("batch").map(String::as_str) == Some("ok") {
                 return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));

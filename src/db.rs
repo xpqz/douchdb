@@ -1501,14 +1501,14 @@ impl Db {
             .collect())
     }
 
-    pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+    pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<DocList> {
         self.all_docs_filtered(opts, None).await
     }
 
     /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
     /// coordinators use this to fetch each document from exactly one primary
     /// instead of merging the same replica from every node.
-    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<DocList> {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
@@ -1552,7 +1552,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         if let Some(keys) = &opts.keys {
             return self.all_docs_by_keys(opts, keys, owned).await;
         }
@@ -1610,7 +1610,10 @@ impl Db {
     pub(crate) async fn all_docs_stream(
         db: Arc<Db>,
         opts: &AllDocsOpts,
-    ) -> DbResult<(AllDocsHead, impl futures::Stream<Item = DbResult<Value>>)> {
+    ) -> DbResult<(
+        AllDocsHead,
+        impl futures::Stream<Item = DbResult<DocListRow>>,
+    )> {
         const PAGE: usize = 256;
 
         struct Cursor {
@@ -1720,7 +1723,7 @@ impl Db {
                     continue;
                 }
                 remaining -= 1;
-                yield Ok(all_docs_row_json(row));
+                yield Ok(all_docs_row(row));
             }
         };
         Ok((head, rows))
@@ -1794,7 +1797,7 @@ impl Db {
         opts: &AllDocsOpts,
         keys: &[Value],
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
@@ -1854,7 +1857,7 @@ impl Db {
             grouped[shard].push((slot, key.to_string()));
         }
 
-        let mut results: Vec<Option<Value>> = vec![None; page.len()];
+        let mut results: Vec<Option<DocListRow>> = (0..page.len()).map(|_| None).collect();
         let fetched = futures::future::join_all(
             grouped
                 .into_iter()
@@ -1877,22 +1880,21 @@ impl Db {
         for rows in fetched {
             for (slot, row) in rows? {
                 results[slot] =
-                    Some(row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"})));
+                    Some(row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())));
             }
         }
 
-        Ok(json!({
-            "total_rows": total_rows,
-            "offset": Value::Null,
-            "rows": results
+        Ok(DocList {
+            total_rows: Some(total_rows),
+            offset: None,
+            rows: results
                 .into_iter()
                 .enumerate()
                 .filter(|(slot, _)| included[*slot])
-                .map(|(slot, row)| {
-                    row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"}))
-                })
-                .collect::<Vec<_>>(),
-        }))
+                .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
+                .collect(),
+            update_seq: None,
+        })
     }
 
     pub(crate) async fn changes_rows(
@@ -2519,13 +2521,17 @@ impl Db {
     /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
     /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
     /// CouchDB reports neither `total_rows` nor `offset` for them.
-    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<DocList> {
         self.local_docs_filtered(opts, None).await
     }
 
     /// Like `local_docs`, but only the shards whose `owned` entry is true.
     /// A cluster coordinator asks each node for one copy of every shard.
-    pub async fn local_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+    pub async fn local_docs_owned(
+        &self,
+        opts: &AllDocsOpts,
+        owned: &ShardMask,
+    ) -> DbResult<DocList> {
         self.local_docs_filtered(opts, Some(owned)).await
     }
 
@@ -2533,7 +2539,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         let listed = futures::future::join_all(
             self.shards
                 .iter()
@@ -2548,7 +2554,12 @@ impl Db {
         }
         docs.sort_by(|a, b| a.0.cmp(&b.0));
         let rows = local_doc_rows(docs, opts);
-        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+        Ok(DocList {
+            total_rows: None,
+            offset: None,
+            rows,
+            update_seq: None,
+        })
     }
 
     /// A node-local record that is not a document: the replication
@@ -4069,6 +4080,82 @@ pub struct ChangeRev {
     pub rev: String,
 }
 
+/// An `_all_docs`-shaped listing (`_all_docs`, `_design_docs`, `_local_docs`).
+/// `_local_docs` and keyed reads report no `offset` and `_local_docs` no
+/// `total_rows`: absent here means `null` on the wire.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocList {
+    pub total_rows: Option<u64>,
+    pub offset: Option<u64>,
+    pub rows: Vec<DocListRow>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub update_seq: Option<Value>,
+}
+
+impl DocList {
+    /// The wire form, for tests that read fields by name.
+    #[cfg(test)]
+    pub(crate) fn json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// One row of a `DocList`: a document (`id`, `key`, `value`, maybe `doc`) or
+/// the `error` row for a key that names none (`key`, `error`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocListRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub key: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<RowValue>,
+    /// `Some(Value::Null)` is the `doc: null` of a deleted document.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub doc: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RowValue {
+    pub rev: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+impl DocListRow {
+    fn found(id: &str, rev: String, doc: Option<Value>) -> DocListRow {
+        DocListRow {
+            id: Some(id.to_string()),
+            key: Value::String(id.to_string()),
+            value: Some(RowValue {
+                rev,
+                deleted: false,
+            }),
+            doc,
+            error: None,
+        }
+    }
+
+    pub fn not_found(key: Value) -> DocListRow {
+        DocListRow {
+            id: None,
+            key,
+            value: None,
+            doc: None,
+            error: Some("not_found".to_string()),
+        }
+    }
+}
+
 /// The body of `GET /{db}`. Fields serialize in CouchDB's order.
 #[derive(Debug, serde::Serialize)]
 pub struct DbInfo {
@@ -4514,7 +4601,7 @@ fn all_docs_key_row(
     shard: &mut crate::store::Shard,
     key: &str,
     opts: &AllDocsOpts,
-) -> DbResult<Option<Value>> {
+) -> DbResult<Option<DocListRow>> {
     let Some(meta) = shard.get_meta(key)? else {
         return Ok(None);
     };
@@ -4522,13 +4609,13 @@ fn all_docs_key_row(
         return Ok(None);
     };
     let deleted = meta.tree.is_deleted(&winner);
-    let mut row = json!({"id": key, "key": key, "value": {"rev": winner.clone()}});
-    if deleted {
-        row["value"]["deleted"] = json!(true);
+    let mut row = DocListRow::found(key, winner.clone(), None);
+    if let Some(value) = &mut row.value {
+        value.deleted = deleted;
     }
     if opts.include_docs {
-        if deleted {
-            row["doc"] = Value::Null;
+        row.doc = Some(if deleted {
+            Value::Null
         } else {
             let doc_opts = DocOpts {
                 rev: Some(winner),
@@ -4536,8 +4623,8 @@ fn all_docs_key_row(
                 attachments: opts.attachments,
                 ..Default::default()
             };
-            row["doc"] = read_doc(shard, key, &doc_opts)?;
-        }
+            read_doc(shard, key, &doc_opts)?
+        });
     }
     Ok(Some(row))
 }
@@ -4649,16 +4736,16 @@ fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
 
 /// Select and render `_local_docs` rows from every local document, which
 /// arrive in id order.
-fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
+fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<DocListRow> {
     let render = |id: &str, doc: &Value| {
-        let rev = doc.get("_rev").cloned().unwrap_or_else(|| json!("0-1"));
-        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-        if opts.include_docs {
-            row["doc"] = doc.clone();
-        }
-        row
+        let rev = doc
+            .get("_rev")
+            .and_then(Value::as_str)
+            .unwrap_or("0-1")
+            .to_string();
+        DocListRow::found(id, rev, opts.include_docs.then(|| doc.clone()))
     };
-    let rows: Vec<Value> = if let Some(keys) = &opts.keys {
+    let rows: Vec<DocListRow> = if let Some(keys) = &opts.keys {
         let mut keys: Vec<&str> = keys
             .iter()
             .filter_map(Value::as_str)
@@ -4670,7 +4757,7 @@ fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> 
         keys.into_iter()
             .map(|key| match docs.iter().find(|(id, _)| id == key) {
                 Some((id, doc)) => render(id, doc),
-                None => json!({"key": key, "error": "not_found"}),
+                None => DocListRow::not_found(Value::String(key.to_string())),
             })
             .collect()
     } else {
@@ -4708,17 +4795,26 @@ struct AllDocsRow {
     doc: Option<Value>,
 }
 
-fn all_docs_row_json(AllDocsRow { id, rev, doc }: AllDocsRow) -> Value {
-    let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-    if let Some(doc) = doc {
-        row["doc"] = doc;
+fn all_docs_row(AllDocsRow { id, rev, doc }: AllDocsRow) -> DocListRow {
+    DocListRow {
+        key: Value::String(id.clone()),
+        id: Some(id),
+        value: Some(RowValue {
+            rev,
+            deleted: false,
+        }),
+        doc,
+        error: None,
     }
-    row
 }
 
-fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
-    let results: Vec<Value> = rows.into_iter().map(all_docs_row_json).collect();
-    Ok(json!({ "total_rows": total, "offset": offset, "rows": results }))
+fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<DocList> {
+    Ok(DocList {
+        total_rows: Some(total as u64),
+        offset: Some(offset as u64),
+        rows: rows.into_iter().map(all_docs_row).collect(),
+        update_seq: None,
+    })
 }
 
 fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<Vec<ChangeRow>> {
@@ -5220,7 +5316,7 @@ mod tests {
         );
         assert_eq!(db.local_get("ae2:peer").await.unwrap(), None);
 
-        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap();
+        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap().json();
         let listed: Vec<&str> = listing["rows"]
             .as_array()
             .unwrap()
@@ -5535,14 +5631,19 @@ mod tests {
     }
 
     /// The streamed `_all_docs` reply, assembled in the shape of `all_docs`.
-    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> Value {
+    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> DocList {
         use futures::StreamExt;
         let (head, rows) = Db::all_docs_stream(db.clone(), opts).await.unwrap();
-        let rows: Vec<Value> = Box::pin(rows)
+        let rows: Vec<DocListRow> = Box::pin(rows)
             .map(|row| row.unwrap())
             .collect::<Vec<_>>()
             .await;
-        json!({"total_rows": head.total_rows, "offset": head.offset, "rows": rows})
+        DocList {
+            total_rows: Some(head.total_rows as u64),
+            offset: Some(head.offset as u64),
+            rows,
+            update_seq: None,
+        }
     }
 
     #[tokio::test]
@@ -5723,8 +5824,8 @@ mod tests {
         );
         let opts = AllDocsOpts::default();
         assert_eq!(
-            streamed_all_docs(&empty, &opts).await,
-            empty.all_docs(&opts).await.unwrap()
+            streamed_all_docs(&empty, &opts).await.json(),
+            empty.all_docs(&opts).await.unwrap().json()
         );
         drop(db);
         drop(empty);
@@ -5767,7 +5868,7 @@ mod tests {
 
         let before = crate::metrics::corrupt_records_skipped();
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(row_ids(&all, "rows"), ["a", "bad-body", "c"]);
+        assert_eq!(row_ids(&all.json(), "rows"), ["a", "bad-body", "c"]);
         assert!(crate::metrics::corrupt_records_skipped() > before);
 
         let before = crate::metrics::corrupt_records_skipped();
@@ -5778,7 +5879,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(row_ids(&all, "rows"), ["a", "c"]);
+        assert_eq!(row_ids(&all.json(), "rows"), ["a", "c"]);
         assert!(
             crate::metrics::corrupt_records_skipped() > before,
             "the skipped body was not counted"
@@ -6788,7 +6889,7 @@ mod tests {
         db.put_docs(vec![json!({"_id": good})], true).await.unwrap();
         // Build the lazy indexes so the failure has to repair them.
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(all["total_rows"], 1);
+        assert_eq!(all.total_rows, Some(1));
 
         db.shards[0]
             .call(|s| {
@@ -6802,7 +6903,7 @@ mod tests {
 
         assert!(db.get_doc(&lost, &DocOpts::default()).await.is_err());
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(all["rows"].as_array().unwrap().len(), 1, "{all}");
+        assert_eq!(all.rows.len(), 1, "{all:?}");
         assert_eq!(db.info().await.unwrap().doc_count, 1);
 
         // The changes cursor is not held back by the lost write.

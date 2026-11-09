@@ -103,7 +103,7 @@ async fn write_local_doc(req: &DbRequest<'_>, doc: Value, ok: StatusCode) -> DbR
     .await?;
     let result = match single_write_result(results) {
         Ok(result) => result,
-        Err(response) => return Ok(response),
+        Err(error) => return Ok(write_failed(&error)),
     };
     Ok(json_of(
         if quorum { ok } else { StatusCode::ACCEPTED },
@@ -403,7 +403,7 @@ async fn copy_doc(
     .await
     {
         Ok((results, _)) => match results.into_iter().next_back().flatten() {
-            Some(WriteResult::Error(error)) => json_of(doc_error_status(&error), &error),
+            Some(WriteResult::Error(error)) => write_failed(&error),
             result => json_of(StatusCode::CREATED, &result),
         },
         Err(error) => fail(error),
@@ -484,7 +484,7 @@ async fn put_doc(
             // Single-document endpoints, unlike `_bulk_docs`, return no id.
             let result = match single_write_result(results) {
                 Ok(result) => result,
-                Err(response) => return response,
+                Err(error) => return write_failed(&error),
             };
             // `batch=ok` answers 202 without a rev, as for `POST /{db}`.
             if q.get("batch").map(String::as_str) == Some("ok") {
@@ -554,7 +554,7 @@ async fn delete_doc(
         Ok((results, quorum)) => {
             let result = match single_write_result(results) {
                 Ok(result) => result,
-                Err(response) => return response,
+                Err(error) => return write_failed(&error),
             };
             json_of(
                 if quorum {

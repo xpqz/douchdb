@@ -2,7 +2,7 @@
 //! `_all_docs`.
 
 use super::*;
-use crate::db::{BulkGetDoc, BulkGetError, BulkGetResult, BulkGetResults};
+use crate::db::{BulkGetDoc, BulkGetError, BulkGetResult, BulkGetResults, DocList};
 
 /// The parsed `_bulk_docs` body.
 struct BulkBody {
@@ -649,7 +649,7 @@ fn all_docs_opts(
 
 /// Run an `_all_docs` query on this node's shards or, for a cluster
 /// coordinator, on the whole cluster.
-async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
+async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<DocList> {
     let (st, db, headers) = (req.st, req.db, req.headers);
     let shard_mask = if st.ctx.cluster.is_internal(headers) {
         req.q
@@ -700,18 +700,18 @@ async fn requested_update_seq(req: &DbRequest<'_>) -> DbResult<Option<Value>> {
 /// rows were read.
 fn all_docs_reply(
     req: &DbRequest<'_>,
-    result: DbResult<Value>,
+    result: DbResult<DocList>,
     update_seq: Option<Value>,
 ) -> Response {
     if !still_allowed(req.st, req.db, req.headers) {
         return access_denied(&req.st.principal(req.headers));
     }
     match result {
-        Ok(mut value) => {
+        Ok(mut list) => {
             if let Some(update_seq) = update_seq {
-                value["update_seq"] = update_seq;
+                list.update_seq = Some(update_seq);
             }
-            json(StatusCode::OK, value)
+            json_of(StatusCode::OK, &list)
         }
         Err(e) => fail(e),
     }
@@ -859,7 +859,7 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
     let mut result = run_all_docs(&req, &opts).await;
-    if let Ok(value) = &mut result {
+    if let Ok(list) = &mut result {
         let everything = AllDocsOpts {
             startkey: Some(DESIGN_FIRST.to_string()),
             endkey: Some(DESIGN_END.to_string()),
@@ -867,11 +867,9 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         };
         match run_all_docs(&req, &everything).await {
             Ok(all) => {
-                let total = all["rows"].as_array().map_or(0, Vec::len);
-                value["total_rows"] = json!(total);
-                if let Some(offset) = value["offset"].as_u64() {
-                    value["offset"] = json!(offset.min(total as u64));
-                }
+                let total = all.rows.len() as u64;
+                list.total_rows = Some(total);
+                list.offset = list.offset.map(|offset| offset.min(total));
             }
             Err(error) => result = Err(error),
         }

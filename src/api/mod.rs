@@ -51,19 +51,24 @@ pub(crate) fn json_of<T: serde::Serialize>(status: StatusCode, value: &T) -> Res
     (status, Json(value)).into_response()
 }
 
-/// The one result of a single-document write. A failure is answered here,
-/// without the `id` that `_bulk_docs` reports; otherwise the caller gets the
-/// result to report (`None` when no replica reported on it).
+/// The one result of a single-document write: the failure without the `id`
+/// that `_bulk_docs` reports, or the result to report (`None` when no replica
+/// reported on it).
 pub(crate) fn single_write_result(
     results: Vec<Option<WriteResult>>,
-) -> Result<Option<WriteResult>, Response> {
+) -> Result<Option<WriteResult>, WriteError> {
     match results.into_iter().next_back().flatten() {
         Some(WriteResult::Error(mut error)) => {
             error.id = None;
-            Err(json_of(doc_error_status(&error), &error))
+            Err(error)
         }
         other => Ok(other),
     }
+}
+
+/// The reply to a failed document write.
+pub(crate) fn write_failed(error: &WriteError) -> Response {
+    json_of(doc_error_status(error), error)
 }
 
 pub(crate) fn fail(e: ApiError) -> Response {
