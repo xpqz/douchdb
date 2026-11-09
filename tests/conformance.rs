@@ -4012,6 +4012,72 @@ async fn all_docs_is_streamed_with_a_stable_body() {
     );
 }
 
+/// CouchDB 3.5 answers HEAD with the `content-length` of the body a GET
+/// would send (documents, the root, `_security`, errors alike), except where
+/// the GET is chunked (`_all_docs`, `_design_docs`, `_local_docs`, `_changes`,
+/// views, `_all_dbs`): there it says `content-length: 0`.
+#[tokio::test]
+async fn head_reports_the_length_of_the_body_a_get_would_send() {
+    let s = Server::start(false);
+    s.fresh_db("headlen").await;
+    let (status, _) = s.put("/headlen/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/headlen/_design/d",
+            json!({"views": {"v": {"map": "function(doc) { emit(doc._id, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let length = |headers: &reqwest::header::HeaderMap| {
+        headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    for path in [
+        "/",
+        "/_up",
+        "/headlen/doc",
+        "/headlen/missing",
+        "/headlen/_design/d",
+    ] {
+        let get = s
+            .client
+            .get(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("get");
+        let get_status = get.status();
+        let body = get.text().await.expect("body");
+        let head = s
+            .client
+            .head(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(head.status(), get_status, "{path}");
+        assert_eq!(length(head.headers()), Some(body.len()), "HEAD {path}");
+    }
+    for path in [
+        "/headlen/_all_docs",
+        "/headlen/_design_docs",
+        "/headlen/_local_docs",
+        "/headlen/_changes",
+        "/headlen/_design/d/_view/v",
+        "/_all_dbs",
+    ] {
+        let head = s
+            .client
+            .head(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(head.status(), StatusCode::OK, "{path}");
+        assert_eq!(length(head.headers()), Some(0), "HEAD {path}");
+    }
+}
+
 #[tokio::test]
 async fn bulk_docs_and_all_docs() {
     let s = Server::start(false);
