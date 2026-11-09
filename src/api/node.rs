@@ -162,11 +162,11 @@ pub async fn db_migration_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Caller(principal): Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
-        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     let db = match st.db(&name).await {
@@ -209,10 +209,10 @@ pub async fn db_migration_delete(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Caller(principal): Caller,
     headers: HeaderMap,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
-        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     let Some(id) = query.get("id") else {
@@ -238,10 +238,10 @@ pub async fn db_migration_delete(
 pub async fn db_security_get(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    Caller(principal): Caller,
     headers: HeaderMap,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
-        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     match st.db(&name).await {
@@ -262,11 +262,11 @@ pub async fn db_security_get(
 pub async fn db_security_put(
     State(st): State<Arc<AppState>>,
     DbName(name): DbName,
+    Caller(principal): Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if !st.ctx.cluster.is_internal(&headers) {
-        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     let db = match st.db(&name).await {
@@ -424,12 +424,12 @@ pub async fn db_cleanup(
 /// tiebreak rules are the same).
 pub async fn metadata_sync(
     State(st): State<Arc<AppState>>,
+    Caller(principal): Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     use crate::fabric::{Accepted, MetadataSync, MetadataSyncReply};
     if !st.ctx.cluster.is_internal(&headers) {
-        let principal = st.principal(&headers);
         return access_denied(&principal);
     }
     let request: MetadataSync = match serde_json::from_slice(&body) {

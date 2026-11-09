@@ -36,6 +36,8 @@ pub(crate) struct DbRequest<'a> {
     pub uri: &'a Uri,
     pub q: &'a HashMap<String, String>,
     pub headers: &'a HeaderMap,
+    /// The caller, resolved once by the admission middleware.
+    pub principal: &'a Principal,
     pub body: &'a Bytes,
 }
 
