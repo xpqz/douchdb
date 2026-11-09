@@ -6,7 +6,7 @@ use crate::cluster::{ShardMap, ShardMask};
 use crate::cluster_http::{forward_client_auth, internal_request, peer_url, send_peer};
 use crate::db::{
     attachments_unsupported, validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult,
-    DocOpts,
+    DocOpts, WriteError, WriteResult,
 };
 use crate::dbname::{illegal_db_name, valid_db_name};
 use crate::fabric::*;
@@ -44,6 +44,31 @@ pub(crate) struct DbRequest<'a> {
 
 pub(crate) fn json(status: StatusCode, value: Value) -> Response {
     (status, Json(value)).into_response()
+}
+
+/// Like `json`, for a typed body that serializes straight to the response.
+pub(crate) fn json_of<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
+    (status, Json(value)).into_response()
+}
+
+/// The one result of a single-document write: the failure without the `id`
+/// that `_bulk_docs` reports, or the result to report (`None` when no replica
+/// reported on it).
+pub(crate) fn single_write_result(
+    results: Vec<Option<WriteResult>>,
+) -> Result<Option<WriteResult>, WriteError> {
+    match results.into_iter().next_back().flatten() {
+        Some(WriteResult::Error(mut error)) => {
+            error.id = None;
+            Err(error)
+        }
+        other => Ok(other),
+    }
+}
+
+/// The reply to a failed document write.
+pub(crate) fn write_failed(error: &WriteError) -> Response {
+    json_of(doc_error_status(error), error)
 }
 
 pub(crate) fn fail(e: ApiError) -> Response {
@@ -246,12 +271,12 @@ pub(crate) fn body_object(body: &[u8]) -> DbResult<Map<String, Value>> {
 }
 
 /// The HTTP status for a failed per-document write result (`{"error": ...}`).
-pub(crate) fn doc_error_status(result: &Value) -> StatusCode {
-    match result.get("error").and_then(Value::as_str) {
-        Some("conflict") => StatusCode::CONFLICT,
-        Some("forbidden") => StatusCode::FORBIDDEN,
-        Some("unauthorized") => StatusCode::UNAUTHORIZED,
-        Some("replica_unavailable" | "internal_server_error" | "unknown_error") => {
+pub(crate) fn doc_error_status(error: &crate::db::WriteError) -> StatusCode {
+    match error.error.as_str() {
+        "conflict" => StatusCode::CONFLICT,
+        "forbidden" => StatusCode::FORBIDDEN,
+        "unauthorized" => StatusCode::UNAUTHORIZED,
+        "replica_unavailable" | "internal_server_error" | "unknown_error" => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
         _ => StatusCode::BAD_REQUEST,

@@ -180,69 +180,98 @@ pub(crate) fn run_index_json(
         return Ok(Vec::new());
     }
     if crate::js::sandboxed() {
-        let mut out = Vec::with_capacity(docs.len());
-        for chunk in docs.chunks(2048) {
-            let value = crate::js::sandbox_request(
-                "index",
-                json!({"source": source, "docs": chunk}),
-                limits,
-            )?;
-            let mut chunk: Vec<IndexedDoc> = serde_json::from_value(value)
-                .map_err(|error| JsError::Runtime(error.to_string()))?;
-            out.append(&mut chunk);
-        }
-        return Ok(out);
+        run_index_sandboxed(source, docs, limits)
+    } else {
+        run_index_in_process(source, docs, limits)
     }
+}
+
+/// Run the index function in the sandbox process, in chunks that keep each
+/// request small.
+fn run_index_sandboxed(
+    source: &str,
+    docs: &[(String, String)],
+    limits: crate::view::ViewLimits,
+) -> Result<Vec<IndexedDoc>, JsError> {
+    let mut out = Vec::with_capacity(docs.len());
+    for chunk in docs.chunks(2048) {
+        let value =
+            crate::js::sandbox_request("index", json!({"source": source, "docs": chunk}), limits)?;
+        let mut chunk: Vec<IndexedDoc> =
+            serde_json::from_value(value).map_err(|error| JsError::Runtime(error.to_string()))?;
+        out.append(&mut chunk);
+    }
+    Ok(out)
+}
+
+/// Run the index function in a QuickJS runtime of this process.
+fn run_index_in_process(
+    source: &str,
+    docs: &[(String, String)],
+    limits: crate::view::ViewLimits,
+) -> Result<Vec<IndexedDoc>, JsError> {
     let runtime = engine(limits)?;
     let context =
         rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
     crate::js::guard("index function", || {
         context.with(|ctx| {
-            let wrapped = INDEX_WRAPPER.replace(crate::view::WRAPPER_SOURCE, source);
+            let wrapped = INDEX_WRAPPER.replace(crate::viewfn::WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
             let mut out = Vec::with_capacity(docs.len());
             const BATCH: usize = 128;
             for chunk in docs.chunks(BATCH) {
-                let mut batch = String::from("[");
-                for (index, (_, raw)) in chunk.iter().enumerate() {
-                    if index > 0 {
-                        batch.push(',');
-                    }
-                    batch.push_str(raw);
-                }
-                batch.push(']');
-                let output: String = func
-                    .call((batch,))
-                    .map_err(|error| JsError::Runtime(format!("{}: {error}", chunk[0].0)))?;
-                crate::js::check_output("index function", &output)?;
-                let emitted: Vec<Vec<(String, Value)>> = serde_json::from_str(&output)
-                    .map_err(|error| JsError::Runtime(error.to_string()))?;
-                if emitted.len() != chunk.len() {
-                    return Err(JsError::Runtime(format!(
-                        "{}: index returned {} results for {} documents",
-                        chunk[0].0,
-                        emitted.len(),
-                        chunk.len()
-                    )));
-                }
-                // The id comes from the stored document, not from the object
-                // the index function was handed.
-                for ((id, _), fields) in chunk.iter().zip(emitted) {
-                    let mut map = Map::new();
-                    for (name, value) in fields {
-                        map.insert(name, value);
-                    }
-                    out.push(IndexedDoc {
-                        id: id.clone(),
-                        fields: map,
-                    });
-                }
+                out.extend(index_chunk(&func, chunk)?);
             }
             Ok(out)
         })
     })
+}
+
+/// Index one batch of documents with a compiled index function.
+fn index_chunk(
+    func: &rquickjs::Function<'_>,
+    chunk: &[(String, String)],
+) -> Result<Vec<IndexedDoc>, JsError> {
+    let mut batch = String::from("[");
+    for (index, (_, raw)) in chunk.iter().enumerate() {
+        if index > 0 {
+            batch.push(',');
+        }
+        batch.push_str(raw);
+    }
+    batch.push(']');
+    let first = chunk.first().map(|(id, _)| id.as_str()).unwrap_or_default();
+    let output: String = func
+        .call((batch,))
+        .map_err(|error| JsError::Runtime(format!("{first}: {error}")))?;
+    crate::js::check_output("index function", &output)?;
+    let emitted: Vec<Vec<(String, Value)>> =
+        serde_json::from_str(&output).map_err(|error| JsError::Runtime(error.to_string()))?;
+    if emitted.len() != chunk.len() {
+        return Err(JsError::Runtime(format!(
+            "{first}: index returned {} results for {} documents",
+            emitted.len(),
+            chunk.len()
+        )));
+    }
+    // The id comes from the stored document, not from the object the index
+    // function was handed.
+    Ok(chunk
+        .iter()
+        .zip(emitted)
+        .map(|((id, _), fields)| {
+            let mut map = Map::new();
+            for (name, value) in fields {
+                map.insert(name, value);
+            }
+            IndexedDoc {
+                id: id.clone(),
+                fields: map,
+            }
+        })
+        .collect())
 }
 
 /// The schema field holding each document's id.
@@ -619,22 +648,13 @@ enum Update {
     Rebuild(Permit, OwnedMutexGuard<Option<Cached>>),
 }
 
-/// Bring the cached index up to date with the changes since its
-/// `last_seq`, re-indexing only the documents that changed.
-async fn update_index(
+/// The ids changed in `(since, last_seq]`, and the live documents among them
+/// as `(id, JSON text)`, which is what the index function takes.
+async fn indexable_changes(
     db: &Db,
-    spec: &SearchSpec,
-    limits: crate::view::ViewLimits,
-    gate: Permit,
-    mut entry: OwnedMutexGuard<Option<Cached>>,
-) -> DbResult<Update> {
-    let since = entry
-        .as_ref()
-        .map_or(0, |cached| cached.snapshot.meta.last_seq);
-    // Read the bound once and record it: every sequence up to it was
-    // committed before it was read, so a gap left by a write that never
-    // finished does not keep the index behind.
-    let last_seq = db.changes_watermark(since, None);
+    since: u64,
+    last_seq: u64,
+) -> DbResult<(std::collections::HashSet<String>, Vec<(String, String)>)> {
     let (rows, _, _) = db
         .changes_rows(&crate::db::ChangesOpts {
             since,
@@ -653,12 +673,109 @@ async fn update_index(
         if row.deleted {
             continue;
         }
-        // The row already carries the document as JSON text, which is what
-        // the index function takes.
+        // The row already carries the document as JSON text.
         if let Some(doc) = row.doc {
             live.push((row.id, doc));
         }
     }
+    Ok((changed, live))
+}
+
+/// An on-disk index's schema, read back: the two bookkeeping fields and the
+/// indexed fields with their kinds.
+struct SchemaLayout {
+    id_field: Field,
+    fields_field: Field,
+    fields: HashMap<String, (Field, FieldKind)>,
+}
+
+impl SchemaLayout {
+    /// None when the schema is not one this code wrote, so only a rebuild can
+    /// bring the index up to date.
+    fn read(schema: &Schema) -> Option<SchemaLayout> {
+        let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
+        let (mut id_field, mut fields_field) = (None, None);
+        for (field, field_entry) in schema.fields() {
+            let kind = match field_entry.field_type() {
+                FieldType::Str(_) if field_entry.name() == ID_FIELD => {
+                    id_field = Some(field);
+                    continue;
+                }
+                FieldType::Str(_) if field_entry.name() == FIELDS_FIELD => {
+                    fields_field = Some(field);
+                    continue;
+                }
+                FieldType::Str(_) => FieldKind::Text,
+                FieldType::F64(_) => FieldKind::Number,
+                FieldType::Bool(_) => FieldKind::Bool,
+                _ => return None,
+            };
+            fields.insert(field_entry.name().to_string(), (field, kind));
+        }
+        Some(SchemaLayout {
+            id_field: id_field?,
+            fields_field: fields_field?,
+            fields,
+        })
+    }
+
+    fn kinds(&self) -> BTreeMap<String, FieldKind> {
+        self.fields
+            .iter()
+            .map(|(name, (_, kind))| (name.clone(), *kind))
+            .collect()
+    }
+}
+
+/// Delete the changed documents from the index, add the re-indexed ones and
+/// commit with `last_seq` as the payload.
+fn write_changes(
+    index: &Index,
+    layout: &SchemaLayout,
+    changed: &std::collections::HashSet<String>,
+    added: &[Arc<SearchDoc>],
+    last_seq: u64,
+    gate: &Permit,
+) -> DbResult<()> {
+    let writer: tantivy::IndexWriter = index
+        .writer(50_000_000)
+        .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    for id in changed {
+        writer.delete_term(Term::from_field_text(layout.id_field, id));
+    }
+    for (at, doc) in added.iter().enumerate() {
+        if at.is_multiple_of(INDEX_BATCH) {
+            gate.check()?;
+        }
+        writer
+            .add_document(tantivy_doc(
+                &doc.id,
+                &doc.fields,
+                (layout.id_field, layout.fields_field),
+                &layout.fields,
+            ))
+            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
+    }
+    finish_writer(writer, last_seq)
+}
+
+/// Bring the cached index up to date with the changes since its
+/// `last_seq`, re-indexing only the documents that changed.
+async fn update_index(
+    db: &Db,
+    spec: &SearchSpec,
+    limits: crate::view::ViewLimits,
+    gate: Permit,
+    mut entry: OwnedMutexGuard<Option<Cached>>,
+) -> DbResult<Update> {
+    let since = entry
+        .as_ref()
+        .map_or(0, |cached| cached.snapshot.meta.last_seq);
+    // Read the bound once and record it: every sequence up to it was
+    // committed before it was read, so a gap left by a write that never
+    // finished does not keep the index behind.
+    let last_seq = db.changes_watermark(since, None);
+    let (changed, live) = indexable_changes(db, since, last_seq).await?;
     let source = spec.source.clone();
     let placement = (db.q, db.partitioned);
     // As in a rebuild, the permits travel with the blocking work so a
@@ -689,57 +806,13 @@ async fn update_index(
             added.push(doc);
         }
         let kinds = meta.kinds.kinds();
-        let schema = tantivy_index.schema();
-        let mut fields: HashMap<String, (Field, FieldKind)> = HashMap::new();
-        let (mut id_field, mut fields_field) = (None, None);
-        for (field, field_entry) in schema.fields() {
-            let kind = match field_entry.field_type() {
-                FieldType::Str(_) if field_entry.name() == ID_FIELD => {
-                    id_field = Some(field);
-                    continue;
-                }
-                FieldType::Str(_) if field_entry.name() == FIELDS_FIELD => {
-                    fields_field = Some(field);
-                    continue;
-                }
-                FieldType::Str(_) => FieldKind::Text,
-                FieldType::F64(_) => FieldKind::Number,
-                FieldType::Bool(_) => FieldKind::Bool,
-                _ => return Ok(Update::Rebuild(gate, entry)),
-            };
-            fields.insert(field_entry.name().to_string(), (field, kind));
-        }
-        let (Some(id_field), Some(fields_field)) = (id_field, fields_field) else {
+        let Some(layout) = SchemaLayout::read(&tantivy_index.schema()) else {
             return Ok(Update::Rebuild(gate, entry));
         };
-        let schema_kinds: BTreeMap<String, FieldKind> = fields
-            .iter()
-            .map(|(name, (_, kind))| (name.clone(), *kind))
-            .collect();
-        if kinds != schema_kinds {
+        if kinds != layout.kinds() {
             return Ok(Update::Rebuild(gate, entry));
         }
-
-        let writer: tantivy::IndexWriter = tantivy_index
-            .writer(50_000_000)
-            .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-        for id in &changed {
-            writer.delete_term(Term::from_field_text(id_field, id));
-        }
-        for (at, doc) in added.iter().enumerate() {
-            if at.is_multiple_of(INDEX_BATCH) {
-                gate.check()?;
-            }
-            writer
-                .add_document(tantivy_doc(
-                    &doc.id,
-                    &doc.fields,
-                    (id_field, fields_field),
-                    &fields,
-                ))
-                .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-        }
-        finish_writer(writer, last_seq)?;
+        write_changes(&tantivy_index, &layout, &changed, &added, last_seq, &gate)?;
         meta.last_seq = last_seq;
         reader
             .reload()
@@ -2182,8 +2255,11 @@ mod tests {
                 .await
                 .unwrap()
             {
-                if let Some(rev) = result["rev"].as_str() {
-                    revs.insert(result["id"].as_str().unwrap().to_string(), rev.to_string());
+                if let Some(rev) = result.json()["rev"].as_str() {
+                    revs.insert(
+                        result.json()["id"].as_str().unwrap().to_string(),
+                        rev.to_string(),
+                    );
                 }
             }
             let rebuilt = index_dir(&db, "_design/b", "idx");
@@ -2408,8 +2484,8 @@ mod tests {
                 })
                 .collect();
             for result in db.put_docs(docs, true).await.unwrap() {
-                let id = result["id"].as_str().unwrap().to_string();
-                revs.insert(id, result["rev"].as_str().unwrap().to_string());
+                let id = result.json()["id"].as_str().unwrap().to_string();
+                revs.insert(id, result.json()["rev"].as_str().unwrap().to_string());
             }
             if step > 0 {
                 std::fs::write(&marker, b"").unwrap();

@@ -1,7 +1,7 @@
 //! The `_changes` feed and its filters.
 
 use super::*;
-use crate::db::ChangesItem;
+use crate::db::{ChangesItem, ChangesList, Seq};
 
 /// `limit` for `_changes`, with CouchDB's own messages for a bad value.
 fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
@@ -74,50 +74,47 @@ fn changes_timeout(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
     }
 }
 
-/// `st` and `db` are the owned handles behind `req`: a streaming feed outlives
-/// the handler, so it needs `Arc`s rather than the borrows in the request.
-pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) -> Response {
-    let DbRequest {
-        name: dbname,
-        q,
-        body,
-        headers,
-        ..
-    } = req;
-    let limit = match changes_limit(q) {
-        Ok(limit) => limit,
-        Err(error) => return fail(error),
-    };
+/// The feed settings that the streaming and long-polling modes share, once
+/// the request's parameters are validated.
+struct FeedOpts {
+    limit: Option<usize>,
+    local_only: bool,
+    heartbeat: Option<std::time::Duration>,
+    /// Milliseconds a longpoll/continuous feed stays open.
+    deadline: u64,
+    /// How often an idle feed re-checks when no local commit wakes it.
+    recheck: std::time::Duration,
+}
+
+/// Validate every `_changes` parameter up front and return the feed type
+/// with its settings. A stream must not turn a bad parameter or filter into
+/// a 200 response that the client retries forever.
+async fn parse_feed(
+    st: &AppState,
+    db: &Arc<Db>,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> DbResult<(&'static str, FeedOpts)> {
+    let limit = changes_limit(q)?;
     let local_only = st.ctx.cluster.is_internal(headers);
     // `live` is sugar for `continuous` (`chttpd_db:parse_changes_query`).
     let feed = match q.get("feed").map(String::as_str).unwrap_or("normal") {
-        "live" => "continuous",
-        feed => feed,
-    };
-    if !["normal", "continuous", "longpoll", "eventsource"].contains(&feed) {
-        return fail(ApiError::bad_request(
-            "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
-        ));
-    }
-    if let Some(raw) = q.get("since") {
-        if let Err(error) = validate_since(raw) {
-            return fail(error);
+        "live" | "continuous" => "continuous",
+        "normal" => "normal",
+        "longpoll" => "longpoll",
+        "eventsource" => "eventsource",
+        _ => {
+            return Err(ApiError::bad_request(
+                "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
+            ))
         }
-    }
-    let timeout = match changes_timeout(q) {
-        Ok(timeout) => timeout,
-        Err(error) => return fail(error),
     };
-    let heartbeat = match changes_heartbeat(q) {
-        Ok(heartbeat) => heartbeat,
-        Err(error) => return fail(error),
-    };
-    // Resolve filters before a longpoll/continuous stream starts. A stream
-    // must not turn a bad filter into a 200 response that the client retries
-    // forever.
-    if let Err(error) = resolve_changes_filter(&db, q).await {
-        return fail(error);
+    if let Some(raw) = q.get("since") {
+        validate_since(raw)?;
     }
+    let timeout = changes_timeout(q)?;
+    let heartbeat = changes_heartbeat(q)?;
+    resolve_changes_filter(db, q).await?;
     // Cap longpoll/continuous connections so a client cannot pin a worker for
     // an arbitrary amount of time.
     let deadline = timeout.unwrap_or(60_000).min(300_000) as u64;
@@ -126,215 +123,280 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
     } else {
         st.config.local_feed_recheck
     };
+    Ok((
+        feed,
+        FeedOpts {
+            limit,
+            local_only,
+            heartbeat,
+            deadline,
+            recheck,
+        },
+    ))
+}
 
-    let eventsource = feed == "eventsource";
-    if feed == "continuous" || eventsource {
-        let dbname = dbname.to_string();
-        let mut query = q.clone();
-        let body = Bytes::copy_from_slice(body);
-        let headers = headers.clone();
-        let stream = async_stream::stream! {
-            let started = std::time::Instant::now();
-            let mut sent = 0usize;
-            let mut heartbeat = Heartbeat::new(heartbeat);
-            // Where the feed stopped, for the closing line CouchDB sends when
-            // a continuous feed times out or reaches its limit.
-            let mut trailer: Option<(Value, u64)> = None;
-            let mut wake = db.subscribe_commits();
-            loop {
-                if limit.map(|limit| sent >= limit).unwrap_or(false) {
-                    break;
-                }
-                if !still_allowed(&st, &db, &headers) {
-                    trailer = None;
-                    break;
-                }
-                wake.borrow_and_update();
-                match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                    Ok(mut value) => {
-                        if !still_allowed(&st, &db, &headers) {
-                            trailer = None;
-                            break;
-                        }
-                        let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
-                        let mut sent_here = 0usize;
-                        let mut last_sent = None;
-                        for row in &rows {
-                            if limit.map(|limit| sent >= limit).unwrap_or(false) {
-                                break;
-                            }
-                            last_sent = row.get("seq").cloned();
-                            sent_here += 1;
-                            let json = serde_json::to_vec(&row).unwrap_or_default();
-                            let line = feed_line(&json, eventsource);
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
-                            sent += 1;
-                        }
-                        let unsent = (rows.len() - sent_here) as u64;
-                        let reported = value.get("last_seq").cloned();
-                        let end_seq = if unsent > 0 { last_sent.or(reported) } else { reported };
-                        let behind = value.get("pending").and_then(Value::as_u64).unwrap_or(0);
-                        trailer = end_seq.map(|seq| (seq, behind + unsent));
-                        if let Some(seq) = value.get("last_seq") {
-                            let since = seq
-                                .as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| seq.to_string());
-                            query.insert("since".to_string(), since);
-                        }
-                    }
-                    Err(error) => {
-                        trailer = None;
-                        let json = serde_json::to_vec(&json!({
-                            "error": error.error,
-                            "reason": error.reason,
-                        }))
-                        .unwrap_or_default();
-                        let line = feed_line(&json, eventsource);
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
-                        break;
-                    }
-                }
-                if started.elapsed().as_millis() as u64 >= deadline
-                    || limit.is_some_and(|limit| sent >= limit)
-                    || st.shutdown.is_cancelled()
-                {
-                    break;
-                }
-                if heartbeat.due() {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
-                        b": heartbeat\n\n"
-                    } else {
-                        b"\n"
-                    }));
-                }
-                wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
-            }
-            // CouchDB's eventsource feed ends without this line.
-            if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
-                let mut line = serde_json::to_vec(&json!({
-                    "last_seq": last_seq,
-                    "pending": pending,
-                }))
-                .unwrap_or_default();
-                line.push(b'\n');
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
-            }
-        };
-        return feed_response(
-            if eventsource {
-                "text/event-stream"
-            } else {
-                "application/json"
-            },
-            stream,
-        );
+/// `st` and `db` are the owned handles behind `req`: a streaming feed outlives
+/// the handler, so it needs `Arc`s rather than the borrows in the request.
+pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) -> Response {
+    let (feed, opts) = match parse_feed(&st, &db, req.q, req.headers).await {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(error),
+    };
+    match feed {
+        "continuous" => changes_continuous(st, db, req, opts, false),
+        "eventsource" => changes_continuous(st, db, req, opts, true),
+        "longpoll" if opts.heartbeat.is_some() => changes_longpoll_stream(st, db, req, opts),
+        "longpoll" => changes_longpoll(&st, &db, req, &opts).await,
+        _ => changes_normal(&st, &db, req, &opts).await,
     }
+}
 
-    if feed == "longpoll" {
-        if heartbeat.is_some() {
-            let mut heartbeat = Heartbeat::new(heartbeat);
-            let dbname = dbname.to_string();
-            let query = q.clone();
-            let body = Bytes::copy_from_slice(body);
-            let headers = headers.clone();
-            let stream = async_stream::stream! {
-                let started = std::time::Instant::now();
-                let mut wake = db.subscribe_commits();
-                loop {
-                    if !still_allowed(&st, &db, &headers) {
-                        break;
-                    }
-                    wake.borrow_and_update();
-                    match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                        Ok(value)
-                            if (value["results"]
-                                .as_array()
-                                .map(|rows| !rows.is_empty())
-                                .unwrap_or(false)
-                                || started.elapsed().as_millis() as u64 >= deadline
-                                || st.shutdown.is_cancelled())
-                                && still_allowed(&st, &db, &headers) =>
-                        {
-                            let mut line = serde_json::to_vec(&value).unwrap_or_default();
-                            line.push(b'\n');
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let mut line = serde_json::to_vec(&json!({
-                                "error": error.error,
-                                "reason": error.reason,
-                            }))
-                            .unwrap_or_default();
-                            line.push(b'\n');
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
-                            break;
-                        }
-                    }
-                    if heartbeat.due() {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
-                    }
-                    wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
-                }
-            };
-            return feed_response("application/json", stream);
-        }
+/// `feed=normal`: the raw fast path when it applies, else one pass.
+async fn changes_normal(
+    st: &AppState,
+    db: &Arc<Db>,
+    req: DbRequest<'_>,
+    opts: &FeedOpts,
+) -> Response {
+    let DbRequest {
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
+    if let Some(response) = changes_normal_raw(st, db, q, body, headers, opts.local_only).await {
+        return response;
+    }
+    match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
+        Ok(v) => json_of(StatusCode::OK, &v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `feed=continuous` and `feed=eventsource`: one JSON line (or SSE event) per
+/// change until the deadline, the limit or shutdown.
+fn changes_continuous(
+    st: Arc<AppState>,
+    db: Arc<Db>,
+    req: DbRequest<'_>,
+    opts: FeedOpts,
+    eventsource: bool,
+) -> Response {
+    let FeedOpts {
+        limit,
+        local_only,
+        heartbeat,
+        deadline,
+        recheck,
+    } = opts;
+    let dbname = req.name.to_string();
+    let mut query = req.q.clone();
+    let body = Bytes::copy_from_slice(req.body);
+    let headers = req.headers.clone();
+    let stream = async_stream::stream! {
         let started = std::time::Instant::now();
+        let mut sent = 0usize;
+        let mut heartbeat = Heartbeat::new(heartbeat);
+        // Where the feed stopped, for the closing line CouchDB sends when
+        // a continuous feed times out or reaches its limit.
+        let mut trailer: Option<(Seq, u64)> = None;
         let mut wake = db.subscribe_commits();
-        let no_heartbeat = Heartbeat::new(None);
         loop {
-            if !still_allowed(&st, &db, headers) {
-                return access_denied(&st.principal(headers));
+            if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                break;
+            }
+            if !still_allowed(&st, &db, &headers) {
+                trailer = None;
+                break;
             }
             wake.borrow_and_update();
-            match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
-                Ok(v)
-                    if v["results"]
-                        .as_array()
-                        .map(|a| !a.is_empty())
-                        .unwrap_or(false) =>
-                {
-                    if !still_allowed(&st, &db, headers) {
-                        return access_denied(&st.principal(headers));
+            match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
+                Ok(value) => {
+                    if !still_allowed(&st, &db, &headers) {
+                        trailer = None;
+                        break;
                     }
-                    return json(StatusCode::OK, v);
-                }
-                Ok(v)
-                    if started.elapsed().as_millis() as u64 >= deadline
-                        || st.shutdown.is_cancelled() =>
-                {
-                    if !still_allowed(&st, &db, headers) {
-                        return access_denied(&st.principal(headers));
+                    let ChangesList { results: rows, last_seq: reported, pending: behind } = value;
+                    let mut sent_here = 0usize;
+                    let mut last_sent = None;
+                    for row in &rows {
+                        if limit.map(|limit| sent >= limit).unwrap_or(false) {
+                            break;
+                        }
+                        last_sent = Some(row.seq.clone());
+                        sent_here += 1;
+                        let json = serde_json::to_vec(&row).unwrap_or_default();
+                        let line = feed_line(&json, eventsource);
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                        sent += 1;
                     }
-                    return json(StatusCode::OK, v);
+                    let unsent = (rows.len() - sent_here) as u64;
+                    query.insert("since".to_string(), reported.to_string());
+                    let end_seq = if unsent > 0 { last_sent.unwrap_or(reported) } else { reported };
+                    trailer = Some((end_seq, behind + unsent));
                 }
-                Ok(_) => {
-                    wait_for_commit(
-                        &mut wake,
-                        recheck,
-                        &no_heartbeat,
-                        started,
-                        deadline,
-                        &st.shutdown,
-                    )
-                    .await
+                Err(error) => {
+                    trailer = None;
+                    let json = serde_json::to_vec(&json!({
+                        "error": error.error,
+                        "reason": error.reason,
+                    }))
+                    .unwrap_or_default();
+                    let line = feed_line(&json, eventsource);
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                    break;
                 }
-                Err(e) => return fail(e),
             }
+            if started.elapsed().as_millis() as u64 >= deadline
+                || limit.is_some_and(|limit| sent >= limit)
+                || st.shutdown.is_cancelled()
+            {
+                break;
+            }
+            if heartbeat.due() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(if eventsource {
+                    b": heartbeat\n\n"
+                } else {
+                    b"\n"
+                }));
+            }
+            wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
         }
-    }
-
-    if feed == "normal" {
-        if let Some(response) = changes_normal_raw(&st, &db, q, body, headers, local_only).await {
-            return response;
+        // CouchDB's eventsource feed ends without this line.
+        if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
+            let mut line = serde_json::to_vec(&json!({
+                "last_seq": last_seq,
+                "pending": pending,
+            }))
+            .unwrap_or_default();
+            line.push(b'\n');
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
         }
-    }
+    };
+    feed_response(
+        if eventsource {
+            "text/event-stream"
+        } else {
+            "application/json"
+        },
+        stream,
+    )
+}
 
-    match changes_once(&st, &db, dbname, q, body, headers, local_only).await {
-        Ok(v) => json(StatusCode::OK, v),
-        Err(e) => fail(e),
+/// `feed=longpoll` with a heartbeat: the response streams, sending a blank
+/// line while it waits and the whole result as one line at the end.
+fn changes_longpoll_stream(
+    st: Arc<AppState>,
+    db: Arc<Db>,
+    req: DbRequest<'_>,
+    opts: FeedOpts,
+) -> Response {
+    let FeedOpts {
+        local_only,
+        heartbeat,
+        deadline,
+        recheck,
+        ..
+    } = opts;
+    let mut heartbeat = Heartbeat::new(heartbeat);
+    let dbname = req.name.to_string();
+    let query = req.q.clone();
+    let body = Bytes::copy_from_slice(req.body);
+    let headers = req.headers.clone();
+    let stream = async_stream::stream! {
+        let started = std::time::Instant::now();
+        let mut wake = db.subscribe_commits();
+        loop {
+            if !still_allowed(&st, &db, &headers) {
+                break;
+            }
+            wake.borrow_and_update();
+            match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
+                Ok(value)
+                    if (!value.results.is_empty()
+                        || started.elapsed().as_millis() as u64 >= deadline
+                        || st.shutdown.is_cancelled())
+                        && still_allowed(&st, &db, &headers) =>
+                {
+                    let mut line = serde_json::to_vec(&value).unwrap_or_default();
+                    line.push(b'\n');
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let mut line = serde_json::to_vec(&json!({
+                        "error": error.error,
+                        "reason": error.reason,
+                    }))
+                    .unwrap_or_default();
+                    line.push(b'\n');
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+                    break;
+                }
+            }
+            if heartbeat.due() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
+            }
+            wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
+        }
+    };
+    feed_response("application/json", stream)
+}
+
+/// `feed=longpoll` without a heartbeat: hold the request until a change
+/// arrives or the deadline passes, then answer once.
+async fn changes_longpoll(
+    st: &AppState,
+    db: &Arc<Db>,
+    req: DbRequest<'_>,
+    opts: &FeedOpts,
+) -> Response {
+    let DbRequest {
+        name: dbname,
+        q,
+        body,
+        headers,
+        ..
+    } = req;
+    let started = std::time::Instant::now();
+    let mut wake = db.subscribe_commits();
+    let no_heartbeat = Heartbeat::new(None);
+    loop {
+        if !still_allowed(st, db, headers) {
+            return access_denied(&st.principal(headers));
+        }
+        wake.borrow_and_update();
+        match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
+            Ok(v) if !v.results.is_empty() => {
+                if !still_allowed(st, db, headers) {
+                    return access_denied(&st.principal(headers));
+                }
+                return json_of(StatusCode::OK, &v);
+            }
+            Ok(v)
+                if started.elapsed().as_millis() as u64 >= opts.deadline
+                    || st.shutdown.is_cancelled() =>
+            {
+                if !still_allowed(st, db, headers) {
+                    return access_denied(&st.principal(headers));
+                }
+                return json_of(StatusCode::OK, &v);
+            }
+            Ok(_) => {
+                wait_for_commit(
+                    &mut wake,
+                    opts.recheck,
+                    &no_heartbeat,
+                    started,
+                    opts.deadline,
+                    &st.shutdown,
+                )
+                .await
+            }
+            Err(e) => return fail(e),
+        }
     }
 }
 
@@ -547,7 +609,7 @@ async fn changes_once(
     body: &[u8],
     headers: &HeaderMap,
     local_only: bool,
-) -> DbResult<Value> {
+) -> DbResult<ChangesList> {
     #[cfg(test)]
     record_changes_once(dbname);
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {

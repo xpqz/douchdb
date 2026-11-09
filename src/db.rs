@@ -934,9 +934,14 @@ impl Db {
 
     /// CouchDB's `cluster` block in database info: shards, copies, and the
     /// default write and read quorums.
-    fn cluster_info(&self) -> Value {
+    fn cluster_info(&self) -> ClusterInfo {
         let n = self.copies();
-        json!({"q": self.q, "n": n, "w": n / 2 + 1, "r": n / 2 + 1})
+        ClusterInfo {
+            q: self.q,
+            n,
+            w: n / 2 + 1,
+            r: n / 2 + 1,
+        }
     }
 
     pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
@@ -1293,7 +1298,7 @@ impl Db {
         (owner, map.replicas_of(shard).to_vec())
     }
 
-    pub async fn info(&self) -> DbResult<Value> {
+    pub async fn info(&self) -> DbResult<DbInfo> {
         // Snapshot the flag before queueing on the shard actors. A compaction
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
@@ -1316,31 +1321,32 @@ impl Db {
             deleted_count += deleted;
             purge_seq = purge_seq.saturating_add(purged);
         }
-        let mut info = json!({
-            "db_name": self.name,
-            "doc_count": doc_count,
-            "doc_del_count": deleted_count,
-            "update_seq": update_seq,
-            "purge_seq": purge_seq,
-            "compact_running": compact_running,
-            "disk_size": 0,
-            "data_size": 0,
-            "sizes": { "active": 0, "external": 0, "file": 0 },
-            "instance_start_time": self.instance_start_time,
-            "disk_format_version": 8,
-            "committed_update_seq": update_seq,
-            "uuid": self.uuid,
-            "cluster": self.cluster_info(),
-        });
-        if self.partitioned {
-            info["props"] = json!({"partitioned": true});
-        }
-        Ok(info)
+        Ok(DbInfo {
+            db_name: self.name.clone(),
+            doc_count,
+            doc_del_count: deleted_count,
+            update_seq,
+            purge_seq,
+            compact_running,
+            disk_size: 0,
+            data_size: 0,
+            sizes: DbSizes {
+                active: 0,
+                external: 0,
+                file: 0,
+            },
+            instance_start_time: self.instance_start_time.clone(),
+            disk_format_version: 8,
+            committed_update_seq: update_seq,
+            uuid: self.uuid.clone(),
+            cluster: self.cluster_info(),
+            props: self.partitioned.then_some(DbProps { partitioned: true }),
+        })
     }
 
     // ----- documents -------------------------------------------------------
 
-    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<Value>> {
+    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<WriteResult>> {
         if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
             return Err(attachments_unsupported());
         }
@@ -1350,7 +1356,7 @@ impl Db {
                 .map(|id| id.starts_with("_design/"))
                 .unwrap_or(false)
         });
-        let mut out: Vec<Option<Value>> = vec![None; docs.len()];
+        let mut out: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
@@ -1372,13 +1378,9 @@ impl Db {
                         ids[i] = Some(id.clone());
                         grouped[self.shard_index(&id)].push((i, doc));
                     }
-                    Err(e) => {
-                        out[i] = Some(json!({
-                            "id": id, "error": e.error, "reason": e.reason
-                        }))
-                    }
+                    Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
                 },
-                Err(e) => out[i] = Some(json!({"error": e.error, "reason": e.reason})),
+                Err(e) => out[i] = Some(WriteResult::error(None, e)),
             }
         }
 
@@ -1417,10 +1419,11 @@ impl Db {
             };
             for (i, result) in results {
                 out[i] = Some(match result {
-                    Ok(doc) => doc,
-                    Err(e) => json!({
-                        "id": ids[i], "error": e.error, "reason": e.reason
-                    }),
+                    Ok(ok) => WriteResult::Ok(ok),
+                    Err(e) => WriteResult::error(
+                        Some(ids[i].clone().map_or(Value::Null, Value::String)),
+                        e,
+                    ),
                 });
             }
         }
@@ -1440,7 +1443,14 @@ impl Db {
         if let Some(error) = shard_error {
             return Err(error);
         }
-        Ok(out.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
+        Ok(out
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    WriteResult::error(None, ApiError::internal("no result for the document"))
+                })
+            })
+            .collect())
     }
 
     pub async fn get_doc(&self, id: &str, opts: &DocOpts) -> DbResult<Value> {
@@ -1491,14 +1501,14 @@ impl Db {
             .collect())
     }
 
-    pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+    pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<DocList> {
         self.all_docs_filtered(opts, None).await
     }
 
     /// Like `all_docs`, but only shards whose `owned` entry is true. Cluster
     /// coordinators use this to fetch each document from exactly one primary
     /// instead of merging the same replica from every node.
-    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+    pub async fn all_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<DocList> {
         self.all_docs_filtered(opts, Some(owned)).await
     }
 
@@ -1542,7 +1552,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         if let Some(keys) = &opts.keys {
             return self.all_docs_by_keys(opts, keys, owned).await;
         }
@@ -1600,7 +1610,10 @@ impl Db {
     pub(crate) async fn all_docs_stream(
         db: Arc<Db>,
         opts: &AllDocsOpts,
-    ) -> DbResult<(AllDocsHead, impl futures::Stream<Item = DbResult<Value>>)> {
+    ) -> DbResult<(
+        AllDocsHead,
+        impl futures::Stream<Item = DbResult<DocListRow>>,
+    )> {
         const PAGE: usize = 256;
 
         struct Cursor {
@@ -1710,7 +1723,7 @@ impl Db {
                     continue;
                 }
                 remaining -= 1;
-                yield Ok(all_docs_row_json(row));
+                yield Ok(all_docs_row(row));
             }
         };
         Ok((head, rows))
@@ -1784,7 +1797,7 @@ impl Db {
         opts: &AllDocsOpts,
         keys: &[Value],
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
@@ -1844,7 +1857,7 @@ impl Db {
             grouped[shard].push((slot, key.to_string()));
         }
 
-        let mut results: Vec<Option<Value>> = vec![None; page.len()];
+        let mut results: Vec<Option<DocListRow>> = (0..page.len()).map(|_| None).collect();
         let fetched = futures::future::join_all(
             grouped
                 .into_iter()
@@ -1867,22 +1880,21 @@ impl Db {
         for rows in fetched {
             for (slot, row) in rows? {
                 results[slot] =
-                    Some(row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"})));
+                    Some(row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())));
             }
         }
 
-        Ok(json!({
-            "total_rows": total_rows,
-            "offset": Value::Null,
-            "rows": results
+        Ok(DocList {
+            total_rows: Some(total_rows),
+            offset: None,
+            rows: results
                 .into_iter()
                 .enumerate()
                 .filter(|(slot, _)| included[*slot])
-                .map(|(slot, row)| {
-                    row.unwrap_or_else(|| json!({"key": page[slot], "error": "not_found"}))
-                })
-                .collect::<Vec<_>>(),
-        }))
+                .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
+                .collect(),
+            update_seq: None,
+        })
     }
 
     pub(crate) async fn changes_rows(
@@ -2087,24 +2099,31 @@ impl Db {
         .sum::<DbResult<usize>>()
     }
 
-    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
+    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<ChangesList> {
         let (rows, last_seq, pending) = self.changes_rows(opts).await?;
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut entry = json!({
-                "seq": row.seq,
-                "id": row.id,
-                "changes": row.changes.iter().map(|(rev, _)| json!({"rev": rev})).collect::<Vec<_>>(),
+            let doc = match row.doc {
+                Some(doc) => Some(serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?),
+                None => None,
+            };
+            results.push(ChangeEntry {
+                seq: Seq::Num(row.seq),
+                id: row.id,
+                changes: row
+                    .changes
+                    .into_iter()
+                    .map(|(rev, _)| ChangeRev { rev })
+                    .collect(),
+                deleted: row.deleted,
+                doc,
             });
-            if row.deleted {
-                entry["deleted"] = json!(true);
-            }
-            if let Some(doc) = row.doc {
-                entry["doc"] = serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?;
-            }
-            results.push(entry);
         }
-        Ok(json!({ "results": results, "last_seq": last_seq, "pending": pending }))
+        Ok(ChangesList {
+            results,
+            last_seq: Seq::Num(last_seq),
+            pending: pending as u64,
+        })
     }
 
     /// Stream changes rows in global sequence order by merging a page at a
@@ -2268,7 +2287,7 @@ impl Db {
         out
     }
 
-    pub async fn revs_diff(&self, body: &Value) -> DbResult<Value> {
+    pub async fn revs_diff(&self, body: &Value) -> DbResult<RevsDiff> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
@@ -2311,20 +2330,22 @@ impl Db {
                 found[slot] = Some(diff);
             }
         }
-        let mut out = Map::new();
+        let mut out = Vec::new();
         for (id, diff) in ids.into_iter().zip(found) {
-            let Some((missing, ancestors)) = diff else {
+            let Some((missing, possible_ancestors)) = diff else {
                 continue;
             };
             if !missing.is_empty() {
-                let mut entry = json!({ "missing": missing });
-                if !ancestors.is_empty() {
-                    entry["possible_ancestors"] = json!(ancestors);
-                }
-                out.insert(id.clone(), entry);
+                out.push((
+                    id.clone(),
+                    RevsDiffEntry {
+                        missing,
+                        possible_ancestors,
+                    },
+                ));
             }
         }
-        Ok(Value::Object(out))
+        Ok(RevsDiff(out))
     }
 
     pub async fn bulk_get(
@@ -2333,7 +2354,7 @@ impl Db {
         attachments: bool,
         revs: bool,
         latest: bool,
-    ) -> DbResult<Value> {
+    ) -> DbResult<BulkGetResults> {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
@@ -2364,7 +2385,7 @@ impl Db {
             grouped[self.shard_index(&id)].push((slot, id, opts));
         }
 
-        let mut out: Vec<Option<Value>> = vec![None; reqs.len()];
+        let mut out: Vec<Option<BulkGetResult>> = (0..reqs.len()).map(|_| None).collect();
         let read = futures::future::join_all(
             grouped
                 .into_iter()
@@ -2388,23 +2409,22 @@ impl Db {
         .await;
         for results in read {
             for (slot, id, rev, result) in results? {
-                out[slot] = Some(match result {
-                    Ok(doc) => json!({ "id": id, "docs": [{"ok": doc}] }),
-                    Err(error) => json!({
-                        "id": id,
-                        "docs": [{"error": {
-                            "id": id,
-                            "rev": rev,
-                            "error": error.error,
-                            "reason": error.reason,
-                        }}]
+                let doc = match result {
+                    Ok(doc) => BulkGetDoc::Doc(doc),
+                    Err(error) => BulkGetDoc::Error(BulkGetError {
+                        id: id.clone(),
+                        rev,
+                        error: error.error.to_string(),
+                        reason: error.reason,
                     }),
+                };
+                out[slot] = Some(BulkGetResult {
+                    id,
+                    docs: vec![doc],
                 });
             }
         }
-        Ok(json!({
-            "results": out.into_iter().map(|value| value.unwrap_or(Value::Null)).collect::<Vec<_>>()
-        }))
+        Ok(BulkGetResults { results: out })
     }
 
     // ----- local documents -------------------------------------------------
@@ -2422,14 +2442,14 @@ impl Db {
             .await
     }
 
-    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<Value> {
+    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<WriteOk> {
         let id = id.to_string();
         self.local_shard(&id)
             .call(move |s| write_local(s, &id, body))
             .await
     }
 
-    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
+    pub async fn local_delete(&self, id: &str) -> DbResult<WriteOk> {
         let id = id.to_string();
         self.local_shard(&id)
             .call(move |s| delete_local(s, &id))
@@ -2439,7 +2459,7 @@ impl Db {
     /// Apply the `_local/` documents of a `_bulk_docs` batch, each on the
     /// shard of its id. A delete of a missing document is a success at rev
     /// 0-0, unlike `DELETE /db/_local/id`, as in CouchDB.
-    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
+    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, WriteResult)> {
         let mut out = Vec::with_capacity(docs.len());
         for (slot, doc) in docs {
             let id = doc
@@ -2455,7 +2475,7 @@ impl Db {
             let result = if deleted {
                 match self.local_delete(&name).await {
                     Err(error) if error.status == 404 => {
-                        Ok(json!({"ok": true, "id": id, "rev": "0-0"}))
+                        Ok(WriteOk::new(id.clone(), "0-0".to_string()))
                     }
                     other => other,
                 }
@@ -2464,9 +2484,10 @@ impl Db {
             };
             out.push((
                 slot,
-                result.unwrap_or_else(
-                    |error| json!({"id": id, "error": error.error, "reason": error.reason}),
-                ),
+                match result {
+                    Ok(ok) => WriteResult::Ok(ok),
+                    Err(error) => WriteResult::error(Some(Value::String(id)), error),
+                },
             ));
         }
         out
@@ -2476,7 +2497,7 @@ impl Db {
     /// this node already holds a newer one. A rebalance uses it to hand a
     /// shard's local documents to a new replica; a normal write would number
     /// the copy one higher.
-    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<Value> {
+    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<WriteResult> {
         let mut out = Vec::with_capacity(docs.len());
         for doc in docs {
             let id = doc
@@ -2489,9 +2510,10 @@ impl Db {
                 .local_shard(&name)
                 .call(move |s| install_local(s, &name, doc))
                 .await;
-            out.push(result.unwrap_or_else(
-                |error| json!({"id": id, "error": error.error, "reason": error.reason}),
-            ));
+            out.push(match result {
+                Ok(ok) => WriteResult::Ok(ok),
+                Err(error) => WriteResult::error(Some(Value::String(id)), error),
+            });
         }
         out
     }
@@ -2499,13 +2521,17 @@ impl Db {
     /// `_local_docs`: the local documents in id order, as `_all_docs` rows,
     /// honouring `keys`, the key range, `descending`, `skip` and `limit`.
     /// CouchDB reports neither `total_rows` nor `offset` for them.
-    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<Value> {
+    pub async fn local_docs(&self, opts: &AllDocsOpts) -> DbResult<DocList> {
         self.local_docs_filtered(opts, None).await
     }
 
     /// Like `local_docs`, but only the shards whose `owned` entry is true.
     /// A cluster coordinator asks each node for one copy of every shard.
-    pub async fn local_docs_owned(&self, opts: &AllDocsOpts, owned: &ShardMask) -> DbResult<Value> {
+    pub async fn local_docs_owned(
+        &self,
+        opts: &AllDocsOpts,
+        owned: &ShardMask,
+    ) -> DbResult<DocList> {
         self.local_docs_filtered(opts, Some(owned)).await
     }
 
@@ -2513,7 +2539,7 @@ impl Db {
         &self,
         opts: &AllDocsOpts,
         owned: Option<&ShardMask>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<DocList> {
         let listed = futures::future::join_all(
             self.shards
                 .iter()
@@ -2528,7 +2554,12 @@ impl Db {
         }
         docs.sort_by(|a, b| a.0.cmp(&b.0));
         let rows = local_doc_rows(docs, opts);
-        Ok(json!({"total_rows": Value::Null, "offset": Value::Null, "rows": rows}))
+        Ok(DocList {
+            total_rows: None,
+            offset: None,
+            rows,
+            update_seq: None,
+        })
     }
 
     /// A node-local record that is not a document: the replication
@@ -3020,7 +3051,7 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
                     }
                 }
                 if let Some(Value::String(reduce)) = view.get("reduce") {
-                    crate::view::check_reduce_name(reduce).map_err(invalid)?;
+                    crate::viewfn::check_reduce_name(reduce).map_err(invalid)?;
                 }
             }
         }
@@ -3121,7 +3152,7 @@ static COMPILE_LOG: std::sync::Mutex<Vec<(String, Option<String>)>> =
 /// CouchDB's `try_compile`. A design document in another language is saved
 /// unchecked: there is no query server to compile it.
 fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
-    use crate::view::{check_compiles, ViewFunction};
+    use crate::viewfn::{check_compiles, ViewFunction};
     if obj
         .get("language")
         .and_then(Value::as_str)
@@ -3132,7 +3163,7 @@ fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
     let Some(Value::Object(views)) = obj.get("views") else {
         return Ok(());
     };
-    let limits = crate::view::ViewLimits::default();
+    let limits = crate::js::ViewLimits::default();
     for (name, view) in views {
         let functions = [(ViewFunction::Map, "map"), (ViewFunction::Reduce, "reduce")];
         for (function, member) in functions {
@@ -3266,7 +3297,7 @@ fn put_many(
     mut compile_errors: HashMap<usize, ApiError>,
     seq: &Arc<AtomicU64>,
     reserved: &Arc<AtomicU64>,
-) -> Vec<(usize, DbResult<Value>)> {
+) -> Vec<(usize, DbResult<WriteOk>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
     // What each staged document's record held in the shard before this batch.
@@ -3337,14 +3368,7 @@ fn put_many(
     }
     let ok_ids: std::collections::HashSet<String> = results
         .iter()
-        .filter_map(|(_, result)| {
-            result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|(_, result)| result.as_ref().ok().map(|ok| ok.id.clone()))
         .collect();
     shard.update_latest(&staged, &ok_ids);
     results
@@ -3388,7 +3412,7 @@ impl Stage<'_> {
         doc: Value,
         new_edits: bool,
         compile_error: Option<ApiError>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<WriteOk> {
         let doc = split_doc(doc)?;
         let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
@@ -3487,7 +3511,7 @@ impl Stage<'_> {
         }
         self.flush_meta(&id, &meta);
 
-        Ok(json!({"ok": true, "id": id, "rev": rev}))
+        Ok(WriteOk::new(id, rev))
     }
 
     fn stage_replicated(
@@ -3495,7 +3519,7 @@ impl Stage<'_> {
         doc: SplitDoc,
         mut meta: DocMeta,
         compile_error: Option<ApiError>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<WriteOk> {
         let SplitDoc {
             id,
             rev,
@@ -3507,7 +3531,7 @@ impl Stage<'_> {
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
         let known = meta.tree.contains(&rev);
         if known && meta.atts.contains_key(&rev) {
-            return Ok(json!({"ok": true, "id": id, "rev": rev}));
+            return Ok(WriteOk::new(id, rev));
         }
         // A replicated design document is validated too (couch_db:
         // prep_and_validate_replicated_updates), unless it is already stored.
@@ -3548,7 +3572,7 @@ impl Stage<'_> {
             self.flush_meta(&id, &meta);
         }
 
-        Ok(json!({"ok": true, "id": id, "rev": rev}))
+        Ok(WriteOk::new(id, rev))
     }
 }
 
@@ -3819,6 +3843,358 @@ impl ChangeFilter {
 pub(crate) enum ChangesItem {
     Row(ChangeRow),
     Scanned(u64),
+}
+
+/// The `_revs_diff` answer: the documents that miss revisions, in the order
+/// they were asked for, serialized as one JSON object keyed by document id.
+#[derive(Debug, Default)]
+pub struct RevsDiff(pub Vec<(String, RevsDiffEntry)>);
+
+#[derive(Debug, serde::Serialize)]
+pub struct RevsDiffEntry {
+    pub missing: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_ancestors: Vec<String>,
+}
+
+impl serde::Serialize for RevsDiff {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (id, entry) in &self.0 {
+            map.serialize_entry(id, entry)?;
+        }
+        map.end()
+    }
+}
+
+/// The `_bulk_get` answer: one result per request, in request order.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetResults {
+    pub results: Vec<Option<BulkGetResult>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetResult {
+    pub id: String,
+    pub docs: Vec<BulkGetDoc>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum BulkGetDoc {
+    #[serde(rename = "ok")]
+    Doc(Value),
+    #[serde(rename = "error")]
+    Error(BulkGetError),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetError {
+    pub id: String,
+    pub rev: String,
+    pub error: String,
+    pub reason: String,
+}
+
+/// The result of one document write.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WriteOk {
+    pub ok: bool,
+    pub id: String,
+    pub rev: String,
+}
+
+impl WriteOk {
+    pub fn new(id: String, rev: String) -> WriteOk {
+        WriteOk { ok: true, id, rev }
+    }
+}
+
+/// A failed document write. `id` is absent when the document had none that
+/// could be read; a `_bulk_docs` validation failure reports the `_id` as sent,
+/// whatever its type.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WriteError {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub id: Option<Value>,
+    pub error: String,
+    pub reason: String,
+}
+
+/// Read a field that may be `null` as `Some(Value::Null)`, so that it
+/// serializes back as `null` instead of vanishing.
+pub(crate) fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// One entry of a `_bulk_docs` answer: serialized as the bare object, `ok`
+/// results and error results alike.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum WriteResult {
+    Ok(WriteOk),
+    Error(WriteError),
+}
+
+impl WriteResult {
+    pub fn error(id: Option<Value>, error: ApiError) -> WriteResult {
+        WriteResult::Error(WriteError {
+            id,
+            error: error.error.to_string(),
+            reason: error.reason,
+        })
+    }
+
+    /// The wire form, for tests that read fields by name.
+    #[cfg(test)]
+    pub(crate) fn json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, WriteResult::Ok(_))
+    }
+}
+
+impl std::fmt::Display for WriteResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(text) => f.write_str(&text),
+            Err(_) => f.write_str("<unprintable>"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FlatWriteResult {
+    ok: Option<bool>,
+    #[serde(default, deserialize_with = "present_value")]
+    id: Option<Value>,
+    rev: Option<String>,
+    error: Option<String>,
+    reason: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for WriteResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let flat = FlatWriteResult::deserialize(deserializer)?;
+        match (flat.error, flat.reason) {
+            (Some(error), reason) => Ok(WriteResult::Error(WriteError {
+                id: flat.id,
+                error,
+                reason: reason.unwrap_or_default(),
+            })),
+            (None, _) => match (flat.ok, flat.id, flat.rev) {
+                (Some(ok), Some(Value::String(id)), Some(rev)) => {
+                    Ok(WriteResult::Ok(WriteOk { ok, id, rev }))
+                }
+                _ => Err(D::Error::custom("not a document write result")),
+            },
+        }
+    }
+}
+
+/// A feed position: a plain sequence number, or the opaque token a cluster
+/// feed reports instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seq {
+    Num(u64),
+    Token(String),
+}
+
+impl Seq {
+    /// The number, for a position that is one.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Seq::Num(seq) => Some(*seq),
+            Seq::Token(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Seq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Seq::Num(seq) => write!(f, "{seq}"),
+            Seq::Token(token) => f.write_str(token),
+        }
+    }
+}
+
+impl serde::Serialize for Seq {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Seq::Num(seq) => serializer.serialize_u64(*seq),
+            Seq::Token(token) => serializer.serialize_str(token),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Seq {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match <Value as serde::Deserialize>::deserialize(deserializer)? {
+            Value::Number(number) => number
+                .as_u64()
+                .map(Seq::Num)
+                .ok_or_else(|| D::Error::custom("a sequence must be a non-negative integer")),
+            Value::String(token) => Ok(Seq::Token(token)),
+            _ => Err(D::Error::custom("a sequence must be a number or a string")),
+        }
+    }
+}
+
+/// The `_changes` answer of one pass.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangesList {
+    pub results: Vec<ChangeEntry>,
+    pub last_seq: Seq,
+    #[serde(default)]
+    pub pending: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangeEntry {
+    pub seq: Seq,
+    pub id: String,
+    pub changes: Vec<ChangeRev>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub doc: Option<Value>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangeRev {
+    pub rev: String,
+}
+
+/// An `_all_docs`-shaped listing (`_all_docs`, `_design_docs`, `_local_docs`).
+/// `_local_docs` and keyed reads report no `offset` and `_local_docs` no
+/// `total_rows`: absent here means `null` on the wire.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocList {
+    pub total_rows: Option<u64>,
+    pub offset: Option<u64>,
+    pub rows: Vec<DocListRow>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub update_seq: Option<Value>,
+}
+
+impl DocList {
+    /// The wire form, for tests that read fields by name.
+    #[cfg(test)]
+    pub(crate) fn json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// One row of a `DocList`: a document (`id`, `key`, `value`, maybe `doc`) or
+/// the `error` row for a key that names none (`key`, `error`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DocListRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub key: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<RowValue>,
+    /// `Some(Value::Null)` is the `doc: null` of a deleted document.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub doc: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RowValue {
+    pub rev: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+impl DocListRow {
+    fn found(id: &str, rev: String, doc: Option<Value>) -> DocListRow {
+        DocListRow {
+            id: Some(id.to_string()),
+            key: Value::String(id.to_string()),
+            value: Some(RowValue {
+                rev,
+                deleted: false,
+            }),
+            doc,
+            error: None,
+        }
+    }
+
+    pub fn not_found(key: Value) -> DocListRow {
+        DocListRow {
+            id: None,
+            key,
+            value: None,
+            doc: None,
+            error: Some("not_found".to_string()),
+        }
+    }
+}
+
+/// The body of `GET /{db}`. Fields serialize in CouchDB's order.
+#[derive(Debug, serde::Serialize)]
+pub struct DbInfo {
+    pub db_name: String,
+    pub doc_count: u64,
+    pub doc_del_count: u64,
+    pub update_seq: u64,
+    pub purge_seq: u64,
+    pub compact_running: bool,
+    pub disk_size: u64,
+    pub data_size: u64,
+    pub sizes: DbSizes,
+    pub instance_start_time: String,
+    pub disk_format_version: u64,
+    pub committed_update_seq: u64,
+    pub uuid: String,
+    pub cluster: ClusterInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub props: Option<DbProps>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DbSizes {
+    pub active: u64,
+    pub external: u64,
+    pub file: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ClusterInfo {
+    pub q: u32,
+    pub n: usize,
+    pub w: usize,
+    pub r: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DbProps {
+    pub partitioned: bool,
 }
 
 #[derive(Debug)]
@@ -4225,7 +4601,7 @@ fn all_docs_key_row(
     shard: &mut crate::store::Shard,
     key: &str,
     opts: &AllDocsOpts,
-) -> DbResult<Option<Value>> {
+) -> DbResult<Option<DocListRow>> {
     let Some(meta) = shard.get_meta(key)? else {
         return Ok(None);
     };
@@ -4233,13 +4609,13 @@ fn all_docs_key_row(
         return Ok(None);
     };
     let deleted = meta.tree.is_deleted(&winner);
-    let mut row = json!({"id": key, "key": key, "value": {"rev": winner.clone()}});
-    if deleted {
-        row["value"]["deleted"] = json!(true);
+    let mut row = DocListRow::found(key, winner.clone(), None);
+    if let Some(value) = &mut row.value {
+        value.deleted = deleted;
     }
     if opts.include_docs {
-        if deleted {
-            row["doc"] = Value::Null;
+        row.doc = Some(if deleted {
+            Value::Null
         } else {
             let doc_opts = DocOpts {
                 rev: Some(winner),
@@ -4247,8 +4623,8 @@ fn all_docs_key_row(
                 attachments: opts.attachments,
                 ..Default::default()
             };
-            row["doc"] = read_doc(shard, key, &doc_opts)?;
-        }
+            read_doc(shard, key, &doc_opts)?
+        });
     }
     Ok(Some(row))
 }
@@ -4279,7 +4655,7 @@ fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
     }
 }
 
-fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
+fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
     // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
     // from the supplied `_rev`, absent meaning 0, and never conflicts: the
     // stored revision is not consulted.
@@ -4300,32 +4676,36 @@ fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
     let mut tx = Tx::new();
     tx.put_json(&local_key(id), &body)?;
     s.commit(tx)?;
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+    Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
-fn delete_local(s: &mut Shard, id: &str) -> DbResult<Value> {
+fn delete_local(s: &mut Shard, id: &str) -> DbResult<WriteOk> {
     if s.get_checked(&local_key(id))?.is_none() {
         return Err(ApiError::not_found("missing"));
     }
     let mut tx = Tx::new();
     tx.delete(&local_key(id));
     s.commit(tx)?;
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
+    Ok(WriteOk::new(format!("_local/{id}"), "0-0".to_string()))
 }
 
 /// Keep a copy of a local document as it is, unless a newer one is stored.
-fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<Value> {
+fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
     let Some(incoming) = local_rev_number(&doc) else {
         return Err(ApiError::bad_request("Invalid rev format"));
     };
     let held = read_local(s, id)?.as_ref().and_then(local_rev_number);
-    let rev = doc.get("_rev").cloned().unwrap_or(Value::Null);
+    let rev = doc
+        .get("_rev")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if held.is_none_or(|held| held < incoming) {
         let mut tx = Tx::new();
         tx.put_json(&local_key(id), &doc)?;
         s.commit(tx)?;
     }
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+    Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
 /// Every local document of one shard, with its `_local/` id.
@@ -4356,16 +4736,16 @@ fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
 
 /// Select and render `_local_docs` rows from every local document, which
 /// arrive in id order.
-fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> {
+fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<DocListRow> {
     let render = |id: &str, doc: &Value| {
-        let rev = doc.get("_rev").cloned().unwrap_or_else(|| json!("0-1"));
-        let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-        if opts.include_docs {
-            row["doc"] = doc.clone();
-        }
-        row
+        let rev = doc
+            .get("_rev")
+            .and_then(Value::as_str)
+            .unwrap_or("0-1")
+            .to_string();
+        DocListRow::found(id, rev, opts.include_docs.then(|| doc.clone()))
     };
-    let rows: Vec<Value> = if let Some(keys) = &opts.keys {
+    let rows: Vec<DocListRow> = if let Some(keys) = &opts.keys {
         let mut keys: Vec<&str> = keys
             .iter()
             .filter_map(Value::as_str)
@@ -4377,7 +4757,7 @@ fn local_doc_rows(docs: Vec<(String, Value)>, opts: &AllDocsOpts) -> Vec<Value> 
         keys.into_iter()
             .map(|key| match docs.iter().find(|(id, _)| id == key) {
                 Some((id, doc)) => render(id, doc),
-                None => json!({"key": key, "error": "not_found"}),
+                None => DocListRow::not_found(Value::String(key.to_string())),
             })
             .collect()
     } else {
@@ -4415,17 +4795,26 @@ struct AllDocsRow {
     doc: Option<Value>,
 }
 
-fn all_docs_row_json(AllDocsRow { id, rev, doc }: AllDocsRow) -> Value {
-    let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
-    if let Some(doc) = doc {
-        row["doc"] = doc;
+fn all_docs_row(AllDocsRow { id, rev, doc }: AllDocsRow) -> DocListRow {
+    DocListRow {
+        key: Value::String(id.clone()),
+        id: Some(id),
+        value: Some(RowValue {
+            rev,
+            deleted: false,
+        }),
+        doc,
+        error: None,
     }
-    row
 }
 
-fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<Value> {
-    let results: Vec<Value> = rows.into_iter().map(all_docs_row_json).collect();
-    Ok(json!({ "total_rows": total, "offset": offset, "rows": results }))
+fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResult<DocList> {
+    Ok(DocList {
+        total_rows: Some(total as u64),
+        offset: Some(offset as u64),
+        rows: rows.into_iter().map(all_docs_row).collect(),
+        update_seq: None,
+    })
 }
 
 fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<Vec<ChangeRow>> {
@@ -4442,11 +4831,11 @@ fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<
             if docs.is_empty() {
                 return Ok(Vec::new());
             }
-            let matched = crate::view::run_filter_json(
+            let matched = crate::viewfn::run_filter_json(
                 source,
                 query,
                 &docs,
-                crate::view::ViewLimits::default(),
+                crate::js::ViewLimits::default(),
             )
             .map_err(ApiError::from)?;
             Ok(rows
@@ -4737,7 +5126,7 @@ mod tests {
                 doc["_rev"] = json!(rev);
             }
             let put = db.put_docs(vec![doc], true).await.unwrap();
-            revs.push(put[0]["rev"].as_str().unwrap().to_string());
+            revs.push(put[0].json()["rev"].as_str().unwrap().to_string());
         }
         assert_eq!(stored_bodies(&db, revs.clone()).await, [true; 4]);
         db.compact().await.unwrap();
@@ -4814,7 +5203,7 @@ mod tests {
         let (db, root) = single_shard_db("att-chunk").await;
         // Uploads are rejected at the API, so plant the attachment directly.
         let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
         db.shards[0]
             .call(move |shard| {
                 let mut meta = shard.get_meta("a")?.unwrap();
@@ -4863,7 +5252,7 @@ mod tests {
     async fn a_non_ascii_attachment_digest_is_corruption_not_a_panic() {
         let (db, root) = single_shard_db("att-digest").await;
         let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
         db.shards[0]
             .call(move |shard| {
                 let mut meta = shard.get_meta("a")?.unwrap();
@@ -4927,7 +5316,7 @@ mod tests {
         );
         assert_eq!(db.local_get("ae2:peer").await.unwrap(), None);
 
-        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap();
+        let listing = db.local_docs(&AllDocsOpts::default()).await.unwrap().json();
         let listed: Vec<&str> = listing["rows"]
             .as_array()
             .unwrap()
@@ -4944,6 +5333,214 @@ mod tests {
         let stale = json!({"_id": "_local/doc00", "_rev": "0-2", "v": "stale"});
         db.install_local_docs(vec![stale]).await;
         assert_eq!(db.local_get("doc00").await.unwrap().unwrap()["v"], "copy");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `_local_docs` rows serialize as `_all_docs` rows do, with null
+    /// `total_rows` and `offset` and `not_found` rows for absent keys.
+    #[tokio::test]
+    async fn local_docs_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("local-wire").await;
+        db.local_put("a", json!({"x": 1})).await.unwrap();
+        db.local_put("b", json!({"y": [true, null]})).await.unwrap();
+        let text = |listing: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&listing.unwrap()).unwrap()).unwrap()
+        };
+        let plain = text(db.local_docs(&AllDocsOpts::default()).await);
+        assert_eq!(
+            plain,
+            r#"{"total_rows":null,"offset":null,"rows":[{"id":"_local/a","key":"_local/a","value":{"rev":"0-1"}},{"id":"_local/b","key":"_local/b","value":{"rev":"0-1"}}]}"#
+        );
+        let keyed = text(
+            db.local_docs(&AllDocsOpts {
+                include_docs: true,
+                keys: Some(vec![
+                    json!("_local/b"),
+                    json!("_local/zz"),
+                    json!("_local/a"),
+                ]),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            keyed,
+            r#"{"total_rows":null,"offset":null,"rows":[{"id":"_local/b","key":"_local/b","value":{"rev":"0-1"},"doc":{"y":[true,null],"_id":"_local/b","_rev":"0-1"}},{"key":"_local/zz","error":"not_found"},{"id":"_local/a","key":"_local/a","value":{"rev":"0-1"},"doc":{"x":1,"_id":"_local/a","_rev":"0-1"}}]}"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `_bulk_get` answers one entry per request in request order: the
+    /// document under `ok`, or the error with the revision that was asked for.
+    #[tokio::test]
+    async fn bulk_get_serializes_in_wire_order() {
+        let (db, root) = single_shard_db("bulk-get-wire").await;
+        let written = db
+            .put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let body = json!({"docs": [
+            {"id": "a", "rev": rev},
+            {"id": "nope"},
+            {"id": "a", "rev": "1-00000000000000000000000000000000"},
+            {"id": "a", "rev": "garbage"},
+        ]});
+        let got = db.bulk_get(&body, false, false, false).await.unwrap();
+        let text = serde_json::to_string(&serde_json::to_value(&got).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"results":[{{"id":"a","docs":[{{"ok":{{"_id":"a","_rev":"{rev}","n":1}}}}]}},{{"id":"nope","docs":[{{"error":{{"id":"nope","rev":"undefined","error":"not_found","reason":"missing"}}}}]}},{{"id":"a","docs":[{{"error":{{"id":"a","rev":"1-00000000000000000000000000000000","error":"not_found","reason":"missing"}}}}]}},{{"id":"a","docs":[{{"error":{{"id":"a","rev":"garbage","error":"not_found","reason":"missing"}}}}]}}]}}"#
+            )
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `put_docs` answers one entry per document in request order: `ok`
+    /// entries, errors with or without the document id, `_local/` writes.
+    #[tokio::test]
+    async fn put_docs_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("put-wire").await;
+        let text = |results: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&results.unwrap()).unwrap()).unwrap()
+        };
+        let first = text(
+            db.put_docs(
+                vec![
+                    json!({"_id": "a"}),
+                    json!({"_id": "_bad"}),
+                    json!({"_id": 5}),
+                    json!({"_id": "_local/l"}),
+                    json!({"_id": "_local/l", "_deleted": true}),
+                    json!({"_id": "_local/gone", "_deleted": true}),
+                ],
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            first,
+            r#"[{"ok":true,"id":"a","rev":"1-967a00dff5e02add41819138abb3284d"},{"error":"illegal_docid","reason":"Only reserved document ids may start with underscore."},{"error":"illegal_docid","reason":"Document id must be a string"},{"ok":true,"id":"_local/l","rev":"0-1"},{"ok":true,"id":"_local/l","rev":"0-0"},{"ok":true,"id":"_local/gone","rev":"0-0"}]"#
+        );
+        let second = text(
+            db.put_docs(
+                vec![
+                    json!({"_id": "a"}),
+                    json!({"_id": "_local/x", "_rev": "bad"}),
+                ],
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            second,
+            r#"[{"id":"a","error":"conflict","reason":"Document update conflict."},{"id":"_local/x","error":"bad_request","reason":"Invalid rev format"}]"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The changes feed serializes with `seq`, `id`, `changes`, then the
+    /// optional `deleted` and `doc`, followed by `last_seq` and `pending`.
+    #[tokio::test]
+    async fn changes_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("changes-wire").await;
+        let written = db
+            .put_docs(
+                vec![json!({"_id": "a", "n": 1}), json!({"_id": "b", "n": 2})],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev_b = written[1].json()["rev"].as_str().unwrap().to_string();
+        db.put_docs(
+            vec![json!({"_id": "b", "_rev": rev_b, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+        let text = |changes: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&changes.unwrap()).unwrap()).unwrap()
+        };
+        let plain = text(db.changes(&ChangesOpts::default()).await);
+        assert_eq!(
+            plain,
+            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}]},{"seq":3,"id":"b","changes":[{"rev":"2-6b4cac76d0f72a9035d0e6b20c710a24"}],"deleted":true}],"last_seq":3,"pending":0}"#
+        );
+        let docs = text(
+            db.changes(&ChangesOpts {
+                include_docs: true,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            docs,
+            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}],"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}],"last_seq":1,"pending":1}"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `_all_docs` rows serialize as `id`, `key`, `value`, then `doc`; a keyed
+    /// read answers `not_found` rows and `doc: null` for deleted documents.
+    #[tokio::test]
+    async fn all_docs_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("all-docs-wire").await;
+        db.put_docs(
+            vec![json!({"_id": "a", "n": 1}), json!({"_id": "b", "n": 2})],
+            true,
+        )
+        .await
+        .unwrap();
+        let gone = db.get_doc("b", &DocOpts::default()).await.unwrap()["_rev"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        db.put_docs(
+            vec![json!({"_id": "b", "_rev": gone, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+        let text = |listing: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&listing.unwrap()).unwrap()).unwrap()
+        };
+        let plain = text(db.all_docs(&AllDocsOpts::default()).await);
+        assert_eq!(
+            plain,
+            r#"{"total_rows":1,"offset":0,"rows":[{"id":"a","key":"a","value":{"rev":"1-731bef401491606a3b246ed178e697c1"}}]}"#
+        );
+        let with_docs = text(
+            db.all_docs(&AllDocsOpts {
+                include_docs: true,
+                skip: 0,
+                limit: 1,
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            with_docs,
+            r#"{"total_rows":1,"offset":0,"rows":[{"id":"a","key":"a","value":{"rev":"1-731bef401491606a3b246ed178e697c1"},"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}]}"#
+        );
+        let keyed = text(
+            db.all_docs(&AllDocsOpts {
+                include_docs: true,
+                keys: Some(vec![json!("b"), json!("zz"), json!(7), json!("a")]),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            keyed,
+            r#"{"total_rows":1,"offset":null,"rows":[{"id":"b","key":"b","value":{"rev":"2-6b4cac76d0f72a9035d0e6b20c710a24","deleted":true},"doc":null},{"key":"zz","error":"not_found"},{"key":7,"error":"not_found"},{"id":"a","key":"a","value":{"rev":"1-731bef401491606a3b246ed178e697c1"},"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}]}"#
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5034,14 +5631,19 @@ mod tests {
     }
 
     /// The streamed `_all_docs` reply, assembled in the shape of `all_docs`.
-    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> Value {
+    async fn streamed_all_docs(db: &Arc<Db>, opts: &AllDocsOpts) -> DocList {
         use futures::StreamExt;
         let (head, rows) = Db::all_docs_stream(db.clone(), opts).await.unwrap();
-        let rows: Vec<Value> = Box::pin(rows)
+        let rows: Vec<DocListRow> = Box::pin(rows)
             .map(|row| row.unwrap())
             .collect::<Vec<_>>()
             .await;
-        json!({"total_rows": head.total_rows, "offset": head.offset, "rows": rows})
+        DocList {
+            total_rows: Some(head.total_rows as u64),
+            offset: Some(head.offset as u64),
+            rows,
+            update_seq: None,
+        }
     }
 
     #[tokio::test]
@@ -5067,7 +5669,7 @@ mod tests {
         let put = db.put_docs(docs, true).await.unwrap();
         // One corrupt body, which include_docs skips.
         let bad_id = "doc0450";
-        let bad_rev = put[450]["rev"].as_str().unwrap().to_string();
+        let bad_rev = put[450].json()["rev"].as_str().unwrap().to_string();
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
@@ -5077,7 +5679,7 @@ mod tests {
             .await
             .unwrap();
         // A deleted document does not count.
-        let gone = put[10]["rev"].as_str().unwrap();
+        let gone = put[10].json()["rev"].as_str().unwrap().to_string();
         db.put_docs(
             vec![json!({"_id": "doc0010", "_rev": gone, "_deleted": true})],
             true,
@@ -5222,8 +5824,8 @@ mod tests {
         );
         let opts = AllDocsOpts::default();
         assert_eq!(
-            streamed_all_docs(&empty, &opts).await,
-            empty.all_docs(&opts).await.unwrap()
+            streamed_all_docs(&empty, &opts).await.json(),
+            empty.all_docs(&opts).await.unwrap().json()
         );
         drop(db);
         drop(empty);
@@ -5254,7 +5856,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let bad_rev = put[1]["rev"].as_str().unwrap().to_string();
+        let bad_rev = put[1].json()["rev"].as_str().unwrap().to_string();
         let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
@@ -5266,7 +5868,7 @@ mod tests {
 
         let before = crate::metrics::corrupt_records_skipped();
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(row_ids(&all, "rows"), ["a", "bad-body", "c"]);
+        assert_eq!(row_ids(&all.json(), "rows"), ["a", "bad-body", "c"]);
         assert!(crate::metrics::corrupt_records_skipped() > before);
 
         let before = crate::metrics::corrupt_records_skipped();
@@ -5277,14 +5879,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(row_ids(&all, "rows"), ["a", "c"]);
+        assert_eq!(row_ids(&all.json(), "rows"), ["a", "c"]);
         assert!(
             crate::metrics::corrupt_records_skipped() > before,
             "the skipped body was not counted"
         );
 
         let changes = db.changes(&ChangesOpts::default()).await.unwrap();
-        assert_eq!(row_ids(&changes, "results"), ["a", "bad-body", "c"]);
+        assert_eq!(
+            row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
+            ["a", "bad-body", "c"]
+        );
         let before = crate::metrics::corrupt_records_skipped();
         let changes = db
             .changes(&ChangesOpts {
@@ -5293,7 +5898,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(row_ids(&changes, "results"), ["a", "c"]);
+        assert_eq!(
+            row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
+            ["a", "c"]
+        );
         assert!(crate::metrics::corrupt_records_skipped() > before);
 
         // View and search builds index every readable document.
@@ -5965,6 +6573,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The `GET /db` body is the serialized `info()` result: its field order
+    /// and the optional `props` are part of the wire format.
+    #[tokio::test]
+    async fn info_serializes_in_wire_order() {
+        for partitioned in [false, true] {
+            let q = 2u32;
+            let root =
+                std::env::temp_dir().join(format!("douchdb-info-wire-{}", crate::util::uuid()));
+            let db = Db::open(
+                &root,
+                "infowire",
+                DbConfig {
+                    q,
+                    revs_limit: 100,
+                    shard_map: ShardMap::single(q),
+                    partitioned,
+                },
+            )
+            .unwrap();
+            let info = serde_json::to_value(db.info().await.unwrap()).unwrap();
+            let mut keys: Vec<&str> = info
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = vec![
+                "db_name",
+                "doc_count",
+                "doc_del_count",
+                "update_seq",
+                "purge_seq",
+                "compact_running",
+                "disk_size",
+                "data_size",
+                "sizes",
+                "instance_start_time",
+                "disk_format_version",
+                "committed_update_seq",
+                "uuid",
+                "cluster",
+            ];
+            if partitioned {
+                expected.push("props");
+            }
+            assert_eq!(keys, expected);
+            keys.clear();
+            assert_eq!(
+                info["sizes"],
+                json!({"active": 0, "external": 0, "file": 0})
+            );
+            assert_eq!(info["cluster"], json!({"q": 2, "n": 1, "w": 1, "r": 1}));
+            assert_eq!(info["doc_count"], json!(0));
+            assert_eq!(info["compact_running"], json!(false));
+            if partitioned {
+                assert_eq!(info["props"], json!({"partitioned": true}));
+            }
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// `_revs_diff` answers in request order, leaves `possible_ancestors` out
+    /// when there are none, and omits documents that miss nothing.
+    #[tokio::test]
+    async fn revs_diff_serializes_in_request_order() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-revs-wire-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "revswire",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let written = db
+            .put_docs(vec![json!({"_id": "known"}), json!({"_id": "same"})], true)
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let same_rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        let body: Value = serde_json::from_str(&format!(
+            r#"{{"zed":["1-aaaa"],"known":["{rev}","2-ffff"],"same":["{same_rev}"],"not-a-list":"x","alpha":["1-bbbb","1-cccc"]}}"#
+        ))
+        .unwrap();
+        let diff = db.revs_diff(&body).await.unwrap();
+        let text = serde_json::to_string(&serde_json::to_value(&diff).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"zed":{{"missing":["1-aaaa"]}},"known":{{"missing":["2-ffff"],"possible_ancestors":["{rev}"]}},"alpha":{{"missing":["1-bbbb","1-cccc"]}}}}"#
+            )
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Requests that touch many documents fan out one call per shard; the
     /// answers must still come back per document, in the order asked.
     #[tokio::test]
@@ -5988,10 +6697,10 @@ mod tests {
         assert!(shards.len() > 1, "the ids must spread over shards");
         let docs = ids.iter().map(|id| json!({"_id": id, "n": id})).collect();
         let written = db.put_docs(docs, true).await.unwrap();
-        assert!(written.iter().all(|row| row["ok"] == json!(true)));
+        assert!(written.iter().all(|row| row.is_ok()));
         let info = db.info().await.unwrap();
-        assert_eq!(info["doc_count"], json!(12));
-        assert_eq!(info["update_seq"], json!(12));
+        assert_eq!(info.doc_count, 12);
+        assert_eq!(info.update_seq, 12);
 
         let got = db.get_docs(&ids, &DocOpts::default()).await.unwrap();
         for (id, doc) in ids.iter().zip(&got) {
@@ -6006,17 +6715,18 @@ mod tests {
         // lists the leaf it has as a possible ancestor.
         let mut diff = Map::new();
         for id in &ids {
-            let rev = written[ids.iter().position(|other| other == id).unwrap()]["rev"].clone();
+            let rev =
+                written[ids.iter().position(|other| other == id).unwrap()].json()["rev"].clone();
             diff.insert(id.clone(), json!([rev, "2-ffff"]));
         }
         let diff = db.revs_diff(&Value::Object(diff)).await.unwrap();
-        let rows = diff.as_object().unwrap();
-        assert_eq!(rows.len(), 12);
+        assert_eq!(diff.0.len(), 12);
         for (position, id) in ids.iter().enumerate() {
-            assert_eq!(rows[id]["missing"], json!(["2-ffff"]));
+            let entry = &diff.0.iter().find(|(row, _)| row == id).unwrap().1;
+            assert_eq!(entry.missing, ["2-ffff"]);
             assert_eq!(
-                rows[id]["possible_ancestors"],
-                json!([written[position]["rev"]])
+                json!(entry.possible_ancestors),
+                json!([written[position].json()["rev"]])
             );
         }
 
@@ -6024,13 +6734,19 @@ mod tests {
         // revisions it removed.
         let mut purge = Map::new();
         for (position, id) in ids.iter().enumerate().take(6) {
-            purge.insert(id.clone(), json!([written[position]["rev"], "9-nope"]));
+            purge.insert(
+                id.clone(),
+                json!([written[position].json()["rev"], "9-nope"]),
+            );
         }
         let purged = db.purge(&Value::Object(purge), 0).await.unwrap();
         for (position, id) in ids.iter().enumerate().take(6) {
-            assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
+            assert_eq!(
+                purged["purged"][id],
+                json!([written[position].json()["rev"]])
+            );
         }
-        assert_eq!(db.info().await.unwrap()["doc_count"], json!(6));
+        assert_eq!(db.info().await.unwrap().doc_count, 6);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -6143,7 +6859,7 @@ mod tests {
         // feed resumed from it would skip that write when it commits.
         assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
         let info = db.info().await.unwrap();
-        let reported = info["update_seq"].as_u64().unwrap();
+        let reported = info.update_seq;
         assert!(reported < held, "info update_seq {reported}");
 
         drop(db);
@@ -6173,7 +6889,7 @@ mod tests {
         db.put_docs(vec![json!({"_id": good})], true).await.unwrap();
         // Build the lazy indexes so the failure has to repair them.
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(all["total_rows"], 1);
+        assert_eq!(all.total_rows, Some(1));
 
         db.shards[0]
             .call(|s| {
@@ -6187,8 +6903,8 @@ mod tests {
 
         assert!(db.get_doc(&lost, &DocOpts::default()).await.is_err());
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
-        assert_eq!(all["rows"].as_array().unwrap().len(), 1, "{all}");
-        assert_eq!(db.info().await.unwrap()["doc_count"], 1);
+        assert_eq!(all.rows.len(), 1, "{all:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
 
         // The changes cursor is not held back by the lost write.
         assert_eq!(db.changes_watermark(0, None), db.seq.load(Ordering::SeqCst));
@@ -6213,8 +6929,8 @@ mod tests {
 
         // The shard accepts the write again.
         let results = db.put_docs(vec![json!({"_id": lost})], true).await.unwrap();
-        assert!(results[0].get("error").is_none(), "{results:?}");
-        assert_eq!(db.info().await.unwrap()["doc_count"], 2);
+        assert!(results[0].is_ok(), "{results:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 2);
         let (rows, last_seq, _) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(last_seq, db.seq.load(Ordering::SeqCst));
@@ -6350,7 +7066,7 @@ mod tests {
             .put_docs(vec![design_doc_with_map(map)], true)
             .await
             .unwrap();
-        assert!(put[0].get("rev").is_some(), "{put:?}");
+        assert!(put[0].is_ok(), "{put:?}");
         let threads = compiled_on(map);
         assert_eq!(threads.len(), 1, "{threads:?}");
         assert!(
@@ -6374,14 +7090,14 @@ mod tests {
             .put_docs(vec![design_doc_with_map(good)], true)
             .await
             .unwrap();
-        assert!(put[0].get("rev").is_some(), "{put:?}");
+        assert!(put[0].is_ok(), "{put:?}");
 
         let bad = "function(doc){ /* order-bad */ emit(";
         let conflict = db
             .put_docs(vec![design_doc_with_map(bad)], true)
             .await
             .unwrap();
-        assert_eq!(conflict[0]["error"], "conflict", "{conflict:?}");
+        assert_eq!(conflict[0].json()["error"], "conflict", "{conflict:?}");
 
         let replicated_map = "function(doc){ /* order-replicated */ emit(1, 1); }";
         let hash = "b".repeat(32);
@@ -6393,7 +7109,7 @@ mod tests {
         });
         for _ in 0..2 {
             let out = db.put_docs(vec![replicated.clone()], false).await.unwrap();
-            assert_eq!(out[0]["ok"], true, "{out:?}");
+            assert_eq!(out[0].json()["ok"], true, "{out:?}");
         }
         assert_eq!(compiled_on(replicated_map).len(), 1);
         drop(db);
@@ -6437,7 +7153,7 @@ mod tests {
         for _ in 0..n {
             let id = uuid();
             let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
-            let rev = written[0]["rev"].as_str().unwrap().to_string();
+            let rev = written[0].json()["rev"].as_str().unwrap().to_string();
             db.purge(&json!({ id.clone(): [rev.clone()] }), 0)
                 .await
                 .unwrap();

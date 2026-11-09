@@ -415,24 +415,6 @@ fn db_get_checked(db: &mut DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(value.map(|bytes| bytes.to_vec()))
 }
 
-/// A stored record that was read from LevelDB successfully but cannot be
-/// decoded. This is the only error a listing may skip: it names one document.
-/// An error from LevelDB itself (I/O, checksum) is a plain `anyhow::Error`
-/// and always fails the request. Point reads and writes treat both the same.
-#[derive(Debug)]
-pub struct CorruptRecord {
-    pub id: String,
-    pub reason: String,
-}
-
-impl std::fmt::Display for CorruptRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "corrupt metadata for {}: {}", self.id, self.reason)
-    }
-}
-
-impl std::error::Error for CorruptRecord {}
-
 /// Which database and shard a shard actor serves, for log lines.
 #[derive(Clone, Debug)]
 pub struct ShardName {
@@ -490,17 +472,20 @@ fn doc_id_from_meta_key(key: &[u8]) -> Result<&str> {
 /// Decode a stored metadata record. A record that does not parse is
 /// corruption: point reads and writes fail on it, and listings skip it
 /// through `ShardName::report_corrupt`.
-fn parse_meta(key: &[u8], value: &[u8]) -> std::result::Result<(String, DocMeta), CorruptRecord> {
+fn parse_meta(
+    key: &[u8],
+    value: &[u8],
+) -> std::result::Result<(String, DocMeta), crate::error::CorruptRecord> {
     #[cfg(test)]
     META_PARSES.with(|count| count.set(count.get() + 1));
     let id = key
         .get(2..)
         .and_then(|id| std::str::from_utf8(id).ok())
-        .ok_or_else(|| CorruptRecord {
+        .ok_or_else(|| crate::error::CorruptRecord {
             id: String::from_utf8_lossy(key.get(2..).unwrap_or_default()).into_owned(),
             reason: "key is not UTF-8".to_string(),
         })?;
-    let meta = serde_json::from_slice(value).map_err(|error| CorruptRecord {
+    let meta = serde_json::from_slice(value).map_err(|error| crate::error::CorruptRecord {
         id: id.to_string(),
         reason: error.to_string(),
     })?;
