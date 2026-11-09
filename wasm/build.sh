@@ -13,9 +13,11 @@ SDK_X86_64_SHA256=c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0b
 
 wasm_dir=$(cd "$(dirname "$0")" && pwd)
 volume=qjs-runner-target-$$
-trap 'docker volume rm -f "$volume" >/dev/null' EXIT
+container=qjs-runner-build-$$
+# The container goes first: a volume in use cannot be removed.
+trap 'docker rm -f "$container" >/dev/null 2>&1; docker volume rm -f "$volume" >/dev/null' EXIT
 
-docker run --rm --platform linux/arm64 \
+docker run --rm --name "$container" --platform linux/arm64 \
   -v "$wasm_dir":/work \
   -v "$volume":/target \
   -e CARGO_TARGET_DIR=/target \
