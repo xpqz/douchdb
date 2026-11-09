@@ -345,8 +345,22 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
     let latest = flag(q, "latest");
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
-        return match db.bulk_get(&value, revs, latest).await {
-            Ok(results) => json_of(StatusCode::OK, &results),
+        if st.ctx.cluster.is_internal(headers) {
+            return match db.bulk_get(&value, revs, latest).await {
+                Ok(results) => json_of(StatusCode::OK, &results),
+                Err(e) => fail(e),
+            };
+        }
+        return match Db::bulk_get_stream(db.clone(), value, revs, latest).await {
+            Ok(results) => {
+                stream_json_response(
+                    &Method::POST,
+                    b"{\"results\":[".to_vec(),
+                    results,
+                    b"]}".to_vec(),
+                )
+                .await
+            }
             Err(e) => fail(e),
         };
     }
@@ -722,10 +736,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(update_seq) => update_seq,
         Err(error) => return fail(error),
     };
-    if opts.keys.is_none()
-        && !req.st.ctx.cluster.is_clustered()
-        && !req.st.ctx.cluster.is_internal(req.headers)
-    {
+    if !req.st.ctx.cluster.is_clustered() && !req.st.ctx.cluster.is_internal(req.headers) {
         return stream_all_docs(&req, &opts, update_seq).await;
     }
     let result = run_all_docs(&req, &opts).await;
@@ -735,7 +746,86 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
 /// Rows are encoded into chunks of about this size as they are read.
 const STREAM_CHUNK: usize = 64 * 1024;
 
-/// `_all_docs` without `keys` on this node: the body is written while the
+/// A JSON body written while its rows are produced: `head`, the rows
+/// separated by commas, then `tail`. Rows are encoded into chunks of about
+/// `STREAM_CHUNK`, so the first bytes leave before the last row is read and
+/// memory stays constant. A failing row can only end the connection early.
+pub(super) fn stream_json_rows<T: serde::Serialize + Send + 'static>(
+    head: Vec<u8>,
+    rows: impl futures::Stream<Item = DbResult<T>> + Send + 'static,
+    tail: Vec<u8>,
+) -> Body {
+    let stream = async_stream::stream! {
+        let mut rows = Box::pin(rows);
+        let mut buffer = head;
+        let mut first = true;
+        while let Some(item) = rows.next().await {
+            let encoded = item.and_then(|row| serde_json::to_vec(&row).map_err(ApiError::internal));
+            match encoded {
+                Ok(encoded) => {
+                    if !first {
+                        buffer.push(b',');
+                    }
+                    first = false;
+                    buffer.extend_from_slice(&encoded);
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!(
+                        "{}: {}",
+                        error.error, error.reason
+                    )));
+                    return;
+                }
+            }
+            if buffer.len() >= STREAM_CHUNK {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        buffer.extend_from_slice(&tail);
+        yield Ok(Bytes::from(buffer));
+    };
+    Body::from_stream(stream)
+}
+
+/// The end of a `{"rows":[...]}` body: the array, the `update_seq` taken
+/// before the rows were read when the request asked for one, and the object.
+pub(super) fn rows_tail(update_seq: Option<Value>) -> Vec<u8> {
+    let mut tail = vec![b']'];
+    if let Some(update_seq) = update_seq {
+        tail.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
+    }
+    tail.push(b'}');
+    tail
+}
+
+/// A 200 reply whose JSON body is written while `rows` are read (see
+/// `stream_json_rows`). The first row is read before the status is sent, so an
+/// error there still gets its status; one after that can only end the
+/// connection early. A HEAD reads no rows.
+pub(super) async fn stream_json_response<T: serde::Serialize + Send + 'static>(
+    method: &Method,
+    head: Vec<u8>,
+    rows: impl futures::Stream<Item = DbResult<T>> + Send + 'static,
+    tail: Vec<u8>,
+) -> Response {
+    let body = if *method == Method::HEAD {
+        Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())
+    } else {
+        let mut rows = Box::pin(rows);
+        let first_row = rows.next().await;
+        if let Some(Err(error)) = first_row {
+            return fail(error);
+        }
+        stream_json_rows(head, futures::stream::iter(first_row).chain(rows), tail)
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `_all_docs` on this node: the body is written while the
 /// rows are read, so a listing of any size takes constant memory and the
 /// first bytes leave before the last row is read. The bytes are those of the
 /// buffered reply. An error on the first page still gets its status; one
@@ -745,70 +835,31 @@ async fn stream_all_docs(
     opts: &AllDocsOpts,
     update_seq: Option<Value>,
 ) -> Response {
-    let (head, rows) = match Db::all_docs_stream(req.db.clone(), opts).await {
-        Ok(stream) => stream,
-        Err(error) => return fail(error),
+    // A `keys` query answers one row per key and has no `offset`.
+    let (head, rows) = if opts.keys.is_some() {
+        match Db::all_docs_keys_stream(req.db.clone(), opts).await {
+            Ok((total_rows, rows)) => (
+                format!("{{\"total_rows\":{total_rows},\"offset\":null,\"rows\":["),
+                rows.boxed(),
+            ),
+            Err(error) => return fail(error),
+        }
+    } else {
+        match Db::all_docs_stream(req.db.clone(), opts).await {
+            Ok((head, rows)) => (
+                format!(
+                    "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+                    head.total_rows, head.offset
+                ),
+                rows.boxed(),
+            ),
+            Err(error) => return fail(error),
+        }
     };
     if !still_allowed(req.st, req.db, req.principal) {
         return access_denied(req.principal);
     }
-    let body = if *req.method == Method::HEAD {
-        Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())
-    } else {
-        // Reading the first row reads the first page of every shard, so an
-        // error there still gets a status.
-        let mut rows = Box::pin(rows);
-        let first_row = rows.next().await;
-        if let Some(Err(error)) = first_row {
-            return fail(error);
-        }
-        let rows = futures::stream::iter(first_row).chain(rows);
-        let stream = async_stream::stream! {
-            let mut rows = Box::pin(rows);
-            let mut buffer = format!(
-                "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
-                head.total_rows, head.offset
-            )
-            .into_bytes();
-            let mut first = true;
-            while let Some(item) = rows.next().await {
-                let encoded = item.and_then(|row| {
-                    serde_json::to_vec(&row).map_err(ApiError::internal)
-                });
-                match encoded {
-                    Ok(encoded) => {
-                        if !first {
-                            buffer.push(b',');
-                        }
-                        first = false;
-                        buffer.extend_from_slice(&encoded);
-                    }
-                    Err(error) => {
-                        yield Err(std::io::Error::other(format!(
-                            "{}: {}",
-                            error.error, error.reason
-                        )));
-                        return;
-                    }
-                }
-                if buffer.len() >= STREAM_CHUNK {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
-                }
-            }
-            buffer.push(b']');
-            if let Some(update_seq) = update_seq {
-                buffer.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
-            }
-            buffer.push(b'}');
-            yield Ok(Bytes::from(buffer));
-        };
-        Body::from_stream(stream)
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    stream_json_response(req.method, head.into_bytes(), rows, rows_tail(update_seq)).await
 }
 
 /// First and one-past-last id of the design documents.
@@ -851,20 +902,33 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         Ok(update_seq) => update_seq,
         Err(error) => return fail(error),
     };
+    if req.st.ctx.cluster.is_clustered() && !req.st.ctx.cluster.is_internal(req.headers) {
+        // The coordinator merges the shards' rows; it counts the design
+        // documents with a second pass.
+        let mut result = run_all_docs(&req, &opts).await;
+        if let Ok(list) = &mut result {
+            let everything = AllDocsOpts {
+                startkey: Some(DESIGN_FIRST.to_string()),
+                endkey: Some(DESIGN_END.to_string()),
+                ..Default::default()
+            };
+            match run_all_docs(&req, &everything).await {
+                Ok(all) => {
+                    let total = all.rows.len() as u64;
+                    list.total_rows = Some(total);
+                    list.offset = list.offset.map(|offset| offset.min(total));
+                }
+                Err(error) => result = Err(error),
+            }
+        }
+        return all_docs_reply(&req, result, update_seq);
+    }
+    // Each shard counts its design documents in the job that reads its rows.
+    opts.count_range = Some((DESIGN_FIRST.to_string(), DESIGN_END.to_string()));
     let mut result = run_all_docs(&req, &opts).await;
     if let Ok(list) = &mut result {
-        let everything = AllDocsOpts {
-            startkey: Some(DESIGN_FIRST.to_string()),
-            endkey: Some(DESIGN_END.to_string()),
-            ..Default::default()
-        };
-        match run_all_docs(&req, &everything).await {
-            Ok(all) => {
-                let total = all.rows.len() as u64;
-                list.total_rows = Some(total);
-                list.offset = list.offset.map(|offset| offset.min(total));
-            }
-            Err(error) => result = Err(error),
+        if let Some(total) = list.total_rows {
+            list.offset = list.offset.map(|offset| offset.min(total));
         }
     }
     all_docs_reply(&req, result, update_seq)

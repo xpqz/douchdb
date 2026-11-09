@@ -403,6 +403,9 @@ pub struct Shard {
     /// shard's handle, so a request's cost can be judged by how many entries
     /// it visited rather than by how long it took.
     scanned: Arc<AtomicU64>,
+    /// Document bodies this shard has read from storage, shared with the
+    /// shard's handle like `scanned`.
+    body_reads: Arc<AtomicU64>,
     /// Ranks of the partitions `_all_docs` was recently asked about. Dropped
     /// whenever `live` is.
     partition_ranks: Vec<PartitionRank>,
@@ -633,6 +636,7 @@ impl Shard {
             live: None,
             rank_cursor: None,
             scanned: Arc::new(AtomicU64::new(0)),
+            body_reads: Arc::new(AtomicU64::new(0)),
             partition_ranks: Vec::new(),
             latest: None,
             pending: Vec::new(),
@@ -802,9 +806,11 @@ impl Shard {
         self.scanned.fetch_add(entries as u64, Ordering::Relaxed);
     }
 
-    /// Share `counter` as this shard's scanned-entries count.
-    fn set_scan_counter(&mut self, counter: Arc<AtomicU64>) {
-        self.scanned = counter;
+    /// Share the handle's counters as this shard's scanned-entries and
+    /// body-read counts.
+    fn set_counters(&mut self, scanned: Arc<AtomicU64>, body_reads: Arc<AtomicU64>) {
+        self.scanned = scanned;
+        self.body_reads = body_reads;
     }
 
     /// Live and deleted document counts for one partition. The partition
@@ -858,6 +864,16 @@ impl Shard {
             self.partition_ranks.clear();
         }
         Ok(self.live.as_ref().expect("live index initialized"))
+    }
+
+    /// How many live documents have an id in `[first, last)`.
+    pub fn live_range_count(&mut self, first: &str, last: &str) -> Result<usize> {
+        let count = self
+            .live_docs()?
+            .range::<str, _>((Bound::Included(first), Bound::Excluded(last)))
+            .count();
+        self.add_scanned(count);
+        Ok(count)
     }
 
     /// How many live documents have an id below `key`. Counts from the
@@ -1211,6 +1227,7 @@ impl Shard {
     }
 
     pub fn get_body(&mut self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        self.body_reads.fetch_add(1, Ordering::Relaxed);
         self.get_checked(&body_key(docid, rev))
     }
 
@@ -1711,6 +1728,8 @@ pub struct ShardHandle {
     jobs: AtomicU64,
     /// Index entries the shard has walked, shared with the shard.
     scanned: Arc<AtomicU64>,
+    /// Document bodies the shard has read, shared with the shard.
+    body_reads: Arc<AtomicU64>,
 }
 
 impl ShardHandle {
@@ -1733,6 +1752,8 @@ impl ShardHandle {
         let tracker = seq_tracker.clone();
         let scanned = Arc::new(AtomicU64::new(0));
         let shard_scanned = scanned.clone();
+        let body_reads = Arc::new(AtomicU64::new(0));
+        let shard_body_reads = body_reads.clone();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             // Open on this thread so the database never crosses threads.
             let mut shard = match Shard::open(&dir, revs_limit) {
@@ -1745,7 +1766,7 @@ impl ShardHandle {
             let initial_seq = shard.seq();
             tracker.store(initial_seq, Ordering::SeqCst);
             shard.set_seq_tracker(tracker.clone());
-            shard.set_scan_counter(shard_scanned);
+            shard.set_counters(shard_scanned, shard_body_reads);
             if ready_tx.send(Ok(initial_seq)).is_err() {
                 return;
             }
@@ -1784,12 +1805,18 @@ impl ShardHandle {
             reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
             jobs: AtomicU64::new(0),
             scanned,
+            body_reads,
         })
     }
 
     /// Index entries the shard has walked to answer reads so far.
     pub fn scanned(&self) -> u64 {
         self.scanned.load(Ordering::Relaxed)
+    }
+
+    /// Document bodies the shard has read from storage so far.
+    pub fn body_reads(&self) -> u64 {
+        self.body_reads.load(Ordering::Relaxed)
     }
 
     /// Jobs submitted to this shard's actor so far.
