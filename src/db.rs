@@ -1207,6 +1207,12 @@ impl Db {
         self.shards.iter().map(ShardHandle::jobs).sum()
     }
 
+    /// Index entries this database's shards have walked to answer reads since
+    /// it opened: the work a request did, whatever the time it took.
+    pub fn shard_scanned(&self) -> u64 {
+        self.shards.iter().map(ShardHandle::scanned).sum()
+    }
+
     /// Highest sequence that is safe for a changes cursor to publish, taken
     /// as a snapshot **before** reading any shard.
     ///
@@ -4591,20 +4597,25 @@ fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) ->
     let live = shard.live_docs()?;
     let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
     let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-    Ok(match (opts.descending, ranked) {
+    let mut walked = 0usize;
+    let offset = match (opts.descending, ranked) {
         (false, None) => live
             .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
+            .inspect(|_| walked += 1)
             .filter(|(id, _)| in_partition(id))
             .count(),
         (true, None) => live
             .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
+            .inspect(|_| walked += 1)
             .filter(|(id, _)| in_partition(id))
             .count(),
         (false, Some(rank)) => rank,
         (true, Some(rank)) => live
             .len()
             .saturating_sub(rank + usize::from(live.contains_key(start))),
-    })
+    };
+    shard.add_scanned(walked);
+    Ok(offset)
 }
 
 /// Up to `take` live ids of the query's range in the query's direction,
@@ -5026,6 +5037,7 @@ fn collect_changes(
             .collect(),
     };
 
+    shard.add_scanned(candidates.len());
     let mut rows = Vec::with_capacity(candidates.len());
     for (seq, id) in candidates {
         let meta = shard.get_meta(&id).map_err(ApiError::from);
@@ -6600,6 +6612,180 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn scan_db(root: &std::path::Path, name: &str, q: u32, partitioned: bool) -> Db {
+        Db::open(
+            root,
+            name,
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned,
+            },
+        )
+        .unwrap()
+    }
+
+    fn descending_design_changes(limit: Option<usize>) -> ChangesOpts {
+        ChangesOpts {
+            since: 0,
+            limit,
+            include_docs: false,
+            style_all_docs: false,
+            descending: true,
+            doc_ids: None,
+            filter: Some(ChangeFilter::Design),
+            conflicts: false,
+            owned: None,
+            until: None,
+        }
+    }
+
+    /// A descending filtered feed reports the lowest sequence it scanned when
+    /// it runs out of documents, the last row's when it stops at its limit,
+    /// and counts the documents older than that as pending.
+    #[tokio::test]
+    async fn descending_filtered_changes_report_last_seq_and_pending() {
+        let root = std::env::temp_dir().join(format!("douchdb-descf-{}", crate::util::uuid()));
+        let db = scan_db(&root, "descf", 2, false);
+        // Sequences 1..=30; the design documents are 5, 12 and 25.
+        let docs: Vec<Value> = (1..=30)
+            .map(|i| match i {
+                5 | 12 | 25 => json!({"_id": format!("_design/d{i}")}),
+                _ => json!({"_id": format!("doc{i:02}")}),
+            })
+            .collect();
+        for doc in docs {
+            db.put_docs(vec![doc], true).await.unwrap();
+        }
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25]);
+        assert_eq!((last_seq, pending), (25, 24));
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(2)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12]);
+        assert_eq!((last_seq, pending), (12, 11));
+
+        // Fewer matches than the limit: the whole feed was scanned.
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(10)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
+        assert_eq!((last_seq, pending), (1, 0));
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(None))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
+        assert_eq!((last_seq, pending), (1, 0));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The newest changes are read first, so a descending filtered feed with a
+    /// small limit visits about a page of the sequence index however many
+    /// documents the database holds.
+    #[tokio::test]
+    async fn descending_filtered_changes_visit_entries_independent_of_size() {
+        let mut visited = Vec::new();
+        for n in [300usize, 3000] {
+            let root = std::env::temp_dir().join(format!("douchdb-descv-{}", crate::util::uuid()));
+            let db = scan_db(&root, "descv", 2, false);
+            let mut docs: Vec<Value> = (0..n).map(|i| json!({"_id": format!("d{i}")})).collect();
+            docs.push(json!({"_id": "_design/newest"}));
+            db.put_docs(docs, true).await.unwrap();
+            // Build the sequence index first: only the read is measured.
+            db.changes_rows(&descending_design_changes(Some(1)))
+                .await
+                .unwrap();
+
+            let before = db.shard_scanned();
+            let (rows, _, _) = db
+                .changes_rows(&descending_design_changes(Some(1)))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            visited.push(db.shard_scanned() - before);
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        // One page per shard at most.
+        assert!(
+            visited.iter().all(|&v| v <= 128),
+            "entries visited for n=300 and n=3000: {visited:?}"
+        );
+    }
+
+    /// Paging a partition's `_all_docs` by `startkey` ranks each start from the
+    /// previous one, so the offset costs the distance between the two, not the
+    /// partition's size, and the partition's count is not recounted.
+    #[tokio::test]
+    async fn partitioned_all_docs_offset_visits_entries_independent_of_size() {
+        let mut visited = Vec::new();
+        for n in [500usize, 5000] {
+            let root = std::env::temp_dir().join(format!("douchdb-partv-{}", crate::util::uuid()));
+            let db = scan_db(&root, "partv", 1, true);
+            let mut docs: Vec<Value> = (0..n)
+                .map(|i| json!({"_id": format!("p:{i:05}")}))
+                .collect();
+            docs.extend((0..10).map(|i| json!({"_id": format!("o:{i}")})));
+            docs.extend((0..10).map(|i| json!({"_id": format!("q:{i}")})));
+            db.put_docs(docs, true).await.unwrap();
+            let query = |start: usize, descending: bool| AllDocsOpts {
+                partition: Some("p".into()),
+                startkey: Some(format!("p:{start:05}")),
+                descending,
+                limit: 1,
+                ..Default::default()
+            };
+            // Warm the cursor deep in the partition.
+            db.all_docs(&query(n - 100, false)).await.unwrap();
+
+            let before = db.shard_scanned();
+            let list = db.all_docs(&query(n - 95, false)).await.unwrap();
+            assert_eq!(
+                (list.total_rows, list.offset),
+                (Some(n as u64), Some(n as u64 - 95))
+            );
+            let list = db.all_docs(&query(n - 90, true)).await.unwrap();
+            assert_eq!((list.total_rows, list.offset), (Some(n as u64), Some(89)));
+            visited.push(db.shard_scanned() - before);
+
+            // Writes before the cursor keep later offsets exact.
+            db.put_docs(vec![json!({"_id": "p:00000a"})], true)
+                .await
+                .unwrap();
+            let rev = db.get_doc("p:00001", &DocOpts::default()).await.unwrap();
+            db.put_docs(
+                vec![json!({"_id": "p:00001", "_rev": rev["_rev"], "_deleted": true})],
+                true,
+            )
+            .await
+            .unwrap();
+            let list = db.all_docs(&query(n - 95, false)).await.unwrap();
+            assert_eq!(
+                (list.total_rows, list.offset),
+                (Some(n as u64), Some(n as u64 - 95))
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        assert!(
+            visited.iter().all(|&v| v <= 50),
+            "entries visited for n=500 and n=5000: {visited:?}"
+        );
     }
 
     /// The `GET /db` body is the serialized `info()` result: its field order

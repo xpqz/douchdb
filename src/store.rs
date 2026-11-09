@@ -361,6 +361,11 @@ pub struct Shard {
     /// is found by counting only the ids between the two keys. Kept in step
     /// with `live` on every write and dropped whenever `live` is.
     rank_cursor: Option<(String, usize)>,
+    /// Index entries this shard has walked to answer reads: change rows read
+    /// from the sequence index and ids counted to rank a key. Shared with the
+    /// shard's handle, so a request's cost can be judged by how many entries
+    /// it visited rather than by how long it took.
+    scanned: Arc<AtomicU64>,
     /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
@@ -583,6 +588,7 @@ impl Shard {
             deleted,
             live: None,
             rank_cursor: None,
+            scanned: Arc::new(AtomicU64::new(0)),
             latest: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
@@ -687,12 +693,24 @@ impl Shard {
         let first = format!("{partition}:");
         let last = format!("{partition};");
         let live = self.live_docs()?;
-        Ok(live
+        let count = live
             .range::<str, _>((
                 std::ops::Bound::Included(first.as_str()),
                 std::ops::Bound::Excluded(last.as_str()),
             ))
-            .count() as u64)
+            .count();
+        self.add_scanned(count);
+        Ok(count as u64)
+    }
+
+    /// Record `entries` index entries walked by a read.
+    pub fn add_scanned(&self, entries: usize) {
+        self.scanned.fetch_add(entries as u64, Ordering::Relaxed);
+    }
+
+    /// Share `counter` as this shard's scanned-entries count.
+    fn set_scan_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.scanned = counter;
     }
 
     /// Live and deleted document counts for one partition. The partition
@@ -756,21 +774,32 @@ impl Shard {
         let (Some(live), cursor) = (self.live.as_ref(), self.rank_cursor.take()) else {
             return Ok(0);
         };
-        let rank = match &cursor {
-            Some((from, rank)) if key == from.as_str() => *rank,
+        let (rank, walked) = match &cursor {
+            Some((from, rank)) if key == from.as_str() => (*rank, 0),
             Some((from, rank)) if key > from.as_str() => {
-                rank + live
+                let walked = live
                     .range::<str, _>((Excluded(from.as_str()), Excluded(key)))
-                    .count()
-                    + usize::from(live.contains_key(from.as_str()))
+                    .count();
+                (
+                    rank + walked + usize::from(live.contains_key(from.as_str())),
+                    walked,
+                )
             }
-            Some((from, rank)) => rank.saturating_sub(
-                live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
-                    .count()
-                    + usize::from(live.contains_key(key)),
-            ),
-            None => live.range::<str, _>((Unbounded, Excluded(key))).count(),
+            Some((from, rank)) => {
+                let walked = live
+                    .range::<str, _>((Excluded(key), Excluded(from.as_str())))
+                    .count();
+                (
+                    rank.saturating_sub(walked + usize::from(live.contains_key(key))),
+                    walked,
+                )
+            }
+            None => {
+                let walked = live.range::<str, _>((Unbounded, Excluded(key))).count();
+                (walked, walked)
+            }
         };
+        self.scanned.fetch_add(walked as u64, Ordering::Relaxed);
         self.rank_cursor = Some((key.to_string(), rank));
         Ok(rank)
     }
@@ -1575,6 +1604,8 @@ pub struct ShardHandle {
     /// Jobs submitted to this shard's actor since it opened. Each one is a
     /// cross-thread hop, so the count is the shard round-trip cost of a request.
     jobs: AtomicU64,
+    /// Index entries the shard has walked, shared with the shard.
+    scanned: Arc<AtomicU64>,
 }
 
 impl ShardHandle {
@@ -1595,6 +1626,8 @@ impl ShardHandle {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u64>>();
         let tracker = seq_tracker.clone();
+        let scanned = Arc::new(AtomicU64::new(0));
+        let shard_scanned = scanned.clone();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             // Open on this thread so the database never crosses threads.
             let mut shard = match Shard::open(&dir, revs_limit) {
@@ -1607,6 +1640,7 @@ impl ShardHandle {
             let initial_seq = shard.seq();
             tracker.store(initial_seq, Ordering::SeqCst);
             shard.set_seq_tracker(tracker.clone());
+            shard.set_scan_counter(shard_scanned);
             if ready_tx.send(Ok(initial_seq)).is_err() {
                 return;
             }
@@ -1644,7 +1678,13 @@ impl ShardHandle {
             seq_tracker,
             reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
             jobs: AtomicU64::new(0),
+            scanned,
         })
+    }
+
+    /// Index entries the shard has walked to answer reads so far.
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(Ordering::Relaxed)
     }
 
     /// Jobs submitted to this shard's actor so far.
