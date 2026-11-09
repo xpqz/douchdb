@@ -576,7 +576,13 @@ async fn purge(req: DbRequest<'_>) -> Response {
     };
     let response =
         if !req.st.ctx.cluster.is_clustered() || req.st.ctx.cluster.is_internal(req.headers) {
-            match req.db.purge(&request, req.st.ctx.cluster.me).await {
+            // A peer's request carries the uuid the coordinator chose.
+            let (request, uuids) = if req.st.ctx.cluster.is_internal(req.headers) {
+                crate::db::split_purge_uuids(&request)
+            } else {
+                (request, Default::default())
+            };
+            match req.db.purge(&request, req.st.ctx.cluster.me, &uuids).await {
                 Ok(purged) => json(StatusCode::CREATED, purged),
                 Err(e) => return fail(e),
             }
