@@ -6786,7 +6786,9 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
     assert_eq!(
         peer_trip_reads(&nodes).await,
         vec![
-            ("get_doc", (2, 1, 0)),
+            // The replica read skips the node discovery reports down: one
+            // call, to the live peer (it was two, one of them to the dead node).
+            ("get_doc", (1, 1, 0)),
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
@@ -6796,6 +6798,63 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("changes_since_now", (2, 1, 0)),
         ]
     );
+}
+
+/// Replica reads route around a node discovery reports down: with one of
+/// three nodes dead and known to be, a document read asks the one live peer
+/// only, whichever form it takes.
+#[tokio::test]
+async fn cluster_replica_read_skips_a_node_discovery_reports_down() {
+    let mut nodes = peer_trip_cluster(3).await;
+    let (_, doc) = nodes[0].get("/trips/d10").await;
+    let rev = doc["_rev"].as_str().unwrap_or_default().to_string();
+    nodes[2].kill();
+    let dead = nodes[2].base.clone();
+    nodes.truncate(2);
+    wait_until_known_down(&nodes[0], &dead).await;
+    for path in [
+        "/trips/d10".to_string(),
+        format!("/trips/d10?rev={rev}"),
+        "/trips/d10?open_revs=all".to_string(),
+        "/trips/d10?r=2".to_string(),
+        "/trips/nonesuch".to_string(),
+    ] {
+        let expect_ok = !path.contains("nonesuch");
+        let before = peer_snapshot(&nodes).await;
+        let (status, body) = nodes[0].get(&path).await;
+        assert_eq!(status.is_success(), expect_ok, "{path}: {status} {body}");
+        let after = peer_snapshot(&nodes).await;
+        assert_eq!(after[0].0 - before[0].0, 1, "{path}: peer calls");
+        assert_eq!(after[0].1 - before[0].1, 1, "{path}: rounds");
+    }
+}
+
+/// The mark may be stale. With node 1 wrongly marked down and node 2 really
+/// down, the read still asks node 1 and succeeds: `r=2` is met by the node the
+/// mark ruled out.
+#[tokio::test]
+async fn cluster_replica_read_asks_a_wrongly_marked_node_when_no_other_copy_answers() {
+    let mut nodes = peer_trip_cluster(3).await;
+    let url = nodes[1].base.clone();
+    loop {
+        nodes[1].kill();
+        wait_until_known_down(&nodes[0], &url).await;
+        nodes[1].restart();
+        nodes[2].kill();
+        let (_, cluster) = nodes[0].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+        nodes[2].restart();
+    }
+    let (status, body) = nodes[0].get("/trips/d10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["n"], 10, "{body}");
 }
 
 /// A node discovery reports down is routed around in the first scatter round,
