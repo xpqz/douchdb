@@ -1227,8 +1227,8 @@ async fn cors_methods_exposed_headers_and_max_age_are_configurable() {
 }
 
 /// The console is the one HTML surface, so it carries a Content-Security-Policy.
-/// The Vue build compiles in-DOM templates at runtime, which needs
-/// `'unsafe-eval'`; everything else is locked down to the same origin.
+/// The templates are precompiled, so scripts need no `'unsafe-eval'`;
+/// everything else is locked down to the same origin.
 #[tokio::test]
 async fn console_responses_carry_a_content_security_policy() {
     let s = Server::start(false);
@@ -1247,7 +1247,7 @@ async fn console_responses_carry_a_content_security_policy() {
             .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"));
         for directive in [
             "default-src 'none'",
-            "script-src 'self' 'unsafe-eval'",
+            "script-src 'self';",
             "frame-ancestors 'none'",
             "object-src 'none'",
             "base-uri 'none'",
@@ -1255,6 +1255,7 @@ async fn console_responses_carry_a_content_security_policy() {
             assert!(csp.contains(directive), "{path}: {csp}");
         }
         assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+        assert!(!csp.contains("unsafe-eval"), "{path}: {csp}");
     }
     // API responses are JSON and get none.
     let response = s
