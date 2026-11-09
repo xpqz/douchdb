@@ -47,6 +47,7 @@ pub struct ReplicationEntry {
     pub started_ms: u64,
     pub finished_ms: u64,
     pub docs: u64,
+    pub rows: u64,
     pub error: Option<String>,
     pub checkpoint: Option<Value>,
 }
@@ -57,6 +58,7 @@ struct ReplicationSnapshot {
     last_finished_ms: u64,
     runs: u64,
     docs: u64,
+    rows: u64,
     error: Option<String>,
     entries: BTreeMap<String, ReplicationEntry>,
 }
@@ -201,9 +203,17 @@ impl ClusterState {
         entry.error = None;
     }
 
-    pub fn replication_finished(&self, db: &str, peer: &str, docs: u64, checkpoint: Option<Value>) {
+    pub fn replication_finished(
+        &self,
+        db: &str,
+        peer: &str,
+        docs: u64,
+        rows: u64,
+        checkpoint: Option<Value>,
+    ) {
         let mut snapshot = self.lock_replication();
         snapshot.docs += docs;
+        snapshot.rows += rows;
         let entry = snapshot
             .entries
             .entry(entry_key(db, peer))
@@ -215,6 +225,7 @@ impl ClusterState {
         entry.state = "ok".to_string();
         entry.finished_ms = now_ms();
         entry.docs = docs;
+        entry.rows = rows;
         entry.error = None;
         entry.checkpoint = checkpoint;
     }
@@ -250,6 +261,7 @@ impl ClusterState {
                     "started": entry.started_ms,
                     "finished": entry.finished_ms,
                     "docs": entry.docs,
+                    "rows": entry.rows,
                     "error": entry.error,
                     "checkpoint": entry.checkpoint,
                 })
@@ -262,6 +274,7 @@ impl ClusterState {
             "last_finished": snapshot.last_finished_ms,
             "runs": snapshot.runs,
             "docs": snapshot.docs,
+            "rows": snapshot.rows,
             "error": snapshot.error,
             "entries": entries,
         })
