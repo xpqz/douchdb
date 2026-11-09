@@ -2218,14 +2218,14 @@ mod scan_tests {
     }
 
     #[test]
-    fn compaction_deletes_nothing_for_a_corrupt_metadata_record() {
+    fn compaction_skips_a_corrupt_metadata_record_and_keeps_its_bodies() {
         let dir = temp_shard_dir("corrupt-compact");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         // A stale-looking body next to an unreadable metadata record: the
-        // sweep cannot know it is stale, so it must keep it and fail.
+        // sweep cannot know it is stale, so it must keep it and carry on.
         shard.put_raw(&meta_key("bad"), b"{not json");
         shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
-        assert!(shard.compact().is_err());
+        shard.compact().unwrap();
         assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
