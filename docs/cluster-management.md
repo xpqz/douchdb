@@ -160,6 +160,7 @@ Membership probes use the shared cluster secret for internal access.
     "last_finished": 1700000000200,
     "runs": 12,
     "docs": 430,
+    "rows": 612,
     "error": null,
     "entries": [
       {
@@ -169,6 +170,7 @@ Membership probes use the shared cluster secret for internal access.
         "started": 1700000000000,
         "finished": 1700000000200,
         "docs": 4,
+        "rows": 4,
         "error": null,
         "checkpoint": "12-g1AAAA..."
       }
@@ -201,7 +203,9 @@ membership-discovered nodes. It retries quickly during startup and then follows
 ### `GET /_node/_local/_replication`
 
 Returns the replicator snapshot: whether a pass is running, whether the timer
-is paused, total runs and documents, the last error, and one entry per
+is paused, total runs, documents written and `_changes` rows received from peers (a pass
+asks each peer for the shards this node replicates plus the design documents of
+the others, so the two stay close), the last error, and one entry per
 database/peer pair with its checkpoint and last result.
 
 ### `POST /_node/_local/_replication/run`

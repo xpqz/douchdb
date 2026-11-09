@@ -1,7 +1,7 @@
 //! Pull replication: the same protocol PouchDB uses, spoken node to node.
 
 use crate::auth::Auth;
-use crate::cluster::Cluster;
+use crate::cluster::{Cluster, ShardMask};
 use crate::cluster_http::{internal_request_raw, send_peer};
 use crate::db::Db;
 use crate::state::AppState;
@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Default)]
 pub struct PullOutcome {
     pub docs: usize,
+    /// `_changes` rows the peer sent, whether or not they were needed.
+    pub rows: usize,
     pub checkpoint: Option<Value>,
 }
 
@@ -48,56 +50,65 @@ pub async fn pull(
         auth,
     };
     ctx.sync_purges().await?;
-    let checkpoint_id = checkpoint_id(db, peer);
-    let mut since = db
-        .checkpoint_get(&checkpoint_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.get("seq").cloned())
-        .unwrap_or_else(|| json!(0));
-
-    let mut total = 0usize;
-    loop {
-        // Between batches, so a stop leaves the checkpoint at the last whole
-        // batch and the next pass resumes from there.
-        if shutdown.is_cancelled() {
-            break;
+    // Two feeds, each with its own checkpoint: the shards this node
+    // replicates, and the design documents of every other shard (design
+    // documents live on every node so views and search work over local
+    // shards). Together they cover what `is_replica_of` accepts, without the
+    // peer sending the rest.
+    let owned = owned_shards(db, cluster.me);
+    let others = other_shards(db, &owned);
+    let id = checkpoint_id(db, peer);
+    let mut outcome = PullOutcome::default();
+    for (feed, checkpoint) in [
+        (Feed::Shards(owned), id.clone()),
+        (Feed::Design(others), format!("{id}:design")),
+    ] {
+        if feed.mask().is_empty() {
+            continue;
         }
-        let resp = ctx.fetch_changes_batch(&since).await?;
-        let results = resp
-            .get("results")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("_changes response has no results array"))?;
-        if results.is_empty() {
-            break;
-        }
-
-        let (mut requested, mut reqs) = ctx.revisions_to_request(results)?;
-        ctx.drop_purged(&mut requested, &mut reqs).await?;
-        let (received, unavailable) = ctx.fetch_missing_docs(&reqs).await?;
-        total += write_batch(db, &received).await?;
-        ensure_all_accounted(db, &requested, &received, &unavailable).await?;
-
-        let last = resp
-            .get("last_seq")
-            .cloned()
-            .ok_or_else(|| anyhow!("_changes response has no last_seq"))?;
-        if last.is_null() {
-            return Err(anyhow!("_changes response has null last_seq"));
-        }
-        if last == since {
-            break;
-        }
-        db.checkpoint_put(&checkpoint_id, &json!({ "seq": last }))
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        since = last;
+        let (docs, rows, since) = ctx.pull_feed(&feed, &checkpoint, shutdown).await?;
+        outcome.docs += docs;
+        outcome.rows += rows;
+        outcome.checkpoint.get_or_insert(since);
     }
-    Ok(PullOutcome {
-        docs: total,
-        checkpoint: Some(since),
-    })
+    Ok(outcome)
+}
+
+/// A peer `_changes` feed this node pulls.
+enum Feed {
+    /// Every change in the shards of the mask.
+    Shards(ShardMask),
+    /// Only the design documents of the shards of the mask.
+    Design(ShardMask),
+}
+
+impl Feed {
+    fn mask(&self) -> &ShardMask {
+        match self {
+            Feed::Shards(mask) | Feed::Design(mask) => mask,
+        }
+    }
+}
+
+/// The shards `me` replicates under the placement it replicates by.
+fn owned_shards(db: &Db, me: usize) -> ShardMask {
+    let map = db.replication_map();
+    let mut mask = ShardMask::none(db.q);
+    for shard in 0..db.q {
+        if map.replicas_of(shard).contains(&me) {
+            mask.select(shard as usize);
+        }
+    }
+    mask
+}
+
+/// The shards `owned` does not cover.
+fn other_shards(db: &Db, owned: &ShardMask) -> ShardMask {
+    let mut mask = ShardMask::none(db.q);
+    for shard in (0..db.q as usize).filter(|shard| !owned.covers(*shard)) {
+        mask.select(shard);
+    }
+    mask
 }
 
 /// Everything one pull needs to talk to a peer about one database.
@@ -133,6 +144,65 @@ fn purge_checkpoint_id(db: &Db, peer: &str) -> String {
 }
 
 impl PullCtx<'_> {
+    /// Drain one feed of the peer from its checkpoint. Returns the documents
+    /// written, the `_changes` rows received, and the position reached.
+    async fn pull_feed(
+        &self,
+        feed: &Feed,
+        checkpoint_id: &str,
+        shutdown: &CancellationToken,
+    ) -> Result<(usize, usize, Value)> {
+        let db = self.db;
+        let mut since = db
+            .checkpoint_get(checkpoint_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("seq").cloned())
+            .unwrap_or_else(|| json!(0));
+
+        let mut total = 0usize;
+        let mut rows = 0usize;
+        loop {
+            // Between batches, so a stop leaves the checkpoint at the last whole
+            // batch and the next pass resumes from there.
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let resp = self.fetch_changes_batch(&since, feed).await?;
+            let results = resp
+                .get("results")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("_changes response has no results array"))?;
+            if results.is_empty() {
+                break;
+            }
+            rows += results.len();
+
+            let (mut requested, mut reqs) = self.revisions_to_request(results)?;
+            self.drop_purged(&mut requested, &mut reqs).await?;
+            let (received, unavailable) = self.fetch_missing_docs(&reqs).await?;
+            total += write_batch(db, &received).await?;
+            ensure_all_accounted(db, &requested, &received, &unavailable).await?;
+
+            let last = resp
+                .get("last_seq")
+                .cloned()
+                .ok_or_else(|| anyhow!("_changes response has no last_seq"))?;
+            if last.is_null() {
+                return Err(anyhow!("_changes response has null last_seq"));
+            }
+            if last == since {
+                break;
+            }
+            db.checkpoint_put(checkpoint_id, &json!({ "seq": last }))
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+            since = last;
+        }
+        Ok((total, rows, since))
+    }
+
     /// Learn of the purges the peer knows of (CouchDB's
     /// `mem3_rep:replicate_purges`): record and apply every purge info the
     /// peer holds past this node's checkpoint, for the shards this node
@@ -233,7 +303,7 @@ impl PullCtx<'_> {
     }
 
     /// One `_changes` page from the peer.
-    async fn fetch_changes_batch(&self, since: &Value) -> Result<Value> {
+    async fn fetch_changes_batch(&self, since: &Value, feed: &Feed) -> Result<Value> {
         const BATCH: usize = 1000;
         // A cluster `_changes` last_seq is an opaque base64 version vector, so
         // forward whatever the peer gave us rather than parsing it as an integer.
@@ -253,7 +323,11 @@ impl PullCtx<'_> {
             ("since", since_param.as_str()),
             ("style", "all_docs"),
             ("limit", &BATCH.to_string()),
+            ("shards", &feed.mask().query_value()),
         ]);
+        if matches!(feed, Feed::Design(_)) {
+            changes = changes.query(&[("filter", "_design")]);
+        }
         if let Some(auth) = self.auth {
             changes = changes.basic_auth(&auth.user, Some(&auth.pass));
         }
@@ -560,6 +634,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                             &name,
                             &peer,
                             outcome.docs as u64,
+                            outcome.rows as u64,
                             outcome.checkpoint,
                         );
                         Ok(outcome.docs)

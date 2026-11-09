@@ -460,15 +460,16 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
 /// Ask every replica for a document. With `open_all`, each peer returns all
 /// leaves (`open_revs=all`) and their histories; otherwise the single winner
 /// (or the client's explicit `rev`) is returned. Explicit not-found answers
-/// count as reachable, but a transport or server failure does not.
+/// count as reachable, but a transport or server failure does not. Peers
+/// discovery reports down are skipped unless fewer than `r` replicas answer.
 pub(crate) async fn replica_docs(
     ctx: &ClusterCtx,
     db: &Db,
-    dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
     headers: &HeaderMap,
     open_all: bool,
+    r: usize,
 ) -> (usize, Vec<Value>) {
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
@@ -493,13 +494,13 @@ pub(crate) async fn replica_docs(
         let local = replicas.remove(index);
         replicas.insert(0, local);
     }
-    let responses = crate::cluster_http::in_one_round(join_all(replicas.into_iter().map(|node| {
-        let inner = inner.clone();
-        let opts = opts.clone();
-        async move {
+    let ask = |replicas: Vec<usize>| {
+        let inner = &inner;
+        let opts = &opts;
+        crate::cluster_http::in_one_round(join_all(replicas.into_iter().map(|node| async move {
             if node == ctx.cluster.me {
                 crate::telemetry::record_local_read();
-                return match db.get_doc(docid, &opts).await {
+                return match db.get_doc(docid, opts).await {
                     Ok(doc) => (true, Some(doc)),
                     Err(error) => (error.status == 404, None),
                 };
@@ -510,11 +511,11 @@ pub(crate) async fn replica_docs(
                 ctx,
                 reqwest::Method::GET,
                 &peer,
-                &[dbname, docid],
+                &[&db.name, docid],
                 Some(headers),
             )
             .header("x-douchdb-quorum-read", "1")
-            .query(&inner);
+            .query(inner);
             match send_peer(request).await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
@@ -526,9 +527,22 @@ pub(crate) async fn replica_docs(
                 Ok(_) => (false, None),
                 Err(_) => (false, None),
             }
+        })))
+    };
+
+    // A peer that discovery found unreachable is not called; it counts as not
+    // having answered. The mark may be stale, so when the others cannot make
+    // up `r` answers the skipped peers are asked after all.
+    let (live, skipped): (Vec<usize>, Vec<usize>) = replicas
+        .into_iter()
+        .partition(|node| *node == ctx.cluster.me || !ctx.health.is_down(*node));
+    let mut responses = ask(live).await;
+    if !skipped.is_empty() {
+        let answered = responses.iter().filter(|(reachable, _)| *reachable).count();
+        if answered < r {
+            responses.extend(ask(skipped).await);
         }
-    })))
-    .await;
+    }
 
     let reachable = responses.iter().filter(|(reachable, _)| *reachable).count();
     let mut docs = Vec::new();

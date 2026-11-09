@@ -466,21 +466,7 @@ fn start_cluster_full(
     replication: usize,
     admin: bool,
 ) -> Vec<Server> {
-    // Cluster tests run with HTTP/2 between nodes, so the whole suite
-    // exercises h2c. The product default is HTTP/1.1; see `--peer-http2`.
-    start_cluster_nodes(n, q, sync_secs, replication, admin, &vec![true; n])
-}
-
-/// Like `start_cluster_full`, with `peer_http2[i]` choosing whether node `i`
-/// speaks HTTP/2 to its peers.
-fn start_cluster_nodes(
-    n: usize,
-    q: u32,
-    sync_secs: &str,
-    replication: usize,
-    admin: bool,
-    peer_http2: &[bool],
-) -> Vec<Server> {
+    // Nodes speak h2c to each other by default, so the whole suite exercises it.
     for attempt in 0..5 {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let nodes = ports
@@ -508,10 +494,6 @@ fn start_cluster_nodes(
                 "--session-secret".to_string(),
                 "test-session-secret".to_string(),
             ];
-            let mut extra = extra;
-            if peer_http2[i] {
-                extra.push("--peer-http2".to_string());
-            }
             match Server::spawn_on(port, &extra, admin, attempt) {
                 Some(server) => servers.push(server),
                 None => {
@@ -6678,58 +6660,18 @@ async fn exercise_peer_traffic(nodes: &[Server], tag: &str) {
     }
 }
 
-async fn trips_cluster_nodes(peer_http2: &[bool], replication: usize) -> Vec<Server> {
-    let nodes = start_cluster_nodes(peer_http2.len(), 4, "3600", replication, false, peer_http2);
+/// Node-to-node requests arrive as HTTP/2 by default and none as HTTP/1.x.
+#[tokio::test]
+async fn cluster_peer_traffic_uses_http2() {
+    let nodes = start_cluster_full(3, 4, "3600", 3, false);
     for node in &nodes {
         node.fresh_db("trips").await;
     }
-    nodes
-}
-
-/// With `--peer-http2` on every node, node-to-node requests arrive as HTTP/2
-/// and none as HTTP/1.x.
-#[tokio::test]
-async fn cluster_peer_traffic_uses_http2() {
-    let nodes = trips_cluster_nodes(&[true, true, true], 3).await;
     exercise_peer_traffic(&nodes, "h2").await;
     for (i, node) in nodes.iter().enumerate() {
         let (http1, http2) = internal_request_versions(node).await;
         assert!(http2 > 0, "node {i} served no HTTP/2 peer request");
         assert_eq!(http1, 0, "node {i} served an HTTP/1.x peer request");
-    }
-}
-
-/// Without the flag peers keep speaking HTTP/1.1, so a rolling upgrade can
-/// start with the new binary on every node and switch the flag on afterwards.
-#[tokio::test]
-async fn cluster_peer_traffic_defaults_to_http1() {
-    let nodes = trips_cluster_nodes(&[false, false, false], 3).await;
-    exercise_peer_traffic(&nodes, "h1").await;
-    for (i, node) in nodes.iter().enumerate() {
-        let (http1, http2) = internal_request_versions(node).await;
-        assert!(http1 > 0, "node {i} served no HTTP/1.x peer request");
-        assert_eq!(http2, 0, "node {i} served an HTTP/2 peer request");
-    }
-}
-
-/// Node 1 speaks HTTP/1.1 to its peers while 0 and 2 speak HTTP/2. Every node
-/// accepts both on one port, so every write and read still works from every
-/// coordinator, and each side sees the protocol its peers chose.
-#[tokio::test]
-async fn cluster_with_mixed_peer_protocols_works() {
-    let nodes = trips_cluster_nodes(&[true, false, true], 3).await;
-    exercise_peer_traffic(&nodes, "mix").await;
-    // (A node's requests to itself use its own protocol, so node 1 may count
-    // some HTTP/1.x requests of its own.)
-    let (_, http2) = internal_request_versions(&nodes[1]).await;
-    assert!(http2 > 0, "node 1 got no HTTP/2 peer request");
-    for i in [0, 2] {
-        let (http1, http2) = internal_request_versions(&nodes[i]).await;
-        assert!(http1 > 0, "node {i} got no HTTP/1.x request from node 1");
-        assert!(
-            http2 > 0,
-            "node {i} got no HTTP/2 request from the other node"
-        );
     }
 }
 
@@ -6786,7 +6728,9 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
     assert_eq!(
         peer_trip_reads(&nodes).await,
         vec![
-            ("get_doc", (2, 1, 0)),
+            // The replica read skips the node discovery reports down: one
+            // call, to the live peer (it was two, one of them to the dead node).
+            ("get_doc", (1, 1, 0)),
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
@@ -6796,6 +6740,63 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("changes_since_now", (2, 1, 0)),
         ]
     );
+}
+
+/// Replica reads route around a node discovery reports down: with one of
+/// three nodes dead and known to be, a document read asks the one live peer
+/// only, whichever form it takes.
+#[tokio::test]
+async fn cluster_replica_read_skips_a_node_discovery_reports_down() {
+    let mut nodes = peer_trip_cluster(3).await;
+    let (_, doc) = nodes[0].get("/trips/d10").await;
+    let rev = doc["_rev"].as_str().unwrap_or_default().to_string();
+    nodes[2].kill();
+    let dead = nodes[2].base.clone();
+    nodes.truncate(2);
+    wait_until_known_down(&nodes[0], &dead).await;
+    for path in [
+        "/trips/d10".to_string(),
+        format!("/trips/d10?rev={rev}"),
+        "/trips/d10?open_revs=all".to_string(),
+        "/trips/d10?r=2".to_string(),
+        "/trips/nonesuch".to_string(),
+    ] {
+        let expect_ok = !path.contains("nonesuch");
+        let before = peer_snapshot(&nodes).await;
+        let (status, body) = nodes[0].get(&path).await;
+        assert_eq!(status.is_success(), expect_ok, "{path}: {status} {body}");
+        let after = peer_snapshot(&nodes).await;
+        assert_eq!(after[0].0 - before[0].0, 1, "{path}: peer calls");
+        assert_eq!(after[0].1 - before[0].1, 1, "{path}: rounds");
+    }
+}
+
+/// The mark may be stale. With node 1 wrongly marked down and node 2 really
+/// down, the read still asks node 1 and succeeds: `r=2` is met by the node the
+/// mark ruled out.
+#[tokio::test]
+async fn cluster_replica_read_asks_a_wrongly_marked_node_when_no_other_copy_answers() {
+    let mut nodes = peer_trip_cluster(3).await;
+    let url = nodes[1].base.clone();
+    loop {
+        nodes[1].kill();
+        wait_until_known_down(&nodes[0], &url).await;
+        nodes[1].restart();
+        nodes[2].kill();
+        let (_, cluster) = nodes[0].get("/_node/_local/_cluster").await;
+        let still_down = cluster["discovery"]["running"] == false
+            && cluster["discovery"]["nodes"]
+                .as_array()
+                .and_then(|peers| peers.iter().find(|peer| peer["url"] == url))
+                .is_some_and(|peer| peer["reachable"] == false);
+        if still_down {
+            break;
+        }
+        nodes[2].restart();
+    }
+    let (status, body) = nodes[0].get("/trips/d10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["n"], 10, "{body}");
 }
 
 /// A node discovery reports down is routed around in the first scatter round,
@@ -8973,6 +8974,128 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
             "anti-entropy did not converge: {response}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Documents a node itself stores: a forwarded `_all_docs` reads only the
+/// node's own shards.
+async fn locally_stored_ids(node: &Server, db: &str) -> Vec<String> {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_all_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    response["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `_changes` rows `node`'s anti-entropy has received since it started.
+async fn replication_rows(node: &Server) -> u64 {
+    let (_, status) = node.get("/_node/_local/_replication").await;
+    status["rows"].as_u64().expect("rows counter")
+}
+
+/// Store `docs` on `node` alone, as a write forwarded by a peer does.
+async fn write_to_one_node(node: &Server, db: &str, docs: Vec<Value>) {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_bulk_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// With q=4, n=1 on three nodes, a node owns one or two shards. Its
+/// anti-entropy pass asks a peer for those shards only, so of the 40 documents
+/// stored on node 0 it is sent just the ones of its own shards, and reads
+/// nothing again once its checkpoint is at the end.
+#[tokio::test]
+async fn cluster_anti_entropy_receives_only_rows_of_owned_shards() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("aeown").await;
+    }
+    let docs: Vec<Value> = (0..40).map(|i| json!({"_id": format!("o{i}")})).collect();
+    write_to_one_node(&nodes[0], "aeown", docs).await;
+    assert!(locally_stored_ids(&nodes[1], "aeown").await.is_empty());
+
+    let before = replication_rows(&nodes[1]).await;
+    sync_node(&nodes[1], "aeown").await;
+    let received = replication_rows(&nodes[1]).await - before;
+    let kept = locally_stored_ids(&nodes[1], "aeown").await.len();
+    assert!(kept > 0 && kept < 40, "node 1 kept {kept} of 40");
+    assert_eq!(
+        received, kept as u64,
+        "node 1 was sent rows of shards it does not own"
+    );
+
+    let before = replication_rows(&nodes[1]).await;
+    sync_node(&nodes[1], "aeown").await;
+    assert_eq!(replication_rows(&nodes[1]).await, before);
+}
+
+/// A design document stored on a node that does not own its shard still
+/// reaches every node, through a feed of its own with its own checkpoint, and
+/// a restarted node does not read that feed again from the start. The design
+/// feed carries design documents only.
+#[tokio::test]
+async fn cluster_design_docs_reach_every_node_and_the_design_checkpoint_persists() {
+    let mut nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("aedes").await;
+    }
+    let designs: Vec<Value> = (0..6)
+        .map(|i| json!({"_id": format!("_design/d{i}"), "views": {}}))
+        .collect();
+    write_to_one_node(&nodes[0], "aedes", designs).await;
+    let plain: Vec<Value> = (0..12).map(|i| json!({"_id": format!("p{i}")})).collect();
+    write_to_one_node(&nodes[0], "aedes", plain).await;
+
+    // Node 2 sees node 0 only: node 1 holds nothing yet. Of node 0's eighteen
+    // documents it is sent the six design documents, owned shard or not, and
+    // each once, and the plain ones of its own shards.
+    let before = replication_rows(&nodes[2]).await;
+    sync_node(&nodes[2], "aedes").await;
+    let received = replication_rows(&nodes[2]).await - before;
+    let ids = locally_stored_ids(&nodes[2], "aedes").await;
+    let owned_plain = ids.iter().filter(|id| !id.starts_with("_design/")).count();
+    assert!(owned_plain < 12, "every plain document is node 2's");
+    assert_eq!(received, 6 + owned_plain as u64);
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
+    }
+
+    sync_node(&nodes[1], "aedes").await;
+    let ids = locally_stored_ids(&nodes[1], "aedes").await;
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
+    }
+
+    // Node 1 now offers the same documents; read them too, so that every feed
+    // of node 2 is at its end. After a restart the checkpoints hold: a pass
+    // reads no row at all.
+    sync_node(&nodes[2], "aedes").await;
+    nodes[2].restart();
+    sync_node(&nodes[2], "aedes").await;
+    assert_eq!(replication_rows(&nodes[2]).await, 0);
+    let ids = locally_stored_ids(&nodes[2], "aedes").await;
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
     }
 }
 

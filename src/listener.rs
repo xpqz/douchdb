@@ -129,8 +129,8 @@ mod tests {
     #[tokio::test]
     async fn one_port_serves_http1_and_h2c() {
         let (base, shutdown, task) = start().await;
-        let h1 = crate::cluster_http::peer_client(false, false).unwrap();
-        let h2 = crate::cluster_http::peer_client(true, false).unwrap();
+        let h1 = reqwest::Client::builder().http1_only().build().unwrap();
+        let h2 = crate::cluster_http::peer_client(false).unwrap();
         let reply = h1.get(format!("{base}/version")).send().await.unwrap();
         assert_eq!(reply.version(), reqwest::Version::HTTP_11);
         assert_eq!(reply.text().await.unwrap(), "HTTP/1.1");
@@ -148,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn large_and_small_requests_share_one_h2_connection() {
         let (base, shutdown, task) = start().await;
-        let client = crate::cluster_http::peer_client(true, false).unwrap();
+        let client = crate::cluster_http::peer_client(false).unwrap();
         let big = vec![b'x'; 12 * 1024 * 1024];
         let mut pending = Vec::new();
         for _ in 0..3 {
