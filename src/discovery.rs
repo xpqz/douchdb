@@ -305,6 +305,7 @@ mod tests {
                 health: Default::default(),
             },
             db_updates: Default::default(),
+            feed_stats: Default::default(),
             cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
             admission: Arc::new(crate::admission::Admission::new(Default::default())),
             compaction: Arc::new(tokio::sync::Semaphore::new(1)),

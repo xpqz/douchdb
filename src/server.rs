@@ -221,6 +221,7 @@ fn build_state(
             health: Default::default(),
         },
         db_updates: api::DbUpdates::default(),
+        feed_stats: Default::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
         shutdown,
     }))

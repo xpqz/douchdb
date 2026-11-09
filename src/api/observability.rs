@@ -198,6 +198,10 @@ async fn local_metrics(st: &AppState) -> Value {
     metrics["auth"] = json!({
         "principal_resolutions": st.principal_resolutions.load(std::sync::atomic::Ordering::Relaxed),
     });
+    metrics["feeds"] = json!({
+        "db_updates_polls": st.feed_stats.db_updates_polls.load(std::sync::atomic::Ordering::Relaxed),
+        "changes_once": st.feed_stats.changes_once.load(std::sync::atomic::Ordering::Relaxed),
+    });
     metrics["databases"] = json!(databases);
     metrics["replication"] = st.cluster_state.replication_json();
     metrics["discovery"] = st

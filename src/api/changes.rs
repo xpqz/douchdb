@@ -81,7 +81,7 @@ struct FeedOpts {
     /// Milliseconds a longpoll/continuous feed stays open.
     deadline: u64,
     /// How often an idle feed re-checks when no local commit wakes it.
-    recheck: std::time::Duration,
+    recheck: Recheck,
 }
 
 /// Validate every `_changes` parameter up front and return the feed type
@@ -117,9 +117,9 @@ async fn parse_feed(
     // an arbitrary amount of time.
     let deadline = timeout.unwrap_or(60_000).min(300_000) as u64;
     let recheck = if st.ctx.cluster.is_clustered() && !local_only {
-        CLUSTER_FEED_RECHECK
+        Recheck::Peers(CLUSTER_FEED_RECHECK)
     } else {
-        st.config.local_feed_recheck
+        Recheck::Security(st.config.local_feed_recheck)
     };
     Ok((
         feed,
@@ -219,6 +219,7 @@ fn changes_continuous(
         // a continuous feed times out or reaches its limit.
         let mut trailer: Option<(Seq, u64)> = None;
         let mut wake = db.subscribe_commits();
+        let mut poll = true;
         loop {
             if limit.map(|limit| sent >= limit).unwrap_or(false) {
                 break;
@@ -228,6 +229,7 @@ fn changes_continuous(
                 break;
             }
             wake.borrow_and_update();
+            if poll {
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                 Ok(value) => {
                     if !still_allowed(&st, &db, &principal) {
@@ -265,6 +267,7 @@ fn changes_continuous(
                     break;
                 }
             }
+            }
             if started.elapsed().as_millis() as u64 >= deadline
                 || limit.is_some_and(|limit| sent >= limit)
                 || st.shutdown.is_cancelled()
@@ -278,7 +281,7 @@ fn changes_continuous(
                     b"\n"
                 }));
             }
-            wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
+            poll = wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
         }
         // CouchDB's eventsource feed ends without this line.
         if let (Some((last_seq, pending)), false) = (trailer, eventsource) {
@@ -325,11 +328,13 @@ fn changes_longpoll_stream(
     let stream = async_stream::stream! {
         let started = std::time::Instant::now();
         let mut wake = db.subscribe_commits();
+        let mut poll = true;
         loop {
             if !still_allowed(&st, &db, &principal) {
                 break;
             }
             wake.borrow_and_update();
+            if poll {
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                 Ok(value)
                     if (!value.results.is_empty()
@@ -354,10 +359,11 @@ fn changes_longpoll_stream(
                     break;
                 }
             }
+            }
             if heartbeat.due() {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
             }
-            wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
+            poll = wait_for_commit(&mut wake, recheck, &heartbeat, started, deadline, &st.shutdown).await;
         }
     };
     feed_response("application/json", stream)
@@ -403,18 +409,23 @@ async fn changes_longpoll(
                 }
                 return json_of(StatusCode::OK, &v);
             }
-            Ok(_) => {
-                wait_for_commit(
-                    &mut wake,
-                    opts.recheck,
-                    &no_heartbeat,
-                    started,
-                    opts.deadline,
-                    &st.shutdown,
-                )
-                .await
-            }
+            Ok(_) => {}
             Err(e) => return fail(e),
+        }
+        // A tick that only had to notice a security change needs no new read.
+        while !wait_for_commit(
+            &mut wake,
+            opts.recheck,
+            &no_heartbeat,
+            started,
+            opts.deadline,
+            &st.shutdown,
+        )
+        .await
+        {
+            if !still_allowed(st, db, principal) {
+                return access_denied(principal);
+            }
         }
     }
 }
@@ -424,26 +435,49 @@ async fn changes_longpoll(
 /// more often than a standalone feed (`Config::local_feed_recheck`).
 const CLUSTER_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// What an idle feed does when no commit wakes it.
+#[derive(Clone, Copy)]
+enum Recheck {
+    /// Standalone: this node sees every commit, so the only out-of-band change
+    /// is the security object, which `still_allowed` re-reads. The feed does
+    /// not repeat its `changes_once` (filter resolution included).
+    Security(std::time::Duration),
+    /// Clustered: peers commit where this node cannot see them, so the feed
+    /// reads again.
+    Peers(std::time::Duration),
+}
+
+impl Recheck {
+    fn interval(self) -> std::time::Duration {
+        match self {
+            Recheck::Security(every) | Recheck::Peers(every) => every,
+        }
+    }
+}
+
 /// Sleep an idle feed until a commit lands, the recheck interval passes, the
 /// next heartbeat is due, the feed's deadline arrives or the server starts
-/// shutting down, whichever is first.
+/// shutting down, whichever is first. Returns whether the feed should read
+/// `changes_once` now: always for a commit, the deadline, shutdown or a
+/// clustered recheck; for a standalone tick or heartbeat only the security
+/// check (done by the caller) is due.
 async fn wait_for_commit(
     wake: &mut tokio::sync::watch::Receiver<()>,
-    recheck: std::time::Duration,
+    recheck: Recheck,
     heartbeat: &Heartbeat,
     started: std::time::Instant,
     deadline_ms: u64,
     shutdown: &tokio_util::sync::CancellationToken,
-) {
+) -> bool {
     let left = std::time::Duration::from_millis(deadline_ms).saturating_sub(started.elapsed());
-    let wait = recheck
-        .min(left)
-        .min(heartbeat.next_in().unwrap_or(recheck));
-    tokio::select! {
-        _ = wake.changed() => {}
-        _ = tokio::time::sleep(wait) => {}
-        _ = shutdown.cancelled() => {}
-    }
+    let every = recheck.interval();
+    let wait = every.min(left).min(heartbeat.next_in().unwrap_or(every));
+    let woken = tokio::select! {
+        _ = wake.changed() => true,
+        _ = tokio::time::sleep(wait) => false,
+        _ = shutdown.cancelled() => true,
+    };
+    woken || matches!(recheck, Recheck::Peers(_)) || wait >= left
 }
 
 /// One feed entry: an SSE event for `eventsource`, else a JSON line. A change's
@@ -643,8 +677,9 @@ async fn changes_once(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<ChangesList> {
-    #[cfg(test)]
-    record_changes_once(dbname);
+    st.feed_stats
+        .changes_once
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
@@ -680,37 +715,12 @@ async fn changes_once(
     Ok(list)
 }
 
-/// `changes_once` calls per database name, so a test can tell whether an idle
-/// feed polls.
-#[cfg(test)]
-static CHANGES_ONCE_CALLS: std::sync::Mutex<Vec<(String, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-#[cfg(test)]
-fn record_changes_once(dbname: &str) {
-    let mut calls = CHANGES_ONCE_CALLS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    match calls.iter_mut().find(|(name, _)| name == dbname) {
-        Some((_, count)) => *count += 1,
-        None => calls.push((dbname.to_string(), 1)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
-
-    fn changes_once_calls(dbname: &str) -> usize {
-        CHANGES_ONCE_CALLS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-            .find(|(name, _)| name == dbname)
-            .map_or(0, |(_, count)| *count)
-    }
 
     /// A continuous feed used to re-run `changes_once` every 50 ms for as long
     /// as it was open. An idle one must wait for a commit instead, and a
@@ -752,7 +762,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let calls = changes_once_calls("idlefeed");
+        let calls = st.feed_stats.changes_once.load(Ordering::Relaxed);
         assert!(calls <= 2, "an idle feed ran changes_once {calls} times");
 
         // A commit wakes it long before a fallback poll could.
@@ -763,6 +773,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(String::from_utf8_lossy(&line).contains("\"id\":\"a\""));
+
+        drop(feed);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Standalone, every commit wakes a feed, so its fallback tick only has to
+    /// notice a security change. It must not re-run `changes_once` (filter
+    /// resolution included) to do that.
+    #[tokio::test]
+    async fn an_idle_feed_does_not_rerun_changes_once_on_its_fallback_ticks() {
+        let root = std::env::temp_dir().join(format!("douchdb-idle-tick-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 500);
+        Arc::get_mut(&mut st).unwrap().config.local_feed_recheck = Duration::from_millis(10);
+        let db = st.create_db("idletick", false, None, None).await.unwrap();
+
+        let uri: Uri = "/idletick/_changes?feed=continuous&since=now&heartbeat=20&timeout=20000"
+            .parse()
+            .unwrap();
+        let q = query(&uri);
+        let headers = HeaderMap::new();
+        let body = Bytes::new();
+        let response = changes(
+            st.clone(),
+            db.clone(),
+            DbRequest {
+                st: &st,
+                db: &db,
+                name: "idletick",
+                method: &Method::GET,
+                uri: &uri,
+                q: &q,
+                headers: &headers,
+                principal: &Principal::service_admin(),
+                body: &body,
+            },
+        )
+        .await;
+        let mut feed = response.into_body().into_data_stream();
+
+        // Let many fallback ticks (and heartbeats) pass with nothing written.
+        for _ in 0..5 {
+            let line = tokio::time::timeout(Duration::from_secs(60), feed.next())
+                .await
+                .expect("the feed sent no heartbeat")
+                .unwrap()
+                .unwrap();
+            assert_eq!(&line[..], b"\n");
+        }
+        let calls = st.feed_stats.changes_once.load(Ordering::Relaxed);
+        assert_eq!(
+            calls, 1,
+            "an idle feed re-ran changes_once on {calls} ticks"
+        );
+
+        // A commit still arrives.
+        db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(60), feed.next())
+                .await
+                .expect("the feed did not wake for a commit")
+                .unwrap()
+                .unwrap();
+            if line.len() > 1 {
+                assert!(String::from_utf8_lossy(&line).contains("\"id\":\"a\""));
+                break;
+            }
+        }
 
         drop(feed);
         st.dbs.write().await.clear();
