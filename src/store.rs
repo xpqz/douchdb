@@ -200,6 +200,15 @@ impl LatestChanges {
             .map(|(seq, id)| (*seq, id.as_str()))
     }
 
+    /// Forget a document that no longer has a record.
+    pub fn remove(&mut self, id: &str) {
+        if let Some(old) = self.by_id.remove(id) {
+            self.by_seq.remove(&(old, id.to_string()));
+            self.buckets.add(bucket_of(old), -1);
+        }
+    }
+
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
@@ -260,7 +269,7 @@ pub struct Tx {
     /// Metadata writes whose before and after states the caller already
     /// knows, by index into `ops`. `commit_at` would otherwise read and decode
     /// both records to learn them.
-    known: std::collections::HashMap<usize, (Option<MetaState>, Option<MetaState>)>,
+    known: std::collections::HashMap<usize, MetaChange>,
 }
 
 impl Tx {
@@ -285,22 +294,24 @@ impl Tx {
     /// Delete a metadata record that cannot be decoded. Its old state is
     /// unknown, so the commit leaves the counters alone; the caller recounts.
     fn delete_corrupt_meta(&mut self, key: &[u8]) {
-        self.known.insert(self.ops.len(), (None, None));
+        self.known.insert(self.ops.len(), (None, None, None));
         self.delete(key);
     }
 
     /// Write a document's metadata record, saying what the document's state
     /// was in the shard before (`old`) and is after the write (`new`), so the
-    /// commit need not decode either. `old` must be the state of the record
-    /// the shard holds when the transaction commits.
+    /// commit need not decode either, and the sequence it carries (`seq`).
+    /// `old` must be the state of the record the shard holds when the
+    /// transaction commits.
     pub fn put_meta(
         &mut self,
         key: &[u8],
         value: &[u8],
         old: Option<MetaState>,
         new: Option<MetaState>,
+        seq: u64,
     ) {
-        self.known.insert(self.ops.len(), (old, new));
+        self.known.insert(self.ops.len(), (old, new, Some(seq)));
         self.put(key, value);
     }
 }
@@ -417,6 +428,10 @@ pub struct Shard {
 /// What a document's metadata says about it: the winning revision, whether it
 /// is live.
 pub(crate) type MetaState = (String, bool);
+
+/// A metadata record's state before and after a commit, and the sequence the
+/// new record carries (`None` when the record goes away).
+type MetaChange = (Option<MetaState>, Option<MetaState>, Option<u64>);
 
 pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
@@ -929,25 +944,6 @@ impl Shard {
         self.latest.is_some()
     }
 
-    pub fn update_latest(
-        &mut self,
-        staged: &std::collections::HashMap<String, DocMeta>,
-        ids: &std::collections::HashSet<String>,
-    ) {
-        let Some(latest) = &mut self.latest else {
-            return;
-        };
-        for id in ids {
-            if let Some(meta) = staged.get(id) {
-                latest.insert(id.clone(), meta.seq);
-            }
-        }
-    }
-
-    pub fn invalidate_latest(&mut self) {
-        self.latest = None;
-    }
-
     /// Drop the lazily built indexes (live ids, latest sequences, the rank
     /// cursor and the partition ranks). They are rebuilt from the shard's
     /// records on next use, so an idle shard holds none of them.
@@ -960,6 +956,7 @@ impl Shard {
 
     /// Entries held by the live and latest-changes indexes, for judging their
     /// memory by count.
+    #[cfg(test)]
     pub fn index_entries(&self) -> usize {
         self.live.as_ref().map_or(0, BTreeMap::len)
             + self.latest.as_ref().map_or(0, LatestChanges::len)
@@ -1196,10 +1193,7 @@ impl Shard {
                 self.pending.push((key.to_vec(), Some(value)));
             }
         }
-        self.live = None;
-        self.rank_cursor = None;
-        self.partition_ranks.clear();
-        self.latest = None;
+        self.release_indexes();
         Ok(())
     }
 
@@ -1379,6 +1373,7 @@ impl Shard {
                 states.push(Some((
                     old.as_ref().and_then(meta_state),
                     new.as_ref().and_then(meta_state),
+                    new.as_ref().map(|meta| meta.seq),
                 )));
             } else {
                 states.push(None);
@@ -1400,7 +1395,13 @@ impl Shard {
         let mut docs = self.docs as i64;
         let mut deleted = self.deleted as i64;
         for ((key, value), state) in tx.ops.into_iter().zip(states) {
-            if let Some((old_state, new_state)) = state {
+            if let Some((old_state, new_state, new_seq)) = state {
+                if let (Some(latest), Ok(id)) = (self.latest.as_mut(), doc_id_from_meta_key(&key)) {
+                    match new_seq {
+                        Some(seq) => latest.insert(id.to_string(), seq),
+                        None => latest.remove(id),
+                    }
+                }
                 match old_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
@@ -1488,10 +1489,7 @@ impl Shard {
         self.seq = mark.seq;
         self.docs = mark.docs;
         self.deleted = mark.deleted;
-        self.live = None;
-        self.rank_cursor = None;
-        self.partition_ranks.clear();
-        self.latest = None;
+        self.release_indexes();
     }
 
     /// Write every queued operation as one synced `WriteBatch`.
@@ -1547,10 +1545,7 @@ impl Shard {
     fn restore_from_disk(&mut self) -> Result<()> {
         self.pending.clear();
         self.overlay.clear();
-        self.live = None;
-        self.rank_cursor = None;
-        self.partition_ranks.clear();
-        self.latest = None;
+        self.release_indexes();
         self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
         self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
         self.deleted = read_counter(&mut self.db, b"z/doc_deleted_count")?.unwrap_or(0);
@@ -1597,10 +1592,7 @@ impl Shard {
         self.db.write(batch, true)?;
         self.docs = 0;
         self.deleted = 0;
-        self.live = None;
-        self.rank_cursor = None;
-        self.partition_ranks.clear();
-        self.latest = None;
+        self.release_indexes();
         self.pending.clear();
         self.overlay.clear();
         self.db

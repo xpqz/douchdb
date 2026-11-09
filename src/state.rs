@@ -118,6 +118,9 @@ pub const DEFAULT_MAX_OPEN_DBS: usize = 256;
 pub struct OpenDb {
     db: Arc<Db>,
     used: AtomicU64,
+    /// The `used` stamp at which the indexes were last released, so an idle
+    /// database is released once per idle spell and not on every sweep.
+    released_at: AtomicU64,
 }
 
 /// Source of the "last used" stamps. Only their order matters.
@@ -128,6 +131,7 @@ impl OpenDb {
         OpenDb {
             db,
             used: AtomicU64::new(DB_CLOCK.fetch_add(1, Ordering::Relaxed)),
+            released_at: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -252,6 +256,8 @@ pub struct AppState {
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
     pub db_opens: AtomicU64,
+    /// The database-use clock at the previous `release_idle_indexes` sweep.
+    pub last_sweep: AtomicU64,
     /// How many times a request's principal was resolved from its headers.
     /// One per request is the goal; the local metrics report it so tests and
     /// operators can count.
@@ -419,6 +425,11 @@ impl AppState {
     /// database back waits for the drop, so it never meets a LevelDB lock
     /// that is still held.
     async fn close_idle(&self) {
+        self.close_over_cap().await;
+        self.release_idle_indexes().await;
+    }
+
+    async fn close_over_cap(&self) {
         let cap = self.config.max_open_dbs.max(1);
         let mut closing = Vec::new();
         {
@@ -454,6 +465,34 @@ impl AppState {
         }
         if !closing.is_empty() {
             tokio::task::spawn_blocking(move || drop(closing));
+        }
+    }
+
+    /// Drop the in-memory indexes of the open databases nobody has asked for
+    /// since the previous sweep, so a database that stays open but idle does
+    /// not keep every document id in memory. Sweeps happen whenever a
+    /// database is opened or created; "idle" is counted in database uses
+    /// between sweeps, not in time. The indexes rebuild on the next query.
+    async fn release_idle_indexes(&self) {
+        let now = DB_CLOCK.load(Ordering::Relaxed);
+        let since = self.last_sweep.swap(now, Ordering::Relaxed);
+        let idle: Vec<Arc<Db>> = {
+            let dbs = self.dbs.read().await;
+            dbs.values()
+                .filter(|open| {
+                    let used = open.used.load(Ordering::Relaxed);
+                    used < since
+                        && Arc::strong_count(&open.db) == 1
+                        && open.released_at.swap(used, Ordering::Relaxed) != used
+                })
+                .map(|open| open.db.clone())
+                .collect()
+        };
+        // Idle databases have nothing queued, so this does not hold up the
+        // caller. It runs after any closing so the handles taken here do not
+        // make a database look busy to `close_over_cap`.
+        for db in idle {
+            db.release_indexes().await;
         }
     }
 
@@ -593,6 +632,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         dbs: Default::default(),
         db_locks: Default::default(),
         db_opens: Default::default(),
+        last_sweep: Default::default(),
         principal_resolutions: Default::default(),
         fs_health: Default::default(),
         shutdown: Default::default(),
@@ -761,16 +801,11 @@ mod tests {
         drop(st.db("busy").await.unwrap());
         drop(st.create_db("other", false, None, None).await.unwrap());
         let idle = st.open_db_if_cached("idle").await.unwrap();
-        let mut released = false;
-        // The release runs in the background: wait for it, not for a time.
-        for _ in 0..100_000 {
-            if idle.index_entries().await == 0 {
-                released = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(released, "the idle database kept its indexes");
+        assert_eq!(
+            idle.index_entries().await,
+            0,
+            "the idle database kept its indexes"
+        );
         assert_eq!(
             st.open_db_if_cached("busy")
                 .await
