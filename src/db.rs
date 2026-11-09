@@ -679,6 +679,31 @@ impl Db {
         )
     }
 
+    /// Drop every shard's lazily built indexes so an idle database holds none
+    /// of them; the next query rebuilds what it needs from the shards' records.
+    pub async fn release_indexes(&self) {
+        for shard in &self.shards {
+            let _ = shard
+                .call(|shard| {
+                    shard.release_indexes();
+                    Ok(())
+                })
+                .await;
+        }
+    }
+
+    /// Entries the shards hold in their live and latest-changes indexes.
+    pub async fn index_entries(&self) -> usize {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard
+                .call(|shard| Ok(shard.index_entries()))
+                .await
+                .unwrap_or(0);
+        }
+        total
+    }
+
     /// Whether the database can be closed and reopened without losing
     /// anything: no rebalance is freezing it, no compaction is running, and no
     /// cluster write holds its gate. What it keeps in memory beyond that is

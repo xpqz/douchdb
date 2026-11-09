@@ -200,6 +200,10 @@ impl LatestChanges {
             .map(|(seq, id)| (*seq, id.as_str()))
     }
 
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
     pub fn seq_of(&self, id: &str) -> Option<u64> {
         self.by_id.get(id).copied()
     }
@@ -942,6 +946,23 @@ impl Shard {
 
     pub fn invalidate_latest(&mut self) {
         self.latest = None;
+    }
+
+    /// Drop the lazily built indexes (live ids, latest sequences, the rank
+    /// cursor and the partition ranks). They are rebuilt from the shard's
+    /// records on next use, so an idle shard holds none of them.
+    pub fn release_indexes(&mut self) {
+        self.live = None;
+        self.rank_cursor = None;
+        self.partition_ranks.clear();
+        self.latest = None;
+    }
+
+    /// Entries held by the live and latest-changes indexes, for judging their
+    /// memory by count.
+    pub fn index_entries(&self) -> usize {
+        self.live.as_ref().map_or(0, BTreeMap::len)
+            + self.latest.as_ref().map_or(0, LatestChanges::len)
     }
 
     pub fn pending_changes(&mut self, after: u64, descending: bool) -> Result<usize> {
@@ -2486,6 +2507,91 @@ mod scan_tests {
             shard.commit_at(tx, Some(seq)).unwrap();
             check(&mut shard);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_keeps_the_latest_index_current() {
+        let dir = temp_shard_dir("latest-commit");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
+        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
+        shard.commit_at(tx, Some(2)).unwrap();
+        assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
+
+        // An update, a new document and a purge, committed with the index
+        // built: it follows them without a rebuild.
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("a"), &meta(false, 3)).unwrap();
+        tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
+        tx.delete(&meta_key("b"));
+        shard.commit_at(tx, Some(4)).unwrap();
+        assert!(shard.latest.is_some(), "the index was dropped, not updated");
+        let latest = shard.latest_changes().unwrap();
+        assert_eq!(latest.seq_of("a"), Some(3));
+        assert_eq!(latest.seq_of("b"), None);
+        assert_eq!(latest.through(u64::MAX).count(), 2);
+        assert_eq!(latest.count_after(3), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An idle shard holds no live or latest-changes entries, and the next
+    /// query rebuilds them: counts, ranks, partition counts and `_changes`
+    /// order come out as they did, and a write made while released shows.
+    #[test]
+    fn released_indexes_are_empty_and_rebuild_on_next_use() {
+        let dir = temp_shard_dir("release-indexes");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut tx = Tx::new();
+        for (seq, id) in [(1, "a"), (2, "p:1"), (3, "p:2"), (4, "q:1"), (5, "z")] {
+            tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
+        }
+        tx.put_json(&meta_key("p:3"), &meta(true, 6)).unwrap();
+        shard.commit_at(tx, Some(6)).unwrap();
+        shard.flush_pending().unwrap();
+
+        let observe = |shard: &mut Shard| {
+            let changes: Vec<(u64, String)> = shard
+                .latest_changes()
+                .unwrap()
+                .after(1)
+                .map(|(seq, id)| (seq, id.to_string()))
+                .collect();
+            (
+                live_ids(shard),
+                shard.live_rank("q:").unwrap(),
+                shard.partition_counts("p").unwrap(),
+                shard.partition_offset("p", "p:2", true).unwrap(),
+                shard.pending_changes(3, false).unwrap(),
+                shard.pending_changes(3, true).unwrap(),
+                changes,
+            )
+        };
+        let before = observe(&mut shard);
+        assert_eq!(before.1, 3);
+        assert_eq!(shard.index_entries(), 5 + 6, "live plus latest");
+
+        shard.release_indexes();
+        assert_eq!(shard.index_entries(), 0);
+        assert!(shard.rank_cursor.is_none() && shard.partition_ranks.is_empty());
+        assert_eq!(observe(&mut shard), before, "rebuilt answers differ");
+        assert_eq!(shard.index_entries(), 5 + 6);
+
+        // A write between the release and the rebuild is not lost.
+        shard.release_indexes();
+        let mut tx = Tx::new();
+        tx.put_json(&meta_key("p:0"), &meta(false, 7)).unwrap();
+        tx.put_json(&meta_key("z"), &meta(true, 8)).unwrap();
+        shard.commit_at(tx, Some(8)).unwrap();
+        assert_eq!(shard.index_entries(), 0, "a write rebuilt the indexes");
+        assert_eq!(live_ids(&mut shard), ["a", "p:0", "p:1", "p:2", "q:1"]);
+        assert_eq!(shard.partition_counts("p").unwrap(), (3, 1));
+        assert_eq!(shard.live_rank("q:").unwrap(), 4);
+        let latest = shard.latest_changes().unwrap();
+        assert_eq!(latest.seq_of("p:0"), Some(7));
+        assert_eq!(latest.seq_of("z"), Some(8));
+        assert_eq!(latest.through(u64::MAX).count(), 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -639,6 +639,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::AllDocsOpts;
 
     /// Every database ever opened used to stay open, with its shard actors and
     /// stores, until it was deleted.
@@ -725,6 +726,63 @@ mod tests {
             .await
             .unwrap();
         drop(held);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A database that stays open but is not asked for between two sweeps
+    /// gives up its in-memory indexes; one in use keeps them, and the idle
+    /// one rebuilds them on its next query.
+    #[tokio::test]
+    async fn idle_databases_release_their_indexes() {
+        let root = std::env::temp_dir().join(format!("douchdb-dbrelease-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 10);
+        let docs =
+            |n: usize| -> Vec<Value> { (0..n).map(|i| json!({"_id": format!("d{i}")})).collect() };
+        // An `_all_docs` page from a startkey builds the live index, a
+        // pending count the latest-changes index.
+        let query = |db: Arc<Db>| async move {
+            let page = AllDocsOpts {
+                startkey: Some("d1".into()),
+                ..AllDocsOpts::default()
+            };
+            assert_eq!(db.all_docs(&page).await.unwrap().rows.len(), 2);
+            assert_eq!(db.changes_pending(0, false, None).await.unwrap(), 3);
+        };
+        let build = |db: Arc<Db>| async move {
+            db.put_docs(docs(3), true).await.unwrap();
+            query(db.clone()).await;
+            assert_eq!(db.index_entries().await, 6);
+        };
+        build(st.create_db("idle", false, None, None).await.unwrap()).await;
+        build(st.create_db("busy", false, None, None).await.unwrap()).await;
+        // Use "busy" again, then open another database: the sweep it runs
+        // finds "idle" untouched since the last one and "busy" in use.
+        drop(st.db("busy").await.unwrap());
+        drop(st.create_db("other", false, None, None).await.unwrap());
+        let idle = st.open_db_if_cached("idle").await.unwrap();
+        let mut released = false;
+        // The release runs in the background: wait for it, not for a time.
+        for _ in 0..100_000 {
+            if idle.index_entries().await == 0 {
+                released = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(released, "the idle database kept its indexes");
+        assert_eq!(
+            st.open_db_if_cached("busy")
+                .await
+                .unwrap()
+                .index_entries()
+                .await,
+            6
+        );
+        // The next query rebuilds them.
+        query(idle.clone()).await;
+        assert_eq!(idle.index_entries().await, 6);
+        drop(idle);
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
     }
