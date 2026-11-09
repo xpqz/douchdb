@@ -169,6 +169,13 @@ fn build_state(
             .iter()
             .map(|header| header.to_ascii_lowercase())
             .collect(),
+        cors_methods: args.cors_methods.clone(),
+        cors_exposed_headers: args
+            .cors_exposed_headers
+            .iter()
+            .map(|header| header.to_ascii_lowercase())
+            .collect(),
+        cors_max_age: args.cors_max_age,
         view_timeout_ms: args.view_timeout_ms,
         view_memory_mb: args.view_memory_mb,
         default_admin_only,
@@ -291,6 +298,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             args.max_request_mb.saturating_mul(1024 * 1024),
         ))
+        .layer(axum::middleware::from_fn(api::json_cache_control))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::cors,

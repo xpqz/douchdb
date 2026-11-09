@@ -258,6 +258,15 @@ pub struct Config {
     /// Request headers a preflight may ask for, replacing CouchDB's default
     /// list when non-empty (CouchDB `[cors] headers`), lowercase.
     pub cors_headers: Vec<String>,
+    /// Methods a preflight may ask for, replacing CouchDB's list when
+    /// non-empty (CouchDB `[cors] methods`); case-sensitive.
+    pub cors_methods: Vec<String>,
+    /// Response headers listed in `Access-Control-Expose-Headers` after the
+    /// simple ones, replacing CouchDB's own list when non-empty (CouchDB
+    /// `[cors] exposed_headers`), lowercase.
+    pub cors_exposed_headers: Vec<String>,
+    /// `Access-Control-Max-Age` seconds (CouchDB `[cors] max_age`, default 600).
+    pub cors_max_age: u64,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     /// When true, a database with an empty `_security` object is admin-only.
@@ -562,6 +571,9 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             cors_origins: Vec::new(),
             cors_credentials: false,
             cors_headers: Vec::new(),
+            cors_methods: Vec::new(),
+            cors_exposed_headers: Vec::new(),
+            cors_max_age: 600,
             view_timeout_ms: 1000,
             view_memory_mb: 1,
             default_admin_only: true,

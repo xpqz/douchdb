@@ -33,6 +33,9 @@ pub struct Args {
     pub cors_origins: Vec<String>,
     pub cors_credentials: bool,
     pub cors_headers: Vec<String>,
+    pub cors_methods: Vec<String>,
+    pub cors_exposed_headers: Vec<String>,
+    pub cors_max_age: u64,
     pub view_timeout_ms: u64,
     pub view_memory_mb: usize,
     pub max_request_mb: usize,
@@ -59,7 +62,9 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--js-sandbox native|process|wasm] [--wasm-runtime wasmi|wasmtime]\n\
                      \x20       [--js-workers N]\n\
                      \x20       [--cors-origins ORIGIN,ORIGIN] [--cors-credentials]\n\
-                     \x20       [--cors-headers HEADER,HEADER] [--view-timeout-ms N]\n\
+                     \x20       [--cors-headers HEADER,HEADER] [--cors-methods METHOD,METHOD]\n\
+                     \x20       [--cors-exposed-headers HEADER,HEADER] [--cors-max-age SECS]\n\
+                     \x20       [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
                      \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
                      \x20       [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]\n\
@@ -183,6 +188,9 @@ pub fn parse_from(
         cors_origins: Vec::new(),
         cors_credentials: false,
         cors_headers: Vec::new(),
+        cors_methods: Vec::new(),
+        cors_exposed_headers: Vec::new(),
+        cors_max_age: 600,
         view_timeout_ms: 5000,
         view_memory_mb: 64,
         max_request_mb: 64,
@@ -318,6 +326,9 @@ pub fn parse_from(
             "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
             "--cors-credentials" => args.cors_credentials = true,
             "--cors-headers" => args.cors_headers = list(&value(&mut it, flag)?),
+            "--cors-methods" => args.cors_methods = list(&value(&mut it, flag)?),
+            "--cors-exposed-headers" => args.cors_exposed_headers = list(&value(&mut it, flag)?),
+            "--cors-max-age" => args.cors_max_age = number(&mut it, flag, 0, u32::MAX.into())?,
             "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -381,6 +392,7 @@ mod tests {
         "--max-request-mb",
         "--max-open-indexes",
         "--max-open-dbs",
+        "--cors-max-age",
     ];
 
     const NEEDS_VALUE: &[&str] = &[
@@ -399,6 +411,8 @@ mod tests {
         "--otel-endpoint",
         "--cors-origins",
         "--cors-headers",
+        "--cors-methods",
+        "--cors-exposed-headers",
     ];
 
     #[test]
