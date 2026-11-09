@@ -13905,6 +13905,176 @@ async fn js_sandboxes_agree_on_view_rows() {
     }
 }
 
+/// Servers for the same view and search work under every sandbox: native,
+/// process, wasm (wasmi) and, with the feature, wasm under Wasmtime. The
+/// memory limit is raised so that an output past the size limit fits in it.
+fn sandbox_servers() -> Vec<Server> {
+    let start = |extra: &[&str]| {
+        let mut args: Vec<String> = extra.iter().map(|arg| arg.to_string()).collect();
+        args.extend(
+            ["--view-memory-mb", "256", "--view-timeout-ms", "600000"].map(str::to_string),
+        );
+        let mut server = Server::start_with(&args, false);
+        // Producing 17 MiB of output is slow in an unoptimised wasm
+        // interpreter: wait for the answer instead of the default client's 60 s.
+        server.client = Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .expect("client");
+        server
+    };
+    let wasmtime = cfg!(feature = "wasmtime")
+        .then(|| start(&["--js-sandbox", "wasm", "--wasm-runtime", "wasmtime"]));
+    [
+        start(&[]),
+        start(&["--js-sandbox", "process"]),
+        start(&["--js-sandbox", "wasm"]),
+    ]
+    .into_iter()
+    .chain(wasmtime)
+    .collect()
+}
+
+/// Load `docs` and the design document `ddoc` into a fresh database on every
+/// sandbox server, run `paths` against each and require identical responses
+/// (status and body text, so object key order counts). Returns the native
+/// server's responses.
+async fn assert_sandboxes_agree_on(
+    db: &str,
+    docs: Value,
+    ddoc: Value,
+    paths: &[&str],
+) -> Vec<(StatusCode, Value)> {
+    let servers = sandbox_servers();
+    let mut baseline: Option<Vec<(StatusCode, String)>> = None;
+    let mut native = Vec::new();
+    for (index, s) in servers.iter().enumerate() {
+        s.fresh_db(db).await;
+        let (status, body) = s.post(&format!("/{db}/_bulk_docs"), docs.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "server {index}: {body}");
+        let (status, body) = s.put(&format!("/{db}/_design/v"), ddoc.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "server {index}: {body}");
+        let mut responses = Vec::new();
+        for path in paths {
+            responses.push(s.get(&format!("/{db}/_design/v/{path}")).await);
+        }
+        let texts: Vec<(StatusCode, String)> = responses
+            .iter()
+            .map(|(status, body)| (*status, body.to_string()))
+            .collect();
+        match &baseline {
+            None => {
+                baseline = Some(texts);
+                native = responses;
+            }
+            Some(expected) => assert_eq!(&texts, expected, "server {index} disagreed with native"),
+        }
+    }
+    native
+}
+
+#[tokio::test]
+async fn js_sandboxes_agree_on_oversize_emitted_output() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
+    // One emitted string past the 16 MiB output limit.
+    let responses = assert_sandboxes_agree_on(
+        "jsbig",
+        json!({"docs": [{"_id": "a"}]}),
+        json!({
+            "views": {"big": {"map": "function(doc){ emit(1, 'x'.repeat(17 * 1024 * 1024)); }"}},
+            "indexes": {"big": {"index": "function(doc){ index('f', 'x'.repeat(17 * 1024 * 1024)); }"}}
+        }),
+        &["_view/big?reduce=false", "_search/big?q=f:x"],
+    )
+    .await;
+    for (status, body) in &responses {
+        assert!(
+            body.to_string().contains("bytes of output (limit 16777216)"),
+            "native should refuse the output: {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn js_sandboxes_agree_on_the_key_order_of_emitted_objects() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
+    let responses = assert_sandboxes_agree_on(
+        "jsorder",
+        json!({"docs": [{"_id": "a"}]}),
+        json!({"views": {"order": {"map":
+            "function(doc){ emit({z: 1, a: 2, m: {y: 1, b: 2}}, {z: 1, a: 2, m: {y: 1, b: 2}}); }"}}}),
+        &["_view/order?reduce=false"],
+    )
+    .await;
+    let row = &responses[0].1["rows"][0];
+    for member in ["key", "value"] {
+        assert_eq!(
+            row[member].to_string(),
+            r#"{"z":1,"a":2,"m":{"y":1,"b":2}}"#,
+            "{member}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn js_sandboxes_agree_on_compile_and_runtime_error_text() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
+    let responses = assert_sandboxes_agree_on(
+        "jserr",
+        json!({"docs": [{"_id": "doc-1"}]}),
+        json!({
+            "views": {"boom": {"map": "function(doc){ throw new Error('boom'); }"}},
+            "indexes": {
+                "boom": {"index": "function(doc){ throw new Error('boom'); }"},
+                "syntax": {"index": "function(doc){ index('f' }"}
+            }
+        }),
+        &[
+            "_view/boom?reduce=false",
+            "_search/boom?q=f:x",
+            "_search/syntax?q=f:x",
+        ],
+    )
+    .await;
+    let text = responses[0].1.to_string();
+    assert!(text.contains("doc-1: "), "doc id prefix: {text}");
+    let text = responses[2].1.to_string();
+    assert!(text.contains("compile: "), "compile prefix: {text}");
+}
+
+#[tokio::test]
+async fn js_sandboxes_agree_on_the_document_a_batch_error_names() {
+    if !sandbox_tested("process") || !sandbox_tested("wasm") {
+        return;
+    }
+    // Errors name the first document of the batch the function failed in, so
+    // every sandbox must cut the same batches. The failing document is far
+    // from the start of whichever batch holds it.
+    let docs: Vec<Value> = (0..1200)
+        .map(|i| json!({"_id": format!("d{i:04}")}))
+        .collect();
+    let responses = assert_sandboxes_agree_on(
+        "jsbatch",
+        json!({"docs": docs}),
+        json!({
+            "views": {"late": {"map": "function(doc){ if (doc._id === 'd0600') throw new Error('late'); }"}},
+            "indexes": {"late": {"index": "function(doc){ if (doc._id === 'd0600') throw new Error('late'); }"}}
+        }),
+        &["_view/late?reduce=false", "_search/late?q=f:x"],
+    )
+    .await;
+    for (status, body) in &responses {
+        assert_eq!(*status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!body.to_string().contains("d0600: "), "{body}");
+    }
+}
+
 #[cfg(not(feature = "wasm"))]
 #[test]
 fn wasm_sandbox_without_the_wasm_feature_fails_at_startup() {
