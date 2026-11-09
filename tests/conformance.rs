@@ -15300,6 +15300,88 @@ fn unparsable_numeric_flag_is_a_startup_error_with_exit_code_2() {
     assert!(stderr.contains("--q") && stderr.contains("abc"), "{stderr}");
 }
 
+/// Run the server with `extra` arguments until it exits on its own, and
+/// return its exit code and stderr. Fails if it kept running past a generous
+/// failsafe.
+fn startup_exit(extra: &[&str]) -> (Option<i32>, String) {
+    use std::io::Read;
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("douchdb-exit-{}-{}", std::process::id(), port));
+    let mut cmd = server_command();
+    cmd.arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&dir)
+        .args(extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(done)) = child.try_wait() {
+            status = Some(done);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.expect("startup must stop, but the server kept running");
+    (status.code(), stderr)
+}
+
+/// A configuration the server cannot start with exits 2, whichever check
+/// finds it, so a supervisor can tell it from a runtime failure (1).
+#[test]
+fn unreadable_users_file_is_a_startup_error_with_exit_code_2() {
+    let (code, stderr) = startup_exit(&["--users-file", "/nonexistent/douchdb-users.json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("users"), "{stderr}");
+}
+
+/// The stdin-EOF test hook takes the graceful shutdown path, not a bare
+/// `process::exit`.
+#[test]
+fn stdin_eof_hook_shuts_down_gracefully() {
+    use std::io::Read;
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("douchdb-eof-{}-{}", std::process::id(), port));
+    let mut cmd = server_command();
+    cmd.arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
+    drop(child.stdin.take());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(done)) = child.try_wait() {
+            status = Some(done);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let mut log = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut log);
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.expect("the server must exit when stdin closes");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(log.contains("stdin closed; shutting down"), "{log}");
+}
+
 /// Send `signal` to a running server.
 fn signal_server(server: &Server, signal: i32) {
     // SAFETY: kill(2) takes plain integers and touches no memory.

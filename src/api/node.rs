@@ -105,7 +105,13 @@ pub async fn replication_status(State(st): State<Arc<AppState>>, _: AdminOnly) -
 pub async fn replication_run(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly) -> Response {
     let db = query(&uri).get("db").cloned();
     if !st.cluster_state.replication_running() {
-        tokio::spawn(crate::replicate::sync_once(st.clone(), db));
+        let state = st.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = crate::replicate::sync_once(state.clone(), db) => {}
+                () = state.shutdown.cancelled() => {}
+            }
+        });
     }
     json(
         StatusCode::ACCEPTED,
@@ -374,7 +380,9 @@ pub async fn db_rebalance(
     let cleanup = flag(&q, "cleanup");
     let timeout_ms = num(&q, "timeout_ms").unwrap_or(30_000).min(300_000) as u64;
 
-    match crate::cluster_ops::rebalance(&st.ctx, &db, &name, &headers, timeout_ms, cleanup).await {
+    match crate::cluster_ops::rebalance(&st.ctx, &db, &headers, timeout_ms, cleanup, &st.shutdown)
+        .await
+    {
         Ok(value) => json(StatusCode::OK, value),
         Err(error) => fail(error),
     }

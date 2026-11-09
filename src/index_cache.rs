@@ -29,6 +29,16 @@ pub fn set_max_open(max: usize) {
     MAX_OPEN.store(max.max(1), Ordering::SeqCst);
 }
 
+/// The server's shutdown token. Index builds and updates stop at their next
+/// `Gate::check`, between batches, once it is cancelled.
+static SHUTDOWN: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+    std::sync::OnceLock::new();
+
+/// Make index updates stop between batches when `token` is cancelled.
+pub fn stop_updates_on(token: tokio_util::sync::CancellationToken) {
+    let _ = SHUTDOWN.set(token);
+}
+
 /// Lowers the shared cap for the length of a test, then restores the default.
 /// Tests that lower it run one at a time, since they would otherwise reset
 /// each other's cap.
@@ -243,10 +253,17 @@ impl Gate {
         self.lock.clone().write_owned().await
     }
 
-    /// `not_found` once the database is being deleted.
+    /// `not_found` once the database is being deleted, and `503` once the
+    /// server is shutting down.
     pub fn check(&self) -> DbResult<()> {
         if self.deleted.is_cancelled() {
             Err(deleted_error())
+        } else if SHUTDOWN.get().is_some_and(|token| token.is_cancelled()) {
+            Err(ApiError::new(
+                503,
+                "shutting_down",
+                "the node is shutting down",
+            ))
         } else {
             Ok(())
         }

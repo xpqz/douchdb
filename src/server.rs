@@ -15,16 +15,18 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-/// Exit when stdin reaches EOF. Test harnesses set `DOUCHDB_EXIT_ON_STDIN_EOF`
-/// and hold the write end of a stdin pipe, so a server dies with its parent even
-/// when the parent is killed and cannot clean up. Off unless the variable is set.
-fn exit_on_stdin_eof() {
-    std::thread::spawn(|| {
+/// Shut down gracefully when stdin reaches EOF. Test harnesses set
+/// `DOUCHDB_EXIT_ON_STDIN_EOF` and hold the write end of a stdin pipe, so a
+/// server stops with its parent even when the parent is killed and cannot
+/// clean up. Off unless the variable is set.
+fn shutdown_on_stdin_eof(shutdown: CancellationToken) {
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut sink = [0u8; 256];
         let mut stdin = std::io::stdin().lock();
         while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
-        std::process::exit(0);
+        tracing::info!("stdin closed; shutting down");
+        shutdown.cancel();
     });
 }
 
@@ -73,9 +75,8 @@ fn config_error(message: impl Into<String>) -> ConfigError {
     ConfigError(message.into())
 }
 
-/// Apply the JS sandbox choice from `--js-sandbox` and `--wasm-runtime`.
+/// Check the `--wasm-runtime` choice against the `--js-sandbox` it applies to.
 fn configure_js_sandbox(args: &Args) -> Result<(), ConfigError> {
-    js::configure(args.js_sandbox, args.js_workers);
     if args.js_sandbox == js::Sandbox::Wasm {
         js::set_wasm_runtime(args.wasm_runtime).map_err(|error| config_error(error.to_string()))?;
     }
@@ -99,9 +100,8 @@ fn check_cluster_args(args: &Args) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Check every option whose value the CLI parser cannot, and apply the JS
-/// sandbox choice. Runs before anything else starts, so a bad configuration
-/// leaves nothing behind.
+/// Check every option whose value the CLI parser cannot. Runs before anything
+/// else starts, so a bad configuration leaves nothing behind.
 fn validate_config(args: &Args) -> Result<(), ConfigError> {
     configure_js_sandbox(args)?;
     check_cluster_args(args)
@@ -119,19 +119,19 @@ fn advertise_url(args: &Args) -> String {
 }
 
 /// Credentials from `--users-file` or `--admin`, if either is configured.
-fn build_auth(args: &Args) -> anyhow::Result<Option<Auth>> {
+fn build_auth(args: &Args) -> Result<Option<Auth>, ConfigError> {
     Ok(if args.users_file.is_some() || args.admin.is_some() {
         if args.nodes.len() > 1 && args.session_secret.trim().is_empty() {
             tracing::warn!(
                 "no --session-secret: each node signs session cookies with its own key, so a cookie only works on the node that issued it"
             );
         }
-        let secret = crate::auth::session_secret(&args.data, &args.session_secret)
-            .map_err(anyhow::Error::msg)?;
+        let secret =
+            crate::auth::session_secret(&args.data, &args.session_secret).map_err(config_error)?;
         if let Some(path) = &args.users_file {
             Some(
                 Auth::from_users_file(args.admin.clone(), std::path::Path::new(path), secret)
-                    .map_err(anyhow::Error::msg)?,
+                    .map_err(config_error)?,
             )
         } else {
             args.admin
@@ -153,6 +153,7 @@ fn build_state(
     args: &Args,
     auth: Option<Auth>,
     advertise: String,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<Arc<AppState>> {
     let default_admin_only = default_admin_only(args, &auth);
     let config = Config {
@@ -210,7 +211,7 @@ fn build_state(
         },
         db_updates: api::DbUpdates::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
-        shutdown: CancellationToken::new(),
+        shutdown,
     }))
 }
 
@@ -341,17 +342,21 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if args.worker {
         anyhow::bail!("--js-worker must be started through run_worker, outside an async runtime");
     }
-    if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
-        exit_on_stdin_eof();
-    }
     validate_config(&args)?;
+    js::configure(args.js_sandbox, args.js_workers);
     crate::index_cache::set_max_open(args.max_open_indexes);
     crate::cluster_ops::set_write_drain_ms(args.rebalance_write_drain_ms);
     crate::cluster_ops::set_stable_wait_ms(args.rebalance_stable_wait_ms);
     crate::db::set_rebalance_freeze_ms(args.rebalance_freeze_ms);
     crate::js::set_worker_startup_ms(args.js_worker_startup_ms);
-    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())?;
-    let result = serve(&args).await;
+    let telemetry = telemetry::init(args.otel_endpoint.clone(), &args.me.to_string())
+        .map_err(|error| config_error(format!("telemetry: {error}")))?;
+    let shutdown = CancellationToken::new();
+    if std::env::var_os("DOUCHDB_EXIT_ON_STDIN_EOF").is_some() {
+        shutdown_on_stdin_eof(shutdown.clone());
+    }
+    crate::index_cache::stop_updates_on(shutdown.clone());
+    let result = serve(&args, shutdown).await;
     if let Some(telemetry) = telemetry {
         let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
         if tokio::time::timeout(TELEMETRY_FLUSH_DEADLINE, flush)
@@ -366,7 +371,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
 /// Start the node and serve until a shutdown signal, then stop the background
 /// tasks and close the databases, all within [`SHUTDOWN_DEADLINE`] of the signal.
-async fn serve(args: &Args) -> anyhow::Result<()> {
+async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
     if args.cors_credentials && args.cors_origins.iter().any(|origin| origin == "*") {
         tracing::warn!(
             "CORS allows any origin and sends credentials; any website can act as a logged-in user"
@@ -376,8 +381,7 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
 
     let advertise = advertise_url(args);
     let auth = build_auth(args)?;
-    let state = build_state(args, auth, advertise)?;
-    let shutdown = state.shutdown.clone();
+    let state = build_state(args, auth, advertise, shutdown.clone())?;
     handle_signals(shutdown.clone())?;
     let mut tasks = Vec::new();
     if state.ctx.cluster.is_clustered() {
