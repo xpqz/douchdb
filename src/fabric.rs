@@ -7,7 +7,8 @@ use crate::cluster_http::{
     ClusterCtx,
 };
 use crate::db::{
-    AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts, WriteError, WriteResult,
+    AllDocsOpts, ApiError, ChangeEntry, ChangesList, ChangesOpts, Db, DbResult, DocOpts, Seq,
+    WriteError, WriteResult,
 };
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::AppState;
@@ -2405,13 +2406,11 @@ pub(crate) async fn fetch_ddoc_from_replica(
     Err(ApiError::not_found(format!("missing {ddoc}")))
 }
 
-fn last_seq_for_node(value: &Value, node: usize) -> Option<u64> {
-    let seq = value.get("last_seq")?;
-    if let Some(seq) = seq.as_u64() {
-        return Some(seq);
+fn last_seq_for_node(seq: &Seq, node: usize) -> Option<u64> {
+    match seq {
+        Seq::Num(seq) => Some(*seq),
+        Seq::Token(token) => decode_since(token)?.get(node).copied(),
     }
-    let decoded = decode_since(seq.as_str()?)?;
-    decoded.get(node).copied()
 }
 
 /// Where a feed stands on shards read from a replica because their preferred
@@ -2439,7 +2438,7 @@ struct ChangeLane {
     node: usize,
     /// Index into the marks of a fallback lane; `None` for an owner lane.
     mark: Option<usize>,
-    rows: std::collections::VecDeque<Value>,
+    rows: std::collections::VecDeque<ChangeEntry>,
     last: Option<u64>,
 }
 
@@ -2447,7 +2446,7 @@ pub(crate) async fn cluster_changes(
     read: ClusterRead<'_>,
     q: &HashMap<String, String>,
     body: &[u8],
-) -> DbResult<Value> {
+) -> DbResult<ChangesList> {
     let ClusterRead { ctx, db, .. } = read;
     let n = ctx.cluster.nodes.len();
     let raw_since = q.get("since").map(String::as_str);
@@ -2484,11 +2483,11 @@ pub(crate) async fn cluster_changes(
         q,
     };
     if limit == Some(0) {
-        return Ok(json!({
-            "results": [],
-            "last_seq": encode_token(&since, &marks),
-            "pending": 0,
-        }));
+        return Ok(ChangesList {
+            results: Vec::new(),
+            last_seq: Seq::Token(encode_token(&since, &marks)),
+            pending: 0,
+        });
     }
 
     let node_limit = if change_filter.is_some() { None } else { limit };
@@ -2507,7 +2506,11 @@ pub(crate) async fn cluster_changes(
                     // Owns no shard: only its sequence is wanted, for its
                     // slot in the vector.
                     let (seq, _) = fetch_node_seqs(read, node).await?;
-                    let empty = json!({"results": [], "last_seq": seq, "pending": 0});
+                    let empty = ChangesList {
+                        results: Vec::new(),
+                        last_seq: Seq::Num(seq),
+                        pending: 0,
+                    };
                     return Ok((shards, None, empty));
                 }
                 let start = ChangesStart::Now;
@@ -2540,18 +2543,19 @@ pub(crate) async fn cluster_changes(
     let mut fallbacks: Vec<FallbackMark> = Vec::new();
     let mut lanes: Vec<ChangeLane> = Vec::new();
     let mut pending = 0;
-    for (node, round, (shards, lane_since, mut value)) in responses {
-        pending += node_pending(&value);
-        let mut rows: Vec<Value> = match value.get_mut("results").map(std::mem::take) {
-            Some(Value::Array(rows)) => rows,
-            _ => Vec::new(),
-        };
-        rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
-        let last = last_seq_for_node(&value, node);
+    for (node, round, (shards, lane_since, value)) in responses {
+        pending += value.pending;
+        let ChangesList {
+            results: mut rows,
+            last_seq,
+            ..
+        } = value;
+        rows.sort_by_key(|row| row.seq.as_u64().unwrap_or(0));
+        let last = last_seq_for_node(&last_seq, node);
         // A node that resolved `since=now` itself started just before its
         // first row, or where it reports having stopped when there is none.
         let lane_since = lane_since.unwrap_or_else(|| match rows.first() {
-            Some(row) => row["seq"].as_u64().unwrap_or(0).saturating_sub(1),
+            Some(row) => row.seq.as_u64().unwrap_or(0).saturating_sub(1),
             None => last.unwrap_or(0),
         });
         let mark = match round {
@@ -2605,7 +2609,7 @@ pub(crate) async fn cluster_changes(
                 continue;
             };
             progressed = true;
-            let shard_seq = row["seq"].as_u64().unwrap_or(0);
+            let shard_seq = row.seq.as_u64().unwrap_or(0);
             let safe = lane.last.map_or(shard_seq, |seq| shard_seq.min(seq));
             match lane.mark {
                 None => {
@@ -2619,7 +2623,7 @@ pub(crate) async fn cluster_changes(
                     }
                 }
             }
-            row["seq"] = json!(encode_token(&progress, &fallbacks));
+            row.seq = Seq::Token(encode_token(&progress, &fallbacks));
             out.push(row);
             if out.len() >= limit {
                 break;
@@ -2655,17 +2659,11 @@ pub(crate) async fn cluster_changes(
 
     // Shard masks are disjoint, so each document's change is produced by
     // exactly one lane.
-    Ok(json!({
-        "results": out,
-        "last_seq": encode_token(&progress, &fallbacks),
-        "pending": pending,
-    }))
-}
-
-/// Changes a node had left after the rows it returned, across the shards it
-/// read for this request.
-fn node_pending(response: &Value) -> u64 {
-    response.get("pending").and_then(Value::as_u64).unwrap_or(0)
+    Ok(ChangesList {
+        results: out,
+        last_seq: Seq::Token(encode_token(&progress, &fallbacks)),
+        pending,
+    })
 }
 
 /// Where a node starts reading changes.
@@ -2683,7 +2681,7 @@ pub(crate) async fn fetch_node_changes(
     mask: &ShardMask,
     start: ChangesStart,
     limit: Option<usize>,
-) -> DbResult<Value> {
+) -> DbResult<ChangesList> {
     let ClusterRead {
         ctx,
         db,
@@ -2794,7 +2792,7 @@ pub(crate) async fn fetch_node_changes(
         return Err(ApiError::new(status, "changes_failed", text));
     }
     response
-        .json::<Value>()
+        .json::<ChangesList>()
         .await
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }

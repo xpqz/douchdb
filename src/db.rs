@@ -2097,24 +2097,31 @@ impl Db {
         .sum::<DbResult<usize>>()
     }
 
-    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<Value> {
+    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<ChangesList> {
         let (rows, last_seq, pending) = self.changes_rows(opts).await?;
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut entry = json!({
-                "seq": row.seq,
-                "id": row.id,
-                "changes": row.changes.iter().map(|(rev, _)| json!({"rev": rev})).collect::<Vec<_>>(),
+            let doc = match row.doc {
+                Some(doc) => Some(serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?),
+                None => None,
+            };
+            results.push(ChangeEntry {
+                seq: Seq::Num(row.seq),
+                id: row.id,
+                changes: row
+                    .changes
+                    .into_iter()
+                    .map(|(rev, _)| ChangeRev { rev })
+                    .collect(),
+                deleted: row.deleted,
+                doc,
             });
-            if row.deleted {
-                entry["deleted"] = json!(true);
-            }
-            if let Some(doc) = row.doc {
-                entry["doc"] = serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?;
-            }
-            results.push(entry);
         }
-        Ok(json!({ "results": results, "last_seq": last_seq, "pending": pending }))
+        Ok(ChangesList {
+            results,
+            last_seq: Seq::Num(last_seq),
+            pending: pending as u64,
+        })
     }
 
     /// Stream changes rows in global sequence order by merging a page at a
@@ -3983,6 +3990,85 @@ impl<'de> serde::Deserialize<'de> for WriteResult {
     }
 }
 
+/// A feed position: a plain sequence number, or the opaque token a cluster
+/// feed reports instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seq {
+    Num(u64),
+    Token(String),
+}
+
+impl Seq {
+    /// The number, for a position that is one.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Seq::Num(seq) => Some(*seq),
+            Seq::Token(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Seq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Seq::Num(seq) => write!(f, "{seq}"),
+            Seq::Token(token) => f.write_str(token),
+        }
+    }
+}
+
+impl serde::Serialize for Seq {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Seq::Num(seq) => serializer.serialize_u64(*seq),
+            Seq::Token(token) => serializer.serialize_str(token),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Seq {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match <Value as serde::Deserialize>::deserialize(deserializer)? {
+            Value::Number(number) => number
+                .as_u64()
+                .map(Seq::Num)
+                .ok_or_else(|| D::Error::custom("a sequence must be a non-negative integer")),
+            Value::String(token) => Ok(Seq::Token(token)),
+            _ => Err(D::Error::custom("a sequence must be a number or a string")),
+        }
+    }
+}
+
+/// The `_changes` answer of one pass.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangesList {
+    pub results: Vec<ChangeEntry>,
+    pub last_seq: Seq,
+    #[serde(default)]
+    pub pending: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangeEntry {
+    pub seq: Seq,
+    pub id: String,
+    pub changes: Vec<ChangeRev>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub doc: Option<Value>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChangeRev {
+    pub rev: String,
+}
+
 /// The body of `GET /{db}`. Fields serialize in CouchDB's order.
 #[derive(Debug, serde::Serialize)]
 pub struct DbInfo {
@@ -5641,7 +5727,10 @@ mod tests {
         );
 
         let changes = db.changes(&ChangesOpts::default()).await.unwrap();
-        assert_eq!(row_ids(&changes, "results"), ["a", "bad-body", "c"]);
+        assert_eq!(
+            row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
+            ["a", "bad-body", "c"]
+        );
         let before = crate::metrics::corrupt_records_skipped();
         let changes = db
             .changes(&ChangesOpts {
@@ -5650,7 +5739,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(row_ids(&changes, "results"), ["a", "c"]);
+        assert_eq!(
+            row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
+            ["a", "c"]
+        );
         assert!(crate::metrics::corrupt_records_skipped() > before);
 
         // View and search builds index every readable document.

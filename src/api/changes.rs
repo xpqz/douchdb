@@ -1,7 +1,7 @@
 //! The `_changes` feed and its filters.
 
 use super::*;
-use crate::db::ChangesItem;
+use crate::db::{ChangesItem, ChangesList, Seq};
 
 /// `limit` for `_changes`, with CouchDB's own messages for a bad value.
 fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
@@ -169,7 +169,7 @@ async fn changes_normal(
         return response;
     }
     match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
-        Ok(v) => json(StatusCode::OK, v),
+        Ok(v) => json_of(StatusCode::OK, &v),
         Err(e) => fail(e),
     }
 }
@@ -200,7 +200,7 @@ fn changes_continuous(
         let mut heartbeat = Heartbeat::new(heartbeat);
         // Where the feed stopped, for the closing line CouchDB sends when
         // a continuous feed times out or reaches its limit.
-        let mut trailer: Option<(Value, u64)> = None;
+        let mut trailer: Option<(Seq, u64)> = None;
         let mut wake = db.subscribe_commits();
         loop {
             if limit.map(|limit| sent >= limit).unwrap_or(false) {
@@ -212,19 +212,19 @@ fn changes_continuous(
             }
             wake.borrow_and_update();
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
-                Ok(mut value) => {
+                Ok(value) => {
                     if !still_allowed(&st, &db, &headers) {
                         trailer = None;
                         break;
                     }
-                    let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
+                    let ChangesList { results: rows, last_seq: reported, pending: behind } = value;
                     let mut sent_here = 0usize;
                     let mut last_sent = None;
                     for row in &rows {
                         if limit.map(|limit| sent >= limit).unwrap_or(false) {
                             break;
                         }
-                        last_sent = row.get("seq").cloned();
+                        last_sent = Some(row.seq.clone());
                         sent_here += 1;
                         let json = serde_json::to_vec(&row).unwrap_or_default();
                         let line = feed_line(&json, eventsource);
@@ -232,17 +232,9 @@ fn changes_continuous(
                         sent += 1;
                     }
                     let unsent = (rows.len() - sent_here) as u64;
-                    let reported = value.get("last_seq").cloned();
-                    let end_seq = if unsent > 0 { last_sent.or(reported) } else { reported };
-                    let behind = value.get("pending").and_then(Value::as_u64).unwrap_or(0);
-                    trailer = end_seq.map(|seq| (seq, behind + unsent));
-                    if let Some(seq) = value.get("last_seq") {
-                        let since = seq
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| seq.to_string());
-                        query.insert("since".to_string(), since);
-                    }
+                    query.insert("since".to_string(), reported.to_string());
+                    let end_seq = if unsent > 0 { last_sent.unwrap_or(reported) } else { reported };
+                    trailer = Some((end_seq, behind + unsent));
                 }
                 Err(error) => {
                     trailer = None;
@@ -322,10 +314,7 @@ fn changes_longpoll_stream(
             wake.borrow_and_update();
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                 Ok(value)
-                    if (value["results"]
-                        .as_array()
-                        .map(|rows| !rows.is_empty())
-                        .unwrap_or(false)
+                    if (!value.results.is_empty()
                         || started.elapsed().as_millis() as u64 >= deadline
                         || st.shutdown.is_cancelled())
                         && still_allowed(&st, &db, &headers) =>
@@ -380,16 +369,11 @@ async fn changes_longpoll(
         }
         wake.borrow_and_update();
         match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
-            Ok(v)
-                if v["results"]
-                    .as_array()
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false) =>
-            {
+            Ok(v) if !v.results.is_empty() => {
                 if !still_allowed(st, db, headers) {
                     return access_denied(&st.principal(headers));
                 }
-                return json(StatusCode::OK, v);
+                return json_of(StatusCode::OK, &v);
             }
             Ok(v)
                 if started.elapsed().as_millis() as u64 >= opts.deadline
@@ -398,7 +382,7 @@ async fn changes_longpoll(
                 if !still_allowed(st, db, headers) {
                     return access_denied(&st.principal(headers));
                 }
-                return json(StatusCode::OK, v);
+                return json_of(StatusCode::OK, &v);
             }
             Ok(_) => {
                 wait_for_commit(
@@ -625,7 +609,7 @@ async fn changes_once(
     body: &[u8],
     headers: &HeaderMap,
     local_only: bool,
-) -> DbResult<Value> {
+) -> DbResult<ChangesList> {
     #[cfg(test)]
     record_changes_once(dbname);
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
