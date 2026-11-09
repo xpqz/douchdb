@@ -4958,4 +4958,162 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Shard-actor jobs one view query submits. Each job is a cross-thread hop
+    /// to the shard's dedicated thread, so the count, unlike latency, does not
+    /// move with machine load.
+    async fn jobs_for(db: &Db, query: &ViewQuery) -> (u64, Value) {
+        let before = db.shard_jobs();
+        let result = query_by_id(db, query).await;
+        (db.shard_jobs() - before, result)
+    }
+
+    async fn query_by_id(db: &Db, query: &ViewQuery) -> Value {
+        super::query(db, "_design/d", "v", query).await.unwrap()
+    }
+
+    /// Before: 1 job (the design document read) for a map query, 2 with
+    /// `include_docs` (design document, then the row bodies), 1 for a reduce.
+    /// After: 0, 1 and 0. The index is not a shard, so a current index costs
+    /// no job, and a design document that has not changed is served from the
+    /// database's cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_query_on_a_current_index_takes_the_fewest_shard_jobs() {
+        let root = std::env::temp_dir().join(format!("douchdb-viewjobs-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "jobs",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/d", "views": {"v": {
+                    "map": "function(doc) { emit(doc._id, 1); }",
+                    "reduce": "_count",
+                }}}),
+                json!({"_id": "a", "n": 1}),
+                json!({"_id": "b", "n": 2}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+
+        let plain = ViewQuery {
+            reduce: Some(false),
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        // The first query builds the index; the ones below find it current.
+        let (_, built) = jobs_for(&db, &plain).await;
+        assert_eq!(built["total_rows"], json!(2), "{built}");
+
+        let (jobs, result) = jobs_for(&db, &plain).await;
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(2), "{result}");
+        let map_jobs = jobs;
+
+        let with_docs = ViewQuery {
+            reduce: Some(false),
+            include_docs: true,
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let (jobs, result) = jobs_for(&db, &with_docs).await;
+        assert_eq!(result["rows"][0]["doc"]["n"], json!(1), "{result}");
+        let include_docs_jobs = jobs;
+
+        let (jobs, result) = jobs_for(
+            &db,
+            &ViewQuery {
+                limit: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(result["rows"][0]["value"], json!(2), "{result}");
+        let reduce_jobs = jobs;
+        assert_eq!(
+            (map_jobs, include_docs_jobs, reduce_jobs),
+            (0, 1, 0),
+            "shard jobs for a map, an include_docs and a reduce query on a current index"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The design document cache must never serve a view definition that has
+    /// since been replaced or removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cached_design_document_follows_every_change() {
+        let root = std::env::temp_dir().join(format!("douchdb-viewspec-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "spec",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let ddoc = |map: &str, rev: Option<&str>| {
+            let mut doc = json!({"_id": "_design/d", "views": {"v": {"map": map}}});
+            if let Some(rev) = rev {
+                doc["_rev"] = json!(rev);
+            }
+            doc
+        };
+        let results = db
+            .put_docs(
+                vec![
+                    ddoc("function(doc) { emit(1, null); }", None),
+                    json!({"_id": "a"}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = match &results[0] {
+            crate::db::WriteResult::Ok(ok) => ok.rev.clone(),
+            other => panic!("design document not written: {other:?}"),
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let first = query_by_id(&db, &query).await;
+        assert_eq!(first["rows"][0]["key"], json!(1), "{first}");
+        // Served from the cache now; a second read still agrees.
+        let again = query_by_id(&db, &query).await;
+        assert_eq!(again["rows"][0]["key"], json!(1), "{again}");
+
+        db.put_docs(
+            vec![ddoc("function(doc) { emit(2, null); }", Some(&rev))],
+            true,
+        )
+        .await
+        .unwrap();
+        let changed = query_by_id(&db, &query).await;
+        assert_eq!(changed["rows"][0]["key"], json!(2), "{changed}");
+
+        let current = db
+            .get_doc("_design/d", &crate::db::DocOpts::default())
+            .await
+            .unwrap();
+        let rev = current["_rev"].as_str().unwrap().to_string();
+        db.purge(&json!({"_design/d": [rev]}), 0).await.unwrap();
+        let gone = super::query(&db, "_design/d", "v", &query).await;
+        assert_eq!(gone.unwrap_err().status, 404);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

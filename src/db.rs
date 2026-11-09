@@ -1140,6 +1140,11 @@ impl Db {
         );
     }
 
+    /// Shard-actor jobs submitted for this database since it opened.
+    pub fn shard_jobs(&self) -> u64 {
+        self.shards.iter().map(ShardHandle::jobs).sum()
+    }
+
     /// Highest sequence that is safe for a changes cursor to publish, taken
     /// as a snapshot **before** reading any shard.
     ///
