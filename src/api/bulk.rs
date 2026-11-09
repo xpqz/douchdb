@@ -84,7 +84,7 @@ async fn validate_bulk_batch(
     st: &AppState,
     db: &Arc<Db>,
     headers: &HeaderMap,
-    docs: &mut Vec<Value>,
+    docs: &mut [Value],
 ) -> DbResult<Vec<Option<ApiError>>> {
     if st.ctx.cluster.is_internal(headers) {
         return Ok(std::iter::repeat_with(|| None).take(docs.len()).collect());
