@@ -8399,6 +8399,94 @@ async fn cluster_rebalance_keeps_local_docs() {
     }
 }
 
+/// Ids of `_local` documents with at least two on every one of `q` shards.
+fn local_ids_on_every_shard(q: u32) -> Vec<String> {
+    let mut per_shard = vec![0usize; q as usize];
+    let mut ids = Vec::new();
+    for i in 0.. {
+        let id = format!("pp{i}");
+        let shard = douchdb::shard_index(&format!("_local/{id}"), q);
+        if per_shard[shard] < 2 {
+            per_shard[shard] += 1;
+            ids.push(id);
+        }
+        if per_shard.iter().all(|count| *count >= 2) {
+            break;
+        }
+    }
+    ids
+}
+
+/// A direct placement change moves `_local` documents with their shard, as a
+/// rebalance does: anti-entropy skips them (as CouchDB's mem3_rep does), so
+/// the new owner would otherwise start without them. Reading from the new
+/// owner alone, with the old one stopped, shows the copy.
+#[tokio::test]
+async fn cluster_placement_put_copies_local_docs_to_the_new_owner() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("localput").await;
+    }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/localput").await;
+    let from = node_to_pin_away_from(&planned);
+    let to = (from + 1) % 3;
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/localput", all_shards_on(from))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = local_ids_on_every_shard(4);
+    for id in &ids {
+        let (status, body) = nodes[0]
+            .put(&format!("/localput/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = nodes[0]
+        .put("/_node/_local/_dbs/localput", all_shards_on(to))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    nodes[from].kill();
+    for id in &ids {
+        let (status, doc) = nodes[to].get(&format!("/localput/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id} on the new owner: {doc}");
+        assert_eq!(doc["v"], *id);
+        assert_eq!(doc["_rev"], "0-1", "the copy keeps the revision: {doc}");
+    }
+}
+
+/// A placement change copies `_local` documents from whichever old copy of a
+/// shard answers: with one of two old owners stopped, the new owner still
+/// receives them.
+#[tokio::test]
+async fn cluster_placement_put_copies_local_docs_from_a_reachable_old_copy() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("localcopy").await;
+    }
+    let both_old = json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]});
+    let (status, _) = nodes[0].put("/_node/_local/_dbs/localcopy", both_old).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = local_ids_on_every_shard(4);
+    for id in &ids {
+        let (status, body) = nodes[0]
+            .put(&format!("/localcopy/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    nodes[2].kill();
+    let moved = json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 0]; 4]});
+    let (status, body) = nodes[0].put("/_node/_local/_dbs/localcopy", moved).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    nodes[1].kill();
+    for id in &ids {
+        let (status, doc) = nodes[0].get(&format!("/localcopy/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id} on the new owner: {doc}");
+        assert_eq!(doc["v"], *id);
+    }
+}
+
 #[tokio::test]
 async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     let nodes = start_cluster_with(3, "3600", 1);
