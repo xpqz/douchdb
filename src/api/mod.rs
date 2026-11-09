@@ -46,6 +46,11 @@ pub(crate) fn json(status: StatusCode, value: Value) -> Response {
     (status, Json(value)).into_response()
 }
 
+/// Like `json`, for a typed body that serializes straight to the response.
+pub(crate) fn json_of<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
+    (status, Json(value)).into_response()
+}
+
 pub(crate) fn fail(e: ApiError) -> Response {
     if e.status >= 500 {
         tracing::error!(

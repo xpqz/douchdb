@@ -934,9 +934,14 @@ impl Db {
 
     /// CouchDB's `cluster` block in database info: shards, copies, and the
     /// default write and read quorums.
-    fn cluster_info(&self) -> Value {
+    fn cluster_info(&self) -> ClusterInfo {
         let n = self.copies();
-        json!({"q": self.q, "n": n, "w": n / 2 + 1, "r": n / 2 + 1})
+        ClusterInfo {
+            q: self.q,
+            n,
+            w: n / 2 + 1,
+            r: n / 2 + 1,
+        }
     }
 
     pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
@@ -1293,7 +1298,7 @@ impl Db {
         (owner, map.replicas_of(shard).to_vec())
     }
 
-    pub async fn info(&self) -> DbResult<Value> {
+    pub async fn info(&self) -> DbResult<DbInfo> {
         // Snapshot the flag before queueing on the shard actors. A compaction
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
@@ -1316,26 +1321,27 @@ impl Db {
             deleted_count += deleted;
             purge_seq = purge_seq.saturating_add(purged);
         }
-        let mut info = json!({
-            "db_name": self.name,
-            "doc_count": doc_count,
-            "doc_del_count": deleted_count,
-            "update_seq": update_seq,
-            "purge_seq": purge_seq,
-            "compact_running": compact_running,
-            "disk_size": 0,
-            "data_size": 0,
-            "sizes": { "active": 0, "external": 0, "file": 0 },
-            "instance_start_time": self.instance_start_time,
-            "disk_format_version": 8,
-            "committed_update_seq": update_seq,
-            "uuid": self.uuid,
-            "cluster": self.cluster_info(),
-        });
-        if self.partitioned {
-            info["props"] = json!({"partitioned": true});
-        }
-        Ok(info)
+        Ok(DbInfo {
+            db_name: self.name.clone(),
+            doc_count,
+            doc_del_count: deleted_count,
+            update_seq,
+            purge_seq,
+            compact_running,
+            disk_size: 0,
+            data_size: 0,
+            sizes: DbSizes {
+                active: 0,
+                external: 0,
+                file: 0,
+            },
+            instance_start_time: self.instance_start_time.clone(),
+            disk_format_version: 8,
+            committed_update_seq: update_seq,
+            uuid: self.uuid.clone(),
+            cluster: self.cluster_info(),
+            props: self.partitioned.then_some(DbProps { partitioned: true }),
+        })
     }
 
     // ----- documents -------------------------------------------------------
@@ -3821,6 +3827,47 @@ pub(crate) enum ChangesItem {
     Scanned(u64),
 }
 
+/// The body of `GET /{db}`. Fields serialize in CouchDB's order.
+#[derive(Debug, serde::Serialize)]
+pub struct DbInfo {
+    pub db_name: String,
+    pub doc_count: u64,
+    pub doc_del_count: u64,
+    pub update_seq: u64,
+    pub purge_seq: u64,
+    pub compact_running: bool,
+    pub disk_size: u64,
+    pub data_size: u64,
+    pub sizes: DbSizes,
+    pub instance_start_time: String,
+    pub disk_format_version: u64,
+    pub committed_update_seq: u64,
+    pub uuid: String,
+    pub cluster: ClusterInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub props: Option<DbProps>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DbSizes {
+    pub active: u64,
+    pub external: u64,
+    pub file: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ClusterInfo {
+    pub q: u32,
+    pub n: usize,
+    pub w: usize,
+    pub r: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DbProps {
+    pub partitioned: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct ChangeRow {
     pub(crate) id: String,
@@ -5965,6 +6012,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The `GET /db` body is the serialized `info()` result: its field order
+    /// and the optional `props` are part of the wire format.
+    #[tokio::test]
+    async fn info_serializes_in_wire_order() {
+        for partitioned in [false, true] {
+            let q = 2u32;
+            let root =
+                std::env::temp_dir().join(format!("douchdb-info-wire-{}", crate::util::uuid()));
+            let db = Db::open(
+                &root,
+                "infowire",
+                DbConfig {
+                    q,
+                    revs_limit: 100,
+                    shard_map: ShardMap::single(q),
+                    partitioned,
+                },
+            )
+            .unwrap();
+            let info = serde_json::to_value(db.info().await.unwrap()).unwrap();
+            let mut keys: Vec<&str> = info
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = vec![
+                "db_name",
+                "doc_count",
+                "doc_del_count",
+                "update_seq",
+                "purge_seq",
+                "compact_running",
+                "disk_size",
+                "data_size",
+                "sizes",
+                "instance_start_time",
+                "disk_format_version",
+                "committed_update_seq",
+                "uuid",
+                "cluster",
+            ];
+            if partitioned {
+                expected.push("props");
+            }
+            assert_eq!(keys, expected);
+            keys.clear();
+            assert_eq!(
+                info["sizes"],
+                json!({"active": 0, "external": 0, "file": 0})
+            );
+            assert_eq!(info["cluster"], json!({"q": 2, "n": 1, "w": 1, "r": 1}));
+            assert_eq!(info["doc_count"], json!(0));
+            assert_eq!(info["compact_running"], json!(false));
+            if partitioned {
+                assert_eq!(info["props"], json!({"partitioned": true}));
+            }
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     /// Requests that touch many documents fan out one call per shard; the
     /// answers must still come back per document, in the order asked.
     #[tokio::test]
@@ -5990,8 +6099,8 @@ mod tests {
         let written = db.put_docs(docs, true).await.unwrap();
         assert!(written.iter().all(|row| row["ok"] == json!(true)));
         let info = db.info().await.unwrap();
-        assert_eq!(info["doc_count"], json!(12));
-        assert_eq!(info["update_seq"], json!(12));
+        assert_eq!(info.doc_count, 12);
+        assert_eq!(info.update_seq, 12);
 
         let got = db.get_docs(&ids, &DocOpts::default()).await.unwrap();
         for (id, doc) in ids.iter().zip(&got) {
@@ -6030,7 +6139,7 @@ mod tests {
         for (position, id) in ids.iter().enumerate().take(6) {
             assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
         }
-        assert_eq!(db.info().await.unwrap()["doc_count"], json!(6));
+        assert_eq!(db.info().await.unwrap().doc_count, 6);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -6143,7 +6252,7 @@ mod tests {
         // feed resumed from it would skip that write when it commits.
         assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
         let info = db.info().await.unwrap();
-        let reported = info["update_seq"].as_u64().unwrap();
+        let reported = info.update_seq;
         assert!(reported < held, "info update_seq {reported}");
 
         drop(db);
@@ -6188,7 +6297,7 @@ mod tests {
         assert!(db.get_doc(&lost, &DocOpts::default()).await.is_err());
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
         assert_eq!(all["rows"].as_array().unwrap().len(), 1, "{all}");
-        assert_eq!(db.info().await.unwrap()["doc_count"], 1);
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
 
         // The changes cursor is not held back by the lost write.
         assert_eq!(db.changes_watermark(0, None), db.seq.load(Ordering::SeqCst));
@@ -6214,7 +6323,7 @@ mod tests {
         // The shard accepts the write again.
         let results = db.put_docs(vec![json!({"_id": lost})], true).await.unwrap();
         assert!(results[0].get("error").is_none(), "{results:?}");
-        assert_eq!(db.info().await.unwrap()["doc_count"], 2);
+        assert_eq!(db.info().await.unwrap().doc_count, 2);
         let (rows, last_seq, _) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(last_seq, db.seq.load(Ordering::SeqCst));

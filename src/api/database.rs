@@ -189,7 +189,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
         );
     }
     match db.info().await {
-        Ok(mut info) => {
+        Ok(info) => {
             // In a cluster the update_seq is the same version vector
             // the changes feed returns, so clients that use it as
             // `since` do not skip another node's changes.
@@ -205,11 +205,16 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                     Ok(tokens) => tokens,
                     Err(e) => return fail(e),
                 };
+                let mut info = match serde_json::to_value(&info) {
+                    Ok(info) => info,
+                    Err(e) => return fail(ApiError::internal(e)),
+                };
                 info["update_seq"] = json!(seq);
                 info["committed_update_seq"] = json!(seq);
                 info["purge_seq"] = json!(purge_seq);
+                return json(StatusCode::OK, info);
             }
-            json(StatusCode::OK, info)
+            json_of(StatusCode::OK, &info)
         }
         Err(e) => fail(e),
     }
