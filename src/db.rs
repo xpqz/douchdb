@@ -2886,7 +2886,27 @@ fn purge_one(
     reserved: &AtomicU64,
 ) -> DbResult<Vec<String>> {
     let mut tx = Tx::new();
-    let Some(mut meta) = s.get_meta(id)? else {
+    let meta = match s.get_meta(id) {
+        Ok(meta) => meta,
+        Err(error)
+            if error
+                .downcast_ref::<crate::error::CorruptRecord>()
+                .is_some() =>
+        {
+            // The revisions cannot be checked against unreadable metadata, so
+            // the document goes whole; this is the repair path for it.
+            let info = PurgeInfo {
+                uuid: replayed.map_or_else(uuid, str::to_string),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            };
+            s.purge_corrupt(id, &info, peers)?;
+            s.invalidate_latest();
+            return Ok(requested.to_vec());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(mut meta) = meta else {
         if let Some(uuid) = replayed {
             let info = PurgeInfo {
                 uuid: uuid.to_string(),
@@ -7142,6 +7162,103 @@ mod tests {
         assert!(!db.apply_purge_infos(0, vec![info], 0).await.unwrap());
         assert_eq!(db.purge_seq().await.unwrap(), 1);
         assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Write `id` normally, then replace its metadata record with garbage, as
+    /// a damaged shard would hold it. The revision the write produced.
+    async fn put_then_corrupt_meta(db: &Db, id: &str) -> String {
+        let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let key = meta_key(id);
+        db.shards[0]
+            .call(move |s| {
+                s.put_raw(&key, b"{not json");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        rev
+    }
+
+    async fn body_exists(db: &Db, id: &str, rev: &str) -> bool {
+        let (id, rev) = (id.to_string(), rev.to_string());
+        db.shards[0]
+            .call(move |s| Ok(s.get_body(&id, &rev)?.is_some()))
+            .await
+            .unwrap()
+    }
+
+    /// A document whose metadata is corrupt cannot be overwritten, but
+    /// `_purge` removes it outright, whatever revisions the request lists,
+    /// and records the purge; the database is usable afterwards.
+    #[tokio::test]
+    async fn purge_removes_a_document_with_corrupt_metadata() {
+        let (db, root) = purge_test_db("purge-corrupt", ShardMap::single(1));
+        db.put_docs(vec![json!({"_id": "good"})], true)
+            .await
+            .unwrap();
+        let rev = put_then_corrupt_meta(&db, "bad").await;
+
+        let written = db
+            .put_docs(vec![json!({"_id": "bad", "_rev": rev})], true)
+            .await
+            .unwrap();
+        let reason = written[0].json()["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(reason.contains("_purge"), "{reason}");
+
+        let listed = "9-ffffffffffffffffffffffffffffffff";
+        let purged = db.purge(&json!({"bad": [listed]}), 0).await.unwrap();
+        assert_eq!(purged["purged"]["bad"], json!([listed]));
+        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert!(!body_exists(&db, "bad", &rev).await);
+        assert!(db.get_doc("bad", &DocOpts::default()).await.is_err());
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(row_ids(&all.json(), "rows"), ["good"]);
+        let changes = db.changes(&ChangesOpts::default()).await.unwrap();
+        assert_eq!(
+            row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
+            ["good"]
+        );
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
+
+        // The id is free again and the database compacts.
+        db.put_docs(vec![json!({"_id": "bad", "n": 1})], true)
+            .await
+            .unwrap();
+        db.compact().await.unwrap();
+        assert_eq!(db.info().await.unwrap().doc_count, 2);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One corrupt record must not stop compaction of the rest of the shard:
+    /// the record and its bodies stay, the other documents are swept.
+    #[tokio::test]
+    async fn compaction_skips_a_corrupt_record_and_sweeps_the_rest() {
+        let (db, root) = purge_test_db("compact-corrupt", ShardMap::single(1));
+        let first = db
+            .put_docs(vec![json!({"_id": "good"})], true)
+            .await
+            .unwrap();
+        let first = first[0].json()["rev"].as_str().unwrap().to_string();
+        db.put_docs(vec![json!({"_id": "good", "_rev": first, "n": 2})], true)
+            .await
+            .unwrap();
+        let bad_rev = put_then_corrupt_meta(&db, "bad").await;
+        assert!(body_exists(&db, "good", &first).await);
+
+        let before = crate::metrics::corrupt_records_skipped();
+        db.compact().await.unwrap();
+        assert!(crate::metrics::corrupt_records_skipped() > before);
+        assert!(!body_exists(&db, "good", &first).await);
+        assert!(body_exists(&db, "bad", &bad_rev).await);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);

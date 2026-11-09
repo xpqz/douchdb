@@ -89,7 +89,10 @@ impl std::error::Error for CorruptRecord {}
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         if e.downcast_ref::<CorruptRecord>().is_some() {
-            return ApiError::corrupt(format!("{e:#}"));
+            return ApiError::corrupt(format!(
+                "{e:#}; its revision tree cannot be validated, so the document cannot be \
+                 changed: purge it with POST /{{db}}/_purge to repair it"
+            ));
         }
         ApiError::internal(format!("{e:#}"))
     }

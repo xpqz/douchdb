@@ -274,6 +274,13 @@ impl Tx {
         self.ops.push((key.to_vec(), None));
     }
 
+    /// Delete a metadata record that cannot be decoded. Its old state is
+    /// unknown, so the commit leaves the counters alone; the caller recounts.
+    fn delete_corrupt_meta(&mut self, key: &[u8]) {
+        self.known.insert(self.ops.len(), (None, None));
+        self.delete(key);
+    }
+
     /// Write a document's metadata record, saying what the document's state
     /// was in the shard before (`old`) and is after the write (`new`), so the
     /// commit need not decode either. `old` must be the state of the record
@@ -443,6 +450,20 @@ impl ShardName {
             doc_id = %id,
             error = %error,
             "skipping corrupt record"
+        );
+        crate::telemetry::record_corrupt_record_skipped();
+    }
+}
+
+impl ShardName {
+    /// Log and count a corrupt record that compaction leaves in place.
+    fn report_compaction_skip(&self, id: &str, error: &dyn std::fmt::Display) {
+        tracing::warn!(
+            db = %self.db,
+            shard = %self.shard,
+            doc_id = %id,
+            error = %error,
+            "compaction is leaving a corrupt record in place; purge the document to repair it"
         );
         crate::telemetry::record_corrupt_record_skipped();
     }
@@ -1038,6 +1059,67 @@ impl Shard {
         Ok(out)
     }
 
+    /// Remove a document whose metadata record cannot be decoded: the record,
+    /// its sequence entry and its revision bodies, and recount the document
+    /// counters, which the record's old state can no longer correct. The
+    /// purge is recorded as `info`. Bodies of a revision that itself contains
+    /// a `/` cannot be told from another document's here; compaction removes
+    /// them as orphans.
+    pub fn purge_corrupt(&mut self, id: &str, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
+        let mut tx = Tx::new();
+        let body_prefix = format!("d/{id}/");
+        let mut keys = Vec::new();
+        self.scan_range_while(body_prefix.as_bytes(), None, false, |key, _| {
+            if key
+                .get(body_prefix.len()..)
+                .is_some_and(|rev| !rev.contains(&b'/'))
+            {
+                keys.push(key.to_vec());
+            }
+            true
+        })?;
+        self.scan_range_while(b"s/", None, false, |key, value| {
+            if value == id.as_bytes() {
+                keys.push(key.to_vec());
+            }
+            true
+        })?;
+        for key in keys {
+            tx.delete(&key);
+        }
+        tx.delete_corrupt_meta(&meta_key(id));
+        self.record_purge(&mut tx, info, peers)?;
+        self.commit(tx)?;
+
+        let (mut docs, mut deleted) = (0u64, 0u64);
+        self.scan_range_while(b"m/", None, false, |key, value| {
+            if let Ok((_, meta)) = parse_meta(key, value) {
+                match meta_state(&meta) {
+                    Some((_, true, _)) => docs += 1,
+                    Some((_, false, _)) => deleted += 1,
+                    None => {}
+                }
+            }
+            true
+        })?;
+        if (docs, deleted) != (self.docs, self.deleted) {
+            self.docs = docs;
+            self.deleted = deleted;
+            for (key, value) in [
+                (b"z/doc_count".as_slice(), docs),
+                (b"z/doc_deleted_count".as_slice(), deleted),
+            ] {
+                let value = value.to_be_bytes().to_vec();
+                self.overlay.insert(key.to_vec(), Some(value.clone()));
+                self.pending.push((key.to_vec(), Some(value)));
+            }
+        }
+        self.live = None;
+        self.rank_cursor = None;
+        self.latest = None;
+        Ok(())
+    }
+
     pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {
         let Some(bytes) = self.get_checked(&meta_key(docid))? else {
             return Ok(None);
@@ -1447,6 +1529,9 @@ impl Shard {
         // Memory stays bounded: each round reads at most BODY_SWEEP_BATCH body
         // keys, deletes the stale ones and resumes after the last key seen.
         let mut start = b"d/".to_vec();
+        // Documents whose corrupt metadata was already reported this sweep.
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        let name = self.name.clone();
         loop {
             let mut keys = Vec::new();
             self.scan_range_while(b"d/", Some(&start), false, |key, _| {
@@ -1475,9 +1560,20 @@ impl Shard {
                 for (at, _) in rest.match_indices('/') {
                     let (id, rev) = (&rest[..at], &rest[at + 1..]);
                     if !leaves.contains_key(id) {
-                        let found = self
-                            .get_meta(id)?
-                            .map(|meta| meta.tree.leaves().into_iter().collect());
+                        // A record that cannot be decoded cannot say which
+                        // bodies are stale: keep them all, report it once and
+                        // carry on with the rest of the shard.
+                        let found = match self.get_meta(id) {
+                            Ok(meta) => meta.map(|meta| meta.tree.leaves().into_iter().collect()),
+                            Err(error) => {
+                                let corrupt = error.downcast::<crate::error::CorruptRecord>()?;
+                                if reported.insert(id.to_string()) {
+                                    name.report_compaction_skip(id, &corrupt);
+                                }
+                                is_leaf = true;
+                                break;
+                            }
+                        };
                         leaves.insert(id.to_string(), found);
                     }
                     if leaves
@@ -2218,14 +2314,14 @@ mod scan_tests {
     }
 
     #[test]
-    fn compaction_deletes_nothing_for_a_corrupt_metadata_record() {
+    fn compaction_skips_a_corrupt_metadata_record_and_keeps_its_bodies() {
         let dir = temp_shard_dir("corrupt-compact");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         // A stale-looking body next to an unreadable metadata record: the
-        // sweep cannot know it is stale, so it must keep it and fail.
+        // sweep cannot know it is stale, so it must keep it and carry on.
         shard.put_raw(&meta_key("bad"), b"{not json");
         shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
-        assert!(shard.compact().is_err());
+        shard.compact().unwrap();
         assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
