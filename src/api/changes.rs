@@ -210,6 +210,7 @@ fn changes_continuous(
     let mut query = req.q.clone();
     let body = Bytes::copy_from_slice(req.body);
     let headers = req.headers.clone();
+    let principal = req.principal.clone();
     let stream = async_stream::stream! {
         let started = std::time::Instant::now();
         let mut sent = 0usize;
@@ -222,14 +223,14 @@ fn changes_continuous(
             if limit.map(|limit| sent >= limit).unwrap_or(false) {
                 break;
             }
-            if !still_allowed(&st, &db, &headers) {
+            if !still_allowed(&st, &db, &principal) {
                 trailer = None;
                 break;
             }
             wake.borrow_and_update();
             match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
                 Ok(value) => {
-                    if !still_allowed(&st, &db, &headers) {
+                    if !still_allowed(&st, &db, &principal) {
                         trailer = None;
                         break;
                     }
@@ -320,11 +321,12 @@ fn changes_longpoll_stream(
     let query = req.q.clone();
     let body = Bytes::copy_from_slice(req.body);
     let headers = req.headers.clone();
+    let principal = req.principal.clone();
     let stream = async_stream::stream! {
         let started = std::time::Instant::now();
         let mut wake = db.subscribe_commits();
         loop {
-            if !still_allowed(&st, &db, &headers) {
+            if !still_allowed(&st, &db, &principal) {
                 break;
             }
             wake.borrow_and_update();
@@ -333,7 +335,7 @@ fn changes_longpoll_stream(
                     if (!value.results.is_empty()
                         || started.elapsed().as_millis() as u64 >= deadline
                         || st.shutdown.is_cancelled())
-                        && still_allowed(&st, &db, &headers) =>
+                        && still_allowed(&st, &db, &principal) =>
                 {
                     let mut line = serde_json::to_vec(&value).unwrap_or_default();
                     line.push(b'\n');
@@ -374,20 +376,21 @@ async fn changes_longpoll(
         q,
         body,
         headers,
+        principal,
         ..
     } = req;
     let started = std::time::Instant::now();
     let mut wake = db.subscribe_commits();
     let no_heartbeat = Heartbeat::new(None);
     loop {
-        if !still_allowed(st, db, headers) {
-            return access_denied(&st.principal(headers));
+        if !still_allowed(st, db, principal) {
+            return access_denied(principal);
         }
         wake.borrow_and_update();
         match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
             Ok(v) if !v.results.is_empty() => {
-                if !still_allowed(st, db, headers) {
-                    return access_denied(&st.principal(headers));
+                if !still_allowed(st, db, principal) {
+                    return access_denied(principal);
                 }
                 return json_of(StatusCode::OK, &v);
             }
@@ -395,8 +398,8 @@ async fn changes_longpoll(
                 if started.elapsed().as_millis() as u64 >= opts.deadline
                     || st.shutdown.is_cancelled() =>
             {
-                if !still_allowed(st, db, headers) {
-                    return access_denied(&st.principal(headers));
+                if !still_allowed(st, db, principal) {
+                    return access_denied(principal);
                 }
                 return json_of(StatusCode::OK, &v);
             }
@@ -735,6 +738,7 @@ mod tests {
                 uri: &uri,
                 q: &q,
                 headers: &headers,
+                principal: &Principal::default(),
                 body: &body,
             },
         )

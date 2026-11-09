@@ -118,6 +118,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
         name: dbname,
         q,
         headers,
+        principal,
         ..
     } = req;
     let method = req.method.clone();
@@ -212,9 +213,11 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
                 && headers.contains_key("x-douchdb-quorum-read");
             get_doc(db, &docid, q, headers, include_deleted).await
         }
-        Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
-        Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers).await,
-        _ if method.as_str() == "COPY" => copy_doc(st, db, dbname, &docid, q, headers).await,
+        Method::PUT => put_doc(req, &docid, body).await,
+        Method::DELETE => delete_doc(st, db, dbname, &docid, q, headers, principal).await,
+        _ if method.as_str() == "COPY" => {
+            copy_doc(st, db, dbname, &docid, q, headers, principal).await
+        }
         _ => fail(ApiError::new(
             405,
             "method_not_allowed",
@@ -330,6 +333,7 @@ async fn copy_doc(
     docid: &str,
     q: &HashMap<String, String>,
     headers: &HeaderMap,
+    principal: &Principal,
 ) -> Response {
     let Some(raw) = headers
         .get("destination")
@@ -351,8 +355,7 @@ async fn copy_doc(
         return fail(ApiError::bad_request("Destination must not be empty"));
     }
     if destination.starts_with("_design/") {
-        let principal = st.principal(headers);
-        if let Some(response) = require_db_access(st, &principal, db, true) {
+        if let Some(response) = require_db_access(st, principal, db, true) {
             return response;
         }
     }
@@ -383,7 +386,7 @@ async fn copy_doc(
     if let Some(rev) = destination_rev {
         copy["_rev"] = json!(rev);
     }
-    if let Some(response) = validate_write(st, db, &mut copy, headers).await {
+    if let Some(response) = validate_write(db, &mut copy, principal).await {
         return response;
     }
     match commit_docs(
@@ -405,15 +408,16 @@ async fn copy_doc(
     }
 }
 
-async fn put_doc(
-    st: &AppState,
-    db: &Arc<Db>,
-    dbname: &str,
-    docid: &str,
-    body: Bytes,
-    q: &HashMap<String, String>,
-    headers: &HeaderMap,
-) -> Response {
+async fn put_doc(req: DbRequest<'_>, docid: &str, body: Bytes) -> Response {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        headers,
+        principal,
+        ..
+    } = req;
     let mut doc = match crate::json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return fail(ApiError::bad_request("invalid UTF-8 JSON")),
@@ -461,7 +465,7 @@ async fn put_doc(
         .get("_deleted")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
+    if let Some(response) = validate_write(db, &mut doc, principal).await {
         return response;
     }
     match commit_docs(
@@ -516,6 +520,7 @@ async fn delete_doc(
     docid: &str,
     q: &HashMap<String, String>,
     headers: &HeaderMap,
+    principal: &Principal,
 ) -> Response {
     if let Err(error) = db.validate_doc_id(docid) {
         return fail(error);
@@ -532,7 +537,7 @@ async fn delete_doc(
         return fail(ApiError::conflict());
     };
     let mut doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
-    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
+    if let Some(response) = validate_write(db, &mut doc, principal).await {
         return response;
     }
     match commit_docs(

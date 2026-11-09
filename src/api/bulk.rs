@@ -85,15 +85,15 @@ async fn validate_bulk_batch(
     st: &AppState,
     db: &Arc<Db>,
     headers: &HeaderMap,
+    principal: &Principal,
     docs: &mut [Value],
 ) -> DbResult<Vec<Option<ApiError>>> {
     if st.ctx.cluster.is_internal(headers) {
         return Ok(std::iter::repeat_with(|| None).take(docs.len()).collect());
     }
     // The same validators as a single-document write.
-    let principal = st.principal(headers);
     let functions = db.validation_functions().await?;
-    crate::validate::validate_docs_with(&functions, db, docs, &principal).await
+    crate::validate::validate_docs_with(&functions, db, docs, principal).await
 }
 
 /// Write the documents that passed validation: on this node for a standalone
@@ -133,6 +133,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         db,
         body,
         headers,
+        principal,
         ..
     } = req;
     let BulkBody {
@@ -143,7 +144,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         Ok(parsed) => parsed,
         Err(error) => return fail(error),
     };
-    if let Some(response) = require_design_admin(st, db, headers, &docs) {
+    if let Some(response) = require_design_admin(st, db, principal, &docs) {
         return response;
     }
     if let Err(error) = check_bulk_docs(db, &docs) {
@@ -163,7 +164,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         return json_of(StatusCode::EXPECTATION_FAILED, &results);
     }
 
-    let validation = match validate_bulk_batch(st, db, headers, &mut docs).await {
+    let validation = match validate_bulk_batch(st, db, headers, principal, &mut docs).await {
         Ok(validation) => validation,
         Err(error) => return fail(error),
     };
@@ -205,7 +206,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
 pub(super) fn require_design_admin(
     st: &AppState,
     db: &Db,
-    headers: &HeaderMap,
+    principal: &Principal,
     docs: &[Value],
 ) -> Option<Response> {
     let writes_design = docs.iter().any(|doc| {
@@ -217,22 +218,19 @@ pub(super) fn require_design_admin(
     if !writes_design {
         return None;
     }
-    let principal = st.principal(headers);
-    require_db_access(st, &principal, db, true)
+    require_db_access(st, principal, db, true)
 }
 
 pub(super) async fn validate_write(
-    st: &AppState,
     db: &Db,
     doc: &mut Value,
-    headers: &HeaderMap,
+    principal: &Principal,
 ) -> Option<Response> {
-    let principal = st.principal(headers);
     let functions = match db.validation_functions().await {
         Ok(functions) => functions,
         Err(error) => return Some(fail(error)),
     };
-    match crate::validate::validate_docs_with(&functions, db, std::slice::from_mut(doc), &principal)
+    match crate::validate::validate_docs_with(&functions, db, std::slice::from_mut(doc), principal)
         .await
     {
         Ok(errors) => errors.into_iter().next().flatten().map(fail),
@@ -698,8 +696,8 @@ fn all_docs_reply(
     result: DbResult<DocList>,
     update_seq: Option<Value>,
 ) -> Response {
-    if !still_allowed(req.st, req.db, req.headers) {
-        return access_denied(&req.st.principal(req.headers));
+    if !still_allowed(req.st, req.db, req.principal) {
+        return access_denied(req.principal);
     }
     match result {
         Ok(mut list) => {
@@ -751,8 +749,8 @@ async fn stream_all_docs(
         Ok(stream) => stream,
         Err(error) => return fail(error),
     };
-    if !still_allowed(req.st, req.db, req.headers) {
-        return access_denied(&req.st.principal(req.headers));
+    if !still_allowed(req.st, req.db, req.principal) {
+        return access_denied(req.principal);
     }
     let body = if *req.method == Method::HEAD {
         Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())

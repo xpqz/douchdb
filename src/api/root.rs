@@ -111,12 +111,7 @@ pub async fn uuids(State(_st): State<Arc<AppState>>, uri: Uri) -> Response {
 
 /// `_db_updates` is an in-memory global feed of database lifecycle and write
 /// events. It is intentionally best-effort: a restart starts a new sequence.
-pub async fn db_updates(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    uri: Uri,
-    _: AdminOnly,
-) -> Response {
+pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly) -> Response {
     let q = query(&uri);
     let feed = q.get("feed").map(String::as_str).unwrap_or("normal");
     let timeout = num(&q, "timeout").unwrap_or(60_000).min(300_000) as u64;
@@ -140,9 +135,7 @@ pub async fn db_updates(
             let mut sent = 0usize;
             let mut heartbeat = Heartbeat::new(heartbeat);
             loop {
-                if limit.map(|limit| sent >= limit).unwrap_or(false)
-                    || !st.principal(&headers).admin
-                {
+                if limit.map(|limit| sent >= limit).unwrap_or(false) {
                     break;
                 }
                 let (events, _) = st.db_updates.since(since);

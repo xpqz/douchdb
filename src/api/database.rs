@@ -38,6 +38,7 @@ pub async fn db_root(
                 uri: &uri,
                 q: &q,
                 headers: &headers,
+                principal: &principal,
                 body: &body,
             };
             if method == Method::POST {
@@ -273,10 +274,10 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     if let Err(e) = db.validate_doc_id(&id) {
         return fail(e);
     }
-    if let Some(response) = require_design_admin(st, db, headers, std::slice::from_ref(&doc)) {
+    if let Some(response) = require_design_admin(st, db, principal, std::slice::from_ref(&doc)) {
         return response;
     }
-    if let Some(response) = validate_write(st, db, &mut doc, headers).await {
+    if let Some(response) = validate_write(db, &mut doc, principal).await {
         return response;
     }
     // `commit_docs` routes the generated id to every replica in its
@@ -470,6 +471,7 @@ pub async fn db_rest(
         uri: &uri,
         q: &q,
         headers: &headers,
+        principal: &principal,
         body: &body,
     };
 
