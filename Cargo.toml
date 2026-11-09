@@ -65,6 +65,18 @@ landlock = "0.4"
 [dev-dependencies]
 proptest = "1"
 
+# The wasmi interpreter is orders of magnitude slower unoptimised, which makes
+# the sandbox tests that run a large view or index through the runner take
+# minutes. Optimise it (and only it) in dev and test builds.
+[profile.dev.package.wasmi]
+opt-level = 1
+[profile.dev.package.wasmi_core]
+opt-level = 1
+[profile.dev.package.wasmi_ir]
+opt-level = 1
+[profile.dev.package.wasmi_collections]
+opt-level = 1
+
 # TEMPORARY local fork: UB-free LRU list (upstream PR #69) and duplicate-key
 # eviction. Published 4.0.2 corrupts the cache on Linux ARM64 release builds.
 # Revisit/remove per docs/storage-dependency.md, tracked by issue #105.

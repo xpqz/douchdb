@@ -29,10 +29,11 @@ impl Default for ViewLimits {
     }
 }
 
-/// A single map/reduce/index call may not return more JSON than this. The
-/// QuickJS heap limit bounds allocations inside the engine; this bounds the
-/// Rust-side string that comes back before it is parsed into values.
-pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+// The output limit and the batch sizes live in one file that the WASM runner
+// includes too, so that every sandbox applies the same limits.
+#[path = "../wasm/limits.rs"]
+pub(crate) mod limits;
+pub use limits::MAX_OUTPUT_BYTES;
 
 /// Why running a user's JavaScript, or the machinery around it, failed.
 ///
@@ -62,10 +63,9 @@ impl std::fmt::Display for JsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JsError::Panic { label, message } => write!(f, "{label} panicked: {message}"),
-            JsError::OutputTooLarge { label, len } => write!(
-                f,
-                "{label} produced {len} bytes of output (limit {MAX_OUTPUT_BYTES})"
-            ),
+            JsError::OutputTooLarge { label, len } => {
+                f.write_str(&limits::output_too_large(label, *len))
+            }
             JsError::InvalidValue(reason) => write!(f, "invalid_value: {reason}"),
             JsError::Runtime(text)
             | JsError::Worker(text)
@@ -119,6 +119,18 @@ pub fn guard<T>(label: &str, f: impl FnOnce() -> Result<T, JsError>) -> Result<T
             })
         }
     }
+}
+
+/// The panic a WASM guest reported before it aborted. The runner cannot unwind
+/// (`panic = "abort"`), so a panic reaches the host as a trap; the runner's
+/// panic hook has written `{"ok": false, "error": "<label> panicked: ..."}` to
+/// stdout first, which is what [`guard`] reports for a native panic.
+#[cfg(feature = "wasm")]
+pub(crate) fn guest_panic(output: &[u8]) -> Option<JsError> {
+    let response: Value = serde_json::from_slice(output).ok()?;
+    let error = response.get("error")?.as_str()?;
+    (response.get("ok") == Some(&Value::Bool(false)) && error.contains(" panicked: "))
+        .then(|| JsError::Runtime(error.to_string()))
 }
 
 pub fn check_output(label: &str, output: &str) -> Result<(), JsError> {
@@ -542,12 +554,15 @@ fn wasmi_request(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     let start = instance
         .get_typed_func::<(), ()>(&store, "_start")
         .map_err(|error| JsError::Sandbox(format!("wasm start: {error}")))?;
-    run_with_deadline(&mut store, &start, limits.timeout)?;
+    let ran = run_with_deadline(&mut store, &start, limits.timeout);
     drop(store);
     let output = stdout
         .try_into_inner()
         .map_err(|_| JsError::Sandbox("wasm stdout is still borrowed".to_string()))?
         .into_inner();
+    if let Err(trap) = ran {
+        return Err(guest_panic(&output).unwrap_or(trap));
+    }
     check_output("wasm worker", &String::from_utf8_lossy(&output))?;
     let response: Value = serde_json::from_slice(&output)
         .map_err(|error| JsError::Sandbox(format!("wasm response: {error}")))?;
@@ -1173,6 +1188,20 @@ mod tests {
             memory: 1,
         };
         assert_eq!(request_limits(&request, limits).timeout, secs(60));
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn a_guest_panic_is_read_from_the_runners_stdout() {
+        let written = br#"{"ok":false,"error":"map function panicked: boom"}"#;
+        assert_eq!(
+            guest_panic(written).map(|error| error.to_string()),
+            Some("map function panicked: boom".to_string())
+        );
+        // Anything else on stdout leaves the trap as the error.
+        assert_eq!(guest_panic(b""), None);
+        assert_eq!(guest_panic(br#"{"ok":true,"value":[]}"#), None);
+        assert_eq!(guest_panic(br#"{"ok":false,"error":"no"}"#), None);
     }
 
     #[test]

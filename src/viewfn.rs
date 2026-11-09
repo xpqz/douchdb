@@ -201,8 +201,7 @@ pub(crate) fn run_map_js(
     docs: &[(String, String)],
     limits: ViewLimits,
 ) -> Result<Vec<Row>, JsError> {
-    const MAX_DOCS: usize = 256;
-    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    use crate::js::limits::{MAP_BATCH_BYTES as MAX_BYTES, MAP_BATCH_DOCS as MAX_DOCS};
     // Sandbox calls pay a process/wasm boundary per batch. Use a larger batch
     // than the native path while keeping the input and output bounded.
     let (max_docs, max_bytes) = if crate::js::sandboxed() {
