@@ -30,9 +30,12 @@ struct WasmtimeState {
 }
 
 /// Compile and cache the wasm module at startup instead of paying the
-/// Cranelift compilation cost on the first query.
-pub fn warm() -> Result<(), JsError> {
-    engine().map(|_| ())
+/// Cranelift compilation cost on the first query, then make the backend
+/// selectable in `js`.
+pub fn install() -> Result<(), JsError> {
+    engine()?;
+    crate::js::register_wasmtime_backend(request);
+    Ok(())
 }
 
 fn engine() -> Result<&'static WasmtimeState, JsError> {

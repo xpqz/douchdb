@@ -1983,7 +1983,7 @@ async fn fetch_local_docs(
 /// One owner's part of a cluster view query.
 #[derive(Default)]
 pub(crate) struct ViewBatch {
-    rows: Arc<Vec<crate::view::Row>>,
+    rows: Arc<Vec<crate::viewfn::Row>>,
     docs: HashMap<String, Value>,
     total_rows: usize,
     offset: usize,
@@ -1992,7 +1992,7 @@ pub(crate) struct ViewBatch {
 /// Merged map rows for a cluster view query, with the counts CouchDB reports.
 pub(crate) struct ClusterViewRows {
     pub spec: crate::view::ViewSpec,
-    pub rows: Arc<Vec<crate::view::Row>>,
+    pub rows: Arc<Vec<crate::viewfn::Row>>,
     pub docs: HashMap<String, Value>,
     pub total_rows: usize,
     pub offset: usize,
@@ -2155,7 +2155,7 @@ pub(crate) async fn cluster_view_rows(
     })
     .await?;
 
-    let mut counts: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+    let mut counts: HashMap<String, (usize, crate::viewfn::Row)> = HashMap::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
     let mut total_rows = 0usize;
     let mut offset = 0usize;
@@ -2169,7 +2169,7 @@ pub(crate) async fn cluster_view_rows(
         total_rows += node_total;
         offset += node_offset;
         docs.extend(node_docs);
-        let mut local: HashMap<String, (usize, crate::view::Row)> = HashMap::new();
+        let mut local: HashMap<String, (usize, crate::viewfn::Row)> = HashMap::new();
         for row in rows.iter() {
             let key = row_key(row);
             local
@@ -2331,7 +2331,7 @@ pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {
         if let Some(doc) = row.get_mut("doc").map(Value::take) {
             docs.insert(id.clone(), doc);
         }
-        rows.push(crate::view::Row {
+        rows.push(crate::viewfn::Row {
             id,
             key: row.get_mut("key").map(Value::take).unwrap_or(Value::Null),
             value: row.get_mut("value").map(Value::take).unwrap_or(Value::Null),
@@ -2345,7 +2345,7 @@ pub(crate) fn decode_view_batch(mut value: Value) -> ViewBatch {
     }
 }
 
-pub(crate) fn row_key(row: &crate::view::Row) -> String {
+pub(crate) fn row_key(row: &crate::viewfn::Row) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}",
         row.id,
