@@ -656,7 +656,7 @@ struct BulkBody<'a, T: serde::Serialize> {
 /// replica directly. The bool is whether the default write quorum was met.
 pub(crate) async fn commit_docs(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     mut docs: Vec<Value>,
     new_edits: bool,
@@ -694,8 +694,7 @@ pub(crate) async fn commit_docs(
 
     let (out, met) = if new_edits {
         let tally = QuorumTally::new(&ids, &primaries, &replicas, write_quorum(w, db.copies()));
-        let db_handle = st.db(dbname).await?;
-        let pending = spawn_quorum_writes(st, &db_handle, dbname, groups, headers, &gate).await;
+        let pending = spawn_quorum_writes(st, db, dbname, groups, headers, &gate).await;
         collect_quorum(pending, tally).await
     } else {
         let responses = replicate_to_all(st, db, dbname, groups, headers).await;

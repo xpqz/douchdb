@@ -5,7 +5,7 @@
 
 use super::{flag, internal_request, query, send_peer, AdminOnly, AppState};
 use crate::db::Db;
-use crate::state::FsHealth;
+use crate::health::FsHealth;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;

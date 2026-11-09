@@ -86,7 +86,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
     }
 
     let principal = st.principal(headers);
-    let validation: Vec<Option<ApiError>> = if is_forwarded(st, headers) {
+    let validation: Vec<Option<ApiError>> = if st.ctx.cluster.is_internal(headers) {
         std::iter::repeat_with(|| None).take(docs.len()).collect()
     } else {
         // The same validators as a single-document write.
@@ -118,10 +118,10 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
 
     let (written, accepted) = if writable.is_empty() {
         (Vec::new(), false)
-    } else if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
+    } else if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         // A forwarded batch has already been placed by its coordinator; write
         // it to this node's shards and let the coordinator count the ack.
-        match put_on_this_node(db, writable, new_edits, is_forwarded(st, headers)).await {
+        match put_on_this_node(db, writable, new_edits, st.ctx.cluster.is_internal(headers)).await {
             Ok(results) => (results, false),
             Err(e) => return fail(e),
         }
@@ -284,7 +284,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
     let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
     let latest = flag(q, "latest");
-    if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.bulk_get(&value, attachments, revs, latest).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -383,7 +383,7 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
         Ok(value) => value,
         Err(error) => return fail(error),
     };
-    if !st.ctx.cluster.is_clustered() || is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.revs_diff(&value).await {
             Ok(v) => json(StatusCode::OK, v),
             Err(e) => fail(e),
@@ -581,14 +581,14 @@ fn all_docs_opts(
 /// coordinator, on the whole cluster.
 async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
     let (st, db, headers) = (req.st, req.db, req.headers);
-    let shard_mask = if is_forwarded(st, headers) {
+    let shard_mask = if st.ctx.cluster.is_internal(headers) {
         req.q
             .get("shards")
             .and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
         None
     };
-    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         cluster_all_docs(
             ClusterRead {
                 ctx: &st.ctx,
@@ -601,7 +601,7 @@ async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value
         .await
     } else if let Some(mask) = shard_mask {
         db.all_docs_owned(opts, &mask).await
-    } else if flag(req.q, "owner_only") && is_forwarded(st, headers) {
+    } else if flag(req.q, "owner_only") && st.ctx.cluster.is_internal(headers) {
         let owned: ShardMask = (0..db.q)
             .map(|shard| db.owner_of_shard(shard) == st.ctx.cluster.me)
             .collect();
@@ -661,7 +661,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
     };
     if opts.keys.is_none()
         && !req.st.ctx.cluster.is_clustered()
-        && !is_forwarded(req.st, req.headers)
+        && !req.st.ctx.cluster.is_internal(req.headers)
     {
         return stream_all_docs(&req, &opts, update_seq).await;
     }
@@ -822,7 +822,7 @@ pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
     let (st, db, headers) = (req.st, req.db, req.headers);
-    let result = if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    let result = if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         cluster_local_docs(
             ClusterRead {
                 ctx: &st.ctx,
@@ -833,7 +833,10 @@ pub(super) async fn local_docs(req: DbRequest<'_>) -> Response {
             &opts,
         )
         .await
-    } else if let Some(mask) = is_forwarded(st, headers)
+    } else if let Some(mask) = st
+        .ctx
+        .cluster
+        .is_internal(headers)
         .then(|| {
             req.q
                 .get("shards")

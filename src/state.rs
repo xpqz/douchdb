@@ -4,6 +4,8 @@
 use crate::auth::Principal;
 use crate::cluster_http::ClusterCtx;
 use crate::db::{ApiError, Db, DbConfig, DbResult};
+use crate::dbname::{illegal_db_name, valid_db_name};
+use crate::health::FsHealthCache;
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -192,48 +194,6 @@ pub struct Config {
 /// sees every commit through `Db::subscribe_commits`, so this only bounds how
 /// long a security change or other out-of-band state can go unnoticed.
 pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// CouchDB's answer to creating a database with an illegal name.
-pub(crate) fn illegal_db_name(name: &str) -> ApiError {
-    ApiError::new(
-        400,
-        "illegal_database_name",
-        format!(
-            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
-             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
-        ),
-    )
-}
-
-/// The system databases CouchDB's `couch_db:validate_dbname` accepts although
-/// they do not match the name regex.
-const SYSTEM_DB_NAMES: [&str; 3] = ["_users", "_replicator", "_global_changes"];
-
-/// CouchDB's `^[a-z][a-z0-9_$()+/-]*(\.[0-9]{10,})?$` (`DBNAME_REGEX` in
-/// `couch_db.erl`) applied after dropping one trailing `.couch`
-/// (`couch_util:drop_dot_couch_ext`), or one of the system databases. The
-/// optional digits are the shard timestamp; the clustered create runs the same
-/// check, so `foo.couch` and `foo.1234567890` are legal names, stored as
-/// given. Doubled and trailing slashes are legal.
-pub(crate) fn valid_db_name(name: &str) -> bool {
-    let bare = name.strip_suffix(".couch").unwrap_or(name);
-    let body = match bare.rsplit_once('.') {
-        Some((body, digits))
-            if digits.len() >= 10 && digits.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            body
-        }
-        _ => bare,
-    };
-    let mut bytes = body.bytes();
-    let regex_match = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
-        && bytes.all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
-        });
-    regex_match || SYSTEM_DB_NAMES.contains(&bare)
-}
 
 // ---------------------------------------------------------------------------
 // state
@@ -514,36 +474,6 @@ impl AppState {
     }
 }
 
-/// How long the filesystem part of the health check is reused. `/_health` is
-/// unauthenticated, so it must not touch the disk on every request.
-pub(crate) const FS_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Result of the blocking filesystem checks.
-#[derive(Clone, Copy)]
-pub(crate) struct FsHealth {
-    pub(crate) readable: bool,
-    pub(crate) writable: bool,
-    pub(crate) unreadable: u64,
-}
-
-/// Short-lived cache of [`FsHealth`].
-#[derive(Default)]
-pub struct FsHealthCache(std::sync::Mutex<Option<(std::time::Instant, FsHealth)>>);
-
-impl FsHealthCache {
-    pub(crate) fn fresh(&self, now: std::time::Instant) -> Option<FsHealth> {
-        let slot = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        match *slot {
-            Some((at, value)) if now.saturating_duration_since(at) < FS_HEALTH_TTL => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn store(&self, now: std::time::Instant, value: FsHealth) {
-        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((now, value));
-    }
-}
-
 /// A node state over `root` for tests: one node, no peers, no auth.
 #[cfg(test)]
 pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
@@ -593,7 +523,6 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Every database ever opened used to stay open, with its shard actors and
     /// stores, until it was deleted.
@@ -710,24 +639,6 @@ mod tests {
         drop((stale, fresh));
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fs_health_cache_serves_within_the_ttl_only() {
-        let cache = FsHealthCache::default();
-        let start = Instant::now();
-        assert!(cache.fresh(start).is_none());
-        cache.store(
-            start,
-            FsHealth {
-                readable: true,
-                writable: true,
-                unreadable: 3,
-            },
-        );
-        let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
-        assert_eq!(hit.map(|value| value.unreadable), Some(3));
-        assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
     }
 
     #[test]

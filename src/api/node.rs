@@ -338,7 +338,7 @@ pub async fn db_metadata_put(
     };
     // A migration owns placement changes until it activates or rolls back.
     // Internal activation/rollback requests carry the forwarded marker.
-    if db.rebalance_in_progress() && !is_forwarded(&st, &headers) {
+    if db.rebalance_in_progress() && !st.ctx.cluster.is_internal(&headers) {
         return fail(ApiError::new(
             409,
             "rebalance_in_progress",
