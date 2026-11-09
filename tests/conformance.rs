@@ -7239,6 +7239,32 @@ async fn cluster_purge_stays_purged_when_a_down_replica_rejoins() {
     }
 }
 
+// One `_purge` is one purge info with one uuid on every copy of the shard (the
+// coordinator picks the uuid, fabric_doc_purge.erl), so anti-entropy finds
+// nothing to replay and the purge sequence stays at 1 on both nodes.
+#[tokio::test]
+async fn cluster_one_purge_counts_once_on_every_copy() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clpurgeonce").await;
+    }
+    let (_, r) = nodes[0].put("/clpurgeonce/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[0]
+        .post("/clpurgeonce/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for _ in 0..2 {
+        for node in &nodes {
+            sync_node(node, "clpurgeonce").await;
+        }
+    }
+    for node in &nodes {
+        let (_, info) = node.get("/clpurgeonce").await;
+        assert_eq!(info["purge_seq"], json!(seq_token(&[1, 1])), "{info}");
+    }
+}
+
 // A node that misses more purges than `_purged_infos_limit` keeps must still
 // learn of all of them: a shard does not trim purge infos a replica has not
 // confirmed (CouchDB keeps them back to the lowest purge checkpoint).
