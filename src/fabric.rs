@@ -6,7 +6,9 @@ use crate::cluster_http::{
     forward_client_auth, in_request_scope, internal_request, internal_request_raw, send_peer,
     ClusterCtx,
 };
-use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::db::{
+    AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts, WriteError, WriteResult,
+};
 use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
@@ -662,14 +664,14 @@ pub(crate) async fn commit_docs(
     new_edits: bool,
     w: usize,
     headers: &HeaderMap,
-) -> DbResult<(Vec<Value>, bool)> {
+) -> DbResult<(Vec<Option<WriteResult>>, bool)> {
     let ctx = &st.ctx;
     if !ctx.cluster.is_clustered() {
         let results = db.put_docs(docs, new_edits).await?;
-        if results.iter().any(|result| result.get("ok").is_some()) {
+        if results.iter().any(WriteResult::is_ok) {
             st.db_updates.record(dbname, "updated");
         }
-        return Ok((results, true));
+        return Ok((results.into_iter().map(Some).collect(), true));
     }
 
     // Hold the write gate until this write and its detached replica writes
@@ -695,7 +697,8 @@ pub(crate) async fn commit_docs(
     let (out, met) = if new_edits {
         let tally = QuorumTally::new(&ids, &primaries, &replicas, write_quorum(w, db.copies()));
         let pending = spawn_quorum_writes(st, db, dbname, groups, headers, &gate).await;
-        collect_quorum(pending, tally).await
+        let (results, met) = collect_quorum(pending, tally).await;
+        (results.into_iter().map(Some).collect(), met)
     } else {
         let responses = replicate_to_all(st, db, dbname, groups, headers).await;
         merge_replicated(&ids, &primaries, responses)
@@ -703,7 +706,7 @@ pub(crate) async fn commit_docs(
     if !met {
         crate::telemetry::record_quorum_failure();
     }
-    if out.iter().any(|result| result.get("ok").is_some()) {
+    if out.iter().flatten().any(WriteResult::is_ok) {
         st.db_updates.record(dbname, "updated");
     }
     Ok((out, met))
@@ -854,7 +857,7 @@ fn write_quorum(w: usize, copies: usize) -> usize {
 type SlotDocs = Vec<(usize, Arc<Value>)>;
 /// One node's answer: the node, the document slots it was sent, and the
 /// per-document results or the failure to reach it.
-type NodeReply = (usize, Vec<usize>, DbResult<Vec<Value>>);
+type NodeReply = (usize, Vec<usize>, DbResult<Vec<WriteResult>>);
 
 /// The documents each node is to receive, with each document's slot in the
 /// request.
@@ -868,11 +871,11 @@ fn group_by_node(docs: &[Arc<Value>], replicas: &[Vec<usize>]) -> HashMap<usize,
     groups
 }
 
-fn replica_unavailable(id: &str) -> Value {
-    json!({
-        "id": id,
-        "error": "replica_unavailable",
-        "reason": "no replica in the shard set is reachable",
+fn replica_unavailable(id: &str) -> WriteResult {
+    WriteResult::Error(WriteError {
+        id: Some(Value::String(id.to_string())),
+        error: "replica_unavailable".to_string(),
+        reason: "no replica in the shard set is reachable".to_string(),
     })
 }
 
@@ -929,7 +932,7 @@ async fn spawn_quorum_writes(
 fn spawn_node_write(
     node: usize,
     slots: Vec<usize>,
-    write: impl std::future::Future<Output = DbResult<Vec<Value>>> + Send + 'static,
+    write: impl std::future::Future<Output = DbResult<Vec<WriteResult>>> + Send + 'static,
 ) -> tokio::task::JoinHandle<NodeReply> {
     use futures::FutureExt;
     // The task keeps counting its peer calls against the client request.
@@ -949,7 +952,7 @@ fn spawn_node_write(
 async fn collect_quorum(
     mut pending: FuturesUnordered<tokio::task::JoinHandle<NodeReply>>,
     mut tally: QuorumTally<'_>,
-) -> (Vec<Value>, bool) {
+) -> (Vec<WriteResult>, bool) {
     while let Some(joined) = pending.next().await {
         // Panics are caught in the task, so only a cancelled task (runtime
         // shutdown) fails to join.
@@ -972,8 +975,8 @@ struct QuorumTally<'a> {
     primaries: &'a [usize],
     quorum: usize,
     acks: Vec<usize>,
-    successes: Vec<Option<Value>>,
-    failures: Vec<Option<Value>>,
+    successes: Vec<Option<WriteResult>>,
+    failures: Vec<Option<WriteResult>>,
     /// Replies still owed per document. Design documents go to every node, and
     /// any node may coordinate a query against them, so their write waits for
     /// every replica to answer rather than only the quorum.
@@ -1004,15 +1007,15 @@ impl<'a> QuorumTally<'a> {
             primaries,
             quorum,
             acks: vec![0; total],
-            successes: vec![None; total],
-            failures: vec![None; total],
+            successes: (0..total).map(|_| None).collect(),
+            failures: (0..total).map(|_| None).collect(),
             unanswered,
         }
     }
 
     /// Record one node's reply for the given slots; `None` means the node
     /// could not be reached.
-    fn record(&mut self, node: usize, slots: Vec<usize>, response: Option<Vec<Value>>) {
+    fn record(&mut self, node: usize, slots: Vec<usize>, response: Option<Vec<WriteResult>>) {
         for slot in &slots {
             if let Some(left) = self.unanswered.get_mut(*slot) {
                 *left = left.saturating_sub(1);
@@ -1029,7 +1032,7 @@ impl<'a> QuorumTally<'a> {
                     ) else {
                         continue;
                     };
-                    if result.get("error").is_none() {
+                    if result.is_ok() {
                         *ack += 1;
                         if success.is_none() || is_primary {
                             *success = Some(result);
@@ -1067,7 +1070,7 @@ impl<'a> QuorumTally<'a> {
     /// The result per document: a success if any replica acknowledged (the
     /// primary's if it did), else a failure (the primary's if it reported one),
     /// else `replica_unavailable`.
-    fn finish(self) -> Vec<Value> {
+    fn finish(self) -> Vec<WriteResult> {
         let ids = self.ids;
         self.successes
             .into_iter()
@@ -1128,9 +1131,9 @@ fn merge_replicated(
     ids: &[String],
     primaries: &[usize],
     responses: Vec<NodeReply>,
-) -> (Vec<Value>, bool) {
+) -> (Vec<Option<WriteResult>>, bool) {
     let total = ids.len();
-    let mut out = vec![Value::Null; total];
+    let mut out: Vec<Option<WriteResult>> = (0..total).map(|_| None).collect();
     let mut reached = vec![false; total];
     for (node, slots, response) in responses {
         match response {
@@ -1150,13 +1153,19 @@ fn merge_replicated(
                         results.get(position)
                     } else {
                         results.iter().find(|result| {
-                            result.get("id").and_then(Value::as_str)
-                                == ids.get(*slot).map(String::as_str)
+                            matches!(
+                                result,
+                                WriteResult::Error(WriteError { id: Some(Value::String(id)), .. })
+                                    if Some(id.as_str()) == ids.get(*slot).map(String::as_str)
+                            ) || matches!(
+                                result,
+                                WriteResult::Ok(ok) if Some(ok.id.as_str()) == ids.get(*slot).map(String::as_str)
+                            )
                         })
                     };
                     if let Some(result) = result {
-                        if primaries.get(*slot) == Some(&node) || out.is_null() {
-                            *out = result.clone();
+                        if primaries.get(*slot) == Some(&node) || out.is_none() {
+                            *out = Some(result.clone());
                         }
                     }
                 }
@@ -1164,8 +1173,8 @@ fn merge_replicated(
             Err(_) => {
                 for slot in slots {
                     if let (Some(out), Some(id)) = (out.get_mut(slot), ids.get(slot)) {
-                        if out.is_null() {
-                            *out = replica_unavailable(id);
+                        if out.is_none() {
+                            *out = Some(replica_unavailable(id));
                         }
                     }
                 }
@@ -1184,7 +1193,7 @@ async fn forward_bulk_owned<T>(
     docs: Vec<T>,
     new_edits: bool,
     headers: HeaderMap,
-) -> DbResult<Vec<Value>>
+) -> DbResult<Vec<WriteResult>>
 where
     T: serde::Serialize,
 {
@@ -1208,15 +1217,10 @@ where
         let text = response.text().await.unwrap_or_default();
         return Err(ApiError::new(status, "bulk_docs_failed", text));
     }
-    match response.json::<Value>().await {
-        Ok(Value::Array(values)) => Ok(values),
-        Ok(_) => Err(ApiError::new(
-            502,
-            "bad_gateway",
-            format!("{peer}: unexpected _bulk_docs response"),
-        )),
-        Err(e) => Err(ApiError::new(502, "bad_gateway", format!("{peer}: {e}"))),
-    }
+    response
+        .json::<Vec<WriteResult>>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
 }
 
 pub(crate) async fn forward_json(
@@ -1806,7 +1810,7 @@ pub(crate) async fn copy_local_docs(
     )))
     .await;
     for results in installs {
-        if let Some(failed) = results?.iter().find(|result| result.get("error").is_some()) {
+        if let Some(failed) = results?.iter().find(|result| !result.is_ok()) {
             return Err(ApiError::new(
                 502,
                 "rebalance_failed",
@@ -3356,7 +3360,8 @@ mod tests {
         let primaries = vec![0, 0];
         let replicas = vec![vec![0, 1], vec![0, 2]];
         let tally = QuorumTally::new(&ids, &primaries, &replicas, 1);
-        let ack = |id: &str| json!({ "id": id, "ok": true, "rev": "1-a" });
+        let ack =
+            |id: &str| WriteResult::Ok(crate::db::WriteOk::new(id.to_string(), "1-a".to_string()));
 
         let pending = FuturesUnordered::new();
         pending.push(spawn_node_write(0, vec![0, 1], {
@@ -3367,7 +3372,7 @@ mod tests {
             panic!("replica task exploded")
         }));
         pending.push(spawn_node_write(2, vec![1], async {
-            std::future::pending::<DbResult<Vec<Value>>>().await
+            std::future::pending::<DbResult<Vec<WriteResult>>>().await
         }));
 
         let settled = tokio::time::timeout(
@@ -3379,7 +3384,7 @@ mod tests {
         let (out, met) = settled;
         assert!(met);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|result| result.get("ok").is_some()));
+        assert!(out.iter().all(WriteResult::is_ok));
     }
 
     /// A peer that accepts a write and never answers must not accumulate
@@ -3572,12 +3577,19 @@ mod tests {
             })
         }
 
-        fn reply(node: usize, slot: usize, verdict: Verdict) -> Value {
+        /// The reply of `node` for document `slot`: the node is carried in the
+        /// revision of an acknowledgement and the reason of a rejection.
+        fn reply(node: usize, slot: usize, verdict: Verdict) -> WriteResult {
+            let id = format!("d{slot}");
             match verdict {
-                Verdict::Ack => json!({"ok": true, "id": format!("d{slot}"), "from": node}),
-                Verdict::Reject => {
-                    json!({"id": format!("d{slot}"), "error": "conflict", "from": node})
+                Verdict::Ack => {
+                    WriteResult::Ok(crate::db::WriteOk::new(id, format!("{node}-from")))
                 }
+                Verdict::Reject => WriteResult::Error(WriteError {
+                    id: Some(Value::String(id)),
+                    error: "conflict".to_string(),
+                    reason: node.to_string(),
+                }),
             }
         }
 
@@ -3636,14 +3648,14 @@ mod tests {
                     if acks[slot] > 0 {
                         // Any acknowledgement beats any failure, and the
                         // primary's acknowledgement beats the others'.
-                        prop_assert!(result.get("error").is_none());
+                        prop_assert!(result.is_ok());
                         let primary_acked = matches!(&nodes[0], Some(v) if matches!(v[slot], Verdict::Ack))
                             && order[..if settled_early { answered } else { copies }].contains(&0);
                         if primary_acked {
-                            prop_assert_eq!(&result["from"], &json!(0));
+                            prop_assert_eq!(&result.json()["rev"], &json!("0-from"));
                         }
                     } else {
-                        prop_assert!(result.get("error").is_some());
+                        prop_assert!(!result.is_ok());
                         prop_assert!(!met);
                     }
                 }
@@ -3660,6 +3672,7 @@ mod tests {
                 tally.record(1, (0..docs).collect(), None);
                 prop_assert!(!tally.settled());
                 for (slot, result) in tally.finish().into_iter().enumerate() {
+                    let result = result.json();
                     prop_assert_eq!(&result["error"], &json!("replica_unavailable"));
                     prop_assert_eq!(&result["id"], &json!(format!("d{slot}")));
                 }

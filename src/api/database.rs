@@ -288,24 +288,21 @@ async fn create_doc(req: DbRequest<'_>, principal: &Principal) -> Response {
     )
     .await
     {
-        Ok((mut results, quorum)) => {
-            let mut result = results.pop().unwrap_or(Value::Null);
-            if result.get("error").is_some() {
-                if let Some(object) = result.as_object_mut() {
-                    object.remove("id");
-                }
-                return json(doc_error_status(&result), result);
-            }
+        Ok((results, quorum)) => {
+            let result = match single_write_result(results) {
+                Ok(result) => result,
+                Err(response) => return response,
+            };
             if q.get("batch").map(String::as_str) == Some("ok") {
                 return json(StatusCode::ACCEPTED, json!({"ok": true, "id": id}));
             }
-            json(
+            json_of(
                 if quorum {
                     StatusCode::CREATED
                 } else {
                     StatusCode::ACCEPTED
                 },
-                result,
+                &result,
             )
         }
         Err(e) => fail(e),

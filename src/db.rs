@@ -1346,7 +1346,7 @@ impl Db {
 
     // ----- documents -------------------------------------------------------
 
-    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<Value>> {
+    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<WriteResult>> {
         if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
             return Err(attachments_unsupported());
         }
@@ -1356,7 +1356,7 @@ impl Db {
                 .map(|id| id.starts_with("_design/"))
                 .unwrap_or(false)
         });
-        let mut out: Vec<Option<Value>> = vec![None; docs.len()];
+        let mut out: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
         let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
@@ -1378,13 +1378,9 @@ impl Db {
                         ids[i] = Some(id.clone());
                         grouped[self.shard_index(&id)].push((i, doc));
                     }
-                    Err(e) => {
-                        out[i] = Some(json!({
-                            "id": id, "error": e.error, "reason": e.reason
-                        }))
-                    }
+                    Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
                 },
-                Err(e) => out[i] = Some(json!({"error": e.error, "reason": e.reason})),
+                Err(e) => out[i] = Some(WriteResult::error(None, e)),
             }
         }
 
@@ -1423,10 +1419,11 @@ impl Db {
             };
             for (i, result) in results {
                 out[i] = Some(match result {
-                    Ok(doc) => doc,
-                    Err(e) => json!({
-                        "id": ids[i], "error": e.error, "reason": e.reason
-                    }),
+                    Ok(ok) => WriteResult::Ok(ok),
+                    Err(e) => WriteResult::error(
+                        Some(ids[i].clone().map_or(Value::Null, Value::String)),
+                        e,
+                    ),
                 });
             }
         }
@@ -1446,7 +1443,14 @@ impl Db {
         if let Some(error) = shard_error {
             return Err(error);
         }
-        Ok(out.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
+        Ok(out
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    WriteResult::error(None, ApiError::internal("no result for the document"))
+                })
+            })
+            .collect())
     }
 
     pub async fn get_doc(&self, id: &str, opts: &DocOpts) -> DbResult<Value> {
@@ -2429,14 +2433,14 @@ impl Db {
             .await
     }
 
-    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<Value> {
+    pub async fn local_put(&self, id: &str, body: Value) -> DbResult<WriteOk> {
         let id = id.to_string();
         self.local_shard(&id)
             .call(move |s| write_local(s, &id, body))
             .await
     }
 
-    pub async fn local_delete(&self, id: &str) -> DbResult<Value> {
+    pub async fn local_delete(&self, id: &str) -> DbResult<WriteOk> {
         let id = id.to_string();
         self.local_shard(&id)
             .call(move |s| delete_local(s, &id))
@@ -2446,7 +2450,7 @@ impl Db {
     /// Apply the `_local/` documents of a `_bulk_docs` batch, each on the
     /// shard of its id. A delete of a missing document is a success at rev
     /// 0-0, unlike `DELETE /db/_local/id`, as in CouchDB.
-    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
+    async fn put_local_docs(&self, docs: Vec<(usize, Value)>) -> Vec<(usize, WriteResult)> {
         let mut out = Vec::with_capacity(docs.len());
         for (slot, doc) in docs {
             let id = doc
@@ -2462,7 +2466,7 @@ impl Db {
             let result = if deleted {
                 match self.local_delete(&name).await {
                     Err(error) if error.status == 404 => {
-                        Ok(json!({"ok": true, "id": id, "rev": "0-0"}))
+                        Ok(WriteOk::new(id.clone(), "0-0".to_string()))
                     }
                     other => other,
                 }
@@ -2471,9 +2475,10 @@ impl Db {
             };
             out.push((
                 slot,
-                result.unwrap_or_else(
-                    |error| json!({"id": id, "error": error.error, "reason": error.reason}),
-                ),
+                match result {
+                    Ok(ok) => WriteResult::Ok(ok),
+                    Err(error) => WriteResult::error(Some(Value::String(id)), error),
+                },
             ));
         }
         out
@@ -2483,7 +2488,7 @@ impl Db {
     /// this node already holds a newer one. A rebalance uses it to hand a
     /// shard's local documents to a new replica; a normal write would number
     /// the copy one higher.
-    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<Value> {
+    pub async fn install_local_docs(&self, docs: Vec<Value>) -> Vec<WriteResult> {
         let mut out = Vec::with_capacity(docs.len());
         for doc in docs {
             let id = doc
@@ -2496,9 +2501,10 @@ impl Db {
                 .local_shard(&name)
                 .call(move |s| install_local(s, &name, doc))
                 .await;
-            out.push(result.unwrap_or_else(
-                |error| json!({"id": id, "error": error.error, "reason": error.reason}),
-            ));
+            out.push(match result {
+                Ok(ok) => WriteResult::Ok(ok),
+                Err(error) => WriteResult::error(Some(Value::String(id)), error),
+            });
         }
         out
     }
@@ -3273,7 +3279,7 @@ fn put_many(
     mut compile_errors: HashMap<usize, ApiError>,
     seq: &Arc<AtomicU64>,
     reserved: &Arc<AtomicU64>,
-) -> Vec<(usize, DbResult<Value>)> {
+) -> Vec<(usize, DbResult<WriteOk>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
     // What each staged document's record held in the shard before this batch.
@@ -3344,14 +3350,7 @@ fn put_many(
     }
     let ok_ids: std::collections::HashSet<String> = results
         .iter()
-        .filter_map(|(_, result)| {
-            result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|(_, result)| result.as_ref().ok().map(|ok| ok.id.clone()))
         .collect();
     shard.update_latest(&staged, &ok_ids);
     results
@@ -3395,7 +3394,7 @@ impl Stage<'_> {
         doc: Value,
         new_edits: bool,
         compile_error: Option<ApiError>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<WriteOk> {
         let doc = split_doc(doc)?;
         let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
@@ -3494,7 +3493,7 @@ impl Stage<'_> {
         }
         self.flush_meta(&id, &meta);
 
-        Ok(json!({"ok": true, "id": id, "rev": rev}))
+        Ok(WriteOk::new(id, rev))
     }
 
     fn stage_replicated(
@@ -3502,7 +3501,7 @@ impl Stage<'_> {
         doc: SplitDoc,
         mut meta: DocMeta,
         compile_error: Option<ApiError>,
-    ) -> DbResult<Value> {
+    ) -> DbResult<WriteOk> {
         let SplitDoc {
             id,
             rev,
@@ -3514,7 +3513,7 @@ impl Stage<'_> {
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
         let known = meta.tree.contains(&rev);
         if known && meta.atts.contains_key(&rev) {
-            return Ok(json!({"ok": true, "id": id, "rev": rev}));
+            return Ok(WriteOk::new(id, rev));
         }
         // A replicated design document is validated too (couch_db:
         // prep_and_validate_replicated_updates), unless it is already stored.
@@ -3555,7 +3554,7 @@ impl Stage<'_> {
             self.flush_meta(&id, &meta);
         }
 
-        Ok(json!({"ok": true, "id": id, "rev": rev}))
+        Ok(WriteOk::new(id, rev))
     }
 }
 
@@ -3877,6 +3876,111 @@ pub struct BulkGetError {
     pub rev: String,
     pub error: String,
     pub reason: String,
+}
+
+/// The result of one document write.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WriteOk {
+    pub ok: bool,
+    pub id: String,
+    pub rev: String,
+}
+
+impl WriteOk {
+    pub fn new(id: String, rev: String) -> WriteOk {
+        WriteOk { ok: true, id, rev }
+    }
+}
+
+/// A failed document write. `id` is absent when the document had none that
+/// could be read; a `_bulk_docs` validation failure reports the `_id` as sent,
+/// whatever its type.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WriteError {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    pub id: Option<Value>,
+    pub error: String,
+    pub reason: String,
+}
+
+/// Read a field that may be `null` as `Some(Value::Null)`, so that it
+/// serializes back as `null` instead of vanishing.
+pub(crate) fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// One entry of a `_bulk_docs` answer: serialized as the bare object, `ok`
+/// results and error results alike.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum WriteResult {
+    Ok(WriteOk),
+    Error(WriteError),
+}
+
+impl WriteResult {
+    pub fn error(id: Option<Value>, error: ApiError) -> WriteResult {
+        WriteResult::Error(WriteError {
+            id,
+            error: error.error.to_string(),
+            reason: error.reason,
+        })
+    }
+
+    /// The wire form, for tests that read fields by name.
+    #[cfg(test)]
+    pub(crate) fn json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, WriteResult::Ok(_))
+    }
+}
+
+impl std::fmt::Display for WriteResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(self) {
+            Ok(text) => f.write_str(&text),
+            Err(_) => f.write_str("<unprintable>"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FlatWriteResult {
+    ok: Option<bool>,
+    #[serde(default, deserialize_with = "present_value")]
+    id: Option<Value>,
+    rev: Option<String>,
+    error: Option<String>,
+    reason: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for WriteResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let flat = FlatWriteResult::deserialize(deserializer)?;
+        match (flat.error, flat.reason) {
+            (Some(error), reason) => Ok(WriteResult::Error(WriteError {
+                id: flat.id,
+                error,
+                reason: reason.unwrap_or_default(),
+            })),
+            (None, _) => match (flat.ok, flat.id, flat.rev) {
+                (Some(ok), Some(Value::String(id)), Some(rev)) => {
+                    Ok(WriteResult::Ok(WriteOk { ok, id, rev }))
+                }
+                _ => Err(D::Error::custom("not a document write result")),
+            },
+        }
+    }
 }
 
 /// The body of `GET /{db}`. Fields serialize in CouchDB's order.
@@ -4378,7 +4482,7 @@ fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
     }
 }
 
-fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
+fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
     // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
     // from the supplied `_rev`, absent meaning 0, and never conflicts: the
     // stored revision is not consulted.
@@ -4399,32 +4503,36 @@ fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<Value> {
     let mut tx = Tx::new();
     tx.put_json(&local_key(id), &body)?;
     s.commit(tx)?;
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+    Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
-fn delete_local(s: &mut Shard, id: &str) -> DbResult<Value> {
+fn delete_local(s: &mut Shard, id: &str) -> DbResult<WriteOk> {
     if s.get_checked(&local_key(id))?.is_none() {
         return Err(ApiError::not_found("missing"));
     }
     let mut tx = Tx::new();
     tx.delete(&local_key(id));
     s.commit(tx)?;
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": "0-0"}))
+    Ok(WriteOk::new(format!("_local/{id}"), "0-0".to_string()))
 }
 
 /// Keep a copy of a local document as it is, unless a newer one is stored.
-fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<Value> {
+fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
     let Some(incoming) = local_rev_number(&doc) else {
         return Err(ApiError::bad_request("Invalid rev format"));
     };
     let held = read_local(s, id)?.as_ref().and_then(local_rev_number);
-    let rev = doc.get("_rev").cloned().unwrap_or(Value::Null);
+    let rev = doc
+        .get("_rev")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if held.is_none_or(|held| held < incoming) {
         let mut tx = Tx::new();
         tx.put_json(&local_key(id), &doc)?;
         s.commit(tx)?;
     }
-    Ok(json!({"ok": true, "id": format!("_local/{id}"), "rev": rev}))
+    Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
 /// Every local document of one shard, with its `_local/` id.
@@ -4836,7 +4944,7 @@ mod tests {
                 doc["_rev"] = json!(rev);
             }
             let put = db.put_docs(vec![doc], true).await.unwrap();
-            revs.push(put[0]["rev"].as_str().unwrap().to_string());
+            revs.push(put[0].json()["rev"].as_str().unwrap().to_string());
         }
         assert_eq!(stored_bodies(&db, revs.clone()).await, [true; 4]);
         db.compact().await.unwrap();
@@ -4913,7 +5021,7 @@ mod tests {
         let (db, root) = single_shard_db("att-chunk").await;
         // Uploads are rejected at the API, so plant the attachment directly.
         let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
         db.shards[0]
             .call(move |shard| {
                 let mut meta = shard.get_meta("a")?.unwrap();
@@ -4962,7 +5070,7 @@ mod tests {
     async fn a_non_ascii_attachment_digest_is_corruption_not_a_panic() {
         let (db, root) = single_shard_db("att-digest").await;
         let put = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
-        let rev = put[0]["rev"].as_str().unwrap().to_string();
+        let rev = put[0].json()["rev"].as_str().unwrap().to_string();
         db.shards[0]
             .call(move |shard| {
                 let mut meta = shard.get_meta("a")?.unwrap();
@@ -5091,7 +5199,7 @@ mod tests {
             .put_docs(vec![json!({"_id": "a", "n": 1})], true)
             .await
             .unwrap();
-        let rev = written[0]["rev"].as_str().unwrap().to_string();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
         let body = json!({"docs": [
             {"id": "a", "rev": rev},
             {"id": "nope"},
@@ -5273,7 +5381,7 @@ mod tests {
         let put = db.put_docs(docs, true).await.unwrap();
         // One corrupt body, which include_docs skips.
         let bad_id = "doc0450";
-        let bad_rev = put[450]["rev"].as_str().unwrap().to_string();
+        let bad_rev = put[450].json()["rev"].as_str().unwrap().to_string();
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
@@ -5283,7 +5391,7 @@ mod tests {
             .await
             .unwrap();
         // A deleted document does not count.
-        let gone = put[10]["rev"].as_str().unwrap();
+        let gone = put[10].json()["rev"].as_str().unwrap().to_string();
         db.put_docs(
             vec![json!({"_id": "doc0010", "_rev": gone, "_deleted": true})],
             true,
@@ -5460,7 +5568,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let bad_rev = put[1]["rev"].as_str().unwrap().to_string();
+        let bad_rev = put[1].json()["rev"].as_str().unwrap().to_string();
         let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
@@ -6254,8 +6362,8 @@ mod tests {
             .put_docs(vec![json!({"_id": "known"}), json!({"_id": "same"})], true)
             .await
             .unwrap();
-        let rev = written[0]["rev"].as_str().unwrap().to_string();
-        let same_rev = written[1]["rev"].as_str().unwrap().to_string();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let same_rev = written[1].json()["rev"].as_str().unwrap().to_string();
         let body: Value = serde_json::from_str(&format!(
             r#"{{"zed":["1-aaaa"],"known":["{rev}","2-ffff"],"same":["{same_rev}"],"not-a-list":"x","alpha":["1-bbbb","1-cccc"]}}"#
         ))
@@ -6295,7 +6403,7 @@ mod tests {
         assert!(shards.len() > 1, "the ids must spread over shards");
         let docs = ids.iter().map(|id| json!({"_id": id, "n": id})).collect();
         let written = db.put_docs(docs, true).await.unwrap();
-        assert!(written.iter().all(|row| row["ok"] == json!(true)));
+        assert!(written.iter().all(|row| row.is_ok()));
         let info = db.info().await.unwrap();
         assert_eq!(info.doc_count, 12);
         assert_eq!(info.update_seq, 12);
@@ -6313,7 +6421,8 @@ mod tests {
         // lists the leaf it has as a possible ancestor.
         let mut diff = Map::new();
         for id in &ids {
-            let rev = written[ids.iter().position(|other| other == id).unwrap()]["rev"].clone();
+            let rev =
+                written[ids.iter().position(|other| other == id).unwrap()].json()["rev"].clone();
             diff.insert(id.clone(), json!([rev, "2-ffff"]));
         }
         let diff = db.revs_diff(&Value::Object(diff)).await.unwrap();
@@ -6323,7 +6432,7 @@ mod tests {
             assert_eq!(entry.missing, ["2-ffff"]);
             assert_eq!(
                 json!(entry.possible_ancestors),
-                json!([written[position]["rev"]])
+                json!([written[position].json()["rev"]])
             );
         }
 
@@ -6331,11 +6440,17 @@ mod tests {
         // revisions it removed.
         let mut purge = Map::new();
         for (position, id) in ids.iter().enumerate().take(6) {
-            purge.insert(id.clone(), json!([written[position]["rev"], "9-nope"]));
+            purge.insert(
+                id.clone(),
+                json!([written[position].json()["rev"], "9-nope"]),
+            );
         }
         let purged = db.purge(&Value::Object(purge), 0).await.unwrap();
         for (position, id) in ids.iter().enumerate().take(6) {
-            assert_eq!(purged["purged"][id], json!([written[position]["rev"]]));
+            assert_eq!(
+                purged["purged"][id],
+                json!([written[position].json()["rev"]])
+            );
         }
         assert_eq!(db.info().await.unwrap().doc_count, 6);
 
@@ -6520,7 +6635,7 @@ mod tests {
 
         // The shard accepts the write again.
         let results = db.put_docs(vec![json!({"_id": lost})], true).await.unwrap();
-        assert!(results[0].get("error").is_none(), "{results:?}");
+        assert!(results[0].is_ok(), "{results:?}");
         assert_eq!(db.info().await.unwrap().doc_count, 2);
         let (rows, last_seq, _) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -6657,7 +6772,7 @@ mod tests {
             .put_docs(vec![design_doc_with_map(map)], true)
             .await
             .unwrap();
-        assert!(put[0].get("rev").is_some(), "{put:?}");
+        assert!(put[0].is_ok(), "{put:?}");
         let threads = compiled_on(map);
         assert_eq!(threads.len(), 1, "{threads:?}");
         assert!(
@@ -6681,14 +6796,14 @@ mod tests {
             .put_docs(vec![design_doc_with_map(good)], true)
             .await
             .unwrap();
-        assert!(put[0].get("rev").is_some(), "{put:?}");
+        assert!(put[0].is_ok(), "{put:?}");
 
         let bad = "function(doc){ /* order-bad */ emit(";
         let conflict = db
             .put_docs(vec![design_doc_with_map(bad)], true)
             .await
             .unwrap();
-        assert_eq!(conflict[0]["error"], "conflict", "{conflict:?}");
+        assert_eq!(conflict[0].json()["error"], "conflict", "{conflict:?}");
 
         let replicated_map = "function(doc){ /* order-replicated */ emit(1, 1); }";
         let hash = "b".repeat(32);
@@ -6700,7 +6815,7 @@ mod tests {
         });
         for _ in 0..2 {
             let out = db.put_docs(vec![replicated.clone()], false).await.unwrap();
-            assert_eq!(out[0]["ok"], true, "{out:?}");
+            assert_eq!(out[0].json()["ok"], true, "{out:?}");
         }
         assert_eq!(compiled_on(replicated_map).len(), 1);
         drop(db);
@@ -6744,7 +6859,7 @@ mod tests {
         for _ in 0..n {
             let id = uuid();
             let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
-            let rev = written[0]["rev"].as_str().unwrap().to_string();
+            let rev = written[0].json()["rev"].as_str().unwrap().to_string();
             db.purge(&json!({ id.clone(): [rev.clone()] }), 0)
                 .await
                 .unwrap();

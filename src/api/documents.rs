@@ -91,7 +91,7 @@ pub(super) async fn local_doc(req: DbRequest<'_>, id: &str) -> Response {
 /// Write one `_local` document to every copy of its shard and answer with
 /// `ok` when the write quorum acknowledged, else 202, as for any document.
 async fn write_local_doc(req: &DbRequest<'_>, doc: Value, ok: StatusCode) -> DbResult<Response> {
-    let (mut results, quorum) = commit_docs(
+    let (results, quorum) = commit_docs(
         req.st,
         req.db,
         req.name,
@@ -101,14 +101,14 @@ async fn write_local_doc(req: &DbRequest<'_>, doc: Value, ok: StatusCode) -> DbR
         req.headers,
     )
     .await?;
-    let mut result = results.pop().unwrap_or(Value::Null);
-    if result.get("error").is_some() {
-        if let Some(object) = result.as_object_mut() {
-            object.remove("id");
-        }
-        return Ok(json(doc_error_status(&result), result));
-    }
-    Ok(json(if quorum { ok } else { StatusCode::ACCEPTED }, result))
+    let result = match single_write_result(results) {
+        Ok(result) => result,
+        Err(response) => return Ok(response),
+    };
+    Ok(json_of(
+        if quorum { ok } else { StatusCode::ACCEPTED },
+        &result,
+    ))
 }
 
 pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
@@ -402,14 +402,10 @@ async fn copy_doc(
     )
     .await
     {
-        Ok((mut results, _)) => {
-            let result = results.pop().unwrap_or(Value::Null);
-            if result.get("error").is_some() {
-                json(doc_error_status(&result), result)
-            } else {
-                json(StatusCode::CREATED, result)
-            }
-        }
+        Ok((results, _)) => match results.into_iter().next_back().flatten() {
+            Some(WriteResult::Error(error)) => json_of(doc_error_status(&error), &error),
+            result => json_of(StatusCode::CREATED, &result),
+        },
         Err(error) => fail(error),
     }
 }
@@ -484,15 +480,12 @@ async fn put_doc(
     )
     .await
     {
-        Ok((mut results, quorum)) => {
-            let mut result = results.pop().unwrap_or(Value::Null);
-            if result.get("error").is_some() {
-                // Single-document endpoints, unlike `_bulk_docs`, return no id.
-                if let Some(obj) = result.as_object_mut() {
-                    obj.remove("id");
-                }
-                return json(doc_error_status(&result), result);
-            }
+        Ok((results, quorum)) => {
+            // Single-document endpoints, unlike `_bulk_docs`, return no id.
+            let result = match single_write_result(results) {
+                Ok(result) => result,
+                Err(response) => return response,
+            };
             // `batch=ok` answers 202 without a rev, as for `POST /{db}`.
             if q.get("batch").map(String::as_str) == Some("ok") {
                 return json(StatusCode::ACCEPTED, json!({"ok": true, "id": docid}));
@@ -505,12 +498,11 @@ async fn put_doc(
             } else {
                 StatusCode::ACCEPTED
             };
-            let etag = result
-                .get("rev")
-                .or_else(|| result.get("_rev"))
-                .and_then(Value::as_str)
-                .map(|rev| format!("\"{rev}\""));
-            let mut response = json(status, result);
+            let etag = match &result {
+                Some(WriteResult::Ok(ok)) => Some(format!("\"{}\"", ok.rev)),
+                _ => None,
+            };
+            let mut response = json_of(status, &result);
             if let Some(etag) = etag {
                 if let Ok(value) = etag.parse() {
                     response.headers_mut().insert(header::ETAG, value);
@@ -559,21 +551,18 @@ async fn delete_doc(
     )
     .await
     {
-        Ok((mut results, quorum)) => {
-            let mut result = results.pop().unwrap_or(Value::Null);
-            if result.get("error").is_some() {
-                if let Some(obj) = result.as_object_mut() {
-                    obj.remove("id");
-                }
-                return json(doc_error_status(&result), result);
-            }
-            json(
+        Ok((results, quorum)) => {
+            let result = match single_write_result(results) {
+                Ok(result) => result,
+                Err(response) => return response,
+            };
+            json_of(
                 if quorum {
                     StatusCode::OK
                 } else {
                     StatusCode::ACCEPTED
                 },
-                result,
+                &result,
             )
         }
         Err(e) => fail(e),

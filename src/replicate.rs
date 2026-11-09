@@ -386,7 +386,7 @@ async fn write_batch(db: &Db, received: &BTreeMap<(String, String), Value>) -> R
         .put_docs(docs, false)
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
-    if let Some(error) = applied.iter().find(|result| result.get("ok").is_none()) {
+    if let Some(error) = applied.iter().find(|result| !result.is_ok()) {
         return Err(anyhow!("replicated document was not applied: {error}"));
     }
     Ok(count)

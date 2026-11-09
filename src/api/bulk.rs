@@ -103,7 +103,7 @@ async fn write_bulk_batch(
     req: DbRequest<'_>,
     writable: Vec<Value>,
     new_edits: bool,
-) -> DbResult<(Vec<Value>, bool)> {
+) -> DbResult<(Vec<Option<WriteResult>>, bool)> {
     let DbRequest {
         st,
         db,
@@ -150,16 +150,17 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         return fail(error);
     }
     if all_or_nothing {
-        let results: Vec<Value> = docs
+        let results: Vec<WriteResult> = docs
             .iter()
             .map(|_| {
-                json!({
-                    "error": "not_implemented",
-                    "reason": "all_or_nothing is not supported"
+                WriteResult::Error(WriteError {
+                    id: None,
+                    error: "not_implemented".to_string(),
+                    reason: "all_or_nothing is not supported".to_string(),
                 })
             })
             .collect();
-        return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
+        return json_of(StatusCode::EXPECTATION_FAILED, &results);
     }
 
     let validation = match validate_bulk_batch(st, db, headers, &mut docs).await {
@@ -167,16 +168,16 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
 
-    let mut results = vec![Value::Null; docs.len()];
+    let mut results: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
     let mut slots: Vec<usize> = Vec::new();
     let mut writable: Vec<Value> = Vec::new();
     for (slot, doc) in docs.into_iter().enumerate() {
         if let Some(error) = &validation[slot] {
-            results[slot] = json!({
-                "id": doc.get("_id").cloned().unwrap_or(Value::Null),
-                "error": error.error,
-                "reason": error.reason,
-            });
+            results[slot] = Some(WriteResult::Error(WriteError {
+                id: Some(doc.get("_id").cloned().unwrap_or(Value::Null)),
+                error: error.error.to_string(),
+                reason: error.reason.clone(),
+            }));
         } else {
             slots.push(slot);
             writable.push(doc);
@@ -249,16 +250,21 @@ async fn put_on_this_node(
     docs: Vec<Value>,
     new_edits: bool,
     internal: bool,
-) -> DbResult<Vec<Value>> {
+) -> DbResult<Vec<Option<WriteResult>>> {
     if new_edits || !internal {
-        return db.put_docs(docs, new_edits).await;
+        return Ok(db
+            .put_docs(docs, new_edits)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect());
     }
     let is_local = |doc: &Value| {
         doc.get("_id")
             .and_then(Value::as_str)
             .is_some_and(|id| id.starts_with("_local/"))
     };
-    let mut results = vec![Value::Null; docs.len()];
+    let mut results: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
     let mut local_slots = Vec::new();
     let mut locals = Vec::new();
     let mut other_slots = Vec::new();
@@ -287,20 +293,23 @@ async fn put_on_this_node(
         .zip(installed)
         .chain(other_slots.into_iter().zip(written))
     {
-        results[slot] = result;
+        results[slot] = Some(result);
     }
     Ok(results)
 }
 
-fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
+/// `None` is a document no replica reported on: JSON `null`, and for a
+/// replicated write nothing to report at all.
+fn bulk_response(new_edits: bool, results: Vec<Option<WriteResult>>) -> Response {
     if new_edits {
-        json(StatusCode::CREATED, Value::Array(results))
+        json_of(StatusCode::CREATED, &results)
     } else {
-        let errors: Vec<Value> = results
+        let errors: Vec<WriteResult> = results
             .into_iter()
-            .filter(|result| result.get("error").is_some())
+            .flatten()
+            .filter(|result| !result.is_ok())
             .collect();
-        json(StatusCode::CREATED, Value::Array(errors))
+        json_of(StatusCode::CREATED, &errors)
     }
 }
 
