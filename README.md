@@ -349,14 +349,14 @@ Behaviour and limits:
 ## Changes feeds
 
 `GET /{db}/_changes` has four feed formats. All of them accept `since` (`0`,
-`now`, or an opaque cluster version vector), `limit`, `include_docs`,
+`now`, or an opaque sequence token), `limit`, `include_docs`,
 `style=all_docs` and `filter=_doc_ids`. Longpoll, continuous and eventsource
 also accept `heartbeat` and `timeout` in milliseconds, capped at five minutes.
 
 **`feed=normal`** (default) returns one JSON object:
 
 ```json
-{"results": [...], "last_seq": 42, "pending": 0}
+{"results": [...], "last_seq": "42-g1AAAA...", "pending": 0}
 ```
 
 **`feed=longpoll`** holds the request until changes appear or the timeout
@@ -391,14 +391,21 @@ changes.onmessage = (event) => {
 ```
 
 `EventSource` cannot set an `Authorization` header: use a same-origin
-`_session` cookie, or put a proxy in front. The eventsource feed does not
-implement `Last-Event-ID` resume; reconnect with an explicit `since` value
-(the previous `last_seq` or change `seq`).
+`_session` cookie, or put a proxy in front. Every event ends with an
+`id: <seq>` line, and a reconnecting client's `Last-Event-ID` header (or a
+`last-event-id` parameter) resumes the feed from that sequence, as in CouchDB.
 
 `_db_updates` also supports `feed=normal`, `longpoll` and `continuous`, but not
-the eventsource format. On a cluster, `since` and `last_seq` are opaque
-`v1:` comma-separated version vectors (the decoder still accepts legacy
-base64url tokens); treat them as opaque and do not parse them client-side.
+the eventsource format.
+
+As in CouchDB 3, which is a cluster even on one node, every sequence douchdb
+sends (`update_seq` and `purge_seq` in `GET /{db}` and `_dbs_info`,
+`update_seq=true` on `_all_docs`, `_design_docs` and views, and `_changes`
+`seq` and `last_seq`) is an opaque `<sum>-<base64url>` string, standalone or
+clustered. Treat it as opaque and do not parse it client-side. `since` takes
+`0`, `now` or such a token; any other plain integer, or a quoted `"0"`, is
+rejected with 400 `Malformed sequence supplied in 'since' parameter.`, as
+CouchDB does (`validate_start_seq` in fabric_view_changes.erl).
 
 ## Web console
 
@@ -605,9 +612,9 @@ router; there is no coordinator role.
   node needs them to evaluate views over its local shards.
 - Database creation and deletion are broadcast to all configured nodes; design
   documents are replicated to every node so views can run against any shard.
-- `_changes` and `GET /db` return a `v1:` comma-separated version vector for
-  `since` / `update_seq` (legacy base64url tokens are still accepted), so a
-  client that saw a partial fan-out resumes without skipping changes.
+- `_changes` and `GET /db` return a version vector, wrapped as an opaque
+  `<sum>-<base64url>` token, for `since` / `update_seq`, so a client that saw
+  a partial fan-out resumes without skipping changes.
 
 All nodes must use identical `--nodes`, `--q`, `--n`, `--cluster-secret` and
 `--admin` credentials. The cluster secret authenticates internal routing headers,
@@ -685,6 +692,10 @@ served per protocol under `http.internal_requests` in
   cleanup return `409 rebalance_in_progress` while a migration owns the
   database. It is still an operator action built on static membership, not an
   online membership protocol.
+- **`_local` documents follow their shard on a placement change.** Anti-entropy
+  skips them (as CouchDB's does), so a rebalance or a direct placement `PUT`
+  copies them to the gaining owners from the old copies that answer, highest
+  `0-N` revision winning; CouchDB itself does not move user `_local` documents.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,

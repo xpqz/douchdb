@@ -2356,9 +2356,7 @@ impl Db {
         }
     }
 
-    pub(crate) fn change_row_json(row: &ChangeRow) -> String {
-        use std::fmt::Write as _;
-
+    pub(crate) fn change_row_json(row: &ChangeRow, seq: &str) -> String {
         fn push_json_string(out: &mut String, value: &str) {
             if value
                 .bytes()
@@ -2374,7 +2372,7 @@ impl Db {
 
         let mut out = String::with_capacity(128);
         out.push_str("{\"seq\":");
-        let _ = write!(out, "{}", row.seq);
+        out.push_str(seq);
         out.push_str(",\"id\":");
         push_json_string(&mut out, &row.id);
         out.push_str(",\"changes\":[");
@@ -2778,7 +2776,7 @@ impl Db {
                         s,
                         &info.id,
                         &info.revs,
-                        Some(&info.uuid),
+                        PurgeSource::Replayed(&info.uuid),
                         &peers,
                         &seq_counter,
                         &reserved,
@@ -2829,22 +2827,34 @@ impl Db {
     }
 
     /// Purge on this node, which is replica `me`.
-    pub async fn purge(&self, body: &Value, me: usize) -> DbResult<Value> {
-        let result = self.purge_docs(body, me).await;
+    /// Purge on this node, which is replica `me`, recording each document's purge under the uuid in
+    /// `uuids` when it has one. The coordinator of a cluster purge picks them,
+    /// so every copy of a shard holds the same purge info.
+    pub async fn purge(
+        &self,
+        body: &Value,
+        me: usize,
+        uuids: &std::collections::BTreeMap<String, String>,
+    ) -> DbResult<Value> {
+        let result = self.purge_docs(body, me, uuids).await;
         // A purge can remove a design document without taking a sequence.
         self.forget_design_docs();
         result
     }
 
-    async fn purge_docs(&self, body: &Value, me: usize) -> DbResult<Value> {
+    async fn purge_docs(
+        &self,
+        body: &Value,
+        me: usize,
+        uuids: &std::collections::BTreeMap<String, String>,
+    ) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
         // One round trip per shard, the shards in parallel, instead of one
         // per document.
         let mut ids = Vec::new();
-        let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
-            (0..self.q).map(|_| Vec::new()).collect();
+        let mut grouped: Vec<Vec<PurgeJob>> = (0..self.q).map(|_| Vec::new()).collect();
         for (id, revs) in map {
             let Some(list) = revs.as_array() else {
                 continue;
@@ -2853,7 +2863,12 @@ impl Db {
                 .iter()
                 .filter_map(|r| r.as_str().map(str::to_string))
                 .collect();
-            grouped[self.shard_index(id)].push((ids.len(), id.clone(), requested));
+            grouped[self.shard_index(id)].push((
+                ids.len(),
+                id.clone(),
+                requested,
+                uuids.get(id).cloned(),
+            ));
             ids.push(id);
         }
         // Purging a document that survives takes a new sequence, so the
@@ -2871,9 +2886,20 @@ impl Db {
                     .call(move |s| {
                         batch
                             .into_iter()
-                            .map(|(slot, id, requested)| {
-                                purge_one(s, &id, &requested, None, &peers, &seq_counter, &reserved)
-                                    .map(|removed| (slot, removed))
+                            .map(|(slot, id, requested, assigned)| {
+                                let source = assigned
+                                    .as_deref()
+                                    .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
+                                purge_one(
+                                    s,
+                                    &id,
+                                    &requested,
+                                    source,
+                                    &peers,
+                                    &seq_counter,
+                                    &reserved,
+                                )
+                                .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
                     })
@@ -2982,18 +3008,82 @@ fn revs_diff_one(
     Ok((missing, ancestors))
 }
 
+/// The body a coordinator sends a peer's `_purge`: each document's revisions
+/// as `{"uuid": .., "revs": [..]}`, so the peer records the coordinator's uuid.
+pub fn with_purge_uuids(body: &Value, uuids: &std::collections::BTreeMap<String, String>) -> Value {
+    let mut out = Map::new();
+    for (id, revs) in body.as_object().into_iter().flatten() {
+        out.insert(
+            id.clone(),
+            match uuids.get(id) {
+                Some(uuid) => json!({"uuid": uuid, "revs": revs}),
+                None => revs.clone(),
+            },
+        );
+    }
+    Value::Object(out)
+}
+
+/// The inverse of `with_purge_uuids`, for a request from a peer: the plain
+/// `{id: [revs]}` body and the uuids it carried.
+pub fn split_purge_uuids(body: &Value) -> (Value, std::collections::BTreeMap<String, String>) {
+    let mut plain = Map::new();
+    let mut uuids = std::collections::BTreeMap::new();
+    for (id, entry) in body.as_object().into_iter().flatten() {
+        match entry.as_object() {
+            Some(carried) => {
+                if let Some(uuid) = carried.get("uuid").and_then(Value::as_str) {
+                    uuids.insert(id.clone(), uuid.to_string());
+                }
+                let revs = carried.get("revs").cloned().unwrap_or(Value::Null);
+                plain.insert(id.clone(), revs);
+            }
+            None => {
+                plain.insert(id.clone(), entry.clone());
+            }
+        }
+    }
+    (Value::Object(plain), uuids)
+}
+
+/// One document's purge on a shard: its slot in the request, id, requested
+/// revisions and the uuid the coordinator assigned.
+type PurgeJob = (usize, String, Vec<String>, Option<String>);
+
+/// Where a purge came from, which decides the uuid of its purge info.
+#[derive(Clone, Copy)]
+enum PurgeSource<'a> {
+    /// A client purge with no uuid given: a new one is made.
+    Fresh,
+    /// A client purge the coordinator gave this uuid.
+    Assigned(&'a str),
+    /// A purge info another copy recorded.
+    Replayed(&'a str),
+}
+
+impl<'a> PurgeSource<'a> {
+    fn uuid(self) -> Option<&'a str> {
+        match self {
+            PurgeSource::Fresh => None,
+            PurgeSource::Assigned(uuid) | PurgeSource::Replayed(uuid) => Some(uuid),
+        }
+    }
+}
+
 /// Purge the requested leaf revisions of one document; the revisions removed.
 ///
 /// The purge is recorded as a purge info in the same transaction. A fresh
 /// purge records the revisions it removed, under a new uuid, and nothing when
 /// it removed none. A `replayed` uuid is a purge another copy of the shard
 /// already recorded: it is recorded here as received, even when this copy
-/// holds none of the revisions, so they cannot be copied back in.
+/// holds none of the revisions, so they cannot be copied back in. An
+/// `Assigned` uuid is a fresh purge whose uuid the coordinator chose, so every
+/// copy records the same one (fabric_doc_purge.erl).
 fn purge_one(
     s: &mut crate::store::Shard,
     id: &str,
     requested: &[String],
-    replayed: Option<&str>,
+    source: PurgeSource<'_>,
     peers: &[usize],
     seq_counter: &AtomicU64,
     reserved: &AtomicU64,
@@ -3009,7 +3099,7 @@ fn purge_one(
             // The revisions cannot be checked against unreadable metadata, so
             // the document goes whole; this is the repair path for it.
             let info = PurgeInfo {
-                uuid: replayed.map_or_else(uuid, str::to_string),
+                uuid: source.uuid().map_or_else(uuid, str::to_string),
                 id: id.to_string(),
                 revs: requested.to_vec(),
             };
@@ -3020,7 +3110,7 @@ fn purge_one(
         Err(error) => return Err(error.into()),
     };
     let Some(mut meta) = meta else {
-        if let Some(uuid) = replayed {
+        if let PurgeSource::Replayed(uuid) = source {
             let info = PurgeInfo {
                 uuid: uuid.to_string(),
                 id: id.to_string(),
@@ -3046,15 +3136,15 @@ fn purge_one(
         }
         removed.push(rev.clone());
     }
-    if replayed.is_some() || !removed.is_empty() {
-        let info = match replayed {
-            Some(uuid) => PurgeInfo {
+    if matches!(source, PurgeSource::Replayed(_)) || !removed.is_empty() {
+        let info = match source {
+            PurgeSource::Replayed(uuid) => PurgeInfo {
                 uuid: uuid.to_string(),
                 id: id.to_string(),
                 revs: requested.to_vec(),
             },
-            None => PurgeInfo {
-                uuid: uuid(),
+            PurgeSource::Assigned(_) | PurgeSource::Fresh => PurgeInfo {
+                uuid: source.uuid().map_or_else(uuid, str::to_string),
                 id: id.to_string(),
                 revs: removed.clone(),
             },
@@ -6613,7 +6703,10 @@ mod tests {
                 json!([written[position].json()["rev"], "9-nope"]),
             );
         }
-        let purged = db.purge(&Value::Object(purge), 0).await.unwrap();
+        let purged = db
+            .purge(&Value::Object(purge), 0, &Default::default())
+            .await
+            .unwrap();
         for (position, id) in ids.iter().enumerate().take(6) {
             assert_eq!(
                 purged["purged"][id],
@@ -7067,7 +7160,10 @@ mod tests {
         assert!(reason.contains("_purge"), "{reason}");
 
         let listed = "9-ffffffffffffffffffffffffffffffff";
-        let purged = db.purge(&json!({"bad": [listed]}), 0).await.unwrap();
+        let purged = db
+            .purge(&json!({"bad": [listed]}), 0, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(purged["purged"]["bad"], json!([listed]));
         assert_eq!(db.purge_seq().await.unwrap(), 1);
         assert!(!body_exists(&db, "bad", &rev).await);
@@ -7125,9 +7221,13 @@ mod tests {
             let id = uuid();
             let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
             let rev = written[0].json()["rev"].as_str().unwrap().to_string();
-            db.purge(&json!({ id.clone(): [rev.clone()] }), 0)
-                .await
-                .unwrap();
+            db.purge(
+                &json!({ id.clone(): [rev.clone()] }),
+                0,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
             revs.insert((id, rev));
         }
         revs

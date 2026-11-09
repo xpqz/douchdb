@@ -190,11 +190,15 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
     }
     match db.info().await {
         Ok(info) => {
-            // In a cluster the update_seq is the same version vector
-            // the changes feed returns, so clients that use it as
-            // `since` do not skip another node's changes.
-            if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
-                let (seq, purge_seq) = match cluster_seq_tokens(ClusterRead {
+            if st.ctx.cluster.is_internal(headers) {
+                return json_of(StatusCode::OK, &info);
+            }
+            // The sequences are opaque tokens, as in CouchDB 3. In a cluster
+            // they are the same version vectors the changes feed returns, so
+            // clients that use them as `since` do not skip another node's
+            // changes.
+            let (seq, purge_seq) = if st.ctx.cluster.is_clustered() {
+                match cluster_seq_tokens(ClusterRead {
                     ctx: &st.ctx,
                     db,
                     dbname: name,
@@ -204,17 +208,17 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                 {
                     Ok(tokens) => tokens,
                     Err(e) => return fail(e),
-                };
-                let mut info = match serde_json::to_value(&info) {
-                    Ok(info) => info,
-                    Err(e) => return fail(ApiError::internal(e)),
-                };
-                info["update_seq"] = json!(seq);
-                info["committed_update_seq"] = json!(seq);
-                info["purge_seq"] = json!(purge_seq);
-                return json(StatusCode::OK, info);
+                }
+            } else {
+                (
+                    encode_local_seq(&st.ctx.cluster, info.update_seq),
+                    encode_local_seq(&st.ctx.cluster, info.purge_seq),
+                )
+            };
+            match info_json(&info, &seq, &purge_seq) {
+                Ok(info) => json(StatusCode::OK, info),
+                Err(e) => fail(e),
             }
-            json_of(StatusCode::OK, &info)
         }
         Err(e) => fail(e),
     }
@@ -572,7 +576,13 @@ async fn purge(req: DbRequest<'_>) -> Response {
     };
     let response =
         if !req.st.ctx.cluster.is_clustered() || req.st.ctx.cluster.is_internal(req.headers) {
-            match req.db.purge(&request, req.st.ctx.cluster.me).await {
+            // A peer's request carries the uuid the coordinator chose.
+            let (request, uuids) = if req.st.ctx.cluster.is_internal(req.headers) {
+                crate::db::split_purge_uuids(&request)
+            } else {
+                (request, Default::default())
+            };
+            match req.db.purge(&request, req.st.ctx.cluster.me, &uuids).await {
                 Ok(purged) => json(StatusCode::CREATED, purged),
                 Err(e) => return fail(e),
             }

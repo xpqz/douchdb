@@ -297,7 +297,8 @@ fn parse_shard_mask(raw: &str, q: u32) -> Option<ShardMask> {
 
 /// The `update_seq` a query reports with `update_seq=true`. In a cluster it is
 /// the opaque vector `GET /db` reports, so it works as a `_changes` since;
-/// otherwise it is this node's sequence, as `GET /db` reports it.
+/// otherwise it is this node's sequence as an opaque token, as `GET /db`
+/// reports it.
 async fn query_update_seq(
     st: &AppState,
     db: &Arc<Db>,
@@ -314,7 +315,22 @@ async fn query_update_seq(
         .await?;
         return Ok(json!(seq));
     }
-    Ok(json!(db.update_seq()))
+    Ok(json!(encode_local_seq(&st.ctx.cluster, db.update_seq())))
+}
+
+/// The body of `GET /{db}` and the `info` of `_dbs_info`: the database's
+/// counts and sizes with its sequences as the opaque tokens CouchDB sends,
+/// not the plain numbers the shards keep.
+pub(crate) fn info_json(
+    info: &crate::db::DbInfo,
+    update_seq: &str,
+    purge_seq: &str,
+) -> DbResult<Value> {
+    let mut info = serde_json::to_value(info).map_err(ApiError::internal)?;
+    info["update_seq"] = json!(update_seq);
+    info["committed_update_seq"] = json!(update_seq);
+    info["purge_seq"] = json!(purge_seq);
+    Ok(info)
 }
 
 /// CouchDB carries keys as JSON values (`startkey="foo"`), so unquote them.

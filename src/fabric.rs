@@ -739,6 +739,12 @@ pub(crate) async fn purge_docs(
     let ctx = &st.ctx;
     let mut groups: HashMap<usize, serde_json::Map<String, Value>> = HashMap::new();
     let mut copies: Vec<usize> = Vec::new();
+    // One uuid per document, shared by every copy, so the copies hold the same
+    // purge info and anti-entropy has nothing to replay (fabric_doc_purge.erl).
+    let uuids: BTreeMap<String, String> = request
+        .keys()
+        .map(|id| (id.clone(), crate::util::uuid()))
+        .collect();
     for (id, revs) in request {
         let (_, replicas) = db.placement_of_doc(id);
         copies.push(replicas.len());
@@ -751,15 +757,17 @@ pub(crate) async fn purge_docs(
     }
     crate::telemetry::record_fanout(groups.len() as u64);
 
+    let uuids = &uuids;
     let replies = crate::cluster_http::in_one_round(join_all(groups.into_iter().map(
         |(node, sub)| async move {
             let body = Value::Object(sub);
             let reply = if node == ctx.cluster.me {
-                db.purge(&body, ctx.cluster.me).await
+                db.purge(&body, ctx.cluster.me, uuids).await
             } else {
                 match ctx.cluster.nodes.get(node) {
                     Some(peer) => {
-                        forward_json(ctx, peer, dbname, "_purge", "", &body, headers).await
+                        let sent = crate::db::with_purge_uuids(&body, uuids);
+                        forward_json(ctx, peer, dbname, "_purge", "", &sent, headers).await
                     }
                     None => Err(nodedown()),
                 }
@@ -1721,10 +1729,10 @@ async fn fetch_remote_docs(
 /// carries them, and it must not: a local delete leaves no tombstone, so a
 /// pull would bring a deleted document back.
 ///
-/// Writes are frozen, so each old copy is read once, the newest revision of
-/// each document wins, and the copy is installed with its revision as is. A
-/// failure leaves the active map untouched; the caller abandons the
-/// migration.
+/// Each old copy is read once; one that cannot be reached is skipped while
+/// another copy of its shards answered. The newest revision of each document
+/// wins and the copy is installed with its revision as is. A failure leaves
+/// the active map untouched; the caller abandons the migration.
 pub(crate) async fn copy_local_docs(
     read: ClusterRead<'_>,
     old_map: &crate::cluster::ShardMap,
@@ -1737,7 +1745,7 @@ pub(crate) async fn copy_local_docs(
         headers,
     } = read;
     let mut gained: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut sources: HashMap<usize, ShardMask> = HashMap::new();
+    let mut sources: BTreeMap<usize, ShardMask> = BTreeMap::new();
     for shard in 0..db.q {
         let old = old_map.replicas_of(shard);
         let new: Vec<usize> = map
@@ -1776,21 +1784,40 @@ pub(crate) async fn copy_local_docs(
         }),
     )))
     .await;
-    let mut newest: BTreeMap<String, Value> = BTreeMap::new();
-    for listing in listings {
-        for row in listing?.rows {
-            let Some(doc) = row.doc else {
-                continue;
-            };
-            let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
-                continue;
-            };
-            let current = newest.get(&id).map_or(0, local_rev_number);
-            if !newest.contains_key(&id) || local_rev_number(&doc) > current {
-                newest.insert(id, doc);
+    // An old copy that does not answer is skipped while another copy of each
+    // of its shards does: copies of a shard hold the same local documents, bar
+    // a write that reached only some of them, which the highest revision
+    // settles. Only a gained shard no old copy answered for fails.
+    let mut answered: Vec<DocList> = Vec::new();
+    let mut answering: Vec<usize> = Vec::new();
+    let mut first_error = None;
+    for ((node, _), listing) in sources.iter().zip(listings) {
+        match listing {
+            Ok(listing) => {
+                answering.push(*node);
+                answered.push(listing);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
             }
         }
     }
+    for shard in gained.keys() {
+        let covered = old_map
+            .replicas_of(*shard as u32)
+            .iter()
+            .any(|node| answering.contains(node));
+        if !covered {
+            return Err(first_error.unwrap_or_else(|| {
+                ApiError::new(
+                    502,
+                    "rebalance_failed",
+                    "no old copy of a shard answered for its _local documents",
+                )
+            }));
+        }
+    }
+    let newest = newest_local_docs(answered);
 
     let mut per_node: HashMap<usize, Vec<Value>> = HashMap::new();
     for (id, doc) in newest {
@@ -1829,6 +1856,27 @@ pub(crate) async fn copy_local_docs(
         }
     }
     Ok(())
+}
+
+/// The newest revision of each `_local` document across the listings, which
+/// are taken in order: of equal revisions the earlier listing's copy stays.
+fn newest_local_docs(listings: Vec<DocList>) -> BTreeMap<String, Value> {
+    let mut newest: BTreeMap<String, Value> = BTreeMap::new();
+    for listing in listings {
+        for row in listing.rows {
+            let Some(doc) = row.doc else {
+                continue;
+            };
+            let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let current = newest.get(&id).map_or(0, local_rev_number);
+            if !newest.contains_key(&id) || local_rev_number(&doc) > current {
+                newest.insert(id, doc);
+            }
+        }
+    }
+    newest
 }
 
 /// The number of a `0-N` local revision, 0 for anything else.
@@ -2929,39 +2977,80 @@ pub(crate) fn encode_since(vector: &[u64]) -> String {
     encode_token(vector, &[])
 }
 
-/// A since token: the per-node vector, then `~node:shard.shard:seq` for each
-/// fallback mark.
+/// The sequence a standalone or local read reports: this node's `seq` in its
+/// slot of a vector, in the same opaque form a cluster feed uses.
+pub(crate) fn encode_local_seq(cluster: &crate::cluster::Cluster, seq: u64) -> String {
+    let mut vector = vec![0; cluster.nodes.len().max(1)];
+    if let Some(slot) = vector.get_mut(cluster.me) {
+        *slot = seq;
+    }
+    encode_since(&vector)
+}
+
+/// A sequence token as CouchDB writes one (`pack_seqs` in
+/// fabric_view_changes.erl): `<sum>-<base64url>`. The sum is only a hint for
+/// people; the opaque part is the per-node vector (`v1:` and the node
+/// sequences, comma separated), then `~node:shard.shard:seq` for each fallback
+/// mark.
 pub(crate) fn encode_token(vector: &[u64], marks: &[FallbackMark]) -> String {
+    use base64::Engine as _;
     use std::fmt::Write as _;
 
-    // This runs once per change row in a cluster feed. The old form was
-    // base64(JSON) and allocated a map plus a base64 buffer for every row.
-    // `v1:` is an opaque token to clients.
-    let mut out = String::with_capacity(3 + vector.len() * 12);
-    out.push_str("v1:");
+    // This runs once per change row in a feed, so it builds the body in one
+    // buffer.
+    let mut body = String::with_capacity(3 + vector.len() * 12);
+    body.push_str("v1:");
+    let mut sum = 0u64;
     for (index, seq) in vector.iter().enumerate() {
         if index > 0 {
-            out.push(',');
+            body.push(',');
         }
-        let _ = write!(out, "{seq}");
+        let _ = write!(body, "{seq}");
+        if *seq != UNKNOWN_SEQ {
+            sum = sum.saturating_add(*seq);
+        }
     }
     for mark in marks {
-        let _ = write!(out, "~{}:", mark.node);
+        let _ = write!(body, "~{}:", mark.node);
         for (index, shard) in mark.shards.iter().enumerate() {
             if index > 0 {
-                out.push('.');
+                body.push('.');
             }
-            let _ = write!(out, "{shard}");
+            let _ = write!(body, "{shard}");
         }
-        let _ = write!(out, ":{}", mark.seq);
+        let _ = write!(body, ":{}", mark.seq);
+        sum = sum.saturating_add(mark.seq);
     }
+    let mut out = String::with_capacity(24 + body.len() * 4 / 3);
+    let _ = write!(out, "{sum}-");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_string(body.as_bytes(), &mut out);
     out
 }
 
-/// The fallback marks of a `v1:` since token; malformed or out-of-cluster
+/// The text inside a token: what CouchDB's `unpack_seq_regex_match` keeps
+/// (surrounding quotes and the `<sum>-` prefix dropped), decoded. `None` for
+/// anything that is not one of our tokens.
+fn token_body(raw: &str) -> Option<String> {
+    use base64::Engine as _;
+
+    let raw = raw.trim_matches('"');
+    let opaque = match raw.split_once('-') {
+        Some((sum, rest)) if !sum.is_empty() && sum.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => raw,
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(opaque)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The fallback marks of a since token; malformed or out-of-cluster
 /// marks are dropped, which only makes that fallback start from the beginning.
 pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
-    let Some(rest) = raw.trim_matches('"').strip_prefix("v1:") else {
+    let Some(body) = token_body(raw) else {
+        return Vec::new();
+    };
+    let Some(rest) = body.strip_prefix("v1:") else {
         return Vec::new();
     };
     rest.split('~')
@@ -2984,10 +3073,11 @@ pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
         .collect()
 }
 
-/// Decodes a `v1:` since token into its per-node sequence vector. Anything
-/// else is not one of ours (`None`).
+/// Decodes a since token into its per-node sequence vector. Anything else is
+/// not one of ours (`None`).
 pub(crate) fn decode_since(raw: &str) -> Option<Vec<u64>> {
-    let rest = raw.trim_matches('"').strip_prefix("v1:")?;
+    let body = token_body(raw)?;
+    let rest = body.strip_prefix("v1:")?;
     let rest = rest.split('~').next().unwrap_or(rest);
     rest.split(',').map(|part| part.parse().ok()).collect()
 }
@@ -3269,6 +3359,40 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn listing(docs: &[Value]) -> DocList {
+        let rows = docs
+            .iter()
+            .map(|doc| {
+                json!({"id": doc["_id"], "key": doc["_id"], "value": {"rev": doc["_rev"]}, "doc": doc})
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({"total_rows": null, "offset": null, "rows": rows}))
+            .expect("listing")
+    }
+
+    #[test]
+    fn newest_local_docs_takes_the_highest_rev_and_the_earlier_on_a_tie() {
+        let first = listing(&[
+            json!({"_id": "_local/a", "_rev": "0-2", "v": "first"}),
+            json!({"_id": "_local/b", "_rev": "0-3", "v": "first"}),
+            json!({"_id": "_local/c", "_rev": "bogus", "v": "first"}),
+        ]);
+        let second = listing(&[
+            json!({"_id": "_local/a", "_rev": "0-10", "v": "second"}),
+            json!({"_id": "_local/b", "_rev": "0-3", "v": "second"}),
+            json!({"_id": "_local/c", "_rev": "0-1", "v": "second"}),
+            json!({"_id": "_local/d", "_rev": "1-abc", "v": "second"}),
+        ]);
+        let newest = newest_local_docs(vec![first, second]);
+        assert_eq!(newest["_local/a"]["v"], "second", "0-10 beats 0-2");
+        assert_eq!(newest["_local/b"]["v"], "first", "a tie keeps the earlier");
+        assert_eq!(
+            newest["_local/c"]["v"], "second",
+            "a number beats a bad rev"
+        );
+        assert_eq!(newest["_local/d"]["v"], "second", "a bad rev alone is kept");
+    }
+
     /// A one-shot HTTP peer that answers every request with `status`.
     fn peer_answering(status: u16) -> String {
         use std::io::{Read, Write};
@@ -3501,11 +3625,18 @@ mod tests {
             seq: 42,
         }];
         let token = encode_token(&[5, 0, 7], &marks);
-        assert_eq!(token, "v1:5,0,7~1:0.3:42");
+        // CouchDB's shape: the sum of the sequences, then base64url.
+        let (sum, opaque) = token.split_once('-').unwrap();
+        assert_eq!(sum, "54");
+        assert!(opaque
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert_eq!(decode_since(&format!("\"{token}\"")), Some(vec![5, 0, 7]));
         assert_eq!(decode_since(&token), Some(vec![5, 0, 7]));
         assert_eq!(decode_fallbacks(&token, 3), marks);
         assert!(decode_fallbacks(&token, 1).is_empty());
-        assert!(decode_fallbacks("v1:5,0,7~x:1:2", 3).is_empty());
+        assert!(decode_fallbacks("v1:5,0,7~1:0.3:42", 3).is_empty());
+        assert_eq!(decode_since("v1:5,0,7"), None);
         assert!(decode_fallbacks("7", 3).is_empty());
     }
 

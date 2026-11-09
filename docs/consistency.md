@@ -59,9 +59,11 @@ where behaviour is best-effort, it says so.
 
 - The normal feed returns one row per document at that document's latest
   revision. It does not emit one row for every historical sequence entry.
-- `since` accepts `0`, `now`, a numeric sequence, or an opaque cluster version
-  vector. Cluster cursors are version vectors so a partial fan-out resumes
-  without skipping a document.
+- `since` accepts `0`, `now` or an opaque `<sum>-<base64url>` token, as
+  CouchDB does; another plain integer is a 400. Every sequence douchdb reports
+  is such a token. In a cluster it holds a version vector so a partial fan-out
+  resumes without skipping a document; standalone it holds the node's one
+  sequence.
 - `limit` counts documents. `descending=true` returns newest documents first
   and, as in CouchDB 3.5, ignores `since`.
 - `pending` is the number of documents after `last_seq` in the requested

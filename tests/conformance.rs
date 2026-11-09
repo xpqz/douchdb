@@ -557,7 +557,7 @@ async fn welcome_and_database_lifecycle() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["db_name"], "lifecycle");
     assert_eq!(body["doc_count"], 0);
-    assert!(body["update_seq"].is_number());
+    assert!(is_couch_seq(&body["update_seq"]), "{body}");
 
     let (status, body) = s.put("/lifecycle", json!({})).await;
     assert_eq!(status, StatusCode::PRECONDITION_FAILED);
@@ -1574,6 +1574,288 @@ async fn internal_consistency_after_concurrent_writes() {
     }
 }
 
+/// CouchDB 3 sends every sequence as `<sum>-<base64url>` (`pack_seqs` in
+/// fabric_view_changes.erl), a standalone node included.
+fn is_couch_seq(value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    match text.split_once('-') {
+        Some((sum, opaque)) => {
+            !sum.is_empty()
+                && sum.bytes().all(|b| b.is_ascii_digit())
+                && !opaque.is_empty()
+                && opaque
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
+        None => false,
+    }
+}
+
+/// The token a node reports for these per-node sequences (`pack_seqs` in
+/// CouchDB): `<sum>-<base64url>` over douchdb's own body.
+fn seq_token(seqs: &[u64]) -> String {
+    use base64::Engine as _;
+    let list: Vec<String> = seqs.iter().map(u64::to_string).collect();
+    let body = format!("v1:{}", list.join(","));
+    format!(
+        "{}-{}",
+        seqs.iter().sum::<u64>(),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+    )
+}
+
+/// The per-node sequences inside a token from `seq_token`.
+fn seq_vector(token: &str) -> Vec<u64> {
+    use base64::Engine as _;
+    let body = token
+        .split_once('-')
+        .and_then(|(_, opaque)| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(opaque)
+                .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    body.strip_prefix("v1:")
+        .unwrap_or_default()
+        .split('~')
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|seq| seq.parse().ok())
+        .collect()
+}
+
+fn feed_ids(body: &Value) -> Vec<String> {
+    body["results"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn standalone_sequences_are_opaque_strings_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("opaque").await;
+    s.put(
+        "/opaque/_design/d",
+        json!({"views": {"v": {"map": "function(doc) { emit(doc._id, 1); }"}}}),
+    )
+    .await;
+    for id in ["a", "b", "c"] {
+        let (status, _) = s.put(&format!("/opaque/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (_, info) = s.get("/opaque").await;
+    for field in ["update_seq", "purge_seq"] {
+        assert!(is_couch_seq(&info[field]), "{field}: {info}");
+    }
+    for path in [
+        "/opaque/_all_docs?update_seq=true",
+        "/opaque/_design_docs?update_seq=true",
+        "/opaque/_design/d/_view/v?update_seq=true",
+    ] {
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(is_couch_seq(&body["update_seq"]), "{path}: {body}");
+    }
+    let (_, dbs_info) = s.post("/_dbs_info", json!({"keys": ["opaque"]})).await;
+    assert!(
+        is_couch_seq(&dbs_info[0]["info"]["update_seq"]),
+        "{dbs_info}"
+    );
+
+    // Every feed mode reports opaque row seqs and a last_seq of that shape.
+    let (_, normal) = s.get("/opaque/_changes").await;
+    assert_eq!(normal["results"].as_array().unwrap().len(), 4, "{normal}");
+    for row in normal["results"].as_array().unwrap() {
+        assert!(is_couch_seq(&row["seq"]), "{normal}");
+    }
+    assert!(is_couch_seq(&normal["last_seq"]), "{normal}");
+    for query in [
+        "limit=0",
+        "descending=true",
+        "include_docs=true",
+        "style=all_docs&limit=2",
+        "filter=_doc_ids&doc_ids=%5B%22a%22%5D",
+        "feed=longpoll",
+        "since=now",
+    ] {
+        let (status, body) = s.get(&format!("/opaque/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert!(is_couch_seq(&body["last_seq"]), "{query}: {body}");
+        for row in body["results"].as_array().unwrap() {
+            assert!(is_couch_seq(&row["seq"]), "{query}: {body}");
+        }
+    }
+    let text = s
+        .client
+        .get(format!(
+            "{}/opaque/_changes?feed=continuous&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5, "{text}");
+    for line in &lines[..4] {
+        assert!(is_couch_seq(&line["seq"]), "{text}");
+    }
+    assert!(is_couch_seq(&lines[4]["last_seq"]), "{text}");
+
+    // The sequence GET /db reports is a usable `since`, and so is the feed's
+    // own last_seq: nothing is replayed.
+    for since in [
+        info["update_seq"].as_str().unwrap_or_default().to_string(),
+        normal["last_seq"].as_str().unwrap_or_default().to_string(),
+    ] {
+        let (status, body) = s.get(&format!("/opaque/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(feed_ids(&body).is_empty(), "replayed: {body}");
+    }
+}
+
+// CouchDB (`validate_start_seq`, fabric_view_changes.erl) takes `since` as
+// 0, "now" or an opaque token and rejects any other plain integer.
+#[tokio::test]
+async fn changes_since_accepts_what_couchdb_accepts() {
+    let s = Server::start(false);
+    s.fresh_db("sincekinds").await;
+    for id in ["a", "b"] {
+        s.put(&format!("/sincekinds/{id}"), json!({})).await;
+    }
+    for since in ["0", "now"] {
+        let (status, body) = s.get(&format!("/sincekinds/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::OK, "{since}: {body}");
+        let want = if since == "now" { 0 } else { 2 };
+        assert_eq!(feed_ids(&body).len(), want, "{since}: {body}");
+    }
+    for since in ["1", "2", "99", "%220%22", "%221%22", "abc", "5-abc", ""] {
+        let (status, body) = s.get(&format!("/sincekinds/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{since}: {body}");
+        assert_eq!(
+            body["reason"], "Malformed sequence supplied in 'since' parameter.",
+            "{since}"
+        );
+    }
+    // A quoted token is read like a bare one (eventsource ids are JSON).
+    let (_, page) = s.get("/sincekinds/_changes?limit=1").await;
+    let quoted = format!("%22{}%22", page["last_seq"].as_str().unwrap_or_default());
+    let (status, body) = s.get(&format!("/sincekinds/_changes?since={quoted}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(feed_ids(&body).len(), 1, "{body}");
+}
+
+#[tokio::test]
+async fn standalone_changes_resume_exactly_from_last_seq_across_a_restart() {
+    let mut s = Server::start(false);
+    s.fresh_db("resume").await;
+    let ids: Vec<String> = (0..7).map(|i| format!("d{i}")).collect();
+    for id in &ids[..5] {
+        s.put(&format!("/resume/{id}"), json!({})).await;
+    }
+
+    // Page through two rows at a time, restarting in the middle.
+    let mut seen = Vec::new();
+    let mut since = "0".to_string();
+    for round in 0..2 {
+        let (status, body) = s
+            .get(&format!("/resume/_changes?since={since}&limit=2"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(is_couch_seq(&body["last_seq"]), "{body}");
+        seen.extend(feed_ids(&body));
+        since = body["last_seq"].as_str().unwrap_or_default().to_string();
+        if round == 0 {
+            s.kill();
+            s.restart();
+        }
+    }
+    assert_eq!(seen, &ids[..4], "no change missed or repeated");
+
+    // The token outlives the process: new writes land after it, in order.
+    s.kill();
+    s.restart();
+    for id in &ids[5..] {
+        s.put(&format!("/resume/{id}"), json!({})).await;
+    }
+    let (_, body) = s.get(&format!("/resume/_changes?since={since}")).await;
+    assert_eq!(feed_ids(&body), &ids[4..], "{body}");
+    let (_, info) = s.get("/resume").await;
+    assert!(is_couch_seq(&info["update_seq"]), "{info}");
+    let update_seq = info["update_seq"].as_str().unwrap_or_default();
+    let (_, body) = s.get(&format!("/resume/_changes?since={update_seq}")).await;
+    assert!(feed_ids(&body).is_empty(), "{body}");
+    s.put("/resume/late", json!({})).await;
+    let (_, body) = s.get(&format!("/resume/_changes?since={update_seq}")).await;
+    assert_eq!(feed_ids(&body), ["late"], "{body}");
+}
+
+// An eventsource event carries `id: <seq>` and a reconnecting browser sends it
+// back as `Last-Event-ID`, which wins over `since` (chttpd_db.erl).
+#[tokio::test]
+async fn eventsource_events_carry_ids_and_resume_from_last_event_id() {
+    let s = Server::start(false);
+    s.fresh_db("sseid").await;
+    for id in ["a", "b", "c"] {
+        s.put(&format!("/sseid/{id}"), json!({})).await;
+    }
+    let url = format!(
+        "{}/sseid/_changes?feed=eventsource&since=0&timeout=300&heartbeat=40",
+        s.base
+    );
+    let text = s
+        .client
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ids: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .map(|raw| serde_json::from_str(raw).unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3, "{text}");
+    assert!(ids.iter().all(is_couch_seq), "{text}");
+
+    let resumed = s
+        .client
+        .get(&url)
+        .header("Last-Event-ID", ids[0].to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let data: Vec<Value> = resumed
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let got: Vec<&str> = data.iter().filter_map(|row| row["id"].as_str()).collect();
+    assert_eq!(got, ["b", "c"], "{resumed}");
+}
+
 #[tokio::test]
 async fn changes_returns_latest_per_document_and_pending() {
     let s = Server::start(false);
@@ -1840,7 +2122,7 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let (_, all) = s.get("/chscanned/_changes").await;
-    assert_eq!(all["last_seq"], 4, "{all}");
+    assert_eq!(all["last_seq"], json!(seq_token(&[4])), "{all}");
 
     let lines = |text: &str| -> Vec<Value> {
         text.lines()
@@ -1850,7 +2132,12 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
     };
     // `none` matches nothing; `first` matches only the first document, so the
     // documents scanned after the last match still count.
-    for (filter, since, matched) in [("none", 0, 0), ("none", 2, 0), ("first", 0, 1)] {
+    let two = seq_token(&[2]);
+    for (filter, since, matched) in [
+        ("none", "0", 0),
+        ("none", two.as_str(), 0),
+        ("first", "0", 1),
+    ] {
         let query = format!("filter=f/{filter}&since={since}");
         for feed in ["normal", "longpoll"] {
             for extra in ["", "&heartbeat=1000"] {
@@ -1866,7 +2153,7 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
                     Some(matched),
                     "{label}"
                 );
-                assert_eq!(body["last_seq"], 4, "{label}");
+                assert_eq!(body["last_seq"], json!(seq_token(&[4])), "{label}");
             }
         }
         let text = s
@@ -1884,14 +2171,17 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
         let rows = lines(&text);
         assert_eq!(
             rows.last(),
-            Some(&json!({"last_seq": 4, "pending": 0})),
+            Some(&json!({"last_seq": seq_token(&[4]), "pending": 0})),
             "{filter} continuous since {since}: {text}"
         );
     }
 
     // A feed already at the head has scanned nothing and stays there.
-    let (_, body) = s.get("/chscanned/_changes?filter=f/none&since=4").await;
-    assert_eq!(body["last_seq"], 4, "{body}");
+    let head = seq_token(&[4]);
+    let (_, body) = s
+        .get(&format!("/chscanned/_changes?filter=f/none&since={head}"))
+        .await;
+    assert_eq!(body["last_seq"], json!(head), "{body}");
 }
 
 #[tokio::test]
@@ -2710,7 +3000,7 @@ async fn all_docs_key_excludes_deleted_and_reports_update_seq() {
 
     let (status, body) = s.get("/allkey/_all_docs?update_seq=true").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["update_seq"].as_u64().unwrap() >= 2);
+    assert!(is_couch_seq(&body["update_seq"]), "{body}");
 }
 
 fn urlencoding(value: &Value) -> String {
@@ -2918,6 +3208,54 @@ async fn database_names_follow_the_couchdb_rule() {
     }
     let (status, body) = s.put("/_users/org.couchdb.user:bob", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// `couch_db:is_system_db_name` accepts a system database name behind a prefix
+/// that itself matches the name regex, so `foo/_users` is legal (the regex
+/// alone already admits it) and so is `ts.1234567890/_users`, which only the
+/// system-name rule admits because the timestamp is not allowed mid-name. A
+/// prefix that fails the regex stays illegal (`foo/_bar` is not a case: it
+/// matches the plain regex and is legal).
+#[tokio::test]
+async fn prefixed_system_database_names_are_legal() {
+    let s = Server::start(false);
+    for path in [
+        "/foo%2F_users",
+        "/foo%2F_replicator",
+        "/foo%2F_global_changes",
+        "/foo%2Fbar%2F_users",
+        "/foo%2F_users.couch",
+        "/ts.1234567890%2F_users",
+        "/ts.1234567890%2F_replicator",
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    // A prefixed `_users` is a plain database: no admin-only rule applies.
+    let (status, body) = s.put("/foo%2F_users/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for (path, name) in [
+        ("/Foo%2F_users", "Foo/_users"),
+        ("/1foo%2F_users", "1foo/_users"),
+        ("/ts.1234567890%2Fbar%2F_users", "ts.1234567890/bar/_users"),
+        ("/foo.couch%2F_users", "foo.couch/_users"),
+        ("/%2F_users", "/_users"),
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
+        assert_eq!(
+            body["reason"],
+            format!(
+                "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+                 characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+            ),
+            "{path}: {body}"
+        );
+    }
 }
 
 /// CouchDB's `validate_dbname` drops one trailing `.couch` before applying the
@@ -3621,18 +3959,19 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
     let (_, first) = s.get("/ranges/_changes?since=0&limit=3").await;
     let first_rows = first["results"].as_array().unwrap();
     assert_eq!(first_rows.len(), 3);
-    let last_seq = first["last_seq"].as_u64().unwrap();
-    assert_eq!(first_rows[2]["seq"].as_u64().unwrap(), last_seq);
+    let last_seq = first["last_seq"].as_str().unwrap().to_string();
+    assert_eq!(first_rows[2]["seq"], first["last_seq"]);
 
     let (_, second) = s
         .get(&format!("/ranges/_changes?since={last_seq}&limit=3"))
         .await;
     let second_rows = second["results"].as_array().unwrap();
     assert_eq!(second_rows.len(), 3);
+    let first_ids: Vec<&Value> = first_rows.iter().map(|row| &row["id"]).collect();
     assert!(
         second_rows
             .iter()
-            .all(|row| row["seq"].as_u64().unwrap() > last_seq),
+            .all(|row| !first_ids.contains(&&row["id"])),
         "resumed feed starts after last_seq"
     );
 
@@ -3801,7 +4140,11 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
         .unwrap();
     let rows = lines(&text);
     assert_eq!(rows.len(), 3, "{text}");
-    assert_eq!(rows[2], json!({"last_seq": 2, "pending": 0}), "{text}");
+    assert_eq!(
+        rows[2],
+        json!({"last_seq": seq_token(&[2]), "pending": 0}),
+        "{text}"
+    );
 
     // The same trailer closes a feed that reached its limit, at once rather
     // than after the next wake-up: with the longest timeout the server
@@ -3824,7 +4167,11 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     .expect("a feed at its limit stayed open");
     let rows = lines(&text);
     assert_eq!(rows.len(), 2, "{text}");
-    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 1}), "{text}");
+    assert_eq!(
+        rows[1],
+        json!({"last_seq": seq_token(&[1]), "pending": 1}),
+        "{text}"
+    );
 }
 
 /// CouchDB's `chttpd_db:parse_changes_query` rewrites `feed=live` to
@@ -3855,7 +4202,11 @@ async fn changes_feed_live_is_continuous() {
         .collect();
     assert_eq!(rows.len(), 2, "{text}");
     assert_eq!(rows[0]["id"], "a", "{text}");
-    assert_eq!(rows[1], json!({"last_seq": 1, "pending": 0}), "{text}");
+    assert_eq!(
+        rows[1],
+        json!({"last_seq": seq_token(&[1]), "pending": 0}),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -3910,7 +4261,10 @@ async fn changes_revs_diff_and_bulk_get() {
     assert_eq!(body["results"][0]["changes"][0]["rev"], a["rev"]);
     assert_eq!(body["pending"], 0);
 
-    let (_, body) = s.get("/rep/_changes?since=1&include_docs=true").await;
+    let since = body["results"][0]["seq"].as_str().unwrap().to_string();
+    let (_, body) = s
+        .get(&format!("/rep/_changes?since={since}&include_docs=true"))
+        .await;
     assert_eq!(body["results"].as_array().unwrap().len(), 1);
     assert_eq!(body["results"][0]["doc"]["x"], 2);
     assert!(body["results"][0]["doc"].get("_revisions").is_none());
@@ -4771,7 +5125,7 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     let (_, r) = s.put("/purgeseq/b", json!({"v": 1})).await;
     let rev_b = r["rev"].as_str().unwrap().to_string();
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(0), "{info}");
+    assert_eq!(info["purge_seq"], json!(seq_token(&[0])), "{info}");
 
     let (status, body) = s
         .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
@@ -4785,13 +5139,13 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     );
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(2), "{info}");
+    assert_eq!(info["purge_seq"], json!(seq_token(&[2])), "{info}");
 
     // A purge that removes nothing does not advance it.
     let (_, body) = s.post("/purgeseq/_purge", json!({"a": ["1-x"]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(2), "{info}");
+    assert_eq!(info["purge_seq"], json!(seq_token(&[2])), "{info}");
 }
 
 #[tokio::test]
@@ -6716,12 +7070,12 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     let (_, r) = nodes[0].put("/clpurge/a", json!({"v": 1})).await;
     let rev = r["rev"].as_str().unwrap().to_string();
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!("v1:0,0"), "{info}");
+    assert_eq!(info["purge_seq"], json!(seq_token(&[0, 0])), "{info}");
 
     let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!("v1:1,1"), "{info}");
+    assert_eq!(info["purge_seq"], json!(seq_token(&[1, 1])), "{info}");
 }
 
 // A peer that discovery marked down and that has since come back stays marked
@@ -6740,7 +7094,11 @@ async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
     let (_, expected) = nodes[0].get("/clinfostale").await;
-    assert_eq!(expected["purge_seq"], json!("v1:1,1"), "{expected}");
+    assert_eq!(
+        expected["purge_seq"],
+        json!(seq_token(&[1, 1])),
+        "{expected}"
+    );
 
     // Make node 0 believe node 1 is down while it is up. Discovery runs on its
     // own only in the first seconds after start, so retry if one of those
@@ -6762,12 +7120,8 @@ async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
     }
     let (_, info) = nodes[0].get("/clinfostale").await;
     assert_eq!(info["update_seq"], expected["update_seq"], "{info}");
-    // A restarted node may count its purge differently; it must not read 0.
-    let purge_seq = info["purge_seq"].as_str().unwrap_or_default();
-    assert!(
-        purge_seq.starts_with("v1:1,") && !purge_seq.ends_with(",0"),
-        "{info}"
-    );
+    // The restarted node still counts the one purge once (#174).
+    assert_eq!(info["purge_seq"], expected["purge_seq"], "{info}");
 }
 
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
@@ -6925,6 +7279,32 @@ async fn cluster_purge_stays_purged_when_a_down_replica_rejoins() {
             StatusCode::NOT_FOUND,
             "node {i} holds the purged revision again"
         );
+    }
+}
+
+// One `_purge` is one purge info with one uuid on every copy of the shard (the
+// coordinator picks the uuid, fabric_doc_purge.erl), so anti-entropy finds
+// nothing to replay and the purge sequence stays at 1 on both nodes.
+#[tokio::test]
+async fn cluster_one_purge_counts_once_on_every_copy() {
+    let nodes = start_cluster_with(2, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("clpurgeonce").await;
+    }
+    let (_, r) = nodes[0].put("/clpurgeonce/a", json!({"v": 1})).await;
+    let rev = r["rev"].as_str().unwrap().to_string();
+    let (status, body) = nodes[0]
+        .post("/clpurgeonce/_purge", json!({"a": [rev]}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for _ in 0..2 {
+        for node in &nodes {
+            sync_node(node, "clpurgeonce").await;
+        }
+    }
+    for node in &nodes {
+        let (_, info) = node.get("/clpurgeonce").await;
+        assert_eq!(info["purge_seq"], json!(seq_token(&[1, 1])), "{info}");
     }
 }
 
@@ -8019,6 +8399,94 @@ async fn cluster_rebalance_keeps_local_docs() {
     }
 }
 
+/// Ids of `_local` documents with at least two on every one of `q` shards.
+fn local_ids_on_every_shard(q: u32) -> Vec<String> {
+    let mut per_shard = vec![0usize; q as usize];
+    let mut ids = Vec::new();
+    for i in 0.. {
+        let id = format!("pp{i}");
+        let shard = douchdb::shard_index(&format!("_local/{id}"), q);
+        if per_shard[shard] < 2 {
+            per_shard[shard] += 1;
+            ids.push(id);
+        }
+        if per_shard.iter().all(|count| *count >= 2) {
+            break;
+        }
+    }
+    ids
+}
+
+/// A direct placement change moves `_local` documents with their shard, as a
+/// rebalance does: anti-entropy skips them (as CouchDB's mem3_rep does), so
+/// the new owner would otherwise start without them. Reading from the new
+/// owner alone, with the old one stopped, shows the copy.
+#[tokio::test]
+async fn cluster_placement_put_copies_local_docs_to_the_new_owner() {
+    let mut nodes = start_cluster_with(3, "3600", 1);
+    for node in &nodes {
+        node.fresh_db("localput").await;
+    }
+    let (_, planned) = nodes[0].get("/_node/_local/_dbs/localput").await;
+    let from = node_to_pin_away_from(&planned);
+    let to = (from + 1) % 3;
+    let (status, _) = nodes[0]
+        .put("/_node/_local/_dbs/localput", all_shards_on(from))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = local_ids_on_every_shard(4);
+    for id in &ids {
+        let (status, body) = nodes[0]
+            .put(&format!("/localput/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = nodes[0]
+        .put("/_node/_local/_dbs/localput", all_shards_on(to))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    nodes[from].kill();
+    for id in &ids {
+        let (status, doc) = nodes[to].get(&format!("/localput/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id} on the new owner: {doc}");
+        assert_eq!(doc["v"], *id);
+        assert_eq!(doc["_rev"], "0-1", "the copy keeps the revision: {doc}");
+    }
+}
+
+/// A placement change copies `_local` documents from whichever old copy of a
+/// shard answers: with one of two old owners stopped, the new owner still
+/// receives them.
+#[tokio::test]
+async fn cluster_placement_put_copies_local_docs_from_a_reachable_old_copy() {
+    let mut nodes = start_cluster_with(3, "3600", 2);
+    for node in &nodes {
+        node.fresh_db("localcopy").await;
+    }
+    let both_old = json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]});
+    let (status, _) = nodes[0].put("/_node/_local/_dbs/localcopy", both_old).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = local_ids_on_every_shard(4);
+    for id in &ids {
+        let (status, body) = nodes[0]
+            .put(&format!("/localcopy/_local/{id}"), json!({"v": id}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    nodes[2].kill();
+    let moved = json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 0]; 4]});
+    let (status, body) = nodes[0].put("/_node/_local/_dbs/localcopy", moved).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    nodes[1].kill();
+    for id in &ids {
+        let (status, doc) = nodes[0].get(&format!("/localcopy/_local/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id} on the new owner: {doc}");
+        assert_eq!(doc["v"], *id);
+    }
+}
+
 #[tokio::test]
 async fn cluster_rebalance_timeout_does_not_clean_old_replicas() {
     let nodes = start_cluster_with(3, "3600", 1);
@@ -8574,7 +9042,12 @@ async fn replication_source_and_target_agree_after_convergence() {
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut latest = HashMap::new();
         for row in body["results"].as_array().unwrap() {
-            latest.insert(row["id"].as_str().unwrap().to_string(), row.clone());
+            // Each coordinator's tokens carry its own view of the vector.
+            let mut row = row.clone();
+            if let Some(row) = row.as_object_mut() {
+                row.remove("seq");
+            }
+            latest.insert(row["id"].as_str().unwrap().to_string(), row);
         }
         changes.push(latest);
     }
@@ -13787,7 +14260,7 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    let mut since = 0u64;
+    let mut since = "0".to_string();
     let mut last_seq = 0u64;
     let mut seen = Vec::new();
     loop {
@@ -13800,7 +14273,7 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
             break;
         }
         for row in rows {
-            let seq = row["seq"].as_u64().expect("numeric seq");
+            let seq = seq_vector(row["seq"].as_str().expect("opaque seq"))[0];
             assert!(
                 seq > last_seq,
                 "changes rows out of order: {seq} after {last_seq}"
@@ -13808,12 +14281,12 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
             last_seq = seq;
             seen.push(row["id"].as_str().unwrap().to_string());
         }
-        let next = body["last_seq"].as_u64().expect("numeric last_seq");
-        assert!(next >= since, "last_seq went backwards");
+        let next = body["last_seq"].as_str().expect("opaque last_seq");
+        assert!(seq_vector(next)[0] >= last_seq, "last_seq went backwards");
         if next == since {
             break;
         }
-        since = next;
+        since = next.to_string();
         assert!(seen.len() <= expected.len(), "duplicate rows returned");
     }
     let unique: std::collections::HashSet<&String> = seen.iter().collect();
