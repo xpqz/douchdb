@@ -146,12 +146,12 @@ impl ShardMap {
 }
 
 impl Cluster {
-    pub fn shard_map(&self, q: u32) -> ShardMap {
-        self.shard_map_n(q, self.n)
+    pub fn shard_map(&self, name: &str, q: u32) -> ShardMap {
+        self.shard_map_n(name, q, self.n)
     }
 
     /// A shard map with `n` copies of each shard, clamped to the node count.
-    pub fn shard_map_n(&self, q: u32, n: usize) -> ShardMap {
+    pub fn shard_map_n(&self, _name: &str, q: u32, n: usize) -> ShardMap {
         let q = q.max(1);
         if self.nodes.is_empty() {
             return ShardMap::single(q);
@@ -273,11 +273,68 @@ mod tests {
     const Q: u32 = 256;
 
     fn replicas_of_shard(cluster: &Cluster, shard: u32) -> Vec<usize> {
-        cluster.shard_map(Q).replicas_of(shard).to_vec()
+        cluster.shard_map("db", Q).replicas_of(shard).to_vec()
     }
 
     fn owner_of_shard(cluster: &Cluster, shard: u32) -> usize {
-        cluster.shard_map(Q).owner_of(shard)
+        cluster.shard_map("db", Q).owner_of(shard)
+    }
+
+    fn copies_per_node(map: &ShardMap, nodes: usize) -> Vec<usize> {
+        let mut counts = vec![0; nodes];
+        for replicas in &map.replicas {
+            for node in replicas {
+                counts[*node] += 1;
+            }
+        }
+        counts
+    }
+
+    fn cluster_of(nodes: usize) -> Cluster {
+        Cluster {
+            nodes: (0..nodes).map(|i| format!("http://node{i}:5984")).collect(),
+            me: 0,
+            n: 1,
+            secret: String::new(),
+        }
+    }
+
+    fn assert_balanced(name: &str, nodes: usize, q: u32, n: usize) {
+        let map = cluster_of(nodes).shard_map_n(name, q, n);
+        let counts = copies_per_node(&map, nodes);
+        let (min, max) = (counts.iter().min(), counts.iter().max());
+        assert!(
+            max.zip(min).is_some_and(|(max, min)| max - min <= 1),
+            "{name} q={q} n={n}: copies per node {counts:?}"
+        );
+        for (shard, replicas) in map.replicas.iter().enumerate() {
+            let distinct: std::collections::HashSet<_> = replicas.iter().collect();
+            assert_eq!(replicas.len(), n, "{name} shard {shard}");
+            assert_eq!(distinct.len(), n, "{name} shard {shard} reuses a node");
+        }
+    }
+
+    #[test]
+    fn default_placement_spreads_copies_evenly() {
+        for name in ["a", "db", "users", "orders-2024", "x1", "x2", "x3", "x4"] {
+            assert_balanced(name, 3, 4, 1);
+            assert_balanced(name, 5, 8, 3);
+            assert_balanced(name, 3, 2, 2);
+            assert_balanced(name, 4, 8, 4);
+        }
+    }
+
+    #[test]
+    fn default_placement_is_deterministic_and_rotates_per_database() {
+        let cluster = cluster_of(3);
+        assert_eq!(
+            cluster.shard_map_n("db", 4, 1),
+            cluster.shard_map_n("db", 4, 1)
+        );
+        let firsts: std::collections::HashSet<_> = (0..16)
+            .map(|i| cluster.shard_map_n(&format!("db{i}"), 4, 1).replicas[0][0])
+            .collect();
+        assert!(firsts.len() > 1, "every database starts on the same node");
     }
 
     #[test]

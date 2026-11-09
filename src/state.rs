@@ -333,7 +333,7 @@ impl AppState {
             DbConfig {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
-                shard_map: self.ctx.cluster.shard_map(self.config.q),
+                shard_map: self.ctx.cluster.shard_map(name, self.config.q),
                 partitioned: false,
             },
         )?);
@@ -477,7 +477,11 @@ impl AppState {
                 shard_map: self
                     .ctx
                     .cluster
-                    .shard_map_n(q.unwrap_or(self.config.q), n.unwrap_or(self.ctx.cluster.n)),
+                    .shard_map_n(
+                        name,
+                        q.unwrap_or(self.config.q),
+                        n.unwrap_or(self.ctx.cluster.n),
+                    ),
                 partitioned,
             },
         )?);

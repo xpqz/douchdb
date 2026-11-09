@@ -790,7 +790,7 @@ pub(crate) async fn rebalance(
     let old_map = db.shard_map();
     // The placement creation uses, so a cluster that has not changed since the
     // database was made is already where it should be.
-    let map = ctx.cluster.shard_map_n(db.q, old_map.n());
+    let map = ctx.cluster.shard_map_n(&db.name, db.q, old_map.n());
     let value = if map.q == old_map.q
         && map.node_count == old_map.node_count
         && map.replicas == old_map.replicas
