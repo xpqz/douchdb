@@ -39,11 +39,14 @@ It runs `cargo build --release --target wasm32-wasip1` with
 `WASI_SDK=/opt/wasi-sdk`, which is what `rquickjs-sys` uses for its C
 compiler and sysroot, and copies the result to `wasm/qjs-runner.wasm`.
 
-The script builds for `linux/amd64` on every host (under emulation on arm64):
-the arm64 and x86_64 WASI SDKs give different wasm bytes, so the checksum is
-only reproducible per platform. Two consecutive builds gave identical bytes. CI
-rebuilds the runner on x86_64 and compares the checksum (the `WASM runner`
-workflow, which runs only when `wasm/` changes).
+The script builds for `linux/arm64` on every host: native on Apple silicon and
+on GitHub's arm64 runners (`ubuntu-24.04-arm`). The arm64 and x86_64 WASI SDKs
+give different wasm bytes, so the checksum is only reproducible on the
+reference platform, arm64; an x86_64 host gets different bytes (the build runs
+under emulation there, and its result will not match the checksum). Two
+consecutive builds gave identical bytes. CI rebuilds the runner on arm64 and
+compares the checksum (the `WASM runner` workflow, which runs only when `wasm/`
+changes).
 
 The runner uses the maintained `rquickjs` crate (MIT) with QuickJS (MIT),
 built through the WASI SDK. Keep the generated `.wasm` in sync with the source;
@@ -55,7 +58,7 @@ default-on `wasm` cargo feature; `--no-default-features` builds without wasmi.
 Expected artifact checksum for the checked-in binary:
 
 ```text
-f3961f44893d65cf42fb6c981c972474a802838d75fc880a03b2c853f7b0cd3d  qjs-runner.wasm
+a4c599be2f47925993a319d4ff847c7f70f93f8e2c6dc6b1a05905879b5978fc  qjs-runner.wasm
 ```
 
 `wasm/qjs-runner.sha256` is the manifest checked by the unit test:
