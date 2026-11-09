@@ -59,6 +59,12 @@ pub async fn session_delete() -> Response {
     response
 }
 
+/// `POST /_session`. With auth configured the credentials are checked and an
+/// `AuthSession` cookie is issued. With no auth configured at all
+/// (`st.ctx.auth` is `None`, i.e. no `--admin` and no users file) the server
+/// is admin-party: every request is already an admin, so any credentials are
+/// accepted, an empty name is reported as `admin`, and no cookie is set since
+/// none is needed. This branch is unreachable once auth is enabled.
 pub async fn session_post(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
     let text = String::from_utf8_lossy(&body);
     let mut user = String::new();

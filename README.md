@@ -748,6 +748,11 @@ database, IAM integration, or row-level security.
 ]}
 ```
 
+With neither `--admin` nor a users file the server is admin-party: every request
+is an admin, and `POST /_session` accepts any credentials (an empty name is
+reported as `admin`) without setting a cookie. Once either is configured,
+`POST /_session` checks the credentials and issues a signed `AuthSession` cookie.
+
 Start with `--users-file /etc/douchdb/users.json`. New databases are admin-only
 by default when authentication is configured; use `--default-security open` for
 public databases. `_security` can be changed by a database or server admin, and
