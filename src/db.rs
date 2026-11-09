@@ -2045,12 +2045,12 @@ impl Db {
         let mut rows;
         let scanned_last;
         match &opts.filter {
-            Some(filter) if !opts.descending => {
+            Some(filter) => {
                 (rows, scanned_last) = self
                     .filtered_changes(opts, filter, &selected, until)
                     .await?;
             }
-            _ => {
+            None => {
                 rows = Vec::new();
                 for index in selected {
                     let shard_opts = opts.clone();
@@ -2069,13 +2069,7 @@ impl Db {
                 if opts.descending {
                     rows.reverse();
                 }
-                // A descending filter is evaluated after merging shard rows
-                // so every shard is scanned: a shard-local limit would
-                // otherwise drop matching rows behind non-matching documents.
                 scanned_last = rows.last().map(|row| row.seq);
-                if let Some(filter) = &opts.filter {
-                    rows = apply_change_filter(rows, filter).await?;
-                }
             }
         }
         if let Some(limit) = opts.limit {
@@ -2096,9 +2090,11 @@ impl Db {
         Ok((rows, last_seq))
     }
 
-    /// An ascending filtered read: scans each shard a page at a time and merges
-    /// the pages in sequence order, filtering as it goes, until `limit` rows
-    /// match or every shard is exhausted. No single shard job loads more than
+    /// A filtered read: scans each shard a page at a time, from `since` up or
+    /// from the newest change down, and merges the pages in sequence order,
+    /// filtering as it goes, until `limit` rows match or every shard is
+    /// exhausted. A descending read stops after the newest matches instead of
+    /// reading the whole feed. No single shard job loads more than
     /// a page of rows (with bodies, for a JS filter). Returns the matching
     /// rows and the last sequence scanned.
     async fn filtered_changes(
@@ -2117,7 +2113,16 @@ impl Db {
             Some(limit) => limit.clamp(64, 1024),
             None => 1024,
         };
-        let mut cursors = vec![opts.since; selected.len()];
+        // Where each shard's next page starts: after this sequence going up,
+        // at or below it going down.
+        let mut cursors = vec![
+            if opts.descending {
+                u64::MAX
+            } else {
+                opts.since
+            };
+            selected.len()
+        ];
         let mut done = vec![false; selected.len()];
         let mut buffers: Vec<VecDeque<ChangeRow>> =
             (0..selected.len()).map(|_| VecDeque::new()).collect();
@@ -2131,35 +2136,61 @@ impl Db {
                 let mut shard_opts = opts.clone();
                 shard_opts.since = cursors[slot];
                 shard_opts.limit = Some(page);
+                let bound = if opts.descending {
+                    cursors[slot]
+                } else {
+                    until
+                };
                 let rows = self.shards[index]
-                    .call(move |s| collect_changes(s, &shard_opts, until))
+                    .call(move |s| collect_changes(s, &shard_opts, bound))
                     .await?;
                 match rows.last() {
                     // A page can come back short when unreadable records are
                     // skipped, so only an empty one ends the shard.
                     None => done[slot] = true,
+                    Some(last) if opts.descending => {
+                        // Sequence 0 is never allocated, so a page reaching it
+                        // is the shard's last.
+                        match last.seq.checked_sub(1) {
+                            Some(next) => cursors[slot] = next,
+                            None => done[slot] = true,
+                        }
+                    }
                     Some(last) => cursors[slot] = last.seq,
                 }
                 buffers[slot].extend(rows);
             }
-            // Everything up to the lowest buffered tail is complete: no shard
-            // can still produce a row below it.
-            let Some(cutoff) = buffers
+            // Everything up to the lowest buffered tail (the highest going
+            // down) is complete: no shard can still produce a row beyond it.
+            let tails = buffers
                 .iter()
                 .zip(&done)
                 .filter(|(_, done)| !**done)
-                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq))
-                .min()
-            else {
+                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq));
+            let Some(cutoff) = (if opts.descending {
+                tails.max()
+            } else {
+                tails.min()
+            }) else {
                 break;
+            };
+            let reached = |seq: u64| {
+                if opts.descending {
+                    seq >= cutoff
+                } else {
+                    seq <= cutoff
+                }
             };
             let mut batch = Vec::new();
             for buffer in &mut buffers {
-                while buffer.front().is_some_and(|row| row.seq <= cutoff) {
+                while buffer.front().is_some_and(|row| reached(row.seq)) {
                     batch.extend(buffer.pop_front());
                 }
             }
             batch.sort_by_key(|row| row.seq);
+            if opts.descending {
+                batch.reverse();
+            }
             scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
             matched.extend(apply_change_filter(batch, filter).await?);
             if opts
@@ -4588,34 +4619,19 @@ fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) ->
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);
     };
-    // Without a partition the rank comes from the shard's cursor, so paging by
-    // `startkey` does not recount every id before it on each request.
-    let ranked = match &opts.partition {
-        None => Some(shard.live_rank(start)?),
-        Some(_) => None,
-    };
+    // The rank comes from the shard's cursor, so paging by `startkey` does not
+    // recount every id before it on each request.
+    if let Some(partition) = &opts.partition {
+        return Ok(shard.partition_offset(partition, start, opts.descending)?);
+    }
+    let rank = shard.live_rank(start)?;
     let live = shard.live_docs()?;
-    let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
-    let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-    let mut walked = 0usize;
-    let offset = match (opts.descending, ranked) {
-        (false, None) => live
-            .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
-            .inspect(|_| walked += 1)
-            .filter(|(id, _)| in_partition(id))
-            .count(),
-        (true, None) => live
-            .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
-            .inspect(|_| walked += 1)
-            .filter(|(id, _)| in_partition(id))
-            .count(),
-        (false, Some(rank)) => rank,
-        (true, Some(rank)) => live
-            .len()
-            .saturating_sub(rank + usize::from(live.contains_key(start))),
-    };
-    shard.add_scanned(walked);
-    Ok(offset)
+    Ok(if opts.descending {
+        live.len()
+            .saturating_sub(rank + usize::from(live.contains_key(start)))
+    } else {
+        rank
+    })
 }
 
 /// Up to `take` live ids of the query's range in the query's direction,
@@ -4985,19 +5001,14 @@ async fn apply_change_filter(
     }
 }
 
-/// Change rows from one shard. An ascending read stops at sequence `until`.
+/// Change rows from one shard. An ascending read stops at sequence `until`; a
+/// descending one starts at it, so a caller pages back by lowering it.
 fn collect_changes(
     shard: &mut crate::store::Shard,
     opts: &ChangesOpts,
     until: u64,
 ) -> DbResult<Vec<ChangeRow>> {
-    // A descending feed has no cursor to resume a filtered scan from, so it
-    // still reads every row; ascending callers page by `since` and `limit`.
-    let limit = if opts.filter.is_some() && opts.descending {
-        usize::MAX
-    } else {
-        opts.limit.unwrap_or(usize::MAX)
-    };
+    let limit = opts.limit.unwrap_or(usize::MAX);
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -5013,7 +5024,13 @@ fn collect_changes(
             let mut selected: Vec<(u64, String)> = ids
                 .iter()
                 .filter_map(|id| latest.seq_of(id).map(|seq| (seq, id.clone())))
-                .filter(|(seq, _)| opts.descending || (*seq > opts.since && *seq <= until))
+                .filter(|(seq, _)| {
+                    if opts.descending {
+                        *seq <= until
+                    } else {
+                        *seq > opts.since && *seq <= until
+                    }
+                })
                 .collect();
             selected.sort();
             selected.dedup();
@@ -5024,7 +5041,7 @@ fn collect_changes(
             selected
         }
         None if opts.descending => latest
-            .all()
+            .through(until)
             .rev()
             .take(limit)
             .map(|(seq, id)| (seq, id.to_string()))
@@ -6703,9 +6720,11 @@ mod tests {
         for n in [300usize, 3000] {
             let root = std::env::temp_dir().join(format!("douchdb-descv-{}", crate::util::uuid()));
             let db = scan_db(&root, "descv", 2, false);
-            let mut docs: Vec<Value> = (0..n).map(|i| json!({"_id": format!("d{i}")})).collect();
-            docs.push(json!({"_id": "_design/newest"}));
+            let docs: Vec<Value> = (0..n).map(|i| json!({"_id": format!("d{i}")})).collect();
             db.put_docs(docs, true).await.unwrap();
+            db.put_docs(vec![json!({"_id": "_design/newest"})], true)
+                .await
+                .unwrap();
             // Build the sequence index first: only the read is measured.
             db.changes_rows(&descending_design_changes(Some(1)))
                 .await
