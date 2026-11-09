@@ -2747,6 +2747,51 @@ async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// One counter of a database from the local metrics, such as `shard_jobs` (the
+/// shard-actor jobs, each a cross-thread hop) or `shard_scanned` (index
+/// entries walked). A scrape runs jobs of its own before it reads the
+/// counters, so callers that compare counts take the cost of a scrape off.
+async fn db_counter(s: &Server, db_name: &str, field: &str) -> u64 {
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let db = metrics["databases"]
+        .as_array()
+        .and_then(|dbs| dbs.iter().find(|db| db["name"] == db_name))
+        .unwrap_or_else(|| panic!("{db_name} missing from the metrics: {metrics}"));
+    db[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{field} of an open db: {db}"))
+}
+
+/// What one request costs in `field`, with the cost of one scrape taken off.
+async fn request_cost(s: &Server, db_name: &str, field: &str, path: &str) -> u64 {
+    let first = db_counter(s, db_name, field).await;
+    let scrape = db_counter(s, db_name, field).await - first;
+    let before = db_counter(s, db_name, field).await;
+    let (status, body) = s.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    db_counter(s, db_name, field).await - before - scrape
+}
+
+/// `_design_docs` counts the design documents for `total_rows` in the same
+/// shard job that reads its rows, not with a second full `_all_docs` pass.
+#[tokio::test]
+async fn design_docs_counts_in_the_same_pass_as_its_rows() {
+    let s = Server::start_with(&["--q".to_string(), "1".to_string()], false);
+    s.fresh_db("ddcount").await;
+    let mut docs: Vec<Value> = (0..5)
+        .map(|i| json!({"_id": format!("_design/d{i}"), "views": {}}))
+        .collect();
+    docs.push(json!({"_id": "plain"}));
+    let (status, _) = s.post("/ddcount/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/ddcount/_design_docs?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 5);
+    let jobs = request_cost(&s, "ddcount", "shard_jobs", "/ddcount/_design_docs?limit=1").await;
+    assert_eq!(jobs, 1, "shard jobs of one _design_docs request");
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts

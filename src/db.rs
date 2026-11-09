@@ -1723,10 +1723,7 @@ impl Db {
                 .map(|(_, shard)| {
                     let opts = opts.clone();
                     shard.call(move |s| {
-                        let docs = match &opts.partition {
-                            Some(partition) => s.partition_live_count(partition)?,
-                            None => s.counts().0,
-                        };
+                        let docs = all_docs_live_total(s, &opts)?;
                         let (rows, offset) = collect_all_docs(s, &opts, take)?;
                         Ok((rows, offset, docs))
                     })
@@ -1781,10 +1778,7 @@ impl Db {
             let shard_opts = opts.clone();
             let (before, docs) = shard
                 .call(move |s| {
-                    let docs = match &shard_opts.partition {
-                        Some(partition) => s.partition_live_count(partition)?,
-                        None => s.counts().0,
-                    };
+                    let docs = all_docs_live_total(s, &shard_opts)?;
                     Ok((all_docs_before_start(s, &shard_opts)?, docs))
                 })
                 .await?;
@@ -1953,12 +1947,12 @@ impl Db {
                     .await?;
             }
         } else {
-            let counts = futures::future::join_all(
-                self.selected_shards(owned)
-                    .into_iter()
-                    .map(|index| self.shards[index].call(|s| Ok(s.counts().0))),
-            )
-            .await;
+            let counts =
+                futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| all_docs_live_total(s, &opts))
+                }))
+                .await;
             for count in counts {
                 total_rows += count?;
             }
@@ -4002,6 +3996,9 @@ pub struct AllDocsOpts {
     pub inclusive_end: bool,
     pub limit: usize,
     pub skip: usize,
+    /// When set, `total_rows` counts only the live ids in `[first, last)`
+    /// instead of every live document (`_design_docs`).
+    pub count_range: Option<(String, String)>,
 }
 
 impl Default for AllDocsOpts {
@@ -4017,6 +4014,7 @@ impl Default for AllDocsOpts {
             inclusive_end: true,
             limit: usize::MAX,
             skip: 0,
+            count_range: None,
         }
     }
 }
@@ -4632,6 +4630,16 @@ fn read_doc_rev(
 /// `startkey`, which is the shard's contribution to `offset`.
 /// How many live ids sort before the query's start key, in the query's
 /// direction: the `offset` of an `_all_docs` reply, before `skip`.
+/// The `total_rows` of one shard: its live documents, or those of the query's
+/// partition or `count_range`.
+fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<u64> {
+    Ok(match (&opts.partition, &opts.count_range) {
+        (Some(partition), _) => shard.partition_live_count(partition)?,
+        (None, Some((first, last))) => shard.live_range_count(first, last)? as u64,
+        (None, None) => shard.counts().0,
+    })
+}
+
 fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);

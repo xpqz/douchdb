@@ -862,20 +862,33 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         Ok(update_seq) => update_seq,
         Err(error) => return fail(error),
     };
+    if req.st.ctx.cluster.is_clustered() && !req.st.ctx.cluster.is_internal(req.headers) {
+        // The coordinator merges the shards' rows; it counts the design
+        // documents with a second pass.
+        let mut result = run_all_docs(&req, &opts).await;
+        if let Ok(list) = &mut result {
+            let everything = AllDocsOpts {
+                startkey: Some(DESIGN_FIRST.to_string()),
+                endkey: Some(DESIGN_END.to_string()),
+                ..Default::default()
+            };
+            match run_all_docs(&req, &everything).await {
+                Ok(all) => {
+                    let total = all.rows.len() as u64;
+                    list.total_rows = Some(total);
+                    list.offset = list.offset.map(|offset| offset.min(total));
+                }
+                Err(error) => result = Err(error),
+            }
+        }
+        return all_docs_reply(&req, result, update_seq);
+    }
+    // Each shard counts its design documents in the job that reads its rows.
+    opts.count_range = Some((DESIGN_FIRST.to_string(), DESIGN_END.to_string()));
     let mut result = run_all_docs(&req, &opts).await;
     if let Ok(list) = &mut result {
-        let everything = AllDocsOpts {
-            startkey: Some(DESIGN_FIRST.to_string()),
-            endkey: Some(DESIGN_END.to_string()),
-            ..Default::default()
-        };
-        match run_all_docs(&req, &everything).await {
-            Ok(all) => {
-                let total = all.rows.len() as u64;
-                list.total_rows = Some(total);
-                list.offset = list.offset.map(|offset| offset.min(total));
-            }
-            Err(error) => result = Err(error),
+        if let Some(total) = list.total_rows {
+            list.offset = list.offset.map(|offset| offset.min(total));
         }
     }
     all_docs_reply(&req, result, update_seq)

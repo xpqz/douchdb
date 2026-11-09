@@ -860,6 +860,16 @@ impl Shard {
         Ok(self.live.as_ref().expect("live index initialized"))
     }
 
+    /// How many live documents have an id in `[first, last)`.
+    pub fn live_range_count(&mut self, first: &str, last: &str) -> Result<usize> {
+        let count = self
+            .live_docs()?
+            .range::<str, _>((Bound::Included(first), Bound::Excluded(last)))
+            .count();
+        self.add_scanned(count);
+        Ok(count)
+    }
+
     /// How many live documents have an id below `key`. Counts from the
     /// previous call's key when there is one, so walking through the keys in
     /// either direction costs the distance moved, not the position.
