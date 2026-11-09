@@ -465,7 +465,6 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
 pub(crate) async fn replica_docs(
     ctx: &ClusterCtx,
     db: &Db,
-    dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
     headers: &HeaderMap,
@@ -512,7 +511,7 @@ pub(crate) async fn replica_docs(
                 ctx,
                 reqwest::Method::GET,
                 &peer,
-                &[dbname, docid],
+                &[&db.name, docid],
                 Some(headers),
             )
             .header("x-douchdb-quorum-read", "1")
