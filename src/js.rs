@@ -239,8 +239,17 @@ pub fn sandboxed() -> bool {
     SANDBOX.load(Ordering::SeqCst) != 0
 }
 
+static SANDBOX_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Requests sent to a sandbox since the process started: round trips, however
+/// many calls each carried.
+pub fn sandbox_requests() -> u64 {
+    SANDBOX_REQUESTS.load(Ordering::Relaxed)
+}
+
 /// Dispatch a map/reduce/index call to the selected sandbox.
 pub fn sandbox_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value, JsError> {
+    SANDBOX_REQUESTS.fetch_add(1, Ordering::Relaxed);
     match SANDBOX.load(Ordering::SeqCst) {
         1 => process_request(kind, payload, limits),
         #[cfg(feature = "wasm")]

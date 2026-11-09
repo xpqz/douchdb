@@ -14258,6 +14258,61 @@ async fn sandboxed_reduce_rereduce_receives_null_keys() {
     );
 }
 
+/// A custom reduce over many small groups costs a few sandbox round trips,
+/// not one per group.
+#[tokio::test]
+async fn sandboxed_grouped_reduce_batches_its_calls() {
+    if !sandbox_tested("process") {
+        return;
+    }
+    let args = vec![
+        "--js-sandbox".to_string(),
+        "process".to_string(),
+        "--q".to_string(),
+        "2".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    s.fresh_db("jsgroups").await;
+    let docs: Vec<Value> = (0..400)
+        .map(|i| json!({"_id": format!("d{i:03}"), "g": i % 200}))
+        .collect();
+    let (status, _) = s.post("/jsgroups/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/jsgroups/_design/v",
+            json!({"views": {"total": {
+                "map": "function(doc){ emit(doc.g, 1); }",
+                "reduce": "function(keys, values, rereduce){ return sum(values); }"
+            }}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let path = "/jsgroups/_design/v/_view/total?group=true";
+    // The first query builds the index and the stored partials.
+    let (status, body) = s.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(200), "{body}");
+    assert!(body["rows"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().all(|row| row["value"] == 2)));
+
+    let (_, metrics) = s.get("/_node/_local/_metrics").await;
+    let before = metrics["js_sandbox_requests"].as_u64().unwrap_or(0);
+    let (status, body) = s.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(200), "{body}");
+    let (_, metrics) = s.get("/_node/_local/_metrics").await;
+    let after = metrics["js_sandbox_requests"].as_u64().unwrap_or(0);
+    // Two shards, each with 200 groups: their edges, their combines and the
+    // merge of the shards' partials, a batch each.
+    assert!(
+        after - before <= 8,
+        "{} sandbox round trips for 200 groups",
+        after - before
+    );
+}
+
 async fn assert_rereduce_keys_are_null(mode: &str) {
     // CouchDB passes keys = null to a rereduce. With two shards, the
     // partial reductions of the shards are combined with a rereduce.
