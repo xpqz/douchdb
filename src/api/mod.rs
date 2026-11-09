@@ -61,15 +61,20 @@ pub(crate) fn fail(e: ApiError) -> Response {
     )
 }
 
-/// A streaming 200 response for a feed: not cached, one chunk per stream item.
+/// A streaming 200 response for a feed, one chunk per stream item. As in
+/// CouchDB (chttpd_db.erl `changes_callback`) only the event stream is
+/// `no-cache`; the JSON feeds get the usual JSON `must-revalidate`.
 pub(crate) fn feed_response(
     content_type: &'static str,
     stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 ) -> Response {
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONTENT_TYPE, content_type);
+    if content_type == "text/event-stream" {
+        response = response.header(header::CACHE_CONTROL, "no-cache");
+    }
+    response
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
