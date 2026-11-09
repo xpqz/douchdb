@@ -495,7 +495,6 @@ Every flag that takes a value also accepts `--flag=VALUE`. A value that is exact
 | `--wasm-runtime` | `wasmi` | WASM host runtime: `wasmi` (lean interpreter) or `wasmtime` (Cranelift JIT; build with `--features wasmtime`, which needs Rust 1.97+) |
 | `--js-workers` | `2` | Worker processes when `--js-sandbox process` is enabled |
 | `--cluster-secret` | empty | Shared secret for internal requests; required with more than one node (or use `DOUCHDB_CLUSTER_SECRET`) |
-| `--peer-http2` | off | Send node-to-node requests over HTTP/2 (see [Node-to-node transport](#node-to-node-transport)) |
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
 | `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
@@ -644,26 +643,16 @@ broadcast) and then write normally.
 ### Node-to-node transport
 
 Every node's listener accepts HTTP/1.1 and cleartext HTTP/2 (h2c, prior
-knowledge) on the same port, so clients see no difference. With
-`--peer-http2` a node sends its requests to other nodes over HTTP/2: one
-multiplexed, header-compressed connection per peer instead of one HTTP/1.1
-connection per request in flight (to `https://` peers h2 is negotiated by ALPN
-instead). Flow control is sized so a large `_bulk_docs` or `_changes` body
-does not stall small requests on the same connection: 1 MiB per stream, 8 MiB
-per connection, 64 KiB frames, 256 concurrent streams per connection, and a
-keep-alive ping every 30 s (dead peer after 10 s). The 2 s connect and 60 s
-request timeouts are unchanged.
-
-The flag is **off by default** so a rolling upgrade is safe: a node that has
-`--peer-http2` cannot talk to a peer from before this release, whose listener
-is HTTP/1.1 only (the request fails like an unreachable peer; there is no
-automatic fallback). Upgrade every node to this release first, still without
-the flag, then restart them with `--peer-http2` one at a time; nodes with and
-without the flag work together in any mix, because every upgraded listener
-accepts both protocols. Once all nodes are upgraded, `--peer-http2` can be
-enabled everywhere. A node reports how many requests from other nodes it
-served per protocol under `http.internal_requests` in
-`/_node/_local/_metrics`.
+knowledge) on the same port, so clients see no difference. Nodes send their
+requests to other nodes over HTTP/2 only: one multiplexed, header-compressed
+connection per peer instead of one HTTP/1.1 connection per request in flight
+(to `https://` peers h2 is negotiated by ALPN). Flow control is sized so a
+large `_bulk_docs` or `_changes` body does not stall small requests on the
+same connection: 1 MiB per stream, 8 MiB per connection, 64 KiB frames, 256
+concurrent streams per connection, and a keep-alive ping every 30 s (dead peer
+after 10 s). The 2 s connect and 60 s request timeouts are unchanged. A node
+reports how many requests from other nodes it served per protocol under
+`http.internal_requests` in `/_node/_local/_metrics`.
 
 ### Cluster limits
 

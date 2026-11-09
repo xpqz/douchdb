@@ -211,7 +211,6 @@ fn build_state(
                 secret: args.cluster_secret.clone(),
             },
             client: crate::cluster_http::peer_client(
-                args.peer_http2,
                 args.nodes
                     .iter()
                     .chain(&args.seed_nodes)
