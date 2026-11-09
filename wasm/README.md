@@ -30,7 +30,7 @@ The script pins the whole toolchain:
 
 | Component | Version |
 | --- | --- |
-| Docker image | `rust:1.96.1-bookworm` (rustc 1.96.1) |
+| Docker image | `rust:1.96.1-bookworm`, digest-pinned in `build.sh` (rustc 1.96.1) |
 | Rust target | `wasm32-wasip1` (`rustup target add`) |
 | WASI SDK | 24.0 (`wasi-sdk-24`, linux tarball, sha256 checked by the script) |
 | Dependencies | `wasm/qjs-runner/Cargo.lock` (`cargo build --locked`) |
