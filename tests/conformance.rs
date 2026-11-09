@@ -7072,13 +7072,8 @@ async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
     }
     let (_, info) = nodes[0].get("/clinfostale").await;
     assert_eq!(info["update_seq"], expected["update_seq"], "{info}");
-    // A restarted node may count its purge differently; it must not read 0.
-    let purge_seq = info["purge_seq"].as_str().unwrap_or_default();
-    let vector = seq_vector(purge_seq);
-    assert!(
-        vector.first() == Some(&1) && vector.get(1).is_some_and(|seq| *seq != 0),
-        "{info}"
-    );
+    // The restarted node still counts the one purge once (#174).
+    assert_eq!(info["purge_seq"], expected["purge_seq"], "{info}");
 }
 
 /// Status of `GET /{db}/{id}?rev={rev}` answered from `node`'s own copy only,
