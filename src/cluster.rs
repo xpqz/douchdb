@@ -184,9 +184,88 @@ impl Cluster {
         }
     }
 
-    /// The placement a rebalance moves `old` to.
+    /// The placement a rebalance moves `old` to: `old` with as few copies
+    /// moved as it takes to fit the current node list and `n`, and then to
+    /// even out the load. Unlike a fresh `shard_map_n`, whose round-robin deal
+    /// reshuffles most copies when a node joins, this keeps every copy that
+    /// can stay. Copies on nodes no longer in the list are re-homed, ranges
+    /// short of `n` copies gain some on the least loaded nodes, ranges over
+    /// `n` lose theirs from the most loaded nodes, and finally copies move
+    /// from the most to the least loaded node until counts differ by at most
+    /// one. Ties break by node address, then range index, so every node
+    /// computes the same map.
     pub fn rebalance_target(&self, old: &ShardMap, n: usize) -> ShardMap {
-        self.shard_map_n("", old.q, n)
+        let node_count = self.nodes.len().max(1);
+        let n = n.max(1).min(node_count);
+        // Position of each node in address order: the tie-break.
+        let mut order: Vec<usize> = (0..node_count).collect();
+        order.sort_by(|a, b| self.nodes.get(*a).cmp(&self.nodes.get(*b)));
+        let mut rank = vec![0usize; node_count];
+        for (pos, node) in order.iter().enumerate() {
+            rank[*node] = pos;
+        }
+        let mut load = vec![0usize; node_count];
+        let mut replicas: Vec<Vec<usize>> = old
+            .replicas
+            .iter()
+            .map(|copies| {
+                let mut kept: Vec<usize> = Vec::new();
+                for node in copies {
+                    if *node < node_count && !kept.contains(node) {
+                        kept.push(*node);
+                    }
+                }
+                for node in &kept {
+                    load[*node] += 1;
+                }
+                kept
+            })
+            .collect();
+        for copies in &mut replicas {
+            while copies.len() > n {
+                let Some(drop) = pick(&load, &rank, copies.iter().copied(), true) else {
+                    break;
+                };
+                copies.retain(|node| *node != drop);
+                load[drop] -= 1;
+            }
+            while copies.len() < n {
+                let held = copies.clone();
+                let free = (0..node_count).filter(|c| !held.contains(c));
+                let Some(add) = pick(&load, &rank, free, false) else {
+                    break;
+                };
+                copies.push(add);
+                load[add] += 1;
+            }
+        }
+        while let (Some(most), Some(least)) = (
+            pick(&load, &rank, 0..node_count, true),
+            pick(&load, &rank, 0..node_count, false),
+        ) {
+            if load[most] <= load[least] + 1 {
+                break;
+            }
+            let Some(slot) = replicas
+                .iter()
+                .position(|copies| copies.contains(&most) && !copies.contains(&least))
+            else {
+                break;
+            };
+            for node in &mut replicas[slot] {
+                if *node == most {
+                    *node = least;
+                }
+            }
+            load[most] -= 1;
+            load[least] += 1;
+        }
+        ShardMap {
+            q: old.q,
+            node_count,
+            replicas,
+            version: 0,
+        }
     }
 
     pub fn is_clustered(&self) -> bool {
@@ -234,6 +313,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The most (`busiest`) or least loaded of `nodes`, ties broken by address
+/// rank.
+fn pick(
+    load: &[usize],
+    rank: &[usize],
+    nodes: impl Iterator<Item = usize>,
+    busiest: bool,
+) -> Option<usize> {
+    if busiest {
+        nodes.max_by_key(|node| (load[*node], rank[*node]))
+    } else {
+        nodes.min_by_key(|node| (load[*node], rank[*node]))
+    }
 }
 
 /// CRC-32 (IEEE), the checksum Erlang's `erlang:crc32/1` computes.
@@ -462,12 +556,16 @@ mod tests {
 
     #[test]
     fn rebalance_target_rehomes_only_a_removed_nodes_copies() {
-        let old = cluster_of(4).shard_map_n("db", 8, 2);
+        let old = cluster_of(4).shard_map_n("db", 8, 1);
         let three = cluster_of(3);
-        let target = three.rebalance_target(&old, 2);
-        assert_target_invariants(&target, 3, 2);
+        let target = three.rebalance_target(&old, 1);
+        assert_target_invariants(&target, 3, 1);
         let on_removed = old.replicas.iter().flatten().filter(|n| **n == 3).count();
-        assert_eq!(moved_copies(&old, &target), on_removed);
+        assert_eq!(
+            moved_copies(&old, &target),
+            on_removed,
+            "{old:?} -> {target:?}"
+        );
         for (before, after) in old.replicas.iter().zip(&target.replicas) {
             for node in before.iter().filter(|node| **node != 3) {
                 assert!(after.contains(node), "{before:?} -> {after:?}");
