@@ -1,8 +1,7 @@
 //! Cluster placement: the static node list, the per-database shard map, and
-//! the rendezvous hashing that seeds new shard maps.
+//! the mem3-style balanced assignment that seeds new shard maps.
 
 use axum::http::HeaderMap;
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default)]
@@ -98,7 +97,8 @@ impl ShardMap {
 
     /// Evenly spread shard replicas across nodes. This is intentionally
     /// simple: for shard `s`, replica `k` goes to `(s + k) % node_count`.
-    /// Tests use it for a predictable placement; real placement is rendezvous.
+    /// Tests use it for a predictable placement; real placement is
+    /// `Cluster::shard_map_n`.
     #[cfg(test)]
     pub fn balanced(q: u32, node_count: usize, n: usize) -> ShardMap {
         let q = q.max(1);
@@ -151,20 +151,33 @@ impl Cluster {
     }
 
     /// A shard map with `n` copies of each shard, clamped to the node count.
-    pub fn shard_map_n(&self, _name: &str, q: u32, n: usize) -> ShardMap {
+    ///
+    /// Mirrors CouchDB's `mem3:choose_shards/3` and
+    /// `mem3_util:create_partition_map/5`: copies are dealt to the node list
+    /// in order, `n` per range, wrapping around, so every node holds the same
+    /// number of copies give or take one and no range has two copies on one
+    /// node. CouchDB starts the deal at a random node; here the start is
+    /// `crc32(name) % nodes` (as `mem3_util:rotate_list/2`), so every node
+    /// computes the same map for a given database name.
+    pub fn shard_map_n(&self, name: &str, q: u32, n: usize) -> ShardMap {
         let q = q.max(1);
         if self.nodes.is_empty() {
             return ShardMap::single(q);
         }
         let n = n.max(1).min(self.nodes.len());
+        // mem3:nodes() is sorted; sort here too so the map does not depend on
+        // the order the node list was configured in.
+        let mut order: Vec<usize> = (0..self.nodes.len()).collect();
+        order.sort_by(|a, b| self.nodes[*a].cmp(&self.nodes[*b]));
+        let start = crc32(name.as_bytes()) as usize % order.len();
         ShardMap {
             q,
             node_count: self.nodes.len(),
-            replicas: (0..q)
+            replicas: (0..q as usize)
                 .map(|shard| {
-                    let mut replicas = self.replicas_of_shard_ranked(shard);
-                    replicas.truncate(n);
-                    replicas
+                    (0..n)
+                        .map(|copy| order[(start + shard * n + copy) % order.len()])
+                        .collect()
                 })
                 .collect(),
             version: 0,
@@ -178,24 +191,6 @@ impl Cluster {
     /// Effective replication factor, clamped to the node count.
     pub fn replication_factor(&self) -> usize {
         self.n.max(1).min(self.nodes.len().max(1))
-    }
-
-    /// Every node, in rendezvous preference order for `shard`: the highest
-    /// scores of `(node, shard)` first. Only used to seed a database's
-    /// `ShardMap`; once created, the stored map is the source of truth for
-    /// placement.
-    fn replicas_of_shard_ranked(&self, shard: u32) -> Vec<usize> {
-        if self.nodes.is_empty() {
-            return vec![0];
-        }
-        let mut ranked: Vec<(u64, usize)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, node)| (score(node, shard), i))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        ranked.into_iter().map(|(_, i)| i).collect()
     }
 
     /// True only for a peer that presents the shared cluster secret. A client
@@ -236,9 +231,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn score(node: &str, shard: u32) -> u64 {
-    let digest = Md5::digest(format!("{node}#{shard}").as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().unwrap())
+/// CRC-32 (IEEE), the checksum Erlang's `erlang:crc32/1` computes.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]
@@ -406,42 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn replica_sets_are_stable_when_a_node_is_added() {
-        let three = cluster(1);
-        let four = Cluster {
-            nodes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-            me: 0,
-            n: 1,
-            secret: String::new(),
-        };
-        let moved = (0..200)
-            .filter(|shard| owner_of_shard(&three, *shard) != owner_of_shard(&four, *shard))
-            .count();
-        assert!(moved > 10 && moved < 100, "moved {moved} of 200 shards");
-
-        // With two replicas per shard, adding node d may only swap d into a
-        // replica set; the surviving members keep their copies.
-        let three = cluster(2);
-        let four = Cluster { n: 2, ..four };
-        let mut changed = 0;
-        for shard in 0..200 {
-            let before: std::collections::BTreeSet<usize> =
-                replicas_of_shard(&three, shard).into_iter().collect();
-            let after: std::collections::BTreeSet<usize> =
-                replicas_of_shard(&four, shard).into_iter().collect();
-            if before != after {
-                changed += 1;
-                assert!(after.contains(&3), "shard {shard}: {before:?} -> {after:?}");
-                assert_eq!(
-                    before.intersection(&after).count(),
-                    1,
-                    "shard {shard}: {before:?} -> {after:?}"
-                );
-            }
-        }
-        assert!(
-            changed > 10 && changed < 150,
-            "changed {changed} of 200 sets"
-        );
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
     }
 }

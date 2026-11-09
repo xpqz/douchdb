@@ -474,14 +474,11 @@ impl AppState {
             DbConfig {
                 q: q.unwrap_or(self.config.q),
                 revs_limit: self.config.revs_limit,
-                shard_map: self
-                    .ctx
-                    .cluster
-                    .shard_map_n(
-                        name,
-                        q.unwrap_or(self.config.q),
-                        n.unwrap_or(self.ctx.cluster.n),
-                    ),
+                shard_map: self.ctx.cluster.shard_map_n(
+                    name,
+                    q.unwrap_or(self.config.q),
+                    n.unwrap_or(self.ctx.cluster.n),
+                ),
                 partitioned,
             },
         )?);
