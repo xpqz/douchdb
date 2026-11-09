@@ -736,10 +736,7 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
         Ok(update_seq) => update_seq,
         Err(error) => return fail(error),
     };
-    if opts.keys.is_none()
-        && !req.st.ctx.cluster.is_clustered()
-        && !req.st.ctx.cluster.is_internal(req.headers)
-    {
+    if !req.st.ctx.cluster.is_clustered() && !req.st.ctx.cluster.is_internal(req.headers) {
         return stream_all_docs(&req, &opts, update_seq).await;
     }
     let result = run_all_docs(&req, &opts).await;
@@ -828,7 +825,7 @@ pub(super) async fn stream_json_response<T: serde::Serialize + Send + 'static>(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// `_all_docs` without `keys` on this node: the body is written while the
+/// `_all_docs` on this node: the body is written while the
 /// rows are read, so a listing of any size takes constant memory and the
 /// first bytes leave before the last row is read. The bytes are those of the
 /// buffered reply. An error on the first page still gets its status; one
@@ -838,17 +835,30 @@ async fn stream_all_docs(
     opts: &AllDocsOpts,
     update_seq: Option<Value>,
 ) -> Response {
-    let (head, rows) = match Db::all_docs_stream(req.db.clone(), opts).await {
-        Ok(stream) => stream,
-        Err(error) => return fail(error),
+    // A `keys` query answers one row per key and has no `offset`.
+    let (head, rows) = if opts.keys.is_some() {
+        match Db::all_docs_keys_stream(req.db.clone(), opts).await {
+            Ok((total_rows, rows)) => (
+                format!("{{\"total_rows\":{total_rows},\"offset\":null,\"rows\":["),
+                rows.boxed(),
+            ),
+            Err(error) => return fail(error),
+        }
+    } else {
+        match Db::all_docs_stream(req.db.clone(), opts).await {
+            Ok((head, rows)) => (
+                format!(
+                    "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+                    head.total_rows, head.offset
+                ),
+                rows.boxed(),
+            ),
+            Err(error) => return fail(error),
+        }
     };
     if !still_allowed(req.st, req.db, req.principal) {
         return access_denied(req.principal);
     }
-    let head = format!(
-        "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
-        head.total_rows, head.offset
-    );
     stream_json_response(req.method, head.into_bytes(), rows, rows_tail(update_seq)).await
 }
 

@@ -2015,12 +2015,12 @@ impl Db {
         Ok(docs)
     }
 
-    async fn all_docs_by_keys(
+    /// The `total_rows` of a `keys` query.
+    async fn keys_total_rows(
         &self,
         opts: &AllDocsOpts,
-        keys: &[Value],
         owned: Option<&ShardMask>,
-    ) -> DbResult<DocList> {
+    ) -> DbResult<u64> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
@@ -2043,18 +2043,62 @@ impl Db {
                 total_rows += count?;
             }
         }
+        Ok(total_rows)
+    }
 
-        let ordered_keys: Vec<Value> = if opts.descending {
-            keys.iter().rev().cloned().collect()
-        } else {
-            keys.to_vec()
+    async fn all_docs_by_keys(
+        &self,
+        opts: &AllDocsOpts,
+        keys: &[Value],
+        owned: Option<&ShardMask>,
+    ) -> DbResult<DocList> {
+        let total_rows = self.keys_total_rows(opts, owned).await?;
+        let page = keys_page(opts, keys);
+        Ok(DocList {
+            total_rows: Some(total_rows),
+            offset: None,
+            rows: self.keys_page_rows(opts, &page, owned).await?,
+            update_seq: None,
+        })
+    }
+
+    /// Like `all_docs` with `keys`, but the rows come back as a stream, a
+    /// chunk of keys at a time. The `total_rows` leads the reply.
+    pub(crate) async fn all_docs_keys_stream(
+        db: Arc<Db>,
+        opts: &AllDocsOpts,
+    ) -> DbResult<(u64, impl futures::Stream<Item = DbResult<DocListRow>>)> {
+        const CHUNK: usize = 256;
+        let keys = opts.keys.clone().unwrap_or_default();
+        let total_rows = db.keys_total_rows(opts, None).await?;
+        let page = keys_page(opts, &keys);
+        let opts = opts.clone();
+        let rows = async_stream::stream! {
+            for chunk in page.chunks(CHUNK) {
+                match db.keys_page_rows(&opts, chunk, None).await {
+                    Ok(rows) => {
+                        for row in rows {
+                            yield Ok(row);
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
         };
-        let page: Vec<Value> = ordered_keys
-            .iter()
-            .skip(opts.skip)
-            .take(opts.limit)
-            .cloned()
-            .collect();
+        Ok((total_rows, rows))
+    }
+
+    /// The rows for `page`, a run of the query's keys in the order they are
+    /// answered: one per key, a `not_found` row for a key with no document.
+    async fn keys_page_rows(
+        &self,
+        opts: &AllDocsOpts,
+        page: &[Value],
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Vec<DocListRow>> {
         let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut included = vec![false; page.len()];
         if opts.partition.is_some() {
@@ -2107,17 +2151,12 @@ impl Db {
             }
         }
 
-        Ok(DocList {
-            total_rows: Some(total_rows),
-            offset: None,
-            rows: results
-                .into_iter()
-                .enumerate()
-                .filter(|(slot, _)| included[*slot])
-                .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
-                .collect(),
-            update_seq: None,
-        })
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .filter(|(slot, _)| included[*slot])
+            .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
+            .collect())
     }
 
     /// The changes rows, the feed's last sequence, and how many changes remain
@@ -4756,6 +4795,17 @@ fn read_doc_rev(
 /// `startkey`, which is the shard's contribution to `offset`.
 /// How many live ids sort before the query's start key, in the query's
 /// direction: the `offset` of an `_all_docs` reply, before `skip`.
+/// The keys a query answers, in the order it answers them: reversed for
+/// `descending`, then past `skip` and up to `limit`.
+fn keys_page(opts: &AllDocsOpts, keys: &[Value]) -> Vec<Value> {
+    let ordered: Box<dyn Iterator<Item = &Value> + '_> = if opts.descending {
+        Box::new(keys.iter().rev())
+    } else {
+        Box::new(keys.iter())
+    };
+    ordered.skip(opts.skip).take(opts.limit).cloned().collect()
+}
+
 /// The `total_rows` of one shard: its live documents, or those of the query's
 /// partition or `count_range`.
 fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<u64> {

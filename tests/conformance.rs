@@ -2944,6 +2944,61 @@ async fn bulk_get_results_are_streamed_in_request_order() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// `_all_docs` with `keys` answers one row per key, in the order asked, and
+/// writes them as it reads them.
+#[tokio::test]
+async fn all_docs_with_keys_is_streamed_in_key_order() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("keystream").await;
+    let docs: Vec<Value> = (0..1000)
+        .map(|i| json!({"_id": format!("d{i:04}"), "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s.post("/keystream/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut keys: Vec<Value> = (0..1000).rev().map(|i| json!(format!("d{i:04}"))).collect();
+    keys.insert(500, json!("nope"));
+    keys.insert(600, json!(7));
+
+    let response = s
+        .client
+        .post(format!("{}/keystream/_all_docs?include_docs=true", s.base))
+        .json(&json!({"keys": keys}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "_all_docs with keys");
+    assert!(
+        body.starts_with("{\"total_rows\":1000,\"offset\":null,\"rows\":[{\"id\":\"d0999\",\"key\":\"d0999\",\"value\":{\"rev\":\"1-"),
+        "{}",
+        &body[..150]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    let rows = value["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1002);
+    assert_eq!(rows[500]["error"], "not_found");
+    assert_eq!(rows[500]["key"], "nope");
+    assert_eq!(rows[600]["key"], 7);
+    assert_eq!(rows[1001]["doc"]["_id"], "d0000");
+
+    // skip, limit and descending apply to the keys.
+    let (status, body) = s
+        .post(
+            "/keystream/_all_docs?descending=true&skip=1&limit=2",
+            json!({"keys": ["d0001", "d0002", "d0003", "d0004"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&Value> = body["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| &row["id"])
+        .collect();
+    assert_eq!(ids, [&json!("d0003"), &json!("d0002")]);
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts
