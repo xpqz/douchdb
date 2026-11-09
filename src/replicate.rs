@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Default)]
 pub struct PullOutcome {
     pub docs: usize,
+    /// `_changes` rows the peer sent, whether or not they were needed.
+    pub rows: usize,
     pub checkpoint: Option<Value>,
 }
 
@@ -58,6 +60,7 @@ pub async fn pull(
         .unwrap_or_else(|| json!(0));
 
     let mut total = 0usize;
+    let mut rows = 0usize;
     loop {
         // Between batches, so a stop leaves the checkpoint at the last whole
         // batch and the next pass resumes from there.
@@ -72,6 +75,7 @@ pub async fn pull(
         if results.is_empty() {
             break;
         }
+        rows += results.len();
 
         let (mut requested, mut reqs) = ctx.revisions_to_request(results)?;
         ctx.drop_purged(&mut requested, &mut reqs).await?;
@@ -96,6 +100,7 @@ pub async fn pull(
     }
     Ok(PullOutcome {
         docs: total,
+        rows,
         checkpoint: Some(since),
     })
 }
@@ -560,6 +565,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                             &name,
                             &peer,
                             outcome.docs as u64,
+                            outcome.rows as u64,
                             outcome.checkpoint,
                         );
                         Ok(outcome.docs)

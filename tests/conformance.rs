@@ -9035,6 +9035,128 @@ async fn cluster_anti_entropy_converges_without_client_reads() {
     }
 }
 
+/// Documents a node itself stores: a forwarded `_all_docs` reads only the
+/// node's own shards.
+async fn locally_stored_ids(node: &Server, db: &str) -> Vec<String> {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_all_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    response["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `_changes` rows `node`'s anti-entropy has received since it started.
+async fn replication_rows(node: &Server) -> u64 {
+    let (_, status) = node.get("/_node/_local/_replication").await;
+    status["rows"].as_u64().expect("rows counter")
+}
+
+/// Store `docs` on `node` alone, as a write forwarded by a peer does.
+async fn write_to_one_node(node: &Server, db: &str, docs: Vec<Value>) {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_bulk_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// With q=4, n=1 on three nodes, a node owns one or two shards. Its
+/// anti-entropy pass asks a peer for those shards only, so of the 40 documents
+/// stored on node 0 it is sent just the ones of its own shards, and reads
+/// nothing again once its checkpoint is at the end.
+#[tokio::test]
+async fn cluster_anti_entropy_receives_only_rows_of_owned_shards() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("aeown").await;
+    }
+    let docs: Vec<Value> = (0..40).map(|i| json!({"_id": format!("o{i}")})).collect();
+    write_to_one_node(&nodes[0], "aeown", docs).await;
+    assert!(locally_stored_ids(&nodes[1], "aeown").await.is_empty());
+
+    let before = replication_rows(&nodes[1]).await;
+    sync_node(&nodes[1], "aeown").await;
+    let received = replication_rows(&nodes[1]).await - before;
+    let kept = locally_stored_ids(&nodes[1], "aeown").await.len();
+    assert!(kept > 0 && kept < 40, "node 1 kept {kept} of 40");
+    assert_eq!(
+        received, kept as u64,
+        "node 1 was sent rows of shards it does not own"
+    );
+
+    let before = replication_rows(&nodes[1]).await;
+    sync_node(&nodes[1], "aeown").await;
+    assert_eq!(replication_rows(&nodes[1]).await, before);
+}
+
+/// A design document stored on a node that does not own its shard still
+/// reaches every node, through a feed of its own with its own checkpoint, and
+/// a restarted node does not read that feed again from the start. The design
+/// feed carries design documents only.
+#[tokio::test]
+async fn cluster_design_docs_reach_every_node_and_the_design_checkpoint_persists() {
+    let mut nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("aedes").await;
+    }
+    let designs: Vec<Value> = (0..6)
+        .map(|i| json!({"_id": format!("_design/d{i}"), "views": {}}))
+        .collect();
+    write_to_one_node(&nodes[0], "aedes", designs).await;
+    let plain: Vec<Value> = (0..12).map(|i| json!({"_id": format!("p{i}")})).collect();
+    write_to_one_node(&nodes[0], "aedes", plain).await;
+
+    // Node 2 sees node 0 only: node 1 holds nothing yet. Of node 0's eighteen
+    // documents it is sent the six design documents, owned shard or not, and
+    // each once, and the plain ones of its own shards.
+    let before = replication_rows(&nodes[2]).await;
+    sync_node(&nodes[2], "aedes").await;
+    let received = replication_rows(&nodes[2]).await - before;
+    let ids = locally_stored_ids(&nodes[2], "aedes").await;
+    let owned_plain = ids.iter().filter(|id| !id.starts_with("_design/")).count();
+    assert!(owned_plain < 12, "every plain document is node 2's");
+    assert_eq!(received, 6 + owned_plain as u64);
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
+    }
+
+    sync_node(&nodes[1], "aedes").await;
+    let ids = locally_stored_ids(&nodes[1], "aedes").await;
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
+    }
+
+    // Node 1 now offers the same documents; read them too, so that every feed
+    // of node 2 is at its end. After a restart the checkpoints hold: a pass
+    // reads no row at all.
+    sync_node(&nodes[2], "aedes").await;
+    nodes[2].restart();
+    sync_node(&nodes[2], "aedes").await;
+    assert_eq!(replication_rows(&nodes[2]).await, 0);
+    let ids = locally_stored_ids(&nodes[2], "aedes").await;
+    for i in 0..6 {
+        assert!(ids.contains(&format!("_design/d{i}")), "{ids:?}");
+    }
+}
+
 #[tokio::test]
 async fn replication_source_and_target_agree_after_convergence() {
     let nodes = start_cluster_with(2, "1", 2);
