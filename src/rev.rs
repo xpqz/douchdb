@@ -77,51 +77,25 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// An attachment as CouchDB sees it when hashing: name, type and md5 only.
-/// Storing the bytes is somebody else's problem.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Attachment {
-    pub name: String,
-    pub content_type: String,
-    pub md5: [u8; 16],
-}
-
 /// Compute a new revision id, exactly as `couch_db:new_revid/1` does.
 ///
 /// `body` must already have `_id`, `_rev`, `_revisions`, `_deleted`,
 /// `_attachments` and the other metadata fields removed, and must retain the
 /// key order it arrived in.
-pub fn new_revid(
-    deleted: bool,
-    parent: Option<&Rev>,
-    body: &Value,
-    attachments: &[Attachment],
-) -> [u8; 16] {
+pub fn new_revid(deleted: bool, parent: Option<&Rev>, body: &Value) -> [u8; 16] {
     let old_start = parent.map(|r| r.pos).unwrap_or(0);
     let old_rev = match parent {
         Some(r) => Term::Binary(r.id.clone()),
         None => Term::Int(0),
     };
 
-    // Erlang's foldl prepends, so the list reaches the hash reversed.
-    let atts = attachments
-        .iter()
-        .rev()
-        .map(|att| {
-            Term::Tuple(vec![
-                Term::Binary(att.name.as_bytes().to_vec()),
-                Term::Binary(att.content_type.as_bytes().to_vec()),
-                Term::Binary(att.md5.to_vec()),
-            ])
-        })
-        .collect();
-
     let term = Term::List(vec![
         Term::Atom(if deleted { "true" } else { "false" }),
         Term::Int(old_start as i64),
         old_rev,
         etf::from_json(body),
-        Term::List(atts),
+        // The attachment list: always empty, as douchdb stores none.
+        Term::List(Vec::new()),
     ]);
 
     Md5::digest(term.encode()).into()
@@ -170,10 +144,10 @@ mod tests {
     fn revid_is_deterministic_and_order_sensitive() {
         let body = json!({"x": 1, "y": 2});
         let reordered = json!({"y": 2, "x": 1});
-        let a = new_revid(false, None, &body, &[]);
-        assert_eq!(a, new_revid(false, None, &body, &[]));
-        assert_ne!(a, new_revid(false, None, &reordered, &[]));
-        assert_ne!(a, new_revid(true, None, &body, &[]));
+        let a = new_revid(false, None, &body);
+        assert_eq!(a, new_revid(false, None, &body));
+        assert_ne!(a, new_revid(false, None, &reordered));
+        assert_ne!(a, new_revid(true, None, &body));
     }
 
     #[test]
@@ -181,24 +155,9 @@ mod tests {
         let body = json!({"x": 1});
         let parent = Rev::parse("1-aabbccddeeff00112233445566778899").unwrap();
         assert_ne!(
-            new_revid(false, Some(&parent), &body, &[]),
-            new_revid(false, None, &body, &[])
+            new_revid(false, Some(&parent), &body),
+            new_revid(false, None, &body)
         );
-    }
-
-    #[test]
-    fn attachments_participate_by_digest_only() {
-        let body = json!({"x": 1});
-        let att = Attachment {
-            name: "a.txt".into(),
-            content_type: "text/plain".into(),
-            md5: [7u8; 16],
-        };
-        let plain = new_revid(false, None, &body, &[]);
-        let with_att = new_revid(false, None, &body, std::slice::from_ref(&att));
-        assert_ne!(plain, with_att);
-        assert_eq!(with_att, new_revid(false, None, &body, &[att]));
-        assert_ne!(hex16(plain), hex16(with_att));
     }
 
     /// Revs recorded from a live Apache CouchDB 3.5.3 (`PUT /db/doc`).
@@ -217,7 +176,7 @@ mod tests {
             (json!({"a": [0, 255]}), "ebdd13a7ecf6387443aa094a0d18b4d6"),
         ];
         for (body, expected) in cases {
-            let got = hex16(new_revid(false, None, &body, &[]));
+            let got = hex16(new_revid(false, None, &body));
             assert_eq!(got, expected, "body {body}");
         }
     }
@@ -235,7 +194,7 @@ mod tests {
         ];
         for (raw, expected) in cases {
             let body = crate::json::from_slice(raw.as_bytes()).unwrap();
-            let got = hex16(new_revid(false, None, &body, &[]));
+            let got = hex16(new_revid(false, None, &body));
             assert_eq!(got, expected, "body {raw}");
         }
     }

@@ -788,9 +788,9 @@ pub(crate) async fn rebalance(
     }
     crate::telemetry::record_rebalance_started();
     let old_map = db.shard_map();
-    // The placement creation uses, so a cluster that has not changed since the
-    // database was made is already where it should be.
-    let map = ctx.cluster.shard_map_n(db.q, old_map.n());
+    // The old placement with as few copies moved as the current nodes need, so
+    // a cluster that has not changed (and is already balanced) moves nothing.
+    let map = ctx.cluster.rebalance_target(&old_map, old_map.n());
     let value = if map.q == old_map.q
         && map.node_count == old_map.node_count
         && map.replicas == old_map.replicas

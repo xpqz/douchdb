@@ -344,11 +344,10 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
         Ok(value) => value,
         Err(error) => return fail(error),
     };
-    let attachments = flag(q, "attachments");
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
     let latest = flag(q, "latest");
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
-        return match db.bulk_get(&value, attachments, revs, latest).await {
+        return match db.bulk_get(&value, revs, latest).await {
             Ok(results) => json_of(StatusCode::OK, &results),
             Err(e) => fail(e),
         };
@@ -375,13 +374,10 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             async move {
                 let sub = json!({"docs": subdocs});
                 let result = if node == st.ctx.cluster.me {
-                    db.bulk_get(&sub, attachments, revs, latest).await
+                    db.bulk_get(&sub, revs, latest).await
                 } else {
                     let peer = st.ctx.cluster.nodes[node].clone();
                     let mut query = format!("revs={revs}");
-                    if attachments {
-                        query.push_str("&attachments=true");
-                    }
                     if latest {
                         query.push_str("&latest=true");
                     }
@@ -575,7 +571,6 @@ fn all_docs_opts(
         partition,
         include_docs: flag(q, "include_docs"),
         conflicts: flag(q, "conflicts"),
-        attachments: flag(q, "attachments"),
         startkey,
         endkey,
         descending: flag(q, "descending"),

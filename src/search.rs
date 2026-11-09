@@ -1592,7 +1592,7 @@ async fn page_rows(
 ) -> DbResult<Vec<Value>> {
     let docs = if request.include_docs {
         let ids: Vec<String> = page.iter().map(|doc| doc.id.clone()).collect();
-        crate::view::docs_by_ids(db, false, &ids).await?
+        crate::view::docs_by_ids(db, &ids).await?
     } else {
         HashMap::new()
     };

@@ -556,8 +556,10 @@ router; there is no coordinator role.
   `PUT /db?q=8&n=2` as in CouchDB, otherwise `--q` and `--n`. `GET /db`
   reports them in `cluster`, with the default write and read quorums
   (`n/2 + 1`) that writes and reads to that database use.
-- `md5(docid)` selects the shard; rendezvous hashing over the node list selects
-  `--n` distinct replicas, in preference order. The first is the primary.
+- `md5(docid)` selects the shard. A new database's shard copies are dealt
+  round-robin over the sorted node list, as CouchDB's mem3 does, starting at a
+  node chosen from the database name, so every node holds within one copy of
+  the same number. The first replica of a shard is its primary.
 - A write is sent to every replica in the shard set and returns once the
   requested quorum acknowledges; the remaining writes continue detached. Reads
   fan out to the replica set and enforce the requested read quorum; `?r=1` is the
@@ -658,8 +660,9 @@ served per protocol under `http.internal_requests` in
 
 - **Static membership.** There is no gossip or automatic join. Discovery
   reports peers and drift, but it does not change placement. To change the
-  node list, restart every node with the new list. Rendezvous hashing and
-  anti-entropy copy data to new replicas; `rebalance` verifies
+  node list, restart every node with the new list, then `rebalance`: it keeps
+  every copy it can and moves only enough to re-home copies from departed
+  nodes and even out per-node counts. Anti-entropy copies the data; `rebalance` verifies
   revision-metadata digests before activation, and destructive cleanup requires
   `?cleanup=true`.
 - **AP by default, but not unconditionally available.** Concurrent writes
@@ -993,14 +996,22 @@ It covers a clean SIGKILL, kill during compaction, truncated tables, bit
 flips, a removed table and a truncated manifest. Each scenario must preserve
 all acknowledged documents or refuse to serve them.
 
+A document whose metadata record is corrupt cannot be read or overwritten
+(the error says so), and listings skip it. To repair it, purge it:
+`POST /db/_purge` with `{"<id>": ["<any rev>"]}` removes the record and all
+its revision bodies whatever revisions the request lists, and records the
+purge like any other. Compaction leaves such a record in place, logs it at
+warn level with the database, shard and document id, and counts it in
+`storage.corrupt_records_skipped`, so it no longer blocks the rest of the
+shard.
+
 ## Status and limits
 
 v0.2: the replication protocol, auth, views, search, multiuser admission, a
 Q-shard × N-replica cluster with anti-entropy, and the embedded console are
 implemented and tested. Attachments are deliberately not supported; documents
-containing `_attachments` are rejected with a 400 `bad_request`. Attachments
-that a database written before v0.2 may still hold stay readable (stubs and
-`attachments=true`, with checked chunk reads) but no attachment can be added or changed.
+containing `_attachments` are rejected with a 400 `bad_request`, and nothing is
+stored for them.
 
 JSON numbers use arbitrary precision: integers beyond `i64`/`u64` are stored
 exactly and hashed with CouchDB's bignum ETF encoding. Document parsing also

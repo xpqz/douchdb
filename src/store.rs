@@ -70,12 +70,6 @@ pub fn body_key(docid: &str, rev: &str) -> Vec<u8> {
     key(b"d/", &format!("{docid}/{rev}"))
 }
 
-pub fn blob_prefix(digest: &str, chunk: u32) -> Vec<u8> {
-    let mut out = key(b"b/", &format!("{digest}/"));
-    out.extend_from_slice(&chunk.to_be_bytes());
-    out
-}
-
 /// Big-endian so byte order is numeric order.
 pub fn seq_key(seq: u64) -> Vec<u8> {
     let mut out = b"s/".to_vec();
@@ -100,27 +94,15 @@ fn key(prefix: &[u8], rest: &str) -> Vec<u8> {
     out
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AttMeta {
-    pub content_type: String,
-    /// Lowercase hex md5 of the content.
-    pub digest: String,
-    pub length: u64,
-    pub revpos: u64,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
-    /// revision -> attachments in document order (order is part of the hash)
-    pub atts: BTreeMap<String, Vec<(String, AttMeta)>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct LiveDoc {
     pub rev: String,
-    pub has_attachments: bool,
 }
 
 /// Counts plus an optional content digest for rebalance verification.
@@ -274,6 +256,13 @@ impl Tx {
         self.ops.push((key.to_vec(), None));
     }
 
+    /// Delete a metadata record that cannot be decoded. Its old state is
+    /// unknown, so the commit leaves the counters alone; the caller recounts.
+    fn delete_corrupt_meta(&mut self, key: &[u8]) {
+        self.known.insert(self.ops.len(), (None, None));
+        self.delete(key);
+    }
+
     /// Write a document's metadata record, saying what the document's state
     /// was in the shard before (`old`) and is after the write (`new`), so the
     /// commit need not decode either. `old` must be the state of the record
@@ -392,18 +381,13 @@ pub struct Shard {
 }
 
 /// What a document's metadata says about it: the winning revision, whether it
-/// is live, and whether that revision has attachments.
-pub(crate) type MetaState = (String, bool, bool);
+/// is live.
+pub(crate) type MetaState = (String, bool);
 
 pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
-        let has_attachments = meta
-            .atts
-            .get(&winner)
-            .map(|atts| !atts.is_empty())
-            .unwrap_or(false);
-        (winner, live, has_attachments)
+        (winner, live)
     })
 }
 
@@ -443,6 +427,20 @@ impl ShardName {
             doc_id = %id,
             error = %error,
             "skipping corrupt record"
+        );
+        crate::telemetry::record_corrupt_record_skipped();
+    }
+}
+
+impl ShardName {
+    /// Log and count a corrupt record that compaction leaves in place.
+    fn report_compaction_skip(&self, id: &str, error: &dyn std::fmt::Display) {
+        tracing::warn!(
+            db = %self.db,
+            shard = %self.shard,
+            doc_id = %id,
+            error = %error,
+            "compaction is leaving a corrupt record in place; purge the document to repair it"
         );
         crate::telemetry::record_corrupt_record_skipped();
     }
@@ -559,8 +557,8 @@ impl Shard {
                     }
                     let (_, meta) = parse_meta(&key, &value)?;
                     match meta_state(&meta) {
-                        Some((_, true, _)) => docs += 1,
-                        Some((_, false, _)) => deleted += 1,
+                        Some((_, true)) => docs += 1,
+                        Some((_, false)) => deleted += 1,
                         None => {}
                     }
                     if !iter.advance() {
@@ -648,7 +646,7 @@ impl Shard {
             hasher.update(b"doc");
             hasher.update(id.as_bytes());
             match meta_state(&meta) {
-                Some((winner, live, _)) => {
+                Some((winner, live)) => {
                     hasher.update(winner.as_bytes());
                     hasher.update([live as u8]);
                 }
@@ -660,21 +658,6 @@ impl Shard {
                 hasher.update(b"leaf");
                 hasher.update(leaf.as_bytes());
                 hasher.update([meta.tree.is_deleted(&leaf) as u8]);
-            }
-            for (rev, atts) in &meta.atts {
-                // Empty attachment vectors can differ between replicas without
-                // changing the document content.
-                if atts.is_empty() {
-                    continue;
-                }
-                hasher.update(b"att");
-                hasher.update(rev.as_bytes());
-                for (name, att) in atts {
-                    hasher.update(name.as_bytes());
-                    hasher.update(att.digest.as_bytes());
-                    hasher.update(att.length.to_be_bytes());
-                    hasher.update(att.revpos.to_be_bytes());
-                }
             }
             documents += 1;
             if !iter.advance() {
@@ -722,7 +705,7 @@ impl Shard {
         self.scan_range_while(prefix.as_bytes(), None, false, |key, value| {
             match parse_meta(key, value) {
                 Ok((_, meta)) => {
-                    if let Some((_, live, _)) = meta_state(&meta) {
+                    if let Some((_, live)) = meta_state(&meta) {
                         if live {
                             docs += 1;
                         } else {
@@ -750,14 +733,8 @@ impl Shard {
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
                     Ok((id, meta)) => {
-                        if let Some((rev, true, has_attachments)) = meta_state(&meta) {
-                            live.insert(
-                                id,
-                                LiveDoc {
-                                    rev,
-                                    has_attachments,
-                                },
-                            );
+                        if let Some((rev, true)) = meta_state(&meta) {
+                            live.insert(id, LiveDoc { rev });
                         }
                     }
                     Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
@@ -1038,6 +1015,67 @@ impl Shard {
         Ok(out)
     }
 
+    /// Remove a document whose metadata record cannot be decoded: the record,
+    /// its sequence entry and its revision bodies, and recount the document
+    /// counters, which the record's old state can no longer correct. The
+    /// purge is recorded as `info`. Bodies of a revision that itself contains
+    /// a `/` cannot be told from another document's here; compaction removes
+    /// them as orphans.
+    pub fn purge_corrupt(&mut self, id: &str, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
+        let mut tx = Tx::new();
+        let body_prefix = format!("d/{id}/");
+        let mut keys = Vec::new();
+        self.scan_range_while(body_prefix.as_bytes(), None, false, |key, _| {
+            if key
+                .get(body_prefix.len()..)
+                .is_some_and(|rev| !rev.contains(&b'/'))
+            {
+                keys.push(key.to_vec());
+            }
+            true
+        })?;
+        self.scan_range_while(b"s/", None, false, |key, value| {
+            if value == id.as_bytes() {
+                keys.push(key.to_vec());
+            }
+            true
+        })?;
+        for key in keys {
+            tx.delete(&key);
+        }
+        tx.delete_corrupt_meta(&meta_key(id));
+        self.record_purge(&mut tx, info, peers)?;
+        self.commit(tx)?;
+
+        let (mut docs, mut deleted) = (0u64, 0u64);
+        self.scan_range_while(b"m/", None, false, |key, value| {
+            if let Ok((_, meta)) = parse_meta(key, value) {
+                match meta_state(&meta) {
+                    Some((_, true)) => docs += 1,
+                    Some((_, false)) => deleted += 1,
+                    None => {}
+                }
+            }
+            true
+        })?;
+        if (docs, deleted) != (self.docs, self.deleted) {
+            self.docs = docs;
+            self.deleted = deleted;
+            for (key, value) in [
+                (b"z/doc_count".as_slice(), docs),
+                (b"z/doc_deleted_count".as_slice(), deleted),
+            ] {
+                let value = value.to_be_bytes().to_vec();
+                self.overlay.insert(key.to_vec(), Some(value.clone()));
+                self.pending.push((key.to_vec(), Some(value)));
+            }
+        }
+        self.live = None;
+        self.rank_cursor = None;
+        self.latest = None;
+        Ok(())
+    }
+
     pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {
         let Some(bytes) = self.get_checked(&meta_key(docid))? else {
             return Ok(None);
@@ -1236,12 +1274,12 @@ impl Shard {
         let mut deleted = self.deleted as i64;
         for ((key, value), state) in tx.ops.into_iter().zip(states) {
             if let Some((old_state, new_state)) = state {
-                match old_state.as_ref().map(|(_, live, _)| *live) {
+                match old_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
                     None => {}
                 }
-                match new_state.as_ref().map(|(_, live, _)| *live) {
+                match new_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs += 1,
                     Some(false) => deleted += 1,
                     None => {}
@@ -1249,14 +1287,8 @@ impl Shard {
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = doc_id_from_meta_key(&key) {
                         let (was_live, is_live) = match new_state {
-                            Some((rev, true, has_attachments)) => {
-                                let old = live.insert(
-                                    id.to_string(),
-                                    LiveDoc {
-                                        rev,
-                                        has_attachments,
-                                    },
-                                );
+                            Some((rev, true)) => {
+                                let old = live.insert(id.to_string(), LiveDoc { rev });
                                 (old.is_some(), true)
                             }
                             _ => (live.remove(id).is_some(), false),
@@ -1447,6 +1479,9 @@ impl Shard {
         // Memory stays bounded: each round reads at most BODY_SWEEP_BATCH body
         // keys, deletes the stale ones and resumes after the last key seen.
         let mut start = b"d/".to_vec();
+        // Documents whose corrupt metadata was already reported this sweep.
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        let name = self.name.clone();
         loop {
             let mut keys = Vec::new();
             self.scan_range_while(b"d/", Some(&start), false, |key, _| {
@@ -1475,9 +1510,20 @@ impl Shard {
                 for (at, _) in rest.match_indices('/') {
                     let (id, rev) = (&rest[..at], &rest[at + 1..]);
                     if !leaves.contains_key(id) {
-                        let found = self
-                            .get_meta(id)?
-                            .map(|meta| meta.tree.leaves().into_iter().collect());
+                        // A record that cannot be decoded cannot say which
+                        // bodies are stale: keep them all, report it once and
+                        // carry on with the rest of the shard.
+                        let found = match self.get_meta(id) {
+                            Ok(meta) => meta.map(|meta| meta.tree.leaves().into_iter().collect()),
+                            Err(error) => {
+                                let corrupt = error.downcast::<crate::error::CorruptRecord>()?;
+                                if reported.insert(id.to_string()) {
+                                    name.report_compaction_skip(id, &corrupt);
+                                }
+                                is_leaf = true;
+                                break;
+                            }
+                        };
                         leaves.insert(id.to_string(), found);
                     }
                     if leaves
@@ -1901,11 +1947,7 @@ mod scan_tests {
         let rev = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[rev], deleted);
-        DocMeta {
-            tree,
-            seq,
-            atts: BTreeMap::new(),
-        }
+        DocMeta { tree, seq }
     }
 
     #[test]
@@ -1916,11 +1958,7 @@ mod scan_tests {
             let edges: BTreeMap<&str, Option<&str>> = edges.iter().copied().collect();
             let tree: RevTree =
                 serde_json::from_value(serde_json::json!({"edges": edges, "deleted": []})).unwrap();
-            DocMeta {
-                tree,
-                seq: 1,
-                atts: BTreeMap::new(),
-            }
+            DocMeta { tree, seq: 1 }
         };
         let mut tx = Tx::new();
         // The only leaf of "doc" has a '/' in its revision id.
@@ -1975,11 +2013,7 @@ mod scan_tests {
         let new = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[old.clone(), new.clone()], false);
-        let doc_meta = DocMeta {
-            tree,
-            seq: 1,
-            atts: BTreeMap::new(),
-        };
+        let doc_meta = DocMeta { tree, seq: 1 };
         // Ids with '/' sort between and around each other's keys.
         let ids = ["a", "a/b", "a/b/c", "a0", "b", "b/", "c", "d/e", "e", "f"];
         let mut tx = Tx::new();
@@ -2218,14 +2252,14 @@ mod scan_tests {
     }
 
     #[test]
-    fn compaction_deletes_nothing_for_a_corrupt_metadata_record() {
+    fn compaction_skips_a_corrupt_metadata_record_and_keeps_its_bodies() {
         let dir = temp_shard_dir("corrupt-compact");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         // A stale-looking body next to an unreadable metadata record: the
-        // sweep cannot know it is stale, so it must keep it and fail.
+        // sweep cannot know it is stale, so it must keep it and carry on.
         shard.put_raw(&meta_key("bad"), b"{not json");
         shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
-        assert!(shard.compact().is_err());
+        shard.compact().unwrap();
         assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
