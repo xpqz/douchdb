@@ -175,7 +175,7 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
         },
         Ordering::SeqCst,
     );
-    MAX_WORKERS.store(workers.clamp(1, 64), Ordering::SeqCst);
+    MAX_WORKERS.store(workers, Ordering::SeqCst);
 }
 
 /// Select the wasm runtime. Returns an error when Wasmtime was requested but
@@ -826,6 +826,14 @@ impl Worker {
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for Worker {
+    /// A worker that is dropped, including by a panicking test, must not leave
+    /// its child running. `kill` is idempotent for an already reaped child.
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 

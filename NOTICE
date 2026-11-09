@@ -12,3 +12,11 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+This product includes data derived from Apache CouchDB
+(https://couchdb.apache.org/), Copyright The Apache Software Foundation,
+licensed under the Apache License, Version 2.0:
+
+  * src/hll/bias.rs: the precision-11 HyperLogLog++ raw-estimate and bias
+    tables from CouchDB's couch_hyper (originally from the appendix of
+    Heule, Nunkesser and Hall, "HyperLogLog in Practice", EDBT 2013).

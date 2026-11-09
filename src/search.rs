@@ -1761,6 +1761,31 @@ mod tests {
         assert_eq!(query_terms("İstanbul"), ["i\u{307}stanbul"]);
     }
 
+    /// `str::to_lowercase` maps a word-final "Σ" to "ς", but tantivy's
+    /// `LowerCaser` (the filter in the analyzer that indexes the text)
+    /// deliberately lowercases per character, giving "σ". Query terms and
+    /// highlighting must agree with the analyzer, not with the std function.
+    #[test]
+    fn final_sigma_lowercases_as_the_indexing_analyzer_does() {
+        let mut analyzer = tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+        let mut indexed = Vec::new();
+        analyzer
+            .token_stream("ΟΔΟΣ ΣΟΦΟΣ")
+            .process(&mut |token| indexed.push(token.text.clone()));
+        assert_eq!(indexed, ["οδοσ", "σοφοσ"]);
+        // The std function would give a final sigma, which the analyzer never indexes.
+        assert_eq!("ΟΔΟΣ".to_lowercase(), "οδος");
+        assert_eq!(query_terms("ΟΔΟΣ"), indexed[..1]);
+
+        let terms = query_terms("ΟΔΟΣ");
+        let fragments = highlight_fragment("η ΟΔΟΣ και οδοσ", &terms, "<b>", "</b>", 100, 1);
+        assert_eq!(fragments, ["η <b>ΟΔΟΣ</b> και οδοσ"]);
+    }
+
     #[test]
     fn query_terms_strip_quotes_from_field_qualified_phrases() {
         assert_eq!(query_terms("item:\"CAFÉ\""), ["café"]);

@@ -8,12 +8,12 @@ use crate::db::{
     attachments_unsupported, validate_doc, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult,
     DocOpts,
 };
+use crate::dbname::{illegal_db_name, valid_db_name};
 use crate::fabric::*;
 pub(crate) use crate::params::{
     doc_ids_from, doc_opts, flag, json_body, json_or_string_param, json_param, lenient_json_param,
     num, resolve_changes_filter,
 };
-use crate::state::{illegal_db_name, valid_db_name};
 pub use crate::state::{AppState, Config, DbUpdates};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -265,13 +265,6 @@ fn parse_shard_mask(raw: &str, q: u32) -> Option<ShardMask> {
     Some(mask)
 }
 
-/// True for a request a peer already routed. Such requests are served from the
-/// local node's shards: re-running the fan-out on the receiving side would send
-/// the request straight back and loop.
-pub(crate) fn is_forwarded(st: &AppState, headers: &HeaderMap) -> bool {
-    st.ctx.cluster.is_internal(headers)
-}
-
 /// The `update_seq` a query reports with `update_seq=true`. In a cluster it is
 /// the opaque vector `GET /db` reports, so it works as a `_changes` since;
 /// otherwise it is this node's sequence, as `GET /db` reports it.
@@ -281,7 +274,7 @@ async fn query_update_seq(
     name: &str,
     headers: &HeaderMap,
 ) -> DbResult<Value> {
-    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         let (seq, _) = cluster_seq_tokens(ClusterRead {
             ctx: &st.ctx,
             db,

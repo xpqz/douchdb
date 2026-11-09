@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Default)]
 pub struct PullOutcome {
@@ -37,6 +38,7 @@ pub async fn pull(
     client: &reqwest::Client,
     cluster: &Cluster,
     auth: Option<&Auth>,
+    shutdown: &CancellationToken,
 ) -> Result<PullOutcome> {
     let ctx = PullCtx {
         db,
@@ -57,6 +59,11 @@ pub async fn pull(
 
     let mut total = 0usize;
     loop {
+        // Between batches, so a stop leaves the checkpoint at the last whole
+        // batch and the next pass resumes from there.
+        if shutdown.is_cancelled() {
+            break;
+        }
         let resp = ctx.fetch_changes_batch(&since).await?;
         let results = resp
             .get("results")
@@ -524,6 +531,9 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
         .await;
     let mut error: Option<String> = None;
     for name in names {
+        if state.shutdown.is_cancelled() {
+            break;
+        }
         let Ok(db) = state.db_cold(&name).await else {
             continue;
         };
@@ -540,6 +550,7 @@ pub async fn sync_once(state: Arc<AppState>, only_db: Option<String>) -> bool {
                     &state.ctx.client,
                     &state.ctx.cluster,
                     state.ctx.auth.as_ref(),
+                    &state.shutdown,
                 )
                 .await;
                 match result {
@@ -679,6 +690,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A pull stops between batches once shutdown starts, instead of draining
+    /// the peer: with the token already cancelled it asks for no changes.
+    #[tokio::test]
+    async fn pull_stops_between_batches_on_shutdown() {
+        async fn asked(State(asked): State<Arc<AtomicBool>>) -> Json<Value> {
+            asked.store(true, Ordering::SeqCst);
+            Json(json!({"results": [], "last_seq": 0}))
+        }
+        let root = std::env::temp_dir().join(format!("douchdb-stop-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "ae",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 100,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .expect("db");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let changes_asked = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route("/ae/_peer_purged_infos", get(no_purges))
+            .route("/ae/_changes", get(asked))
+            .with_state(changes_asked.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let peer = format!("http://{addr}");
+        let cluster = Cluster {
+            nodes: vec![peer.clone()],
+            me: 0,
+            n: 1,
+            secret: "test-secret".to_string(),
+        };
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let outcome = pull(
+            &db,
+            &peer,
+            &reqwest::Client::new(),
+            &cluster,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a stopped pull is not an error");
+        assert_eq!(outcome.docs, 0);
+        assert!(
+            !changes_asked.load(Ordering::SeqCst),
+            "a cancelled pull still asked for changes"
+        );
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn partial_bulk_get_does_not_advance_the_checkpoint() {
         let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
@@ -718,7 +790,15 @@ mod tests {
         };
         let client = reqwest::Client::new();
 
-        let first = pull(&db, &peer, &client, &cluster, None).await;
+        let first = pull(
+            &db,
+            &peer,
+            &client,
+            &cluster,
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
         let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
@@ -726,9 +806,16 @@ mod tests {
             "checkpoint advanced past a missing revision"
         );
 
-        let second = pull(&db, &peer, &client, &cluster, None)
-            .await
-            .expect("second pass");
+        let second = pull(
+            &db,
+            &peer,
+            &client,
+            &cluster,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("second pass");
         assert_eq!(second.checkpoint, Some(json!(2)));
         assert!(db
             .get_doc("b", &crate::db::DocOpts::default())
@@ -818,9 +905,16 @@ mod tests {
             secret: "test-secret".to_string(),
         };
         let auth = Auth::new("node".to_string(), "pw".to_string(), b"k".to_vec());
-        pull(&db, &peer, &reqwest::Client::new(), &cluster, Some(&auth))
-            .await
-            .expect("pull");
+        pull(
+            &db,
+            &peer,
+            &reqwest::Client::new(),
+            &cluster,
+            Some(&auth),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("pull");
 
         use base64::Engine;
         let basic = format!(

@@ -10,6 +10,7 @@ use futures::future::join_all;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Apply a security object locally and push it to every peer.
 ///
@@ -275,6 +276,20 @@ impl Backoff {
     }
 }
 
+/// Wait out `delay`, or fail the moment shutdown starts: a rebalance poll must
+/// not hold the shutdown until its own deadline. Callers release the freeze
+/// through their usual error path.
+async fn pause(delay: std::time::Duration, shutdown: &CancellationToken) -> DbResult<()> {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => Ok(()),
+        () = shutdown.cancelled() => Err(ApiError::new(
+            503,
+            "shutting_down",
+            "the node is shutting down",
+        )),
+    }
+}
+
 fn remaining(deadline: std::time::Instant) -> std::time::Duration {
     deadline.saturating_duration_since(std::time::Instant::now())
 }
@@ -325,6 +340,7 @@ async fn stable_source_states(
     old_map: &ShardMap,
     headers: &HeaderMap,
     grace: std::time::Duration,
+    shutdown: &CancellationToken,
 ) -> DbResult<Vec<ShardState>> {
     let deadline = std::time::Instant::now() + grace;
     let owners = owners_of(&[old_map]);
@@ -341,7 +357,7 @@ async fn stable_source_states(
                 "old replicas did not agree on a stable content digest",
             ));
         }
-        tokio::time::sleep(delay.next().min(remaining(deadline))).await;
+        pause(delay.next().min(remaining(deadline)), shutdown).await?;
     }
 }
 
@@ -352,6 +368,7 @@ async fn wait_for_rebalance(
     map: &ShardMap,
     headers: &HeaderMap,
     timeout_ms: u64,
+    shutdown: &CancellationToken,
 ) -> DbResult<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let owners = owners_of(&[old_map, map]);
@@ -437,7 +454,7 @@ async fn wait_for_rebalance(
                 "new replicas did not match the old shard content before the timeout",
             ));
         }
-        tokio::time::sleep(delay.next().min(remaining(deadline))).await;
+        pause(delay.next().min(remaining(deadline)), shutdown).await?;
     }
 }
 
@@ -669,12 +686,13 @@ async fn activate_map_everywhere(
 async fn migrate(
     ctx: &ClusterCtx,
     db: &Arc<Db>,
-    name: &str,
     old_map: &ShardMap,
     map: &ShardMap,
     headers: &HeaderMap,
     timeout_ms: u64,
+    shutdown: &CancellationToken,
 ) -> DbResult<Value> {
+    let name = db.name.as_str();
     // Identifies this coordinator's migration: only a clear carrying it may
     // unfreeze the peers, so a rival or stale coordinator cannot.
     let migration_id = crate::util::uuid();
@@ -693,6 +711,7 @@ async fn migrate(
         headers,
         // Allow slow digest scans plus any in-flight write to settle.
         std::time::Duration::from_millis(STABLE_WAIT_MS.load(Ordering::SeqCst)),
+        shutdown,
     )
     .await
     {
@@ -701,7 +720,9 @@ async fn migrate(
         return Err(error);
     }
 
-    if let Err(error) = wait_for_rebalance(ctx, db, old_map, map, headers, timeout_ms).await {
+    if let Err(error) =
+        wait_for_rebalance(ctx, db, old_map, map, headers, timeout_ms, shutdown).await
+    {
         // The active map never changed, so reads continued on the old owners
         // throughout the migration attempt.
         clear_migration_everywhere(ctx, db, name, &migration_id, headers).await;
@@ -751,10 +772,10 @@ async fn migrate(
 pub(crate) async fn rebalance(
     ctx: &ClusterCtx,
     db: &Arc<Db>,
-    name: &str,
     headers: &HeaderMap,
     timeout_ms: u64,
     cleanup: bool,
+    shutdown: &CancellationToken,
 ) -> DbResult<Value> {
     // Freeze client writes before reading the source digests. Reads continue to
     // use the old active map; anti-entropy is internal and remains allowed.
@@ -781,7 +802,7 @@ pub(crate) async fn rebalance(
         value
     } else {
         // The activation picks the version under the Db lock.
-        migrate(ctx, db, name, &old_map, &map, headers, timeout_ms).await?
+        migrate(ctx, db, &old_map, &map, headers, timeout_ms, shutdown).await?
     };
     if !cleanup {
         return Ok(value);
@@ -859,6 +880,82 @@ mod tests {
         let stored = db.shard_map();
         assert_eq!(stored.replicas, target.replicas);
         assert_eq!(stored.version, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The rebalance polls give up the moment shutdown starts, rather than
+    /// sleeping on to their own deadline: with the token already cancelled and
+    /// an hour to spare, the wait fails at once with 503.
+    #[tokio::test]
+    async fn rebalance_polling_stops_on_shutdown() {
+        let root = std::env::temp_dir().join(format!("douchdb-stop-{}", crate::util::uuid()));
+        let old_map = ShardMap {
+            q: 2,
+            node_count: 2,
+            replicas: vec![vec![0], vec![0]],
+            version: 1,
+        };
+        let map = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            version: 2,
+            ..old_map.clone()
+        };
+        let db = Arc::new(
+            Db::open(
+                &root,
+                "stop",
+                DbConfig {
+                    q: 2,
+                    revs_limit: 100,
+                    shard_map: old_map.clone(),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
+        let ctx = ClusterCtx {
+            cluster: Cluster {
+                nodes: vec![
+                    "http://127.0.0.1:1".to_string(),
+                    "http://127.0.0.1:2".to_string(),
+                ],
+                me: 0,
+                n: 1,
+                secret: "test-secret".to_string(),
+            },
+            client: reqwest::Client::new(),
+            auth: None,
+            health: Default::default(),
+        };
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let waited = wait_for_rebalance(
+            &ctx,
+            &db,
+            &old_map,
+            &map,
+            &HeaderMap::new(),
+            3_600_000,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(waited.err().map(|error| error.status), Some(503));
+        // Old owners that cannot be reached never agree, so this one polls.
+        let unreachable = ShardMap {
+            replicas: vec![vec![1], vec![1]],
+            ..old_map.clone()
+        };
+        let stable = stable_source_states(
+            &ctx,
+            &db,
+            &unreachable,
+            &HeaderMap::new(),
+            std::time::Duration::from_secs(3_600),
+            &shutdown,
+        )
+        .await;
+        assert_eq!(stable.err().map(|error| error.status), Some(503));
+        drop(db);
         std::fs::remove_dir_all(root).ok();
     }
 }

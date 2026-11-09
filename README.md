@@ -500,6 +500,11 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 
 Without `--nodes` it runs as a single node (the cluster with one member).
 
+Exit status: `0` after a clean shutdown (SIGTERM or SIGINT), `2` for a
+configuration the server refuses to start with (an unparsable flag, a bad
+`--users-file` or `--admin`, a cluster without `--cluster-secret`), and `1` for
+a runtime failure such as being unable to bind the listen address.
+
 ## CORS
 
 Cross-origin access is **off by default**. Enable it for browser clients
@@ -747,6 +752,11 @@ database, IAM integration, or row-level security.
   {"name":"bob","token":"bob-token","roles":[]}
 ]}
 ```
+
+With neither `--admin` nor a users file the server is admin-party: every request
+is an admin, and `POST /_session` accepts any credentials (an empty name is
+reported as `admin`) without setting a cookie. Once either is configured,
+`POST /_session` checks the credentials and issues a signed `AuthSession` cookie.
 
 Start with `--users-file /etc/douchdb/users.json`. New databases are admin-only
 by default when authentication is configured; use `--default-security open` for

@@ -252,7 +252,7 @@ pub(super) async fn search_request(
     }
 
     let started = std::time::Instant::now();
-    let result = if is_forwarded(st, headers) {
+    let result = if st.ctx.cluster.is_internal(headers) {
         if let Some(mask) = q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q)) {
             request.owner_shards = Some(mask);
         }
@@ -276,7 +276,7 @@ pub(super) async fn search_request(
     } else {
         crate::search::query(db, ddoc, index_name, &request, limits).await
     };
-    if !is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_internal(headers) {
         crate::metrics::record_engine(
             "search",
             started.elapsed().as_secs_f64() * 1000.0,
@@ -405,7 +405,7 @@ pub(super) async fn view_request(
         Ok(query) => query,
         Err(error) => return fail(error),
     };
-    if is_forwarded(st, headers) {
+    if st.ctx.cluster.is_internal(headers) {
         if let Some(mask) = q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q)) {
             query.owner_shards = Some(mask);
         } else if flag(q, "owner_only") {
@@ -419,7 +419,7 @@ pub(super) async fn view_request(
 
     // Owners reduce their own shards and the coordinator combines the
     // partials, instead of shipping every map row.
-    let combine_reduce = if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    let combine_reduce = if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         match crate::view::load_spec(db, ddoc, view_name).await {
             Ok(spec) => {
                 let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
@@ -464,7 +464,7 @@ pub(super) async fn view_request(
             reducer,
         )
         .await
-    } else if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    } else if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         match cluster_view_rows(
             ClusterRead {
                 ctx: &st.ctx,
@@ -490,7 +490,7 @@ pub(super) async fn view_request(
     } else {
         crate::view::query(db, ddoc, view_name, &query).await
     };
-    if !is_forwarded(st, headers) {
+    if !st.ctx.cluster.is_internal(headers) {
         crate::metrics::record_engine(
             "views",
             started.elapsed().as_secs_f64() * 1000.0,

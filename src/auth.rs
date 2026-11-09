@@ -8,6 +8,7 @@
 
 use axum::http::HeaderMap;
 use base64::Engine;
+use hmac::digest::Key;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -132,6 +133,23 @@ pub struct Auth {
     /// user in the file wins a shared token.
     by_digest: HashMap<[u8; 32], usize>,
     secret: Vec<u8>,
+}
+
+/// An HMAC-SHA256 keyed by `input`, applying HMAC's own key rule (RFC 2104):
+/// a key longer than the block is hashed, a shorter one is zero-padded. Same
+/// MAC as `Hmac::new_from_slice`, through a constructor that cannot fail.
+fn hmac_sha256(input: &[u8]) -> Hmac<Sha256> {
+    let mut key = Key::<Hmac<Sha256>>::default();
+    if input.len() > key.len() {
+        key.iter_mut()
+            .zip(Sha256::digest(input))
+            .for_each(|(slot, byte)| *slot = byte);
+    } else {
+        key.iter_mut()
+            .zip(input)
+            .for_each(|(slot, byte)| *slot = *byte);
+    }
+    Hmac::<Sha256>::new(&key)
 }
 
 impl Auth {
@@ -368,9 +386,9 @@ impl Auth {
     /// digest, as CouchDB keys it with the secret plus the user's salt, so
     /// changing a credential invalidates the user's sessions.
     fn mac(&self, salt: &[u8; 32]) -> Hmac<Sha256> {
-        let mut key = self.secret.clone();
-        key.extend_from_slice(salt);
-        Hmac::<Sha256>::new_from_slice(&key).expect("hmac key")
+        let mut input = self.secret.clone();
+        input.extend_from_slice(salt);
+        hmac_sha256(&input)
     }
 
     fn sign(&self, name: &str, payload: &str) -> String {
@@ -490,6 +508,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_key_rule_matches_new_from_slice() {
+        for len in [0, 1, 32, 63, 64, 65, 96, 200] {
+            let input: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut ours = hmac_sha256(&input);
+            let mut theirs = Hmac::<Sha256>::new_from_slice(&input).unwrap();
+            ours.update(b"payload");
+            theirs.update(b"payload");
+            assert_eq!(
+                ours.finalize().into_bytes(),
+                theirs.finalize().into_bytes(),
+                "key length {len}"
+            );
+        }
+    }
 
     // Tests run in parallel, so each one needs its own users file. Sharing a
     // fixed path lets one test read the file while another has truncated it.

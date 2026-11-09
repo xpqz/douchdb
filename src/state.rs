@@ -4,6 +4,8 @@
 use crate::auth::Principal;
 use crate::cluster_http::ClusterCtx;
 use crate::db::{ApiError, Db, DbConfig, DbResult};
+use crate::dbname::{illegal_db_name, valid_db_name};
+use crate::health::FsHealthCache;
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -132,6 +134,86 @@ impl Placement {
     }
 }
 
+type LockMap = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// One lock per database name, present only while someone holds or waits on
+/// it. Every holder and waiter owns a clone of the entry's `Arc`, taken under
+/// the map lock, so a guard that finds nobody else sharing the entry when it
+/// lets go can remove it without stranding a waiter on a lock that a later
+/// caller would replace with a fresh one.
+#[derive(Default)]
+pub struct NameLocks {
+    map: Arc<LockMap>,
+}
+
+/// A name's lock, held or being waited for. Dropping it releases the lock and
+/// removes the entry when no one else uses it, also when the wait is cancelled.
+pub struct NameGuard {
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    name: String,
+    map: Arc<LockMap>,
+}
+
+impl NameLocks {
+    fn guard(&self, name: &str) -> NameGuard {
+        let lock = self
+            .map
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        NameGuard {
+            held: None,
+            lock: Some(lock),
+            name: name.to_string(),
+            map: self.map.clone(),
+        }
+    }
+
+    pub async fn lock(&self, name: &str) -> NameGuard {
+        let mut guard = self.guard(name);
+        if let Some(lock) = guard.lock.clone() {
+            guard.held = Some(lock.lock_owned().await);
+        }
+        guard
+    }
+
+    /// The lock if it is free right now.
+    pub fn try_lock(&self, name: &str) -> Option<NameGuard> {
+        let mut guard = self.guard(name);
+        let lock = guard.lock.clone()?;
+        guard.held = Some(lock.try_lock_owned().ok()?);
+        Some(guard)
+    }
+
+    /// Entries in the map.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+}
+
+impl Drop for NameGuard {
+    fn drop(&mut self) {
+        self.held = None;
+        self.lock = None;
+        let mut map = self.map.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Under the map lock nobody can clone the entry, so a count of one
+        // means only the map holds it.
+        if map
+            .get(&self.name)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(&self.name);
+        }
+    }
+}
+
 pub struct AppState {
     pub root: PathBuf,
     /// The open databases, at most `config.max_open_dbs` once idle ones have
@@ -140,7 +222,7 @@ pub struct AppState {
     /// One lock per database name. Open, create and drop of a name run one at
     /// a time, so a name is never opened twice (the second open would fail on
     /// the LevelDB lock) and a drop cannot interleave with a create or open.
-    pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub db_locks: NameLocks,
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
     pub db_opens: AtomicU64,
@@ -183,62 +265,20 @@ pub struct Config {
     pub default_admin_only: bool,
     /// Databases kept open between requests; see `AppState::close_idle`.
     pub max_open_dbs: usize,
+    /// How often an idle standalone `_changes` feed re-checks when no commit
+    /// wakes it; see [`LOCAL_FEED_RECHECK`].
+    pub local_feed_recheck: std::time::Duration,
 }
 
-/// CouchDB's answer to creating a database with an illegal name.
-pub(crate) fn illegal_db_name(name: &str) -> ApiError {
-    ApiError::new(
-        400,
-        "illegal_database_name",
-        format!(
-            "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
-             characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
-        ),
-    )
-}
-
-/// The system databases CouchDB's `couch_db:validate_dbname` accepts although
-/// they do not match the name regex.
-const SYSTEM_DB_NAMES: [&str; 3] = ["_users", "_replicator", "_global_changes"];
-
-/// CouchDB's `^[a-z][a-z0-9_$()+/-]*(\.[0-9]{10,})?$` (`DBNAME_REGEX` in
-/// `couch_db.erl`) applied after dropping one trailing `.couch`
-/// (`couch_util:drop_dot_couch_ext`), or one of the system databases. The
-/// optional digits are the shard timestamp; the clustered create runs the same
-/// check, so `foo.couch` and `foo.1234567890` are legal names, stored as
-/// given. Doubled and trailing slashes are legal.
-pub(crate) fn valid_db_name(name: &str) -> bool {
-    let bare = name.strip_suffix(".couch").unwrap_or(name);
-    let body = match bare.rsplit_once('.') {
-        Some((body, digits))
-            if digits.len() >= 10 && digits.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            body
-        }
-        _ => bare,
-    };
-    let mut bytes = body.bytes();
-    let regex_match = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
-        && bytes.all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'$' | b'+' | b'(' | b')' | b'/')
-        });
-    regex_match || SYSTEM_DB_NAMES.contains(&bare)
-}
+/// The production value of [`Config::local_feed_recheck`]. A standalone node
+/// sees every commit through `Db::subscribe_commits`, so this only bounds how
+/// long a security change or other out-of-band state can go unnoticed.
+pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // state
 
 impl AppState {
-    fn name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .db_locks
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        locks.entry(name.to_string()).or_default().clone()
-    }
-
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         self.open_db(name, true).await
     }
@@ -274,8 +314,7 @@ impl AppState {
         }
         // Concurrent first requests for one name share a single open, and a
         // drop that won the race leaves nothing to open.
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         if let Some(open) = self.dbs.read().await.get(name) {
             return Ok(if hot { open.touch() } else { open.db.clone() });
         }
@@ -365,7 +404,7 @@ impl AppState {
                 if !quiescent {
                     continue;
                 }
-                let Ok(guard) = self.name_lock(&name).try_lock_owned() else {
+                let Some(guard) = self.db_locks.try_lock(&name) else {
                     continue;
                 };
                 if let Some(open) = dbs.remove(&name) {
@@ -409,8 +448,7 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(illegal_db_name(name));
         }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         let path = crate::db::db_path(&self.root, name);
         crate::view::forget_db(&path).await;
         crate::search::forget_db(&path).await;
@@ -448,8 +486,7 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(ApiError::db_not_found());
         }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         // Marked before the gates are forgotten: a request holding the handle
         // can no longer take a fresh gate and reach the index directories.
         if let Some(open) = self.dbs.write().await.remove(name) {
@@ -506,36 +543,6 @@ impl AppState {
     }
 }
 
-/// How long the filesystem part of the health check is reused. `/_health` is
-/// unauthenticated, so it must not touch the disk on every request.
-pub(crate) const FS_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Result of the blocking filesystem checks.
-#[derive(Clone, Copy)]
-pub(crate) struct FsHealth {
-    pub(crate) readable: bool,
-    pub(crate) writable: bool,
-    pub(crate) unreadable: u64,
-}
-
-/// Short-lived cache of [`FsHealth`].
-#[derive(Default)]
-pub struct FsHealthCache(std::sync::Mutex<Option<(std::time::Instant, FsHealth)>>);
-
-impl FsHealthCache {
-    pub(crate) fn fresh(&self, now: std::time::Instant) -> Option<FsHealth> {
-        let slot = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        match *slot {
-            Some((at, value)) if now.saturating_duration_since(at) < FS_HEALTH_TTL => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn store(&self, now: std::time::Instant, value: FsHealth) {
-        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((now, value));
-    }
-}
-
 /// A node state over `root` for tests: one node, no peers, no auth.
 #[cfg(test)]
 pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
@@ -559,6 +566,10 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             view_memory_mb: 1,
             default_admin_only: true,
             max_open_dbs,
+            // A test must not be answered by this fallback: with it out of
+            // reach, a feed that does not wake for a commit hangs instead of
+            // passing late.
+            local_feed_recheck: std::time::Duration::from_secs(3600),
         },
         ctx: ClusterCtx {
             auth: None,
@@ -581,7 +592,6 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Every database ever opened used to stay open, with its shard actors and
     /// stores, until it was deleted.
@@ -602,6 +612,41 @@ mod tests {
         let open = st.dbs.read().await.len();
         assert!(open <= 4, "{open} databases are open, cap is 4");
         drop(st);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The per-name locks were never removed: one entry stayed for every
+    /// distinct name that was created, opened or dropped.
+    #[tokio::test]
+    async fn name_locks_are_removed_once_unused() {
+        let root = std::env::temp_dir().join(format!("douchdb-locks-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 2);
+        for n in 0..8 {
+            let name = format!("db{n}");
+            st.create_db(&name, false, None, None).await.unwrap();
+            st.db(&name).await.unwrap();
+        }
+        for n in 0..4 {
+            st.drop_db(&format!("db{n}")).await.unwrap();
+        }
+        // A drop of a name that never existed, and an open of one.
+        let _ = st.drop_db("never").await;
+        let _ = st.db("never").await;
+        // Closing an idle database releases its lock on the blocking pool, so
+        // wait for the map to drain rather than for a fixed time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let left = st.db_locks.len();
+            if left == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{left} name locks are still in the map"
+            );
+            tokio::task::yield_now().await;
+        }
+        st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -698,24 +743,6 @@ mod tests {
         drop((stale, fresh));
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fs_health_cache_serves_within_the_ttl_only() {
-        let cache = FsHealthCache::default();
-        let start = Instant::now();
-        assert!(cache.fresh(start).is_none());
-        cache.store(
-            start,
-            FsHealth {
-                readable: true,
-                writable: true,
-                unreadable: 3,
-            },
-        );
-        let hit = cache.fresh(start + FS_HEALTH_TTL - Duration::from_millis(1));
-        assert_eq!(hit.map(|value| value.unreadable), Some(3));
-        assert!(cache.fresh(start + FS_HEALTH_TTL).is_none());
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub(super) async fn local_doc(req: DbRequest<'_>, id: &str) -> Response {
         body,
         ..
     } = req;
-    let routed = st.ctx.cluster.is_clustered() && !is_forwarded(st, headers);
+    let routed = st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers);
     match method.as_str() {
         "GET" => {
             let found = if routed {
@@ -139,7 +139,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
         && (method == Method::GET || method == Method::HEAD)
         && st.ctx.cluster.is_clustered()
         && read_quorum > 1
-        && !is_forwarded(st, headers)
+        && !st.ctx.cluster.is_internal(headers)
     {
         if revision_shaped {
             // Revision-shaped responses are served locally, but the requested
@@ -208,8 +208,8 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
 
     match method {
         Method::GET | Method::HEAD => {
-            let include_deleted =
-                is_forwarded(st, headers) && headers.contains_key("x-douchdb-quorum-read");
+            let include_deleted = st.ctx.cluster.is_internal(headers)
+                && headers.contains_key("x-douchdb-quorum-read");
             get_doc(db, &docid, q, headers, include_deleted).await
         }
         Method::PUT => put_doc(st, db, dbname, &docid, body, q, headers).await,
@@ -325,7 +325,7 @@ async fn check_if_match(db: &Db, docid: &str, headers: &HeaderMap) -> Option<Res
 
 async fn copy_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
@@ -416,7 +416,7 @@ async fn copy_doc(
 
 async fn put_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     body: Bytes,
@@ -524,7 +524,7 @@ async fn put_doc(
 
 async fn delete_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
