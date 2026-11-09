@@ -829,6 +829,14 @@ impl Worker {
     }
 }
 
+impl Drop for Worker {
+    /// A worker that is dropped, including by a panicking test, must not leave
+    /// its child running. `kill` is idempotent for an already reaped child.
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// One thread kills every worker that outlives its deadline, instead of an OS
 /// thread per request. A request registers its worker's pid and deadline and
 /// drops the returned [`Deadline`] when the exchange ends, which removes the

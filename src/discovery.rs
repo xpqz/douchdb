@@ -287,6 +287,7 @@ mod tests {
                 view_memory_mb: 1,
                 default_admin_only: true,
                 max_open_dbs: 256,
+                local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
             },
             ctx: ClusterCtx {
                 auth: Some(Auth::new("admin".into(), "hunter2".into(), b"k".to_vec())),

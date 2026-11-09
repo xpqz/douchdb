@@ -183,7 +183,15 @@ pub struct Config {
     pub default_admin_only: bool,
     /// Databases kept open between requests; see `AppState::close_idle`.
     pub max_open_dbs: usize,
+    /// How often an idle standalone `_changes` feed re-checks when no commit
+    /// wakes it; see [`LOCAL_FEED_RECHECK`].
+    pub local_feed_recheck: std::time::Duration,
 }
+
+/// The production value of [`Config::local_feed_recheck`]. A standalone node
+/// sees every commit through `Db::subscribe_commits`, so this only bounds how
+/// long a security change or other out-of-band state can go unnoticed.
+pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// CouchDB's answer to creating a database with an illegal name.
 pub(crate) fn illegal_db_name(name: &str) -> ApiError {
@@ -559,6 +567,10 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             view_memory_mb: 1,
             default_admin_only: true,
             max_open_dbs,
+            // A test must not be answered by this fallback: with it out of
+            // reach, a feed that does not wake for a commit hangs instead of
+            // passing late.
+            local_feed_recheck: std::time::Duration::from_secs(3600),
         },
         ctx: ClusterCtx {
             auth: None,
