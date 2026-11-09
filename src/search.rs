@@ -220,8 +220,7 @@ fn run_index_in_process(
                 .eval(wrapped)
                 .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
             let mut out = Vec::with_capacity(docs.len());
-            const BATCH: usize = 128;
-            for chunk in docs.chunks(BATCH) {
+            for chunk in docs.chunks(crate::js::limits::INDEX_BATCH_DOCS) {
                 out.extend(index_chunk(&func, chunk)?);
             }
             Ok(out)

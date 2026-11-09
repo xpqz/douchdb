@@ -90,10 +90,89 @@ pub fn parse_args() -> Args {
     }
 }
 
-type ArgIter = std::vec::IntoIter<String>;
+const KNOWN_FLAGS: &[&str] = &[
+    "--listen",
+    "--data",
+    "--q",
+    "--n",
+    "--revs-limit",
+    "--admin",
+    "--users-file",
+    "--session-secret",
+    "--default-security",
+    "--max-in-flight",
+    "--per-user-in-flight",
+    "--per-user-rate",
+    "--heavy-in-flight",
+    "--heavy-per-user",
+    "--background-in-flight",
+    "--compact-concurrency",
+    "--nodes",
+    "--me",
+    "--advertise",
+    "--seed-nodes",
+    "--sync-secs",
+    "--js-sandbox",
+    "--wasm-runtime",
+    "--js-worker",
+    "--js-workers",
+    "--view-timeout-ms",
+    "--view-memory-mb",
+    "--max-request-mb",
+    "--rebalance-write-drain-ms",
+    "--rebalance-stable-wait-ms",
+    "--rebalance-freeze-ms",
+    "--js-worker-startup-ms",
+    "--max-open-indexes",
+    "--max-open-dbs",
+    "--peer-http2",
+    "--cluster-secret",
+    "--otel-endpoint",
+    "--cors-origins",
+    "--cors-credentials",
+    "--cors-headers",
+    "--cors-methods",
+    "--cors-exposed-headers",
+    "--cors-max-age",
+    "--help",
+    "-h",
+];
 
+/// The command line, with the `VALUE` of a `--flag=VALUE` argument held aside
+/// until the flag's handler asks for it.
+struct ArgIter {
+    rest: std::vec::IntoIter<String>,
+    inline: Option<String>,
+}
+
+/// Whether `arg` is exactly a known flag, or the `--flag=...` form of one.
+fn is_known_flag(arg: &str) -> bool {
+    let name = if arg.starts_with("--") {
+        arg.split_once('=').map_or(arg, |(name, _)| name)
+    } else {
+        arg
+    };
+    KNOWN_FLAGS.contains(&name)
+}
+
+/// The value of `flag`: the `=VALUE` part, or else the next argument. A next
+/// argument that is itself a known flag is refused rather than swallowed (a
+/// forgotten value would otherwise silently eat the following flag); the
+/// `=` form passes such a string through.
 fn value(it: &mut ArgIter, flag: &str) -> Result<String, String> {
-    it.next().ok_or_else(|| format!("{flag} requires a value"))
+    if let Some(inline) = it.inline.take() {
+        return Ok(inline);
+    }
+    let next = it
+        .rest
+        .next()
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    if is_known_flag(&next) {
+        return Err(format!(
+            "{flag} needs a value; got the flag {next}. Use {flag}=VALUE if the value really is that string"
+        ));
+    }
+    Ok(next)
 }
 
 /// Parse an unsigned integer flag value that must lie in `min..=max`.
@@ -205,10 +284,17 @@ pub fn parse_from(
         otel_endpoint: environment(&env, "OTEL_EXPORTER_OTLP_ENDPOINT")?,
     };
     let argv: Vec<String> = argv.into_iter().collect();
-    let mut it = argv.into_iter();
+    let mut it = ArgIter {
+        rest: argv.into_iter(),
+        inline: None,
+    };
     let mut me_given = false;
-    while let Some(arg) = it.next() {
-        let flag = arg.as_str();
+    while let Some(arg) = it.rest.next() {
+        let mut flag = arg.as_str();
+        if let Some((name, inline)) = arg.split_once('=').filter(|_| arg.starts_with("--")) {
+            flag = name;
+            it.inline = Some(inline.to_string());
+        }
         match flag {
             "--listen" => {
                 args.listen = value(&mut it, flag)?;
@@ -226,7 +312,7 @@ pub fn parse_from(
             "--q" => args.q = number(&mut it, flag, 1, u32::MAX.into())?,
             "--n" => args.n = number(&mut it, flag, 1, u32::MAX.into())?,
             "--revs-limit" => args.revs_limit = number(&mut it, flag, 1, u64::MAX)?,
-            "--admin" => args.admin = Some(admin(&it.next().unwrap_or_default(), "--admin")?),
+            "--admin" => args.admin = Some(admin(&value(&mut it, flag)?, "--admin")?),
             "--users-file" => args.users_file = Some(value(&mut it, flag)?),
             "--session-secret" => args.session_secret = value(&mut it, flag)?,
             "--default-security" => {
@@ -331,6 +417,9 @@ pub fn parse_from(
             "--cors-max-age" => args.cors_max_age = number(&mut it, flag, 0, u32::MAX.into())?,
             "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
+        }
+        if it.inline.is_some() {
+            return Err(format!("{flag} does not take a value"));
         }
     }
     // An index outside the node list would silently make this node advertise
@@ -441,6 +530,56 @@ mod tests {
         for flag in NUMERIC.iter().chain(NEEDS_VALUE) {
             let message = error(&[flag]);
             assert!(message.contains(flag), "{flag}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_value_flag_does_not_swallow_a_following_known_flag() {
+        let message = error(&["--session-secret", "--data", "x"]);
+        assert!(message.contains("--session-secret"), "{message}");
+        assert!(message.contains("--data"), "{message}");
+        assert!(message.contains("--session-secret=VALUE"), "{message}");
+        // The `--flag=...` form of a known flag is just as much a flag.
+        let message = error(&["--session-secret", "--data=x"]);
+        assert!(message.contains("--data"), "{message}");
+        // Every value flag, numeric or not, refuses a known flag as its value.
+        for flag in NUMERIC.iter().chain(NEEDS_VALUE) {
+            let message = error(&[flag, "--peer-http2"]);
+            assert!(message.contains(flag), "{flag}: {message}");
+        }
+    }
+
+    #[test]
+    fn equals_form_passes_a_value_that_looks_like_a_flag() {
+        let args = parse(&["--session-secret=--data"]).unwrap().unwrap();
+        assert_eq!(args.session_secret, "--data");
+        let args = parse(&["--data=/tmp/x", "--q=4", "--admin=a:b"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.data, PathBuf::from("/tmp/x"));
+        assert_eq!(args.q, 4);
+        assert_eq!(args.admin, Some(("a".to_string(), "b".to_string())));
+        // Only the first `=` splits, so the value may contain more.
+        let args = parse(&["--session-secret=a=b"]).unwrap().unwrap();
+        assert_eq!(args.session_secret, "a=b");
+        // A flag that takes no value rejects one.
+        assert!(error(&["--peer-http2=yes"]).contains("--peer-http2"));
+    }
+
+    #[test]
+    fn a_value_that_merely_starts_with_dashes_is_accepted() {
+        let args = parse(&["--session-secret", "--weird-secret"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.session_secret, "--weird-secret");
+        let args = parse(&["--session-secret", "-x"]).unwrap().unwrap();
+        assert_eq!(args.session_secret, "-x");
+    }
+
+    #[test]
+    fn every_value_flag_is_a_known_flag() {
+        for flag in NUMERIC.iter().chain(NEEDS_VALUE) {
+            assert!(KNOWN_FLAGS.contains(flag), "{flag}");
         }
     }
 

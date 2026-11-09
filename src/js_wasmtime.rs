@@ -6,7 +6,7 @@
 //! `--wasm-runtime wasmtime`.
 
 use crate::js::ViewLimits;
-use crate::js::{check_output, wasm_memory_cap, JsError, MAX_OUTPUT_BYTES};
+use crate::js::{check_output, guest_panic, wasm_memory_cap, JsError, MAX_OUTPUT_BYTES};
 use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -146,12 +146,14 @@ fn request_inner(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
         .map_err(|error| JsError::Sandbox(format!("wasm start: {error}")))?;
-    start
-        .call(&mut store, ())
-        .map_err(|error| JsError::Sandbox(format!("wasm run: {error:?}")))?;
+    let ran = start.call(&mut store, ());
     drop(store);
 
     let output = stdout.contents();
+    if let Err(error) = ran {
+        return Err(guest_panic(&output)
+            .unwrap_or_else(|| JsError::Sandbox(format!("wasm run: {error:?}"))));
+    }
     check_output("wasm worker", &String::from_utf8_lossy(&output))?;
     let response: Value = serde_json::from_slice(&output)
         .map_err(|error| JsError::Sandbox(format!("wasm response: {error}")))?;
