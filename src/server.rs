@@ -191,6 +191,7 @@ fn build_state(
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
         db_opens: Default::default(),
+        last_sweep: Default::default(),
         principal_resolutions: Default::default(),
         fs_health: Default::default(),
         config,

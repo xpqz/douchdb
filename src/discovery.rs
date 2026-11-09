@@ -272,6 +272,7 @@ mod tests {
             dbs: Default::default(),
             db_locks: Default::default(),
             db_opens: Default::default(),
+            last_sweep: Default::default(),
             principal_resolutions: Default::default(),
             fs_health: Default::default(),
             shutdown: Default::default(),

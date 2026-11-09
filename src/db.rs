@@ -679,6 +679,32 @@ impl Db {
         )
     }
 
+    /// Drop every shard's lazily built indexes so an idle database holds none
+    /// of them; the next query rebuilds what it needs from the shards' records.
+    pub async fn release_indexes(&self) {
+        for shard in &self.shards {
+            let _ = shard
+                .call(|shard| {
+                    shard.release_indexes();
+                    Ok(())
+                })
+                .await;
+        }
+    }
+
+    /// Entries the shards hold in their live and latest-changes indexes.
+    #[cfg(test)]
+    pub async fn index_entries(&self) -> usize {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard
+                .call(|shard| Ok(shard.index_entries()))
+                .await
+                .unwrap_or(0);
+        }
+        total
+    }
+
     /// Whether the database can be closed and reopened without losing
     /// anything: no rebalance is freezing it, no compaction is running, and no
     /// cluster write holds its gate. What it keeps in memory beyond that is
@@ -3153,7 +3179,6 @@ fn purge_one(
                 revs: requested.to_vec(),
             };
             s.purge_corrupt(id, &info, peers)?;
-            s.invalidate_latest();
             return Ok(requested.to_vec());
         }
         Err(error) => return Err(error.into()),
@@ -3220,9 +3245,6 @@ fn purge_one(
         }
     } else {
         s.commit(tx)?;
-    }
-    if !removed.is_empty() {
-        s.invalidate_latest();
     }
     Ok(removed)
 }
@@ -3606,7 +3628,6 @@ fn put_many(
         // written back as if it were valid.
         if let Err(e) = meta.tree.prune(limit) {
             let message = corrupt_tree(id, e).reason;
-            shard.invalidate_latest();
             return results
                 .into_iter()
                 .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
@@ -3619,12 +3640,12 @@ fn put_many(
                 bytes,
                 old,
                 new: meta_state(meta),
+                seq: meta.seq,
             });
         }
     }
 
     if let Err(e) = commit_ops(shard, ops, metas) {
-        shard.invalidate_latest();
         let message = e.to_string();
         return results
             .into_iter()
@@ -3636,11 +3657,6 @@ fn put_many(
             })
             .collect();
     }
-    let ok_ids: std::collections::HashSet<String> = results
-        .iter()
-        .filter_map(|(_, result)| result.as_ref().ok().map(|ok| ok.id.clone()))
-        .collect();
-    shard.update_latest(&staged, &ok_ids);
     results
 }
 
@@ -3925,6 +3941,7 @@ struct MetaWrite {
     bytes: Vec<u8>,
     old: Option<MetaState>,
     new: Option<MetaState>,
+    seq: u64,
 }
 
 /// Commit a batch's operations and its documents' metadata records.
@@ -3950,7 +3967,7 @@ fn commit_ops(
         }
     }
     for meta in metas {
-        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new);
+        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new, meta.seq);
     }
     shard.commit_at(tx, last_seq)
 }
@@ -5673,7 +5690,7 @@ mod tests {
         .unwrap();
         db.shards[0]
             .call(|shard| {
-                shard.invalidate_latest();
+                shard.release_indexes();
                 Ok(())
             })
             .await
