@@ -200,7 +200,7 @@ fn wrap(source: &str, user_ctx: &Value, sec_obj: &Value) -> String {
     )
 }
 
-fn outcome(row: &crate::view::Row) -> Result<(), ApiError> {
+fn outcome(row: &crate::viewfn::Row) -> Result<(), ApiError> {
     let reason = row
         .value
         .as_str()

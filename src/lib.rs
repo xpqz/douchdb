@@ -36,6 +36,7 @@ pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod validate;
 pub(crate) mod view;
+pub(crate) mod viewfn;
 pub(crate) mod worker;
 
 pub use cli::parse_args;

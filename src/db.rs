@@ -3020,7 +3020,7 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
                     }
                 }
                 if let Some(Value::String(reduce)) = view.get("reduce") {
-                    crate::view::check_reduce_name(reduce).map_err(invalid)?;
+                    crate::viewfn::check_reduce_name(reduce).map_err(invalid)?;
                 }
             }
         }
@@ -3121,7 +3121,7 @@ static COMPILE_LOG: std::sync::Mutex<Vec<(String, Option<String>)>> =
 /// CouchDB's `try_compile`. A design document in another language is saved
 /// unchecked: there is no query server to compile it.
 fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
-    use crate::view::{check_compiles, ViewFunction};
+    use crate::viewfn::{check_compiles, ViewFunction};
     if obj
         .get("language")
         .and_then(Value::as_str)
@@ -3132,7 +3132,7 @@ fn compile_views(obj: &Map<String, Value>) -> DbResult<()> {
     let Some(Value::Object(views)) = obj.get("views") else {
         return Ok(());
     };
-    let limits = crate::view::ViewLimits::default();
+    let limits = crate::js::ViewLimits::default();
     for (name, view) in views {
         let functions = [(ViewFunction::Map, "map"), (ViewFunction::Reduce, "reduce")];
         for (function, member) in functions {
@@ -4442,11 +4442,11 @@ fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<
             if docs.is_empty() {
                 return Ok(Vec::new());
             }
-            let matched = crate::view::run_filter_json(
+            let matched = crate::viewfn::run_filter_json(
                 source,
                 query,
                 &docs,
-                crate::view::ViewLimits::default(),
+                crate::js::ViewLimits::default(),
             )
             .map_err(ApiError::from)?;
             Ok(rows

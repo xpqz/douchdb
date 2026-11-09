@@ -198,7 +198,7 @@ pub(crate) fn run_index_json(
         rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
     crate::js::guard("index function", || {
         context.with(|ctx| {
-            let wrapped = INDEX_WRAPPER.replace(crate::view::WRAPPER_SOURCE, source);
+            let wrapped = INDEX_WRAPPER.replace(crate::viewfn::WRAPPER_SOURCE, source);
             let func: rquickjs::Function = ctx
                 .eval(wrapped)
                 .map_err(|error| JsError::Runtime(format!("compile: {error}")))?;
