@@ -73,29 +73,11 @@ fn config_error(message: impl Into<String>) -> ConfigError {
     ConfigError(message.into())
 }
 
-/// Choose the JS sandbox from `--js-sandbox` and `--wasm-runtime`.
+/// Apply the JS sandbox choice from `--js-sandbox` and `--wasm-runtime`.
 fn configure_js_sandbox(args: &Args) -> Result<(), ConfigError> {
-    match args.js_sandbox.as_str() {
-        "native" => js::configure(js::Sandbox::Native, args.js_workers),
-        "process" => js::configure(js::Sandbox::Process, args.js_workers),
-        "wasm" => {
-            js::configure(js::Sandbox::Wasm, args.js_workers);
-            let runtime = match args.wasm_runtime.as_str() {
-                "wasmi" => js::WasmRuntime::Wasmi,
-                "wasmtime" => js::WasmRuntime::Wasmtime,
-                other => {
-                    return Err(config_error(format!(
-                        "unknown --wasm-runtime value: {other} (expected wasmi or wasmtime)"
-                    )));
-                }
-            };
-            js::set_wasm_runtime(runtime).map_err(|error| config_error(error.to_string()))?;
-        }
-        other => {
-            return Err(config_error(format!(
-                "unknown --js-sandbox value: {other} (expected native, process or wasm)"
-            )));
-        }
+    js::configure(args.js_sandbox, args.js_workers);
+    if args.js_sandbox == js::Sandbox::Wasm {
+        js::set_wasm_runtime(args.wasm_runtime).map_err(|error| config_error(error.to_string()))?;
     }
     Ok(())
 }
@@ -122,13 +104,7 @@ fn check_cluster_args(args: &Args) -> Result<(), ConfigError> {
 /// leaves nothing behind.
 fn validate_config(args: &Args) -> Result<(), ConfigError> {
     configure_js_sandbox(args)?;
-    check_cluster_args(args)?;
-    match args.default_security.as_str() {
-        "open" | "admin-only" | "" => Ok(()),
-        other => Err(config_error(format!(
-            "unknown --default-security value: {other} (expected open or admin-only)"
-        ))),
-    }
+    check_cluster_args(args)
 }
 
 /// The URL peers and clients are told to reach this node on.
@@ -169,12 +145,7 @@ fn build_auth(args: &Args) -> anyhow::Result<Option<Auth>> {
 
 /// Whether new databases start admin-only, from `--default-security`.
 fn default_admin_only(args: &Args, auth: &Option<Auth>) -> bool {
-    match args.default_security.as_str() {
-        "open" => false,
-        "admin-only" => true,
-        // Anything else was refused by `validate_config`.
-        _ => auth.is_some(),
-    }
+    args.default_admin_only.unwrap_or_else(|| auth.is_some())
 }
 
 /// The shared application state for this node.
@@ -185,8 +156,8 @@ fn build_state(
 ) -> anyhow::Result<Arc<AppState>> {
     let default_admin_only = default_admin_only(args, &auth);
     let config = Config {
-        q: args.q.max(1),
-        revs_limit: args.revs_limit.max(1),
+        q: args.q,
+        revs_limit: args.revs_limit,
         sync_secs: args.sync_secs,
         seeds: args.seed_nodes.clone(),
         advertise,
@@ -197,8 +168,8 @@ fn build_state(
             .iter()
             .map(|header| header.to_ascii_lowercase())
             .collect(),
-        view_timeout_ms: args.view_timeout_ms.max(1),
-        view_memory_mb: args.view_memory_mb.max(1),
+        view_timeout_ms: args.view_timeout_ms,
+        view_memory_mb: args.view_memory_mb,
         default_admin_only,
         max_open_dbs: args.max_open_dbs,
         local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
@@ -210,9 +181,7 @@ fn build_state(
         db_opens: Default::default(),
         fs_health: Default::default(),
         config,
-        compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            args.compact_concurrency.max(1),
-        )),
+        compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(args.compact_concurrency)),
         admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
             max_in_flight: args.max_in_flight,
             per_user_in_flight: args.per_user_in_flight,
@@ -226,7 +195,7 @@ fn build_state(
             cluster: Cluster {
                 nodes: args.nodes.clone(),
                 me: args.me,
-                n: args.n.max(1),
+                n: args.n,
                 secret: args.cluster_secret.clone(),
             },
             client: crate::cluster_http::peer_client(
@@ -319,7 +288,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
         // multi-document `_bulk_docs`. CouchDB's limit is far higher.
         .layer(axum::extract::DefaultBodyLimit::max(
-            args.max_request_mb.max(1).saturating_mul(1024 * 1024),
+            args.max_request_mb.saturating_mul(1024 * 1024),
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

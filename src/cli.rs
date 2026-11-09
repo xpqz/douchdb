@@ -11,7 +11,9 @@ pub struct Args {
     pub admin: Option<(String, String)>,
     pub users_file: Option<String>,
     pub session_secret: String,
-    pub default_security: String,
+    /// `--default-security`: `Some(true)` for admin-only, `Some(false)` for
+    /// open, `None` to follow whether authentication is configured.
+    pub default_admin_only: Option<bool>,
     pub max_in_flight: usize,
     pub per_user_in_flight: usize,
     pub per_user_rate: usize,
@@ -24,8 +26,8 @@ pub struct Args {
     pub advertise: String,
     pub seed_nodes: Vec<String>,
     pub sync_secs: u64,
-    pub js_sandbox: String,
-    pub wasm_runtime: String,
+    pub js_sandbox: crate::js::Sandbox,
+    pub wasm_runtime: crate::js::WasmRuntime,
     pub js_workers: usize,
     pub worker: bool,
     pub cors_origins: Vec<String>,
@@ -161,7 +163,7 @@ pub fn parse_from(
             .transpose()?,
         users_file: None,
         session_secret: environment(&env, "DOUCHDB_SESSION_SECRET")?.unwrap_or_default(),
-        default_security: String::new(),
+        default_admin_only: None,
         max_in_flight: 64,
         per_user_in_flight: 16,
         per_user_rate: 0,
@@ -174,8 +176,8 @@ pub fn parse_from(
         advertise: String::new(),
         seed_nodes: Vec::new(),
         sync_secs: 5,
-        js_sandbox: "native".to_string(),
-        wasm_runtime: "wasmi".to_string(),
+        js_sandbox: crate::js::Sandbox::Native,
+        wasm_runtime: crate::js::WasmRuntime::Wasmi,
         js_workers: 2,
         worker: false,
         cors_origins: Vec::new(),
@@ -196,6 +198,7 @@ pub fn parse_from(
     };
     let argv: Vec<String> = argv.into_iter().collect();
     let mut it = argv.into_iter();
+    let mut me_given = false;
     while let Some(arg) = it.next() {
         let flag = arg.as_str();
         match flag {
@@ -218,7 +221,17 @@ pub fn parse_from(
             "--admin" => args.admin = Some(admin(&it.next().unwrap_or_default(), "--admin")?),
             "--users-file" => args.users_file = Some(value(&mut it, flag)?),
             "--session-secret" => args.session_secret = value(&mut it, flag)?,
-            "--default-security" => args.default_security = value(&mut it, flag)?,
+            "--default-security" => {
+                args.default_admin_only = Some(match value(&mut it, flag)?.as_str() {
+                    "open" => false,
+                    "admin-only" => true,
+                    other => {
+                        return Err(format!(
+                            "unknown --default-security value: {other:?} (expected open or admin-only)"
+                        ));
+                    }
+                })
+            }
             "--max-in-flight" => args.max_in_flight = number(&mut it, flag, 0, u32::MAX.into())?,
             "--per-user-in-flight" => {
                 args.per_user_in_flight = number(&mut it, flag, 0, u32::MAX.into())?
@@ -241,7 +254,10 @@ pub fn parse_from(
                     .map(str::to_string)
                     .collect()
             }
-            "--me" => args.me = number(&mut it, flag, 0, u32::MAX.into())?,
+            "--me" => {
+                args.me = number(&mut it, flag, 0, u32::MAX.into())?;
+                me_given = true;
+            }
             "--advertise" => args.advertise = value(&mut it, flag)?,
             "--seed-nodes" => {
                 args.seed_nodes = value(&mut it, flag)?
@@ -252,8 +268,29 @@ pub fn parse_from(
                     .collect()
             }
             "--sync-secs" => args.sync_secs = number(&mut it, flag, 0, u64::MAX)?,
-            "--js-sandbox" => args.js_sandbox = value(&mut it, flag)?,
-            "--wasm-runtime" => args.wasm_runtime = value(&mut it, flag)?,
+            "--js-sandbox" => {
+                args.js_sandbox = match value(&mut it, flag)?.as_str() {
+                    "native" => crate::js::Sandbox::Native,
+                    "process" => crate::js::Sandbox::Process,
+                    "wasm" => crate::js::Sandbox::Wasm,
+                    other => {
+                        return Err(format!(
+                            "unknown --js-sandbox value: {other:?} (expected native, process or wasm)"
+                        ));
+                    }
+                }
+            }
+            "--wasm-runtime" => {
+                args.wasm_runtime = match value(&mut it, flag)?.as_str() {
+                    "wasmi" => crate::js::WasmRuntime::Wasmi,
+                    "wasmtime" => crate::js::WasmRuntime::Wasmtime,
+                    other => {
+                        return Err(format!(
+                            "unknown --wasm-runtime value: {other:?} (expected wasmi or wasmtime)"
+                        ));
+                    }
+                }
+            }
             "--js-worker" => args.worker = true,
             "--js-workers" => args.js_workers = number(&mut it, flag, 1, 64)?,
             "--view-timeout-ms" => args.view_timeout_ms = number(&mut it, flag, 1, u64::MAX)?,
@@ -287,6 +324,9 @@ pub fn parse_from(
     }
     // An index outside the node list would silently make this node advertise
     // the wrong URL (or, in a cluster, own the wrong shards).
+    if me_given && args.nodes.is_empty() {
+        return Err("--me requires --nodes".to_string());
+    }
     if !args.nodes.is_empty() && args.me >= args.nodes.len() {
         return Err(format!(
             "--me {} is out of range: --nodes lists {} node(s), so --me must be 0..{}",
@@ -504,8 +544,10 @@ mod tests {
             assert!(message.contains(flag), "{flag} {bad:?}: {message}");
         }
         // A wasm runtime typo is rejected even when the sandbox is not wasm.
-        assert!(error(&["--js-sandbox", "native", "--wasm-runtime", "wasmx"])
-            .contains("--wasm-runtime"));
+        assert!(
+            error(&["--js-sandbox", "native", "--wasm-runtime", "wasmx"])
+                .contains("--wasm-runtime")
+        );
         for good in ["native", "process", "wasm"] {
             assert!(parse(&["--js-sandbox", good]).is_ok(), "{good}");
         }
@@ -520,7 +562,10 @@ mod tests {
     #[test]
     fn me_without_nodes_is_rejected() {
         let message = error(&["--me", "1"]);
-        assert!(message.contains("--me") && message.contains("--nodes"), "{message}");
+        assert!(
+            message.contains("--me") && message.contains("--nodes"),
+            "{message}"
+        );
         assert!(error(&["--me", "0"]).contains("--nodes"));
     }
 

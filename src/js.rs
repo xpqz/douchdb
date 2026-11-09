@@ -175,7 +175,7 @@ pub fn configure(sandbox: Sandbox, workers: usize) {
         },
         Ordering::SeqCst,
     );
-    MAX_WORKERS.store(workers.clamp(1, 64), Ordering::SeqCst);
+    MAX_WORKERS.store(workers, Ordering::SeqCst);
 }
 
 /// Select the wasm runtime. Returns an error when Wasmtime was requested but
