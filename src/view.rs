@@ -6,7 +6,7 @@
 //! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
-use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, DocOpts};
+use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult};
 use crate::index_cache::{Gate, Registry, Slot};
 use crate::js::JsError;
 use crate::util::hex;
@@ -1941,26 +1941,7 @@ pub(crate) async fn docs_by_ids(db: &Db, ids: &[String]) -> DbResult<HashMap<Str
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let opts = AllDocsOpts {
-        keys: Some(ids.iter().cloned().map(Value::String).collect()),
-        include_docs: true,
-        limit: usize::MAX,
-        ..Default::default()
-    };
-    let all = db.all_docs(&opts).await?;
-    let mut docs = HashMap::new();
-    for row in all.rows {
-        let Some(id) = row.id else {
-            continue;
-        };
-        if id.starts_with("_design/") || id.starts_with("_local/") {
-            continue;
-        }
-        if let Some(doc) = row.doc {
-            docs.insert(id, doc);
-        }
-    }
-    Ok(docs)
+    db.docs_by_ids(ids).await
 }
 
 /// Drop every index for a database. Used by `_purge`, which can remove a
@@ -2026,7 +2007,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
 }
 
 pub async fn load_spec(db: &Db, ddoc_id: &str, view_name: &str) -> DbResult<ViewSpec> {
-    let ddoc = db.get_doc(ddoc_id, &DocOpts::default()).await?;
+    let ddoc = db.design_doc(ddoc_id).await?;
     spec_from_doc(&ddoc, view_name)
 }
 

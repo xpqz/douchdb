@@ -447,6 +447,12 @@ pub struct Db {
     /// Bumped on every design-document write, so a validator load that raced
     /// with one is not cached.
     design_generation: AtomicU64,
+    /// Design documents already read, with the committed sequence of their
+    /// shard at the time (see `design_doc`).
+    design_docs: std::sync::Mutex<HashMap<String, (u64, Arc<Value>)>>,
+    /// Bumped by the operations that change documents without moving a
+    /// shard's sequence, so a read that raced with one is not cached.
+    design_epoch: AtomicU64,
     /// Set when the database is deleted; see `mark_deleted`.
     deleted: AtomicBool,
 }
@@ -458,6 +464,9 @@ pub struct DbConfig {
     pub shard_map: ShardMap,
     pub partitioned: bool,
 }
+
+/// Design documents `Db::design_doc` keeps.
+const DESIGN_CACHE_LIMIT: usize = 64;
 
 /// Upper bound for a cluster-wide rebalance write freeze. If the coordinator
 /// disappears, peers resume writes after this window instead of staying frozen.
@@ -604,6 +613,8 @@ impl Db {
             commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
+            design_docs: std::sync::Mutex::new(HashMap::new()),
+            design_epoch: AtomicU64::new(0),
             deleted: AtomicBool::new(false),
         })
     }
@@ -856,6 +867,57 @@ impl Db {
             *cached = Some(functions.clone());
         }
         Ok(functions)
+    }
+
+    /// The winning revision of design document `id`, as `get_doc` returns it.
+    ///
+    /// A copy read earlier is served without a shard job while its shard has
+    /// committed nothing since: any write to the document moves the shard's
+    /// committed sequence, so the copy cannot be stale. A write still in
+    /// flight (reserved past committed) is not waited for, and a read that
+    /// starts then is not cached.
+    pub(crate) async fn design_doc(&self, id: &str) -> DbResult<Arc<Value>> {
+        let index = self.shard_index(id);
+        // Reserved first: a write that reserves between the two loads commits
+        // a sequence above `reserved`, and then the two differ.
+        let reserved = self.reserved_seq[index].load(Ordering::SeqCst);
+        let committed = self.committed_seq[index].load(Ordering::SeqCst);
+        let quiet = reserved == committed;
+        if quiet {
+            let cached = self
+                .design_docs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some((_, doc)) = cached.get(id).filter(|(seq, _)| *seq == committed) {
+                return Ok(doc.clone());
+            }
+        }
+        let epoch = self.design_epoch.load(Ordering::SeqCst);
+        let doc = Arc::new(self.get_doc(id, &DocOpts::default()).await?);
+        if quiet {
+            let mut cached = self
+                .design_docs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if self.design_epoch.load(Ordering::SeqCst) == epoch {
+                // Few enough design documents are read per database that a
+                // full cache is cleared rather than evicted from.
+                if cached.len() >= DESIGN_CACHE_LIMIT {
+                    cached.clear();
+                }
+                cached.insert(id.to_string(), (committed, doc.clone()));
+            }
+        }
+        Ok(doc)
+    }
+
+    /// Forget every cached design document.
+    fn forget_design_docs(&self) {
+        self.design_epoch.fetch_add(1, Ordering::SeqCst);
+        self.design_docs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
     }
 
     /// Generation of this node's design documents.
@@ -1229,13 +1291,18 @@ impl Db {
     }
 
     pub async fn clear_shards(&self, shards: &[usize]) -> DbResult<()> {
+        let mut result = Ok(());
         for &index in shards {
             let Some(shard) = self.shards.get(index) else {
                 continue;
             };
-            shard.call(|s| s.clear().map_err(ApiError::from)).await?;
+            result = shard.call(|s| s.clear().map_err(ApiError::from)).await;
+            if result.is_err() {
+                break;
+            }
         }
-        Ok(())
+        self.forget_design_docs();
+        result
     }
 
     pub async fn shard_counts(&self) -> DbResult<Vec<(u64, u64)>> {
@@ -1503,6 +1570,50 @@ impl Db {
             .into_iter()
             .map(|result| result.unwrap_or_else(|| Err(ApiError::not_found("missing"))))
             .collect())
+    }
+
+    /// The current body of each of `ids` that names a document, with one job
+    /// per shard and nothing else (`all_docs` with `keys` also counts the
+    /// shard's documents, a second job). A deleted document maps to `null`;
+    /// an id that is missing, or that names a design or local document, is
+    /// left out.
+    pub(crate) async fn docs_by_ids(&self, ids: &[String]) -> DbResult<HashMap<String, Value>> {
+        let mut grouped: Vec<Vec<String>> = (0..self.q).map(|_| Vec::new()).collect();
+        for id in ids {
+            if id.starts_with("_design/") || id.starts_with("_local/") {
+                continue;
+            }
+            grouped[self.shard_index(id)].push(id.clone());
+        }
+        let opts = AllDocsOpts {
+            include_docs: true,
+            ..Default::default()
+        };
+        let fetched = futures::future::join_all(
+            grouped
+                .into_iter()
+                .enumerate()
+                .filter(|(_, batch)| !batch.is_empty())
+                .map(|(index, batch)| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| {
+                        batch
+                            .into_iter()
+                            .filter_map(|id| match all_docs_key_row(s, &id, &opts) {
+                                Ok(Some(row)) => row.doc.map(|doc| Ok((id, doc))),
+                                Ok(None) => None,
+                                Err(error) => Some(Err(error)),
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    })
+                }),
+        )
+        .await;
+        let mut docs = HashMap::new();
+        for batch in fetched {
+            docs.extend(batch?);
+        }
+        Ok(docs)
     }
 
     pub async fn all_docs(&self, opts: &AllDocsOpts) -> DbResult<DocList> {
@@ -2719,6 +2830,13 @@ impl Db {
 
     /// Purge on this node, which is replica `me`.
     pub async fn purge(&self, body: &Value, me: usize) -> DbResult<Value> {
+        let result = self.purge_docs(body, me).await;
+        // A purge can remove a design document without taking a sequence.
+        self.forget_design_docs();
+        result
+    }
+
+    async fn purge_docs(&self, body: &Value, me: usize) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
