@@ -735,6 +735,47 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
 /// Rows are encoded into chunks of about this size as they are read.
 const STREAM_CHUNK: usize = 64 * 1024;
 
+/// A JSON body written while its rows are produced: `head`, the rows
+/// separated by commas, then `tail`. Rows are encoded into chunks of about
+/// `STREAM_CHUNK`, so the first bytes leave before the last row is read and
+/// memory stays constant. A failing row can only end the connection early.
+pub(super) fn stream_json_rows<T: serde::Serialize + Send + 'static>(
+    head: Vec<u8>,
+    rows: impl futures::Stream<Item = DbResult<T>> + Send + 'static,
+    tail: Vec<u8>,
+) -> Body {
+    let stream = async_stream::stream! {
+        let mut rows = Box::pin(rows);
+        let mut buffer = head;
+        let mut first = true;
+        while let Some(item) = rows.next().await {
+            let encoded = item.and_then(|row| serde_json::to_vec(&row).map_err(ApiError::internal));
+            match encoded {
+                Ok(encoded) => {
+                    if !first {
+                        buffer.push(b',');
+                    }
+                    first = false;
+                    buffer.extend_from_slice(&encoded);
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!(
+                        "{}: {}",
+                        error.error, error.reason
+                    )));
+                    return;
+                }
+            }
+            if buffer.len() >= STREAM_CHUNK {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
+            }
+        }
+        buffer.extend_from_slice(&tail);
+        yield Ok(Bytes::from(buffer));
+    };
+    Body::from_stream(stream)
+}
+
 /// `_all_docs` without `keys` on this node: the body is written while the
 /// rows are read, so a listing of any size takes constant memory and the
 /// first bytes leave before the last row is read. The bytes are those of the
@@ -763,46 +804,16 @@ async fn stream_all_docs(
             return fail(error);
         }
         let rows = futures::stream::iter(first_row).chain(rows);
-        let stream = async_stream::stream! {
-            let mut rows = Box::pin(rows);
-            let mut buffer = format!(
-                "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
-                head.total_rows, head.offset
-            )
-            .into_bytes();
-            let mut first = true;
-            while let Some(item) = rows.next().await {
-                let encoded = item.and_then(|row| {
-                    serde_json::to_vec(&row).map_err(ApiError::internal)
-                });
-                match encoded {
-                    Ok(encoded) => {
-                        if !first {
-                            buffer.push(b',');
-                        }
-                        first = false;
-                        buffer.extend_from_slice(&encoded);
-                    }
-                    Err(error) => {
-                        yield Err(std::io::Error::other(format!(
-                            "{}: {}",
-                            error.error, error.reason
-                        )));
-                        return;
-                    }
-                }
-                if buffer.len() >= STREAM_CHUNK {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(&mut buffer)));
-                }
-            }
-            buffer.push(b']');
-            if let Some(update_seq) = update_seq {
-                buffer.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
-            }
-            buffer.push(b'}');
-            yield Ok(Bytes::from(buffer));
-        };
-        Body::from_stream(stream)
+        let head = format!(
+            "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+            head.total_rows, head.offset
+        );
+        let mut tail = vec![b']'];
+        if let Some(update_seq) = update_seq {
+            tail.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
+        }
+        tail.push(b'}');
+        stream_json_rows(head.into_bytes(), rows, tail)
     };
     Response::builder()
         .status(StatusCode::OK)
