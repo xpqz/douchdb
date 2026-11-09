@@ -1729,10 +1729,10 @@ async fn fetch_remote_docs(
 /// carries them, and it must not: a local delete leaves no tombstone, so a
 /// pull would bring a deleted document back.
 ///
-/// Writes are frozen, so each old copy is read once, the newest revision of
-/// each document wins, and the copy is installed with its revision as is. A
-/// failure leaves the active map untouched; the caller abandons the
-/// migration.
+/// Each old copy is read once; one that cannot be reached is skipped while
+/// another copy of its shards answered. The newest revision of each document
+/// wins and the copy is installed with its revision as is. A failure leaves
+/// the active map untouched; the caller abandons the migration.
 pub(crate) async fn copy_local_docs(
     read: ClusterRead<'_>,
     old_map: &crate::cluster::ShardMap,
@@ -1745,7 +1745,7 @@ pub(crate) async fn copy_local_docs(
         headers,
     } = read;
     let mut gained: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut sources: HashMap<usize, ShardMask> = HashMap::new();
+    let mut sources: BTreeMap<usize, ShardMask> = BTreeMap::new();
     for shard in 0..db.q {
         let old = old_map.replicas_of(shard);
         let new: Vec<usize> = map
@@ -1784,21 +1784,40 @@ pub(crate) async fn copy_local_docs(
         }),
     )))
     .await;
-    let mut newest: BTreeMap<String, Value> = BTreeMap::new();
-    for listing in listings {
-        for row in listing?.rows {
-            let Some(doc) = row.doc else {
-                continue;
-            };
-            let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
-                continue;
-            };
-            let current = newest.get(&id).map_or(0, local_rev_number);
-            if !newest.contains_key(&id) || local_rev_number(&doc) > current {
-                newest.insert(id, doc);
+    // An old copy that does not answer is skipped while another copy of each
+    // of its shards does: copies of a shard hold the same local documents, bar
+    // a write that reached only some of them, which the highest revision
+    // settles. Only a gained shard no old copy answered for fails.
+    let mut answered: Vec<DocList> = Vec::new();
+    let mut answering: Vec<usize> = Vec::new();
+    let mut first_error = None;
+    for ((node, _), listing) in sources.iter().zip(listings) {
+        match listing {
+            Ok(listing) => {
+                answering.push(*node);
+                answered.push(listing);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
             }
         }
     }
+    for shard in gained.keys() {
+        let covered = old_map
+            .replicas_of(*shard as u32)
+            .iter()
+            .any(|node| answering.contains(node));
+        if !covered {
+            return Err(first_error.unwrap_or_else(|| {
+                ApiError::new(
+                    502,
+                    "rebalance_failed",
+                    "no old copy of a shard answered for its _local documents",
+                )
+            }));
+        }
+    }
+    let newest = newest_local_docs(answered);
 
     let mut per_node: HashMap<usize, Vec<Value>> = HashMap::new();
     for (id, doc) in newest {
@@ -1837,6 +1856,27 @@ pub(crate) async fn copy_local_docs(
         }
     }
     Ok(())
+}
+
+/// The newest revision of each `_local` document across the listings, which
+/// are taken in order: of equal revisions the earlier listing's copy stays.
+fn newest_local_docs(listings: Vec<DocList>) -> BTreeMap<String, Value> {
+    let mut newest: BTreeMap<String, Value> = BTreeMap::new();
+    for listing in listings {
+        for row in listing.rows {
+            let Some(doc) = row.doc else {
+                continue;
+            };
+            let Some(id) = doc.get("_id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let current = newest.get(&id).map_or(0, local_rev_number);
+            if !newest.contains_key(&id) || local_rev_number(&doc) > current {
+                newest.insert(id, doc);
+            }
+        }
+    }
+    newest
 }
 
 /// The number of a `0-N` local revision, 0 for anything else.
@@ -3318,6 +3358,40 @@ async fn fetch_search_mask(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn listing(docs: &[Value]) -> DocList {
+        let rows = docs
+            .iter()
+            .map(|doc| {
+                json!({"id": doc["_id"], "key": doc["_id"], "value": {"rev": doc["_rev"]}, "doc": doc})
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({"total_rows": null, "offset": null, "rows": rows}))
+            .expect("listing")
+    }
+
+    #[test]
+    fn newest_local_docs_takes_the_highest_rev_and_the_earlier_on_a_tie() {
+        let first = listing(&[
+            json!({"_id": "_local/a", "_rev": "0-2", "v": "first"}),
+            json!({"_id": "_local/b", "_rev": "0-3", "v": "first"}),
+            json!({"_id": "_local/c", "_rev": "bogus", "v": "first"}),
+        ]);
+        let second = listing(&[
+            json!({"_id": "_local/a", "_rev": "0-10", "v": "second"}),
+            json!({"_id": "_local/b", "_rev": "0-3", "v": "second"}),
+            json!({"_id": "_local/c", "_rev": "0-1", "v": "second"}),
+            json!({"_id": "_local/d", "_rev": "1-abc", "v": "second"}),
+        ]);
+        let newest = newest_local_docs(vec![first, second]);
+        assert_eq!(newest["_local/a"]["v"], "second", "0-10 beats 0-2");
+        assert_eq!(newest["_local/b"]["v"], "first", "a tie keeps the earlier");
+        assert_eq!(
+            newest["_local/c"]["v"], "second",
+            "a number beats a bad rev"
+        );
+        assert_eq!(newest["_local/d"]["v"], "second", "a bad rev alone is kept");
+    }
 
     /// A one-shot HTTP peer that answers every request with `status`.
     fn peer_answering(status: u16) -> String {

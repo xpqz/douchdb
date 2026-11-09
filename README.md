@@ -692,6 +692,10 @@ served per protocol under `http.internal_requests` in
   cleanup return `409 rebalance_in_progress` while a migration owns the
   database. It is still an operator action built on static membership, not an
   online membership protocol.
+- **`_local` documents follow their shard on a placement change.** Anti-entropy
+  skips them (as CouchDB's does), so a rebalance or a direct placement `PUT`
+  copies them to the gaining owners from the old copies that answer, highest
+  `0-N` revision winning; CouchDB itself does not move user `_local` documents.
 
 The cluster paths are covered by the integration tests, including
 `cluster_writes_land_on_the_whole_replica_set`,

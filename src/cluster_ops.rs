@@ -123,6 +123,23 @@ pub(crate) async fn apply_shard_map(
             return Err(shard_map_rejected());
         }
     } else {
+        // Anti-entropy never carries `_local` documents (CouchDB's mem3_rep
+        // does not either), so hand them to the gaining owners before the
+        // map goes live, as a rebalance does. Best effort: replacing an
+        // owner that is gone must stay possible, and a shard none of whose
+        // old copies answers has nothing left to copy.
+        let read = crate::fabric::ClusterRead {
+            ctx,
+            db,
+            dbname: name,
+            headers,
+        };
+        if let Err(error) = crate::fabric::copy_local_docs(read, &db.shard_map(), &map).await {
+            tracing::warn!(
+                "_local documents of {name} were not copied: {}",
+                error.reason
+            );
+        }
         map = db.set_next_shard_map(map)?;
     }
     if internal {
