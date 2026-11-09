@@ -2200,6 +2200,60 @@ mod tests {
         }
     }
 
+    /// Shard jobs an incremental search update costs on a three-shard
+    /// database. Before: 7 jobs, 3 of them the per-shard `pending` count the
+    /// index never uses. After: 4.
+    #[tokio::test]
+    async fn an_incremental_search_update_skips_the_pending_pass() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-pending-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchpending",
+            crate::db::DbConfig {
+                q: 3,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(3),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/d", "indexes": {"idx": {
+                    "index": "function(doc){ index('a', doc.a); }"}}}),
+                json!({"_id": "x", "a": "one"}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewLimits::default();
+        let request = SearchRequest {
+            query: "*:*".to_string(),
+            limit: 10,
+            ..SearchRequest::default()
+        };
+        // Builds the index.
+        query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        db.put_docs(vec![json!({"_id": "y", "a": "two"})], true)
+            .await
+            .unwrap();
+        let before = db.shard_jobs();
+        let result = query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        let jobs = db.shard_jobs() - before;
+        assert_eq!(result["total_rows"], json!(2), "{result}");
+        assert_eq!(jobs, 4, "shard jobs for one incremental update");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn updated_indexes_match_a_rebuild_over_random_writes() {
         let root = std::env::temp_dir().join(format!(
