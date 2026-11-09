@@ -134,6 +134,86 @@ impl Placement {
     }
 }
 
+type LockMap = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// One lock per database name, present only while someone holds or waits on
+/// it. Every holder and waiter owns a clone of the entry's `Arc`, taken under
+/// the map lock, so a guard that finds nobody else sharing the entry when it
+/// lets go can remove it without stranding a waiter on a lock that a later
+/// caller would replace with a fresh one.
+#[derive(Default)]
+pub struct NameLocks {
+    map: Arc<LockMap>,
+}
+
+/// A name's lock, held or being waited for. Dropping it releases the lock and
+/// removes the entry when no one else uses it, also when the wait is cancelled.
+pub struct NameGuard {
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    name: String,
+    map: Arc<LockMap>,
+}
+
+impl NameLocks {
+    fn guard(&self, name: &str) -> NameGuard {
+        let lock = self
+            .map
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        NameGuard {
+            held: None,
+            lock: Some(lock),
+            name: name.to_string(),
+            map: self.map.clone(),
+        }
+    }
+
+    pub async fn lock(&self, name: &str) -> NameGuard {
+        let mut guard = self.guard(name);
+        if let Some(lock) = guard.lock.clone() {
+            guard.held = Some(lock.lock_owned().await);
+        }
+        guard
+    }
+
+    /// The lock if it is free right now.
+    pub fn try_lock(&self, name: &str) -> Option<NameGuard> {
+        let mut guard = self.guard(name);
+        let lock = guard.lock.clone()?;
+        guard.held = Some(lock.try_lock_owned().ok()?);
+        Some(guard)
+    }
+
+    /// Entries in the map.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+}
+
+impl Drop for NameGuard {
+    fn drop(&mut self) {
+        self.held = None;
+        self.lock = None;
+        let mut map = self.map.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Under the map lock nobody can clone the entry, so a count of one
+        // means only the map holds it.
+        if map
+            .get(&self.name)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(&self.name);
+        }
+    }
+}
+
 pub struct AppState {
     pub root: PathBuf,
     /// The open databases, at most `config.max_open_dbs` once idle ones have
@@ -142,7 +222,7 @@ pub struct AppState {
     /// One lock per database name. Open, create and drop of a name run one at
     /// a time, so a name is never opened twice (the second open would fail on
     /// the LevelDB lock) and a drop cannot interleave with a create or open.
-    pub db_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub db_locks: NameLocks,
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
     pub db_opens: AtomicU64,
@@ -199,14 +279,6 @@ pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_se
 // state
 
 impl AppState {
-    fn name_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .db_locks
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        locks.entry(name.to_string()).or_default().clone()
-    }
-
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         self.open_db(name, true).await
     }
@@ -242,8 +314,7 @@ impl AppState {
         }
         // Concurrent first requests for one name share a single open, and a
         // drop that won the race leaves nothing to open.
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         if let Some(open) = self.dbs.read().await.get(name) {
             return Ok(if hot { open.touch() } else { open.db.clone() });
         }
@@ -333,7 +404,7 @@ impl AppState {
                 if !quiescent {
                     continue;
                 }
-                let Ok(guard) = self.name_lock(&name).try_lock_owned() else {
+                let Some(guard) = self.db_locks.try_lock(&name) else {
                     continue;
                 };
                 if let Some(open) = dbs.remove(&name) {
@@ -377,8 +448,7 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(illegal_db_name(name));
         }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         let path = crate::db::db_path(&self.root, name);
         crate::view::forget_db(&path).await;
         crate::search::forget_db(&path).await;
@@ -416,8 +486,7 @@ impl AppState {
         if !valid_db_name(name) {
             return Err(ApiError::db_not_found());
         }
-        let lock = self.name_lock(name);
-        let _guard = lock.lock().await;
+        let _guard = self.db_locks.lock(name).await;
         // Marked before the gates are forgotten: a request holding the handle
         // can no longer take a fresh gate and reach the index directories.
         if let Some(open) = self.dbs.write().await.remove(name) {
@@ -567,7 +636,7 @@ mod tests {
         // wait for the map to drain rather than for a fixed time.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            let left = st.db_locks.lock().unwrap().len();
+            let left = st.db_locks.len();
             if left == 0 {
                 break;
             }
