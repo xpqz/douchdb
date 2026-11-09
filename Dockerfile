@@ -10,10 +10,12 @@ COPY vendor ./vendor
 COPY src ./src
 COPY ui ./ui
 # `src/js.rs` embeds the checked-in QuickJS WASI runner, and `src/view.rs` and
-# `src/search.rs` the shared JS wrappers, at compile time.
+# `src/search.rs` the shared JS wrappers, at compile time; `src/js.rs` also
+# includes the output limits it shares with the runner.
 RUN mkdir -p wasm
 COPY wasm/qjs-runner.wasm ./wasm/qjs-runner.wasm
 COPY wasm/js ./wasm/js
+COPY wasm/limits.rs ./wasm/limits.rs
 RUN cargo build --release --locked
 
 # debian:bookworm-slim, by digest (the tag is a moving target).
