@@ -59,6 +59,21 @@ pub async fn security_headers(
     response
 }
 
+/// The per-request span. Its attributes are exported as OTel trace data, so
+/// they are bounded like the metric labels: the route template and a method
+/// from a fixed set (`http.route` as in the OTel HTTP semantic conventions),
+/// never the raw URL, whose path and query carry client-chosen ids and values.
+fn request_span(method: &Method, route: &str) -> tracing::Span {
+    tracing::info_span!(
+        "http.request",
+        "http.method" = crate::metrics::method_label(method.as_str()),
+        "http.route" = route,
+        "peer.calls" = tracing::field::Empty,
+        "peer.rounds" = tracing::field::Empty,
+        "peer.wait_ms" = tracing::field::Empty,
+    )
+}
+
 pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     use tracing::Instrument;
 
@@ -69,14 +84,7 @@ pub async fn log_requests(req: axum::extract::Request, next: axum::middleware::N
     // Held across the handler so a dropped request (client disconnect) still
     // decrements the in-flight count.
     let _in_flight = crate::metrics::request_started();
-    let span = tracing::info_span!(
-        "http.request",
-        "http.method" = %method,
-        "http.url" = %uri,
-        "peer.calls" = tracing::field::Empty,
-        "peer.rounds" = tracing::field::Empty,
-        "peer.wait_ms" = tracing::field::Empty,
-    );
+    let span = request_span(&method, &crate::metrics::route_label(&path));
     // Peer calls made for this request are counted here and added to the route
     // metrics when the request, and any replica task it left running, is done.
     let internal = req.headers().contains_key("x-douchdb-forwarded")
@@ -362,4 +370,54 @@ fn add_cors_headers(headers: &mut HeaderMap, config: &Config, origin: &str) {
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         &exposed.join(", "),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<(String, String)>>>);
+
+    struct Collect<'a>(&'a mut Vec<(String, String)>);
+    impl tracing::field::Visit for Collect<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Ok(mut fields) = self.0.lock() {
+                attrs.record(&mut Collect(&mut fields));
+            }
+        }
+    }
+
+    #[test]
+    fn request_span_carries_route_and_method_not_the_url() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let route = crate::metrics::route_label("/secretdb/secretdoc");
+            let _span = request_span(&Method::GET, &route);
+        });
+        let fields = captured.0.lock().map(|f| f.clone()).unwrap_or_default();
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"http.route"), "{fields:?}");
+        assert!(names.contains(&"http.method"), "{fields:?}");
+        assert!(!names.contains(&"http.url"), "{fields:?}");
+        assert!(
+            fields.iter().all(|(_, value)| !value.contains("secret")),
+            "{fields:?}"
+        );
+    }
 }
