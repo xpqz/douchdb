@@ -5110,6 +5110,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `put_docs` answers one entry per document in request order: `ok`
+    /// entries, errors with or without the document id, `_local/` writes.
+    #[tokio::test]
+    async fn put_docs_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("put-wire").await;
+        let text = |results: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&results.unwrap()).unwrap()).unwrap()
+        };
+        let first = text(
+            db.put_docs(
+                vec![
+                    json!({"_id": "a"}),
+                    json!({"_id": "_bad"}),
+                    json!({"_id": 5}),
+                    json!({"_id": "_local/l"}),
+                    json!({"_id": "_local/l", "_deleted": true}),
+                    json!({"_id": "_local/gone", "_deleted": true}),
+                ],
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            first,
+            r#"[{"ok":true,"id":"a","rev":"1-967a00dff5e02add41819138abb3284d"},{"error":"illegal_docid","reason":"Only reserved document ids may start with underscore."},{"error":"illegal_docid","reason":"Document id must be a string"},{"ok":true,"id":"_local/l","rev":"0-1"},{"ok":true,"id":"_local/l","rev":"0-0"},{"ok":true,"id":"_local/gone","rev":"0-0"}]"#
+        );
+        let second = text(
+            db.put_docs(
+                vec![
+                    json!({"_id": "a"}),
+                    json!({"_id": "_local/x", "_rev": "bad"}),
+                ],
+                true,
+            )
+            .await,
+        );
+        assert_eq!(
+            second,
+            r#"[{"id":"a","error":"conflict","reason":"Document update conflict."},{"id":"_local/x","error":"bad_request","reason":"Invalid rev format"}]"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
