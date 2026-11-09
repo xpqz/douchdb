@@ -8,6 +8,7 @@
 
 use axum::http::HeaderMap;
 use base64::Engine;
+use hmac::digest::Key;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -368,9 +369,16 @@ impl Auth {
     /// digest, as CouchDB keys it with the secret plus the user's salt, so
     /// changing a credential invalidates the user's sessions.
     fn mac(&self, salt: &[u8; 32]) -> Hmac<Sha256> {
-        let mut key = self.secret.clone();
-        key.extend_from_slice(salt);
-        Hmac::<Sha256>::new_from_slice(&key).expect("hmac key")
+        let mut input = self.secret.clone();
+        input.extend_from_slice(salt);
+        // Hash the key material down to one SHA-256 block key, zero-padded to
+        // HMAC's block size, so the constructor takes a fixed-size key and
+        // cannot fail.
+        let mut key = Key::<Hmac<Sha256>>::default();
+        key.iter_mut()
+            .zip(Sha256::digest(&input))
+            .for_each(|(slot, byte)| *slot = byte);
+        Hmac::<Sha256>::new(&key)
     }
 
     fn sign(&self, name: &str, payload: &str) -> String {
