@@ -139,6 +139,7 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly)
                     break;
                 }
                 let (events, _) = st.db_updates.since(since);
+                st.feed_stats.db_updates_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for event in events {
                     if limit.map(|limit| sent >= limit).unwrap_or(false) {
                         break;
@@ -169,6 +170,9 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly)
     let started = std::time::Instant::now();
     loop {
         let (events, current) = st.db_updates.since(since);
+        st.feed_stats
+            .db_updates_polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !events.is_empty()
             || feed == "normal"
             || started.elapsed().as_millis() as u64 >= timeout
@@ -261,4 +265,44 @@ pub async fn dbs_info(
         }
     }
     json(StatusCode::OK, Value::Array(results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A longpoll `_db_updates` used to re-read the event log every 100 ms. It
+    /// must wait for an event, read the log again only when one is recorded,
+    /// and then answer.
+    #[tokio::test]
+    async fn an_idle_longpoll_db_updates_waits_for_an_event_instead_of_polling() {
+        let root = std::env::temp_dir().join(format!("douchdb-idle-dbu-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 500);
+        let uri: Uri = "/_db_updates?feed=longpoll&timeout=300000".parse().unwrap();
+        let feed = tokio::spawn(db_updates(State(st.clone()), uri, AdminOnly));
+        while st.feed_stats.db_updates_polls.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Several old poll intervals pass with nothing recorded.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let polls = st.feed_stats.db_updates_polls.load(Ordering::Relaxed);
+        assert_eq!(polls, 1, "an idle feed read the log {polls} times");
+
+        st.create_db("woken", false, None, None).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(60), feed)
+            .await
+            .expect("the feed did not wake for an event")
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["results"][0]["db_name"], "woken");
+        assert_eq!(body["results"][0]["type"], "created");
+
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

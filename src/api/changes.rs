@@ -643,8 +643,9 @@ async fn changes_once(
     headers: &HeaderMap,
     local_only: bool,
 ) -> DbResult<ChangesList> {
-    #[cfg(test)]
-    record_changes_once(dbname);
+    st.feed_stats
+        .changes_once
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if st.ctx.cluster.is_clustered() && !local_only && !flag(q, "descending") {
         return cluster_changes(
             ClusterRead {
@@ -680,37 +681,12 @@ async fn changes_once(
     Ok(list)
 }
 
-/// `changes_once` calls per database name, so a test can tell whether an idle
-/// feed polls.
-#[cfg(test)]
-static CHANGES_ONCE_CALLS: std::sync::Mutex<Vec<(String, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-#[cfg(test)]
-fn record_changes_once(dbname: &str) {
-    let mut calls = CHANGES_ONCE_CALLS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    match calls.iter_mut().find(|(name, _)| name == dbname) {
-        Some((_, count)) => *count += 1,
-        None => calls.push((dbname.to_string(), 1)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
-
-    fn changes_once_calls(dbname: &str) -> usize {
-        CHANGES_ONCE_CALLS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-            .find(|(name, _)| name == dbname)
-            .map_or(0, |(_, count)| *count)
-    }
 
     /// A continuous feed used to re-run `changes_once` every 50 ms for as long
     /// as it was open. An idle one must wait for a commit instead, and a
@@ -752,7 +728,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let calls = changes_once_calls("idlefeed");
+        let calls = st.feed_stats.changes_once.load(Ordering::Relaxed);
         assert!(calls <= 2, "an idle feed ran changes_once {calls} times");
 
         // A commit wakes it long before a fallback poll could.
@@ -763,6 +739,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(String::from_utf8_lossy(&line).contains("\"id\":\"a\""));
+
+        drop(feed);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Standalone, every commit wakes a feed, so its fallback tick only has to
+    /// notice a security change. It must not re-run `changes_once` (filter
+    /// resolution included) to do that.
+    #[tokio::test]
+    async fn an_idle_feed_does_not_rerun_changes_once_on_its_fallback_ticks() {
+        let root = std::env::temp_dir().join(format!("douchdb-idle-tick-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 500);
+        Arc::get_mut(&mut st).unwrap().config.local_feed_recheck = Duration::from_millis(10);
+        let db = st.create_db("idletick", false, None, None).await.unwrap();
+
+        let uri: Uri = "/idletick/_changes?feed=continuous&since=now&heartbeat=20&timeout=20000"
+            .parse()
+            .unwrap();
+        let q = query(&uri);
+        let headers = HeaderMap::new();
+        let body = Bytes::new();
+        let response = changes(
+            st.clone(),
+            db.clone(),
+            DbRequest {
+                st: &st,
+                db: &db,
+                name: "idletick",
+                method: &Method::GET,
+                uri: &uri,
+                q: &q,
+                headers: &headers,
+                principal: &Principal::service_admin(),
+                body: &body,
+            },
+        )
+        .await;
+        let mut feed = response.into_body().into_data_stream();
+
+        // Let many fallback ticks (and heartbeats) pass with nothing written.
+        for _ in 0..5 {
+            let line = tokio::time::timeout(Duration::from_secs(60), feed.next())
+                .await
+                .expect("the feed sent no heartbeat")
+                .unwrap()
+                .unwrap();
+            assert_eq!(&line[..], b"\n");
+        }
+        let calls = st.feed_stats.changes_once.load(Ordering::Relaxed);
+        assert_eq!(
+            calls, 1,
+            "an idle feed re-ran changes_once on {calls} ticks"
+        );
+
+        // A commit still arrives.
+        db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(60), feed.next())
+                .await
+                .expect("the feed did not wake for a commit")
+                .unwrap()
+                .unwrap();
+            if line.len() > 1 {
+                assert!(String::from_utf8_lossy(&line).contains("\"id\":\"a\""));
+                break;
+            }
+        }
 
         drop(feed);
         st.dbs.write().await.clear();
