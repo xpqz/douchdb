@@ -272,6 +272,7 @@ mod tests {
             dbs: Default::default(),
             db_locks: Default::default(),
             db_opens: Default::default(),
+            principal_resolutions: Default::default(),
             fs_health: Default::default(),
             shutdown: Default::default(),
             config: Config {
@@ -304,6 +305,7 @@ mod tests {
                 health: Default::default(),
             },
             db_updates: Default::default(),
+            feed_stats: Default::default(),
             cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
             admission: Arc::new(crate::admission::Admission::new(Default::default())),
             compaction: Arc::new(tokio::sync::Semaphore::new(1)),

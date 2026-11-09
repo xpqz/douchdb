@@ -171,9 +171,8 @@ pub(super) fn require_db_access(
     }
 }
 
-pub(super) fn still_allowed(st: &AppState, db: &Db, headers: &HeaderMap) -> bool {
-    let principal = st.principal(headers);
-    db_access(st, &principal, db).is_some()
+pub(super) fn still_allowed(st: &AppState, db: &Db, principal: &Principal) -> bool {
+    db_access(st, principal, db).is_some()
 }
 
 pub(super) fn requires_db_admin(rest: &str, method: &Method) -> bool {

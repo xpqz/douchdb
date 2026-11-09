@@ -23,9 +23,20 @@ struct DbEvent {
     kind: String,
 }
 
-#[derive(Default)]
 pub struct DbUpdates {
     events: Mutex<DbEvents>,
+    /// Signalled whenever an event is recorded, so a feed waits for it
+    /// instead of polling.
+    wake: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for DbUpdates {
+    fn default() -> Self {
+        DbUpdates {
+            events: Mutex::default(),
+            wake: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +63,11 @@ impl DbUpdates {
             db_name: name.to_string(),
             kind: kind.to_string(),
         });
+        self.wake.send_replace(());
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.wake.subscribe()
     }
 
     pub(crate) fn current(&self) -> u64 {
@@ -82,6 +98,16 @@ impl DbUpdates {
             .collect();
         (results, events.seq)
     }
+}
+
+/// Work done by feeds, counted so tests and operators can tell an idle feed
+/// that waits from one that polls. Reported by the local metrics.
+#[derive(Default)]
+pub struct FeedStats {
+    /// Reads of the `_db_updates` event log by a feed.
+    pub db_updates_polls: AtomicU64,
+    /// Full `_changes` reads (filter resolution included) by a feed.
+    pub changes_once: AtomicU64,
 }
 
 /// Default for `--max-open-dbs`. CouchDB's `max_dbs_open` is 500, but a
@@ -226,9 +252,14 @@ pub struct AppState {
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
     pub db_opens: AtomicU64,
+    /// How many times a request's principal was resolved from its headers.
+    /// One per request is the goal; the local metrics report it so tests and
+    /// operators can count.
+    pub principal_resolutions: AtomicU64,
     pub config: Config,
     pub ctx: ClusterCtx,
     pub db_updates: DbUpdates,
+    pub feed_stats: FeedStats,
     pub cluster_state: Arc<crate::cluster_state::ClusterState>,
     pub admission: Arc<crate::admission::Admission>,
     /// Bound concurrent `_compact` requests across databases on this node.
@@ -539,6 +570,7 @@ impl AppState {
     /// requests without user credentials are service admins; peers are trusted
     /// by the shared cluster secret.
     pub fn principal(&self, headers: &HeaderMap) -> Principal {
+        self.principal_resolutions.fetch_add(1, Ordering::Relaxed);
         let Some(auth) = &self.ctx.auth else {
             return Principal::service_admin();
         };
@@ -561,6 +593,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         dbs: Default::default(),
         db_locks: Default::default(),
         db_opens: Default::default(),
+        principal_resolutions: Default::default(),
         fs_health: Default::default(),
         shutdown: Default::default(),
         config: Config {
@@ -596,6 +629,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             health: Default::default(),
         },
         db_updates: Default::default(),
+        feed_stats: Default::default(),
         cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
         admission: Arc::new(crate::admission::Admission::new(Default::default())),
         compaction: Arc::new(tokio::sync::Semaphore::new(1)),

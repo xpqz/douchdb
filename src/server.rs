@@ -191,6 +191,7 @@ fn build_state(
         dbs: RwLock::new(HashMap::new()),
         db_locks: Default::default(),
         db_opens: Default::default(),
+        principal_resolutions: Default::default(),
         fs_health: Default::default(),
         config,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(args.compact_concurrency)),
@@ -220,6 +221,7 @@ fn build_state(
             health: Default::default(),
         },
         db_updates: api::DbUpdates::default(),
+        feed_stats: Default::default(),
         cluster_state: std::sync::Arc::new(cluster_state::ClusterState::new()),
         shutdown,
     }))

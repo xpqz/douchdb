@@ -275,6 +275,7 @@ pub(super) async fn search_request(
         uri,
         q,
         headers,
+        principal,
         body,
         ..
     } = req;
@@ -318,8 +319,8 @@ pub(super) async fn search_request(
             result.is_ok(),
         );
     }
-    if !still_allowed(st, db, headers) {
-        return access_denied(&st.principal(headers));
+    if !still_allowed(st, db, principal) {
+        return access_denied(principal);
     }
     match result {
         Ok(value) => json(StatusCode::OK, value),
@@ -508,6 +509,7 @@ pub(super) async fn view_request(
         name: dbname,
         method,
         headers,
+        principal,
         ..
     } = req;
     if let Some(response) = require_method(method, &["GET", "POST", "HEAD"]) {
@@ -544,8 +546,8 @@ pub(super) async fn view_request(
             result.is_ok(),
         );
     }
-    if !still_allowed(st, db, headers) {
-        return access_denied(&st.principal(headers));
+    if !still_allowed(st, db, principal) {
+        return access_denied(principal);
     }
 
     match result {
