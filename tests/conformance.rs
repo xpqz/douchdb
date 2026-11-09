@@ -14683,6 +14683,61 @@ async fn observability_metrics_and_health_report_local_state() {
     );
 }
 
+/// The shard-actor jobs a view query costs over HTTP, from the per-database
+/// `shard_jobs` counter of the metrics. Each job is a cross-thread hop, so the
+/// count (not latency) is what batching reads must reduce. A scrape runs jobs
+/// of its own before it reads the counter, so the cost of one scrape is
+/// measured with two back-to-back scrapes and taken off each request.
+#[tokio::test]
+async fn a_view_query_on_a_current_index_costs_the_fewest_shard_jobs() {
+    let s = Server::start_with(&["--q".to_string(), "1".to_string()], false);
+    s.fresh_db("viewjobs").await;
+    let (status, _) = s
+        .put(
+            "/viewjobs/_design/d",
+            json!({"views": {"v": {
+                "map": "function(doc) { emit(doc._id, 1); }",
+                "reduce": "_count",
+            }}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..3)
+        .map(|i| json!({"_id": format!("d{i}"), "n": i}))
+        .collect();
+    let (status, _) = s.post("/viewjobs/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    async fn jobs(s: &Server) -> u64 {
+        let (status, metrics) = s.get("/_node/_local/_metrics").await;
+        assert_eq!(status, StatusCode::OK, "{metrics}");
+        let db = metrics["databases"]
+            .as_array()
+            .and_then(|dbs| dbs.iter().find(|db| db["name"] == "viewjobs"))
+            .unwrap_or_else(|| panic!("viewjobs missing from the metrics: {metrics}"));
+        db["shard_jobs"].as_u64().expect("shard_jobs of an open db")
+    }
+    // The first query builds the index; the ones measured find it current.
+    let (status, body) = s.get("/viewjobs/_design/d/_view/v?reduce=false").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = jobs(&s).await;
+    let scrape = jobs(&s).await - first;
+
+    let mut cost = Vec::new();
+    for path in [
+        "/viewjobs/_design/d/_view/v?reduce=false",
+        "/viewjobs/_design/d/_view/v?reduce=false&include_docs=true",
+        "/viewjobs/_design/d/_view/v",
+    ] {
+        let before = jobs(&s).await;
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        cost.push(jobs(&s).await - before - scrape);
+    }
+    // map, map with include_docs, reduce.
+    assert_eq!(cost, vec![0, 1, 0], "shard jobs per query");
+}
+
 #[tokio::test]
 async fn cluster_metrics_and_health_aggregate_across_nodes() {
     let mut nodes = start_cluster_with(3, "3600", 2);
