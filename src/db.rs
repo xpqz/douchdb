@@ -2341,7 +2341,7 @@ impl Db {
         attachments: bool,
         revs: bool,
         latest: bool,
-    ) -> DbResult<Value> {
+    ) -> DbResult<BulkGetResults> {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
@@ -2372,7 +2372,7 @@ impl Db {
             grouped[self.shard_index(&id)].push((slot, id, opts));
         }
 
-        let mut out: Vec<Option<Value>> = vec![None; reqs.len()];
+        let mut out: Vec<Option<BulkGetResult>> = (0..reqs.len()).map(|_| None).collect();
         let read = futures::future::join_all(
             grouped
                 .into_iter()
@@ -2396,23 +2396,22 @@ impl Db {
         .await;
         for results in read {
             for (slot, id, rev, result) in results? {
-                out[slot] = Some(match result {
-                    Ok(doc) => json!({ "id": id, "docs": [{"ok": doc}] }),
-                    Err(error) => json!({
-                        "id": id,
-                        "docs": [{"error": {
-                            "id": id,
-                            "rev": rev,
-                            "error": error.error,
-                            "reason": error.reason,
-                        }}]
+                let doc = match result {
+                    Ok(doc) => BulkGetDoc::Doc(doc),
+                    Err(error) => BulkGetDoc::Error(BulkGetError {
+                        id: id.clone(),
+                        rev,
+                        error: error.error.to_string(),
+                        reason: error.reason,
                     }),
+                };
+                out[slot] = Some(BulkGetResult {
+                    id,
+                    docs: vec![doc],
                 });
             }
         }
-        Ok(json!({
-            "results": out.into_iter().map(|value| value.unwrap_or(Value::Null)).collect::<Vec<_>>()
-        }))
+        Ok(BulkGetResults { results: out })
     }
 
     // ----- local documents -------------------------------------------------
@@ -3852,6 +3851,34 @@ impl serde::Serialize for RevsDiff {
     }
 }
 
+/// The `_bulk_get` answer: one result per request, in request order.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetResults {
+    pub results: Vec<Option<BulkGetResult>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetResult {
+    pub id: String,
+    pub docs: Vec<BulkGetDoc>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum BulkGetDoc {
+    #[serde(rename = "ok")]
+    Doc(Value),
+    #[serde(rename = "error")]
+    Error(BulkGetError),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BulkGetError {
+    pub id: String,
+    pub rev: String,
+    pub error: String,
+    pub reason: String,
+}
+
 /// The body of `GET /{db}`. Fields serialize in CouchDB's order.
 #[derive(Debug, serde::Serialize)]
 pub struct DbInfo {
@@ -5038,7 +5065,11 @@ mod tests {
         let keyed = text(
             db.local_docs(&AllDocsOpts {
                 include_docs: true,
-                keys: Some(vec![json!("_local/b"), json!("_local/zz"), json!("_local/a")]),
+                keys: Some(vec![
+                    json!("_local/b"),
+                    json!("_local/zz"),
+                    json!("_local/a"),
+                ]),
                 ..Default::default()
             })
             .await,
@@ -5056,7 +5087,10 @@ mod tests {
     #[tokio::test]
     async fn bulk_get_serializes_in_wire_order() {
         let (db, root) = single_shard_db("bulk-get-wire").await;
-        let written = db.put_docs(vec![json!({"_id": "a", "n": 1})], true).await.unwrap();
+        let written = db
+            .put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
         let rev = written[0]["rev"].as_str().unwrap().to_string();
         let body = json!({"docs": [
             {"id": "a", "rev": rev},

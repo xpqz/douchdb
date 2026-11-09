@@ -2,6 +2,7 @@
 //! `_all_docs`.
 
 use super::*;
+use crate::db::{BulkGetDoc, BulkGetError, BulkGetResult, BulkGetResults};
 
 /// The parsed `_bulk_docs` body.
 struct BulkBody {
@@ -339,7 +340,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
     let latest = flag(q, "latest");
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.bulk_get(&value, attachments, revs, latest).await {
-            Ok(v) => json(StatusCode::OK, v),
+            Ok(results) => json_of(StatusCode::OK, &results),
             Err(e) => fail(e),
         };
     }
@@ -353,7 +354,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             bulk_read_candidates(db, id, st.ctx.cluster.me)
         })
         .collect();
-    let mut out = vec![Value::Null; reqs.len()];
+    let mut out: Vec<Option<BulkGetResult>> = (0..reqs.len()).map(|_| None).collect();
     let mut pending: Vec<usize> = (0..reqs.len()).collect();
     while !pending.is_empty() {
         let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -375,7 +376,12 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                     if latest {
                         query.push_str("&latest=true");
                     }
-                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers)
+                        .await
+                        .and_then(|value| {
+                            serde_json::from_value::<BulkGetResults>(value)
+                                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+                        })
                 };
                 (slots, result)
             }
@@ -384,9 +390,8 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
         {
             match result {
-                Ok(mut value) => {
-                    let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
-                    for (slot, row) in slots.into_iter().zip(rows) {
+                Ok(value) => {
+                    for (slot, row) in slots.into_iter().zip(value.results) {
                         out[slot] = row;
                     }
                 }
@@ -403,14 +408,14 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                                 .get("rev")
                                 .and_then(Value::as_str)
                                 .unwrap_or("undefined");
-                            out[slot] = json!({
-                                "id": id,
-                                "docs": [{"error": {
-                                    "id": id,
-                                    "rev": rev,
-                                    "error": "internal_fabric_error",
-                                    "reason": "all_workers_died",
-                                }}]
+                            out[slot] = Some(BulkGetResult {
+                                id: id.to_string(),
+                                docs: vec![BulkGetDoc::Error(BulkGetError {
+                                    id: id.to_string(),
+                                    rev: rev.to_string(),
+                                    error: "internal_fabric_error".to_string(),
+                                    reason: "all_workers_died".to_string(),
+                                })],
                             });
                         } else {
                             return fail(error);
@@ -420,7 +425,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             }
         }
     }
-    json(StatusCode::OK, json!({"results": out}))
+    json_of(StatusCode::OK, &BulkGetResults { results: out })
 }
 
 pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
