@@ -491,6 +491,40 @@ mod tests {
     }
 
     #[test]
+    fn enum_flags_reject_unknown_values_in_the_parser() {
+        for (flag, bad) in [
+            ("--js-sandbox", "wasn"),
+            ("--js-sandbox", ""),
+            ("--wasm-runtime", "wasmtim"),
+            ("--wasm-runtime", ""),
+            ("--default-security", "closed"),
+            ("--default-security", ""),
+        ] {
+            let message = error(&[flag, bad]);
+            assert!(message.contains(flag), "{flag} {bad:?}: {message}");
+        }
+        // A wasm runtime typo is rejected even when the sandbox is not wasm.
+        assert!(error(&["--js-sandbox", "native", "--wasm-runtime", "wasmx"])
+            .contains("--wasm-runtime"));
+        for good in ["native", "process", "wasm"] {
+            assert!(parse(&["--js-sandbox", good]).is_ok(), "{good}");
+        }
+        for good in ["wasmi", "wasmtime"] {
+            assert!(parse(&["--wasm-runtime", good]).is_ok(), "{good}");
+        }
+        for good in ["open", "admin-only"] {
+            assert!(parse(&["--default-security", good]).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn me_without_nodes_is_rejected() {
+        let message = error(&["--me", "1"]);
+        assert!(message.contains("--me") && message.contains("--nodes"), "{message}");
+        assert!(error(&["--me", "0"]).contains("--nodes"));
+    }
+
+    #[test]
     fn empty_listen_and_data_are_rejected() {
         assert!(error(&["--listen", ""]).contains("--listen"));
         assert!(error(&["--data", ""]).contains("--data"));
