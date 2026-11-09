@@ -15357,8 +15357,8 @@ fn stdin_eof_hook_shuts_down_gracefully() {
         .arg(format!("127.0.0.1:{port}"))
         .arg("--data")
         .arg(&dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     let mut child = spawn_locked(&mut cmd).expect("spawn douchdb");
     drop(child.stdin.take());
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -15371,15 +15371,15 @@ fn stdin_eof_hook_shuts_down_gracefully() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
+    let mut log = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut log);
     }
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
     let status = status.expect("the server must exit when stdin closes");
-    assert_eq!(status.code(), Some(0), "{stderr}");
-    assert!(stderr.contains("stdin closed; shutting down"), "{stderr}");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(log.contains("stdin closed; shutting down"), "{log}");
 }
 
 /// Send `signal` to a running server.

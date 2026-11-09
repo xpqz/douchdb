@@ -500,6 +500,11 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 
 Without `--nodes` it runs as a single node (the cluster with one member).
 
+Exit status: `0` after a clean shutdown (SIGTERM or SIGINT), `2` for a
+configuration the server refuses to start with (an unparsable flag, a bad
+`--users-file` or `--admin`, a cluster without `--cluster-secret`), and `1` for
+a runtime failure such as being unable to bind the listen address.
+
 ## CORS
 
 Cross-origin access is **off by default**. Enable it for browser clients
