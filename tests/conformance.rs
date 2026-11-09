@@ -4626,6 +4626,73 @@ async fn attachments_are_rejected() {
     assert_eq!(body["error"], "bad_request");
 }
 
+// The other doors an attachment could come through are shut the same way:
+// replicated writes (`new_edits=false`), a POST that creates a document, and
+// a replicated write that carries only a stub. The `attachments` read
+// parameters stay accepted and have nothing to inline.
+#[tokio::test]
+async fn attachments_are_rejected_on_every_write_path_and_read_params_are_inert() {
+    let s = Server::start(false);
+    s.fresh_db("attpin").await;
+    let data = base64_encode(b"hi there");
+
+    let (status, body) = s
+        .post(
+            "/attpin/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "repl",
+                "_rev": "1-967a00dff5e02add41819138abb3284d",
+                "_attachments": {"a.txt": {"content_type": "text/plain", "data": data}}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+
+    let (status, body) = s
+        .post(
+            "/attpin/_bulk_docs",
+            json!({"new_edits": false, "docs": [{
+                "_id": "stub",
+                "_rev": "1-967a00dff5e02add41819138abb3284d",
+                "_attachments": {"a.txt": {
+                    "stub": true, "content_type": "text/plain",
+                    "digest": "md5-xxxxxxxxxxxxxxxxxxxxxx==", "length": 8, "revpos": 1
+                }}
+            }]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+
+    let (status, body) = s
+        .post("/attpin", json!({"_attachments": {"a": {"data": data}}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_request");
+
+    let (status, _) = s.put("/attpin/plain", json!({"a": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for path in [
+        "/attpin/plain?attachments=true",
+        "/attpin/plain?attachments=true&att_encoding_info=true",
+        "/attpin/_all_docs?include_docs=true&attachments=true",
+        "/attpin/_changes?include_docs=true&attachments=true",
+    ] {
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(!body.to_string().contains("_attachments"), "{path}: {body}");
+    }
+    let (status, body) = s
+        .post(
+            "/attpin/_bulk_get?attachments=true",
+            json!({"docs": [{"id": "plain"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("_attachments"), "{body}");
+}
+
 // CouchDB's `_purge` acts on leaf revisions only: a leaf and the ancestors no
 // other branch shares go, and a listed non-leaf revision is ignored and not
 // reported. Verified against CouchDB 3.5.
