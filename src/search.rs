@@ -2255,8 +2255,11 @@ mod tests {
                 .await
                 .unwrap()
             {
-                if let Some(rev) = result["rev"].as_str() {
-                    revs.insert(result["id"].as_str().unwrap().to_string(), rev.to_string());
+                if let Some(rev) = result.json()["rev"].as_str() {
+                    revs.insert(
+                        result.json()["id"].as_str().unwrap().to_string(),
+                        rev.to_string(),
+                    );
                 }
             }
             let rebuilt = index_dir(&db, "_design/b", "idx");
@@ -2481,8 +2484,8 @@ mod tests {
                 })
                 .collect();
             for result in db.put_docs(docs, true).await.unwrap() {
-                let id = result["id"].as_str().unwrap().to_string();
-                revs.insert(id, result["rev"].as_str().unwrap().to_string());
+                let id = result.json()["id"].as_str().unwrap().to_string();
+                revs.insert(id, result.json()["rev"].as_str().unwrap().to_string());
             }
             if step > 0 {
                 std::fs::write(&marker, b"").unwrap();

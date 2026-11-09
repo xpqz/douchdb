@@ -1953,16 +1953,16 @@ pub(crate) async fn docs_by_ids(
         limit: usize::MAX,
         ..Default::default()
     };
-    let mut all = db.all_docs(&opts).await?;
+    let all = db.all_docs(&opts).await?;
     let mut docs = HashMap::new();
-    for mut row in crate::json::take_array(&mut all, "rows").unwrap_or_default() {
-        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+    for row in all.rows {
+        let Some(id) = row.id else {
             continue;
         };
         if id.starts_with("_design/") || id.starts_with("_local/") {
             continue;
         }
-        if let Some(doc) = row.get_mut("doc").map(Value::take) {
+        if let Some(doc) = row.doc {
             docs.insert(id, doc);
         }
     }
@@ -1994,7 +1994,7 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     let _gate = index_gate(db).write().await?;
     db.check_live()?;
     let mut live = std::collections::HashSet::new();
-    let mut all = db
+    let all = db
         .all_docs(&AllDocsOpts {
             include_docs: true,
             startkey: Some("_design/".to_string()),
@@ -2003,8 +2003,8 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
             ..Default::default()
         })
         .await?;
-    for row in crate::json::take_array(&mut all, "rows").unwrap_or_default() {
-        let Some(ddoc) = row.get("doc") else {
+    for row in all.rows {
+        let Some(ddoc) = &row.doc else {
             continue;
         };
         let Some(id) = ddoc.get("_id").and_then(Value::as_str) else {

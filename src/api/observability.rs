@@ -125,7 +125,7 @@ async fn local_metrics(st: &AppState) -> Value {
                     Some(db) => db
                         .info()
                         .await
-                        .map_or(Value::Null, |info| info["update_seq"].clone()),
+                        .map_or(Value::Null, |info| json!(info.update_seq)),
                     None => Value::Null,
                 };
                 let map = &placed.shard_map;

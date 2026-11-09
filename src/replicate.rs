@@ -386,7 +386,7 @@ async fn write_batch(db: &Db, received: &BTreeMap<(String, String), Value>) -> R
         .put_docs(docs, false)
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
-    if let Some(error) = applied.iter().find(|result| result.get("ok").is_none()) {
+    if let Some(error) = applied.iter().find(|result| !result.is_ok()) {
         return Err(anyhow!("replicated document was not applied: {error}"));
     }
     Ok(count)
@@ -421,15 +421,17 @@ async fn ensure_all_accounted(
         .revs_diff(&body)
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
+    let diff: BTreeMap<&str, &crate::db::RevsDiffEntry> = diff
+        .0
+        .iter()
+        .map(|(id, entry)| (id.as_str(), entry))
+        .collect();
     let mut missing = Vec::new();
     for (id, revs) in &unaccounted {
         let missing_set: BTreeSet<&str> = diff
-            .get(id)
-            .and_then(|entry| entry.get("missing"))
-            .and_then(Value::as_array)
+            .get(id.as_str())
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+            .flat_map(|entry| entry.missing.iter().map(String::as_str))
             .collect();
         for rev in revs {
             if missing_set.contains(rev.as_str()) {

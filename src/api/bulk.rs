@@ -2,6 +2,7 @@
 //! `_all_docs`.
 
 use super::*;
+use crate::db::{BulkGetDoc, BulkGetError, BulkGetResult, BulkGetResults, DocList};
 
 /// The parsed `_bulk_docs` body.
 struct BulkBody {
@@ -102,7 +103,7 @@ async fn write_bulk_batch(
     req: DbRequest<'_>,
     writable: Vec<Value>,
     new_edits: bool,
-) -> DbResult<(Vec<Value>, bool)> {
+) -> DbResult<(Vec<Option<WriteResult>>, bool)> {
     let DbRequest {
         st,
         db,
@@ -149,16 +150,17 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         return fail(error);
     }
     if all_or_nothing {
-        let results: Vec<Value> = docs
+        let results: Vec<WriteResult> = docs
             .iter()
             .map(|_| {
-                json!({
-                    "error": "not_implemented",
-                    "reason": "all_or_nothing is not supported"
+                WriteResult::Error(WriteError {
+                    id: None,
+                    error: "not_implemented".to_string(),
+                    reason: "all_or_nothing is not supported".to_string(),
                 })
             })
             .collect();
-        return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
+        return json_of(StatusCode::EXPECTATION_FAILED, &results);
     }
 
     let validation = match validate_bulk_batch(st, db, headers, &mut docs).await {
@@ -166,16 +168,16 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
 
-    let mut results = vec![Value::Null; docs.len()];
+    let mut results: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
     let mut slots: Vec<usize> = Vec::new();
     let mut writable: Vec<Value> = Vec::new();
     for (slot, doc) in docs.into_iter().enumerate() {
         if let Some(error) = &validation[slot] {
-            results[slot] = json!({
-                "id": doc.get("_id").cloned().unwrap_or(Value::Null),
-                "error": error.error,
-                "reason": error.reason,
-            });
+            results[slot] = Some(WriteResult::Error(WriteError {
+                id: Some(doc.get("_id").cloned().unwrap_or(Value::Null)),
+                error: error.error.to_string(),
+                reason: error.reason.clone(),
+            }));
         } else {
             slots.push(slot);
             writable.push(doc);
@@ -248,16 +250,21 @@ async fn put_on_this_node(
     docs: Vec<Value>,
     new_edits: bool,
     internal: bool,
-) -> DbResult<Vec<Value>> {
+) -> DbResult<Vec<Option<WriteResult>>> {
     if new_edits || !internal {
-        return db.put_docs(docs, new_edits).await;
+        return Ok(db
+            .put_docs(docs, new_edits)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect());
     }
     let is_local = |doc: &Value| {
         doc.get("_id")
             .and_then(Value::as_str)
             .is_some_and(|id| id.starts_with("_local/"))
     };
-    let mut results = vec![Value::Null; docs.len()];
+    let mut results: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
     let mut local_slots = Vec::new();
     let mut locals = Vec::new();
     let mut other_slots = Vec::new();
@@ -286,20 +293,23 @@ async fn put_on_this_node(
         .zip(installed)
         .chain(other_slots.into_iter().zip(written))
     {
-        results[slot] = result;
+        results[slot] = Some(result);
     }
     Ok(results)
 }
 
-fn bulk_response(new_edits: bool, results: Vec<Value>) -> Response {
+/// `None` is a document no replica reported on: JSON `null`, and for a
+/// replicated write nothing to report at all.
+fn bulk_response(new_edits: bool, results: Vec<Option<WriteResult>>) -> Response {
     if new_edits {
-        json(StatusCode::CREATED, Value::Array(results))
+        json_of(StatusCode::CREATED, &results)
     } else {
-        let errors: Vec<Value> = results
+        let errors: Vec<WriteResult> = results
             .into_iter()
-            .filter(|result| result.get("error").is_some())
+            .flatten()
+            .filter(|result| !result.is_ok())
             .collect();
-        json(StatusCode::CREATED, Value::Array(errors))
+        json_of(StatusCode::CREATED, &errors)
     }
 }
 
@@ -339,7 +349,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
     let latest = flag(q, "latest");
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.bulk_get(&value, attachments, revs, latest).await {
-            Ok(v) => json(StatusCode::OK, v),
+            Ok(results) => json_of(StatusCode::OK, &results),
             Err(e) => fail(e),
         };
     }
@@ -353,7 +363,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             bulk_read_candidates(db, id, st.ctx.cluster.me)
         })
         .collect();
-    let mut out = vec![Value::Null; reqs.len()];
+    let mut out: Vec<Option<BulkGetResult>> = (0..reqs.len()).map(|_| None).collect();
     let mut pending: Vec<usize> = (0..reqs.len()).collect();
     while !pending.is_empty() {
         let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -375,7 +385,12 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                     if latest {
                         query.push_str("&latest=true");
                     }
-                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_bulk_get", &query, &sub, headers)
+                        .await
+                        .and_then(|value| {
+                            serde_json::from_value::<BulkGetResults>(value)
+                                .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
+                        })
                 };
                 (slots, result)
             }
@@ -384,9 +399,8 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
         {
             match result {
-                Ok(mut value) => {
-                    let rows = crate::json::take_array(&mut value, "results").unwrap_or_default();
-                    for (slot, row) in slots.into_iter().zip(rows) {
+                Ok(value) => {
+                    for (slot, row) in slots.into_iter().zip(value.results) {
                         out[slot] = row;
                     }
                 }
@@ -403,14 +417,14 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
                                 .get("rev")
                                 .and_then(Value::as_str)
                                 .unwrap_or("undefined");
-                            out[slot] = json!({
-                                "id": id,
-                                "docs": [{"error": {
-                                    "id": id,
-                                    "rev": rev,
-                                    "error": "internal_fabric_error",
-                                    "reason": "all_workers_died",
-                                }}]
+                            out[slot] = Some(BulkGetResult {
+                                id: id.to_string(),
+                                docs: vec![BulkGetDoc::Error(BulkGetError {
+                                    id: id.to_string(),
+                                    rev: rev.to_string(),
+                                    error: "internal_fabric_error".to_string(),
+                                    reason: "all_workers_died".to_string(),
+                                })],
                             });
                         } else {
                             return fail(error);
@@ -420,7 +434,7 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
             }
         }
     }
-    json(StatusCode::OK, json!({"results": out}))
+    json_of(StatusCode::OK, &BulkGetResults { results: out })
 }
 
 pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
@@ -438,7 +452,7 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
     };
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.revs_diff(&value).await {
-            Ok(v) => json(StatusCode::OK, v),
+            Ok(diff) => json_of(StatusCode::OK, &diff),
             Err(e) => fail(e),
         };
     }
@@ -469,7 +483,10 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
             );
             async move {
                 let result = if node == st.ctx.cluster.me {
-                    db.revs_diff(&sub).await
+                    match db.revs_diff(&sub).await {
+                        Ok(diff) => serde_json::to_value(&diff).map_err(ApiError::internal),
+                        Err(error) => Err(error),
+                    }
                 } else {
                     let peer = st.ctx.cluster.nodes[node].clone();
                     forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers).await
@@ -632,7 +649,7 @@ fn all_docs_opts(
 
 /// Run an `_all_docs` query on this node's shards or, for a cluster
 /// coordinator, on the whole cluster.
-async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<Value> {
+async fn run_all_docs(req: &DbRequest<'_>, opts: &AllDocsOpts) -> DbResult<DocList> {
     let (st, db, headers) = (req.st, req.db, req.headers);
     let shard_mask = if st.ctx.cluster.is_internal(headers) {
         req.q
@@ -683,18 +700,18 @@ async fn requested_update_seq(req: &DbRequest<'_>) -> DbResult<Option<Value>> {
 /// rows were read.
 fn all_docs_reply(
     req: &DbRequest<'_>,
-    result: DbResult<Value>,
+    result: DbResult<DocList>,
     update_seq: Option<Value>,
 ) -> Response {
     if !still_allowed(req.st, req.db, req.headers) {
         return access_denied(&req.st.principal(req.headers));
     }
     match result {
-        Ok(mut value) => {
+        Ok(mut list) => {
             if let Some(update_seq) = update_seq {
-                value["update_seq"] = update_seq;
+                list.update_seq = Some(update_seq);
             }
-            json(StatusCode::OK, value)
+            json_of(StatusCode::OK, &list)
         }
         Err(e) => fail(e),
     }
@@ -842,7 +859,7 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         Err(error) => return fail(error),
     };
     let mut result = run_all_docs(&req, &opts).await;
-    if let Ok(value) = &mut result {
+    if let Ok(list) = &mut result {
         let everything = AllDocsOpts {
             startkey: Some(DESIGN_FIRST.to_string()),
             endkey: Some(DESIGN_END.to_string()),
@@ -850,11 +867,9 @@ pub(super) async fn design_docs(req: DbRequest<'_>) -> Response {
         };
         match run_all_docs(&req, &everything).await {
             Ok(all) => {
-                let total = all["rows"].as_array().map_or(0, Vec::len);
-                value["total_rows"] = json!(total);
-                if let Some(offset) = value["offset"].as_u64() {
-                    value["offset"] = json!(offset.min(total as u64));
-                }
+                let total = all.rows.len() as u64;
+                list.total_rows = Some(total);
+                list.offset = list.offset.map(|offset| offset.min(total));
             }
             Err(error) => result = Err(error),
         }
