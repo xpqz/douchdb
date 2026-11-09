@@ -8,17 +8,27 @@ set and client.
 
 | | CouchDB | douchdb |
 |---|---|---|
-| Image / build | `couchdb:3.5` (3.5.3) | `douchdb:bench` from this tree |
+| Image / build | `couchdb:3.5.3` (digest-pinned) | `douchdb:bench` from this tree |
 | Nodes | 3 | 3 |
 | Q | 8 | 8 |
 | N | 3 | 3 |
 | Per node | 2 CPUs, 2 GiB | 2 CPUs, 2 GiB |
 | Storage | named Docker volume | named Docker volume |
-| Auth | `admin:password` | `admin:secret` |
+| Auth | `COUCHDB_USER` / `COUCHDB_PASSWORD` | `DOUCHDB_ADMIN` |
 | Front end | none; client round-robins nodes | none; client round-robins nodes |
 | Anti-entropy | CouchDB defaults | `--sync-secs 3600` (writes are synchronous n=3) |
 
-Compose files:
+Compose files. The credentials have no defaults: export them first, and use the
+same values for `scripts/docker_compare.py`. The ports are bound to
+127.0.0.1.
+
+```sh
+export COUCHDB_PASSWORD=$(openssl rand -hex 16)
+export COUCHDB_SECRET=$(openssl rand -hex 16)
+export COUCHDB_ERLANG_COOKIE=$(openssl rand -hex 16)
+export DOUCHDB_ADMIN=admin:$(openssl rand -hex 16)
+export DOUCHDB_CLUSTER_SECRET=$(openssl rand -hex 16)
+```
 
 ```sh
 docker compose -f docker/bench/couchdb.yml up -d
@@ -30,12 +40,12 @@ CouchDB needs its nodes joined and q/n configured before the benchmark:
 ```sh
 for port in 15984 15985 15986; do
   for node in 10.99.0.11 10.99.0.12 10.99.0.13; do
-    curl -s -u admin:password -X PUT -H 'Content-Type: application/json' \
+    curl -s -u "admin:$COUCHDB_PASSWORD" -X PUT -H 'Content-Type: application/json' \
       -d '{}' "http://127.0.0.1:$port/_node/_local/_nodes/couchdb@$node" >/dev/null
   done
   for pair in q:8 n:3; do
     key=${pair%%:*}; value=${pair##*:}
-    curl -s -u admin:password -X PUT -H 'Content-Type: application/json' \
+    curl -s -u "admin:$COUCHDB_PASSWORD" -X PUT -H 'Content-Type: application/json' \
       -d "\"$value\"" "http://127.0.0.1:$port/_node/_local/_config/cluster/$key" >/dev/null
   done
 done

@@ -438,7 +438,8 @@ douchdb with `--cors-origins` for that origin (see below).
 
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
-        [--admin user:pass] [--users-file FILE] [--session-secret SECRET]
+        [--admin user:pass]         (or DOUCHDB_ADMIN)
+        [--users-file FILE] [--session-secret SECRET]
         [--default-security open|admin-only]
         [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]
         [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]
@@ -604,13 +605,15 @@ so a client cannot make a request look like a peer's. It is required (at least
 BIN=./target/release/douchdb
 NODES=http://127.0.0.1:5984,http://127.0.0.1:5985,http://127.0.0.1:5986
 
-SECRET=change-me-cluster-secret
+# Environment variables keep the credentials out of the process list.
+export DOUCHDB_ADMIN=admin:$(openssl rand -hex 16)
+SECRET=$(openssl rand -hex 16)
 $BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 0
+  --cluster-secret $SECRET --nodes $NODES --me 0
 $BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 1
+  --cluster-secret $SECRET --nodes $NODES --me 1
 $BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 2
+  --cluster-secret $SECRET --nodes $NODES --me 2
 ```
 
 Clients can talk to any node. Create the database through any node (it is

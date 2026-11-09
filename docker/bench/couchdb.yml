@@ -1,16 +1,16 @@
 name: couch-bench
 services:
   couch1:
-    image: couchdb:3.5
+    image: couchdb:3.5.3@sha256:907eab5b7e55ab7cfd241d39b90b2a335ea40bef82acee5a37388c08bf201dda
     container_name: couch-bench-1
     hostname: couch1
     environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
-      COUCHDB_SECRET: benchsecret
-      COUCHDB_ERLANG_COOKIE: benchcookie
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?set COUCHDB_PASSWORD, see docs/couchdb-comparison.md}
+      COUCHDB_SECRET: ${COUCHDB_SECRET:?set COUCHDB_SECRET, see docs/couchdb-comparison.md}
+      COUCHDB_ERLANG_COOKIE: ${COUCHDB_ERLANG_COOKIE:?set COUCHDB_ERLANG_COOKIE, see docs/couchdb-comparison.md}
       NODENAME: 10.99.0.11
-    ports: ["15984:5984"]
+    ports: ["127.0.0.1:15984:5984"]
     cpus: 2.0
     mem_limit: 2g
     networks:
@@ -18,16 +18,16 @@ services:
         ipv4_address: 10.99.0.11
     volumes: ["couch1-data:/opt/couchdb/data"]
   couch2:
-    image: couchdb:3.5
+    image: couchdb:3.5.3@sha256:907eab5b7e55ab7cfd241d39b90b2a335ea40bef82acee5a37388c08bf201dda
     container_name: couch-bench-2
     hostname: couch2
     environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
-      COUCHDB_SECRET: benchsecret
-      COUCHDB_ERLANG_COOKIE: benchcookie
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?set COUCHDB_PASSWORD, see docs/couchdb-comparison.md}
+      COUCHDB_SECRET: ${COUCHDB_SECRET:?set COUCHDB_SECRET, see docs/couchdb-comparison.md}
+      COUCHDB_ERLANG_COOKIE: ${COUCHDB_ERLANG_COOKIE:?set COUCHDB_ERLANG_COOKIE, see docs/couchdb-comparison.md}
       NODENAME: 10.99.0.12
-    ports: ["15985:5984"]
+    ports: ["127.0.0.1:15985:5984"]
     cpus: 2.0
     mem_limit: 2g
     networks:
@@ -35,16 +35,16 @@ services:
         ipv4_address: 10.99.0.12
     volumes: ["couch2-data:/opt/couchdb/data"]
   couch3:
-    image: couchdb:3.5
+    image: couchdb:3.5.3@sha256:907eab5b7e55ab7cfd241d39b90b2a335ea40bef82acee5a37388c08bf201dda
     container_name: couch-bench-3
     hostname: couch3
     environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
-      COUCHDB_SECRET: benchsecret
-      COUCHDB_ERLANG_COOKIE: benchcookie
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?set COUCHDB_PASSWORD, see docs/couchdb-comparison.md}
+      COUCHDB_SECRET: ${COUCHDB_SECRET:?set COUCHDB_SECRET, see docs/couchdb-comparison.md}
+      COUCHDB_ERLANG_COOKIE: ${COUCHDB_ERLANG_COOKIE:?set COUCHDB_ERLANG_COOKIE, see docs/couchdb-comparison.md}
       NODENAME: 10.99.0.13
-    ports: ["15986:5984"]
+    ports: ["127.0.0.1:15986:5984"]
     cpus: 2.0
     mem_limit: 2g
     networks:

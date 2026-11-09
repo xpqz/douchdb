@@ -5,7 +5,7 @@
 # builds give different wasm bytes; CI rebuilds on x86_64 and compares.
 set -eu
 
-IMAGE=rust:1.96.1-bookworm
+IMAGE=rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
 WASI_SDK_VERSION=24.0
 SDK_ARM64_SHA256=ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646
 SDK_X86_64_SHA256=c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5
