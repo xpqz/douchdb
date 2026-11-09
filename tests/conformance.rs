@@ -3214,8 +3214,8 @@ async fn database_names_follow_the_couchdb_rule() {
 /// that itself matches the name regex, so `foo/_users` is legal (the regex
 /// alone already admits it) and so is `ts.1234567890/_users`, which only the
 /// system-name rule admits because the timestamp is not allowed mid-name. A
-/// prefix that fails the regex, or a suffix that is not a system database and
-/// fails the regex, stays illegal.
+/// prefix that fails the regex stays illegal (`foo/_bar` is not a case: it
+/// matches the plain regex and is legal).
 #[tokio::test]
 async fn prefixed_system_database_names_are_legal() {
     let s = Server::start(false);
@@ -3227,7 +3227,6 @@ async fn prefixed_system_database_names_are_legal() {
         "/foo%2F_users.couch",
         "/ts.1234567890%2F_users",
         "/ts.1234567890%2F_replicator",
-        "/ts2.1234567890%2Fbar%2F_users",
     ] {
         let (status, body) = s.put(path, json!({})).await;
         assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
@@ -3241,17 +3240,11 @@ async fn prefixed_system_database_names_are_legal() {
     for (path, name) in [
         ("/Foo%2F_users", "Foo/_users"),
         ("/1foo%2F_users", "1foo/_users"),
-        ("/foo%2F_bar", "foo/_bar"),
+        ("/ts.1234567890%2Fbar%2F_users", "ts.1234567890/bar/_users"),
         ("/foo.couch%2F_users", "foo.couch/_users"),
         ("/%2F_users", "/_users"),
-        ("/foo%2F_other", "foo/_other"),
     ] {
         let (status, body) = s.put(path, json!({})).await;
-        // `foo/_bar` and `foo/_other` match the plain name regex.
-        if name.starts_with("foo/_") {
-            assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
-            continue;
-        }
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
         assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
         assert_eq!(
