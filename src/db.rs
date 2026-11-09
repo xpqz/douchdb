@@ -1239,6 +1239,12 @@ impl Db {
         self.shards.iter().map(ShardHandle::scanned).sum()
     }
 
+    /// Document bodies this database's shards have read from storage since it
+    /// opened.
+    pub fn shard_body_reads(&self) -> u64 {
+        self.shards.iter().map(ShardHandle::body_reads).sum()
+    }
+
     /// Highest sequence that is safe for a changes cursor to publish, taken
     /// as a snapshot **before** reading any shard.
     ///
@@ -1764,6 +1770,11 @@ impl Db {
             index: usize,
             after: Option<String>,
             buffer: std::collections::VecDeque<AllDocsRow>,
+            /// How many of the front rows of `buffer` have their documents.
+            /// Rows read while a skip is pending are only ids: they are
+            /// likely to be skipped, so their documents are read once the
+            /// rows that will be returned are known.
+            loaded: usize,
             done: bool,
         }
 
@@ -1788,6 +1799,7 @@ impl Db {
                 index,
                 after: None,
                 buffer: std::collections::VecDeque::new(),
+                loaded: 0,
                 done: false,
             });
         }
@@ -1803,6 +1815,8 @@ impl Db {
             let mut remaining = opts.limit;
             while remaining > 0 {
                 let wanted = skip.saturating_add(remaining).min(PAGE);
+                // Rows that will be skipped are only stepped over.
+                let load = skip == 0;
                 let hungry: Vec<usize> = (0..cursors.len())
                     .filter(|slot| cursors[*slot].buffer.is_empty() && !cursors[*slot].done)
                     .collect();
@@ -1818,7 +1832,12 @@ impl Db {
                                         scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
                                     let last = scanned.last().map(|row| row.id.clone());
                                     let exhausted = scanned.len() < wanted;
-                                    Ok((load_all_docs(s, scanned, &shard_opts)?, last, exhausted))
+                                    let rows = if load {
+                                        load_all_docs(s, scanned, &shard_opts)?
+                                    } else {
+                                        scanned
+                                    };
+                                    Ok((rows, last, exhausted))
                                 })
                                 .await
                         }
@@ -1829,6 +1848,7 @@ impl Db {
                             Ok((rows, last, exhausted)) => {
                                 let cursor = &mut cursors[slot];
                                 cursor.buffer.extend(rows);
+                                cursor.loaded = if load { cursor.buffer.len() } else { 0 };
                                 if last.is_some() {
                                     cursor.after = last;
                                 }
@@ -1841,6 +1861,67 @@ impl Db {
                         }
                     }
                     continue;
+                }
+                if opts.include_docs && skip == 0 {
+                    // The rows the merge is certain to return next, as far as
+                    // the buffers reach: read exactly their documents.
+                    let mut taken = vec![0usize; cursors.len()];
+                    for _ in 0..remaining {
+                        let mut best: Option<usize> = None;
+                        let mut blocked = false;
+                        for (slot, cursor) in cursors.iter().enumerate() {
+                            let Some(row) = cursor.buffer.get(taken[slot]) else {
+                                blocked |= !cursor.done;
+                                continue;
+                            };
+                            let better = match best.and_then(|best| cursors[best].buffer.get(taken[best])) {
+                                None => true,
+                                Some(current) if opts.descending => row.id > current.id,
+                                Some(current) => row.id < current.id,
+                            };
+                            if better {
+                                best = Some(slot);
+                            }
+                        }
+                        let Some(best) = best.filter(|_| !blocked) else {
+                            break;
+                        };
+                        taken[best] += 1;
+                    }
+                    let loads: Vec<usize> = (0..cursors.len())
+                        .filter(|slot| taken[*slot] > cursors[*slot].loaded)
+                        .collect();
+                    if !loads.is_empty() {
+                        let mut rests = Vec::with_capacity(loads.len());
+                        let mut fetches = Vec::with_capacity(loads.len());
+                        for slot in &loads {
+                            let cursor = &mut cursors[*slot];
+                            // `buffer` keeps the loaded rows; the ones to load
+                            // and the ones still bare are taken off its end.
+                            let mut wanted = cursor.buffer.split_off(cursor.loaded);
+                            rests.push(wanted.split_off(taken[*slot] - cursor.loaded));
+                            let shard_opts = opts.clone();
+                            fetches.push(db.shards[cursor.index].call(move |s| {
+                                load_all_docs(s, wanted.into_iter().collect(), &shard_opts)
+                            }));
+                        }
+                        let results = futures::future::join_all(fetches).await;
+                        for ((slot, rest), result) in loads.into_iter().zip(rests).zip(results) {
+                            let cursor = &mut cursors[slot];
+                            match result {
+                                Ok(rows) => {
+                                    cursor.loaded += rows.len();
+                                    cursor.buffer.extend(rows);
+                                    cursor.buffer.extend(rest);
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
                 let mut best: Option<usize> = None;
                 for (slot, cursor) in cursors.iter().enumerate() {
@@ -1856,9 +1937,14 @@ impl Db {
                         best = Some(slot);
                     }
                 }
-                let Some(row) = best.and_then(|slot| cursors[slot].buffer.pop_front()) else {
+                let Some(slot) = best else {
                     break;
                 };
+                let cursor = &mut cursors[slot];
+                let Some(row) = cursor.buffer.pop_front() else {
+                    break;
+                };
+                cursor.loaded = cursor.loaded.saturating_sub(1);
                 if skip > 0 {
                     skip -= 1;
                     continue;
@@ -5842,6 +5928,25 @@ mod tests {
                 AllDocsOpts {
                     skip: 301,
                     limit: 400,
+                    ..base()
+                },
+            ),
+            (
+                "skip over unread documents, then read some",
+                AllDocsOpts {
+                    skip: 301,
+                    limit: 400,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending skip over unread documents",
+                AllDocsOpts {
+                    skip: 300,
+                    limit: 300,
+                    include_docs: true,
+                    descending: true,
                     ..base()
                 },
             ),

@@ -2792,6 +2792,33 @@ async fn design_docs_counts_in_the_same_pass_as_its_rows() {
     assert_eq!(jobs, 1, "shard jobs of one _design_docs request");
 }
 
+/// A large `skip` with `include_docs` steps over ids only: the bodies of the
+/// skipped rows are never read, in either direction.
+#[tokio::test]
+async fn all_docs_skip_does_not_read_skipped_bodies() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("skipbody").await;
+    let docs: Vec<Value> = (0..300)
+        .map(|i| json!({"_id": format!("d{i:04}"), "n": i}))
+        .collect();
+    let (status, _) = s.post("/skipbody/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for path in [
+        "/skipbody/_all_docs?include_docs=true&skip=250&limit=3",
+        "/skipbody/_all_docs?include_docs=true&skip=250&limit=3&descending=true",
+    ] {
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"].as_array().map(Vec::len), Some(3), "{body}");
+        let reads = request_cost(&s, "skipbody", "shard_body_reads", path).await;
+        assert_eq!(reads, 3, "bodies read by {path}");
+    }
+    let (_, body) = s
+        .get("/skipbody/_all_docs?include_docs=true&skip=250&limit=1")
+        .await;
+    assert_eq!(body["rows"][0]["doc"]["n"], 250);
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts
