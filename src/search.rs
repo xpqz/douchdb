@@ -654,8 +654,8 @@ async fn indexable_changes(
     since: u64,
     last_seq: u64,
 ) -> DbResult<(std::collections::HashSet<String>, Vec<(String, String)>)> {
-    let (rows, _, _) = db
-        .changes_rows(&crate::db::ChangesOpts {
+    let (rows, _) = db
+        .changes_rows_only(&crate::db::ChangesOpts {
             since,
             include_docs: true,
             until: Some(last_seq),

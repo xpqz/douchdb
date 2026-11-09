@@ -2008,10 +2008,25 @@ impl Db {
         })
     }
 
+    /// The changes rows, the feed's last sequence, and how many changes remain
+    /// after it.
     pub(crate) async fn changes_rows(
         &self,
         opts: &ChangesOpts,
     ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
+        let (rows, last_seq) = self.changes_rows_only(opts).await?;
+        let pending = self
+            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
+            .await?;
+        Ok((rows, last_seq, pending))
+    }
+
+    /// `changes_rows` without `pending`, which costs a further shard job per
+    /// shard. For callers that only consume rows, such as index updates.
+    pub(crate) async fn changes_rows_only(
+        &self,
+        opts: &ChangesOpts,
+    ) -> DbResult<(Vec<ChangeRow>, u64)> {
         let watermark = opts
             .until
             .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_ref()));
@@ -2072,10 +2087,7 @@ impl Db {
             scanned_last.or(rows.last().map(|r| r.seq))
         }
         .unwrap_or(opts.since);
-        let pending = self
-            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
-            .await?;
-        Ok((rows, last_seq, pending))
+        Ok((rows, last_seq))
     }
 
     /// An ascending filtered read: scans each shard a page at a time and merges

@@ -1851,8 +1851,8 @@ async fn ensure_rows(
         let (mut gate, mut index) = (gate, index);
         loop {
             gate.check()?;
-            let (rows, _, _) = db
-                .changes_rows(&ChangesOpts {
+            let (rows, _) = db
+                .changes_rows_only(&ChangesOpts {
                     since: index.last_seq,
                     limit: Some(CHANGES_PAGE),
                     include_docs: true,
