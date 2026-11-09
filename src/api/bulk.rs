@@ -345,8 +345,22 @@ pub(super) async fn bulk_get(req: DbRequest<'_>) -> Response {
     let revs = flag(q, "revs") || value.get("revs").and_then(Value::as_bool).unwrap_or(false);
     let latest = flag(q, "latest");
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
-        return match db.bulk_get(&value, revs, latest).await {
-            Ok(results) => json_of(StatusCode::OK, &results),
+        if st.ctx.cluster.is_internal(headers) {
+            return match db.bulk_get(&value, revs, latest).await {
+                Ok(results) => json_of(StatusCode::OK, &results),
+                Err(e) => fail(e),
+            };
+        }
+        return match Db::bulk_get_stream(db.clone(), value, revs, latest).await {
+            Ok(results) => {
+                stream_json_response(
+                    &Method::POST,
+                    b"{\"results\":[".to_vec(),
+                    results,
+                    b"]}".to_vec(),
+                )
+                .await
+            }
             Err(e) => fail(e),
         };
     }

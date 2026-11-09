@@ -2621,7 +2621,47 @@ impl Db {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
+        Ok(BulkGetResults {
+            results: self.bulk_get_chunk(reqs, revs, latest).await?,
+        })
+    }
 
+    /// Like `bulk_get`, but the results come back as a stream, a chunk of
+    /// requests at a time, so a large batch never sits in memory whole. The
+    /// results are in request order.
+    pub async fn bulk_get_stream(
+        db: Arc<Db>,
+        body: Value,
+        revs: bool,
+        latest: bool,
+    ) -> DbResult<impl futures::Stream<Item = DbResult<Option<BulkGetResult>>>> {
+        const CHUNK: usize = 256;
+        let Some(reqs) = body.get("docs").and_then(Value::as_array).cloned() else {
+            return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
+        };
+        Ok(async_stream::stream! {
+            for chunk in reqs.chunks(CHUNK) {
+                match db.bulk_get_chunk(chunk, revs, latest).await {
+                    Ok(results) => {
+                        for result in results {
+                            yield Ok(result);
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn bulk_get_chunk(
+        &self,
+        reqs: &[Value],
+        revs: bool,
+        latest: bool,
+    ) -> DbResult<Vec<Option<BulkGetResult>>> {
         // One shard-actor round trip per shard instead of one per document.
         // `_bulk_get` is on the hot replication path, so the channel hops are
         // the difference between a batch and a request storm.
@@ -2683,7 +2723,7 @@ impl Db {
                 });
             }
         }
-        Ok(BulkGetResults { results: out })
+        Ok(out)
     }
 
     // ----- local documents -------------------------------------------------

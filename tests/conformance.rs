@@ -2897,6 +2897,53 @@ async fn view_rows_are_streamed_with_a_stable_body() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+/// `_bulk_get` results are written as they are read, in request order, with
+/// the same bytes as the buffered reply.
+#[tokio::test]
+async fn bulk_get_results_are_streamed_in_request_order() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("bgstream").await;
+    let docs: Vec<Value> = (0..1000)
+        .map(|i| json!({"_id": format!("d{i:04}"), "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s.post("/bgstream/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Requested in reverse, with a missing id and a bad rev among them.
+    let mut ids: Vec<String> = (0..1000).rev().map(|i| format!("d{i:04}")).collect();
+    ids.insert(500, "nope".to_string());
+    let mut requests: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+    requests.push(json!({"id": "d0000", "rev": "9-abc"}));
+
+    let response = s
+        .client
+        .post(format!("{}/bgstream/_bulk_get", s.base))
+        .json(&json!({"docs": requests}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "_bulk_get");
+    assert!(
+        body.starts_with(
+            "{\"results\":[{\"id\":\"d0999\",\"docs\":[{\"ok\":{\"_id\":\"d0999\",\"_rev\":\"1-"
+        ),
+        "{}",
+        &body[..150]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    let results = value["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1002);
+    for (result, id) in results.iter().zip(&ids) {
+        assert_eq!(result["id"], *id);
+    }
+    assert_eq!(results[500]["docs"][0]["error"]["error"], "not_found");
+    assert_eq!(results[1001]["docs"][0]["error"]["rev"], "9-abc");
+
+    let (status, body) = s.post("/bgstream/_bulk_get", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts
