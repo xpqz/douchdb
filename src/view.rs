@@ -5090,7 +5090,9 @@ mod tests {
             .await
             .unwrap();
         let rev = current["_rev"].as_str().unwrap().to_string();
-        db.purge(&json!({"_design/d": [rev]}), 0).await.unwrap();
+        db.purge(&json!({"_design/d": [rev]}), 0, &Default::default())
+            .await
+            .unwrap();
         let gone = super::query(&db, "_design/d", "v", &query).await;
         assert_eq!(gone.unwrap_err().status, 404);
 

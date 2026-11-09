@@ -739,6 +739,12 @@ pub(crate) async fn purge_docs(
     let ctx = &st.ctx;
     let mut groups: HashMap<usize, serde_json::Map<String, Value>> = HashMap::new();
     let mut copies: Vec<usize> = Vec::new();
+    // One uuid per document, shared by every copy, so the copies hold the same
+    // purge info and anti-entropy has nothing to replay (fabric_doc_purge.erl).
+    let uuids: BTreeMap<String, String> = request
+        .keys()
+        .map(|id| (id.clone(), crate::util::uuid()))
+        .collect();
     for (id, revs) in request {
         let (_, replicas) = db.placement_of_doc(id);
         copies.push(replicas.len());
@@ -751,15 +757,17 @@ pub(crate) async fn purge_docs(
     }
     crate::telemetry::record_fanout(groups.len() as u64);
 
+    let uuids = &uuids;
     let replies = crate::cluster_http::in_one_round(join_all(groups.into_iter().map(
         |(node, sub)| async move {
             let body = Value::Object(sub);
             let reply = if node == ctx.cluster.me {
-                db.purge(&body, ctx.cluster.me).await
+                db.purge(&body, ctx.cluster.me, uuids).await
             } else {
                 match ctx.cluster.nodes.get(node) {
                     Some(peer) => {
-                        forward_json(ctx, peer, dbname, "_purge", "", &body, headers).await
+                        let sent = crate::db::with_purge_uuids(&body, uuids);
+                        forward_json(ctx, peer, dbname, "_purge", "", &sent, headers).await
                     }
                     None => Err(nodedown()),
                 }
