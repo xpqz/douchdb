@@ -83,9 +83,10 @@ fn wait_for_listener(child: &mut Child, port: u16) -> Listener {
 /// Whether to exercise the given `--js-sandbox` mode. Set
 /// `DOUCHDB_TEST_JS_SANDBOXES` to a comma-separated list (for example
 /// `native`) to restrict the sandbox tests; unset, every mode runs. CI runs
-/// only `native`, so run the full set locally before changing the process or
-/// WASM sandboxes. Tests for an excluded mode return early and report as
-/// passed.
+/// `native` and `process` (ci.yml sets it to `native,process`, so the `wasm`
+/// tests are skipped there); the weekly workflow runs `native,process,wasm`
+/// with `--features wasmtime`. Tests for an excluded mode return early and
+/// report as passed.
 fn sandbox_tested(mode: &str) -> bool {
     if mode == "wasm" && cfg!(not(feature = "wasm")) {
         return false;

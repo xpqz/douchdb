@@ -7,25 +7,29 @@ x-douchdb: &douchdb
   cpus: 2.0
   mem_limit: 2g
   environment:
-    DOUCHDB_CLUSTER_SECRET: bench-cluster-secret-123456
+    # No defaults: export both before `docker compose up` (see
+    # docs/couchdb-comparison.md). Passed in the environment so they stay out
+    # of the process list.
+    DOUCHDB_CLUSTER_SECRET: ${DOUCHDB_CLUSTER_SECRET:?set DOUCHDB_CLUSTER_SECRET (16+ characters), see docs/couchdb-comparison.md}
+    DOUCHDB_ADMIN: ${DOUCHDB_ADMIN:?set DOUCHDB_ADMIN (user:password), see docs/couchdb-comparison.md}
 services:
   node0:
     <<: *douchdb
     container_name: douch-bench-1
-    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","0","--sync-secs","3600"]
-    ports: ["25984:5984"]
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","0","--sync-secs","3600"]
+    ports: ["127.0.0.1:25984:5984"]
     volumes: ["douch0-data:/data"]
   node1:
     <<: *douchdb
     container_name: douch-bench-2
-    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","1","--sync-secs","3600"]
-    ports: ["25985:5984"]
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","1","--sync-secs","3600"]
+    ports: ["127.0.0.1:25985:5984"]
     volumes: ["douch1-data:/data"]
   node2:
     <<: *douchdb
     container_name: douch-bench-3
-    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--admin","admin:secret","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","2","--sync-secs","3600"]
-    ports: ["25986:5984"]
+    command: ["--listen","0.0.0.0:5984","--data","/data","--q","8","--n","3","--nodes","http://node0:5984,http://node1:5984,http://node2:5984","--me","2","--sync-secs","3600"]
+    ports: ["127.0.0.1:25986:5984"]
     volumes: ["douch2-data:/data"]
 volumes:
   douch0-data:

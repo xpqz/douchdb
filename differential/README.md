@@ -15,7 +15,7 @@ python3 differential/run.py --seed 1
 ```
 
 By default this builds the `douchdb:differential` image from the repository,
-starts a one-node douchdb (`q=1`, `n=1`) and a `couchdb:3.5` container, and runs
+starts a one-node douchdb (`q=1`, `n=1`) and a `couchdb:3.5.3` container, and runs
 60 operations. Docker must be available.
 
 Common options:
@@ -160,7 +160,7 @@ rules that are not part of its API contract. Those rows are compared as a
 multiset and the multi-key offset is ignored; single-key and range queries are
 compared exactly, including offset.
 
-Search is not covered: stock `couchdb:3.5` has no `_search` endpoint (it
+Search is not covered: stock `couchdb:3.5.3` has no `_search` endpoint (it
 requires Clouseau), so there is nothing to compare against. DouchDB's search
 endpoint is covered by the conformance tests.
 

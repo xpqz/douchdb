@@ -2,7 +2,8 @@
 """Benchmark a running 3-node CouchDB or DouchDB cluster.
 
 The matching compose files live in docker/bench/. Bring one cluster up at a
-time, then run:
+time. Export the credentials the compose files require (DOUCHDB_ADMIN, or
+COUCHDB_PASSWORD and optionally COUCHDB_USER), then run:
 
     python3 scripts/docker_compare.py --engine couchdb --json-out couch.json
     python3 scripts/docker_compare.py --engine douchdb --json-out douch.json
@@ -11,20 +12,40 @@ import argparse
 import base64
 import http.client
 import json
+import os
+import sys
 import threading
 import time
 import urllib.parse
 
+
+
+def required(variable):
+    value = os.environ.get(variable)
+    if not value:
+        sys.exit(f"set {variable}, the same value the compose file uses")
+    return value
+
+
+def basic(user_password):
+    return "Basic " + base64.b64encode(user_password.encode()).decode()
+
+
+def couch_auth():
+    user = os.environ.get("COUCHDB_USER", "admin")
+    return basic(f"{user}:{required('COUCHDB_PASSWORD')}")
+
+
 COUCH = {
     "name": "couchdb",
     "hosts": [("127.0.0.1", 15984), ("127.0.0.1", 15985), ("127.0.0.1", 15986)],
-    "auth": "Basic " + base64.b64encode(b"admin:password").decode(),
+    "auth": couch_auth,
     "create": "/bench?q=8&n=3",
 }
 DOUCH = {
     "name": "douchdb",
     "hosts": [("127.0.0.1", 25984), ("127.0.0.1", 25985), ("127.0.0.1", 25986)],
-    "auth": "Basic " + base64.b64encode(b"admin:secret").decode(),
+    "auth": lambda: basic(required("DOUCHDB_ADMIN")),
     "create": "/bench",
 }
 
@@ -34,7 +55,7 @@ class Conn:
         self.engine = engine
         self.host, self.port = engine["hosts"][0]
         self.conn = http.client.HTTPConnection(self.host, self.port, timeout=180)
-        self.headers = {"Authorization": engine["auth"], "Connection": "keep-alive"}
+        self.headers = {"Authorization": engine["auth"](), "Connection": "keep-alive"}
         self.index = 0
 
     def rotate(self):
