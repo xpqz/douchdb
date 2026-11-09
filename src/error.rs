@@ -68,9 +68,27 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// A stored record that was read from LevelDB successfully but cannot be
+/// decoded. This is the only error a listing may skip: it names one document.
+/// An error from LevelDB itself (I/O, checksum) is a plain `anyhow::Error`
+/// and always fails the request. Point reads and writes treat both the same.
+#[derive(Debug)]
+pub struct CorruptRecord {
+    pub id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for CorruptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "corrupt metadata for {}: {}", self.id, self.reason)
+    }
+}
+
+impl std::error::Error for CorruptRecord {}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        if e.downcast_ref::<crate::store::CorruptRecord>().is_some() {
+        if e.downcast_ref::<CorruptRecord>().is_some() {
             return ApiError::corrupt(format!("{e:#}"));
         }
         ApiError::internal(format!("{e:#}"))
