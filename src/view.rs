@@ -1851,8 +1851,8 @@ async fn ensure_rows(
         let (mut gate, mut index) = (gate, index);
         loop {
             gate.check()?;
-            let (rows, _, _) = db
-                .changes_rows(&ChangesOpts {
+            let (rows, _) = db
+                .changes_rows_only(&ChangesOpts {
                     since: index.last_seq,
                     limit: Some(CHANGES_PAGE),
                     include_docs: true,
@@ -5025,6 +5025,50 @@ mod tests {
             "shard jobs for a map, an include_docs and a reduce query on a current index"
         );
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Shard jobs an incremental view update costs on a three-shard database.
+    /// Before: 9 jobs, 3 of them the per-shard `pending` count the index never
+    /// uses. After: 6.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_incremental_view_update_skips_the_pending_pass() {
+        let root = std::env::temp_dir().join(format!("douchdb-viewpend-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "pend",
+            crate::db::DbConfig {
+                q: 3,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(3),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/d", "views": {"v": {
+                    "map": "function(doc) { emit(doc._id, 1); }",
+                }}}),
+                json!({"_id": "a", "n": 1}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        // Builds the index and caches the design document.
+        query_by_id(&db, &query).await;
+        db.put_docs(vec![json!({"_id": "b", "n": 2})], true)
+            .await
+            .unwrap();
+        let (jobs, result) = jobs_for(&db, &query).await;
+        assert_eq!(result["total_rows"], json!(2), "{result}");
+        assert_eq!(jobs, 6, "shard jobs for one incremental update");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
