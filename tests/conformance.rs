@@ -2747,6 +2747,258 @@ async fn upper_case_hex_revisions_match_and_respond_in_lower_case() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// One counter of a database from the local metrics, such as `shard_jobs` (the
+/// shard-actor jobs, each a cross-thread hop) or `shard_scanned` (index
+/// entries walked). A scrape runs jobs of its own before it reads the
+/// counters, so callers that compare counts take the cost of a scrape off.
+async fn db_counter(s: &Server, db_name: &str, field: &str) -> u64 {
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let db = metrics["databases"]
+        .as_array()
+        .and_then(|dbs| dbs.iter().find(|db| db["name"] == db_name))
+        .unwrap_or_else(|| panic!("{db_name} missing from the metrics: {metrics}"));
+    db[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{field} of an open db: {db}"))
+}
+
+/// What one request costs in `field`, with the cost of one scrape taken off.
+async fn request_cost(s: &Server, db_name: &str, field: &str, path: &str) -> u64 {
+    let first = db_counter(s, db_name, field).await;
+    let scrape = db_counter(s, db_name, field).await - first;
+    let before = db_counter(s, db_name, field).await;
+    let (status, body) = s.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    db_counter(s, db_name, field).await - before - scrape
+}
+
+/// `_design_docs` counts the design documents for `total_rows` in the same
+/// shard job that reads its rows, not with a second full `_all_docs` pass.
+#[tokio::test]
+async fn design_docs_counts_in_the_same_pass_as_its_rows() {
+    let s = Server::start_with(&["--q".to_string(), "1".to_string()], false);
+    s.fresh_db("ddcount").await;
+    let mut docs: Vec<Value> = (0..5)
+        .map(|i| json!({"_id": format!("_design/d{i}"), "views": {}}))
+        .collect();
+    docs.push(json!({"_id": "plain"}));
+    let (status, _) = s.post("/ddcount/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = s.get("/ddcount/_design_docs?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_rows"], 5);
+    let jobs = request_cost(&s, "ddcount", "shard_jobs", "/ddcount/_design_docs?limit=1").await;
+    assert_eq!(jobs, 1, "shard jobs of one _design_docs request");
+}
+
+/// A large `skip` with `include_docs` steps over ids only: the bodies of the
+/// skipped rows are never read, in either direction.
+#[tokio::test]
+async fn all_docs_skip_does_not_read_skipped_bodies() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("skipbody").await;
+    let docs: Vec<Value> = (0..300)
+        .map(|i| json!({"_id": format!("d{i:04}"), "n": i}))
+        .collect();
+    let (status, _) = s.post("/skipbody/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for path in [
+        "/skipbody/_all_docs?include_docs=true&skip=250&limit=3",
+        "/skipbody/_all_docs?include_docs=true&skip=250&limit=3&descending=true",
+    ] {
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"].as_array().map(Vec::len), Some(3), "{body}");
+        let reads = request_cost(&s, "skipbody", "shard_body_reads", path).await;
+        assert_eq!(reads, 3, "bodies read by {path}");
+    }
+    let (_, body) = s
+        .get("/skipbody/_all_docs?include_docs=true&skip=250&limit=1")
+        .await;
+    assert_eq!(body["rows"][0]["doc"]["n"], 250);
+}
+
+/// A response read chunk by chunk: its headers, the size of every chunk and
+/// the whole body. A streamed body is not sized up front (no
+/// `content-length`) and is written in more than one chunk when it is larger
+/// than one; a buffered one carries its length. Nothing here depends on how
+/// fast the chunks arrive.
+async fn read_chunks(
+    mut response: reqwest::Response,
+) -> (reqwest::header::HeaderMap, Vec<usize>, String) {
+    let headers = response.headers().clone();
+    let mut sizes = Vec::new();
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("read chunk") {
+        sizes.push(chunk.len());
+        body.extend_from_slice(&chunk);
+    }
+    (headers, sizes, String::from_utf8(body).expect("utf-8 body"))
+}
+
+/// The response is streamed: chunked, in several chunks.
+fn assert_streamed(headers: &reqwest::header::HeaderMap, sizes: &[usize], what: &str) {
+    assert!(
+        !headers.contains_key("content-length"),
+        "{what} must not be sized up front: {headers:?}"
+    );
+    assert!(sizes.len() > 1, "{what} came in {} chunk(s)", sizes.len());
+}
+
+/// A view's rows are written as they are read: a listing that spans several
+/// chunks is chunked, and its bytes are those of the buffered reply.
+#[tokio::test]
+async fn view_rows_are_streamed_with_a_stable_body() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("viewstream").await;
+    let (status, _) = s
+        .put(
+            "/viewstream/_design/d",
+            json!({"views": {"v": {"map": "function(doc) { emit(doc.n, doc.pad); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..1500)
+        .map(|i| json!({"_id": format!("d{i:05}"), "n": i, "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s
+        .post("/viewstream/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = s
+        .client
+        .get(format!(
+            "{}/viewstream/_design/d/_view/v?include_docs=true&update_seq=true",
+            s.base
+        ))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "a view");
+    assert!(
+        body.starts_with(
+            "{\"total_rows\":1500,\"offset\":0,\"rows\":[{\"id\":\"d00000\",\"key\":0,\"value\":\"xxxxxxxx"
+        ),
+        "{}",
+        &body[..200]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(value["rows"].as_array().map(Vec::len), Some(1500));
+    assert_eq!(value["rows"][1499]["doc"]["_id"], "d01499");
+    assert!(value["update_seq"].is_string(), "{}", value["update_seq"]);
+    assert!(body.ends_with('}') && body.contains("],\"update_seq\":"));
+
+    // An error is still a status, not a broken stream.
+    let (status, body) = s.get("/viewstream/_design/d/_view/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// `_bulk_get` results are written as they are read, in request order, with
+/// the same bytes as the buffered reply.
+#[tokio::test]
+async fn bulk_get_results_are_streamed_in_request_order() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("bgstream").await;
+    let docs: Vec<Value> = (0..1000)
+        .map(|i| json!({"_id": format!("d{i:04}"), "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s.post("/bgstream/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Requested in reverse, with a missing id and a bad rev among them.
+    let mut ids: Vec<String> = (0..1000).rev().map(|i| format!("d{i:04}")).collect();
+    ids.insert(500, "nope".to_string());
+    let mut requests: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+    requests.push(json!({"id": "d0000", "rev": "9-abc"}));
+
+    let response = s
+        .client
+        .post(format!("{}/bgstream/_bulk_get", s.base))
+        .json(&json!({"docs": requests}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "_bulk_get");
+    assert!(
+        body.starts_with(
+            "{\"results\":[{\"id\":\"d0999\",\"docs\":[{\"ok\":{\"_id\":\"d0999\",\"_rev\":\"1-"
+        ),
+        "{}",
+        &body[..150]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    let results = value["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1002);
+    for (result, id) in results.iter().zip(&ids) {
+        assert_eq!(result["id"], *id);
+    }
+    assert_eq!(results[500]["docs"][0]["error"]["error"], "not_found");
+    assert_eq!(results[1001]["docs"][0]["error"]["rev"], "9-abc");
+
+    let (status, body) = s.post("/bgstream/_bulk_get", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `_all_docs` with `keys` answers one row per key, in the order asked, and
+/// writes them as it reads them.
+#[tokio::test]
+async fn all_docs_with_keys_is_streamed_in_key_order() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("keystream").await;
+    let docs: Vec<Value> = (0..1000)
+        .map(|i| json!({"_id": format!("d{i:04}"), "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s.post("/keystream/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut keys: Vec<Value> = (0..1000).rev().map(|i| json!(format!("d{i:04}"))).collect();
+    keys.insert(500, json!("nope"));
+    keys.insert(600, json!(7));
+
+    let response = s
+        .client
+        .post(format!("{}/keystream/_all_docs?include_docs=true", s.base))
+        .json(&json!({"keys": keys}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "_all_docs with keys");
+    assert!(
+        body.starts_with("{\"total_rows\":1000,\"offset\":null,\"rows\":[{\"id\":\"d0999\",\"key\":\"d0999\",\"value\":{\"rev\":\"1-"),
+        "{}",
+        &body[..150]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    let rows = value["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1002);
+    assert_eq!(rows[500]["error"], "not_found");
+    assert_eq!(rows[500]["key"], "nope");
+    assert_eq!(rows[600]["key"], 7);
+    assert_eq!(rows[1001]["doc"]["_id"], "d0000");
+
+    // skip, limit and descending apply to the keys.
+    let (status, body) = s
+        .post(
+            "/keystream/_all_docs?descending=true&skip=1&limit=2",
+            json!({"keys": ["d0001", "d0002", "d0003", "d0004"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&Value> = body["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| &row["id"])
+        .collect();
+    assert_eq!(ids, [&json!("d0003"), &json!("d0002")]);
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts
@@ -3758,6 +4010,72 @@ async fn all_docs_is_streamed_with_a_stable_body() {
         "HEAD must not build the body to size it: {:?}",
         head.headers()
     );
+}
+
+/// CouchDB 3.5 answers HEAD with the `content-length` of the body a GET
+/// would send (documents, the root, `_security`, errors alike), except where
+/// the GET is chunked (`_all_docs`, `_design_docs`, `_local_docs`, `_changes`,
+/// views, `_all_dbs`): there it says `content-length: 0`.
+#[tokio::test]
+async fn head_reports_the_length_of_the_body_a_get_would_send() {
+    let s = Server::start(false);
+    s.fresh_db("headlen").await;
+    let (status, _) = s.put("/headlen/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = s
+        .put(
+            "/headlen/_design/d",
+            json!({"views": {"v": {"map": "function(doc) { emit(doc._id, 1); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let length = |headers: &reqwest::header::HeaderMap| {
+        headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+    };
+    for path in [
+        "/",
+        "/_up",
+        "/headlen/doc",
+        "/headlen/missing",
+        "/headlen/_design/d",
+    ] {
+        let get = s
+            .client
+            .get(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("get");
+        let get_status = get.status();
+        let body = get.text().await.expect("body");
+        let head = s
+            .client
+            .head(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(head.status(), get_status, "{path}");
+        assert_eq!(length(head.headers()), Some(body.len()), "HEAD {path}");
+    }
+    for path in [
+        "/headlen/_all_docs",
+        "/headlen/_design_docs",
+        "/headlen/_local_docs",
+        "/headlen/_changes",
+        "/headlen/_design/d/_view/v",
+        "/_all_dbs",
+    ] {
+        let head = s
+            .client
+            .head(format!("{}{path}", s.base))
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(head.status(), StatusCode::OK, "{path}");
+        assert_eq!(length(head.headers()), Some(0), "HEAD {path}");
+    }
 }
 
 #[tokio::test]

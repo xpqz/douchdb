@@ -1239,6 +1239,12 @@ impl Db {
         self.shards.iter().map(ShardHandle::scanned).sum()
     }
 
+    /// Document bodies this database's shards have read from storage since it
+    /// opened.
+    pub fn shard_body_reads(&self) -> u64 {
+        self.shards.iter().map(ShardHandle::body_reads).sum()
+    }
+
     /// Highest sequence that is safe for a changes cursor to publish, taken
     /// as a snapshot **before** reading any shard.
     ///
@@ -1723,10 +1729,7 @@ impl Db {
                 .map(|(_, shard)| {
                     let opts = opts.clone();
                     shard.call(move |s| {
-                        let docs = match &opts.partition {
-                            Some(partition) => s.partition_live_count(partition)?,
-                            None => s.counts().0,
-                        };
+                        let docs = all_docs_live_total(s, &opts)?;
                         let (rows, offset) = collect_all_docs(s, &opts, take)?;
                         Ok((rows, offset, docs))
                     })
@@ -1767,6 +1770,11 @@ impl Db {
             index: usize,
             after: Option<String>,
             buffer: std::collections::VecDeque<AllDocsRow>,
+            /// How many of the front rows of `buffer` have their documents.
+            /// Rows read while a skip is pending are only ids: they are
+            /// likely to be skipped, so their documents are read once the
+            /// rows that will be returned are known.
+            loaded: usize,
             done: bool,
         }
 
@@ -1781,10 +1789,7 @@ impl Db {
             let shard_opts = opts.clone();
             let (before, docs) = shard
                 .call(move |s| {
-                    let docs = match &shard_opts.partition {
-                        Some(partition) => s.partition_live_count(partition)?,
-                        None => s.counts().0,
-                    };
+                    let docs = all_docs_live_total(s, &shard_opts)?;
                     Ok((all_docs_before_start(s, &shard_opts)?, docs))
                 })
                 .await?;
@@ -1794,6 +1799,7 @@ impl Db {
                 index,
                 after: None,
                 buffer: std::collections::VecDeque::new(),
+                loaded: 0,
                 done: false,
             });
         }
@@ -1809,6 +1815,8 @@ impl Db {
             let mut remaining = opts.limit;
             while remaining > 0 {
                 let wanted = skip.saturating_add(remaining).min(PAGE);
+                // Rows that will be skipped are only stepped over.
+                let load = skip == 0;
                 let hungry: Vec<usize> = (0..cursors.len())
                     .filter(|slot| cursors[*slot].buffer.is_empty() && !cursors[*slot].done)
                     .collect();
@@ -1824,7 +1832,12 @@ impl Db {
                                         scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
                                     let last = scanned.last().map(|row| row.id.clone());
                                     let exhausted = scanned.len() < wanted;
-                                    Ok((load_all_docs(s, scanned, &shard_opts)?, last, exhausted))
+                                    let rows = if load {
+                                        load_all_docs(s, scanned, &shard_opts)?
+                                    } else {
+                                        scanned
+                                    };
+                                    Ok((rows, last, exhausted))
                                 })
                                 .await
                         }
@@ -1835,6 +1848,7 @@ impl Db {
                             Ok((rows, last, exhausted)) => {
                                 let cursor = &mut cursors[slot];
                                 cursor.buffer.extend(rows);
+                                cursor.loaded = if load { cursor.buffer.len() } else { 0 };
                                 if last.is_some() {
                                     cursor.after = last;
                                 }
@@ -1847,6 +1861,67 @@ impl Db {
                         }
                     }
                     continue;
+                }
+                if opts.include_docs && skip == 0 {
+                    // The rows the merge is certain to return next, as far as
+                    // the buffers reach: read exactly their documents.
+                    let mut taken = vec![0usize; cursors.len()];
+                    for _ in 0..remaining {
+                        let mut best: Option<usize> = None;
+                        let mut blocked = false;
+                        for (slot, cursor) in cursors.iter().enumerate() {
+                            let Some(row) = cursor.buffer.get(taken[slot]) else {
+                                blocked |= !cursor.done;
+                                continue;
+                            };
+                            let better = match best.and_then(|best| cursors[best].buffer.get(taken[best])) {
+                                None => true,
+                                Some(current) if opts.descending => row.id > current.id,
+                                Some(current) => row.id < current.id,
+                            };
+                            if better {
+                                best = Some(slot);
+                            }
+                        }
+                        let Some(best) = best.filter(|_| !blocked) else {
+                            break;
+                        };
+                        taken[best] += 1;
+                    }
+                    let loads: Vec<usize> = (0..cursors.len())
+                        .filter(|slot| taken[*slot] > cursors[*slot].loaded)
+                        .collect();
+                    if !loads.is_empty() {
+                        let mut rests = Vec::with_capacity(loads.len());
+                        let mut fetches = Vec::with_capacity(loads.len());
+                        for slot in &loads {
+                            let cursor = &mut cursors[*slot];
+                            // `buffer` keeps the loaded rows; the ones to load
+                            // and the ones still bare are taken off its end.
+                            let mut wanted = cursor.buffer.split_off(cursor.loaded);
+                            rests.push(wanted.split_off(taken[*slot] - cursor.loaded));
+                            let shard_opts = opts.clone();
+                            fetches.push(db.shards[cursor.index].call(move |s| {
+                                load_all_docs(s, wanted.into_iter().collect(), &shard_opts)
+                            }));
+                        }
+                        let results = futures::future::join_all(fetches).await;
+                        for ((slot, rest), result) in loads.into_iter().zip(rests).zip(results) {
+                            let cursor = &mut cursors[slot];
+                            match result {
+                                Ok(rows) => {
+                                    cursor.loaded += rows.len();
+                                    cursor.buffer.extend(rows);
+                                    cursor.buffer.extend(rest);
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
                 let mut best: Option<usize> = None;
                 for (slot, cursor) in cursors.iter().enumerate() {
@@ -1862,9 +1937,14 @@ impl Db {
                         best = Some(slot);
                     }
                 }
-                let Some(row) = best.and_then(|slot| cursors[slot].buffer.pop_front()) else {
+                let Some(slot) = best else {
                     break;
                 };
+                let cursor = &mut cursors[slot];
+                let Some(row) = cursor.buffer.pop_front() else {
+                    break;
+                };
+                cursor.loaded = cursor.loaded.saturating_sub(1);
                 if skip > 0 {
                     skip -= 1;
                     continue;
@@ -1935,12 +2015,12 @@ impl Db {
         Ok(docs)
     }
 
-    async fn all_docs_by_keys(
+    /// The `total_rows` of a `keys` query.
+    async fn keys_total_rows(
         &self,
         opts: &AllDocsOpts,
-        keys: &[Value],
         owned: Option<&ShardMask>,
-    ) -> DbResult<DocList> {
+    ) -> DbResult<u64> {
         let mut total_rows = 0u64;
         if let Some(partition) = &opts.partition {
             let shard = self.partition_shard(partition);
@@ -1953,28 +2033,72 @@ impl Db {
                     .await?;
             }
         } else {
-            let counts = futures::future::join_all(
-                self.selected_shards(owned)
-                    .into_iter()
-                    .map(|index| self.shards[index].call(|s| Ok(s.counts().0))),
-            )
-            .await;
+            let counts =
+                futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
+                    let opts = opts.clone();
+                    self.shards[index].call(move |s| all_docs_live_total(s, &opts))
+                }))
+                .await;
             for count in counts {
                 total_rows += count?;
             }
         }
+        Ok(total_rows)
+    }
 
-        let ordered_keys: Vec<Value> = if opts.descending {
-            keys.iter().rev().cloned().collect()
-        } else {
-            keys.to_vec()
+    async fn all_docs_by_keys(
+        &self,
+        opts: &AllDocsOpts,
+        keys: &[Value],
+        owned: Option<&ShardMask>,
+    ) -> DbResult<DocList> {
+        let total_rows = self.keys_total_rows(opts, owned).await?;
+        let page = keys_page(opts, keys);
+        Ok(DocList {
+            total_rows: Some(total_rows),
+            offset: None,
+            rows: self.keys_page_rows(opts, &page, owned).await?,
+            update_seq: None,
+        })
+    }
+
+    /// Like `all_docs` with `keys`, but the rows come back as a stream, a
+    /// chunk of keys at a time. The `total_rows` leads the reply.
+    pub(crate) async fn all_docs_keys_stream(
+        db: Arc<Db>,
+        opts: &AllDocsOpts,
+    ) -> DbResult<(u64, impl futures::Stream<Item = DbResult<DocListRow>>)> {
+        const CHUNK: usize = 256;
+        let keys = opts.keys.clone().unwrap_or_default();
+        let total_rows = db.keys_total_rows(opts, None).await?;
+        let page = keys_page(opts, &keys);
+        let opts = opts.clone();
+        let rows = async_stream::stream! {
+            for chunk in page.chunks(CHUNK) {
+                match db.keys_page_rows(&opts, chunk, None).await {
+                    Ok(rows) => {
+                        for row in rows {
+                            yield Ok(row);
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
         };
-        let page: Vec<Value> = ordered_keys
-            .iter()
-            .skip(opts.skip)
-            .take(opts.limit)
-            .cloned()
-            .collect();
+        Ok((total_rows, rows))
+    }
+
+    /// The rows for `page`, a run of the query's keys in the order they are
+    /// answered: one per key, a `not_found` row for a key with no document.
+    async fn keys_page_rows(
+        &self,
+        opts: &AllDocsOpts,
+        page: &[Value],
+        owned: Option<&ShardMask>,
+    ) -> DbResult<Vec<DocListRow>> {
         let mut grouped: Vec<Vec<(usize, String)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut included = vec![false; page.len()];
         if opts.partition.is_some() {
@@ -2027,17 +2151,12 @@ impl Db {
             }
         }
 
-        Ok(DocList {
-            total_rows: Some(total_rows),
-            offset: None,
-            rows: results
-                .into_iter()
-                .enumerate()
-                .filter(|(slot, _)| included[*slot])
-                .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
-                .collect(),
-            update_seq: None,
-        })
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .filter(|(slot, _)| included[*slot])
+            .map(|(slot, row)| row.unwrap_or_else(|| DocListRow::not_found(page[slot].clone())))
+            .collect())
     }
 
     /// The changes rows, the feed's last sequence, and how many changes remain
@@ -2541,7 +2660,47 @@ impl Db {
         let Some(reqs) = body.get("docs").and_then(Value::as_array) else {
             return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
         };
+        Ok(BulkGetResults {
+            results: self.bulk_get_chunk(reqs, revs, latest).await?,
+        })
+    }
 
+    /// Like `bulk_get`, but the results come back as a stream, a chunk of
+    /// requests at a time, so a large batch never sits in memory whole. The
+    /// results are in request order.
+    pub async fn bulk_get_stream(
+        db: Arc<Db>,
+        body: Value,
+        revs: bool,
+        latest: bool,
+    ) -> DbResult<impl futures::Stream<Item = DbResult<Option<BulkGetResult>>>> {
+        const CHUNK: usize = 256;
+        let Some(reqs) = body.get("docs").and_then(Value::as_array).cloned() else {
+            return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
+        };
+        Ok(async_stream::stream! {
+            for chunk in reqs.chunks(CHUNK) {
+                match db.bulk_get_chunk(chunk, revs, latest).await {
+                    Ok(results) => {
+                        for result in results {
+                            yield Ok(result);
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn bulk_get_chunk(
+        &self,
+        reqs: &[Value],
+        revs: bool,
+        latest: bool,
+    ) -> DbResult<Vec<Option<BulkGetResult>>> {
         // One shard-actor round trip per shard instead of one per document.
         // `_bulk_get` is on the hot replication path, so the channel hops are
         // the difference between a batch and a request storm.
@@ -2603,7 +2762,7 @@ impl Db {
                 });
             }
         }
-        Ok(BulkGetResults { results: out })
+        Ok(out)
     }
 
     // ----- local documents -------------------------------------------------
@@ -4002,6 +4161,9 @@ pub struct AllDocsOpts {
     pub inclusive_end: bool,
     pub limit: usize,
     pub skip: usize,
+    /// When set, `total_rows` counts only the live ids in `[first, last)`
+    /// instead of every live document (`_design_docs`).
+    pub count_range: Option<(String, String)>,
 }
 
 impl Default for AllDocsOpts {
@@ -4017,6 +4179,7 @@ impl Default for AllDocsOpts {
             inclusive_end: true,
             limit: usize::MAX,
             skip: 0,
+            count_range: None,
         }
     }
 }
@@ -4632,6 +4795,27 @@ fn read_doc_rev(
 /// `startkey`, which is the shard's contribution to `offset`.
 /// How many live ids sort before the query's start key, in the query's
 /// direction: the `offset` of an `_all_docs` reply, before `skip`.
+/// The keys a query answers, in the order it answers them: reversed for
+/// `descending`, then past `skip` and up to `limit`.
+fn keys_page(opts: &AllDocsOpts, keys: &[Value]) -> Vec<Value> {
+    let ordered: Box<dyn Iterator<Item = &Value> + '_> = if opts.descending {
+        Box::new(keys.iter().rev())
+    } else {
+        Box::new(keys.iter())
+    };
+    ordered.skip(opts.skip).take(opts.limit).cloned().collect()
+}
+
+/// The `total_rows` of one shard: its live documents, or those of the query's
+/// partition or `count_range`.
+fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<u64> {
+    Ok(match (&opts.partition, &opts.count_range) {
+        (Some(partition), _) => shard.partition_live_count(partition)?,
+        (None, Some((first, last))) => shard.live_range_count(first, last)? as u64,
+        (None, None) => shard.counts().0,
+    })
+}
+
 fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);
@@ -5834,6 +6018,25 @@ mod tests {
                 AllDocsOpts {
                     skip: 301,
                     limit: 400,
+                    ..base()
+                },
+            ),
+            (
+                "skip over unread documents, then read some",
+                AllDocsOpts {
+                    skip: 301,
+                    limit: 400,
+                    include_docs: true,
+                    ..base()
+                },
+            ),
+            (
+                "descending skip over unread documents",
+                AllDocsOpts {
+                    skip: 300,
+                    limit: 300,
+                    include_docs: true,
+                    descending: true,
                     ..base()
                 },
             ),

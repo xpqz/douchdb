@@ -32,11 +32,37 @@ pub async fn couch_reason_phrase(
     response
 }
 
+/// Whether CouchDB answers a GET of `path` with a chunked body, which a HEAD
+/// then reports as `content-length: 0`: the listings that are written as they
+/// are read. Every other reply is sized, and a HEAD reports that size.
+fn chunked_in_couchdb(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    matches!(
+        last,
+        "_all_dbs" | "_dbs_info" | "_all_docs" | "_design_docs" | "_local_docs" | "_changes"
+    ) || path.contains("/_view/")
+}
+
+/// A HEAD runs the GET and sends its headers without the body, with the
+/// `content-length` CouchDB (mochiweb) gives it: the size of the body a GET
+/// would send, or 0 where that body is chunked.
 pub async fn head_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let head = req.method() == Method::HEAD;
+    let path = req.uri().path().to_string();
     let mut response = next.run(req).await;
     if head {
+        let chunked = response.status() == StatusCode::OK && chunked_in_couchdb(&path);
+        let length = if chunked {
+            None
+        } else {
+            axum::body::HttpBody::size_hint(response.body()).exact()
+        };
         *response.body_mut() = Body::empty();
+        if let Some(length) = length {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+        }
     }
     response
 }

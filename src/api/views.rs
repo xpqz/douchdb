@@ -538,7 +538,13 @@ pub(super) async fn view_request(
         None
     };
     let started = std::time::Instant::now();
-    let result = run_view(req, view, &mut query, combine_reduce.as_deref()).await;
+    let result = if !st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
+        crate::view::query_stream(db.clone(), view.ddoc, view.name, &query).await
+    } else {
+        run_view(req, view, &mut query, combine_reduce.as_deref())
+            .await
+            .map(crate::view::ViewReply::Reduced)
+    };
     if !st.ctx.cluster.is_internal(headers) {
         crate::metrics::record_engine(
             "views",
@@ -551,11 +557,18 @@ pub(super) async fn view_request(
     }
 
     match result {
-        Ok(mut value) => {
+        Ok(crate::view::ViewReply::Reduced(mut value)) => {
             if let Some(update_seq) = update_seq {
                 value["update_seq"] = update_seq;
             }
             json(StatusCode::OK, value)
+        }
+        Ok(crate::view::ViewReply::Rows(rows)) => {
+            let head = format!(
+                "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+                rows.total_rows, rows.offset
+            );
+            stream_json_response(method, head.into_bytes(), rows.rows, rows_tail(update_seq)).await
         }
         Err(error) => fail(error),
     }
