@@ -325,7 +325,7 @@ async fn check_if_match(db: &Db, docid: &str, headers: &HeaderMap) -> Option<Res
 
 async fn copy_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
@@ -416,7 +416,7 @@ async fn copy_doc(
 
 async fn put_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     body: Bytes,
@@ -524,7 +524,7 @@ async fn put_doc(
 
 async fn delete_doc(
     st: &AppState,
-    db: &Db,
+    db: &Arc<Db>,
     dbname: &str,
     docid: &str,
     q: &HashMap<String, String>,
