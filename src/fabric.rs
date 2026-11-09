@@ -1665,9 +1665,6 @@ async fn fetch_remote_docs(
     if opts.conflicts {
         query.push(("conflicts", "true".to_string()));
     }
-    if opts.attachments {
-        query.push(("attachments", "true".to_string()));
-    }
     if opts.descending {
         query.push(("descending", "true".to_string()));
     }
@@ -2055,13 +2052,13 @@ async fn fetch_view_mask(
     local.owner_shards = Some(mask.clone());
     if node == ctx.cluster.me {
         let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
-        let docs = if query.include_docs || query.attachments {
+        let docs = if query.include_docs {
             let ids = selection
                 .rows
                 .iter()
                 .map(|row| row.id.clone())
                 .collect::<Vec<_>>();
-            crate::view::docs_by_ids(db, query.attachments, &ids).await?
+            crate::view::docs_by_ids(db, &ids).await?
         } else {
             HashMap::new()
         };
@@ -2081,10 +2078,6 @@ async fn fetch_view_mask(
         (
             "include_docs",
             if query.include_docs { "true" } else { "false" }.to_string(),
-        ),
-        (
-            "attachments",
-            if query.attachments { "true" } else { "false" }.to_string(),
         ),
     ];
     push_range_params(&mut params, query);

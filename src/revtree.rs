@@ -129,12 +129,6 @@ impl RevTree {
         self.edges.is_empty()
     }
 
-    /// Every known revision, in string order.
-    #[cfg(test)]
-    pub fn revs(&self) -> impl Iterator<Item = &String> {
-        self.edges.keys()
-    }
-
     /// The parent of a revision; `None` for a root or an unknown revision.
     pub fn parent(&self, rev: &str) -> Option<&str> {
         self.edges.get(rev)?.as_deref()

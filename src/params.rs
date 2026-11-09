@@ -24,7 +24,6 @@ pub(crate) fn doc_opts(q: &HashMap<String, String>) -> DocOpts {
         local_seq: flag(q, "local_seq"),
         conflicts: flag(q, "conflicts"),
         deleted_conflicts: flag(q, "deleted_conflicts"),
-        attachments: flag(q, "attachments"),
         open_revs: q
             .get("open_revs")
             .map(|v| serde_json::from_str::<Vec<String>>(v).unwrap_or_else(|_| vec![v.clone()])),

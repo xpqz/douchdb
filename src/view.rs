@@ -42,7 +42,6 @@ pub struct ViewQuery {
     pub group: bool,
     pub group_level: usize,
     pub include_docs: bool,
-    pub attachments: bool,
     pub update_seq: bool,
     pub limits: ViewLimits,
     /// Internal cluster filter: return only rows whose shard is owned by this
@@ -1663,9 +1662,9 @@ pub async fn query_with_spec(
     query.total_rows_override = Some(selection.total_rows);
     query.offset_override = Some(selection.offset);
     let rows = Arc::new(selection.rows);
-    let docs = if !reduce && (query.include_docs || query.attachments) {
+    let docs = if !reduce && query.include_docs {
         let ids = selected_row_ids(&rows, &query);
-        docs_by_ids(db, query.attachments, &ids).await?
+        docs_by_ids(db, &ids).await?
     } else {
         HashMap::new()
     };
@@ -1938,18 +1937,13 @@ pub(crate) async fn blocking<T: Send + 'static>(
         .map_err(|error| ApiError::new(500, "view_error", format!("view task failed: {error}")))?
 }
 
-pub(crate) async fn docs_by_ids(
-    db: &Db,
-    attachments: bool,
-    ids: &[String],
-) -> DbResult<HashMap<String, Value>> {
+pub(crate) async fn docs_by_ids(db: &Db, ids: &[String]) -> DbResult<HashMap<String, Value>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
     let opts = AllDocsOpts {
         keys: Some(ids.iter().cloned().map(Value::String).collect()),
         include_docs: true,
-        attachments,
         limit: usize::MAX,
         ..Default::default()
     };

@@ -288,8 +288,7 @@ impl PullCtx<'_> {
                     reqs.push(json!({
                         "id": id,
                         "rev": rev,
-                        "revs": true,
-                        "attachments": true
+                        "revs": true
                     }));
                 }
             }

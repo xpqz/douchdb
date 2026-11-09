@@ -122,8 +122,7 @@ LevelDB writes; after it is built, writes pay an in-memory BTreeMap update
 
 Cold view builds now take their document ids and winning revisions from the
 live-document map instead of scanning and decoding every `DocMeta` again. They
-still read one body per document and fall back to the full document shape only
-for revisions with attachments.
+still read one body per document.
 
 | Operation | Before (#35) | After (#35) |
 |---|---|---|

@@ -297,7 +297,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .route("/{db}/", any(api::db_root))
         .route("/{db}/{*rest}", any(api::db_rest))
         .fallback(api::not_found)
-        // Axum's 2 MiB default would reject a single 1 MiB attachment plus a
+        // Axum's 2 MiB default would reject a large
         // multi-document `_bulk_docs`. CouchDB's limit is far higher.
         .layer(axum::extract::DefaultBodyLimit::max(
             args.max_request_mb.saturating_mul(1024 * 1024),

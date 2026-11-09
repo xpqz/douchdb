@@ -70,12 +70,6 @@ pub fn body_key(docid: &str, rev: &str) -> Vec<u8> {
     key(b"d/", &format!("{docid}/{rev}"))
 }
 
-pub fn blob_prefix(digest: &str, chunk: u32) -> Vec<u8> {
-    let mut out = key(b"b/", &format!("{digest}/"));
-    out.extend_from_slice(&chunk.to_be_bytes());
-    out
-}
-
 /// Big-endian so byte order is numeric order.
 pub fn seq_key(seq: u64) -> Vec<u8> {
     let mut out = b"s/".to_vec();
@@ -100,27 +94,15 @@ fn key(prefix: &[u8], rest: &str) -> Vec<u8> {
     out
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AttMeta {
-    pub content_type: String,
-    /// Lowercase hex md5 of the content.
-    pub digest: String,
-    pub length: u64,
-    pub revpos: u64,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
-    /// revision -> attachments in document order (order is part of the hash)
-    pub atts: BTreeMap<String, Vec<(String, AttMeta)>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct LiveDoc {
     pub rev: String,
-    pub has_attachments: bool,
 }
 
 /// Counts plus an optional content digest for rebalance verification.
@@ -399,18 +381,13 @@ pub struct Shard {
 }
 
 /// What a document's metadata says about it: the winning revision, whether it
-/// is live, and whether that revision has attachments.
-pub(crate) type MetaState = (String, bool, bool);
+/// is live.
+pub(crate) type MetaState = (String, bool);
 
 pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
-        let has_attachments = meta
-            .atts
-            .get(&winner)
-            .map(|atts| !atts.is_empty())
-            .unwrap_or(false);
-        (winner, live, has_attachments)
+        (winner, live)
     })
 }
 
@@ -580,8 +557,8 @@ impl Shard {
                     }
                     let (_, meta) = parse_meta(&key, &value)?;
                     match meta_state(&meta) {
-                        Some((_, true, _)) => docs += 1,
-                        Some((_, false, _)) => deleted += 1,
+                        Some((_, true)) => docs += 1,
+                        Some((_, false)) => deleted += 1,
                         None => {}
                     }
                     if !iter.advance() {
@@ -669,7 +646,7 @@ impl Shard {
             hasher.update(b"doc");
             hasher.update(id.as_bytes());
             match meta_state(&meta) {
-                Some((winner, live, _)) => {
+                Some((winner, live)) => {
                     hasher.update(winner.as_bytes());
                     hasher.update([live as u8]);
                 }
@@ -681,21 +658,6 @@ impl Shard {
                 hasher.update(b"leaf");
                 hasher.update(leaf.as_bytes());
                 hasher.update([meta.tree.is_deleted(&leaf) as u8]);
-            }
-            for (rev, atts) in &meta.atts {
-                // Empty attachment vectors can differ between replicas without
-                // changing the document content.
-                if atts.is_empty() {
-                    continue;
-                }
-                hasher.update(b"att");
-                hasher.update(rev.as_bytes());
-                for (name, att) in atts {
-                    hasher.update(name.as_bytes());
-                    hasher.update(att.digest.as_bytes());
-                    hasher.update(att.length.to_be_bytes());
-                    hasher.update(att.revpos.to_be_bytes());
-                }
             }
             documents += 1;
             if !iter.advance() {
@@ -743,7 +705,7 @@ impl Shard {
         self.scan_range_while(prefix.as_bytes(), None, false, |key, value| {
             match parse_meta(key, value) {
                 Ok((_, meta)) => {
-                    if let Some((_, live, _)) = meta_state(&meta) {
+                    if let Some((_, live)) = meta_state(&meta) {
                         if live {
                             docs += 1;
                         } else {
@@ -771,14 +733,8 @@ impl Shard {
             self.scan_range_while(b"m/", None, false, |key, value| {
                 match parse_meta(key, value) {
                     Ok((id, meta)) => {
-                        if let Some((rev, true, has_attachments)) = meta_state(&meta) {
-                            live.insert(
-                                id,
-                                LiveDoc {
-                                    rev,
-                                    has_attachments,
-                                },
-                            );
+                        if let Some((rev, true)) = meta_state(&meta) {
+                            live.insert(id, LiveDoc { rev });
                         }
                     }
                     Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
@@ -1095,8 +1051,8 @@ impl Shard {
         self.scan_range_while(b"m/", None, false, |key, value| {
             if let Ok((_, meta)) = parse_meta(key, value) {
                 match meta_state(&meta) {
-                    Some((_, true, _)) => docs += 1,
-                    Some((_, false, _)) => deleted += 1,
+                    Some((_, true)) => docs += 1,
+                    Some((_, false)) => deleted += 1,
                     None => {}
                 }
             }
@@ -1318,12 +1274,12 @@ impl Shard {
         let mut deleted = self.deleted as i64;
         for ((key, value), state) in tx.ops.into_iter().zip(states) {
             if let Some((old_state, new_state)) = state {
-                match old_state.as_ref().map(|(_, live, _)| *live) {
+                match old_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs -= 1,
                     Some(false) => deleted -= 1,
                     None => {}
                 }
-                match new_state.as_ref().map(|(_, live, _)| *live) {
+                match new_state.as_ref().map(|(_, live)| *live) {
                     Some(true) => docs += 1,
                     Some(false) => deleted += 1,
                     None => {}
@@ -1331,14 +1287,8 @@ impl Shard {
                 if let Some(live) = self.live.as_mut() {
                     if let Ok(id) = doc_id_from_meta_key(&key) {
                         let (was_live, is_live) = match new_state {
-                            Some((rev, true, has_attachments)) => {
-                                let old = live.insert(
-                                    id.to_string(),
-                                    LiveDoc {
-                                        rev,
-                                        has_attachments,
-                                    },
-                                );
+                            Some((rev, true)) => {
+                                let old = live.insert(id.to_string(), LiveDoc { rev });
                                 (old.is_some(), true)
                             }
                             _ => (live.remove(id).is_some(), false),
@@ -1997,11 +1947,7 @@ mod scan_tests {
         let rev = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[rev], deleted);
-        DocMeta {
-            tree,
-            seq,
-            atts: BTreeMap::new(),
-        }
+        DocMeta { tree, seq }
     }
 
     #[test]
@@ -2012,11 +1958,7 @@ mod scan_tests {
             let edges: BTreeMap<&str, Option<&str>> = edges.iter().copied().collect();
             let tree: RevTree =
                 serde_json::from_value(serde_json::json!({"edges": edges, "deleted": []})).unwrap();
-            DocMeta {
-                tree,
-                seq: 1,
-                atts: BTreeMap::new(),
-            }
+            DocMeta { tree, seq: 1 }
         };
         let mut tx = Tx::new();
         // The only leaf of "doc" has a '/' in its revision id.
@@ -2071,11 +2013,7 @@ mod scan_tests {
         let new = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[old.clone(), new.clone()], false);
-        let doc_meta = DocMeta {
-            tree,
-            seq: 1,
-            atts: BTreeMap::new(),
-        };
+        let doc_meta = DocMeta { tree, seq: 1 };
         // Ids with '/' sort between and around each other's keys.
         let ids = ["a", "a/b", "a/b/c", "a0", "b", "b/", "c", "d/e", "e", "f"];
         let mut tx = Tx::new();

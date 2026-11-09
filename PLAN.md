@@ -147,9 +147,8 @@ couch_hash:md5_hash(
   `_revs_info`, `_local_seq` already removed. **Key order is the order they
   appeared in the JSON document** — `couch_doc:from_json_obj` builds a proplist
   and never sorts it.
-* `Atts2` — list of `{Name, Type, Md5}` triples, **reversed**, for attachments
-  that carry an md5. The API rejects attachments now, but the hash code keeps
-  this path for legacy documents and CouchDB rev compatibility.
+* `Atts2` — list of `{Name, Type, Md5}` triples for attachments. douchdb stores
+  none, so it is always the empty list.
 
 Three consequences that are easy to miss:
 
@@ -477,7 +476,7 @@ the bulk of the growth.
   issue/branch/merge workflow is documented in `docs/process.md`.
 * **Stabilization pass.** Rebalance readiness now compares per-shard
   revision-metadata digests (document ids, winning revisions, deleted flags,
-  conflict leaves and attachment metadata) instead of live counts; old replicas
+  conflict leaves) instead of live counts; old replicas
   must agree, cleanup is explicit (`?cleanup=true`), and a timeout leaves the
   active map unchanged. During verification, reads use the old active map,
   client writes are frozen on every node for a bounded window, and anti-entropy
