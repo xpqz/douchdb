@@ -767,6 +767,16 @@ mod tests {
     }
 
     #[test]
+    fn anti_entropy_routes_have_their_own_labels() {
+        assert_eq!(route_label("/ae/_changes"), "/ae/_changes");
+        assert_eq!(route_label("/ae/_bulk_get"), "/ae/_bulk_get");
+        assert_eq!(
+            route_label("/ae/_peer_purged_infos"),
+            "/ae/_peer_purged_infos"
+        );
+    }
+
+    #[test]
     fn probes_are_recognised_by_route() {
         for path in ["/_health", "/_up", "/_node/_local/_health"] {
             assert!(is_probe(&route_label(path)), "{path}");
