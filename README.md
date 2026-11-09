@@ -993,6 +993,15 @@ It covers a clean SIGKILL, kill during compaction, truncated tables, bit
 flips, a removed table and a truncated manifest. Each scenario must preserve
 all acknowledged documents or refuse to serve them.
 
+A document whose metadata record is corrupt cannot be read or overwritten
+(the error says so), and listings skip it. To repair it, purge it:
+`POST /db/_purge` with `{"<id>": ["<any rev>"]}` removes the record and all
+its revision bodies whatever revisions the request lists, and records the
+purge like any other. Compaction leaves such a record in place, logs it at
+warn level with the database, shard and document id, and counts it in
+`storage.corrupt_records_skipped`, so it no longer blocks the rest of the
+shard.
+
 ## Status and limits
 
 v0.2: the replication protocol, auth, views, search, multiuser admission, a

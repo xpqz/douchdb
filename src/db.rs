@@ -2886,7 +2886,27 @@ fn purge_one(
     reserved: &AtomicU64,
 ) -> DbResult<Vec<String>> {
     let mut tx = Tx::new();
-    let Some(mut meta) = s.get_meta(id)? else {
+    let meta = match s.get_meta(id) {
+        Ok(meta) => meta,
+        Err(error)
+            if error
+                .downcast_ref::<crate::error::CorruptRecord>()
+                .is_some() =>
+        {
+            // The revisions cannot be checked against unreadable metadata, so
+            // the document goes whole; this is the repair path for it.
+            let info = PurgeInfo {
+                uuid: replayed.map_or_else(uuid, str::to_string),
+                id: id.to_string(),
+                revs: requested.to_vec(),
+            };
+            s.purge_corrupt(id, &info, peers)?;
+            s.invalidate_latest();
+            return Ok(requested.to_vec());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(mut meta) = meta else {
         if let Some(uuid) = replayed {
             let info = PurgeInfo {
                 uuid: uuid.to_string(),
