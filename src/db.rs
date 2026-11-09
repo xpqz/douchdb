@@ -5262,6 +5262,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The changes feed serializes with `seq`, `id`, `changes`, then the
+    /// optional `deleted` and `doc`, followed by `last_seq` and `pending`.
+    #[tokio::test]
+    async fn changes_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("changes-wire").await;
+        let written = db
+            .put_docs(
+                vec![json!({"_id": "a", "n": 1}), json!({"_id": "b", "n": 2})],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev_b = written[1].json()["rev"].as_str().unwrap().to_string();
+        db.put_docs(
+            vec![json!({"_id": "b", "_rev": rev_b, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+        let text = |changes: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&changes.unwrap()).unwrap()).unwrap()
+        };
+        let plain = text(db.changes(&ChangesOpts::default()).await);
+        assert_eq!(
+            plain,
+            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}]},{"seq":3,"id":"b","changes":[{"rev":"2-6b4cac76d0f72a9035d0e6b20c710a24"}],"deleted":true}],"last_seq":3,"pending":0}"#
+        );
+        let docs = text(
+            db.changes(&ChangesOpts {
+                include_docs: true,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            docs,
+            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}],"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}],"last_seq":1,"pending":1}"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
