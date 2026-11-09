@@ -738,7 +738,7 @@ mod tests {
                 uri: &uri,
                 q: &q,
                 headers: &headers,
-                principal: &Principal::default(),
+                principal: &Principal::service_admin(),
                 body: &body,
             },
         )
