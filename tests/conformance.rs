@@ -1574,6 +1574,253 @@ async fn internal_consistency_after_concurrent_writes() {
     }
 }
 
+/// CouchDB 3 sends every sequence as `<sum>-<base64url>` (`pack_seqs` in
+/// fabric_view_changes.erl), a standalone node included.
+fn is_couch_seq(value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    match text.split_once('-') {
+        Some((sum, opaque)) => {
+            !sum.is_empty()
+                && sum.bytes().all(|b| b.is_ascii_digit())
+                && !opaque.is_empty()
+                && opaque
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
+        None => false,
+    }
+}
+
+fn feed_ids(body: &Value) -> Vec<String> {
+    body["results"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn standalone_sequences_are_opaque_strings_like_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("opaque").await;
+    s.put(
+        "/opaque/_design/d",
+        json!({"views": {"v": {"map": "function(doc) { emit(doc._id, 1); }"}}}),
+    )
+    .await;
+    for id in ["a", "b", "c"] {
+        let (status, _) = s.put(&format!("/opaque/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (_, info) = s.get("/opaque").await;
+    for field in ["update_seq", "purge_seq"] {
+        assert!(is_couch_seq(&info[field]), "{field}: {info}");
+    }
+    for path in [
+        "/opaque/_all_docs?update_seq=true",
+        "/opaque/_design_docs?update_seq=true",
+        "/opaque/_design/d/_view/v?update_seq=true",
+    ] {
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(is_couch_seq(&body["update_seq"]), "{path}: {body}");
+    }
+    let (_, dbs_info) = s.post("/_dbs_info", json!({"keys": ["opaque"]})).await;
+    assert!(
+        is_couch_seq(&dbs_info[0]["info"]["update_seq"]),
+        "{dbs_info}"
+    );
+
+    // Every feed mode reports opaque row seqs and a last_seq of that shape.
+    let (_, normal) = s.get("/opaque/_changes").await;
+    assert_eq!(normal["results"].as_array().unwrap().len(), 4, "{normal}");
+    for row in normal["results"].as_array().unwrap() {
+        assert!(is_couch_seq(&row["seq"]), "{normal}");
+    }
+    assert!(is_couch_seq(&normal["last_seq"]), "{normal}");
+    for query in [
+        "limit=0",
+        "descending=true",
+        "include_docs=true",
+        "style=all_docs&limit=2",
+        "filter=_doc_ids&doc_ids=%5B%22a%22%5D",
+        "feed=longpoll",
+        "since=now",
+    ] {
+        let (status, body) = s.get(&format!("/opaque/_changes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert!(is_couch_seq(&body["last_seq"]), "{query}: {body}");
+        for row in body["results"].as_array().unwrap() {
+            assert!(is_couch_seq(&row["seq"]), "{query}: {body}");
+        }
+    }
+    let text = s
+        .client
+        .get(format!(
+            "{}/opaque/_changes?feed=continuous&since=0&timeout=200",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5, "{text}");
+    for line in &lines[..4] {
+        assert!(is_couch_seq(&line["seq"]), "{text}");
+    }
+    assert!(is_couch_seq(&lines[4]["last_seq"]), "{text}");
+
+    // The sequence GET /db reports is a usable `since`, and so is the feed's
+    // own last_seq: nothing is replayed.
+    for since in [
+        info["update_seq"].as_str().unwrap_or_default().to_string(),
+        normal["last_seq"].as_str().unwrap_or_default().to_string(),
+    ] {
+        let (status, body) = s.get(&format!("/opaque/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(feed_ids(&body).is_empty(), "replayed: {body}");
+    }
+}
+
+// CouchDB (`validate_start_seq`, fabric_view_changes.erl) takes `since` as
+// 0, "now" or an opaque token and rejects any other plain integer.
+#[tokio::test]
+async fn changes_since_accepts_what_couchdb_accepts() {
+    let s = Server::start(false);
+    s.fresh_db("sincekinds").await;
+    for id in ["a", "b"] {
+        s.put(&format!("/sincekinds/{id}"), json!({})).await;
+    }
+    for since in ["0", "now"] {
+        let (status, body) = s.get(&format!("/sincekinds/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::OK, "{since}: {body}");
+        let want = if since == "now" { 0 } else { 2 };
+        assert_eq!(feed_ids(&body).len(), want, "{since}: {body}");
+    }
+    for since in ["1", "2", "99", "%220%22", "%221%22", "abc", "5-abc", ""] {
+        let (status, body) = s.get(&format!("/sincekinds/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{since}: {body}");
+        assert_eq!(
+            body["reason"], "Malformed sequence supplied in 'since' parameter.",
+            "{since}"
+        );
+    }
+    // A quoted token is read like a bare one (eventsource ids are JSON).
+    let (_, page) = s.get("/sincekinds/_changes?limit=1").await;
+    let quoted = format!("%22{}%22", page["last_seq"].as_str().unwrap_or_default());
+    let (status, body) = s.get(&format!("/sincekinds/_changes?since={quoted}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(feed_ids(&body).len(), 1, "{body}");
+}
+
+#[tokio::test]
+async fn standalone_changes_resume_exactly_from_last_seq_across_a_restart() {
+    let mut s = Server::start(false);
+    s.fresh_db("resume").await;
+    let ids: Vec<String> = (0..7).map(|i| format!("d{i}")).collect();
+    for id in &ids[..5] {
+        s.put(&format!("/resume/{id}"), json!({})).await;
+    }
+
+    // Page through two rows at a time, restarting in the middle.
+    let mut seen = Vec::new();
+    let mut since = "0".to_string();
+    for round in 0..2 {
+        let (status, body) = s
+            .get(&format!("/resume/_changes?since={since}&limit=2"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(is_couch_seq(&body["last_seq"]), "{body}");
+        seen.extend(feed_ids(&body));
+        since = body["last_seq"].as_str().unwrap_or_default().to_string();
+        if round == 0 {
+            s.kill();
+            s.restart();
+        }
+    }
+    assert_eq!(seen, &ids[..4], "no change missed or repeated");
+
+    // The token outlives the process: new writes land after it, in order.
+    s.kill();
+    s.restart();
+    for id in &ids[5..] {
+        s.put(&format!("/resume/{id}"), json!({})).await;
+    }
+    let (_, body) = s.get(&format!("/resume/_changes?since={since}")).await;
+    assert_eq!(feed_ids(&body), &ids[4..], "{body}");
+    let (_, info) = s.get("/resume").await;
+    assert!(is_couch_seq(&info["update_seq"]), "{info}");
+    let update_seq = info["update_seq"].as_str().unwrap_or_default();
+    let (_, body) = s.get(&format!("/resume/_changes?since={update_seq}")).await;
+    assert!(feed_ids(&body).is_empty(), "{body}");
+    s.put("/resume/late", json!({})).await;
+    let (_, body) = s.get(&format!("/resume/_changes?since={update_seq}")).await;
+    assert_eq!(feed_ids(&body), ["late"], "{body}");
+}
+
+// An eventsource event carries `id: <seq>` and a reconnecting browser sends it
+// back as `Last-Event-ID`, which wins over `since` (chttpd_db.erl).
+#[tokio::test]
+async fn eventsource_events_carry_ids_and_resume_from_last_event_id() {
+    let s = Server::start(false);
+    s.fresh_db("sseid").await;
+    for id in ["a", "b", "c"] {
+        s.put(&format!("/sseid/{id}"), json!({})).await;
+    }
+    let url = format!(
+        "{}/sseid/_changes?feed=eventsource&since=0&timeout=300&heartbeat=40",
+        s.base
+    );
+    let text = s
+        .client
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ids: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .map(|raw| serde_json::from_str(raw).unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3, "{text}");
+    assert!(ids.iter().all(is_couch_seq), "{text}");
+
+    let resumed = s
+        .client
+        .get(&url)
+        .header("Last-Event-ID", ids[0].to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let data: Vec<Value> = resumed
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let got: Vec<&str> = data.iter().filter_map(|row| row["id"].as_str()).collect();
+    assert_eq!(got, ["b", "c"], "{resumed}");
+}
+
 #[tokio::test]
 async fn changes_returns_latest_per_document_and_pending() {
     let s = Server::start(false);
