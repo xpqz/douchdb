@@ -688,6 +688,7 @@ pub fn snapshot() -> Value {
             "per_second": history_json(&state),
         },
         "views": state.views.json(),
+        "js_sandbox_requests": crate::js::sandbox_requests(),
         "search": state.search.json(),
         "integrity": {
             "corrupt_records_skipped": state.corrupt_records_skipped,

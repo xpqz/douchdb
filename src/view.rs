@@ -800,7 +800,7 @@ impl ViewRows {
                 query,
                 unique.as_deref(),
                 &mut partials,
-                &mut |first, end| reduce_span(rows, &blocks, first, end, reducer, visited),
+                &mut |ranges| reduce_spans(rows, &blocks, ranges, reducer, visited),
             )?;
         }
         assemble_reduce(partials, query, reducer)
@@ -981,38 +981,57 @@ fn equal_range<S: SortedRows + ?Sized>(rows: &S, key: &Value) -> (usize, usize) 
     )
 }
 
+/// Reduces row ranges, `first..end` each, to one value apiece.
+type SpanReducer<'a> = dyn FnMut(&[(usize, usize)]) -> Result<Vec<Value>, JsError> + 'a;
+
 /// Add one sorted shard's partial reductions for `query` to `partials`.
-/// `span` reduces the rows `first..end`.
+/// `spans` reduces the row ranges it is given, `first..end` each, all at once
+/// so a sandboxed reducer is not called once per range.
 fn reduce_ranges<S: SortedRows + ?Sized>(
     rows: &S,
     query: &ViewQuery,
     unique: Option<&[Value]>,
     partials: &mut Partials,
-    span: &mut dyn FnMut(usize, usize) -> Result<Value, JsError>,
+    spans: &mut SpanReducer,
 ) -> Result<(), JsError> {
+    let ranges = query_ranges(rows, query, unique);
+    let values = spans(&ranges.iter().map(|(_, span)| *span).collect::<Vec<_>>())?;
+    for ((key, _), value) in ranges.into_iter().zip(values) {
+        add_partial(partials, key, value);
+    }
+    Ok(())
+}
+
+/// The groups of `query` in one sorted shard, each with its partial's key and
+/// the rows `first..end` it covers.
+fn query_ranges<S: SortedRows + ?Sized>(
+    rows: &S,
+    query: &ViewQuery,
+    unique: Option<&[Value]>,
+) -> Vec<(Value, (usize, usize))> {
     let (lo, hi) = range_bounds(rows, query);
     let clamp = |(first, end): (usize, usize)| (first.max(lo), end.min(hi));
     if let Some(keys) = unique {
-        for key in keys {
-            let (first, end) = clamp(equal_range(rows, key));
-            if first < end {
-                add_partial(partials, key.clone(), span(first, end)?);
-            }
-        }
-        return Ok(());
+        return keys
+            .iter()
+            .map(|key| (key.clone(), clamp(equal_range(rows, key))))
+            .filter(|(_, (first, end))| first < end)
+            .collect();
     }
     let (lo, hi) = match &query.key {
         Some(key) => clamp(equal_range(rows, key)),
         None => (lo, hi),
     };
     if !query.group && query.group_level == 0 {
-        if lo < hi {
-            add_partial(partials, Value::Null, span(lo, hi)?);
-        }
-        return Ok(());
+        return if lo < hi {
+            vec![(Value::Null, (lo, hi))]
+        } else {
+            Vec::new()
+        };
     }
     // Group keys never decrease along sorted rows, so each group is a run
     // found by binary search.
+    let mut ranges = Vec::new();
     let mut start = lo;
     while start < hi {
         let group = group_key(&rows.row(start).key, query.group_level);
@@ -1023,44 +1042,79 @@ fn reduce_ranges<S: SortedRows + ?Sized>(
                 cmp_json(&group_key(&row.key, query.group_level), &group) != Ordering::Greater
             })
             .min(hi);
-        add_partial(partials, group, span(start, end)?);
+        ranges.push((group, (start, end)));
         start = end;
     }
-    Ok(())
+    ranges
 }
 
-/// Reduce `rows[first..end]` from the largest stored partials it covers
-/// whole, plus the rows and partials at either edge.
-fn reduce_span(
+/// One piece of a span's reduction: the rows at an edge, reduced with the
+/// edges of the other spans, or a stored partial.
+enum Piece {
+    Edge,
+    Stored(Value),
+}
+
+/// Reduce each of `ranges` (`first..end` of `rows`) from the largest stored
+/// partials it covers whole, plus the rows and partials at either edge. The
+/// edges of all ranges are reduced together, and then the pieces of all
+/// ranges are combined together, so a custom reducer is called in batches.
+fn reduce_spans(
     rows: &ShardRows,
     spans: &Spans,
-    first: usize,
-    end: usize,
+    ranges: &[(usize, usize)],
     reducer: &mut JsReducer,
     visited: &AtomicU64,
-) -> Result<Value, JsError> {
+) -> Result<Vec<Value>, JsError> {
     let starts = &spans.starts;
     let count = starts.len().saturating_sub(1);
-    // The whole blocks in the span: from the first block starting at or after
-    // `first` to the last ending at or before `end`.
-    let lo = starts[..count].partition_point(|start| *start < first);
-    let hi = starts[1..].partition_point(|end_of| *end_of <= end);
-    let mut parts = Vec::new();
-    if lo >= hi {
-        visit(visited, end - first);
-        parts.push(reduce_rows(rows.range(first, end), reducer)?);
-    } else {
-        if first < starts[lo] {
-            visit(visited, starts[lo] - first);
-            parts.push(reduce_rows(rows.range(first, starts[lo]), reducer)?);
+    let mut edges = Vec::new();
+    let mut plan: Vec<Vec<Piece>> = Vec::with_capacity(ranges.len());
+    for &(first, end) in ranges {
+        // The whole blocks in the span: from the first block starting at or
+        // after `first` to the last ending at or before `end`.
+        let lo = starts[..count].partition_point(|start| *start < first);
+        let hi = starts[1..].partition_point(|end_of| *end_of <= end);
+        let mut pieces = Vec::new();
+        let mut edge = |first: usize, end: usize, pieces: &mut Vec<Piece>| {
+            visit(visited, end - first);
+            edges.push((first, end));
+            pieces.push(Piece::Edge);
+        };
+        match (starts.get(lo), starts.get(hi)) {
+            (Some(&block_lo), Some(&block_hi)) if lo < hi => {
+                if first < block_lo {
+                    edge(first, block_lo, &mut pieces);
+                }
+                pieces.extend(
+                    block_parts(&spans.levels, lo, hi)
+                        .into_iter()
+                        .map(Piece::Stored),
+                );
+                if block_hi < end {
+                    edge(block_hi, end, &mut pieces);
+                }
+            }
+            _ => edge(first, end, &mut pieces),
         }
-        parts.extend(block_parts(&spans.levels, lo, hi));
-        if starts[hi] < end {
-            visit(visited, end - starts[hi]);
-            parts.push(reduce_rows(rows.range(starts[hi], end), reducer)?);
-        }
+        plan.push(pieces);
     }
-    combine_children(reducer, &parts)
+    let mut edges = reduce_blocks(rows, edges.into_iter(), reducer)?.into_iter();
+    let groups: Vec<Vec<Value>> = plan
+        .into_iter()
+        .map(|pieces| {
+            pieces
+                .into_iter()
+                .map(|piece| match piece {
+                    Piece::Stored(value) => Ok(value),
+                    Piece::Edge => edges
+                        .next()
+                        .ok_or_else(|| JsError::Runtime("edge reduction missing".into())),
+                })
+                .collect()
+        })
+        .collect::<Result<_, JsError>>()?;
+    combine_many(reducer, groups.iter().map(Vec::as_slice))
 }
 
 /// The fewest stored partials covering blocks `lo..hi`, in row order.
@@ -1184,13 +1238,15 @@ pub(crate) fn assemble_reduce(
         groups
     };
 
+    // The groups' rereduces go in as one batch.
+    let groups: Vec<(Value, Vec<Value>)> = groups
+        .into_iter()
+        .skip(query.skip)
+        .take(query.limit)
+        .collect();
+    let combined = combine_many(reducer, groups.iter().map(|(_, values)| values.as_slice()))?;
     let mut rows = Vec::new();
-    for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {
-        let mut value = if values.len() == 1 {
-            values.pop().unwrap_or(Value::Null)
-        } else {
-            combine_partials(reducer, &values)?
-        };
+    for ((key, _), mut value) in groups.into_iter().zip(combined) {
         // Owners hand their sketches to the coordinator, which reports the
         // estimate of the union.
         if query.owner_shards.is_none() {
@@ -1994,16 +2050,28 @@ async fn ensure_rows(
         // Read the bound before scanning, so a write that lands during the
         // scan stays above it and is picked up by the next update.
         let bound = db.changes_watermark(0, None);
-        let docs = db.map_docs(None).await?;
-        return blocking(move || {
-            // In batches, so a deleted database is noticed between them.
-            let mut rows = Vec::new();
-            for batch in docs.chunks(CHANGES_PAGE) {
+        // The documents are read and mapped a page at a time, so a rebuild
+        // holds one page of document bodies, not the whole database's.
+        let mut cursor = crate::db::MapCursor::default();
+        let mut rows = Vec::new();
+        let (mut gate, mut index) = (gate, index);
+        loop {
+            let docs = db.map_docs_page(None, &mut cursor, CHANGES_PAGE).await?;
+            if docs.is_empty() {
+                break;
+            }
+            let map = map.clone();
+            // Between pages, so a deleted database is noticed.
+            (gate, index, rows) = blocking(move || {
                 gate.check()?;
-                rows.extend(run_map_json(&map, batch, limits).map_err(|reason| {
+                rows.extend(run_map_json(&map, &docs, limits).map_err(|reason| {
                     ApiError::new(500, "view_error", format!("map function failed: {reason}"))
                 })?);
-            }
+                Ok((gate, index, rows))
+            })
+            .await?;
+        }
+        return blocking(move || {
             gate.check()?;
             index
                 .rebuild(rows, bound, &design)
@@ -2904,13 +2972,18 @@ fn reduce_with(
     // Do the same for custom JavaScript reducers.
     const CHUNK: usize = REDUCE_CHUNK;
     if values.len() > CHUNK {
-        let mut partials = Vec::new();
-        for (offset, chunk) in values.chunks(CHUNK).enumerate() {
+        // The chunks go in as one batch, not a round trip each.
+        let calls = values.chunks(CHUNK).enumerate().map(|(offset, chunk)| {
             let start = offset * CHUNK;
             let end = (start + chunk.len()).min(keys.len());
             let chunk_keys = if start < end { &keys[start..end] } else { &[] };
-            partials.push(reducer.call(chunk_keys, chunk, false)?);
-        }
+            ReduceCall {
+                keys: chunk_keys.to_vec(),
+                values: chunk.to_vec(),
+                rereduce: false,
+            }
+        });
+        let partials = reducer.call_many(calls)?;
         return reducer.call(&[], &partials, true);
     }
     reducer.call(keys, values, false)
