@@ -3210,6 +3210,61 @@ async fn database_names_follow_the_couchdb_rule() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// `couch_db:is_system_db_name` accepts a system database name behind a prefix
+/// that itself matches the name regex, so `foo/_users` is legal (the regex
+/// alone already admits it) and so is `ts.1234567890/_users`, which only the
+/// system-name rule admits because the timestamp is not allowed mid-name. A
+/// prefix that fails the regex, or a suffix that is not a system database and
+/// fails the regex, stays illegal.
+#[tokio::test]
+async fn prefixed_system_database_names_are_legal() {
+    let s = Server::start(false);
+    for path in [
+        "/foo%2F_users",
+        "/foo%2F_replicator",
+        "/foo%2F_global_changes",
+        "/foo%2Fbar%2F_users",
+        "/foo%2F_users.couch",
+        "/ts.1234567890%2F_users",
+        "/ts.1234567890%2F_replicator",
+        "/ts2.1234567890%2Fbar%2F_users",
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, body) = s.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    // A prefixed `_users` is a plain database: no admin-only rule applies.
+    let (status, body) = s.put("/foo%2F_users/doc", json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for (path, name) in [
+        ("/Foo%2F_users", "Foo/_users"),
+        ("/1foo%2F_users", "1foo/_users"),
+        ("/foo%2F_bar", "foo/_bar"),
+        ("/foo.couch%2F_users", "foo.couch/_users"),
+        ("/%2F_users", "/_users"),
+        ("/foo%2F_other", "foo/_other"),
+    ] {
+        let (status, body) = s.put(path, json!({})).await;
+        // `foo/_bar` and `foo/_other` match the plain name regex.
+        if name.starts_with("foo/_") {
+            assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{path}: {body}");
+        assert_eq!(
+            body["reason"],
+            format!(
+                "Name: '{name}'. Only lowercase characters (a-z), digits (0-9), and any of the \
+                 characters _, $, (, ), +, -, and / are allowed. Must begin with a letter."
+            ),
+            "{path}: {body}"
+        );
+    }
+}
+
 /// CouchDB's `validate_dbname` drops one trailing `.couch` before applying the
 /// regex, which also allows a `.` plus ten or more digits at the end (the
 /// shard timestamp). `fabric_db_create` runs the same check, so the clustered
