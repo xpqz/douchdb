@@ -2274,7 +2274,7 @@ impl Db {
         out
     }
 
-    pub async fn revs_diff(&self, body: &Value) -> DbResult<Value> {
+    pub async fn revs_diff(&self, body: &Value) -> DbResult<RevsDiff> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
@@ -2317,20 +2317,22 @@ impl Db {
                 found[slot] = Some(diff);
             }
         }
-        let mut out = Map::new();
+        let mut out = Vec::new();
         for (id, diff) in ids.into_iter().zip(found) {
-            let Some((missing, ancestors)) = diff else {
+            let Some((missing, possible_ancestors)) = diff else {
                 continue;
             };
             if !missing.is_empty() {
-                let mut entry = json!({ "missing": missing });
-                if !ancestors.is_empty() {
-                    entry["possible_ancestors"] = json!(ancestors);
-                }
-                out.insert(id.clone(), entry);
+                out.push((
+                    id.clone(),
+                    RevsDiffEntry {
+                        missing,
+                        possible_ancestors,
+                    },
+                ));
             }
         }
-        Ok(Value::Object(out))
+        Ok(RevsDiff(out))
     }
 
     pub async fn bulk_get(
@@ -3825,6 +3827,29 @@ impl ChangeFilter {
 pub(crate) enum ChangesItem {
     Row(ChangeRow),
     Scanned(u64),
+}
+
+/// The `_revs_diff` answer: the documents that miss revisions, in the order
+/// they were asked for, serialized as one JSON object keyed by document id.
+#[derive(Debug, Default)]
+pub struct RevsDiff(pub Vec<(String, RevsDiffEntry)>);
+
+#[derive(Debug, serde::Serialize)]
+pub struct RevsDiffEntry {
+    pub missing: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_ancestors: Vec<String>,
+}
+
+impl serde::Serialize for RevsDiff {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (id, entry) in &self.0 {
+            map.serialize_entry(id, entry)?;
+        }
+        map.end()
+    }
 }
 
 /// The body of `GET /{db}`. Fields serialize in CouchDB's order.
@@ -6074,6 +6099,45 @@ mod tests {
         }
     }
 
+    /// `_revs_diff` answers in request order, leaves `possible_ancestors` out
+    /// when there are none, and omits documents that miss nothing.
+    #[tokio::test]
+    async fn revs_diff_serializes_in_request_order() {
+        let q = 2u32;
+        let root = std::env::temp_dir().join(format!("douchdb-revs-wire-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "revswire",
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let written = db
+            .put_docs(vec![json!({"_id": "known"}), json!({"_id": "same"})], true)
+            .await
+            .unwrap();
+        let rev = written[0]["rev"].as_str().unwrap().to_string();
+        let same_rev = written[1]["rev"].as_str().unwrap().to_string();
+        let body: Value = serde_json::from_str(&format!(
+            r#"{{"zed":["1-aaaa"],"known":["{rev}","2-ffff"],"same":["{same_rev}"],"not-a-list":"x","alpha":["1-bbbb","1-cccc"]}}"#
+        ))
+        .unwrap();
+        let diff = db.revs_diff(&body).await.unwrap();
+        let text = serde_json::to_string(&serde_json::to_value(&diff).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"zed":{{"missing":["1-aaaa"]}},"known":{{"missing":["2-ffff"],"possible_ancestors":["{rev}"]}},"alpha":{{"missing":["1-bbbb","1-cccc"]}}}}"#
+            )
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Requests that touch many documents fan out one call per shard; the
     /// answers must still come back per document, in the order asked.
     #[tokio::test]
@@ -6119,12 +6183,12 @@ mod tests {
             diff.insert(id.clone(), json!([rev, "2-ffff"]));
         }
         let diff = db.revs_diff(&Value::Object(diff)).await.unwrap();
-        let rows = diff.as_object().unwrap();
-        assert_eq!(rows.len(), 12);
+        assert_eq!(diff.0.len(), 12);
         for (position, id) in ids.iter().enumerate() {
-            assert_eq!(rows[id]["missing"], json!(["2-ffff"]));
+            let entry = &diff.0.iter().find(|(row, _)| row == id).unwrap().1;
+            assert_eq!(entry.missing, ["2-ffff"]);
             assert_eq!(
-                rows[id]["possible_ancestors"],
+                json!(entry.possible_ancestors),
                 json!([written[position]["rev"]])
             );
         }

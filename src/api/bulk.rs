@@ -438,7 +438,7 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
     };
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         return match db.revs_diff(&value).await {
-            Ok(v) => json(StatusCode::OK, v),
+            Ok(diff) => json_of(StatusCode::OK, &diff),
             Err(e) => fail(e),
         };
     }
@@ -469,7 +469,10 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
             );
             async move {
                 let result = if node == st.ctx.cluster.me {
-                    db.revs_diff(&sub).await
+                    match db.revs_diff(&sub).await {
+                        Ok(diff) => serde_json::to_value(&diff).map_err(ApiError::internal),
+                        Err(error) => Err(error),
+                    }
                 } else {
                     let peer = st.ctx.cluster.nodes[node].clone();
                     forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers).await
