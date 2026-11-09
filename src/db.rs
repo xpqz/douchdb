@@ -5051,6 +5051,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `_bulk_get` answers one entry per request in request order: the
+    /// document under `ok`, or the error with the revision that was asked for.
+    #[tokio::test]
+    async fn bulk_get_serializes_in_wire_order() {
+        let (db, root) = single_shard_db("bulk-get-wire").await;
+        let written = db.put_docs(vec![json!({"_id": "a", "n": 1})], true).await.unwrap();
+        let rev = written[0]["rev"].as_str().unwrap().to_string();
+        let body = json!({"docs": [
+            {"id": "a", "rev": rev},
+            {"id": "nope"},
+            {"id": "a", "rev": "1-00000000000000000000000000000000"},
+            {"id": "a", "rev": "garbage"},
+        ]});
+        let got = db.bulk_get(&body, false, false, false).await.unwrap();
+        let text = serde_json::to_string(&serde_json::to_value(&got).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"results":[{{"id":"a","docs":[{{"ok":{{"_id":"a","_rev":"{rev}","n":1}}}}]}},{{"id":"nope","docs":[{{"error":{{"id":"nope","rev":"undefined","error":"not_found","reason":"missing"}}}}]}},{{"id":"a","docs":[{{"error":{{"id":"a","rev":"1-00000000000000000000000000000000","error":"not_found","reason":"missing"}}}}]}},{{"id":"a","docs":[{{"error":{{"id":"a","rev":"garbage","error":"not_found","reason":"missing"}}}}]}}]}}"#
+            )
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
