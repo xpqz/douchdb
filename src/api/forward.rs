@@ -109,8 +109,8 @@ pub(crate) async fn quorum_read(
     // be the correct global winner, so top-level winners alone are not enough.
     let requested_rev = q.get("rev").cloned();
     let open_all = requested_rev.is_none();
-    let (reachable, docs) = replica_docs(ctx, db, dbname, docid, q, headers, open_all).await;
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
+    let (reachable, docs) = replica_docs(ctx, db, dbname, docid, q, headers, open_all, r).await;
     if let Some(error) = read_quorum_failure(reachable, r, q) {
         return fail(error);
     }
@@ -195,8 +195,8 @@ pub(crate) async fn quorum_reachable(
     headers: &HeaderMap,
     r: usize,
 ) -> Option<Response> {
-    let (reachable, _) = replica_docs(ctx, db, dbname, docid, q, headers, false).await;
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
+    let (reachable, _) = replica_docs(ctx, db, dbname, docid, q, headers, false, r).await;
     read_quorum_failure(reachable, r, q).map(fail)
 }
 
