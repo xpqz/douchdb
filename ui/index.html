@@ -1235,9 +1235,13 @@
       <div v-if="toast" class="toast" :class="toastKind" data-testid="toast">{{ toast }}</div>
     </div>
 
-    <script src="vendor/vue.global.prod.js"></script>
+    <!-- Source of the code editor's template; compiled into render.js. -->
+    <template id="tpl-code-editor"><div class="code-editor" ref="host"></div></template>
+
+    <script src="vendor/vue.runtime.global.prod.js"></script>
     <script src="vendor/codemirror/codemirror.js"></script>
     <script src="vendor/codemirror/mode/javascript/javascript.js"></script>
+    <script src="render.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

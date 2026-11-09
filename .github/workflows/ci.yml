@@ -105,6 +105,12 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: clients/pouchdb/package-lock.json
+      - name: Console templates are precompiled
+        run: |
+          cd ui/build
+          npm ci
+          node compile.mjs
+          git diff --exit-code -- ../render.js
       - name: Build douchdb image
         run: docker build -t douchdb:clients .
       - name: Start douchdb
