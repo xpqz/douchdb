@@ -30,3 +30,6 @@ __pycache__/
 
 # Local compose secrets
 /.env
+
+# Console template compiler install
+/ui/build/node_modules/

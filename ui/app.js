@@ -45,6 +45,7 @@
   }
 
   const App = {
+    render: window.consoleRender.app,
     setup() {
       const baseUrl = ref(localStorage.getItem('douchdb.ui.base') || defaultBase());
       const databases = ref([]);
@@ -1562,7 +1563,7 @@
   const CodeEditor = {
     props: { modelValue: { type: String, default: '' } },
     emits: ['update:modelValue'],
-    template: '<div class="code-editor" ref="host"></div>',
+    render: window.consoleRender.codeEditor,
     mounted() {
       this.cm = CodeMirror(this.$refs.host, {
         value: this.modelValue || '',

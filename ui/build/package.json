@@ -1,0 +1,9 @@
+{
+  "name": "douchdb-console-build",
+  "private": true,
+  "description": "Precompiles the console templates (ui/index.html) into ui/render.js. The compiler version must equal the vendored Vue runtime version.",
+  "type": "module",
+  "dependencies": {
+    "@vue/compiler-dom": "3.5.44"
+  }
+}

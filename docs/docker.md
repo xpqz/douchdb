@@ -133,8 +133,8 @@ sparklines, route/database/replication/fabric tables, health checks and
 per-node state. The JSON is available directly (admin credentials required):
 
 ```sh
-curl -u admin:secret 'http://localhost:8080/_node/_local/_metrics?cluster=true'
-curl -u admin:secret 'http://localhost:8080/_node/_local/_health?cluster=true'
+curl -u "$DOUCHDB_ADMIN" 'http://localhost:8080/_node/_local/_metrics?cluster=true'
+curl -u "$DOUCHDB_ADMIN" 'http://localhost:8080/_node/_local/_health?cluster=true'
 curl 'http://localhost:8080/_health'
 ```
 

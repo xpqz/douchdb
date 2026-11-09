@@ -179,6 +179,29 @@ fn hold_for_body(permit: crate::admission::Permit, response: Response) -> Respon
     Response::from_parts(parts, Body::from_stream(held))
 }
 
+/// CouchDB's `couch_httpd:maybe_add_default_headers/2` (couch_httpd.erl 3.5.0)
+/// gives every JSON response `Cache-Control: must-revalidate`, error bodies and
+/// feeds included, unless the handler set its own. Runs inside `cors`, so the
+/// header also lands in `Access-Control-Expose-Headers` as it does in CouchDB.
+pub async fn json_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if is_json {
+        response
+            .headers_mut()
+            .entry(header::CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static("must-revalidate"));
+    }
+    response
+}
+
 /// Opt-in CORS, matching CouchDB's `[cors]` configuration and its
 /// `chttpd_cors` module (apache/couchdb src/chttpd/src/chttpd_cors.erl). The
 /// embedded console is served from the same origin and needs none of this; it
@@ -275,10 +298,9 @@ const CORS_DEFAULT_HEADERS: &[&str] = &[
 ];
 
 /// CouchDB's `?SUPPORTED_METHODS`, the default of `[cors] methods`.
-const CORS_METHODS: &str = "CONNECT, COPY, DELETE, GET, HEAD, OPTIONS, POST, PUT, TRACE";
-
-/// CouchDB's `?CORS_DEFAULT_MAX_AGE`.
-const CORS_MAX_AGE: &str = "600";
+const CORS_METHODS: &[&str] = &[
+    "CONNECT", "COPY", "DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT", "TRACE",
+];
 
 /// CouchDB's `?SIMPLE_HEADERS` other than `content-type`, which is always
 /// listed: response headers worth naming in `Access-Control-Expose-Headers`.
@@ -290,9 +312,15 @@ const CORS_SIMPLE_HEADERS: &[&str] = &[
     "pragma",
 ];
 
-/// CouchDB's `?COUCH_HEADERS`, always exposed.
-const CORS_COUCH_HEADERS: &str =
-    "accept-ranges, etag, server, x-couch-request-id, x-couch-update-newrev, x-couchdb-body-time";
+/// CouchDB's `?COUCH_HEADERS`, the default of `[cors] exposed_headers`.
+const CORS_COUCH_HEADERS: &[&str] = &[
+    "accept-ranges",
+    "etag",
+    "server",
+    "x-couch-request-id",
+    "x-couch-update-newrev",
+    "x-couchdb-body-time",
+];
 
 /// Whether a preflight may ask for this (lowercase) header: CouchDB's list, or
 /// exactly `--cors-headers` when set (`[cors] headers` replaces the default).
@@ -313,10 +341,12 @@ fn preflight_response(config: &Config, headers: &HeaderMap) -> Option<Response> 
         .get(header::ACCESS_CONTROL_REQUEST_METHOD)?
         .to_str()
         .ok()?;
-    if !CORS_METHODS
-        .split(", ")
-        .any(|supported| supported == method)
-    {
+    let methods: Vec<&str> = if config.cors_methods.is_empty() {
+        CORS_METHODS.to_vec()
+    } else {
+        config.cors_methods.iter().map(String::as_str).collect()
+    };
+    if !methods.contains(&method) {
         return None;
     }
     let requested = match headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
@@ -336,8 +366,16 @@ fn preflight_response(config: &Config, headers: &HeaderMap) -> Option<Response> 
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     let out = response.headers_mut();
-    put_cors_header(out, header::ACCESS_CONTROL_MAX_AGE, CORS_MAX_AGE);
-    put_cors_header(out, header::ACCESS_CONTROL_ALLOW_METHODS, CORS_METHODS);
+    put_cors_header(
+        out,
+        header::ACCESS_CONTROL_MAX_AGE,
+        &config.cors_max_age.to_string(),
+    );
+    put_cors_header(
+        out,
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        &methods.join(", "),
+    );
     put_cors_header(out, header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
     Some(response)
 }
@@ -360,7 +398,11 @@ fn add_cors_headers(headers: &mut HeaderMap, config: &Config, origin: &str) {
             exposed.push(name);
         }
     }
-    exposed.push(CORS_COUCH_HEADERS.to_string());
+    if config.cors_exposed_headers.is_empty() {
+        exposed.extend(CORS_COUCH_HEADERS.iter().map(|name| name.to_string()));
+    } else {
+        exposed.extend(config.cors_exposed_headers.iter().cloned());
+    }
     put_cors_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     if config.cors_credentials && origin != "*" {
         put_cors_header(headers, header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");

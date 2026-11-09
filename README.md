@@ -438,7 +438,8 @@ douchdb with `--cors-origins` for that origin (see below).
 
 ```
 douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
-        [--admin user:pass] [--users-file FILE] [--session-secret SECRET]
+        [--admin user:pass]         (or DOUCHDB_ADMIN)
+        [--users-file FILE] [--session-secret SECRET]
         [--default-security open|admin-only]
         [--max-in-flight N] [--per-user-in-flight N] [--per-user-rate N]
         [--heavy-in-flight N] [--heavy-per-user N] [--background-in-flight N]
@@ -449,6 +450,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--js-workers N]
         [--cluster-secret SECRET] [--cors-origins ORIGIN,ORIGIN]
         [--cors-credentials] [--cors-headers HEADER,HEADER]
+        [--cors-methods METHOD,METHOD] [--cors-exposed-headers HEADER,HEADER]
+        [--cors-max-age SECS]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
         [--max-open-indexes N] [--max-open-dbs N]
         [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]
@@ -487,6 +490,9 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
 | `--cors-origins` | empty | Allowed browser origins; empty disables CORS |
 | `--cors-credentials` | off | Send `Access-Control-Allow-Credentials: true`, so cross-origin pages may use cookies and `Authorization` (CouchDB `[cors] credentials`, default false) |
 | `--cors-headers` | empty | Request headers a preflight may ask for; replaces CouchDB's default list (CouchDB `[cors] headers`) |
+| `--cors-methods` | CouchDB's list | Methods a preflight may ask for and `Access-Control-Allow-Methods` lists; replaces CouchDB's default list (CouchDB `[cors] methods`, matched case-sensitively) |
+| `--cors-exposed-headers` | CouchDB's list | Response headers named in `Access-Control-Expose-Headers` after `content-type` and the simple headers present; replaces CouchDB's list (CouchDB `[cors] exposed_headers`) |
+| `--cors-max-age` | 600 | `Access-Control-Max-Age` seconds on a preflight (CouchDB `[cors] max_age`) |
 | `--view-timeout-ms` | `5000` | Wall-clock limit for one view query. Matches CouchDB's `[couchdb] os_process_timeout` (5000 ms). Slow or heavily loaded hosts may need a larger value |
 | `--view-memory-mb` | `64` | QuickJS heap limit for native/process modes; wasm uses a 128 MiB linear-memory cap |
 | `--max-request-mb` | `64` | Maximum HTTP request body |
@@ -524,7 +530,13 @@ preflight whose method and requested headers are supported gets `204` with
 headers echoed back. The supported request headers are CouchDB's default list
 (`Accept`, `Authorization`, `Content-Type`, `Origin` and so on), or exactly
 the headers given in `--cors-headers` (CouchDB `[cors] headers` replaces the
-default list). Anything else, including a header outside that list, is not
+default list). `--cors-methods` likewise replaces the supported (and
+advertised) method list, `--cors-exposed-headers` replaces the response headers
+CouchDB always exposes (`accept-ranges`, `etag`, `server`, `x-couch-request-id`
+and so on) and `--cors-max-age` replaces the 600 s default. Per-host
+`[cors:host]` sections have no equivalent: the options are global. JSON
+responses carry `Cache-Control: must-revalidate` as in CouchDB, so it is named
+in `Access-Control-Expose-Headers`. Anything else, including a header outside that list, is not
 treated as a preflight: it gets no preflight headers and is handled as a
 plain `OPTIONS` request, so the browser rejects it. Wildcards match
 subdomains (`https://*.example.com`, a douchdb extension), and ports must
@@ -604,13 +616,15 @@ so a client cannot make a request look like a peer's. It is required (at least
 BIN=./target/release/douchdb
 NODES=http://127.0.0.1:5984,http://127.0.0.1:5985,http://127.0.0.1:5986
 
-SECRET=change-me-cluster-secret
+# Environment variables keep the credentials out of the process list.
+export DOUCHDB_ADMIN=admin:$(openssl rand -hex 16)
+SECRET=$(openssl rand -hex 16)
 $BIN --listen 127.0.0.1:5984 --data /tmp/n1 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 0
+  --cluster-secret $SECRET --nodes $NODES --me 0
 $BIN --listen 127.0.0.1:5985 --data /tmp/n2 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 1
+  --cluster-secret $SECRET --nodes $NODES --me 1
 $BIN --listen 127.0.0.1:5986 --data /tmp/n3 --q 4 --n 3 \
-  --admin admin:secret --cluster-secret $SECRET --nodes $NODES --me 2
+  --cluster-secret $SECRET --nodes $NODES --me 2
 ```
 
 Clients can talk to any node. Create the database through any node (it is
