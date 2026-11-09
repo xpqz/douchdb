@@ -173,6 +173,7 @@ async fn local_metrics(st: &AppState) -> Value {
                     "pending_shard_map": placed.pending_shard_map,
                     "local_shards": local_shards,
                     "disk_bytes": bytes,
+                    "shard_jobs": placed.open.as_ref().map(|db| db.shard_jobs()),
                     "shards": shards,
                 }));
             }

@@ -1572,6 +1572,9 @@ pub struct ShardHandle {
     seq_tracker: Arc<AtomicU64>,
     /// Highest sequence allocated for a write on this shard, committed or not.
     reserved_seq: Arc<AtomicU64>,
+    /// Jobs submitted to this shard's actor since it opened. Each one is a
+    /// cross-thread hop, so the count is the shard round-trip cost of a request.
+    jobs: AtomicU64,
 }
 
 impl ShardHandle {
@@ -1640,7 +1643,13 @@ impl ShardHandle {
             initial_seq,
             seq_tracker,
             reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
+            jobs: AtomicU64::new(0),
         })
+    }
+
+    /// Jobs submitted to this shard's actor so far.
+    pub fn jobs(&self) -> u64 {
+        self.jobs.load(Ordering::Relaxed)
     }
 
     /// Sequence number this shard had when it was opened.
@@ -1664,6 +1673,7 @@ impl ShardHandle {
         R: Send + 'static,
         F: FnOnce(&mut Shard) -> std::result::Result<R, ApiError> + Send + 'static,
     {
+        self.jobs.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         let seq_tracker = self.seq_tracker.clone();
         let reserved_seq = self.reserved_seq.clone();
