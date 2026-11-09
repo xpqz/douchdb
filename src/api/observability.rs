@@ -176,6 +176,7 @@ async fn local_metrics(st: &AppState) -> Value {
                     "shard_jobs": placed.open.as_ref().map(|db| db.shard_jobs()),
                     "shard_scanned": placed.open.as_ref().map(|db| db.shard_scanned()),
                     "shard_body_reads": placed.open.as_ref().map(|db| db.shard_body_reads()),
+                    "view_rows_visited": placed.open.as_ref().map(|db| db.view_rows_visited()),
                     "shards": shards,
                 }));
             }

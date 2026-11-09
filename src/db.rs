@@ -455,6 +455,18 @@ pub struct Db {
     design_epoch: AtomicU64,
     /// Set when the database is deleted; see `mark_deleted`.
     deleted: AtomicBool,
+    /// Index rows view queries have looked at since the database opened.
+    view_rows_visited: Arc<AtomicU64>,
+}
+
+/// Documents `map_docs` reads at a time.
+const MAP_DOCS_PAGE: usize = 1000;
+
+/// Where a paged `map_docs_page` read has got to.
+#[derive(Default)]
+pub struct MapCursor {
+    shard: usize,
+    after: Option<String>,
 }
 
 #[derive(Clone)]
@@ -616,6 +628,7 @@ impl Db {
             design_docs: std::sync::Mutex::new(HashMap::new()),
             design_epoch: AtomicU64::new(0),
             deleted: AtomicBool::new(false),
+            view_rows_visited: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1237,6 +1250,16 @@ impl Db {
     /// it opened: the work a request did, whatever the time it took.
     pub fn shard_scanned(&self) -> u64 {
         self.shards.iter().map(ShardHandle::scanned).sum()
+    }
+
+    /// View index rows this database's queries have looked at since it opened:
+    /// the work a view query did, whatever the time it took.
+    pub fn view_rows_visited(&self) -> u64 {
+        self.view_rows_visited.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn view_rows_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.view_rows_visited)
     }
 
     /// Document bodies this database's shards have read from storage since it
@@ -1963,18 +1986,50 @@ impl Db {
     /// shards so replicas do not pay to index documents they never serve.
     pub async fn map_docs(&self, owned: Option<&ShardMask>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
-        for index in self.selected_shards(owned) {
-            let mut shard_docs = self.shards[index]
-                .call(|s| {
+        let mut cursor = MapCursor::default();
+        loop {
+            let mut page = self
+                .map_docs_page(owned, &mut cursor, MAP_DOCS_PAGE)
+                .await?;
+            if page.is_empty() {
+                return Ok(docs);
+            }
+            docs.append(&mut page);
+        }
+    }
+
+    /// The next at most `limit` documents `map_docs` would return, in shard
+    /// and id order, and none once they are all read. A caller that maps each
+    /// page before asking for the next holds one page of bodies, not every
+    /// body in the database.
+    pub async fn map_docs_page(
+        &self,
+        owned: Option<&ShardMask>,
+        cursor: &mut MapCursor,
+        limit: usize,
+    ) -> DbResult<Vec<(String, String)>> {
+        let shards = self.selected_shards(owned);
+        while let Some(&index) = shards.get(cursor.shard) {
+            let after = cursor.after.take();
+            let (docs, last) = self.shards[index]
+                .call(move |s| {
                     // Build (or reuse) the live map, then read only bodies.
                     // This avoids decoding every full DocMeta record again for
                     // each cold view build.
+                    let from = match &after {
+                        Some(after) => std::ops::Bound::Excluded(after.clone()),
+                        None => std::ops::Bound::Unbounded,
+                    };
                     let metas: Vec<(String, String)> = s
                         .live_docs()?
-                        .iter()
+                        .range((from, std::ops::Bound::Unbounded))
                         .filter(|(id, _)| !id.starts_with("_design/") && !id.starts_with("_local/"))
+                        .take(limit)
                         .map(|(id, doc)| (id.clone(), doc.rev.clone()))
                         .collect();
+                    let last = (metas.len() == limit)
+                        .then(|| metas.last().map(|(id, _)| id.clone()))
+                        .flatten();
 
                     let mut docs = Vec::with_capacity(metas.len());
                     for (id, rev) in metas {
@@ -2007,12 +2062,18 @@ impl Db {
                             ));
                         }
                     }
-                    Ok(docs)
+                    Ok((docs, last))
                 })
                 .await?;
-            docs.append(&mut shard_docs);
+            match last {
+                Some(last) => cursor.after = Some(last),
+                None => cursor.shard += 1,
+            }
+            if !docs.is_empty() {
+                return Ok(docs);
+            }
         }
-        Ok(docs)
+        Ok(Vec::new())
     }
 
     /// The `total_rows` of a `keys` query.
@@ -6863,6 +6924,39 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// A view build reads its documents a page at a time: no page holds more
+    /// than the limit, however many documents the shards hold, and the pages
+    /// together are exactly what `map_docs` returns.
+    #[tokio::test]
+    async fn map_docs_pages_are_bounded_and_cover_every_document() {
+        let root = std::env::temp_dir().join(format!("douchdb-mappage-{}", crate::util::uuid()));
+        let db = scan_db(&root, "mappage", 3, false);
+        let mut docs: Vec<Value> = (0..250).map(|i| json!({"_id": format!("d{i}")})).collect();
+        docs.push(json!({"_id": "_design/skipped"}));
+        db.put_docs(docs, true).await.unwrap();
+
+        let mut cursor = MapCursor::default();
+        let mut sizes = Vec::new();
+        let mut paged = Vec::new();
+        loop {
+            let page = db.map_docs_page(None, &mut cursor, 40).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            sizes.push(page.len());
+            paged.extend(page);
+        }
+        assert!(sizes.iter().all(|&size| size <= 40), "{sizes:?}");
+        assert!(sizes.len() >= 250 / 40, "{sizes:?}");
+        let mut all = db.map_docs(None).await.unwrap();
+        paged.sort();
+        all.sort();
+        assert_eq!(paged.len(), 250);
+        assert_eq!(paged, all);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn descending_design_changes(limit: Option<usize>) -> ChangesOpts {

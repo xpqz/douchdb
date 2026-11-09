@@ -55,8 +55,8 @@ MUTATIONS = [
     (
         "reduce query ignores skip",
         "src/view.rs",
-        "    for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {",
-        "    for (key, mut values) in groups.into_iter().take(query.limit) {",
+        "        .into_iter()\n        .skip(query.skip)\n        .take(query.limit)\n        .collect();",
+        "        .into_iter()\n        .take(query.limit)\n        .collect();",
         ["cargo", "test", "--locked", "--test", "conformance", "views_map_reduce_collation_and_query_options"],
     ),
     (

@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -96,24 +97,69 @@ struct ViewIndex {
     db: Ldb,
     last_seq: u64,
     design: String,
-    /// Shard count and partitioning of the database, used to split the cached
-    /// rows by shard.
-    placement: (u32, bool),
+    /// Shard count and partitioning of the database and view, used to split
+    /// the cached rows.
+    placement: Placement,
     /// Sorted rows for the current index state. Warm queries reuse this
     /// instead of scanning and parsing every stored row on each request.
     cached: Option<Arc<ViewRows>>,
 }
 
-/// A view's sorted rows, split by the shard of each row's document. A query
-/// reads only the shards it is asked for, finds its key range by binary
+/// How a view's rows are split.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    q: u32,
+    /// The database is partitioned: its documents are placed by partition.
+    partitioned: bool,
+    /// The view is queried through `_partition`, so its rows are kept in one
+    /// run per partition rather than one per shard.
+    by_partition: bool,
+}
+
+impl Placement {
+    fn shards(q: u32, partitioned: bool) -> Placement {
+        Placement {
+            q,
+            partitioned,
+            by_partition: false,
+        }
+    }
+
+    fn shard_of(&self, id: &str) -> usize {
+        crate::db::shard_index_for(id, self.q, self.partitioned)
+    }
+}
+
+/// A view's sorted rows, split into runs: one per shard, or one per partition
+/// for a partitioned view, which is only queried through a partition. A query
+/// reads only the runs it is asked for, finds its key range by binary
 /// search, and copies only the rows it can return, so its cost follows the
-/// result rather than the size of the index.
+/// result rather than the size of the index. A partition's run is its own
+/// sorted run, so a partition query never walks the other partitions that
+/// share its shard.
 #[derive(Default)]
 pub struct ViewRows {
     shards: Vec<ShardRows>,
-    /// Per shard, partial reductions for one reducer: built by the first
+    /// Per run, partial reductions for one reducer: built by the first
     /// reduce that needs them and kept up to date across writes.
     blocks: Vec<StdMutex<Option<BlockTree>>>,
+    /// For a partitioned view, which run belongs to which partition and shard.
+    partitions: Option<Partitions>,
+}
+
+#[derive(Clone, Default)]
+struct Partitions {
+    by_name: HashMap<String, usize>,
+    shard_of: Vec<usize>,
+}
+
+/// The name a row's partition run is known by. A document outside any
+/// partition gets a name no partition can have, since those start with `_`.
+fn run_name(id: &str) -> String {
+    match crate::db::partition_of(id) {
+        Some((partition, _)) => partition.to_string(),
+        None => format!("_{id}"),
+    }
 }
 
 /// Rows per storage block of a shard. A write copies only the blocks it
@@ -607,6 +653,7 @@ impl Clone for ViewRows {
     fn clone(&self) -> Self {
         ViewRows {
             shards: self.shards.clone(),
+            partitions: self.partitions.clone(),
             blocks: self
                 .blocks
                 .iter()
@@ -629,47 +676,100 @@ pub struct Selection {
 }
 
 impl ViewRows {
-    fn from_rows(rows: Vec<Row>, (q, partitioned): (u32, bool)) -> ViewRows {
-        let mut shards = vec![Vec::new(); q.max(1) as usize];
-        for row in rows {
-            let shard = crate::db::shard_index_for(&row.id, q, partitioned);
-            shards[shard].push(row);
+    fn from_rows(rows: Vec<Row>, placement: Placement) -> ViewRows {
+        let mut view = ViewRows::default();
+        if placement.by_partition {
+            view.partitions = Some(Partitions::default());
+        } else {
+            view.shards = vec![ShardRows::default(); placement.q.max(1) as usize];
+            view.blocks = view.shards.iter().map(|_| StdMutex::new(None)).collect();
         }
-        let shards: Vec<ShardRows> = shards
-            .into_iter()
-            .map(|mut rows| {
-                sort_rows(&mut rows);
-                ShardRows::from_sorted(rows)
-            })
-            .collect();
-        let blocks = shards.iter().map(|_| StdMutex::new(None)).collect();
-        ViewRows { shards, blocks }
+        let mut runs: Vec<Vec<Row>> = vec![Vec::new(); view.shards.len()];
+        for row in rows {
+            let run = view.run_for(&row.id, placement);
+            if run == runs.len() {
+                runs.push(Vec::new());
+            }
+            runs[run].push(row);
+        }
+        for (run, mut rows) in runs.into_iter().enumerate() {
+            sort_rows(&mut rows);
+            view.shards[run] = ShardRows::from_sorted(rows);
+        }
+        view
+    }
+
+    /// The run holding the rows of document `id`, started if it is new.
+    fn run_for(&mut self, id: &str, placement: Placement) -> usize {
+        let Some(partitions) = &mut self.partitions else {
+            return placement.shard_of(id);
+        };
+        match partitions.by_name.entry(run_name(id)) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let run = self.shards.len();
+                entry.insert(run);
+                partitions.shard_of.push(placement.shard_of(id));
+                self.shards.push(ShardRows::default());
+                self.blocks.push(StdMutex::new(None));
+                run
+            }
+        }
+    }
+
+    /// The run of document `id`, if it has one.
+    fn existing_run(&self, id: &str, placement: Placement) -> Option<usize> {
+        match &self.partitions {
+            Some(partitions) => partitions.by_name.get(&run_name(id)).copied(),
+            None => Some(placement.shard_of(id)),
+        }
+    }
+
+    /// The shard a run's rows belong to.
+    fn shard_of_run(&self, run: usize) -> usize {
+        match &self.partitions {
+            Some(partitions) => partitions.shard_of.get(run).copied().unwrap_or(run),
+            None => run,
+        }
+    }
+
+    /// The runs a query reads, in the shards of `mask` (all when `None`): a
+    /// partition query on a partitioned view reads only that partition's run.
+    fn runs_for(&self, query: &ViewQuery, mask: Option<&crate::cluster::ShardMask>) -> Vec<usize> {
+        let runs: Vec<usize> = match (&query.partition, &self.partitions) {
+            (Some(partition), Some(partitions)) => partitions
+                .by_name
+                .get(partition)
+                .copied()
+                .into_iter()
+                .collect(),
+            _ => (0..self.shards.len()).collect(),
+        };
+        runs.into_iter()
+            .filter(|run| mask.is_none_or(|mask| mask.covers(self.shard_of_run(*run))))
+            .collect()
     }
 
     /// Replace the rows `removed` (each an id and key) of the documents
-    /// that changed with `added`, shard by shard. Only the blocks holding
+    /// that changed with `added`, run by run. Only the blocks holding
     /// those rows are changed.
-    fn replace_docs(
-        &mut self,
-        removed: &[(String, Value)],
-        added: Vec<Row>,
-        (q, partitioned): (u32, bool),
-    ) {
+    fn replace_docs(&mut self, removed: &[(String, Value)], added: Vec<Row>, placement: Placement) {
         type Touched<'a> = (Vec<(&'a str, &'a Value)>, Vec<Row>);
         let mut touched: HashMap<usize, Touched> = HashMap::new();
         for (id, key) in removed {
-            let shard = crate::db::shard_index_for(id, q, partitioned);
-            touched.entry(shard).or_default().0.push((id, key));
+            if let Some(run) = self.existing_run(id, placement) {
+                touched.entry(run).or_default().0.push((id, key));
+            }
         }
         for row in added {
-            let shard = crate::db::shard_index_for(&row.id, q, partitioned);
-            touched.entry(shard).or_default().1.push(row);
+            let run = self.run_for(&row.id, placement);
+            touched.entry(run).or_default().1.push(row);
         }
-        for (shard, (gone, mut rows)) in touched {
-            let positions = self.shards[shard].positions(&gone);
+        for (run, (gone, mut rows)) in touched {
+            let positions = self.shards[run].positions(&gone);
             sort_rows(&mut rows);
-            let inserted = self.shards[shard].replace(&positions, rows);
-            if let Some(slot) = self.blocks.get_mut(shard) {
+            let inserted = self.shards[run].replace(&positions, rows);
+            if let Some(slot) = self.blocks.get_mut(run) {
                 let tree = slot.get_mut().unwrap_or_else(|poison| poison.into_inner());
                 if let Some(blocks) = tree.as_mut() {
                     if !blocks.apply_write(&positions, &inserted) {
@@ -680,66 +780,38 @@ impl ViewRows {
         }
     }
 
-    /// Reduce `query` over the shards in `mask` (all when `None`). Each range
-    /// or group reads the stored partials of the blocks it covers whole and
-    /// reduces only the rows at its edges.
+    /// Reduce `query` over the shards in `mask` (all when `None`), or over its
+    /// partition. Each range or group reads the stored partials of the blocks
+    /// it covers whole and reduces only the rows at its edges.
     pub(crate) fn reduce(
         &self,
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
+        visited: &AtomicU64,
     ) -> Result<Value, JsError> {
         let mut partials = Partials::new();
         let unique = query.keys.as_deref().map(unique_keys);
-        for (index, rows) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.covers(index)) {
-                continue;
-            }
-            let blocks = self.block_partials(index, reducer)?;
+        for index in self.runs_for(query, mask) {
+            let rows = &self.shards[index];
+            let blocks = self.block_partials(index, reducer, visited)?;
             reduce_ranges(
                 rows,
                 query,
                 unique.as_deref(),
                 &mut partials,
-                &mut |first, end| reduce_span(rows, &blocks, first, end, reducer),
+                &mut |ranges| reduce_spans(rows, &blocks, ranges, reducer, visited),
             )?;
         }
         assemble_reduce(partials, query, reducer)
     }
 
-    /// Reduce `query` over the rows of its partition. A partition shares its
-    /// shard with others, so there are no stored partials for it and its rows
-    /// are found by walking the shard; they are reduced where they lie.
-    pub(crate) fn reduce_partition(
+    fn block_partials(
         &self,
-        query: &ViewQuery,
-        partition: &str,
-        mask: Option<&crate::cluster::ShardMask>,
+        shard: usize,
         reducer: &mut JsReducer,
-    ) -> Result<Value, JsError> {
-        let mut partials = Partials::new();
-        let unique = query.keys.as_deref().map(unique_keys);
-        let prefix = format!("{partition}:");
-        for (index, shard) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.covers(index)) {
-                continue;
-            }
-            let rows: Vec<&Row> = shard
-                .range(0, shard.len())
-                .filter(|row| row.id.starts_with(&prefix))
-                .collect();
-            reduce_ranges(
-                rows.as_slice(),
-                query,
-                unique.as_deref(),
-                &mut partials,
-                &mut |first, end| reduce_rows(rows[first..end].iter().copied(), reducer),
-            )?;
-        }
-        assemble_reduce(partials, query, reducer)
-    }
-
-    fn block_partials(&self, shard: usize, reducer: &mut JsReducer) -> Result<Arc<Spans>, JsError> {
+        visited: &AtomicU64,
+    ) -> Result<Arc<Spans>, JsError> {
         let Some(slot) = self.blocks.get(shard) else {
             return Ok(Arc::default());
         };
@@ -752,6 +824,7 @@ impl ViewRows {
             }
             return Ok(Arc::clone(&tree.spans));
         }
+        visit(visited, rows.len());
         let tree = BlockTree::build(rows, reducer)?;
         let spans = Arc::clone(&tree.spans);
         *slot = Some(tree);
@@ -766,6 +839,7 @@ impl ViewRows {
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
         reduce: bool,
+        visited: &AtomicU64,
     ) -> Selection {
         let cap = if reduce {
             usize::MAX
@@ -777,24 +851,10 @@ impl ViewRows {
             total_rows: 0,
             offset: 0,
         };
-        for (index, shard) in self.shards.iter().enumerate() {
-            if mask.is_some_and(|mask| !mask.covers(index)) {
-                continue;
-            }
-            match &query.partition {
-                Some(partition) => {
-                    // A partition is one shard, but it shares it with other
-                    // partitions, so its rows are counted by walking it.
-                    let prefix = format!("{partition}:");
-                    let rows: Vec<&Row> = shard
-                        .range(0, shard.len())
-                        .filter(|row| row.id.starts_with(&prefix))
-                        .collect();
-                    select_sorted(rows.as_slice(), query, cap, &mut out);
-                }
-                None => select_sorted(shard, query, cap, &mut out),
-            }
+        for index in self.runs_for(query, mask) {
+            select_sorted(&self.shards[index], query, cap, &mut out);
         }
+        visit(visited, out.rows.len());
         // Rows from one document share a shard, so a stable sort keeps the
         // emission order of equal rows.
         out.rows.sort_by(row_cmp);
@@ -889,6 +949,11 @@ fn select_sorted<S: SortedRows + ?Sized>(
         .extend(chosen.into_iter().map(|index| rows.row(index).clone()));
 }
 
+/// Count `rows` index rows a query looked at.
+fn visit(visited: &AtomicU64, rows: usize) {
+    visited.fetch_add(rows as u64, AtomicOrdering::Relaxed);
+}
+
 /// The index range of sorted `rows` inside the query's start and end bounds.
 fn range_bounds<S: SortedRows + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, usize) {
     let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(pred);
@@ -916,38 +981,57 @@ fn equal_range<S: SortedRows + ?Sized>(rows: &S, key: &Value) -> (usize, usize) 
     )
 }
 
+/// Reduces row ranges, `first..end` each, to one value apiece.
+type SpanReducer<'a> = dyn FnMut(&[(usize, usize)]) -> Result<Vec<Value>, JsError> + 'a;
+
 /// Add one sorted shard's partial reductions for `query` to `partials`.
-/// `span` reduces the rows `first..end`.
+/// `spans` reduces the row ranges it is given, `first..end` each, all at once
+/// so a sandboxed reducer is not called once per range.
 fn reduce_ranges<S: SortedRows + ?Sized>(
     rows: &S,
     query: &ViewQuery,
     unique: Option<&[Value]>,
     partials: &mut Partials,
-    span: &mut dyn FnMut(usize, usize) -> Result<Value, JsError>,
+    spans: &mut SpanReducer,
 ) -> Result<(), JsError> {
+    let ranges = query_ranges(rows, query, unique);
+    let values = spans(&ranges.iter().map(|(_, span)| *span).collect::<Vec<_>>())?;
+    for ((key, _), value) in ranges.into_iter().zip(values) {
+        add_partial(partials, key, value);
+    }
+    Ok(())
+}
+
+/// The groups of `query` in one sorted shard, each with its partial's key and
+/// the rows `first..end` it covers.
+fn query_ranges<S: SortedRows + ?Sized>(
+    rows: &S,
+    query: &ViewQuery,
+    unique: Option<&[Value]>,
+) -> Vec<(Value, (usize, usize))> {
     let (lo, hi) = range_bounds(rows, query);
     let clamp = |(first, end): (usize, usize)| (first.max(lo), end.min(hi));
     if let Some(keys) = unique {
-        for key in keys {
-            let (first, end) = clamp(equal_range(rows, key));
-            if first < end {
-                add_partial(partials, key.clone(), span(first, end)?);
-            }
-        }
-        return Ok(());
+        return keys
+            .iter()
+            .map(|key| (key.clone(), clamp(equal_range(rows, key))))
+            .filter(|(_, (first, end))| first < end)
+            .collect();
     }
     let (lo, hi) = match &query.key {
         Some(key) => clamp(equal_range(rows, key)),
         None => (lo, hi),
     };
     if !query.group && query.group_level == 0 {
-        if lo < hi {
-            add_partial(partials, Value::Null, span(lo, hi)?);
-        }
-        return Ok(());
+        return if lo < hi {
+            vec![(Value::Null, (lo, hi))]
+        } else {
+            Vec::new()
+        };
     }
     // Group keys never decrease along sorted rows, so each group is a run
     // found by binary search.
+    let mut ranges = Vec::new();
     let mut start = lo;
     while start < hi {
         let group = group_key(&rows.row(start).key, query.group_level);
@@ -958,40 +1042,79 @@ fn reduce_ranges<S: SortedRows + ?Sized>(
                 cmp_json(&group_key(&row.key, query.group_level), &group) != Ordering::Greater
             })
             .min(hi);
-        add_partial(partials, group, span(start, end)?);
+        ranges.push((group, (start, end)));
         start = end;
     }
-    Ok(())
+    ranges
 }
 
-/// Reduce `rows[first..end]` from the largest stored partials it covers
-/// whole, plus the rows and partials at either edge.
-fn reduce_span(
+/// One piece of a span's reduction: the rows at an edge, reduced with the
+/// edges of the other spans, or a stored partial.
+enum Piece {
+    Edge,
+    Stored(Value),
+}
+
+/// Reduce each of `ranges` (`first..end` of `rows`) from the largest stored
+/// partials it covers whole, plus the rows and partials at either edge. The
+/// edges of all ranges are reduced together, and then the pieces of all
+/// ranges are combined together, so a custom reducer is called in batches.
+fn reduce_spans(
     rows: &ShardRows,
     spans: &Spans,
-    first: usize,
-    end: usize,
+    ranges: &[(usize, usize)],
     reducer: &mut JsReducer,
-) -> Result<Value, JsError> {
+    visited: &AtomicU64,
+) -> Result<Vec<Value>, JsError> {
     let starts = &spans.starts;
     let count = starts.len().saturating_sub(1);
-    // The whole blocks in the span: from the first block starting at or after
-    // `first` to the last ending at or before `end`.
-    let lo = starts[..count].partition_point(|start| *start < first);
-    let hi = starts[1..].partition_point(|end_of| *end_of <= end);
-    let mut parts = Vec::new();
-    if lo >= hi {
-        parts.push(reduce_rows(rows.range(first, end), reducer)?);
-    } else {
-        if first < starts[lo] {
-            parts.push(reduce_rows(rows.range(first, starts[lo]), reducer)?);
+    let mut edges = Vec::new();
+    let mut plan: Vec<Vec<Piece>> = Vec::with_capacity(ranges.len());
+    for &(first, end) in ranges {
+        // The whole blocks in the span: from the first block starting at or
+        // after `first` to the last ending at or before `end`.
+        let lo = starts[..count].partition_point(|start| *start < first);
+        let hi = starts[1..].partition_point(|end_of| *end_of <= end);
+        let mut pieces = Vec::new();
+        let mut edge = |first: usize, end: usize, pieces: &mut Vec<Piece>| {
+            visit(visited, end - first);
+            edges.push((first, end));
+            pieces.push(Piece::Edge);
+        };
+        match (starts.get(lo), starts.get(hi)) {
+            (Some(&block_lo), Some(&block_hi)) if lo < hi => {
+                if first < block_lo {
+                    edge(first, block_lo, &mut pieces);
+                }
+                pieces.extend(
+                    block_parts(&spans.levels, lo, hi)
+                        .into_iter()
+                        .map(Piece::Stored),
+                );
+                if block_hi < end {
+                    edge(block_hi, end, &mut pieces);
+                }
+            }
+            _ => edge(first, end, &mut pieces),
         }
-        parts.extend(block_parts(&spans.levels, lo, hi));
-        if starts[hi] < end {
-            parts.push(reduce_rows(rows.range(starts[hi], end), reducer)?);
-        }
+        plan.push(pieces);
     }
-    combine_children(reducer, &parts)
+    let mut edges = reduce_blocks(rows, edges.into_iter(), reducer)?.into_iter();
+    let groups: Vec<Vec<Value>> = plan
+        .into_iter()
+        .map(|pieces| {
+            pieces
+                .into_iter()
+                .map(|piece| match piece {
+                    Piece::Stored(value) => Ok(value),
+                    Piece::Edge => edges
+                        .next()
+                        .ok_or_else(|| JsError::Runtime("edge reduction missing".into())),
+                })
+                .collect()
+        })
+        .collect::<Result<_, JsError>>()?;
+    combine_many(reducer, groups.iter().map(Vec::as_slice))
 }
 
 /// The fewest stored partials covering blocks `lo..hi`, in row order.
@@ -1115,13 +1238,15 @@ pub(crate) fn assemble_reduce(
         groups
     };
 
+    // The groups' rereduces go in as one batch.
+    let groups: Vec<(Value, Vec<Value>)> = groups
+        .into_iter()
+        .skip(query.skip)
+        .take(query.limit)
+        .collect();
+    let combined = combine_many(reducer, groups.iter().map(|(_, values)| values.as_slice()))?;
     let mut rows = Vec::new();
-    for (key, mut values) in groups.into_iter().skip(query.skip).take(query.limit) {
-        let mut value = if values.len() == 1 {
-            values.pop().unwrap_or(Value::Null)
-        } else {
-            combine_partials(reducer, &values)?
-        };
+    for ((key, _), mut value) in groups.into_iter().zip(combined) {
         // Owners hand their sketches to the coordinator, which reports the
         // estimate of the union.
         if query.owner_shards.is_none() {
@@ -1381,7 +1506,7 @@ impl ViewIndex {
             db,
             last_seq,
             design,
-            placement: (1, false),
+            placement: Placement::shards(1, false),
             cached: None,
         })
     }
@@ -1428,7 +1553,7 @@ impl ViewIndex {
     }
 
     /// Record the database's placement; a change drops the cached split.
-    fn set_placement(&mut self, placement: (u32, bool)) {
+    fn set_placement(&mut self, placement: Placement) {
         if self.placement != placement {
             self.placement = placement;
             self.cached = None;
@@ -1644,16 +1769,14 @@ pub async fn query_with_spec(
     if let Some(reducer) = spec.reduce.as_deref().filter(|_| reduce) {
         check_query(spec, query)?;
         let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
+        let visited = db.view_rows_counter();
         let reducer = reducer.to_string();
         let query = query.clone();
         return blocking(move || {
             let mut js = JsReducer::new(&reducer, query.limits);
             let mask = query.owner_shards.as_ref();
-            match &query.partition {
-                Some(partition) => rows.reduce_partition(&query, partition, mask, &mut js),
-                None => rows.reduce(&query, mask, &mut js),
-            }
-            .map_err(|reason| reduce_failure(&reason))
+            rows.reduce(&query, mask, &mut js, &visited)
+                .map_err(|reason| reduce_failure(&reason))
         })
         .await;
     }
@@ -1798,7 +1921,12 @@ pub async fn local_select(
     reduce: bool,
 ) -> DbResult<Selection> {
     let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-    Ok(rows.select(query, query.owner_shards.as_ref(), reduce))
+    Ok(rows.select(
+        query,
+        query.owner_shards.as_ref(),
+        reduce,
+        &db.view_rows_counter(),
+    ))
 }
 
 pub async fn finish(
@@ -1900,7 +2028,11 @@ async fn ensure_rows(
     let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
     // A query queued behind a long build leaves when the database is deleted.
     let mut index = gate.until(handle.lock_owned()).await?;
-    index.set_placement((db.q, db.partitioned));
+    index.set_placement(Placement {
+        q: db.q,
+        partitioned: db.partitioned,
+        by_partition: db.partitioned && spec.partitioned,
+    });
     // Read after the lock: a query that updated the index while this one
     // waited has moved its last_seq past any sequence read earlier, which
     // would look like a recreated database and force a full rebuild.
@@ -1918,16 +2050,28 @@ async fn ensure_rows(
         // Read the bound before scanning, so a write that lands during the
         // scan stays above it and is picked up by the next update.
         let bound = db.changes_watermark(0, None);
-        let docs = db.map_docs(None).await?;
-        return blocking(move || {
-            // In batches, so a deleted database is noticed between them.
-            let mut rows = Vec::new();
-            for batch in docs.chunks(CHANGES_PAGE) {
+        // The documents are read and mapped a page at a time, so a rebuild
+        // holds one page of document bodies, not the whole database's.
+        let mut cursor = crate::db::MapCursor::default();
+        let mut rows = Vec::new();
+        let (mut gate, mut index) = (gate, index);
+        loop {
+            let docs = db.map_docs_page(None, &mut cursor, CHANGES_PAGE).await?;
+            if docs.is_empty() {
+                break;
+            }
+            let map = map.clone();
+            // Between pages, so a deleted database is noticed.
+            (gate, index, rows) = blocking(move || {
                 gate.check()?;
-                rows.extend(run_map_json(&map, batch, limits).map_err(|reason| {
+                rows.extend(run_map_json(&map, &docs, limits).map_err(|reason| {
                     ApiError::new(500, "view_error", format!("map function failed: {reason}"))
                 })?);
-            }
+                Ok((gate, index, rows))
+            })
+            .await?;
+        }
+        return blocking(move || {
             gate.check()?;
             index
                 .rebuild(rows, bound, &design)
@@ -2828,13 +2972,18 @@ fn reduce_with(
     // Do the same for custom JavaScript reducers.
     const CHUNK: usize = REDUCE_CHUNK;
     if values.len() > CHUNK {
-        let mut partials = Vec::new();
-        for (offset, chunk) in values.chunks(CHUNK).enumerate() {
+        // The chunks go in as one batch, not a round trip each.
+        let calls = values.chunks(CHUNK).enumerate().map(|(offset, chunk)| {
             let start = offset * CHUNK;
             let end = (start + chunk.len()).min(keys.len());
             let chunk_keys = if start < end { &keys[start..end] } else { &[] };
-            partials.push(reducer.call(chunk_keys, chunk, false)?);
-        }
+            ReduceCall {
+                keys: chunk_keys.to_vec(),
+                values: chunk.to_vec(),
+                rereduce: false,
+            }
+        });
+        let partials = reducer.call_many(calls)?;
         return reducer.call(&[], &partials, true);
     }
     reducer.call(keys, values, false)
@@ -3885,7 +4034,7 @@ mod tests {
     #[test]
     fn block_partials_follow_writes() {
         // One shard with enough blocks for a level of parents above them.
-        let placement = (1, false);
+        let placement = Placement::shards(1, false);
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
@@ -4012,7 +4161,9 @@ mod tests {
                 for query in &queries {
                     let expected = render(&spec, &rows, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
-                    let actual = view.reduce(query, None, &mut js).unwrap();
+                    let actual = view
+                        .reduce(query, None, &mut js, &AtomicU64::new(0))
+                        .unwrap();
                     assert_eq!(actual, expected, "{reducer} step {step} {query:?}");
                 }
             }
@@ -4030,7 +4181,7 @@ mod tests {
 
     #[test]
     fn shard_blocks_follow_writes() {
-        let placement = (1, false);
+        let placement = Placement::shards(1, false);
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move |bound: u64| {
             state ^= state << 13;
@@ -4183,7 +4334,7 @@ mod tests {
     fn block_reductions_match_a_single_pass() {
         // Enough rows that every shard has several full blocks, keyed so
         // groups and ranges start and end inside blocks.
-        let placement = (3, false);
+        let placement = Placement::shards(3, false);
         let mut rows: Vec<Row> = (0..5000)
             .map(|i| Row {
                 id: format!("d{i:05}"),
@@ -4305,7 +4456,7 @@ mod tests {
                         .iter()
                         .filter(|row| {
                             query.owner_shards.as_ref().is_none_or(|owned| {
-                                let shard = crate::db::shard_index_for(&row.id, placement.0, false);
+                                let shard = crate::db::shard_index_for(&row.id, placement.q, false);
                                 owned.covers(shard)
                             })
                         })
@@ -4314,7 +4465,12 @@ mod tests {
                     let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
                     let actual = view
-                        .reduce(query, query.owner_shards.as_ref(), &mut js)
+                        .reduce(
+                            query,
+                            query.owner_shards.as_ref(),
+                            &mut js,
+                            &AtomicU64::new(0),
+                        )
                         .unwrap();
                     assert_eq!(actual, expected, "{reducer} {query:?}");
                 }
@@ -5197,6 +5353,152 @@ mod tests {
         assert_eq!(jobs, 6, "shard jobs for one incremental update");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A partitioned view keeps one run per partition. Writes move rows
+    /// between keys, drop them, and start runs for new partitions, and a
+    /// partition's reads follow, as they do a rebuild from the same rows.
+    #[test]
+    fn partition_runs_follow_writes() {
+        let row = |id: &str, key: i64| Row {
+            id: id.into(),
+            key: json!(key),
+            value: json!(1),
+        };
+        let placement = Placement {
+            q: 2,
+            partitioned: true,
+            by_partition: true,
+        };
+        let mut rows: Vec<Row> = (0..700)
+            .flat_map(|n| ["a", "b", "c"].map(|p| row(&format!("{p}:d{n}"), n % 50)))
+            .collect();
+        let mut view = ViewRows::from_rows(rows.clone(), placement);
+        let visited = AtomicU64::new(0);
+        let ids = |view: &ViewRows, partition: &str| {
+            let query = ViewQuery {
+                limit: usize::MAX,
+                partition: Some(partition.into()),
+                ..Default::default()
+            };
+            let selection = view.select(&query, None, false, &visited);
+            (
+                selection.total_rows,
+                selection.rows.into_iter().map(|r| r.id).collect::<Vec<_>>(),
+            )
+        };
+        let count = |view: &ViewRows, partition: &str| {
+            let query = ViewQuery {
+                limit: usize::MAX,
+                partition: Some(partition.into()),
+                ..Default::default()
+            };
+            let mut js = JsReducer::new("_count", query.limits);
+            view.reduce(&query, None, &mut js, &visited).unwrap()
+        };
+        assert_eq!(ids(&view, "b").0, 700);
+        assert_eq!(
+            count(&view, "b"),
+            json!({"rows": [{"key": null, "value": 700}]})
+        );
+
+        // Move b:d0 to a later key, delete b:d1, add rows to a new partition.
+        let removed = vec![
+            ("b:d0".to_string(), json!(0)),
+            ("b:d1".to_string(), json!(1)),
+        ];
+        let added = vec![row("b:d0", 99), row("z:d0", 5), row("z:d1", 5)];
+        view.replace_docs(&removed, added.clone(), placement);
+        rows.retain(|r| r.id != "b:d0" && r.id != "b:d1");
+        rows.extend(added);
+        let fresh = ViewRows::from_rows(rows, placement);
+        for partition in ["a", "b", "c", "z", "missing"] {
+            assert_eq!(ids(&view, partition), ids(&fresh, partition), "{partition}");
+            assert_eq!(
+                count(&view, partition),
+                count(&fresh, partition),
+                "{partition}"
+            );
+        }
+        assert_eq!(ids(&view, "b").0, 699);
+        assert_eq!(ids(&view, "z").0, 2);
+        assert_eq!(ids(&view, "missing"), (0, Vec::new()));
+        assert_eq!(ids(&view, "b").1.last().map(String::as_str), Some("b:d0"));
+    }
+
+    /// A partition's view query works on that partition's rows, however many
+    /// other partitions share its shard: the index rows it visits do not grow
+    /// with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partition_view_queries_visit_rows_independent_of_other_partitions() {
+        const K: usize = 600;
+        let mut per_p = Vec::new();
+        for partitions in [2usize, 6] {
+            let root = std::env::temp_dir().join(format!("douchdb-pvisit-{}", crate::util::uuid()));
+            let db = Db::open(
+                &root,
+                "pvisit",
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    shard_map: crate::cluster::ShardMap::single(1),
+                    partitioned: true,
+                },
+            )
+            .unwrap();
+            let mut docs = vec![json!({
+                "_id": "_design/d",
+                "views": {"v": {
+                    "map": "function(doc) { emit(doc.n, 1); }",
+                    "reduce": "_count",
+                }},
+            })];
+            for p in 0..partitions {
+                for n in 0..K {
+                    docs.push(json!({"_id": format!("p{p}:d{n}"), "n": n}));
+                }
+            }
+            db.put_docs(docs, true).await.unwrap();
+            let query = |reduce: bool, range: bool| ViewQuery {
+                limit: usize::MAX,
+                partition: Some("p0".into()),
+                reduce: Some(reduce),
+                startkey: range.then(|| json!(100)),
+                endkey: range.then(|| json!(400)),
+                ..Default::default()
+            };
+            let run = |reduce: bool, range: bool| {
+                let (db, query) = (&db, query(reduce, range));
+                async move {
+                    let before = db.view_rows_visited();
+                    let result = super::query(db, "_design/d", "v", &query).await.unwrap();
+                    (result, db.view_rows_visited() - before)
+                }
+            };
+            // The first query builds the index; only later ones are measured.
+            run(false, false).await;
+            run(true, true).await;
+            let (rows, map_visits) = run(false, false).await;
+            assert_eq!(rows["total_rows"], json!(K), "{rows}");
+            assert_eq!(rows["rows"].as_array().map(Vec::len), Some(K));
+            let (reduced, reduce_visits) = run(true, true).await;
+            assert_eq!(reduced["rows"][0]["value"], json!(300), "{reduced}");
+            per_p.push((partitions, map_visits, reduce_visits));
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        // The map reads its K rows; a ranged reduce reads the rows at the two
+        // edges of its range, not the shard.
+        for &(partitions, map_visits, reduce_visits) in &per_p {
+            assert!(
+                map_visits <= K as u64 + 64,
+                "{partitions} partitions: {per_p:?}"
+            );
+            assert!(
+                reduce_visits <= 2 * ROW_BLOCK as u64,
+                "{partitions} partitions: {per_p:?}"
+            );
+        }
     }
 
     /// The design document cache must never serve a view definition that has
