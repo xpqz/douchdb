@@ -8465,9 +8465,7 @@ async fn cluster_placement_put_copies_local_docs_from_a_reachable_old_copy() {
         node.fresh_db("localcopy").await;
     }
     let both_old = json!({"q": 4, "node_count": 3, "replicas": vec![vec![1, 2]; 4]});
-    let (status, _) = nodes[0]
-        .put("/_node/_local/_dbs/localcopy", both_old)
-        .await;
+    let (status, _) = nodes[0].put("/_node/_local/_dbs/localcopy", both_old).await;
     assert_eq!(status, StatusCode::OK);
     let ids = local_ids_on_every_shard(4);
     for id in &ids {
