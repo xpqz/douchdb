@@ -1671,6 +1671,99 @@ pub async fn query_with_spec(
     finish(spec, rows, docs, &query).await
 }
 
+/// The reply to a view query on this node.
+pub enum ViewReply {
+    /// A reduce, which is computed whole.
+    Reduced(Value),
+    /// The rows of a map view, read as they are consumed.
+    Rows(MapRows),
+}
+
+/// The selected rows of a map view: the counts that lead the reply, and the
+/// rows, whose documents (for `include_docs`) are read a chunk at a time.
+pub struct MapRows {
+    pub total_rows: usize,
+    pub offset: usize,
+    pub rows: futures::stream::BoxStream<'static, DbResult<Value>>,
+}
+
+/// Rows whose documents are read together.
+const DOC_CHUNK: usize = 256;
+
+/// Like `query`, but a map view's rows come back as a stream, so a large
+/// listing does not build its documents and JSON in memory at once. The
+/// selected index rows are still held; their documents are not.
+pub async fn query_stream(
+    db: Arc<Db>,
+    ddoc_id: &str,
+    view_name: &str,
+    query: &ViewQuery,
+) -> DbResult<ViewReply> {
+    let spec = load_spec(&db, ddoc_id, view_name).await?;
+    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    if reduce {
+        return query_with_spec(&db, ddoc_id, view_name, &spec, query)
+            .await
+            .map(ViewReply::Reduced);
+    }
+    validate_view_partition(&db, &spec, query.partition.as_deref())?;
+    let selection = local_select(&db, ddoc_id, view_name, &spec, query, false).await?;
+    check_query(&spec, query)?;
+    let mut query = query.clone();
+    query.total_rows_override = Some(selection.total_rows);
+    query.offset_override = Some(selection.offset);
+    let (ordered, total_rows, before_start) = ordered_rows(&selection.rows, &query);
+    let skip = query.skip.min(total_rows.saturating_sub(before_start));
+    let selected: Vec<Row> = ordered
+        .into_iter()
+        .filter(|row| in_range(row, &query))
+        .skip(skip)
+        .take(query.limit)
+        .cloned()
+        .collect();
+    drop(selection);
+    let include_docs = query.include_docs;
+    let rows = async_stream::stream! {
+        for chunk in selected.chunks(DOC_CHUNK) {
+            let docs = if include_docs {
+                let ids: Vec<String> = chunk.iter().map(|row| row.id.clone()).collect();
+                match docs_by_ids(&db, &ids).await {
+                    Ok(docs) => docs,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+            for row in chunk {
+                yield Ok(map_row_entry(row, &docs, include_docs));
+            }
+        }
+    };
+    Ok(ViewReply::Rows(MapRows {
+        total_rows,
+        offset: before_start + skip,
+        rows: futures::StreamExt::boxed(rows),
+    }))
+}
+
+/// One row of a map view reply.
+fn map_row_entry(row: &Row, docs: &HashMap<String, Value>, include_docs: bool) -> Value {
+    let mut entry = json!({
+        "id": row.id.clone(),
+        "key": row.key.clone(),
+        "value": row.value.clone(),
+    });
+    if include_docs {
+        if let Some(doc) = docs.get(&row.id) {
+            entry["doc"] = doc.clone();
+        }
+    }
+    entry
+}
+
 /// Partitioned design docs may only be queried through `_partition`, and
 /// global design docs may only be queried globally.
 pub fn validate_view_partition(db: &Db, spec: &ViewSpec, partition: Option<&str>) -> DbResult<()> {
@@ -2619,19 +2712,7 @@ fn render(
     let take = query.limit;
     let selected = ordered.into_iter().skip(skip).take(take);
     let rows: Vec<Value> = selected
-        .map(|row| {
-            let mut entry = json!({
-                "id": row.id.clone(),
-                "key": row.key.clone(),
-                "value": row.value.clone(),
-            });
-            if query.include_docs {
-                if let Some(doc) = docs.get(&row.id) {
-                    entry["doc"] = doc.clone();
-                }
-            }
-            entry
-        })
+        .map(|row| map_row_entry(row, docs, query.include_docs))
         .collect();
     Ok(json!({
         "total_rows": total_rows,

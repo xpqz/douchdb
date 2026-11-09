@@ -2819,6 +2819,84 @@ async fn all_docs_skip_does_not_read_skipped_bodies() {
     assert_eq!(body["rows"][0]["doc"]["n"], 250);
 }
 
+/// A response read chunk by chunk: its headers, the size of every chunk and
+/// the whole body. A streamed body is not sized up front (no
+/// `content-length`) and is written in more than one chunk when it is larger
+/// than one; a buffered one carries its length. Nothing here depends on how
+/// fast the chunks arrive.
+async fn read_chunks(
+    mut response: reqwest::Response,
+) -> (reqwest::header::HeaderMap, Vec<usize>, String) {
+    let headers = response.headers().clone();
+    let mut sizes = Vec::new();
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("read chunk") {
+        sizes.push(chunk.len());
+        body.extend_from_slice(&chunk);
+    }
+    (headers, sizes, String::from_utf8(body).expect("utf-8 body"))
+}
+
+/// The response is streamed: chunked, in several chunks.
+fn assert_streamed(headers: &reqwest::header::HeaderMap, sizes: &[usize], what: &str) {
+    assert!(
+        !headers.contains_key("content-length"),
+        "{what} must not be sized up front: {headers:?}"
+    );
+    assert!(sizes.len() > 1, "{what} came in {} chunk(s)", sizes.len());
+}
+
+/// A view's rows are written as they are read: a listing that spans several
+/// chunks is chunked, and its bytes are those of the buffered reply.
+#[tokio::test]
+async fn view_rows_are_streamed_with_a_stable_body() {
+    let s = Server::start_with(&["--q".to_string(), "2".to_string()], false);
+    s.fresh_db("viewstream").await;
+    let (status, _) = s
+        .put(
+            "/viewstream/_design/d",
+            json!({"views": {"v": {"map": "function(doc) { emit(doc.n, doc.pad); }"}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..1500)
+        .map(|i| json!({"_id": format!("d{i:05}"), "n": i, "pad": "x".repeat(200)}))
+        .collect();
+    let (status, _) = s
+        .post("/viewstream/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let response = s
+        .client
+        .get(format!(
+            "{}/viewstream/_design/d/_view/v?include_docs=true&update_seq=true",
+            s.base
+        ))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (headers, sizes, body) = read_chunks(response).await;
+    assert_streamed(&headers, &sizes, "a view");
+    assert!(
+        body.starts_with(
+            "{\"total_rows\":1500,\"offset\":0,\"rows\":[{\"id\":\"d00000\",\"key\":0,\"value\":\"xxxxxxxx"
+        ),
+        "{}",
+        &body[..200]
+    );
+    let value: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(value["rows"].as_array().map(Vec::len), Some(1500));
+    assert_eq!(value["rows"][1499]["doc"]["_id"], "d01499");
+    assert!(value["update_seq"].is_string(), "{}", value["update_seq"]);
+    assert!(body.ends_with('}') && body.contains("],\"update_seq\":"));
+
+    // An error is still a status, not a broken stream.
+    let (status, body) = s.get("/viewstream/_design/d/_view/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 /// `_design_docs` and `_local_docs` are `_all_docs` over the `_design/` and
 /// `_local/` ranges. Shapes below were taken from CouchDB 3.5.3: `_design_docs`
 /// counts only design documents in `total_rows` (the offset still counts

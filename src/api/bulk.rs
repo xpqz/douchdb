@@ -776,6 +776,44 @@ pub(super) fn stream_json_rows<T: serde::Serialize + Send + 'static>(
     Body::from_stream(stream)
 }
 
+/// The end of a `{"rows":[...]}` body: the array, the `update_seq` taken
+/// before the rows were read when the request asked for one, and the object.
+pub(super) fn rows_tail(update_seq: Option<Value>) -> Vec<u8> {
+    let mut tail = vec![b']'];
+    if let Some(update_seq) = update_seq {
+        tail.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
+    }
+    tail.push(b'}');
+    tail
+}
+
+/// A 200 reply whose JSON body is written while `rows` are read (see
+/// `stream_json_rows`). The first row is read before the status is sent, so an
+/// error there still gets its status; one after that can only end the
+/// connection early. A HEAD reads no rows.
+pub(super) async fn stream_json_response<T: serde::Serialize + Send + 'static>(
+    method: &Method,
+    head: Vec<u8>,
+    rows: impl futures::Stream<Item = DbResult<T>> + Send + 'static,
+    tail: Vec<u8>,
+) -> Response {
+    let body = if *method == Method::HEAD {
+        Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())
+    } else {
+        let mut rows = Box::pin(rows);
+        let first_row = rows.next().await;
+        if let Some(Err(error)) = first_row {
+            return fail(error);
+        }
+        stream_json_rows(head, futures::stream::iter(first_row).chain(rows), tail)
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// `_all_docs` without `keys` on this node: the body is written while the
 /// rows are read, so a listing of any size takes constant memory and the
 /// first bytes leave before the last row is read. The bytes are those of the
@@ -793,33 +831,11 @@ async fn stream_all_docs(
     if !still_allowed(req.st, req.db, req.principal) {
         return access_denied(req.principal);
     }
-    let body = if *req.method == Method::HEAD {
-        Body::from_stream(futures::stream::empty::<Result<Bytes, std::io::Error>>())
-    } else {
-        // Reading the first row reads the first page of every shard, so an
-        // error there still gets a status.
-        let mut rows = Box::pin(rows);
-        let first_row = rows.next().await;
-        if let Some(Err(error)) = first_row {
-            return fail(error);
-        }
-        let rows = futures::stream::iter(first_row).chain(rows);
-        let head = format!(
-            "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
-            head.total_rows, head.offset
-        );
-        let mut tail = vec![b']'];
-        if let Some(update_seq) = update_seq {
-            tail.extend_from_slice(format!(",\"update_seq\":{update_seq}").as_bytes());
-        }
-        tail.push(b'}');
-        stream_json_rows(head.into_bytes(), rows, tail)
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    let head = format!(
+        "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+        head.total_rows, head.offset
+    );
+    stream_json_response(req.method, head.into_bytes(), rows, rows_tail(update_seq)).await
 }
 
 /// First and one-past-last id of the design documents.
