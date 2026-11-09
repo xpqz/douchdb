@@ -455,6 +455,8 @@ pub struct Db {
     design_epoch: AtomicU64,
     /// Set when the database is deleted; see `mark_deleted`.
     deleted: AtomicBool,
+    /// Index rows view queries have looked at since the database opened.
+    view_rows_visited: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -616,6 +618,7 @@ impl Db {
             design_docs: std::sync::Mutex::new(HashMap::new()),
             design_epoch: AtomicU64::new(0),
             deleted: AtomicBool::new(false),
+            view_rows_visited: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1237,6 +1240,16 @@ impl Db {
     /// it opened: the work a request did, whatever the time it took.
     pub fn shard_scanned(&self) -> u64 {
         self.shards.iter().map(ShardHandle::scanned).sum()
+    }
+
+    /// View index rows this database's queries have looked at since it opened:
+    /// the work a view query did, whatever the time it took.
+    pub fn view_rows_visited(&self) -> u64 {
+        self.view_rows_visited.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn view_rows_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.view_rows_visited)
     }
 
     /// Document bodies this database's shards have read from storage since it

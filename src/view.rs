@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -688,6 +689,7 @@ impl ViewRows {
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
+        visited: &AtomicU64,
     ) -> Result<Value, JsError> {
         let mut partials = Partials::new();
         let unique = query.keys.as_deref().map(unique_keys);
@@ -695,13 +697,13 @@ impl ViewRows {
             if mask.is_some_and(|mask| !mask.covers(index)) {
                 continue;
             }
-            let blocks = self.block_partials(index, reducer)?;
+            let blocks = self.block_partials(index, reducer, visited)?;
             reduce_ranges(
                 rows,
                 query,
                 unique.as_deref(),
                 &mut partials,
-                &mut |first, end| reduce_span(rows, &blocks, first, end, reducer),
+                &mut |first, end| reduce_span(rows, &blocks, first, end, reducer, visited),
             )?;
         }
         assemble_reduce(partials, query, reducer)
@@ -716,6 +718,7 @@ impl ViewRows {
         partition: &str,
         mask: Option<&crate::cluster::ShardMask>,
         reducer: &mut JsReducer,
+        visited: &AtomicU64,
     ) -> Result<Value, JsError> {
         let mut partials = Partials::new();
         let unique = query.keys.as_deref().map(unique_keys);
@@ -728,18 +731,27 @@ impl ViewRows {
                 .range(0, shard.len())
                 .filter(|row| row.id.starts_with(&prefix))
                 .collect();
+            visit(visited, shard.len());
             reduce_ranges(
                 rows.as_slice(),
                 query,
                 unique.as_deref(),
                 &mut partials,
-                &mut |first, end| reduce_rows(rows[first..end].iter().copied(), reducer),
+                &mut |first, end| {
+                    visit(visited, end - first);
+                    reduce_rows(rows[first..end].iter().copied(), reducer)
+                },
             )?;
         }
         assemble_reduce(partials, query, reducer)
     }
 
-    fn block_partials(&self, shard: usize, reducer: &mut JsReducer) -> Result<Arc<Spans>, JsError> {
+    fn block_partials(
+        &self,
+        shard: usize,
+        reducer: &mut JsReducer,
+        visited: &AtomicU64,
+    ) -> Result<Arc<Spans>, JsError> {
         let Some(slot) = self.blocks.get(shard) else {
             return Ok(Arc::default());
         };
@@ -752,6 +764,7 @@ impl ViewRows {
             }
             return Ok(Arc::clone(&tree.spans));
         }
+        visit(visited, rows.len());
         let tree = BlockTree::build(rows, reducer)?;
         let spans = Arc::clone(&tree.spans);
         *slot = Some(tree);
@@ -766,6 +779,7 @@ impl ViewRows {
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
         reduce: bool,
+        visited: &AtomicU64,
     ) -> Selection {
         let cap = if reduce {
             usize::MAX
@@ -790,11 +804,13 @@ impl ViewRows {
                         .range(0, shard.len())
                         .filter(|row| row.id.starts_with(&prefix))
                         .collect();
+                    visit(visited, shard.len());
                     select_sorted(rows.as_slice(), query, cap, &mut out);
                 }
                 None => select_sorted(shard, query, cap, &mut out),
             }
         }
+        visit(visited, out.rows.len());
         // Rows from one document share a shard, so a stable sort keeps the
         // emission order of equal rows.
         out.rows.sort_by(row_cmp);
@@ -889,6 +905,11 @@ fn select_sorted<S: SortedRows + ?Sized>(
         .extend(chosen.into_iter().map(|index| rows.row(index).clone()));
 }
 
+/// Count `rows` index rows a query looked at.
+fn visit(visited: &AtomicU64, rows: usize) {
+    visited.fetch_add(rows as u64, AtomicOrdering::Relaxed);
+}
+
 /// The index range of sorted `rows` inside the query's start and end bounds.
 fn range_bounds<S: SortedRows + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, usize) {
     let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(pred);
@@ -972,6 +993,7 @@ fn reduce_span(
     first: usize,
     end: usize,
     reducer: &mut JsReducer,
+    visited: &AtomicU64,
 ) -> Result<Value, JsError> {
     let starts = &spans.starts;
     let count = starts.len().saturating_sub(1);
@@ -981,13 +1003,16 @@ fn reduce_span(
     let hi = starts[1..].partition_point(|end_of| *end_of <= end);
     let mut parts = Vec::new();
     if lo >= hi {
+        visit(visited, end - first);
         parts.push(reduce_rows(rows.range(first, end), reducer)?);
     } else {
         if first < starts[lo] {
+            visit(visited, starts[lo] - first);
             parts.push(reduce_rows(rows.range(first, starts[lo]), reducer)?);
         }
         parts.extend(block_parts(&spans.levels, lo, hi));
         if starts[hi] < end {
+            visit(visited, end - starts[hi]);
             parts.push(reduce_rows(rows.range(starts[hi], end), reducer)?);
         }
     }
@@ -1644,14 +1669,17 @@ pub async fn query_with_spec(
     if let Some(reducer) = spec.reduce.as_deref().filter(|_| reduce) {
         check_query(spec, query)?;
         let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
+        let visited = db.view_rows_counter();
         let reducer = reducer.to_string();
         let query = query.clone();
         return blocking(move || {
             let mut js = JsReducer::new(&reducer, query.limits);
             let mask = query.owner_shards.as_ref();
             match &query.partition {
-                Some(partition) => rows.reduce_partition(&query, partition, mask, &mut js),
-                None => rows.reduce(&query, mask, &mut js),
+                Some(partition) => {
+                    rows.reduce_partition(&query, partition, mask, &mut js, &visited)
+                }
+                None => rows.reduce(&query, mask, &mut js, &visited),
             }
             .map_err(|reason| reduce_failure(&reason))
         })
@@ -1798,7 +1826,12 @@ pub async fn local_select(
     reduce: bool,
 ) -> DbResult<Selection> {
     let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-    Ok(rows.select(query, query.owner_shards.as_ref(), reduce))
+    Ok(rows.select(
+        query,
+        query.owner_shards.as_ref(),
+        reduce,
+        &db.view_rows_counter(),
+    ))
 }
 
 pub async fn finish(
@@ -4012,7 +4045,9 @@ mod tests {
                 for query in &queries {
                     let expected = render(&spec, &rows, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
-                    let actual = view.reduce(query, None, &mut js).unwrap();
+                    let actual = view
+                        .reduce(query, None, &mut js, &AtomicU64::new(0))
+                        .unwrap();
                     assert_eq!(actual, expected, "{reducer} step {step} {query:?}");
                 }
             }
@@ -4314,7 +4349,12 @@ mod tests {
                     let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
                     let mut js = JsReducer::new(reducer, query.limits);
                     let actual = view
-                        .reduce(query, query.owner_shards.as_ref(), &mut js)
+                        .reduce(
+                            query,
+                            query.owner_shards.as_ref(),
+                            &mut js,
+                            &AtomicU64::new(0),
+                        )
                         .unwrap();
                     assert_eq!(actual, expected, "{reducer} {query:?}");
                 }
@@ -5197,6 +5237,81 @@ mod tests {
         assert_eq!(jobs, 6, "shard jobs for one incremental update");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A partition's view query works on that partition's rows, however many
+    /// other partitions share its shard: the index rows it visits do not grow
+    /// with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partition_view_queries_visit_rows_independent_of_other_partitions() {
+        const K: usize = 600;
+        let mut per_p = Vec::new();
+        for partitions in [2usize, 6] {
+            let root = std::env::temp_dir().join(format!("douchdb-pvisit-{}", crate::util::uuid()));
+            let db = Db::open(
+                &root,
+                "pvisit",
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    shard_map: crate::cluster::ShardMap::single(1),
+                    partitioned: true,
+                },
+            )
+            .unwrap();
+            let mut docs = vec![json!({
+                "_id": "_design/d",
+                "views": {"v": {
+                    "map": "function(doc) { emit(doc.n, 1); }",
+                    "reduce": "_count",
+                }},
+            })];
+            for p in 0..partitions {
+                for n in 0..K {
+                    docs.push(json!({"_id": format!("p{p}:d{n}"), "n": n}));
+                }
+            }
+            db.put_docs(docs, true).await.unwrap();
+            let query = |reduce: bool, range: bool| ViewQuery {
+                limit: usize::MAX,
+                partition: Some("p0".into()),
+                reduce: Some(reduce),
+                startkey: range.then(|| json!(100)),
+                endkey: range.then(|| json!(400)),
+                ..Default::default()
+            };
+            let run = |reduce: bool, range: bool| {
+                let (db, query) = (&db, query(reduce, range));
+                async move {
+                    let before = db.view_rows_visited();
+                    let result = super::query(db, "_design/d", "v", &query).await.unwrap();
+                    (result, db.view_rows_visited() - before)
+                }
+            };
+            // The first query builds the index; only later ones are measured.
+            run(false, false).await;
+            run(true, true).await;
+            let (rows, map_visits) = run(false, false).await;
+            assert_eq!(rows["total_rows"], json!(K), "{rows}");
+            assert_eq!(rows["rows"].as_array().map(Vec::len), Some(K));
+            let (reduced, reduce_visits) = run(true, true).await;
+            assert_eq!(reduced["rows"][0]["value"], json!(300), "{reduced}");
+            per_p.push((partitions, map_visits, reduce_visits));
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        // The map reads its K rows; a ranged reduce reads the rows at the two
+        // edges of its range, not the shard.
+        for &(partitions, map_visits, reduce_visits) in &per_p {
+            assert!(
+                map_visits <= K as u64 + 64,
+                "{partitions} partitions: {per_p:?}"
+            );
+            assert!(
+                reduce_visits <= 2 * ROW_BLOCK as u64,
+                "{partitions} partitions: {per_p:?}"
+            );
+        }
     }
 
     /// The design document cache must never serve a view definition that has
