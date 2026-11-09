@@ -554,8 +554,9 @@ work. Three changes target it:
 - The live-document index supplies the winning revision for ordinary live
   documents, avoiding a LevelDB metadata read and revision-tree decode per
   row. Tombstones and `style=all_docs` still use the full metadata path.
-- Cluster sequence tokens use a compact `v1:<node seqs>` form instead of
-  base64(JSON) encoded per row. `decode_since` still accepts old tokens.
+- Cluster sequence tokens wrap a compact `v1:<node seqs>` body instead of
+  base64(JSON) of a map encoded per row; they are then written in CouchDB's
+  `<sum>-<base64url>` shape.
 
 Before/after on the 6,000-document cluster benchmark:
 

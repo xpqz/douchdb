@@ -241,7 +241,19 @@ pub async fn dbs_info(
         };
         match st.db(name).await {
             Ok(db) => match db.info().await {
-                Ok(info) => results.push(json!({"key": name, "info": info})),
+                Ok(info) => {
+                    let cluster = &st.ctx.cluster;
+                    let seq = encode_local_seq(cluster, info.update_seq);
+                    let purge_seq = encode_local_seq(cluster, info.purge_seq);
+                    match info_json(&info, &seq, &purge_seq) {
+                        Ok(info) => results.push(json!({"key": name, "info": info})),
+                        Err(error) => results.push(json!({
+                            "key": name,
+                            "error": error.error,
+                            "reason": error.reason,
+                        })),
+                    }
+                }
                 Err(error) => results.push(json!({
                     "key": name,
                     "error": error.error,
