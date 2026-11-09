@@ -1115,6 +1115,117 @@ async fn cors_preflight_matches_chttpd_cors() {
     );
 }
 
+/// CouchDB adds `Cache-Control: must-revalidate` to every JSON response
+/// (`couch_httpd:maybe_add_default_headers/2`, couch_httpd.erl 3.5.0), errors
+/// included, and so lists `cache-control` in `Access-Control-Expose-Headers`
+/// (`?SIMPLE_HEADERS` in chttpd_cors.hrl: the expose list names the simple
+/// headers the response carries).
+#[tokio::test]
+async fn json_responses_carry_cache_control_must_revalidate() {
+    let server = Server::start_with(&["--cors-origins".to_string(), "*".to_string()], false);
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    for (path, status) in [("/", 200), ("/missing-db", 404), ("/_all_dbs", 200)] {
+        let response = server
+            .client
+            .get(format!("{}{path}", server.base))
+            .header("Origin", "http://app.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status, "{path}");
+        assert_eq!(
+            header(&response, "cache-control").as_deref(),
+            Some("must-revalidate"),
+            "{path}"
+        );
+        let exposed = header(&response, "access-control-expose-headers").unwrap_or_default();
+        assert!(
+            exposed.starts_with("content-type, cache-control, "),
+            "{path}: {exposed}"
+        );
+    }
+}
+
+/// CouchDB's `[cors] methods`, `exposed_headers` and `max_age`
+/// (chttpd_cors.erl `get_cors_config/1`, 3.5.0): `methods` replaces the
+/// supported-method list (and is what `Access-Control-Allow-Methods` lists),
+/// `exposed_headers` replaces `?COUCH_HEADERS` in the expose list, and
+/// `max_age` replaces the default 600.
+#[tokio::test]
+async fn cors_methods_exposed_headers_and_max_age_are_configurable() {
+    let server = Server::start_with(
+        &[
+            "--cors-origins".to_string(),
+            "*".to_string(),
+            "--cors-methods".to_string(),
+            "GET, put".to_string(),
+            "--cors-exposed-headers".to_string(),
+            "X-One, x-two".to_string(),
+            "--cors-max-age".to_string(),
+            "42".to_string(),
+        ],
+        false,
+    );
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let preflight = |method: &'static str| {
+        server
+            .client
+            .request(Method::OPTIONS, format!("{}/demo/doc", server.base))
+            .header("Origin", "http://app.test")
+            .header("Access-Control-Request-Method", method)
+            .send()
+    };
+    let response = preflight("GET").await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, "access-control-allow-methods").as_deref(),
+        Some("GET, put")
+    );
+    assert_eq!(
+        header(&response, "access-control-max-age").as_deref(),
+        Some("42")
+    );
+    // A method outside the list is not a preflight (and `put` is matched
+    // case-sensitively, as CouchDB does).
+    for method in ["POST", "PUT"] {
+        let response = preflight(method).await.unwrap();
+        assert_ne!(response.status(), StatusCode::NO_CONTENT, "{method}");
+        assert_eq!(
+            header(&response, "access-control-allow-methods"),
+            None,
+            "{method}"
+        );
+    }
+    assert_eq!(
+        preflight("put").await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let response = server
+        .client
+        .get(format!("{}/", server.base))
+        .header("Origin", "http://app.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&response, "access-control-expose-headers").as_deref(),
+        Some("content-type, cache-control, x-one, x-two")
+    );
+}
+
 /// The console is the one HTML surface, so it carries a Content-Security-Policy.
 /// The Vue build compiles in-DOM templates at runtime, which needs
 /// `'unsafe-eval'`; everything else is locked down to the same origin.
