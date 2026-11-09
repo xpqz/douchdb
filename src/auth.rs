@@ -135,6 +135,23 @@ pub struct Auth {
     secret: Vec<u8>,
 }
 
+/// An HMAC-SHA256 keyed by `input`, applying HMAC's own key rule (RFC 2104):
+/// a key longer than the block is hashed, a shorter one is zero-padded. Same
+/// MAC as `Hmac::new_from_slice`, through a constructor that cannot fail.
+fn hmac_sha256(input: &[u8]) -> Hmac<Sha256> {
+    let mut key = Key::<Hmac<Sha256>>::default();
+    if input.len() > key.len() {
+        key.iter_mut()
+            .zip(Sha256::digest(input))
+            .for_each(|(slot, byte)| *slot = byte);
+    } else {
+        key.iter_mut()
+            .zip(input)
+            .for_each(|(slot, byte)| *slot = *byte);
+    }
+    Hmac::<Sha256>::new(&key)
+}
+
 impl Auth {
     /// A server-admin-only auth instance. Kept for callers that only have
     /// `--admin`. `secret` is the session cookie HMAC key; see
@@ -371,14 +388,7 @@ impl Auth {
     fn mac(&self, salt: &[u8; 32]) -> Hmac<Sha256> {
         let mut input = self.secret.clone();
         input.extend_from_slice(salt);
-        // Hash the key material down to one SHA-256 block key, zero-padded to
-        // HMAC's block size, so the constructor takes a fixed-size key and
-        // cannot fail.
-        let mut key = Key::<Hmac<Sha256>>::default();
-        key.iter_mut()
-            .zip(Sha256::digest(&input))
-            .for_each(|(slot, byte)| *slot = byte);
-        Hmac::<Sha256>::new(&key)
+        hmac_sha256(&input)
     }
 
     fn sign(&self, name: &str, payload: &str) -> String {
@@ -498,6 +508,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_key_rule_matches_new_from_slice() {
+        for len in [0, 1, 32, 63, 64, 65, 96, 200] {
+            let input: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut ours = hmac_sha256(&input);
+            let mut theirs = Hmac::<Sha256>::new_from_slice(&input).unwrap();
+            ours.update(b"payload");
+            theirs.update(b"payload");
+            assert_eq!(
+                ours.finalize().into_bytes(),
+                theirs.finalize().into_bytes(),
+                "key length {len}"
+            );
+        }
+    }
 
     // Tests run in parallel, so each one needs its own users file. Sharing a
     // fixed path lets one test read the file while another has truncated it.

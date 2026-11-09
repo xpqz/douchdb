@@ -5507,8 +5507,7 @@ fn forged_cookie(secret: &[u8], password: &str, name: &str) -> String {
     use sha2::Digest;
     let mut key = secret.to_vec();
     key.extend_from_slice(&sha2::Sha256::digest(password.as_bytes()));
-    // The server hashes secret + credential digest down to the HMAC key.
-    let key = sha2::Sha256::digest(&key);
+    let key = key.as_slice();
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let exp = std::time::SystemTime::now()
@@ -5517,7 +5516,7 @@ fn forged_cookie(secret: &[u8], password: &str, name: &str) -> String {
         .as_secs()
         + 600;
     let payload = format!("{name}:{exp}");
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     format!(
