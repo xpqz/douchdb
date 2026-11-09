@@ -184,6 +184,11 @@ impl Cluster {
         }
     }
 
+    /// The placement a rebalance moves `old` to.
+    pub fn rebalance_target(&self, old: &ShardMap, n: usize) -> ShardMap {
+        self.shard_map_n("", old.q, n)
+    }
+
     pub fn is_clustered(&self) -> bool {
         self.nodes.len() > 1
     }
@@ -405,6 +410,84 @@ mod tests {
         }
         // A larger factor is clamped to the node count.
         assert_eq!(replicas_of_shard(&cluster(9), 0).len(), 3);
+    }
+
+    fn moved_copies(old: &ShardMap, new: &ShardMap) -> usize {
+        old.replicas
+            .iter()
+            .zip(&new.replicas)
+            .map(|(a, b)| b.iter().filter(|node| !a.contains(node)).count())
+            .sum()
+    }
+
+    fn assert_target_invariants(target: &ShardMap, nodes: usize, n: usize) {
+        let counts = copies_per_node(target, nodes);
+        let spread =
+            counts.iter().max().copied().unwrap_or(0) - counts.iter().min().copied().unwrap_or(0);
+        assert!(spread <= 1, "copies per node {counts:?}");
+        for replicas in &target.replicas {
+            let distinct: std::collections::HashSet<_> = replicas.iter().collect();
+            assert_eq!(replicas.len(), n);
+            assert_eq!(distinct.len(), n, "range reuses a node: {replicas:?}");
+            assert!(replicas.iter().all(|node| *node < nodes));
+        }
+    }
+
+    #[test]
+    fn rebalance_target_of_an_unchanged_cluster_is_the_old_map() {
+        let cluster = cluster_of(3);
+        for name in ["db", "alpha", "beta", "gamma"] {
+            let old = cluster.shard_map_n(name, 8, 3);
+            assert_eq!(cluster.rebalance_target(&old, 3), old, "{name}");
+            let old = cluster.shard_map_n(name, 4, 1);
+            assert_eq!(cluster.rebalance_target(&old, 1), old, "{name}");
+        }
+    }
+
+    #[test]
+    fn rebalance_target_moves_only_what_a_new_node_needs() {
+        for name in ["db", "alpha", "beta", "gamma"] {
+            let old = cluster_of(3).shard_map_n(name, 8, 3);
+            let four = cluster_of(4);
+            let target = four.rebalance_target(&old, 3);
+            assert_target_invariants(&target, 4, 3);
+            assert_eq!(copies_per_node(&target, 4), vec![6, 6, 6, 6]);
+            assert_eq!(
+                moved_copies(&old, &target),
+                6,
+                "{name}: {old:?} -> {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebalance_target_rehomes_only_a_removed_nodes_copies() {
+        let old = cluster_of(4).shard_map_n("db", 8, 2);
+        let three = cluster_of(3);
+        let target = three.rebalance_target(&old, 2);
+        assert_target_invariants(&target, 3, 2);
+        let on_removed = old.replicas.iter().flatten().filter(|n| **n == 3).count();
+        assert_eq!(moved_copies(&old, &target), on_removed);
+        for (before, after) in old.replicas.iter().zip(&target.replicas) {
+            for node in before.iter().filter(|node| **node != 3) {
+                assert!(after.contains(node), "{before:?} -> {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rebalance_target_holds_its_invariants_over_a_sweep() {
+        for from in 1..=5usize {
+            for to in 1..=5usize {
+                for q in [1u32, 2, 3, 4, 7, 8, 16] {
+                    for n in 1..=4usize {
+                        let old = cluster_of(from).shard_map_n("sweep", q, n);
+                        let target = cluster_of(to).rebalance_target(&old, n);
+                        assert_target_invariants(&target, to, n.min(to));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
