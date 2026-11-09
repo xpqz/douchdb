@@ -466,6 +466,8 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--otel-endpoint URL]
 ```
 
+Every flag that takes a value also accepts `--flag=VALUE`. A value that is exactly the name of another flag (`--session-secret --data x`) is refused as a likely forgotten value; write `--session-secret=--data` if you really mean it.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--listen` | `127.0.0.1:5984` | HTTP listen address |
