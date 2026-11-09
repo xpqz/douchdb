@@ -1,8 +1,7 @@
 //! Cluster placement: the static node list, the per-database shard map, and
-//! the rendezvous hashing that seeds new shard maps.
+//! the mem3-style balanced assignment that seeds new shard maps.
 
 use axum::http::HeaderMap;
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default)]
@@ -98,7 +97,8 @@ impl ShardMap {
 
     /// Evenly spread shard replicas across nodes. This is intentionally
     /// simple: for shard `s`, replica `k` goes to `(s + k) % node_count`.
-    /// Tests use it for a predictable placement; real placement is rendezvous.
+    /// Tests use it for a predictable placement; real placement is
+    /// `Cluster::shard_map_n`.
     #[cfg(test)]
     pub fn balanced(q: u32, node_count: usize, n: usize) -> ShardMap {
         let q = q.max(1);
@@ -146,27 +146,124 @@ impl ShardMap {
 }
 
 impl Cluster {
-    pub fn shard_map(&self, q: u32) -> ShardMap {
-        self.shard_map_n(q, self.n)
+    pub fn shard_map(&self, name: &str, q: u32) -> ShardMap {
+        self.shard_map_n(name, q, self.n)
     }
 
     /// A shard map with `n` copies of each shard, clamped to the node count.
-    pub fn shard_map_n(&self, q: u32, n: usize) -> ShardMap {
+    ///
+    /// Mirrors CouchDB's `mem3:choose_shards/3` and
+    /// `mem3_util:create_partition_map/5`: copies are dealt to the node list
+    /// in order, `n` per range, wrapping around, so every node holds the same
+    /// number of copies give or take one and no range has two copies on one
+    /// node. CouchDB starts the deal at a random node; here the start is
+    /// `crc32(name) % nodes` (as `mem3_util:rotate_list/2`), so every node
+    /// computes the same map for a given database name.
+    pub fn shard_map_n(&self, name: &str, q: u32, n: usize) -> ShardMap {
         let q = q.max(1);
         if self.nodes.is_empty() {
             return ShardMap::single(q);
         }
         let n = n.max(1).min(self.nodes.len());
+        // mem3:nodes() is sorted; sort here too so the map does not depend on
+        // the order the node list was configured in.
+        let mut order: Vec<usize> = (0..self.nodes.len()).collect();
+        order.sort_by(|a, b| self.nodes[*a].cmp(&self.nodes[*b]));
+        let start = crc32(name.as_bytes()) as usize % order.len();
         ShardMap {
             q,
             node_count: self.nodes.len(),
-            replicas: (0..q)
+            replicas: (0..q as usize)
                 .map(|shard| {
-                    let mut replicas = self.replicas_of_shard_ranked(shard);
-                    replicas.truncate(n);
-                    replicas
+                    (0..n)
+                        .map(|copy| order[(start + shard * n + copy) % order.len()])
+                        .collect()
                 })
                 .collect(),
+            version: 0,
+        }
+    }
+
+    /// The placement a rebalance moves `old` to: `old` with as few copies
+    /// moved as it takes to fit the current node list and `n`, and then to
+    /// even out the load. Unlike a fresh `shard_map_n`, whose round-robin deal
+    /// reshuffles most copies when a node joins, this keeps every copy that
+    /// can stay. Copies on nodes no longer in the list are re-homed, ranges
+    /// short of `n` copies gain some on the least loaded nodes, ranges over
+    /// `n` lose theirs from the most loaded nodes, and finally copies move
+    /// from the most to the least loaded node until counts differ by at most
+    /// one. Ties break by node address, then range index, so every node
+    /// computes the same map.
+    pub fn rebalance_target(&self, old: &ShardMap, n: usize) -> ShardMap {
+        let node_count = self.nodes.len().max(1);
+        let n = n.max(1).min(node_count);
+        // Position of each node in address order: the tie-break.
+        let mut order: Vec<usize> = (0..node_count).collect();
+        order.sort_by(|a, b| self.nodes.get(*a).cmp(&self.nodes.get(*b)));
+        let mut rank = vec![0usize; node_count];
+        for (pos, node) in order.iter().enumerate() {
+            rank[*node] = pos;
+        }
+        let mut load = vec![0usize; node_count];
+        let mut replicas: Vec<Vec<usize>> = old
+            .replicas
+            .iter()
+            .map(|copies| {
+                let mut kept: Vec<usize> = Vec::new();
+                for node in copies {
+                    if *node < node_count && !kept.contains(node) {
+                        kept.push(*node);
+                    }
+                }
+                for node in &kept {
+                    load[*node] += 1;
+                }
+                kept
+            })
+            .collect();
+        for copies in &mut replicas {
+            while copies.len() > n {
+                let Some(drop) = pick(&load, &rank, copies.iter().copied(), true) else {
+                    break;
+                };
+                copies.retain(|node| *node != drop);
+                load[drop] -= 1;
+            }
+            while copies.len() < n {
+                let held = copies.clone();
+                let free = (0..node_count).filter(|c| !held.contains(c));
+                let Some(add) = pick(&load, &rank, free, false) else {
+                    break;
+                };
+                copies.push(add);
+                load[add] += 1;
+            }
+        }
+        while let (Some(most), Some(least)) = (
+            pick(&load, &rank, 0..node_count, true),
+            pick(&load, &rank, 0..node_count, false),
+        ) {
+            if load[most] <= load[least] + 1 {
+                break;
+            }
+            let Some(slot) = replicas
+                .iter()
+                .position(|copies| copies.contains(&most) && !copies.contains(&least))
+            else {
+                break;
+            };
+            for node in &mut replicas[slot] {
+                if *node == most {
+                    *node = least;
+                }
+            }
+            load[most] -= 1;
+            load[least] += 1;
+        }
+        ShardMap {
+            q: old.q,
+            node_count,
+            replicas,
             version: 0,
         }
     }
@@ -178,24 +275,6 @@ impl Cluster {
     /// Effective replication factor, clamped to the node count.
     pub fn replication_factor(&self) -> usize {
         self.n.max(1).min(self.nodes.len().max(1))
-    }
-
-    /// Every node, in rendezvous preference order for `shard`: the highest
-    /// scores of `(node, shard)` first. Only used to seed a database's
-    /// `ShardMap`; once created, the stored map is the source of truth for
-    /// placement.
-    fn replicas_of_shard_ranked(&self, shard: u32) -> Vec<usize> {
-        if self.nodes.is_empty() {
-            return vec![0];
-        }
-        let mut ranked: Vec<(u64, usize)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, node)| (score(node, shard), i))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        ranked.into_iter().map(|(_, i)| i).collect()
     }
 
     /// True only for a peer that presents the shared cluster secret. A client
@@ -236,9 +315,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn score(node: &str, shard: u32) -> u64 {
-    let digest = Md5::digest(format!("{node}#{shard}").as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().unwrap())
+/// The most (`busiest`) or least loaded of `nodes`, ties broken by address
+/// rank.
+fn pick(
+    load: &[usize],
+    rank: &[usize],
+    nodes: impl Iterator<Item = usize>,
+    busiest: bool,
+) -> Option<usize> {
+    if busiest {
+        nodes.max_by_key(|node| (load[*node], rank[*node]))
+    } else {
+        nodes.min_by_key(|node| (load[*node], rank[*node]))
+    }
+}
+
+/// CRC-32 (IEEE), the checksum Erlang's `erlang:crc32/1` computes.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]
@@ -273,11 +374,68 @@ mod tests {
     const Q: u32 = 256;
 
     fn replicas_of_shard(cluster: &Cluster, shard: u32) -> Vec<usize> {
-        cluster.shard_map(Q).replicas_of(shard).to_vec()
+        cluster.shard_map("db", Q).replicas_of(shard).to_vec()
     }
 
     fn owner_of_shard(cluster: &Cluster, shard: u32) -> usize {
-        cluster.shard_map(Q).owner_of(shard)
+        cluster.shard_map("db", Q).owner_of(shard)
+    }
+
+    fn copies_per_node(map: &ShardMap, nodes: usize) -> Vec<usize> {
+        let mut counts = vec![0; nodes];
+        for replicas in &map.replicas {
+            for node in replicas {
+                counts[*node] += 1;
+            }
+        }
+        counts
+    }
+
+    fn cluster_of(nodes: usize) -> Cluster {
+        Cluster {
+            nodes: (0..nodes).map(|i| format!("http://node{i}:5984")).collect(),
+            me: 0,
+            n: 1,
+            secret: String::new(),
+        }
+    }
+
+    fn assert_balanced(name: &str, nodes: usize, q: u32, n: usize) {
+        let map = cluster_of(nodes).shard_map_n(name, q, n);
+        let counts = copies_per_node(&map, nodes);
+        let (min, max) = (counts.iter().min(), counts.iter().max());
+        assert!(
+            max.zip(min).is_some_and(|(max, min)| max - min <= 1),
+            "{name} q={q} n={n}: copies per node {counts:?}"
+        );
+        for (shard, replicas) in map.replicas.iter().enumerate() {
+            let distinct: std::collections::HashSet<_> = replicas.iter().collect();
+            assert_eq!(replicas.len(), n, "{name} shard {shard}");
+            assert_eq!(distinct.len(), n, "{name} shard {shard} reuses a node");
+        }
+    }
+
+    #[test]
+    fn default_placement_spreads_copies_evenly() {
+        for name in ["a", "db", "users", "orders-2024", "x1", "x2", "x3", "x4"] {
+            assert_balanced(name, 3, 4, 1);
+            assert_balanced(name, 5, 8, 3);
+            assert_balanced(name, 3, 2, 2);
+            assert_balanced(name, 4, 8, 4);
+        }
+    }
+
+    #[test]
+    fn default_placement_is_deterministic_and_rotates_per_database() {
+        let cluster = cluster_of(3);
+        assert_eq!(
+            cluster.shard_map_n("db", 4, 1),
+            cluster.shard_map_n("db", 4, 1)
+        );
+        let firsts: std::collections::HashSet<_> = (0..16)
+            .map(|i| cluster.shard_map_n(&format!("db{i}"), 4, 1).replicas[0][0])
+            .collect();
+        assert!(firsts.len() > 1, "every database starts on the same node");
     }
 
     #[test]
@@ -348,43 +506,91 @@ mod tests {
         assert_eq!(replicas_of_shard(&cluster(9), 0).len(), 3);
     }
 
-    #[test]
-    fn replica_sets_are_stable_when_a_node_is_added() {
-        let three = cluster(1);
-        let four = Cluster {
-            nodes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-            me: 0,
-            n: 1,
-            secret: String::new(),
-        };
-        let moved = (0..200)
-            .filter(|shard| owner_of_shard(&three, *shard) != owner_of_shard(&four, *shard))
-            .count();
-        assert!(moved > 10 && moved < 100, "moved {moved} of 200 shards");
+    fn moved_copies(old: &ShardMap, new: &ShardMap) -> usize {
+        old.replicas
+            .iter()
+            .zip(&new.replicas)
+            .map(|(a, b)| b.iter().filter(|node| !a.contains(node)).count())
+            .sum()
+    }
 
-        // With two replicas per shard, adding node d may only swap d into a
-        // replica set; the surviving members keep their copies.
-        let three = cluster(2);
-        let four = Cluster { n: 2, ..four };
-        let mut changed = 0;
-        for shard in 0..200 {
-            let before: std::collections::BTreeSet<usize> =
-                replicas_of_shard(&three, shard).into_iter().collect();
-            let after: std::collections::BTreeSet<usize> =
-                replicas_of_shard(&four, shard).into_iter().collect();
-            if before != after {
-                changed += 1;
-                assert!(after.contains(&3), "shard {shard}: {before:?} -> {after:?}");
-                assert_eq!(
-                    before.intersection(&after).count(),
-                    1,
-                    "shard {shard}: {before:?} -> {after:?}"
-                );
+    fn assert_target_invariants(target: &ShardMap, nodes: usize, n: usize) {
+        let counts = copies_per_node(target, nodes);
+        let spread =
+            counts.iter().max().copied().unwrap_or(0) - counts.iter().min().copied().unwrap_or(0);
+        assert!(spread <= 1, "copies per node {counts:?}");
+        for replicas in &target.replicas {
+            let distinct: std::collections::HashSet<_> = replicas.iter().collect();
+            assert_eq!(replicas.len(), n);
+            assert_eq!(distinct.len(), n, "range reuses a node: {replicas:?}");
+            assert!(replicas.iter().all(|node| *node < nodes));
+        }
+    }
+
+    #[test]
+    fn rebalance_target_of_an_unchanged_cluster_is_the_old_map() {
+        let cluster = cluster_of(3);
+        for name in ["db", "alpha", "beta", "gamma"] {
+            let old = cluster.shard_map_n(name, 8, 3);
+            assert_eq!(cluster.rebalance_target(&old, 3), old, "{name}");
+            let old = cluster.shard_map_n(name, 4, 1);
+            assert_eq!(cluster.rebalance_target(&old, 1), old, "{name}");
+        }
+    }
+
+    #[test]
+    fn rebalance_target_moves_only_what_a_new_node_needs() {
+        for name in ["db", "alpha", "beta", "gamma"] {
+            let old = cluster_of(3).shard_map_n(name, 8, 3);
+            let four = cluster_of(4);
+            let target = four.rebalance_target(&old, 3);
+            assert_target_invariants(&target, 4, 3);
+            assert_eq!(copies_per_node(&target, 4), vec![6, 6, 6, 6]);
+            assert_eq!(
+                moved_copies(&old, &target),
+                6,
+                "{name}: {old:?} -> {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebalance_target_rehomes_only_a_removed_nodes_copies() {
+        let old = cluster_of(4).shard_map_n("db", 8, 1);
+        let three = cluster_of(3);
+        let target = three.rebalance_target(&old, 1);
+        assert_target_invariants(&target, 3, 1);
+        let on_removed = old.replicas.iter().flatten().filter(|n| **n == 3).count();
+        assert_eq!(
+            moved_copies(&old, &target),
+            on_removed,
+            "{old:?} -> {target:?}"
+        );
+        for (before, after) in old.replicas.iter().zip(&target.replicas) {
+            for node in before.iter().filter(|node| **node != 3) {
+                assert!(after.contains(node), "{before:?} -> {after:?}");
             }
         }
-        assert!(
-            changed > 10 && changed < 150,
-            "changed {changed} of 200 sets"
-        );
+    }
+
+    #[test]
+    fn rebalance_target_holds_its_invariants_over_a_sweep() {
+        for from in 1..=5usize {
+            for to in 1..=5usize {
+                for q in [1u32, 2, 3, 4, 7, 8, 16] {
+                    for n in 1..=4usize {
+                        let old = cluster_of(from).shard_map_n("sweep", q, n);
+                        let target = cluster_of(to).rebalance_target(&old, n);
+                        assert_target_invariants(&target, to, n.min(to));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
     }
 }

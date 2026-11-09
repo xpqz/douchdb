@@ -7646,6 +7646,27 @@ fn node_to_pin_away_from(planned: &Value) -> usize {
     usize::from(planned_keeps_every_shard_on(planned, 0))
 }
 
+/// A rebalance moves a pinned placement to a balanced one: every node holds
+/// the same number of shard copies give or take one, and no shard has two
+/// copies on one node. (It need not be the placement creation chose, since a
+/// rebalance moves as few copies as it can.)
+fn assert_balanced_placement(map: &Value, nodes: usize) {
+    let mut counts = vec![0usize; nodes];
+    for replicas in map["replicas"].as_array().unwrap() {
+        let replicas = replicas.as_array().unwrap();
+        let distinct: std::collections::HashSet<_> = replicas.iter().collect();
+        assert_eq!(distinct.len(), replicas.len(), "{map}");
+        for node in replicas {
+            counts[node.as_u64().unwrap() as usize] += 1;
+        }
+    }
+    let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+    assert!(
+        max - min <= 1,
+        "unbalanced copies per node {counts:?}: {map}"
+    );
+}
+
 /// Whether the planned placement keeps the first copy of every shard on `node`.
 fn planned_keeps_every_shard_on(planned: &Value, node: usize) -> bool {
     planned["replicas"]
@@ -7790,12 +7811,12 @@ async fn cluster_rebalance_converges_and_cleans_old_replicas() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // The planner moves the shards to the placement creation gave them.
+    // The planner moves the pinned shards to a balanced placement.
     let (status, map) = nodes[0]
         .post("/_node/_local/_dbs/reb/rebalance", json!({}))
         .await;
     assert_eq!(status, StatusCode::OK, "{map}");
-    assert_eq!(map["replicas"], planned["replicas"], "{map}");
+    assert_balanced_placement(&map, nodes.len());
     assert_ne!(map["version"], pinned["version"], "nothing moved: {map}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -17495,7 +17516,7 @@ async fn rebalance_keeps_reads_on_old_map_and_freezes_writes() {
 
     let (status, map) = nodes[0].get("/_node/_local/_dbs/rebread").await;
     assert_eq!(status, StatusCode::OK, "{map}");
-    assert_eq!(map["replicas"], planned["replicas"], "{map}");
+    assert_balanced_placement(&map, nodes.len());
 }
 
 /// Wait until writes to `db` through `node` are refused because a rebalance
