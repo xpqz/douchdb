@@ -311,6 +311,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Validators run user JavaScript, which must happen on the blocking pool;
+    /// the JavaScript entry point asserts it is not inside an async task.
+    #[tokio::test]
+    async fn validators_run_javascript_off_the_async_workers() {
+        let (db, root) = open("blocking", 1);
+        db.put_docs(
+            vec![json!({
+                "_id": "_design/v",
+                "validate_doc_update": "function (newDoc) { if (newDoc.bad) { throw {forbidden: 'no'}; } }"
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+        let functions = db.validation_functions().await.unwrap();
+        let mut docs = vec![json!({"_id": "ok"}), json!({"_id": "bad", "bad": true})];
+        let errors = validate_docs_with(&functions, &db, &mut docs, &principal())
+            .await
+            .unwrap();
+        assert!(errors[0].is_none());
+        assert_eq!(errors[1].as_ref().map(|e| e.status), Some(403));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A validator that calls `emit` itself breaks the one-row-per-document
     /// contract; each document is then run alone, as it always was.
     #[test]

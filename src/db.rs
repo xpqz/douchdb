@@ -2068,7 +2068,7 @@ impl Db {
                 // otherwise drop matching rows behind non-matching documents.
                 scanned_last = rows.last().map(|row| row.seq);
                 if let Some(filter) = &opts.filter {
-                    rows = apply_change_filter(rows, filter)?;
+                    rows = apply_change_filter(rows, filter).await?;
                 }
             }
         }
@@ -2155,7 +2155,7 @@ impl Db {
             }
             batch.sort_by_key(|row| row.seq);
             scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
-            matched.extend(apply_change_filter(batch, filter)?);
+            matched.extend(apply_change_filter(batch, filter).await?);
             if opts
                 .limit
                 .is_some_and(|limit| limit > 0 && matched.len() >= limit)
@@ -2326,7 +2326,7 @@ impl Db {
                                         done[slot] = true;
                                     }
                                     if let Some(filter) = &opts.filter {
-                                        match apply_change_filter(rows, filter) {
+                                        match apply_change_filter(rows, filter).await {
                                             Ok(filtered) => rows = filtered,
                                             Err(error) => {
                                                 yield Err(error);
@@ -4936,31 +4936,40 @@ fn finish_all_docs(rows: Vec<AllDocsRow>, total: usize, offset: usize) -> DbResu
     })
 }
 
-fn apply_change_filter(rows: Vec<ChangeRow>, filter: &ChangeFilter) -> DbResult<Vec<ChangeRow>> {
+/// Apply a `_changes` filter to one batch of rows. A JavaScript filter runs
+/// the whole batch in one go on the blocking pool, as view maps do.
+async fn apply_change_filter(
+    rows: Vec<ChangeRow>,
+    filter: &ChangeFilter,
+) -> DbResult<Vec<ChangeRow>> {
     match filter {
         ChangeFilter::Design => Ok(rows
             .into_iter()
             .filter(|row| row.id.starts_with("_design/"))
             .collect()),
         ChangeFilter::Js { source, query } => {
-            let docs: Vec<(String, String)> = rows
-                .iter()
-                .filter_map(|row| row.doc.clone().map(|doc| (row.id.clone(), doc)))
-                .collect();
-            if docs.is_empty() {
-                return Ok(Vec::new());
-            }
-            let matched = crate::viewfn::run_filter_json(
-                source,
-                query,
-                &docs,
-                crate::js::ViewLimits::default(),
-            )
-            .map_err(ApiError::from)?;
-            Ok(rows
-                .into_iter()
-                .filter(|row| matched.contains(&row.id))
-                .collect())
+            let (source, query) = (source.clone(), query.clone());
+            crate::view::blocking(move || {
+                let docs: Vec<(String, String)> = rows
+                    .iter()
+                    .filter_map(|row| row.doc.clone().map(|doc| (row.id.clone(), doc)))
+                    .collect();
+                if docs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let matched = crate::viewfn::run_filter_json(
+                    &source,
+                    &query,
+                    &docs,
+                    crate::js::ViewLimits::default(),
+                )
+                .map_err(ApiError::from)?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|row| matched.contains(&row.id))
+                    .collect())
+            })
+            .await
         }
     }
 }
@@ -5459,6 +5468,50 @@ mod tests {
             docs,
             r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}],"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}],"last_seq":1,"pending":1}"#
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A `_changes` filter runs user JavaScript, which must happen on the
+    /// blocking pool; the JavaScript entry point asserts it is not inside an
+    /// async task. Covers the ascending and descending paths.
+    #[tokio::test]
+    async fn changes_filters_run_javascript_off_the_async_workers() {
+        let (db, root) = single_shard_db("changes-filter-blocking").await;
+        db.put_docs(
+            (0..5)
+                .map(|n| json!({"_id": format!("d{n}"), "n": n}))
+                .collect(),
+            true,
+        )
+        .await
+        .unwrap();
+        let filter = ChangeFilter::Js {
+            source: "function (doc, req) { return doc.n % 2 === 0; }".to_string(),
+            query: "{}".to_string(),
+        };
+        let ids = |list: ChangesList| -> Vec<String> {
+            list.results.into_iter().map(|row| row.id).collect()
+        };
+        let ascending = db
+            .changes(&ChangesOpts {
+                filter: Some(filter.clone()),
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(ascending), ["d0", "d2", "d4"]);
+        let descending = db
+            .changes(&ChangesOpts {
+                filter: Some(filter.clone()),
+                include_docs: true,
+                descending: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(descending), ["d4", "d2", "d0"]);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
