@@ -5463,6 +5463,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A `_changes` filter runs user JavaScript, which must happen on the
+    /// blocking pool; the JavaScript entry point asserts it is not inside an
+    /// async task. Covers the ascending and descending paths.
+    #[tokio::test]
+    async fn changes_filters_run_javascript_off_the_async_workers() {
+        let (db, root) = single_shard_db("changes-filter-blocking").await;
+        db.put_docs(
+            (0..5).map(|n| json!({"_id": format!("d{n}"), "n": n})).collect(),
+            true,
+        )
+        .await
+        .unwrap();
+        let filter = ChangeFilter::Js {
+            source: "function (doc, req) { return doc.n % 2 === 0; }".to_string(),
+            query: "{}".to_string(),
+        };
+        let ids = |list: ChangesList| -> Vec<String> {
+            list.results.into_iter().map(|row| row.id).collect()
+        };
+        let ascending = db
+            .changes(&ChangesOpts {
+                filter: Some(filter.clone()),
+                include_docs: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(ascending), ["d0", "d2", "d4"]);
+        let descending = db
+            .changes(&ChangesOpts {
+                filter: Some(filter.clone()),
+                include_docs: true,
+                descending: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(descending), ["d4", "d2", "d0"]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `_all_docs` rows serialize as `id`, `key`, `value`, then `doc`; a keyed
     /// read answers `not_found` rows and `doc: null` for deleted documents.
     #[tokio::test]

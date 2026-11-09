@@ -1932,9 +1932,54 @@ const CHANGES_PAGE: usize = 1000;
 pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> DbResult<T> + Send + 'static,
 ) -> DbResult<T> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| ApiError::new(500, "view_error", format!("view task failed: {error}")))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(debug_assertions)]
+        let _mark = blocking_mark::enter();
+        work()
+    })
+    .await
+    .map_err(|error| ApiError::new(500, "view_error", format!("view task failed: {error}")))?
+}
+
+/// Debug-build check that user JavaScript runs on the blocking pool. Tokio
+/// gives blocking-pool threads the same runtime context as async workers, so
+/// the two cannot be told apart from outside; [`blocking`] marks its threads.
+#[cfg(debug_assertions)]
+mod blocking_mark {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MARKED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Mark;
+
+    pub(super) fn enter() -> Mark {
+        MARKED.with(|marked| marked.set(true));
+        Mark
+    }
+
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            MARKED.with(|marked| marked.set(false));
+        }
+    }
+
+    /// Whether the thread may run user JavaScript: it is outside any Tokio
+    /// runtime (a plain thread, a sandbox worker), or marked by [`enter`].
+    pub(super) fn allows_javascript() -> bool {
+        tokio::runtime::Handle::try_current().is_err() || MARKED.with(Cell::get)
+    }
+}
+
+/// Panic, in debug builds, if user JavaScript is about to run on an async
+/// runtime worker rather than on the blocking pool.
+pub(crate) fn debug_assert_off_runtime_workers() {
+    #[cfg(debug_assertions)]
+    assert!(
+        blocking_mark::allows_javascript(),
+        "user JavaScript ran on an async runtime worker instead of the blocking pool"
+    );
 }
 
 pub(crate) async fn docs_by_ids(db: &Db, ids: &[String]) -> DbResult<HashMap<String, Value>> {
