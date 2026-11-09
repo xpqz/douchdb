@@ -6567,6 +6567,12 @@ async fn peer_trip_cluster(replication: usize) -> Vec<Server> {
         let (status, body) = nodes[0].get(path).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
+    // A startup discovery pass can probe a peer before it listens and mark it
+    // down, and a replica read skips nodes marked down (#151); measure only
+    // once node 0 sees every peer up.
+    for peer in &nodes[1..] {
+        wait_until_known_up(&nodes[0], &peer.base).await;
+    }
     nodes
 }
 
