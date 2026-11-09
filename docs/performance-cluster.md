@@ -299,7 +299,7 @@ correct keys, a range window and a cluster-wide offset.
 
 Each database now carries a mem3-style shard map: one ordered replica list per
 shard, persisted as `shard-map.json` and cached in memory. It defaults to the
-rendezvous placement, and all routing, anti-entropy filters and owner filters
+balanced mem3-style placement (#77), and all routing, anti-entropy filters and owner filters
 read it.
 
 Inspect it on any node:

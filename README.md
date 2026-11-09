@@ -556,8 +556,10 @@ router; there is no coordinator role.
   `PUT /db?q=8&n=2` as in CouchDB, otherwise `--q` and `--n`. `GET /db`
   reports them in `cluster`, with the default write and read quorums
   (`n/2 + 1`) that writes and reads to that database use.
-- `md5(docid)` selects the shard; rendezvous hashing over the node list selects
-  `--n` distinct replicas, in preference order. The first is the primary.
+- `md5(docid)` selects the shard. A new database's shard copies are dealt
+  round-robin over the sorted node list, as CouchDB's mem3 does, starting at a
+  node chosen from the database name, so every node holds within one copy of
+  the same number. The first replica of a shard is its primary.
 - A write is sent to every replica in the shard set and returns once the
   requested quorum acknowledges; the remaining writes continue detached. Reads
   fan out to the replica set and enforce the requested read quorum; `?r=1` is the
@@ -658,8 +660,9 @@ served per protocol under `http.internal_requests` in
 
 - **Static membership.** There is no gossip or automatic join. Discovery
   reports peers and drift, but it does not change placement. To change the
-  node list, restart every node with the new list. Rendezvous hashing and
-  anti-entropy copy data to new replicas; `rebalance` verifies
+  node list, restart every node with the new list, then `rebalance`: it keeps
+  every copy it can and moves only enough to re-home copies from departed
+  nodes and even out per-node counts. Anti-entropy copies the data; `rebalance` verifies
   revision-metadata digests before activation, and destructive cleanup requires
   `?cleanup=true`.
 - **AP by default, but not unconditionally available.** Concurrent writes
