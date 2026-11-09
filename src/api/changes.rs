@@ -20,18 +20,16 @@ fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
 }
 
 /// CouchDB's `_changes` rejects a malformed `since` rather than reading it as
-/// 0: it must be `now`, a non-negative integer or an opaque sequence token
-/// (`N-<base64>`). douchdb's own cluster tokens decode through `decode_since`.
-fn validate_since(raw: &str) -> DbResult<()> {
-    let opaque = raw.split_once('-').is_some_and(|(seq, token)| {
-        !seq.is_empty()
-            && seq.bytes().all(|b| b.is_ascii_digit())
-            && !token.is_empty()
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    });
-    if raw == "now" || raw.parse::<u64>().is_ok() || opaque || decode_since(raw).is_some() {
+/// 0 (`validate_start_seq`, fabric_view_changes.erl): it must be `now`, the
+/// unquoted `0` or an opaque sequence token (`N-<base64>`) that decodes.
+/// Any other plain integer is malformed too. A peer node's own requests keep
+/// passing the plain per-node sequences the shards use.
+fn validate_since(raw: &str, local_only: bool) -> DbResult<()> {
+    if raw == "now"
+        || raw == "0"
+        || decode_since(raw).is_some()
+        || (local_only && raw.parse::<u64>().is_ok())
+    {
         return Ok(());
     }
     Err(ApiError::bad_request(
@@ -110,7 +108,7 @@ async fn parse_feed(
         }
     };
     if let Some(raw) = q.get("since") {
-        validate_since(raw)?;
+        validate_since(raw, local_only)?;
     }
     let timeout = changes_timeout(q)?;
     let heartbeat = changes_heartbeat(q)?;
@@ -138,6 +136,24 @@ async fn parse_feed(
 /// `st` and `db` are the owned handles behind `req`: a streaming feed outlives
 /// the handler, so it needs `Arc`s rather than the borrows in the request.
 pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) -> Response {
+    // `last-event-id` is another name for `since`, and an eventsource
+    // client's `Last-Event-ID` header (a browser reconnecting) wins over both
+    // (`parse_changes_query` in chttpd_db.erl).
+    let mut req = req;
+    let from_header = match req.headers.get("last-event-id") {
+        Some(value) if req.q.get("feed").map(String::as_str) == Some("eventsource") => {
+            value.to_str().ok().map(str::to_string)
+        }
+        _ => None,
+    };
+    let resume = from_header.or_else(|| req.q.get("last-event-id").cloned());
+    let resumed_query;
+    if let Some(since) = resume {
+        let mut query = req.q.clone();
+        query.insert("since".to_string(), since);
+        resumed_query = query;
+        req.q = &resumed_query;
+    }
     let (feed, opts) = match parse_feed(&st, &db, req.q, req.headers).await {
         Ok(parsed) => parsed,
         Err(error) => return fail(error),
@@ -227,7 +243,7 @@ fn changes_continuous(
                         last_sent = Some(row.seq.clone());
                         sent_here += 1;
                         let json = serde_json::to_vec(&row).unwrap_or_default();
-                        let line = feed_line(&json, eventsource);
+                        let line = feed_line(&json, eventsource, Some(&row.seq));
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                         sent += 1;
                     }
@@ -243,7 +259,7 @@ fn changes_continuous(
                         "reason": error.reason,
                     }))
                     .unwrap_or_default();
-                    let line = feed_line(&json, eventsource);
+                    let line = feed_line(&json, eventsource, None);
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                     break;
                 }
@@ -427,13 +443,21 @@ async fn wait_for_commit(
     }
 }
 
-/// One feed entry: an SSE `data:` event for `eventsource`, else a JSON line.
-fn feed_line(json: &[u8], eventsource: bool) -> Vec<u8> {
-    if eventsource {
-        [b"data: ".as_slice(), json, b"\n\n"].concat()
-    } else {
-        [json, b"\n"].concat()
+/// One feed entry: an SSE event for `eventsource`, else a JSON line. A change's
+/// event ends with `id: <seq>` as in CouchDB, so a reconnecting client can send
+/// it back as `Last-Event-ID`.
+fn feed_line(json: &[u8], eventsource: bool, seq: Option<&Seq>) -> Vec<u8> {
+    if !eventsource {
+        return [json, b"\n"].concat();
     }
+    let mut line = [b"data: ".as_slice(), json, b"\n"].concat();
+    if let Some(seq) = seq {
+        line.extend_from_slice(b"id: ");
+        line.extend_from_slice(&serde_json::to_vec(seq).unwrap_or_default());
+        line.push(b'\n');
+    }
+    line.push(b'\n');
+    line
 }
 
 async fn changes_normal_raw(
@@ -464,7 +488,8 @@ async fn changes_normal_raw(
     let (mut opts, mut progress) = changes_options(st, db, q, body, headers, local_only)
         .await
         .ok()?;
-    let rewrite = local_mask.is_some();
+    // A client sees opaque tokens; a peer's own reads stay plain shard seqs.
+    let rewrite = !local_only;
     if let Some(mask) = local_mask {
         opts.owned = Some(mask);
     }
@@ -484,8 +509,8 @@ async fn changes_normal_raw(
                 Ok(ChangesItem::Row(row)) => row,
                 Ok(ChangesItem::Scanned(seq)) => {
                     last_seq = seq;
-                    if rewrite {
-                        progress[me] = seq;
+                    if let Some(slot) = progress.get_mut(me) {
+                        *slot = seq;
                     }
                     continue;
                 }
@@ -495,14 +520,19 @@ async fn changes_normal_raw(
                 }
             };
             last_seq = row.seq;
-            if rewrite {
-                progress[me] = row.seq;
-            }
+            let seq = if rewrite {
+                if let Some(slot) = progress.get_mut(me) {
+                    *slot = row.seq;
+                }
+                format!("\"{}\"", crate::fabric::encode_since(&progress))
+            } else {
+                row.seq.to_string()
+            };
             if !first {
                 buffer.push(',');
             }
             first = false;
-            buffer.push_str(&Db::change_row_json(&row));
+            buffer.push_str(&Db::change_row_json(&row, &seq));
             if buffer.len() >= 64 * 1024 {
                 yield Ok(Bytes::from(std::mem::take(&mut buffer)));
             }
@@ -626,8 +656,25 @@ async fn changes_once(
         .await;
     }
 
-    let (opts, _) = changes_options(st, db, q, body, headers, local_only).await?;
-    db.changes(&opts).await
+    let (opts, progress) = changes_options(st, db, q, body, headers, local_only).await?;
+    let mut list = db.changes(&opts).await?;
+    if !local_only {
+        // The sequences a client gets are opaque, as in CouchDB 3, where even
+        // one node is a cluster; a peer's own reads stay plain shard seqs.
+        let me = st.ctx.cluster.me;
+        let token = |seq: &mut Seq| {
+            if let Seq::Num(num) = *seq {
+                let mut vector = progress.clone();
+                if let Some(slot) = vector.get_mut(me) {
+                    *slot = num;
+                }
+                *seq = Seq::Token(crate::fabric::encode_since(&vector));
+            }
+        };
+        token(&mut list.last_seq);
+        list.results.iter_mut().for_each(|row| token(&mut row.seq));
+    }
+    Ok(list)
 }
 
 /// `changes_once` calls per database name, so a test can tell whether an idle

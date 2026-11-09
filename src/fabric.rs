@@ -2929,39 +2929,80 @@ pub(crate) fn encode_since(vector: &[u64]) -> String {
     encode_token(vector, &[])
 }
 
-/// A since token: the per-node vector, then `~node:shard.shard:seq` for each
-/// fallback mark.
+/// The sequence a standalone or local read reports: this node's `seq` in its
+/// slot of a vector, in the same opaque form a cluster feed uses.
+pub(crate) fn encode_local_seq(cluster: &crate::cluster::Cluster, seq: u64) -> String {
+    let mut vector = vec![0; cluster.nodes.len().max(1)];
+    if let Some(slot) = vector.get_mut(cluster.me) {
+        *slot = seq;
+    }
+    encode_since(&vector)
+}
+
+/// A sequence token as CouchDB writes one (`pack_seqs` in
+/// fabric_view_changes.erl): `<sum>-<base64url>`. The sum is only a hint for
+/// people; the opaque part is the per-node vector (`v1:` and the node
+/// sequences, comma separated), then `~node:shard.shard:seq` for each fallback
+/// mark.
 pub(crate) fn encode_token(vector: &[u64], marks: &[FallbackMark]) -> String {
+    use base64::Engine as _;
     use std::fmt::Write as _;
 
-    // This runs once per change row in a cluster feed. The old form was
-    // base64(JSON) and allocated a map plus a base64 buffer for every row.
-    // `v1:` is an opaque token to clients.
-    let mut out = String::with_capacity(3 + vector.len() * 12);
-    out.push_str("v1:");
+    // This runs once per change row in a feed, so it builds the body in one
+    // buffer.
+    let mut body = String::with_capacity(3 + vector.len() * 12);
+    body.push_str("v1:");
+    let mut sum = 0u64;
     for (index, seq) in vector.iter().enumerate() {
         if index > 0 {
-            out.push(',');
+            body.push(',');
         }
-        let _ = write!(out, "{seq}");
+        let _ = write!(body, "{seq}");
+        if *seq != UNKNOWN_SEQ {
+            sum = sum.saturating_add(*seq);
+        }
     }
     for mark in marks {
-        let _ = write!(out, "~{}:", mark.node);
+        let _ = write!(body, "~{}:", mark.node);
         for (index, shard) in mark.shards.iter().enumerate() {
             if index > 0 {
-                out.push('.');
+                body.push('.');
             }
-            let _ = write!(out, "{shard}");
+            let _ = write!(body, "{shard}");
         }
-        let _ = write!(out, ":{}", mark.seq);
+        let _ = write!(body, ":{}", mark.seq);
+        sum = sum.saturating_add(mark.seq);
     }
+    let mut out = String::with_capacity(24 + body.len() * 4 / 3);
+    let _ = write!(out, "{sum}-");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_string(body.as_bytes(), &mut out);
     out
 }
 
-/// The fallback marks of a `v1:` since token; malformed or out-of-cluster
+/// The text inside a token: what CouchDB's `unpack_seq_regex_match` keeps
+/// (surrounding quotes and the `<sum>-` prefix dropped), decoded. `None` for
+/// anything that is not one of our tokens.
+fn token_body(raw: &str) -> Option<String> {
+    use base64::Engine as _;
+
+    let raw = raw.trim_matches('"');
+    let opaque = match raw.split_once('-') {
+        Some((sum, rest)) if !sum.is_empty() && sum.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => raw,
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(opaque)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The fallback marks of a since token; malformed or out-of-cluster
 /// marks are dropped, which only makes that fallback start from the beginning.
 pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
-    let Some(rest) = raw.trim_matches('"').strip_prefix("v1:") else {
+    let Some(body) = token_body(raw) else {
+        return Vec::new();
+    };
+    let Some(rest) = body.strip_prefix("v1:") else {
         return Vec::new();
     };
     rest.split('~')
@@ -2984,10 +3025,11 @@ pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
         .collect()
 }
 
-/// Decodes a `v1:` since token into its per-node sequence vector. Anything
-/// else is not one of ours (`None`).
+/// Decodes a since token into its per-node sequence vector. Anything else is
+/// not one of ours (`None`).
 pub(crate) fn decode_since(raw: &str) -> Option<Vec<u64>> {
-    let rest = raw.trim_matches('"').strip_prefix("v1:")?;
+    let body = token_body(raw)?;
+    let rest = body.strip_prefix("v1:")?;
     let rest = rest.split('~').next().unwrap_or(rest);
     rest.split(',').map(|part| part.parse().ok()).collect()
 }
@@ -3501,11 +3543,18 @@ mod tests {
             seq: 42,
         }];
         let token = encode_token(&[5, 0, 7], &marks);
-        assert_eq!(token, "v1:5,0,7~1:0.3:42");
+        // CouchDB's shape: the sum of the sequences, then base64url.
+        let (sum, opaque) = token.split_once('-').unwrap();
+        assert_eq!(sum, "54");
+        assert!(opaque
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert_eq!(decode_since(&format!("\"{token}\"")), Some(vec![5, 0, 7]));
         assert_eq!(decode_since(&token), Some(vec![5, 0, 7]));
         assert_eq!(decode_fallbacks(&token, 3), marks);
         assert!(decode_fallbacks(&token, 1).is_empty());
-        assert!(decode_fallbacks("v1:5,0,7~x:1:2", 3).is_empty());
+        assert!(decode_fallbacks("v1:5,0,7~1:0.3:42", 3).is_empty());
+        assert_eq!(decode_since("v1:5,0,7"), None);
         assert!(decode_fallbacks("7", 3).is_empty());
     }
 

@@ -2356,9 +2356,7 @@ impl Db {
         }
     }
 
-    pub(crate) fn change_row_json(row: &ChangeRow) -> String {
-        use std::fmt::Write as _;
-
+    pub(crate) fn change_row_json(row: &ChangeRow, seq: &str) -> String {
         fn push_json_string(out: &mut String, value: &str) {
             if value
                 .bytes()
@@ -2374,7 +2372,7 @@ impl Db {
 
         let mut out = String::with_capacity(128);
         out.push_str("{\"seq\":");
-        let _ = write!(out, "{}", row.seq);
+        out.push_str(seq);
         out.push_str(",\"id\":");
         push_json_string(&mut out, &row.id);
         out.push_str(",\"changes\":[");
