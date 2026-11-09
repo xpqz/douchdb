@@ -10,6 +10,7 @@ use rusty_leveldb::{LdbIterator, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +130,22 @@ pub struct LatestChanges {
 
 const SEQ_BUCKET_BITS: u32 = 8;
 
+/// Where one partition's ids sit among the shard's live ids, kept current on
+/// every write so a partition's count and offsets are not recounted by
+/// walking the partition.
+struct PartitionRank {
+    /// The partition's key range: `[first, last)`, as `name:` to `name;`.
+    first: String,
+    last: String,
+    /// Live ids below `first`.
+    below: usize,
+    /// Live ids in the partition.
+    count: usize,
+}
+
+/// Partitions whose ranks a shard remembers.
+const PARTITION_RANKS: usize = 16;
+
 impl LatestChanges {
     pub fn insert(&mut self, id: String, seq: u64) {
         if let Some(old) = self.by_id.insert(id.clone(), seq) {
@@ -173,9 +190,14 @@ impl LatestChanges {
             .map(|(seq, id)| (*seq, id.as_str()))
     }
 
-    /// Every document, in sequence order.
-    pub fn all(&self) -> impl DoubleEndedIterator<Item = (u64, &str)> {
-        self.by_seq.iter().map(|(seq, id)| (*seq, id.as_str()))
+    /// Documents whose latest sequence is at or below `seq`, in sequence order.
+    pub fn through(&self, seq: u64) -> impl DoubleEndedIterator<Item = (u64, &str)> {
+        let end = seq.checked_add(1).map_or(Bound::Unbounded, |next| {
+            Bound::Excluded((next, String::new()))
+        });
+        self.by_seq
+            .range((Bound::Unbounded, end))
+            .map(|(seq, id)| (*seq, id.as_str()))
     }
 
     pub fn seq_of(&self, id: &str) -> Option<u64> {
@@ -361,6 +383,14 @@ pub struct Shard {
     /// is found by counting only the ids between the two keys. Kept in step
     /// with `live` on every write and dropped whenever `live` is.
     rank_cursor: Option<(String, usize)>,
+    /// Index entries this shard has walked to answer reads: change rows read
+    /// from the sequence index and ids counted to rank a key. Shared with the
+    /// shard's handle, so a request's cost can be judged by how many entries
+    /// it visited rather than by how long it took.
+    scanned: Arc<AtomicU64>,
+    /// Ranks of the partitions `_all_docs` was recently asked about. Dropped
+    /// whenever `live` is.
+    partition_ranks: Vec<PartitionRank>,
     /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
@@ -583,6 +613,8 @@ impl Shard {
             deleted,
             live: None,
             rank_cursor: None,
+            scanned: Arc::new(AtomicU64::new(0)),
+            partition_ranks: Vec::new(),
             latest: None,
             pending: Vec::new(),
             overlay: std::collections::HashMap::new(),
@@ -682,17 +714,78 @@ impl Shard {
         })
     }
 
-    /// Live document count for one partition, using the in-memory live map.
+    /// Live document count for one partition.
     pub fn partition_live_count(&mut self, partition: &str) -> Result<u64> {
+        Ok(self.partition_rank(partition)?.1 as u64)
+    }
+
+    /// How many live ids of `partition` come before `start` in the query's
+    /// direction: the offset of a partitioned `_all_docs` reply. `start` is
+    /// ranked from the previous rank, so paging by `startkey` costs the
+    /// distance moved, not the partition's size.
+    pub fn partition_offset(
+        &mut self,
+        partition: &str,
+        start: &str,
+        descending: bool,
+    ) -> Result<usize> {
+        let (below, count) = self.partition_rank(partition)?;
+        let rank = self.live_rank(start)?;
+        let on_start = usize::from(
+            self.live
+                .as_ref()
+                .is_some_and(|live| live.contains_key(start)),
+        );
+        Ok(if descending {
+            // Ids after `start`: all but those up to and including it.
+            let through = (rank + on_start).saturating_sub(below).min(count);
+            count - through
+        } else {
+            rank.saturating_sub(below).min(count)
+        })
+    }
+
+    /// `(live ids below the partition, live ids in it)`, found once by
+    /// walking the partition and then kept current by writes.
+    fn partition_rank(&mut self, partition: &str) -> Result<(usize, usize)> {
         let first = format!("{partition}:");
+        if let Some(known) = self
+            .partition_ranks
+            .iter()
+            .find(|known| known.first == first)
+        {
+            return Ok((known.below, known.count));
+        }
         let last = format!("{partition};");
+        let below = self.live_rank(&first)?;
         let live = self.live_docs()?;
-        Ok(live
+        let count = live
             .range::<str, _>((
-                std::ops::Bound::Included(first.as_str()),
-                std::ops::Bound::Excluded(last.as_str()),
+                Bound::Included(first.as_str()),
+                Bound::Excluded(last.as_str()),
             ))
-            .count() as u64)
+            .count();
+        self.add_scanned(count);
+        if self.partition_ranks.len() >= PARTITION_RANKS {
+            self.partition_ranks.remove(0);
+        }
+        self.partition_ranks.push(PartitionRank {
+            first,
+            last,
+            below,
+            count,
+        });
+        Ok((below, count))
+    }
+
+    /// Record `entries` index entries walked by a read.
+    pub fn add_scanned(&self, entries: usize) {
+        self.scanned.fetch_add(entries as u64, Ordering::Relaxed);
+    }
+
+    /// Share `counter` as this shard's scanned-entries count.
+    fn set_scan_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.scanned = counter;
     }
 
     /// Live and deleted document counts for one partition. The partition
@@ -743,6 +836,7 @@ impl Shard {
             })?;
             self.live = Some(live);
             self.rank_cursor = None;
+            self.partition_ranks.clear();
         }
         Ok(self.live.as_ref().expect("live index initialized"))
     }
@@ -756,21 +850,32 @@ impl Shard {
         let (Some(live), cursor) = (self.live.as_ref(), self.rank_cursor.take()) else {
             return Ok(0);
         };
-        let rank = match &cursor {
-            Some((from, rank)) if key == from.as_str() => *rank,
+        let (rank, walked) = match &cursor {
+            Some((from, rank)) if key == from.as_str() => (*rank, 0),
             Some((from, rank)) if key > from.as_str() => {
-                rank + live
+                let walked = live
                     .range::<str, _>((Excluded(from.as_str()), Excluded(key)))
-                    .count()
-                    + usize::from(live.contains_key(from.as_str()))
+                    .count();
+                (
+                    rank + walked + usize::from(live.contains_key(from.as_str())),
+                    walked,
+                )
             }
-            Some((from, rank)) => rank.saturating_sub(
-                live.range::<str, _>((Excluded(key), Excluded(from.as_str())))
-                    .count()
-                    + usize::from(live.contains_key(key)),
-            ),
-            None => live.range::<str, _>((Unbounded, Excluded(key))).count(),
+            Some((from, rank)) => {
+                let walked = live
+                    .range::<str, _>((Excluded(key), Excluded(from.as_str())))
+                    .count();
+                (
+                    rank.saturating_sub(walked + usize::from(live.contains_key(key))),
+                    walked,
+                )
+            }
+            None => {
+                let walked = live.range::<str, _>((Unbounded, Excluded(key))).count();
+                (walked, walked)
+            }
         };
+        self.scanned.fetch_add(walked as u64, Ordering::Relaxed);
         self.rank_cursor = Some((key.to_string(), rank));
         Ok(rank)
     }
@@ -1072,6 +1177,7 @@ impl Shard {
         }
         self.live = None;
         self.rank_cursor = None;
+        self.partition_ranks.clear();
         self.latest = None;
         Ok(())
     }
@@ -1293,6 +1399,18 @@ impl Shard {
                             }
                             _ => (live.remove(id).is_some(), false),
                         };
+                        if was_live != is_live {
+                            for known in &mut self.partition_ranks {
+                                let step = |n: &mut usize| {
+                                    *n = if is_live { *n + 1 } else { n.saturating_sub(1) }
+                                };
+                                if id < known.first.as_str() {
+                                    step(&mut known.below);
+                                } else if id < known.last.as_str() {
+                                    step(&mut known.count);
+                                }
+                            }
+                        }
                         if let Some((from, rank)) = self.rank_cursor.as_mut() {
                             if id < from.as_str() && was_live != is_live {
                                 if is_live {
@@ -1351,6 +1469,7 @@ impl Shard {
         self.deleted = mark.deleted;
         self.live = None;
         self.rank_cursor = None;
+        self.partition_ranks.clear();
         self.latest = None;
     }
 
@@ -1409,6 +1528,7 @@ impl Shard {
         self.overlay.clear();
         self.live = None;
         self.rank_cursor = None;
+        self.partition_ranks.clear();
         self.latest = None;
         self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
         self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
@@ -1458,6 +1578,7 @@ impl Shard {
         self.deleted = 0;
         self.live = None;
         self.rank_cursor = None;
+        self.partition_ranks.clear();
         self.latest = None;
         self.pending.clear();
         self.overlay.clear();
@@ -1575,6 +1696,8 @@ pub struct ShardHandle {
     /// Jobs submitted to this shard's actor since it opened. Each one is a
     /// cross-thread hop, so the count is the shard round-trip cost of a request.
     jobs: AtomicU64,
+    /// Index entries the shard has walked, shared with the shard.
+    scanned: Arc<AtomicU64>,
 }
 
 impl ShardHandle {
@@ -1595,6 +1718,8 @@ impl ShardHandle {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u64>>();
         let tracker = seq_tracker.clone();
+        let scanned = Arc::new(AtomicU64::new(0));
+        let shard_scanned = scanned.clone();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             // Open on this thread so the database never crosses threads.
             let mut shard = match Shard::open(&dir, revs_limit) {
@@ -1607,6 +1732,7 @@ impl ShardHandle {
             let initial_seq = shard.seq();
             tracker.store(initial_seq, Ordering::SeqCst);
             shard.set_seq_tracker(tracker.clone());
+            shard.set_scan_counter(shard_scanned);
             if ready_tx.send(Ok(initial_seq)).is_err() {
                 return;
             }
@@ -1644,7 +1770,13 @@ impl ShardHandle {
             seq_tracker,
             reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
             jobs: AtomicU64::new(0),
+            scanned,
         })
+    }
+
+    /// Index entries the shard has walked to answer reads so far.
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(Ordering::Relaxed)
     }
 
     /// Jobs submitted to this shard's actor so far.
@@ -2229,7 +2361,7 @@ mod scan_tests {
         // Scans that serve many documents skip the record and count it.
         let before = crate::metrics::corrupt_records_skipped();
         assert_eq!(live_ids(&mut shard), ["a"]);
-        assert_eq!(shard.latest_changes().unwrap().all().count(), 1);
+        assert_eq!(shard.latest_changes().unwrap().through(u64::MAX).count(), 1);
         assert_eq!(shard.partition_counts("p").unwrap(), (0, 0));
         assert!(crate::metrics::corrupt_records_skipped() >= before + 3);
         // The anti-entropy fingerprint must not paper over it.
@@ -2480,7 +2612,10 @@ mod scan_tests {
                     assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
                     assert_eq!(
                         latest.count_before(cursor),
-                        latest.all().take_while(|(seq, _)| *seq < cursor).count()
+                        latest
+                            .through(u64::MAX)
+                            .take_while(|(seq, _)| *seq < cursor)
+                            .count()
                     );
                 }
             }
@@ -2489,7 +2624,10 @@ mod scan_tests {
             assert_eq!(latest.count_after(cursor), latest.after(cursor).count());
             assert_eq!(
                 latest.count_before(cursor),
-                latest.all().take_while(|(seq, _)| *seq < cursor).count()
+                latest
+                    .through(u64::MAX)
+                    .take_while(|(seq, _)| *seq < cursor)
+                    .count()
             );
         }
     }
@@ -2515,7 +2653,11 @@ mod scan_tests {
         assert!(after(4).is_empty());
         assert!(after(u64::MAX).is_empty());
         assert_eq!(
-            latest.all().rev().map(|(seq, _)| seq).collect::<Vec<_>>(),
+            latest
+                .through(u64::MAX)
+                .rev()
+                .map(|(seq, _)| seq)
+                .collect::<Vec<_>>(),
             [4, 3, 2]
         );
         assert_eq!(latest.seq_of("a"), Some(4));

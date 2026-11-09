@@ -1207,6 +1207,12 @@ impl Db {
         self.shards.iter().map(ShardHandle::jobs).sum()
     }
 
+    /// Index entries this database's shards have walked to answer reads since
+    /// it opened: the work a request did, whatever the time it took.
+    pub fn shard_scanned(&self) -> u64 {
+        self.shards.iter().map(ShardHandle::scanned).sum()
+    }
+
     /// Highest sequence that is safe for a changes cursor to publish, taken
     /// as a snapshot **before** reading any shard.
     ///
@@ -2039,12 +2045,12 @@ impl Db {
         let mut rows;
         let scanned_last;
         match &opts.filter {
-            Some(filter) if !opts.descending => {
+            Some(filter) => {
                 (rows, scanned_last) = self
                     .filtered_changes(opts, filter, &selected, until)
                     .await?;
             }
-            _ => {
+            None => {
                 rows = Vec::new();
                 for index in selected {
                     let shard_opts = opts.clone();
@@ -2063,13 +2069,7 @@ impl Db {
                 if opts.descending {
                     rows.reverse();
                 }
-                // A descending filter is evaluated after merging shard rows
-                // so every shard is scanned: a shard-local limit would
-                // otherwise drop matching rows behind non-matching documents.
                 scanned_last = rows.last().map(|row| row.seq);
-                if let Some(filter) = &opts.filter {
-                    rows = apply_change_filter(rows, filter).await?;
-                }
             }
         }
         if let Some(limit) = opts.limit {
@@ -2090,9 +2090,11 @@ impl Db {
         Ok((rows, last_seq))
     }
 
-    /// An ascending filtered read: scans each shard a page at a time and merges
-    /// the pages in sequence order, filtering as it goes, until `limit` rows
-    /// match or every shard is exhausted. No single shard job loads more than
+    /// A filtered read: scans each shard a page at a time, from `since` up or
+    /// from the newest change down, and merges the pages in sequence order,
+    /// filtering as it goes, until `limit` rows match or every shard is
+    /// exhausted. A descending read stops after the newest matches instead of
+    /// reading the whole feed. No single shard job loads more than
     /// a page of rows (with bodies, for a JS filter). Returns the matching
     /// rows and the last sequence scanned.
     async fn filtered_changes(
@@ -2111,7 +2113,16 @@ impl Db {
             Some(limit) => limit.clamp(64, 1024),
             None => 1024,
         };
-        let mut cursors = vec![opts.since; selected.len()];
+        // Where each shard's next page starts: after this sequence going up,
+        // at or below it going down.
+        let mut cursors = vec![
+            if opts.descending {
+                u64::MAX
+            } else {
+                opts.since
+            };
+            selected.len()
+        ];
         let mut done = vec![false; selected.len()];
         let mut buffers: Vec<VecDeque<ChangeRow>> =
             (0..selected.len()).map(|_| VecDeque::new()).collect();
@@ -2125,35 +2136,61 @@ impl Db {
                 let mut shard_opts = opts.clone();
                 shard_opts.since = cursors[slot];
                 shard_opts.limit = Some(page);
+                let bound = if opts.descending {
+                    cursors[slot]
+                } else {
+                    until
+                };
                 let rows = self.shards[index]
-                    .call(move |s| collect_changes(s, &shard_opts, until))
+                    .call(move |s| collect_changes(s, &shard_opts, bound))
                     .await?;
                 match rows.last() {
                     // A page can come back short when unreadable records are
                     // skipped, so only an empty one ends the shard.
                     None => done[slot] = true,
+                    Some(last) if opts.descending => {
+                        // Sequence 0 is never allocated, so a page reaching it
+                        // is the shard's last.
+                        match last.seq.checked_sub(1) {
+                            Some(next) => cursors[slot] = next,
+                            None => done[slot] = true,
+                        }
+                    }
                     Some(last) => cursors[slot] = last.seq,
                 }
                 buffers[slot].extend(rows);
             }
-            // Everything up to the lowest buffered tail is complete: no shard
-            // can still produce a row below it.
-            let Some(cutoff) = buffers
+            // Everything up to the lowest buffered tail (the highest going
+            // down) is complete: no shard can still produce a row beyond it.
+            let tails = buffers
                 .iter()
                 .zip(&done)
                 .filter(|(_, done)| !**done)
-                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq))
-                .min()
-            else {
+                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq));
+            let Some(cutoff) = (if opts.descending {
+                tails.max()
+            } else {
+                tails.min()
+            }) else {
                 break;
+            };
+            let reached = |seq: u64| {
+                if opts.descending {
+                    seq >= cutoff
+                } else {
+                    seq <= cutoff
+                }
             };
             let mut batch = Vec::new();
             for buffer in &mut buffers {
-                while buffer.front().is_some_and(|row| row.seq <= cutoff) {
+                while buffer.front().is_some_and(|row| reached(row.seq)) {
                     batch.extend(buffer.pop_front());
                 }
             }
             batch.sort_by_key(|row| row.seq);
+            if opts.descending {
+                batch.reverse();
+            }
             scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
             matched.extend(apply_change_filter(batch, filter).await?);
             if opts
@@ -4582,28 +4619,18 @@ fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) ->
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);
     };
-    // Without a partition the rank comes from the shard's cursor, so paging by
-    // `startkey` does not recount every id before it on each request.
-    let ranked = match &opts.partition {
-        None => Some(shard.live_rank(start)?),
-        Some(_) => None,
-    };
+    // The rank comes from the shard's cursor, so paging by `startkey` does not
+    // recount every id before it on each request.
+    if let Some(partition) = &opts.partition {
+        return Ok(shard.partition_offset(partition, start, opts.descending)?);
+    }
+    let rank = shard.live_rank(start)?;
     let live = shard.live_docs()?;
-    let prefix = opts.partition.as_ref().map(|p| format!("{p}:"));
-    let in_partition = |id: &str| prefix.as_deref().map(|p| id.starts_with(p)).unwrap_or(true);
-    Ok(match (opts.descending, ranked) {
-        (false, None) => live
-            .range::<str, _>((Bound::Unbounded, Bound::Excluded(start)))
-            .filter(|(id, _)| in_partition(id))
-            .count(),
-        (true, None) => live
-            .range::<str, _>((Bound::Excluded(start), Bound::Unbounded))
-            .filter(|(id, _)| in_partition(id))
-            .count(),
-        (false, Some(rank)) => rank,
-        (true, Some(rank)) => live
-            .len()
-            .saturating_sub(rank + usize::from(live.contains_key(start))),
+    Ok(if opts.descending {
+        live.len()
+            .saturating_sub(rank + usize::from(live.contains_key(start)))
+    } else {
+        rank
     })
 }
 
@@ -4974,19 +5001,14 @@ async fn apply_change_filter(
     }
 }
 
-/// Change rows from one shard. An ascending read stops at sequence `until`.
+/// Change rows from one shard. An ascending read stops at sequence `until`; a
+/// descending one starts at it, so a caller pages back by lowering it.
 fn collect_changes(
     shard: &mut crate::store::Shard,
     opts: &ChangesOpts,
     until: u64,
 ) -> DbResult<Vec<ChangeRow>> {
-    // A descending feed has no cursor to resume a filtered scan from, so it
-    // still reads every row; ascending callers page by `since` and `limit`.
-    let limit = if opts.filter.is_some() && opts.descending {
-        usize::MAX
-    } else {
-        opts.limit.unwrap_or(usize::MAX)
-    };
+    let limit = opts.limit.unwrap_or(usize::MAX);
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -5002,7 +5024,13 @@ fn collect_changes(
             let mut selected: Vec<(u64, String)> = ids
                 .iter()
                 .filter_map(|id| latest.seq_of(id).map(|seq| (seq, id.clone())))
-                .filter(|(seq, _)| opts.descending || (*seq > opts.since && *seq <= until))
+                .filter(|(seq, _)| {
+                    if opts.descending {
+                        *seq <= until
+                    } else {
+                        *seq > opts.since && *seq <= until
+                    }
+                })
                 .collect();
             selected.sort();
             selected.dedup();
@@ -5013,7 +5041,7 @@ fn collect_changes(
             selected
         }
         None if opts.descending => latest
-            .all()
+            .through(until)
             .rev()
             .take(limit)
             .map(|(seq, id)| (seq, id.to_string()))
@@ -5026,6 +5054,7 @@ fn collect_changes(
             .collect(),
     };
 
+    shard.add_scanned(candidates.len());
     let mut rows = Vec::with_capacity(candidates.len());
     for (seq, id) in candidates {
         let meta = shard.get_meta(&id).map_err(ApiError::from);
@@ -6600,6 +6629,182 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn scan_db(root: &std::path::Path, name: &str, q: u32, partitioned: bool) -> Db {
+        Db::open(
+            root,
+            name,
+            DbConfig {
+                q,
+                revs_limit: 100,
+                shard_map: ShardMap::single(q),
+                partitioned,
+            },
+        )
+        .unwrap()
+    }
+
+    fn descending_design_changes(limit: Option<usize>) -> ChangesOpts {
+        ChangesOpts {
+            since: 0,
+            limit,
+            include_docs: false,
+            style_all_docs: false,
+            descending: true,
+            doc_ids: None,
+            filter: Some(ChangeFilter::Design),
+            conflicts: false,
+            owned: None,
+            until: None,
+        }
+    }
+
+    /// A descending filtered feed reports the lowest sequence it scanned when
+    /// it runs out of documents, the last row's when it stops at its limit,
+    /// and counts the documents older than that as pending.
+    #[tokio::test]
+    async fn descending_filtered_changes_report_last_seq_and_pending() {
+        let root = std::env::temp_dir().join(format!("douchdb-descf-{}", crate::util::uuid()));
+        let db = scan_db(&root, "descf", 2, false);
+        // Sequences 1..=30; the design documents are 5, 12 and 25.
+        let docs: Vec<Value> = (1..=30)
+            .map(|i| match i {
+                5 | 12 | 25 => json!({"_id": format!("_design/d{i}")}),
+                _ => json!({"_id": format!("doc{i:02}")}),
+            })
+            .collect();
+        for doc in docs {
+            db.put_docs(vec![doc], true).await.unwrap();
+        }
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25]);
+        assert_eq!((last_seq, pending), (25, 24));
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(2)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12]);
+        assert_eq!((last_seq, pending), (12, 11));
+
+        // Fewer matches than the limit: the whole feed was scanned.
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(Some(10)))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
+        assert_eq!((last_seq, pending), (1, 0));
+
+        let (rows, last_seq, pending) = db
+            .changes_rows(&descending_design_changes(None))
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
+        assert_eq!((last_seq, pending), (1, 0));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The newest changes are read first, so a descending filtered feed with a
+    /// small limit visits about a page of the sequence index however many
+    /// documents the database holds.
+    #[tokio::test]
+    async fn descending_filtered_changes_visit_entries_independent_of_size() {
+        let mut visited = Vec::new();
+        for n in [300usize, 3000] {
+            let root = std::env::temp_dir().join(format!("douchdb-descv-{}", crate::util::uuid()));
+            let db = scan_db(&root, "descv", 2, false);
+            let docs: Vec<Value> = (0..n).map(|i| json!({"_id": format!("d{i}")})).collect();
+            db.put_docs(docs, true).await.unwrap();
+            db.put_docs(vec![json!({"_id": "_design/newest"})], true)
+                .await
+                .unwrap();
+            // Build the sequence index first: only the read is measured.
+            db.changes_rows(&descending_design_changes(Some(1)))
+                .await
+                .unwrap();
+
+            let before = db.shard_scanned();
+            let (rows, _, _) = db
+                .changes_rows(&descending_design_changes(Some(1)))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            visited.push(db.shard_scanned() - before);
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        // One page per shard at most.
+        assert!(
+            visited.iter().all(|&v| v <= 128),
+            "entries visited for n=300 and n=3000: {visited:?}"
+        );
+    }
+
+    /// Paging a partition's `_all_docs` by `startkey` ranks each start from the
+    /// previous one, so the offset costs the distance between the two, not the
+    /// partition's size, and the partition's count is not recounted.
+    #[tokio::test]
+    async fn partitioned_all_docs_offset_visits_entries_independent_of_size() {
+        let mut visited = Vec::new();
+        for n in [500usize, 5000] {
+            let root = std::env::temp_dir().join(format!("douchdb-partv-{}", crate::util::uuid()));
+            let db = scan_db(&root, "partv", 1, true);
+            let mut docs: Vec<Value> = (0..n)
+                .map(|i| json!({"_id": format!("p:{i:05}")}))
+                .collect();
+            docs.extend((0..10).map(|i| json!({"_id": format!("o:{i}")})));
+            docs.extend((0..10).map(|i| json!({"_id": format!("q:{i}")})));
+            db.put_docs(docs, true).await.unwrap();
+            let query = |start: usize, descending: bool| AllDocsOpts {
+                partition: Some("p".into()),
+                startkey: Some(format!("p:{start:05}")),
+                descending,
+                limit: 1,
+                ..Default::default()
+            };
+            // Warm the cursor deep in the partition.
+            db.all_docs(&query(n - 100, false)).await.unwrap();
+
+            let before = db.shard_scanned();
+            let list = db.all_docs(&query(n - 95, false)).await.unwrap();
+            assert_eq!(
+                (list.total_rows, list.offset),
+                (Some(n as u64), Some(n as u64 - 95))
+            );
+            let list = db.all_docs(&query(n - 90, true)).await.unwrap();
+            assert_eq!((list.total_rows, list.offset), (Some(n as u64), Some(89)));
+            visited.push(db.shard_scanned() - before);
+
+            // Writes before the cursor keep later offsets exact.
+            db.put_docs(vec![json!({"_id": "p:00000a"})], true)
+                .await
+                .unwrap();
+            let rev = db.get_doc("p:00001", &DocOpts::default()).await.unwrap();
+            db.put_docs(
+                vec![json!({"_id": "p:00001", "_rev": rev["_rev"], "_deleted": true})],
+                true,
+            )
+            .await
+            .unwrap();
+            let list = db.all_docs(&query(n - 95, false)).await.unwrap();
+            assert_eq!(
+                (list.total_rows, list.offset),
+                (Some(n as u64), Some(n as u64 - 95))
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        assert!(
+            visited.iter().all(|&v| v <= 50),
+            "entries visited for n=500 and n=5000: {visited:?}"
+        );
     }
 
     /// The `GET /db` body is the serialized `info()` result: its field order
