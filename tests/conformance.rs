@@ -13911,9 +13911,7 @@ async fn js_sandboxes_agree_on_view_rows() {
 fn sandbox_servers() -> Vec<Server> {
     let start = |extra: &[&str]| {
         let mut args: Vec<String> = extra.iter().map(|arg| arg.to_string()).collect();
-        args.extend(
-            ["--view-memory-mb", "256", "--view-timeout-ms", "600000"].map(str::to_string),
-        );
+        args.extend(["--view-memory-mb", "256", "--view-timeout-ms", "600000"].map(str::to_string));
         let mut server = Server::start_with(&args, false);
         // Producing 17 MiB of output is slow in an unoptimised wasm
         // interpreter: wait for the answer instead of the default client's 60 s.
@@ -13991,7 +13989,8 @@ async fn js_sandboxes_agree_on_oversize_emitted_output() {
     .await;
     for (status, body) in &responses {
         assert!(
-            body.to_string().contains("bytes of output (limit 16777216)"),
+            body.to_string()
+                .contains("bytes of output (limit 16777216)"),
             "native should refuse the output: {status} {body}"
         );
     }

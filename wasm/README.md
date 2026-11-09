@@ -6,7 +6,17 @@ wrappers as the native view/search code: `wasm/js/map.js`, `index.js` and
 host (`src/view.rs`, `src/search.rs`) and the runner. The placeholder
 `__DOUCHDB_SOURCE__` is replaced by the user's function. The wrappers return
 per-document results only; the runner pairs them with the document ids the host
-sent. Changing a `.js` file changes the runner: rebuild it. The host compiles it once, gives it a
+sent. `wasm/limits.rs` is shared the same way (a `#[path]` module in `src/js.rs`
+and in the runner): the 16 MiB output limit with its error text, and the
+batch sizes. The runner re-batches the documents of a request at the native
+engine's batch sizes and applies the output limit per batch, and it words its
+errors as the native engine does (`compile: ...` for the wrapper, the first
+document id of the batch for a map or index call), so a function behaves alike
+in every sandbox. The runner is built with `panic = "abort"` (this target
+cannot unwind): a panic prints the native `... panicked: ...` error to stdout
+from a panic hook and then traps, and the host prefers that text to the bare
+trap. Changing a `.js` file or `limits.rs` changes the runner: rebuild it.
+The host compiles it once, gives it a
 request on stdin and reads a JSON response from stdout. It has no filesystem or
 network capabilities: the WASI context has no preopens, environment or args,
 and the host grants only the request/stdout pipes plus WASI clock/random,
@@ -58,7 +68,7 @@ default-on `wasm` cargo feature; `--no-default-features` builds without wasmi.
 Expected artifact checksum for the checked-in binary:
 
 ```text
-a4c599be2f47925993a319d4ff847c7f70f93f8e2c6dc6b1a05905879b5978fc  qjs-runner.wasm
+1786b747d8e470872ee24c604176c903818bc827512444e62b99cddb5f951e58  qjs-runner.wasm
 ```
 
 `wasm/qjs-runner.sha256` is the manifest checked by the unit test:
