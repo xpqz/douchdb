@@ -5020,6 +5020,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// `_local_docs` rows serialize as `_all_docs` rows do, with null
+    /// `total_rows` and `offset` and `not_found` rows for absent keys.
+    #[tokio::test]
+    async fn local_docs_serialize_in_wire_order() {
+        let (db, root) = single_shard_db("local-wire").await;
+        db.local_put("a", json!({"x": 1})).await.unwrap();
+        db.local_put("b", json!({"y": [true, null]})).await.unwrap();
+        let text = |listing: DbResult<_>| -> String {
+            serde_json::to_string(&serde_json::to_value::<&_>(&listing.unwrap()).unwrap()).unwrap()
+        };
+        let plain = text(db.local_docs(&AllDocsOpts::default()).await);
+        assert_eq!(
+            plain,
+            r#"{"total_rows":null,"offset":null,"rows":[{"id":"_local/a","key":"_local/a","value":{"rev":"0-1"}},{"id":"_local/b","key":"_local/b","value":{"rev":"0-1"}}]}"#
+        );
+        let keyed = text(
+            db.local_docs(&AllDocsOpts {
+                include_docs: true,
+                keys: Some(vec![json!("_local/b"), json!("_local/zz"), json!("_local/a")]),
+                ..Default::default()
+            })
+            .await,
+        );
+        assert_eq!(
+            keyed,
+            r#"{"total_rows":null,"offset":null,"rows":[{"id":"_local/b","key":"_local/b","value":{"rev":"0-1"},"doc":{"y":[true,null],"_id":"_local/b","_rev":"0-1"}},{"key":"_local/zz","error":"not_found"},{"id":"_local/a","key":"_local/a","value":{"rev":"0-1"},"doc":{"x":1,"_id":"_local/a","_rev":"0-1"}}]}"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_corrupt_local_document_is_an_error_not_missing() {
         let (db, root) = single_shard_db("local-corrupt").await;
