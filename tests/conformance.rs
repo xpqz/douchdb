@@ -1286,7 +1286,8 @@ async fn console_is_served_from_the_couchdb_api_origin() {
         .starts_with("text/html"));
     let html = response.text().await.unwrap();
     assert!(html.contains("id=\"app\""), "Vue mount point missing");
-    assert!(html.contains("vendor/vue.global.prod.js"));
+    assert!(html.contains("vendor/vue.runtime.global.prod.js"));
+    assert!(html.contains("render.js"));
     assert!(html.contains("data-testid=\"open-cluster\""));
     assert!(html.contains("data-testid=\"open-metrics\""));
     assert!(html.contains("data-testid=\"metrics-routes\""));
@@ -1329,7 +1330,10 @@ async fn console_is_served_from_the_couchdb_api_origin() {
 
     let response = s
         .client
-        .get(format!("{}/_utils/vendor/vue.global.prod.js", s.base))
+        .get(format!(
+            "{}/_utils/vendor/vue.runtime.global.prod.js",
+            s.base
+        ))
         .send()
         .await
         .unwrap();
