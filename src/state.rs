@@ -546,6 +546,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The per-name locks were never removed: one entry stayed for every
+    /// distinct name that was created, opened or dropped.
+    #[tokio::test]
+    async fn name_locks_are_removed_once_unused() {
+        let root = std::env::temp_dir().join(format!("douchdb-locks-{}", crate::util::uuid()));
+        let st = test_state(root.clone(), 2);
+        for n in 0..8 {
+            let name = format!("db{n}");
+            st.create_db(&name, false, None, None).await.unwrap();
+            st.db(&name).await.unwrap();
+        }
+        for n in 0..4 {
+            st.drop_db(&format!("db{n}")).await.unwrap();
+        }
+        // A drop of a name that never existed, and an open of one.
+        let _ = st.drop_db("never").await;
+        let _ = st.db("never").await;
+        // Closing an idle database releases its lock on the blocking pool, so
+        // wait for the map to drain rather than for a fixed time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let left = st.db_locks.lock().unwrap().len();
+            if left == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{left} name locks are still in the map"
+            );
+            tokio::task::yield_now().await;
+        }
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A database a request holds, or one that is being rebalanced, stays
     /// open past the cap; idle ones go.
     #[tokio::test]
