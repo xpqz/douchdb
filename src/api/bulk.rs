@@ -3,47 +3,54 @@
 
 use super::*;
 
-pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
-    let DbRequest {
-        st,
-        db,
-        name: dbname,
-        q,
-        body,
-        headers,
-        ..
-    } = req;
+/// The parsed `_bulk_docs` body.
+struct BulkBody {
+    new_edits: bool,
+    all_or_nothing: bool,
+    docs: Vec<Value>,
+}
+
+/// Parse and check the shape of a `_bulk_docs` body.
+fn parse_bulk_body(body: &[u8]) -> DbResult<BulkBody> {
     let Ok(mut value) = crate::json::from_slice(body) else {
-        return fail(ApiError::bad_request("invalid UTF-8 JSON"));
+        return Err(ApiError::bad_request("invalid UTF-8 JSON"));
     };
     let new_edits = match value.get("new_edits") {
         Some(Value::Bool(new_edits)) => *new_edits,
         Some(_) => {
-            return fail(ApiError::bad_request(
+            return Err(ApiError::bad_request(
                 "`new_edits` parameter must be a boolean.",
             ))
         }
         None => true,
     };
-    let Some(mut docs) = crate::json::take_array(&mut value, "docs") else {
-        return fail(ApiError::bad_request("Missing JSON list of 'docs'"));
+    let Some(docs) = crate::json::take_array(&mut value, "docs") else {
+        return Err(ApiError::bad_request("Missing JSON list of 'docs'"));
     };
     if !new_edits
         && docs
             .iter()
             .any(|doc| doc.get("_rev").is_none() && doc.get("_revisions").is_none())
     {
-        return fail(ApiError::bad_request(
+        return Err(ApiError::bad_request(
             "When `new_edits: false`, the document needs `_rev` or `_revisions` specified",
         ));
     }
-    if let Some(response) = require_design_admin(st, db, headers, &docs) {
-        return response;
-    }
-    for doc in &docs {
-        if let Err(e) = validate_doc(doc) {
-            return fail(e);
-        }
+    let all_or_nothing = value
+        .get("all_or_nothing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(BulkBody {
+        new_edits,
+        all_or_nothing,
+        docs,
+    })
+}
+
+/// Reject malformed documents and ids that only reserved documents may use.
+fn check_bulk_docs(db: &Db, docs: &[Value]) -> DbResult<()> {
+    for doc in docs {
+        validate_doc(doc)?;
         if !db.partitioned {
             match doc.get("_id") {
                 Some(Value::String(id))
@@ -51,7 +58,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
                         && !id.starts_with("_design/")
                         && !id.starts_with("_local/") =>
                 {
-                    return fail(ApiError::new(
+                    return Err(ApiError::new(
                         400,
                         "illegal_docid",
                         "Only reserved document ids may start with underscore.",
@@ -59,7 +66,7 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
                 }
                 Some(Value::String(_)) | None => {}
                 Some(_) => {
-                    return fail(ApiError::new(
+                    return Err(ApiError::new(
                         400,
                         "illegal_docid",
                         "Document id must be a string",
@@ -68,11 +75,80 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
             }
         }
     }
-    if value
-        .get("all_or_nothing")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    Ok(())
+}
+
+/// Run the validate_doc_update functions over the batch, one verdict per
+/// document. A forwarded batch was validated by its coordinator.
+async fn validate_bulk_batch(
+    st: &AppState,
+    db: &Arc<Db>,
+    headers: &HeaderMap,
+    docs: &mut Vec<Value>,
+) -> DbResult<Vec<Option<ApiError>>> {
+    if st.ctx.cluster.is_internal(headers) {
+        return Ok(std::iter::repeat_with(|| None).take(docs.len()).collect());
+    }
+    // The same validators as a single-document write.
+    let principal = st.principal(headers);
+    let functions = db.validation_functions().await?;
+    crate::validate::validate_docs_with(&functions, db, docs, &principal).await
+}
+
+/// Write the documents that passed validation: on this node for a standalone
+/// server or a forwarded batch, otherwise through the cluster coordinator.
+/// The flag is true when the write reached fewer replicas than requested.
+async fn write_bulk_batch(
+    req: DbRequest<'_>,
+    writable: Vec<Value>,
+    new_edits: bool,
+) -> DbResult<(Vec<Value>, bool)> {
+    let DbRequest {
+        st,
+        db,
+        name: dbname,
+        q,
+        headers,
+        ..
+    } = req;
+    if writable.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
+        // A forwarded batch has already been placed by its coordinator; write
+        // it to this node's shards and let the coordinator count the ack.
+        let results =
+            put_on_this_node(db, writable, new_edits, st.ctx.cluster.is_internal(headers)).await?;
+        return Ok((results, false));
+    }
+    let w = num(q, "w").unwrap_or(0);
+    let (results, quorum) = commit_docs(st, db, dbname, writable, new_edits, w, headers).await?;
+    Ok((results, !quorum))
+}
+
+pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
+    let DbRequest {
+        st,
+        db,
+        body,
+        headers,
+        ..
+    } = req;
+    let BulkBody {
+        new_edits,
+        all_or_nothing,
+        mut docs,
+    } = match parse_bulk_body(body) {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(error),
+    };
+    if let Some(response) = require_design_admin(st, db, headers, &docs) {
+        return response;
+    }
+    if let Err(error) = check_bulk_docs(db, &docs) {
+        return fail(error);
+    }
+    if all_or_nothing {
         let results: Vec<Value> = docs
             .iter()
             .map(|_| {
@@ -85,19 +161,9 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         return json(StatusCode::EXPECTATION_FAILED, Value::Array(results));
     }
 
-    let principal = st.principal(headers);
-    let validation: Vec<Option<ApiError>> = if st.ctx.cluster.is_internal(headers) {
-        std::iter::repeat_with(|| None).take(docs.len()).collect()
-    } else {
-        // The same validators as a single-document write.
-        let functions = match db.validation_functions().await {
-            Ok(functions) => functions,
-            Err(error) => return fail(error),
-        };
-        match crate::validate::validate_docs_with(&functions, db, &mut docs, &principal).await {
-            Ok(errors) => errors,
-            Err(error) => return fail(error),
-        }
+    let validation = match validate_bulk_batch(st, db, headers, &mut docs).await {
+        Ok(validation) => validation,
+        Err(error) => return fail(error),
     };
 
     let mut results = vec![Value::Null; docs.len()];
@@ -116,23 +182,10 @@ pub(super) async fn bulk_docs(req: DbRequest<'_>) -> Response {
         }
     }
 
-    let (written, accepted) = if writable.is_empty() {
-        (Vec::new(), false)
-    } else if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
-        // A forwarded batch has already been placed by its coordinator; write
-        // it to this node's shards and let the coordinator count the ack.
-        match put_on_this_node(db, writable, new_edits, st.ctx.cluster.is_internal(headers)).await {
-            Ok(results) => (results, false),
-            Err(e) => return fail(e),
-        }
-    } else {
-        let w = num(q, "w").unwrap_or(0);
-        match commit_docs(st, db, dbname, writable, new_edits, w, headers).await {
-            Ok((results, quorum)) => (results, !quorum),
-            Err(e) => return fail(e),
-        }
+    let (written, accepted) = match write_bulk_batch(req, writable, new_edits).await {
+        Ok(written) => written,
+        Err(error) => return fail(error),
     };
-
     for (slot, result) in slots.into_iter().zip(written) {
         results[slot] = result;
     }
