@@ -88,7 +88,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
         Ok(limit) => limit,
         Err(error) => return fail(error),
     };
-    let local_only = is_forwarded(&st, headers);
+    let local_only = st.ctx.cluster.is_internal(headers);
     // `live` is sugar for `continuous` (`chttpd_db:parse_changes_query`).
     let feed = match q.get("feed").map(String::as_str).unwrap_or("normal") {
         "live" => "continuous",
@@ -519,7 +519,7 @@ async fn changes_options(
         }
     }
     let since = progress.get(st.ctx.cluster.me).copied().unwrap_or(0);
-    let owned = if is_forwarded(st, headers) {
+    let owned = if st.ctx.cluster.is_internal(headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
         None

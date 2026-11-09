@@ -240,7 +240,10 @@ pub(super) fn reject_during_rebalance(
     rest: &str,
     headers: &HeaderMap,
 ) -> Option<Response> {
-    if db.rebalance_in_progress() && !is_forwarded(st, headers) && is_write_request(method, rest) {
+    if db.rebalance_in_progress()
+        && !st.ctx.cluster.is_internal(headers)
+        && is_write_request(method, rest)
+    {
         Some(fail(ApiError::new(
             503,
             "rebalance_in_progress",

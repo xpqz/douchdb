@@ -173,7 +173,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
     if let Some(response) = require_db_access(st, principal, db, false) {
         return response;
     }
-    if is_forwarded(st, headers)
+    if st.ctx.cluster.is_internal(headers)
         && headers
             .get("x-douchdb-update-seq")
             .and_then(|value| value.to_str().ok())
@@ -193,7 +193,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             // In a cluster the update_seq is the same version vector
             // the changes feed returns, so clients that use it as
             // `since` do not skip another node's changes.
-            if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+            if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
                 let (seq, purge_seq) = match cluster_seq_tokens(ClusterRead {
                     ctx: &st.ctx,
                     db,
@@ -323,7 +323,7 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
             "method not allowed",
         ));
     }
-    if st.ctx.cluster.is_clustered() && !is_forwarded(st, headers) {
+    if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
         let replicas = db.replicas_of_shard(db.partition_shard(partition) as u32);
         if !replicas.contains(&st.ctx.cluster.me) && !replicas.is_empty() {
             for node in &replicas {
@@ -568,19 +568,20 @@ async fn purge(req: DbRequest<'_>) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    let response = if !req.st.ctx.cluster.is_clustered() || is_forwarded(req.st, req.headers) {
-        match req.db.purge(&request, req.st.ctx.cluster.me).await {
-            Ok(purged) => json(StatusCode::CREATED, purged),
-            Err(e) => return fail(e),
-        }
-    } else {
-        let Some(map) = request.as_object() else {
-            return fail(ApiError::bad_request("Request body must be a JSON object"));
+    let response =
+        if !req.st.ctx.cluster.is_clustered() || req.st.ctx.cluster.is_internal(req.headers) {
+            match req.db.purge(&request, req.st.ctx.cluster.me).await {
+                Ok(purged) => json(StatusCode::CREATED, purged),
+                Err(e) => return fail(e),
+            }
+        } else {
+            let Some(map) = request.as_object() else {
+                return fail(ApiError::bad_request("Request body must be a JSON object"));
+            };
+            let w = num(req.q, "w").unwrap_or(0);
+            let results = purge_docs(req.st, req.db, req.name, map, w, req.headers).await;
+            purge_results_to_json(results)
         };
-        let w = num(req.q, "w").unwrap_or(0);
-        let results = purge_docs(req.st, req.db, req.name, map, w, req.headers).await;
-        purge_results_to_json(results)
-    };
     if let Err(e) = invalidate_indexes(req.db).await {
         return fail(e);
     }
@@ -592,7 +593,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
 /// Internal only: CouchDB has no such endpoint, its shard copies exchange
 /// purge infos inside mem3_rep.
 async fn purged_infos(req: DbRequest<'_>) -> Response {
-    if !is_forwarded(req.st, req.headers) {
+    if !req.st.ctx.cluster.is_internal(req.headers) {
         return fail(ApiError::not_found("missing"));
     }
     let since: Vec<u64> = req
