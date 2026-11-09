@@ -124,7 +124,7 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
     let recheck = if st.ctx.cluster.is_clustered() && !local_only {
         CLUSTER_FEED_RECHECK
     } else {
-        LOCAL_FEED_RECHECK
+        st.config.local_feed_recheck
     };
 
     let eventsource = feed == "eventsource";
@@ -338,19 +338,9 @@ pub(super) async fn changes(st: Arc<AppState>, db: Arc<Db>, req: DbRequest<'_>) 
     }
 }
 
-/// How often an idle feed re-checks when no local commit wakes it. A
-/// standalone node sees every commit through `Db::subscribe_commits`, so this
-/// only bounds how long a security change or other out-of-band state can go
-/// unnoticed. A clustered feed also reads peers, whose commits this node
-/// cannot observe, so it polls more often.
-///
-/// A test must not be answered by this fallback: with it out of reach, a feed
-/// that does not wake for a commit hangs instead of passing late.
-const LOCAL_FEED_RECHECK: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(3600)
-} else {
-    std::time::Duration::from_secs(5)
-};
+/// How often an idle clustered feed re-checks when no local commit wakes it.
+/// It also reads peers, whose commits this node cannot observe, so it polls
+/// more often than a standalone feed (`Config::local_feed_recheck`).
 const CLUSTER_FEED_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Sleep an idle feed until a commit lands, the recheck interval passes, the

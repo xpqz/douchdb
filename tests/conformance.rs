@@ -13136,7 +13136,6 @@ async fn assert_rereduce_keys_are_null(mode: &str) {
 }
 
 #[tokio::test]
-#[allow(unused_mut, clippy::useless_vec)]
 async fn js_sandboxes_agree_on_view_rows() {
     if !sandbox_tested("process") || !sandbox_tested("wasm") {
         return;
@@ -13154,21 +13153,25 @@ async fn js_sandboxes_agree_on_view_rows() {
         "unicode": {"map": "function(doc){ if (doc.s !== undefined) emit(doc.s, doc.s.length); }"}
     }});
 
-    let mut servers = vec![
+    let wasmtime = cfg!(feature = "wasmtime").then(|| {
+        Server::start_with(
+            &[
+                "--js-sandbox".to_string(),
+                "wasm".to_string(),
+                "--wasm-runtime".to_string(),
+                "wasmtime".to_string(),
+            ],
+            false,
+        )
+    });
+    let servers: Vec<Server> = [
         Server::start(false),
         Server::start_with(&["--js-sandbox".to_string(), "process".to_string()], false),
         Server::start_with(&["--js-sandbox".to_string(), "wasm".to_string()], false),
-    ];
-    #[cfg(feature = "wasmtime")]
-    servers.push(Server::start_with(
-        &[
-            "--js-sandbox".to_string(),
-            "wasm".to_string(),
-            "--wasm-runtime".to_string(),
-            "wasmtime".to_string(),
-        ],
-        false,
-    ));
+    ]
+    .into_iter()
+    .chain(wasmtime)
+    .collect();
 
     let mut baseline: Option<Vec<Value>> = None;
     for (index, s) in servers.iter().enumerate() {
