@@ -23,9 +23,20 @@ struct DbEvent {
     kind: String,
 }
 
-#[derive(Default)]
 pub struct DbUpdates {
     events: Mutex<DbEvents>,
+    /// Signalled whenever an event is recorded, so a feed waits for it
+    /// instead of polling.
+    wake: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for DbUpdates {
+    fn default() -> Self {
+        DbUpdates {
+            events: Mutex::default(),
+            wake: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +63,11 @@ impl DbUpdates {
             db_name: name.to_string(),
             kind: kind.to_string(),
         });
+        self.wake.send_replace(());
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.wake.subscribe()
     }
 
     pub(crate) fn current(&self) -> u64 {

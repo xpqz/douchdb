@@ -134,10 +134,14 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly)
             let started = std::time::Instant::now();
             let mut sent = 0usize;
             let mut heartbeat = Heartbeat::new(heartbeat);
+            let mut wake = st.db_updates.subscribe();
             loop {
                 if limit.map(|limit| sent >= limit).unwrap_or(false) {
                     break;
                 }
+                // Mark the signal seen before reading, so an event recorded
+                // after the read wakes the wait below.
+                wake.borrow_and_update();
                 let (events, _) = st.db_updates.since(since);
                 st.feed_stats.db_updates_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for event in events {
@@ -158,17 +162,17 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly)
                 if heartbeat.due() {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n"));
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                    _ = st.shutdown.cancelled() => {}
-                }
+                wait_for_event(&mut wake, &heartbeat, started, timeout, &st.shutdown).await;
             }
         };
         return feed_response("application/json", stream);
     }
 
     let started = std::time::Instant::now();
+    let mut wake = st.db_updates.subscribe();
+    let no_heartbeat = Heartbeat::new(None);
     loop {
+        wake.borrow_and_update();
         let (events, current) = st.db_updates.since(since);
         st.feed_stats
             .db_updates_polls
@@ -192,10 +196,25 @@ pub async fn db_updates(State(st): State<Arc<AppState>>, uri: Uri, _: AdminOnly)
                 json!({"results": selected, "last_seq": last_seq}),
             );
         }
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-            _ = st.shutdown.cancelled() => {}
-        }
+        wait_for_event(&mut wake, &no_heartbeat, started, timeout, &st.shutdown).await;
+    }
+}
+
+/// Sleep an idle `_db_updates` feed until an event is recorded, the next
+/// heartbeat is due, its timeout arrives or the server starts shutting down.
+async fn wait_for_event(
+    wake: &mut tokio::sync::watch::Receiver<()>,
+    heartbeat: &Heartbeat,
+    started: std::time::Instant,
+    timeout_ms: u64,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let left = std::time::Duration::from_millis(timeout_ms).saturating_sub(started.elapsed());
+    let wait = heartbeat.next_in().map_or(left, |next| next.min(left));
+    tokio::select! {
+        _ = wake.changed() => {}
+        _ = tokio::time::sleep(wait) => {}
+        _ = shutdown.cancelled() => {}
     }
 }
 
