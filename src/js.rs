@@ -154,6 +154,20 @@ pub enum WasmRuntime {
 static SANDBOX: AtomicU8 = AtomicU8::new(0);
 #[cfg(feature = "wasm")]
 static WASM_RUNTIME: AtomicU8 = AtomicU8::new(0);
+/// The Wasmtime request function. `js_wasmtime` depends on this module for
+/// its error and limit types, so it plugs itself in here at startup rather
+/// than being named from here.
+#[cfg(feature = "wasm")]
+static WASMTIME_BACKEND: std::sync::OnceLock<WasmBackend> = std::sync::OnceLock::new();
+/// Run one sandbox request, as a body of the worker protocol, in a wasm runtime.
+#[cfg(feature = "wasm")]
+pub(crate) type WasmBackend = fn(&[u8], ViewLimits) -> Result<Value, JsError>;
+
+/// Make the Wasmtime runtime selectable with [`set_wasm_runtime`].
+#[cfg(feature = "wasmtime")]
+pub(crate) fn register_wasmtime_backend(backend: WasmBackend) {
+    let _ = WASMTIME_BACKEND.set(backend);
+}
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(2);
 /// A debug-build worker needs a moment to start; a hung one is killed after this.
 /// Default for `--js-worker-startup-ms`.
@@ -188,19 +202,14 @@ pub fn set_wasm_runtime(runtime: WasmRuntime) -> Result<(), JsError> {
             Ok(())
         }
         WasmRuntime::Wasmtime => {
-            #[cfg(feature = "wasmtime")]
-            {
-                crate::js_wasmtime::warm()?;
-                WASM_RUNTIME.store(1, Ordering::SeqCst);
-                Ok(())
-            }
-            #[cfg(not(feature = "wasmtime"))]
-            {
-                Err(JsError::Sandbox(
+            if WASMTIME_BACKEND.get().is_none() {
+                return Err(JsError::Sandbox(
                     "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
                         .to_string(),
-                ))
+                ));
             }
+            WASM_RUNTIME.store(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 }
@@ -494,17 +503,13 @@ fn wasm_request(kind: &str, payload: Value, limits: ViewLimits) -> Result<Value,
 #[cfg(feature = "wasm")]
 fn wasm_run(body: &[u8], limits: ViewLimits) -> Result<Value, JsError> {
     if WASM_RUNTIME.load(Ordering::SeqCst) == 1 {
-        #[cfg(feature = "wasmtime")]
-        {
-            return crate::js_wasmtime::request(body, limits);
-        }
-        #[cfg(not(feature = "wasmtime"))]
-        {
-            return Err(JsError::Sandbox(
+        return match WASMTIME_BACKEND.get() {
+            Some(backend) => backend(body, limits),
+            None => Err(JsError::Sandbox(
                 "the wasmtime backend is not compiled; rebuild with `cargo build --features wasmtime`"
                     .to_string(),
-            ));
-        }
+            )),
+        };
     }
     wasmi_request(body, limits)
 }

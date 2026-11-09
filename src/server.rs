@@ -78,6 +78,10 @@ fn config_error(message: impl Into<String>) -> ConfigError {
 /// Check the `--wasm-runtime` choice against the `--js-sandbox` it applies to.
 fn configure_js_sandbox(args: &Args) -> Result<(), ConfigError> {
     if args.js_sandbox == js::Sandbox::Wasm {
+        #[cfg(feature = "wasmtime")]
+        if args.wasm_runtime == js::WasmRuntime::Wasmtime {
+            crate::js_wasmtime::install().map_err(|error| config_error(error.to_string()))?;
+        }
         js::set_wasm_runtime(args.wasm_runtime).map_err(|error| config_error(error.to_string()))?;
     }
     Ok(())
