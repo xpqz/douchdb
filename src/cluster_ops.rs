@@ -530,12 +530,12 @@ static STABLE_WAIT_MS: AtomicU64 = AtomicU64::new(DEFAULT_STABLE_WAIT_MS);
 
 /// Set the write-drain wait (`--rebalance-write-drain-ms`).
 pub fn set_write_drain_ms(ms: u64) {
-    WRITE_DRAIN_MS.store(ms.max(1), Ordering::SeqCst);
+    WRITE_DRAIN_MS.store(ms, Ordering::SeqCst);
 }
 
 /// Set the wait for the old owners to settle (`--rebalance-stable-wait-ms`).
 pub fn set_stable_wait_ms(ms: u64) {
-    STABLE_WAIT_MS.store(ms.max(1), Ordering::SeqCst);
+    STABLE_WAIT_MS.store(ms, Ordering::SeqCst);
 }
 
 /// A peer's refusal of a migration. `conflict` marks a different migration

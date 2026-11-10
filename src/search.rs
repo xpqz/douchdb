@@ -1381,7 +1381,9 @@ pub async fn query(
     limits: crate::view::ViewLimits,
 ) -> DbResult<Value> {
     let started = Instant::now();
-    if request.timeout_ms == 0 || started.elapsed().as_millis() as u64 > request.timeout_ms {
+    // A zero timeout has expired before any work starts, as in clouseau. The
+    // check after the index build covers every other deadline.
+    if request.timeout_ms == 0 {
         return Err(timeout_error());
     }
     let deadline = started + Duration::from_millis(request.timeout_ms);

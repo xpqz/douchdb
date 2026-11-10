@@ -490,7 +490,14 @@ pub async fn db_rest(
         "_peer_purged_infos" => Some(&["GET"]),
         _ => None,
     };
-    if let Some(response) = allowed.and_then(|allowed| require_method(&method, allowed)) {
+    // CouchDB (mochiweb) serves a HEAD as a GET, but still advertises only
+    // `PUT,GET` in `Allow`, so a HEAD of `_security` is checked as a GET.
+    let checked = if method == Method::HEAD && rest == "_security" {
+        &Method::GET
+    } else {
+        &method
+    };
+    if let Some(response) = allowed.and_then(|allowed| require_method(checked, allowed)) {
         return response;
     }
 
@@ -754,9 +761,9 @@ async fn purged_infos_limit(req: DbRequest<'_>) -> Response {
     }
 }
 
-/// `GET` or `PUT /{db}/_security`.
+/// `GET`, `HEAD` or `PUT /{db}/_security`.
 async fn security(req: DbRequest<'_>) -> Response {
-    if *req.method == Method::GET {
+    if *req.method == Method::GET || *req.method == Method::HEAD {
         return json(StatusCode::OK, req.db.security());
     }
     let value: Value = match serde_json::from_slice(req.body) {
