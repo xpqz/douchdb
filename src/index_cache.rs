@@ -26,7 +26,7 @@ static MAX_OPEN: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_OPEN);
 
 /// Set the cap shared by the view, search and gate registries.
 pub fn set_max_open(max: usize) {
-    MAX_OPEN.store(max.max(1), Ordering::SeqCst);
+    MAX_OPEN.store(max, Ordering::SeqCst);
 }
 
 /// The server's shutdown token. Index builds and updates stop at their next

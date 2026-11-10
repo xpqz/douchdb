@@ -16185,6 +16185,40 @@ async fn server_admin_endpoints_reject_anonymous_and_non_admin_callers() {
     }
 }
 
+/// CouchDB 3.5 answers `HEAD /{db}/_security` with 200 and the headers of the
+/// GET, `content-length` included, and no body.
+#[tokio::test]
+async fn head_security_matches_get_headers_without_a_body() {
+    let s = Server::start(false);
+    s.fresh_db("headsec").await;
+    let (status, _) = s
+        .put(
+            "/headsec/_security",
+            json!({"members": {"names": ["alice"], "roles": []}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let url = format!("{}/headsec/_security", s.base);
+    let get = s.client.get(&url).send().await.expect("get");
+    assert_eq!(get.status(), StatusCode::OK);
+    let content_type = get.headers().get("content-type").cloned();
+    let length = get.bytes().await.expect("get body").len();
+    assert!(length > 0);
+
+    let head = s.client.head(&url).send().await.expect("head");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers().get("content-type"), content_type.as_ref());
+    assert_eq!(
+        head.headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(length)
+    );
+    assert!(head.bytes().await.expect("head body").is_empty());
+}
+
 #[tokio::test]
 async fn security_object_enforces_members_admins_roles_and_all_dbs_filtering() {
     let users = UsersFile::new(USERS);
