@@ -1957,14 +1957,7 @@ mod panic_tests {
     use super::*;
 
     fn handle() -> ShardHandle {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-panic-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-panic-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         ShardHandle::spawn(&dir, 1000, Default::default()).unwrap()
     }
@@ -2073,14 +2066,7 @@ mod panic_tests {
 
     #[tokio::test]
     async fn dropping_the_handle_releases_the_database_lock() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-drop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-drop-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         let handle = ShardHandle::spawn(&dir, 1000, Default::default()).unwrap();
         handle.call(put(b"x/kept")).await.unwrap();
@@ -2229,14 +2215,7 @@ mod scan_tests {
 
     #[test]
     fn counters_track_live_and_deleted_documents_across_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-counts-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-counts-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut shard = Shard::open(&dir, 1000).unwrap();
         assert_eq!(shard.counts(), (0, 0));
@@ -2310,14 +2289,7 @@ mod scan_tests {
     }
 
     fn temp_shard_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -2452,14 +2424,7 @@ mod scan_tests {
 
     #[test]
     fn live_index_tracks_documents_and_rebuilds_on_open() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-live-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
@@ -2616,14 +2581,7 @@ mod scan_tests {
 
     #[test]
     fn scan_range_merges_overlay_and_stops_early_in_both_directions() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-range-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-range-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut shard = Shard::open(&dir, 1000).unwrap();
         // a, c and e are flushed to disk; b and d stay in the overlay, so
@@ -2794,14 +2752,7 @@ mod scan_tests {
     /// not make the document disappear from point reads.
     #[test]
     fn point_reads_survive_updates_across_memtable_rollovers() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-rollover-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-rollover-{}", crate::util::uuid()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let ids: Vec<String> = (0..40).map(|n| format!("doc{n:02}")).collect();
