@@ -102,6 +102,80 @@ pub fn reusable_runtime(
     Ok((runtime, deadline))
 }
 
+/// A test-only JavaScript global, `__pause()`, that holds the calling engine
+/// until the test releases it. It lets a test observe the async runtime while
+/// user JavaScript is provably running, with no timing assumptions: the
+/// failsafe only turns a hang into a failure.
+#[cfg(test)]
+pub mod test_pause {
+    use super::JsError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    static FAILSAFE_HIT: AtomicBool = AtomicBool::new(false);
+
+    /// Install `__pause` in `context`.
+    pub fn install(context: &rquickjs::Context) -> Result<(), JsError> {
+        context.with(|ctx| {
+            let pause = rquickjs::Function::new(ctx.clone(), || {
+                STARTED.store(true, Ordering::SeqCst);
+                let failsafe = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !RELEASED.load(Ordering::SeqCst) {
+                    if std::time::Instant::now() > failsafe {
+                        FAILSAFE_HIT.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+            .map_err(|error| JsError::Runtime(error.to_string()))?;
+            ctx.globals()
+                .set("__pause", pause)
+                .map_err(|error| JsError::Runtime(error.to_string()))
+        })
+    }
+
+    /// Owns the pause for one test; the pause is process-wide, so tests that
+    /// use it run one at a time.
+    pub struct Pause {
+        _serial: tokio::sync::OwnedMutexGuard<()>,
+    }
+
+    pub async fn arm() -> Pause {
+        static SERIAL: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> =
+            std::sync::OnceLock::new();
+        let serial = SERIAL.get_or_init(Default::default).clone();
+        let pause = Pause {
+            _serial: serial.lock_owned().await,
+        };
+        STARTED.store(false, Ordering::SeqCst);
+        RELEASED.store(false, Ordering::SeqCst);
+        FAILSAFE_HIT.store(false, Ordering::SeqCst);
+        pause
+    }
+
+    impl Pause {
+        /// Wait until a script has called `__pause()`.
+        pub async fn started(&self) {
+            while !STARTED.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Let the paused script go on.
+        pub fn release(&self) {
+            RELEASED.store(true, Ordering::SeqCst);
+        }
+
+        /// Whether the script gave up waiting for a release.
+        pub fn failsafe_hit(&self) -> bool {
+            FAILSAFE_HIT.load(Ordering::SeqCst)
+        }
+    }
+}
+
 /// Contain a Rust panic from the bindings (a C `abort` or segfault is not
 /// unwindable; that is what the worker-process plan is for).
 pub fn guard<T>(label: &str, f: impl FnOnce() -> Result<T, JsError>) -> Result<T, JsError> {
