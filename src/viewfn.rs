@@ -240,6 +240,8 @@ pub(crate) fn run_map_js(
     let runtime = engine(limits)?;
     let context =
         rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
+    #[cfg(test)]
+    crate::js::test_pause::install(&context)?;
 
     crate::js::guard("map function", || {
         context.with(|ctx| {

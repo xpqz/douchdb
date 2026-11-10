@@ -3200,6 +3200,8 @@ fn compile_reducer(source: &str, limits: ViewLimits) -> Result<ReduceEngine, JsE
         std::time::Instant::now() + limits.timeout;
     let context =
         rquickjs::Context::full(&runtime).map_err(|error| JsError::Runtime(error.to_string()))?;
+    #[cfg(test)]
+    crate::js::test_pause::install(&context)?;
     crate::js::guard("reduce function", || {
         context.with(|ctx| {
             let wrapped = REDUCE_WRAPPER.replace(WRAPPER_SOURCE, source);
@@ -4788,14 +4790,7 @@ mod tests {
 
     #[test]
     fn index_cache_tracks_incremental_updates() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-view-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-view-cache-{}", crate::util::uuid()));
         let mut index = ViewIndex::open(&dir).unwrap();
         index
             .rebuild(
@@ -4867,14 +4862,7 @@ mod tests {
 
     #[test]
     fn index_rows_survive_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "douchdb-view-index-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("douchdb-view-index-{}", crate::util::uuid()));
         let rows = vec![
             Row {
                 id: "a".into(),
@@ -4924,15 +4912,15 @@ mod tests {
             .unwrap();
         let spec = ViewSpec {
             map: "function(doc) { emit(doc._id, 1); }".to_string(),
-            reduce: Some(
-                "function(k, v, re) { var t = Date.now(); while (Date.now() - t < 600) {} return 1; }"
-                    .to_string(),
-            ),
+            reduce: Some("function(k, v, re) { __pause(); return 1; }".to_string()),
             partitioned: false,
         };
         // A task that does nothing but yield counts how often the runtime got
-        // to run it. A call that blocks the runtime leaves it a handful of
-        // turns; one that runs on the blocking pool leaves it thousands.
+        // to run it. The script holds itself inside `__pause()` until the
+        // test has seen the ticker take several more turns, so a script that
+        // blocked the runtime could not be observed making progress and
+        // would hit the pause's failsafe instead.
+        let pause = crate::js::test_pause::arm().await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ticker = tokio::spawn({
@@ -4944,23 +4932,30 @@ mod tests {
                 }
             }
         });
-        tokio::task::yield_now().await;
-        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
         };
-        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
-            .await
-            .unwrap();
-        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
+        let observe = async {
+            pause.started().await;
+            let seen = ticks.load(std::sync::atomic::Ordering::SeqCst);
+            while ticks.load(std::sync::atomic::Ordering::SeqCst) < seen + 3 {
+                tokio::task::yield_now().await;
+            }
+            pause.release();
+        };
+        let (result, ()) = tokio::join!(
+            query_with_spec(&db, "_design/d", "v", &spec, &query),
+            observe
+        );
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         ticker.await.unwrap();
-        assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
         assert!(
-            ticks_during > 1_000,
-            "the reduce blocked the runtime: {ticks_during} turns while it ran"
+            !pause.failsafe_hit(),
+            "the reduce blocked the runtime: the ticker never ran while it was paused"
         );
+        let result = result.unwrap();
+        assert_eq!(result["rows"][0]["value"], json!(1), "{result}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5010,6 +5005,9 @@ mod tests {
     /// its indexes, and must leave no gate behind for the deleted database.
     #[tokio::test]
     async fn forget_db_waits_for_a_query_in_flight() {
+        // Other tests lower the registries' shared cap, and an idle index or
+        // gate over it is evicted, whoever owns it. Run with them excluded.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root = std::env::temp_dir().join(format!("douchdb-forget-{}", crate::util::uuid()));
         let db = Db::open(
             &root,
@@ -5080,6 +5078,9 @@ mod tests {
     /// depends on timing, and the timeout only turns a hang into a failure.
     #[tokio::test]
     async fn forget_db_does_not_wait_for_a_build() {
+        // Other tests lower the registries' shared cap, and an idle index or
+        // gate over it is evicted, whoever owns it. Run with them excluded.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root = std::env::temp_dir().join(format!("douchdb-cancel-{}", crate::util::uuid()));
         let config = || crate::db::DbConfig {
             q: 1,
@@ -5182,14 +5183,16 @@ mod tests {
             .await
             .unwrap();
         let spec = ViewSpec {
-            map: "function(doc) { var t = Date.now(); while (Date.now() - t < 600) {} emit(doc._id, 1); }"
-                .to_string(),
+            map: "function(doc) { __pause(); emit(doc._id, 1); }".to_string(),
             reduce: None,
             partitioned: false,
         };
         // A task that does nothing but yield counts how often the runtime got
-        // to run it. A call that blocks the runtime leaves it a handful of
-        // turns; one that runs on the blocking pool leaves it thousands.
+        // to run it. The script holds itself inside `__pause()` until the
+        // test has seen the ticker take several more turns, so a script that
+        // blocked the runtime could not be observed making progress and
+        // would hit the pause's failsafe instead.
+        let pause = crate::js::test_pause::arm().await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ticker = tokio::spawn({
@@ -5201,23 +5204,30 @@ mod tests {
                 }
             }
         });
-        tokio::task::yield_now().await;
-        let ticks_before = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let query = ViewQuery {
             limit: usize::MAX,
             ..Default::default()
         };
-        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
-            .await
-            .unwrap();
-        let ticks_during = ticks.load(std::sync::atomic::Ordering::SeqCst) - ticks_before;
+        let observe = async {
+            pause.started().await;
+            let seen = ticks.load(std::sync::atomic::Ordering::SeqCst);
+            while ticks.load(std::sync::atomic::Ordering::SeqCst) < seen + 3 {
+                tokio::task::yield_now().await;
+            }
+            pause.release();
+        };
+        let (result, ()) = tokio::join!(
+            query_with_spec(&db, "_design/d", "v", &spec, &query),
+            observe
+        );
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         ticker.await.unwrap();
-        assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
         assert!(
-            ticks_during > 1_000,
-            "the map blocked the runtime: {ticks_during} turns while it ran"
+            !pause.failsafe_hit(),
+            "the map blocked the runtime: the ticker never ran while it was paused"
         );
+        let result = result.unwrap();
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(1));
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
