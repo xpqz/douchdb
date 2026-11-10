@@ -5441,6 +5441,11 @@ mod tests {
     /// with them.
     #[tokio::test(flavor = "multi_thread")]
     async fn partition_view_queries_visit_rows_independent_of_other_partitions() {
+        // The visit counts assume the built index stays open between queries.
+        // Another test lowering the shared cap would evict it, and the reopened
+        // index then reads its partition's rows again to rebuild its block
+        // reductions.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         const K: usize = 600;
         let mut per_p = Vec::new();
         for partitions in [2usize, 6] {
