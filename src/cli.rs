@@ -88,59 +88,242 @@ pub fn parse_args() -> Args {
     }
 }
 
-const KNOWN_FLAGS: &[&str] = &[
-    "--listen",
-    "--data",
-    "--q",
-    "--n",
-    "--revs-limit",
-    "--admin",
-    "--users-file",
-    "--session-secret",
-    "--default-security",
-    "--max-in-flight",
-    "--per-user-in-flight",
-    "--per-user-rate",
-    "--heavy-in-flight",
-    "--heavy-per-user",
-    "--background-in-flight",
-    "--compact-concurrency",
-    "--nodes",
-    "--me",
-    "--advertise",
-    "--seed-nodes",
-    "--sync-secs",
-    "--js-sandbox",
-    "--wasm-runtime",
-    "--js-worker",
-    "--js-workers",
-    "--view-timeout-ms",
-    "--view-memory-mb",
-    "--max-request-mb",
-    "--rebalance-write-drain-ms",
-    "--rebalance-stable-wait-ms",
-    "--rebalance-freeze-ms",
-    "--js-worker-startup-ms",
-    "--max-open-indexes",
-    "--max-open-dbs",
-    "--cluster-secret",
-    "--otel-endpoint",
-    "--cors-origins",
-    "--cors-credentials",
-    "--cors-headers",
-    "--cors-methods",
-    "--cors-exposed-headers",
-    "--cors-max-age",
-    "--help",
-    "-h",
-];
-
 /// The command line, with the `VALUE` of a `--flag=VALUE` argument held aside
 /// until the flag's handler asks for it.
 struct ArgIter {
     rest: std::vec::IntoIter<String>,
     inline: Option<String>,
 }
+
+/// One command-line flag: its name, whether it takes a value, and the setter
+/// that applies it. `is_known_flag` and `parse_from` both read this table, so
+/// a flag cannot be parsed without also being protected from being swallowed
+/// as another flag's value.
+struct Flag {
+    name: &'static str,
+    takes_value: bool,
+    set: fn(&mut Args, &mut ArgIter, &str) -> Result<(), String>,
+}
+
+/// A flag that reads a number in `min..=max` into `Args::$field`.
+macro_rules! numeric {
+    ($name:literal, $field:ident, $min:expr, $max:expr) => {
+        Flag {
+            name: $name,
+            takes_value: true,
+            set: |args, it, flag| {
+                args.$field = number(it, flag, $min, $max)?;
+                Ok(())
+            },
+        }
+    };
+}
+
+/// A flag whose raw value is handled by `$set(args, value)`.
+macro_rules! valued {
+    ($name:literal, $set:expr) => {
+        Flag {
+            name: $name,
+            takes_value: true,
+            set: |args, it, flag| {
+                let raw = value(it, flag)?;
+                let set: fn(&mut Args, String) -> Result<(), String> = $set;
+                set(args, raw)
+            },
+        }
+    };
+}
+
+/// A flag that takes no value and does `$set(args)`.
+macro_rules! switch {
+    ($name:literal, $set:expr) => {
+        Flag {
+            name: $name,
+            takes_value: false,
+            set: |args, _, _| {
+                let set: fn(&mut Args) = $set;
+                set(args);
+                Ok(())
+            },
+        }
+    };
+}
+
+/// `--help` is answered by `parse_from` before any setter runs.
+fn nothing(_: &mut Args, _: &mut ArgIter, _: &str) -> Result<(), String> {
+    Ok(())
+}
+
+static FLAGS: &[Flag] = &[
+    valued!("--listen", |args, raw| {
+        if raw.trim().is_empty() {
+            return Err("--listen requires a non-empty address".to_string());
+        }
+        args.listen = raw;
+        Ok(())
+    }),
+    valued!("--data", |args, dir| {
+        if dir.is_empty() {
+            return Err("--data requires a non-empty directory".to_string());
+        }
+        args.data = PathBuf::from(dir);
+        Ok(())
+    }),
+    numeric!("--q", q, 1, u32::MAX.into()),
+    numeric!("--n", n, 1, u32::MAX.into()),
+    numeric!("--revs-limit", revs_limit, 1, u64::MAX),
+    valued!("--admin", |args, raw| {
+        args.admin = Some(admin(&raw, "--admin")?);
+        Ok(())
+    }),
+    valued!("--users-file", |args, raw| {
+        args.users_file = Some(raw);
+        Ok(())
+    }),
+    valued!("--session-secret", |args, raw| {
+        args.session_secret = raw;
+        Ok(())
+    }),
+    valued!("--default-security", |args, raw| {
+        args.default_admin_only = Some(match raw.as_str() {
+            "open" => false,
+            "admin-only" => true,
+            other => {
+                return Err(format!(
+                    "unknown --default-security value: {other:?} (expected open or admin-only)"
+                ));
+            }
+        });
+        Ok(())
+    }),
+    numeric!("--max-in-flight", max_in_flight, 0, u32::MAX.into()),
+    numeric!(
+        "--per-user-in-flight",
+        per_user_in_flight,
+        0,
+        u32::MAX.into()
+    ),
+    numeric!("--per-user-rate", per_user_rate, 0, u32::MAX.into()),
+    numeric!("--heavy-in-flight", heavy_in_flight, 0, u32::MAX.into()),
+    numeric!("--heavy-per-user", heavy_per_user, 0, u32::MAX.into()),
+    numeric!(
+        "--background-in-flight",
+        background_in_flight,
+        0,
+        u32::MAX.into()
+    ),
+    numeric!(
+        "--compact-concurrency",
+        compact_concurrency,
+        1,
+        u32::MAX.into()
+    ),
+    valued!("--nodes", |args, raw| {
+        args.nodes = raw
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(())
+    }),
+    numeric!("--me", me, 0, u32::MAX.into()),
+    valued!("--advertise", |args, raw| {
+        args.advertise = raw;
+        Ok(())
+    }),
+    valued!("--seed-nodes", |args, raw| {
+        args.seed_nodes = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+            .map(|node| node.trim_end_matches('/').to_string())
+            .collect();
+        Ok(())
+    }),
+    numeric!("--sync-secs", sync_secs, 0, u64::MAX),
+    valued!("--js-sandbox", |args, raw| {
+        args.js_sandbox = match raw.as_str() {
+            "native" => crate::js::Sandbox::Native,
+            "process" => crate::js::Sandbox::Process,
+            "wasm" => crate::js::Sandbox::Wasm,
+            other => {
+                return Err(format!(
+                    "unknown --js-sandbox value: {other:?} (expected native, process or wasm)"
+                ));
+            }
+        };
+        Ok(())
+    }),
+    valued!("--wasm-runtime", |args, raw| {
+        args.wasm_runtime = match raw.as_str() {
+            "wasmi" => crate::js::WasmRuntime::Wasmi,
+            "wasmtime" => crate::js::WasmRuntime::Wasmtime,
+            other => {
+                return Err(format!(
+                    "unknown --wasm-runtime value: {other:?} (expected wasmi or wasmtime)"
+                ));
+            }
+        };
+        Ok(())
+    }),
+    switch!("--js-worker", |args| args.worker = true),
+    numeric!("--js-workers", js_workers, 1, 64),
+    numeric!("--view-timeout-ms", view_timeout_ms, 1, u64::MAX),
+    numeric!("--view-memory-mb", view_memory_mb, 1, u32::MAX.into()),
+    numeric!("--max-request-mb", max_request_mb, 1, u32::MAX.into()),
+    numeric!(
+        "--rebalance-write-drain-ms",
+        rebalance_write_drain_ms,
+        1,
+        u64::MAX
+    ),
+    numeric!(
+        "--rebalance-stable-wait-ms",
+        rebalance_stable_wait_ms,
+        1,
+        u64::MAX
+    ),
+    numeric!("--rebalance-freeze-ms", rebalance_freeze_ms, 1, u64::MAX),
+    numeric!("--js-worker-startup-ms", js_worker_startup_ms, 1, u64::MAX),
+    numeric!("--max-open-indexes", max_open_indexes, 1, u32::MAX.into()),
+    numeric!("--max-open-dbs", max_open_dbs, 1, u32::MAX.into()),
+    valued!("--cluster-secret", |args, raw| {
+        args.cluster_secret = raw;
+        Ok(())
+    }),
+    valued!("--otel-endpoint", |args, raw| {
+        args.otel_endpoint = Some(raw);
+        Ok(())
+    }),
+    valued!("--cors-origins", |args, raw| {
+        args.cors_origins = list(&raw);
+        Ok(())
+    }),
+    switch!("--cors-credentials", |args| args.cors_credentials = true),
+    valued!("--cors-headers", |args, raw| {
+        args.cors_headers = list(&raw);
+        Ok(())
+    }),
+    valued!("--cors-methods", |args, raw| {
+        args.cors_methods = list(&raw);
+        Ok(())
+    }),
+    valued!("--cors-exposed-headers", |args, raw| {
+        args.cors_exposed_headers = list(&raw);
+        Ok(())
+    }),
+    numeric!("--cors-max-age", cors_max_age, 0, u32::MAX.into()),
+    Flag {
+        name: "--help",
+        takes_value: false,
+        set: nothing,
+    },
+    Flag {
+        name: "-h",
+        takes_value: false,
+        set: nothing,
+    },
+];
 
 /// Whether `arg` is exactly a known flag, or the `--flag=...` form of one.
 fn is_known_flag(arg: &str) -> bool {
@@ -149,7 +332,7 @@ fn is_known_flag(arg: &str) -> bool {
     } else {
         arg
     };
-    KNOWN_FLAGS.contains(&name)
+    FLAGS.iter().any(|flag| flag.name == name)
 }
 
 /// The value of `flag`: the `=VALUE` part, or else the next argument. A next
@@ -291,129 +474,15 @@ pub fn parse_from(
             flag = name;
             it.inline = Some(inline.to_string());
         }
-        match flag {
-            "--listen" => {
-                args.listen = value(&mut it, flag)?;
-                if args.listen.trim().is_empty() {
-                    return Err("--listen requires a non-empty address".to_string());
-                }
-            }
-            "--data" => {
-                let dir = value(&mut it, flag)?;
-                if dir.is_empty() {
-                    return Err("--data requires a non-empty directory".to_string());
-                }
-                args.data = PathBuf::from(dir);
-            }
-            "--q" => args.q = number(&mut it, flag, 1, u32::MAX.into())?,
-            "--n" => args.n = number(&mut it, flag, 1, u32::MAX.into())?,
-            "--revs-limit" => args.revs_limit = number(&mut it, flag, 1, u64::MAX)?,
-            "--admin" => args.admin = Some(admin(&value(&mut it, flag)?, "--admin")?),
-            "--users-file" => args.users_file = Some(value(&mut it, flag)?),
-            "--session-secret" => args.session_secret = value(&mut it, flag)?,
-            "--default-security" => {
-                args.default_admin_only = Some(match value(&mut it, flag)?.as_str() {
-                    "open" => false,
-                    "admin-only" => true,
-                    other => {
-                        return Err(format!(
-                            "unknown --default-security value: {other:?} (expected open or admin-only)"
-                        ));
-                    }
-                })
-            }
-            "--max-in-flight" => args.max_in_flight = number(&mut it, flag, 0, u32::MAX.into())?,
-            "--per-user-in-flight" => {
-                args.per_user_in_flight = number(&mut it, flag, 0, u32::MAX.into())?
-            }
-            "--per-user-rate" => args.per_user_rate = number(&mut it, flag, 0, u32::MAX.into())?,
-            "--heavy-in-flight" => {
-                args.heavy_in_flight = number(&mut it, flag, 0, u32::MAX.into())?
-            }
-            "--heavy-per-user" => args.heavy_per_user = number(&mut it, flag, 0, u32::MAX.into())?,
-            "--background-in-flight" => {
-                args.background_in_flight = number(&mut it, flag, 0, u32::MAX.into())?
-            }
-            "--compact-concurrency" => {
-                args.compact_concurrency = number(&mut it, flag, 1, u32::MAX.into())?
-            }
-            "--nodes" => {
-                args.nodes = value(&mut it, flag)?
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }
-            "--me" => {
-                args.me = number(&mut it, flag, 0, u32::MAX.into())?;
-                me_given = true;
-            }
-            "--advertise" => args.advertise = value(&mut it, flag)?,
-            "--seed-nodes" => {
-                args.seed_nodes = value(&mut it, flag)?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|node| !node.is_empty())
-                    .map(|node| node.trim_end_matches('/').to_string())
-                    .collect()
-            }
-            "--sync-secs" => args.sync_secs = number(&mut it, flag, 0, u64::MAX)?,
-            "--js-sandbox" => {
-                args.js_sandbox = match value(&mut it, flag)?.as_str() {
-                    "native" => crate::js::Sandbox::Native,
-                    "process" => crate::js::Sandbox::Process,
-                    "wasm" => crate::js::Sandbox::Wasm,
-                    other => {
-                        return Err(format!(
-                            "unknown --js-sandbox value: {other:?} (expected native, process or wasm)"
-                        ));
-                    }
-                }
-            }
-            "--wasm-runtime" => {
-                args.wasm_runtime = match value(&mut it, flag)?.as_str() {
-                    "wasmi" => crate::js::WasmRuntime::Wasmi,
-                    "wasmtime" => crate::js::WasmRuntime::Wasmtime,
-                    other => {
-                        return Err(format!(
-                            "unknown --wasm-runtime value: {other:?} (expected wasmi or wasmtime)"
-                        ));
-                    }
-                }
-            }
-            "--js-worker" => args.worker = true,
-            "--js-workers" => args.js_workers = number(&mut it, flag, 1, 64)?,
-            "--view-timeout-ms" => args.view_timeout_ms = number(&mut it, flag, 1, u64::MAX)?,
-            "--view-memory-mb" => args.view_memory_mb = number(&mut it, flag, 1, u32::MAX.into())?,
-            "--max-request-mb" => args.max_request_mb = number(&mut it, flag, 1, u32::MAX.into())?,
-            "--rebalance-write-drain-ms" => {
-                args.rebalance_write_drain_ms = number(&mut it, flag, 1, u64::MAX)?
-            }
-            "--rebalance-stable-wait-ms" => {
-                args.rebalance_stable_wait_ms = number(&mut it, flag, 1, u64::MAX)?
-            }
-            "--rebalance-freeze-ms" => {
-                args.rebalance_freeze_ms = number(&mut it, flag, 1, u64::MAX)?
-            }
-            "--js-worker-startup-ms" => {
-                args.js_worker_startup_ms = number(&mut it, flag, 1, u64::MAX)?
-            }
-            "--max-open-indexes" => {
-                args.max_open_indexes = number(&mut it, flag, 1, u32::MAX.into())?
-            }
-            "--max-open-dbs" => args.max_open_dbs = number(&mut it, flag, 1, u32::MAX.into())?,
-            "--cluster-secret" => args.cluster_secret = value(&mut it, flag)?,
-            "--otel-endpoint" => args.otel_endpoint = Some(value(&mut it, flag)?),
-            "--cors-origins" => args.cors_origins = list(&value(&mut it, flag)?),
-            "--cors-credentials" => args.cors_credentials = true,
-            "--cors-headers" => args.cors_headers = list(&value(&mut it, flag)?),
-            "--cors-methods" => args.cors_methods = list(&value(&mut it, flag)?),
-            "--cors-exposed-headers" => args.cors_exposed_headers = list(&value(&mut it, flag)?),
-            "--cors-max-age" => args.cors_max_age = number(&mut it, flag, 0, u32::MAX.into())?,
-            "--help" | "-h" => return Ok(None),
-            other => return Err(format!("unknown argument: {other}")),
+        if matches!(flag, "--help" | "-h") {
+            return Ok(None);
         }
-        if it.inline.is_some() {
+        let Some(known) = FLAGS.iter().find(|known| known.name == flag) else {
+            return Err(format!("unknown argument: {flag}"));
+        };
+        (known.set)(&mut args, &mut it, flag)?;
+        me_given |= flag == "--me";
+        if !known.takes_value && it.inline.is_some() {
             return Err(format!("{flag} does not take a value"));
         }
     }
@@ -572,10 +641,23 @@ mod tests {
     }
 
     #[test]
-    fn every_value_flag_is_a_known_flag() {
-        for flag in NUMERIC.iter().chain(NEEDS_VALUE) {
-            assert!(KNOWN_FLAGS.contains(flag), "{flag}");
+    fn the_test_lists_match_the_flag_table() {
+        // The table is the one source of flags, so every flag is known to the
+        // value check. The lists above must cover exactly its value flags, or
+        // a new flag would escape the tests that loop over them.
+        for flag in FLAGS {
+            assert!(is_known_flag(flag.name), "{}", flag.name);
+            let listed = NUMERIC.contains(&flag.name) || NEEDS_VALUE.contains(&flag.name);
+            assert_eq!(listed, flag.takes_value, "{}", flag.name);
         }
+        for flag in NUMERIC.iter().chain(NEEDS_VALUE) {
+            let entry = FLAGS.iter().find(|entry| entry.name == *flag);
+            assert!(entry.is_some_and(|entry| entry.takes_value), "{flag}");
+        }
+        let mut names: Vec<_> = FLAGS.iter().map(|flag| flag.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), FLAGS.len(), "a flag is listed twice");
     }
 
     #[test]
