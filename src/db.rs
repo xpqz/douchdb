@@ -490,7 +490,7 @@ static REBALANCE_FREEZE_MS: AtomicU64 = AtomicU64::new(DEFAULT_REBALANCE_FREEZE_
 /// Set the freeze bound (`--rebalance-freeze-ms`). Every freeze on this node,
 /// whether it started the rebalance or accepted a peer's announcement, uses it.
 pub fn set_rebalance_freeze_ms(ms: u64) {
-    REBALANCE_FREEZE_MS.store(ms.max(1), Ordering::SeqCst);
+    REBALANCE_FREEZE_MS.store(ms, Ordering::SeqCst);
 }
 
 fn now_millis() -> u64 {

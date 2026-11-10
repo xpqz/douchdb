@@ -262,7 +262,7 @@ static WORKER_STARTUP_MS: AtomicU64 = AtomicU64::new(DEFAULT_WORKER_STARTUP_MS);
 
 /// Set how long a starting worker may take (`--js-worker-startup-ms`).
 pub fn set_worker_startup_ms(ms: u64) {
-    WORKER_STARTUP_MS.store(ms.max(1), Ordering::SeqCst);
+    WORKER_STARTUP_MS.store(ms, Ordering::SeqCst);
 }
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
