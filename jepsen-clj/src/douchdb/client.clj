@@ -5,6 +5,7 @@
   {_id: k, value: v}; reads use a read quorum, writes use a write quorum, and
   compare-and-set is a read followed by a conditional PUT using If-Match."
   (:require [cheshire.core :as json]
+            [douchdb.convergence :as convergence]
             [douchdb.db :as db]
             [douchdb.http :as http]
             [douchdb.liveness :as liveness]
@@ -40,10 +41,11 @@
 
 (defn- classify-write
   "A write that provably never reached the server failed; one that may have
-  reached it is indeterminate."
+  reached it is indeterminate. An acknowledged write carries the revision it
+  created, so the partition checker can look for it at the end."
   [response]
   (case (:status response)
-    (200 201) {:type :ok}
+    (200 201) {:type :ok :rev (get-in response [:body :rev])}
     202 {:type :info :error :quorum-not-met}
     (409 412) {:type :conflict}
     nil (if (http/not-sent? response)
@@ -123,11 +125,11 @@
               {:type :fail :error :revision-mismatch}
               result)))))))
 
-(defrecord DouchClient [node db-name read-quorum write-quorum]
+(defrecord DouchClient [node nodes db-name read-quorum write-quorum]
   client/Client
   (open! [_ test node]
     (liveness/mark-origin!)
-    (->DouchClient node (:db-name test)
+    (->DouchClient node (:nodes test) (:db-name test)
                    (:read-quorum test 2)
                    (:write-quorum test 2)))
 
@@ -142,7 +144,8 @@
           c this
           completed (fn [op result]
                       (cond-> (assoc op :type (:type result))
-                        (:error result) (assoc :error (:error result))))]
+                        (:error result) (assoc :error (:error result))
+                        (:rev result) (assoc :rev (:rev result))))]
       (case (:f op)
         :write (completed op (write-register c key value))
         :read (let [result (read-register c key)]
@@ -151,7 +154,12 @@
                        :value (independent/tuple key (:value result))))
         :cas (let [[expected new-value] value]
                (completed op (cas-register c key expected new-value)))
-        :cas-write (completed op (cas-write-register c key value))))))
+        :cas-write (completed op (cas-write-register c key value))
+        :final-state (let [state (convergence/final-state
+                                   (:nodes c) (:db-name c) (doc-id key))]
+                       (assoc op
+                              :type (if (:converged? state) :ok :info)
+                              :value (independent/tuple key state)))))))
 
 (defn douchdb []
-  (->DouchClient nil nil nil nil))
+  (->DouchClient nil nil nil nil nil))
