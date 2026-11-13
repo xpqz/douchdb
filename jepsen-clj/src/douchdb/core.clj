@@ -1,5 +1,10 @@
 (ns douchdb.core
-  "Run a real Jepsen linearizability test against a douchdb cluster.
+  "Run a real Jepsen test against a douchdb cluster.
+
+  Without faults and under process kills, the checker is linearizability.
+  Under network partitions it is douchdb.convergence: CouchDB does not behave
+  as a single copy of the data while the network is split, so that run checks
+  what CouchDB does promise instead.
 
   The cluster is expected to be running as Docker containers named
   douchdb-jepsen-0, douchdb-jepsen-1, ... on a user-defined Docker network.
@@ -10,6 +15,7 @@
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
             [douchdb.client :as dc]
+            [douchdb.convergence :as convergence]
             [douchdb.db :as db]
             [douchdb.liveness :as liveness]
             [douchdb.nemesis :as dn]
@@ -141,27 +147,47 @@
         next
         (->CasWriteRegister (:value next))))))
 
-(defn- checker
-  []
-  (independent/checker
-    (checker/linearizable
-      {:model (->CasWriteRegister nil)})))
+(defn- partition?
+  [{:keys [no-nemesis fault]}]
+  (and (not no-nemesis) (= "partition" fault)))
+
+(defn- safety-checker
+  "Returns [name checker]."
+  [options]
+  (if (partition? options)
+    [:convergence (independent/checker (convergence/checker))]
+    [:linearizable (independent/checker
+                     (checker/linearizable
+                       {:model (->CasWriteRegister nil)}))]))
+
+(defn- final-generator
+  "After the timed workload. A partition run heals the network and then waits,
+  per key, for every node to hold the same revisions; other runs read every
+  key once so an acknowledged write that vanished still fails the checker."
+  [options]
+  (if (partition? options)
+    (gen/concat
+      (gen/nemesis (gen/once {:type :info :f :heal :value :all}))
+      (gen/clients (independent/final-generator (constantly {:f :final-state}))))
+    (when-not (:no-final-reads options)
+      (gen/clients (independent/final-generator (constantly {:f :read}))))))
 
 (defn- test-map
   [{:keys [nodes time-limit concurrency nemesis-interval fault no-nemesis
-           network seed workload ops-per-key read-quorum write-quorum no-final-reads
+           network seed workload ops-per-key read-quorum write-quorum
            liveness max-indeterminate-pct liveness-interval-ms]
-    db-name :db}]
-  (let [tracked (independent/track-keys (make-workload workload ops-per-key))
-        body (cond->> tracked
+    db-name :db
+    :as options}]
+  (let [[safety-name safety] (safety-checker options)
+        body (cond->> (make-workload workload ops-per-key)
                (not no-nemesis)
                (gen/nemesis (nemesis-generator nemesis-interval fault)))
         timed (gen/time-limit time-limit body)
-        generator (if no-final-reads
-                    timed
-                    (gen/concat
-                      timed
-                      (independent/final-generator (constantly {:f :read}))))]
+        final (final-generator options)
+        ;; final-generator emits one op per key recorded by track-keys, so
+        ;; the tracking must wrap it as well as the workload.
+        generator (independent/track-keys
+                    (if final (gen/concat timed final) timed))]
     (cond-> {:name (str "douchdb-" (if no-nemesis "no-fault" fault)
                         "-" workload "-r" read-quorum "-w" write-quorum)
              :nodes nodes
@@ -181,22 +207,23 @@
              :generator generator
              :checker (if liveness
                         (checker/compose
-                          {:linearizable (checker)
+                          {safety-name safety
                            :liveness (liveness/checker
                                        {:samples (:samples liveness)
                                         :max-indeterminate-pct max-indeterminate-pct
                                         :liveness-interval-ms liveness-interval-ms})})
-                        (checker))
+                        safety)
              :time-limit time-limit}
       seed (assoc :seed seed))))
 
 (defn- verdict
-  "Names the checkers behind a result: liveness and linearizability are
-  composed, and either can fail or be unable to decide on its own."
-  [results]
-  (let [parts (if (contains? results :linearizable)
-                (select-keys results [:linearizable :liveness])
-                {:linearizable results})
+  "Names the checkers behind a result: liveness and the safety checker
+  (linearizable or convergence) are composed, and either can fail or be
+  unable to decide on its own."
+  [safety-name results]
+  (let [parts (if (contains? results :liveness)
+                (select-keys results [safety-name :liveness])
+                {safety-name results})
         named (fn [v] (->> parts
                            (filter #(= v (:valid? (val %))))
                            (map (comp name key))
@@ -214,7 +241,7 @@
         (cli/parse-opts args cli-options)]
     (cond
       (:help options)
-      (do (println "Run a Jepsen linearizability test against douchdb.\n")
+      (do (println "Run a Jepsen test against douchdb.\n")
           (println summary)
           (System/exit 0))
 
@@ -252,7 +279,7 @@
             (println "Jepsen results:")
             (pp/pprint results)
             (println)
-            (println (verdict results))
+            (println (verdict (first (safety-checker options)) results))
             (System/exit (case (:valid? results) true 0 false 1 3)))
           (catch Exception e
             (.printStackTrace e)

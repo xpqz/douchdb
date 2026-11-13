@@ -14,8 +14,11 @@ The test is a set of independent registers. Each key is a document:
 Each key gets one writer and one reader. Writes are conditional updates from
 the revision the writer just read; reads use `?r=2`. A node can be killed and
 restarted, or disconnected from the Docker network, while the workload runs.
-The checker asks whether every completed read is explainable by a linearizable
-register, given that failed and indeterminate operations may not have happened.
+
+Without faults and under kills, the checker asks whether every completed read
+is explainable by a linearizable register, given that failed and indeterminate
+operations may not have happened. Under network partitions it checks what
+CouchDB promises instead; see [Partitions](#partitions).
 
 ## Quick start
 
@@ -44,7 +47,7 @@ Useful options:
 -n, --no-nemesis               run without faults
     --read-quorum N            read quorum r, 1-3 (default 2)
     --write-quorum N           write quorum w, 1-3 (default 2)
-    --no-final-reads           skip the final read of every key
+    --no-final-reads           skip the final read of every key (not partition runs)
     --liveness-interval-ms MS  container/health sample interval (default 500)
     --max-indeterminate-pct N  fail above this indeterminate percentage (default 20)
     --no-liveness              disable runtime liveness sampling
@@ -109,9 +112,34 @@ and checker results are written under `jepsen-clj/store/`.
 - **Faults:** a custom Docker nemesis. `kill` uses `docker kill`/`docker
   start`; `partition` uses `docker network disconnect`/`connect`. The nemesis
   starts and reconnects every node during teardown.
-- **Checker:** `jepsen.checker/linearizable` with a CAS-register model wrapped
-  by `jepsen.independent/checker`. The model accepts the CAS workload's
-  `:cas-write` operation as a successful write.
+- **Checker:** without faults and under kills, `jepsen.checker/linearizable`
+  with a CAS-register model wrapped by `jepsen.independent/checker`. The model
+  accepts the CAS workload's `:cas-write` operation as a successful write.
+  Under partitions, `douchdb.convergence/checker`; see below.
+
+## Partitions
+
+CouchDB is not a single copy of the data while the network is split, and
+douchdb mimics it. A write that reaches fewer than `w` copies is still stored
+and answered with 202, a writer can read a stale revision and start a conflict
+branch, and copies answer reads differently until anti-entropy catches up. A
+read can therefore return an older value than an earlier read did. The
+linearizability checker rejects that, correctly, so partition runs check
+CouchDB's actual promises instead:
+
+- **No invented data:** every read returns nil or a value that some write,
+  invoked before the read returned and not known to have failed, tried to
+  store.
+- **Acknowledged writes survive:** the client records the revision of every
+  201 write. After the run, that revision must be in the document's revision
+  tree, as the winner, an ancestor or a conflict.
+- **Convergence:** after the workload, the nemesis heals the network and a
+  final `:final-state` operation per key asks every node for its own copy
+  (`open_revs=all&revs=true&r=1`) until all nodes hold the same leaves. A key
+  that has not converged within 120 seconds fails the run.
+
+The final state replaces the final reads, so `--no-final-reads` has no effect
+on partition runs.
 
 ## Liveness
 
@@ -171,6 +199,7 @@ its connection. Jepsen's checker treats those as possibly having happened.
 
 - `src/douchdb/core.clj` — CLI, workload, nemesis generator, test map.
 - `src/douchdb/client.clj` — register client over the CouchDB HTTP API.
+- `src/douchdb/convergence.clj` — final-state collection and partition checker.
 - `src/douchdb/db.clj` — database setup/teardown and readiness waits.
 - `src/douchdb/nemesis.clj` — Docker kill/start and network partition.
 - `src/douchdb/http.clj` — small clj-http wrapper.
