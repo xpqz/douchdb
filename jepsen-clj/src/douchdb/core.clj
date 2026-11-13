@@ -162,15 +162,30 @@
 
 (defn- final-generator
   "After the timed workload. A partition run heals the network and then waits,
-  per key, for every node to hold the same revisions; other runs read every
-  key once so an acknowledged write that vanished still fails the checker."
+  per key, for every node to hold the same revisions. Other runs read every
+  key once so an acknowledged write that vanished still fails the checker; a
+  kill run first restarts every node, so those reads see every copy rather
+  than the ones that happened to survive the last kill. gen/concat moves on
+  once the recovery op is issued, not once it completes, so the final ops
+  synchronize on it."
   [options]
-  (if (partition? options)
+  (cond
+    (partition? options)
     (gen/concat
       (gen/nemesis (gen/once {:type :info :f :heal :value :all}))
-      (gen/clients (independent/final-generator (constantly {:f :final-state}))))
-    (when-not (:no-final-reads options)
-      (gen/clients (independent/final-generator (constantly {:f :read}))))))
+      (gen/synchronize
+        (gen/clients (independent/final-generator (constantly {:f :final-state})))))
+
+    (:no-final-reads options)
+    nil
+
+    :else
+    (let [reads (gen/clients (independent/final-generator (constantly {:f :read})))]
+      (if (:no-nemesis options)
+        reads
+        (gen/concat
+          (gen/nemesis (gen/once {:type :info :f :start :value :all}))
+          (gen/synchronize reads))))))
 
 (defn- test-map
   [{:keys [nodes time-limit concurrency nemesis-interval fault no-nemesis

@@ -79,7 +79,7 @@ DOUCHDB_NODES=douchdb-jepsen-0 DOUCHDB_N=1 DOUCHDB_Q=1 \
 
 After the timed workload, the final generator reads every key once, so a write
 that was acknowledged but disappeared by the end of the test is still checked.
-Pass `--no-final-reads` to omit it.
+A kill run restarts every node first. Pass `--no-final-reads` to omit it.
 
 `run.sh` builds `douchdb:jepsen` from the repository `Dockerfile`, builds the
 runner image, creates `douchdb-jepsen-net`, and starts three node containers on
@@ -161,8 +161,14 @@ Samples are written to `liveness.edn` under the run's `store` directory.
 
 ## Validation
 
-On 2026-11-03 against the current tree. Counts are operations in the top-level
-history; the first three rows are the original register runs.
+On 2026-11-03 against the tree of that date. Counts are operations in the
+top-level history; the first three rows are the original register runs.
+
+These runs predate the fix that made the final reads run: `track-keys`
+wrapped only the timed workload, so the final generator saw no keys and
+emitted nothing. They checked the reads made during the workload only, not
+whether every acknowledged write was still there at the end. The nightly
+results before 2026-11-13 have the same gap.
 
 | Scenario | Workload | r/w | Duration | Completed | Indeterminate | Failed | Result |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
