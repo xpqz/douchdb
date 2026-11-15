@@ -18538,6 +18538,131 @@ async fn quorum_read_prefers_conflict_winner_across_replicas() {
     }
 }
 
+/// The leaves `node` holds for `id` in its own copy, sorted.
+async fn local_leaves(node: &Server, db: &str, id: &str) -> Vec<String> {
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = node
+        .req_with(
+            Method::GET,
+            &format!("/{db}/{id}?open_revs=all&r=1"),
+            None,
+            &internal,
+        )
+        .await;
+    if status == StatusCode::NOT_FOUND {
+        return Vec::new();
+    }
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut leaves: Vec<String> = body
+        .as_array()
+        .expect("open_revs list")
+        .iter()
+        .filter_map(|entry| entry["ok"]["_rev"].as_str().map(str::to_string))
+        .collect();
+    leaves.sort();
+    leaves
+}
+
+/// `fabric_doc_open` read-repairs: when the copies that answer disagree, the
+/// coordinator writes the newer revision to the stale copies before it
+/// replies. A copy that missed an update holds it after one quorum read,
+/// without waiting for anti-entropy (off here).
+#[tokio::test]
+async fn quorum_read_repairs_a_stale_copy() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("qrepair").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = nodes[0]
+        .post(
+            "/qrepair/_bulk_docs?w=3",
+            json!({"docs": [{"_id": "x", "v": 1}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = body[0]["rev"].as_str().unwrap().to_string();
+
+    // Update only node 0's copy.
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            "/qrepair/_bulk_docs",
+            Some(json!({"docs": [{"_id": "x", "_rev": first, "v": 2}]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second = body[0]["rev"].as_str().unwrap().to_string();
+    assert_eq!(
+        local_leaves(&nodes[1], "qrepair", "x").await,
+        vec![first.clone()]
+    );
+
+    let (status, body) = nodes[1].get("/qrepair/x?r=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], 2, "{body}");
+
+    for (index, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_leaves(node, "qrepair", "x").await,
+            vec![second.clone()],
+            "node {index} was not repaired"
+        );
+    }
+}
+
+/// Read repair carries every leaf, not only the winner: each copy ends up
+/// with both conflict branches.
+#[tokio::test]
+async fn quorum_read_repairs_every_conflict_branch() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db("qrepconf").await;
+    }
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let root = "00000000000000000000000000000000";
+    let branches = [
+        ("b", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ("c", "cccccccccccccccccccccccccccccccc"),
+    ];
+    for (node, (v, id)) in nodes.iter().zip(branches) {
+        let docs = json!({"new_edits": false, "docs": [
+            {"_id": "x", "_rev": format!("2-{id}"),
+             "_revisions": {"start": 2, "ids": [id, root]}, "v": v}
+        ]});
+        let (status, body) = node
+            .req_with(Method::POST, "/qrepconf/_bulk_docs", Some(docs), &internal)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (status, body) = nodes[2].get("/qrepconf/x?r=3").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["v"], "c", "{body}");
+
+    let both = vec![
+        "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        "2-cccccccccccccccccccccccccccccccc".to_string(),
+    ];
+    for (index, node) in nodes.iter().enumerate() {
+        assert_eq!(
+            local_leaves(node, "qrepconf", "x").await,
+            both,
+            "node {index} was not repaired"
+        );
+    }
+}
+
 #[tokio::test]
 async fn quorum_reconciliation_is_coordinator_independent() {
     let nodes = start_cluster_with(3, "3600", 3);

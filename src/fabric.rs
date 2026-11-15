@@ -462,6 +462,8 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
 /// (or the client's explicit `rev`) is returned. Explicit not-found answers
 /// count as reachable, but a transport or server failure does not. Peers
 /// discovery reports down are skipped unless fewer than `r` replicas answer.
+/// Returns, for each replica that answered, its node and the documents it
+/// returned (none for a not-found answer).
 pub(crate) async fn replica_docs(
     ctx: &ClusterCtx,
     db: &Db,
@@ -470,7 +472,7 @@ pub(crate) async fn replica_docs(
     headers: &HeaderMap,
     open_all: bool,
     r: usize,
-) -> (usize, Vec<Value>) {
+) -> Vec<(usize, Vec<Value>)> {
     let mut inner = q.clone();
     inner.insert("r".to_string(), "1".to_string());
     inner.insert("revs".to_string(), "true".to_string());
@@ -501,8 +503,8 @@ pub(crate) async fn replica_docs(
             if node == ctx.cluster.me {
                 crate::telemetry::record_local_read();
                 return match db.get_doc(docid, opts).await {
-                    Ok(doc) => (true, Some(doc)),
-                    Err(error) => (error.status == 404, None),
+                    Ok(doc) => (node, true, Some(doc)),
+                    Err(error) => (node, error.status == 404, None),
                 };
             }
             crate::telemetry::record_remote_read();
@@ -519,13 +521,13 @@ pub(crate) async fn replica_docs(
             match send_peer(request).await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<Value>().await {
-                        Ok(value) => (true, Some(value)),
-                        Err(_) => (false, None),
+                        Ok(value) => (node, true, Some(value)),
+                        Err(_) => (node, false, None),
                     }
                 }
-                Ok(response) if response.status() == StatusCode::NOT_FOUND => (true, None),
-                Ok(_) => (false, None),
-                Err(_) => (false, None),
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => (node, true, None),
+                Ok(_) => (node, false, None),
+                Err(_) => (node, false, None),
             }
         })))
     };
@@ -538,28 +540,131 @@ pub(crate) async fn replica_docs(
         .partition(|node| *node == ctx.cluster.me || !ctx.health.is_down(*node));
     let mut responses = ask(live).await;
     if !skipped.is_empty() {
-        let answered = responses.iter().filter(|(reachable, _)| *reachable).count();
+        let answered = responses
+            .iter()
+            .filter(|(_, reachable, _)| *reachable)
+            .count();
         if answered < r {
             responses.extend(ask(skipped).await);
         }
     }
 
-    let reachable = responses.iter().filter(|(reachable, _)| *reachable).count();
-    let mut docs = Vec::new();
-    for (_, value) in responses {
-        match value {
-            Some(Value::Array(entries)) => {
-                for entry in entries {
-                    if let Some(ok) = entry.get("ok") {
-                        docs.push(ok.clone());
-                    }
+    responses
+        .into_iter()
+        .filter(|(_, reachable, _)| *reachable)
+        .map(|(node, _, value)| {
+            let docs = match value {
+                Some(Value::Array(entries)) => entries
+                    .iter()
+                    .filter_map(|entry| entry.get("ok").cloned())
+                    .collect(),
+                Some(value) => vec![value],
+                None => Vec::new(),
+            };
+            (node, docs)
+        })
+        .collect()
+}
+
+/// What read repair writes: for each replica that answered, the leaves some
+/// other replica returned that it lacks (`fabric_doc_open:read_repair`). A
+/// leaf is a returned revision that no returned history names as an ancestor;
+/// it is sent with the longest history any replica gave for it, so the stale
+/// copy can graft it onto its own tree. Replicas that already hold every leaf
+/// are left out.
+pub(crate) fn read_repair_plan(answers: &[(usize, Vec<Value>)]) -> Vec<(usize, Vec<Value>)> {
+    let mut best: BTreeMap<String, &Value> = BTreeMap::new();
+    let mut ancestors = BTreeSet::new();
+    for doc in answers.iter().flat_map(|(_, docs)| docs) {
+        let Some(rev) = doc.get("_rev").and_then(Value::as_str) else {
+            continue;
+        };
+        let history = revision_history(doc);
+        ancestors.extend(history.iter().skip(1).cloned());
+        best.entry(rev.to_string())
+            .and_modify(|current| {
+                if history.len() > revision_history(current).len() {
+                    *current = doc;
+                }
+            })
+            .or_insert(doc);
+    }
+    let leaves: Vec<(&String, &Value)> = best
+        .iter()
+        .filter(|(rev, _)| !ancestors.contains(*rev))
+        .map(|(rev, doc)| (rev, *doc))
+        .collect();
+    answers
+        .iter()
+        .filter_map(|(node, docs)| {
+            let held: BTreeSet<&str> = docs
+                .iter()
+                .filter_map(|doc| doc.get("_rev").and_then(Value::as_str))
+                .collect();
+            let missing: Vec<Value> = leaves
+                .iter()
+                .filter(|(rev, _)| !held.contains(rev.as_str()))
+                .map(|(_, doc)| replicated_body(doc))
+                .collect();
+            (!missing.is_empty()).then_some((*node, missing))
+        })
+        .collect()
+}
+
+/// A read response as a `new_edits=false` write: the body plus the members a
+/// replicated write takes, without the read-only ones (`_conflicts`,
+/// `_local_seq`, ...) a client's query options may have added.
+fn replicated_body(doc: &Value) -> Value {
+    let mut body = doc.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.retain(|key, _| {
+            !key.starts_with('_')
+                || matches!(key.as_str(), "_id" | "_rev" | "_revisions" | "_deleted")
+        });
+    }
+    body
+}
+
+/// Write each replica the leaves it lacks, as replicated changes, and wait
+/// for the writes before the read replies, as `fabric_doc_open` does. A
+/// failed repair does not fail the read; anti-entropy catches the copy up.
+pub(crate) async fn read_repair(
+    st: &AppState,
+    db: &Db,
+    plan: Vec<(usize, Vec<Value>)>,
+    headers: &HeaderMap,
+) {
+    if plan.is_empty() || db.rebalance_in_progress() {
+        return;
+    }
+    let ctx = &st.ctx;
+    let writes = plan.into_iter().map(|(node, docs)| async move {
+        let result = if node == ctx.cluster.me {
+            db.put_docs(docs, false).await
+        } else {
+            forward_bulk_owned(
+                ctx.client.clone(),
+                ctx.cluster.secret.clone(),
+                ctx.cluster.nodes[node].clone(),
+                db.name.clone(),
+                docs,
+                false,
+                headers.clone(),
+            )
+            .await
+        };
+        match result {
+            Ok(results) => {
+                if node == ctx.cluster.me && results.iter().any(WriteResult::is_ok) {
+                    st.db_updates.record(&db.name, "updated");
                 }
             }
-            Some(value) => docs.push(value),
-            None => {}
+            Err(error) => {
+                tracing::warn!(db = %db.name, node, %error, "read repair failed");
+            }
         }
-    }
-    (reachable, docs)
+    });
+    crate::cluster_http::in_one_round(join_all(writes)).await;
 }
 
 pub(crate) struct Reconciled {
@@ -3617,6 +3722,34 @@ mod tests {
             in_flight < 200,
             "{in_flight} replica writes are in flight to a peer that never answers"
         );
+    }
+
+    fn leaf(rev: &str, ids: &[&str]) -> Value {
+        let start: u64 = rev.split('-').next().unwrap().parse().unwrap();
+        json!({"_id": "x", "_rev": rev, "_revisions": {"start": start, "ids": ids},
+               "_conflicts": ["ignored"], "v": rev})
+    }
+
+    #[test]
+    fn read_repair_plan_is_empty_when_replicas_agree() {
+        let doc = leaf("2-b", &["b", "a"]);
+        let answers = vec![
+            (0, vec![doc.clone()]),
+            (1, vec![doc.clone()]),
+            (2, vec![doc]),
+        ];
+        assert!(read_repair_plan(&answers).is_empty());
+    }
+
+    #[test]
+    fn read_repair_plan_sends_each_replica_only_the_leaves_it_lacks() {
+        let old = leaf("1-a", &["a"]);
+        let new = leaf("2-b", &["b", "a"]);
+        let answers = vec![(0, vec![new.clone()]), (1, vec![old]), (2, Vec::new())];
+        let plan = read_repair_plan(&answers);
+        let expected = json!({"_id": "x", "_rev": "2-b",
+                              "_revisions": {"start": 2, "ids": ["b", "a"]}, "v": "2-b"});
+        assert_eq!(plan, vec![(1, vec![expected.clone()]), (2, vec![expected])]);
     }
 
     #[test]
