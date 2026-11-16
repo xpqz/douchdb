@@ -567,26 +567,14 @@ mod tests {
         });
         entered_rx.recv().unwrap();
 
-        let (done_tx, done_rx) = mpsc::channel();
-        let unrelated = std::thread::spawn({
-            let path = other.file();
-            move || {
-                let db = open(&path, CACHE).unwrap();
-                close_verified(db, &path).unwrap();
-                done_tx.send(()).unwrap();
-            }
-        });
-        // The pass criterion is the completion signal, received while the
-        // first open is still held. The bound only keeps a regression from
-        // hanging the suite; it is never what a passing run waits for.
-        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(120));
+        // Inline: with one lock for every file this blocks for good, and
+        // the run's bound reports it.
+        let path = other.file();
+        let db = open(&path, CACHE).unwrap();
+        close_verified(db, &path).unwrap();
+
         release_tx.send(()).unwrap();
         held.join().unwrap().unwrap();
-        unrelated.join().unwrap();
-        assert!(
-            finished.is_ok(),
-            "an open and close of another path waited for this path's open"
-        );
     }
 
     #[test]
