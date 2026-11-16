@@ -2391,11 +2391,24 @@ impl Db {
         opts: &ChangesOpts,
         full_rows: bool,
     ) -> DbResult<ChangesList> {
+        // A descending read starts each selected shard at its bound, so the
+        // rows' positions start there too (CouchDB starts each reverse worker
+        // at its shard's update_seq). The bound is fixed here so the read and
+        // the row positions share it.
+        let bound = opts.descending.then(|| self.changes_bound(opts));
+        let bounded = bound.clone().map(|bound| ChangesOpts {
+            until: Some(bound),
+            ..opts.clone()
+        });
+        let opts = bounded.as_ref().unwrap_or(opts);
         let (rows, last, pending) = self.changes_rows(opts).await?;
         let selected = self.selected_shards(opts.owned.as_ref());
         let mut progress = ShardSince(
             (0..self.shards.len())
-                .map(|shard| opts.since.get(shard))
+                .map(|shard| match &bound {
+                    Some(bound) if selected.contains(&shard) => bound.get(shard),
+                    _ => opts.since.get(shard),
+                })
                 .collect(),
         );
         let mut results = Vec::with_capacity(rows.len());
@@ -6985,6 +6998,55 @@ mod tests {
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
         assert_eq!((last_seq.get(0), pending), (1, 0));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A descending feed starts every shard at its current position, so a
+    /// row's token puts the shards not yet read there, not at `since`: it
+    /// agrees with `last_seq`, and resuming from it replays nothing (CouchDB
+    /// starts each reverse worker at its shard's update_seq).
+    #[tokio::test]
+    async fn descending_row_tokens_start_unread_shards_at_their_bound() {
+        let root = std::env::temp_dir().join(format!("douchdb-descrow-{}", crate::util::uuid()));
+        let db = scan_db(&root, "descrow", 2, false);
+        for i in 0..10 {
+            db.put_docs(vec![json!({"_id": format!("doc{i}")})], true)
+                .await
+                .unwrap();
+        }
+        let positions = |token: &str| {
+            db.shard_since(0, &crate::since::Since::Token(crate::since::decode(token).unwrap()))
+        };
+        let opts = ChangesOpts {
+            descending: true,
+            limit: Some(1),
+            filter: None,
+            ..descending_design_changes(Some(1))
+        };
+        let list = db.changes(0, &opts, true).await.unwrap();
+        assert_eq!(list.results.len(), 1);
+        let row = positions(&list.results[0].seq);
+        let last = positions(&list.last_seq);
+        let current = db.changes_bound(&opts);
+        assert!((0..2).all(|shard| current.get(shard) > 0), "{current:?}");
+        assert_eq!(row, last, "the row's token and last_seq disagree");
+
+        let (replayed, _) = db
+            .changes_rows_only(&ChangesOpts {
+                since: row,
+                descending: false,
+                limit: None,
+                ..opts
+            })
+            .await
+            .unwrap();
+        assert!(
+            replayed.is_empty(),
+            "resuming from the row replayed {:?}",
+            replayed.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
