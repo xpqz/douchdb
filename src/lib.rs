@@ -29,7 +29,7 @@ pub(crate) mod rev;
 pub(crate) mod revtree;
 pub(crate) mod search;
 pub(crate) mod server;
-pub mod since;
+pub(crate) mod since;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod telemetry;

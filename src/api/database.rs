@@ -180,24 +180,28 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             .and_then(|value| value.to_str().ok())
             == Some("1")
     {
-        let purge_seq = match db.purge_seq().await {
-            Ok(purge_seq) => purge_seq,
+        // Every local copy's uuid, committed position and purge sequence,
+        // for a coordinator building the cluster's tokens.
+        let purge_seqs = match db.shard_purge_seqs().await {
+            Ok(purge_seqs) => purge_seqs,
             Err(e) => return fail(e),
         };
-        return json(
-            StatusCode::OK,
-            json!({"update_seq": db.update_seq(), "purge_seq": purge_seq}),
-        );
+        let shards: Vec<Value> = db
+            .shard_seqs()
+            .into_iter()
+            .zip(purge_seqs)
+            .map(|((uuid, seq), purged)| json!([uuid, seq, purged]))
+            .collect();
+        return json(StatusCode::OK, json!({ "shards": shards }));
     }
     match db.info().await {
         Ok(info) => {
             if st.ctx.cluster.is_internal(headers) {
                 return json_of(StatusCode::OK, &info);
             }
-            // The sequences are opaque tokens, as in CouchDB 3. In a cluster
-            // they are the same version vectors the changes feed returns, so
-            // clients that use them as `since` do not skip another node's
-            // changes.
+            // The sequences are opaque tokens, as in CouchDB 3: one position
+            // per shard range, on a named copy, the same form the changes
+            // feed returns, so they work as `since`.
             let (seq, purge_seq) = if st.ctx.cluster.is_clustered() {
                 match cluster_seq_tokens(ClusterRead {
                     ctx: &st.ctx,
@@ -211,10 +215,7 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                     Err(e) => return fail(e),
                 }
             } else {
-                (
-                    encode_local_seq(&st.ctx.cluster, info.update_seq),
-                    encode_local_seq(&st.ctx.cluster, info.purge_seq),
-                )
+                info.local_tokens(st.ctx.cluster.me)
             };
             match info_json(&info, &seq, &purge_seq) {
                 Ok(info) => json(StatusCode::OK, info),

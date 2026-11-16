@@ -4,6 +4,7 @@ use crate::auth::Auth;
 use crate::cluster::{Cluster, ShardMask};
 use crate::cluster_http::{internal_request_raw, send_peer};
 use crate::db::Db;
+use crate::since::{decode, encode, CopyPos};
 use crate::state::AppState;
 use crate::store::PurgeInfo;
 use anyhow::{anyhow, Result};
@@ -50,23 +51,24 @@ pub async fn pull(
         auth,
     };
     ctx.sync_purges().await?;
-    // Two feeds, each with its own checkpoint: the shards this node
+    let peer_node = cluster
+        .nodes
+        .iter()
+        .position(|node| node == peer)
+        .ok_or_else(|| anyhow!("{peer} is not a node of this cluster"))?;
+    // Two feeds, each with its own checkpoints: the shards this node
     // replicates, and the design documents of every other shard (design
     // documents live on every node so views and search work over local
     // shards). Together they cover what `is_replica_of` accepts, without the
     // peer sending the rest.
     let owned = owned_shards(db, cluster.me);
     let others = other_shards(db, &owned);
-    let id = checkpoint_id(db, peer);
     let mut outcome = PullOutcome::default();
-    for (feed, checkpoint) in [
-        (Feed::Shards(owned), id.clone()),
-        (Feed::Design(others), format!("{id}:design")),
-    ] {
+    for feed in [Feed::Shards(owned), Feed::Design(others)] {
         if feed.mask().is_empty() {
             continue;
         }
-        let (docs, rows, since) = ctx.pull_feed(&feed, &checkpoint, shutdown).await?;
+        let (docs, rows, since) = ctx.pull_feed(&feed, peer_node, shutdown).await?;
         outcome.docs += docs;
         outcome.rows += rows;
         outcome.checkpoint.get_or_insert(since);
@@ -86,6 +88,16 @@ impl Feed {
     fn mask(&self) -> &ShardMask {
         match self {
             Feed::Shards(mask) | Feed::Design(mask) => mask,
+        }
+    }
+
+    /// The prefix of this feed's checkpoint ids. A design-only checkpoint
+    /// says nothing about a shard's other documents, so it is kept apart:
+    /// a shard this node starts to replicate is pulled in full from 0.
+    fn kind(&self) -> &'static str {
+        match self {
+            Feed::Shards(_) => "ae3",
+            Feed::Design(_) => "ae3d",
         }
     }
 }
@@ -126,11 +138,12 @@ type RevPairs = BTreeSet<(String, String)>;
 /// Revisions the peer returned, and revisions it explicitly no longer has.
 type Fetched = (BTreeMap<(String, String), Value>, RevPairs);
 
-/// Include the replica placement in the checkpoint id. When placement changes,
-/// the new replica starts from zero instead of skipping documents that were
-/// filtered out under the old map. Only the replica lists matter: the version
-/// counter changes without changing what this node replicates, and keying on
-/// it would re-pull every document after each metadata bump.
+/// Include the replica placement in the purge checkpoint id. When placement
+/// changes, the new replica reads the purges from zero instead of skipping
+/// ones that were filtered out under the old map. Only the replica lists
+/// matter: the version counter changes without changing what this node
+/// replicates, and keying on it would re-read every purge after each
+/// metadata bump.
 fn checkpoint_id(db: &Db, peer: &str) -> String {
     let map_tag = crate::util::hex(&Md5::digest(
         serde_json::to_vec(&db.replication_map().replicas).unwrap_or_default(),
@@ -144,32 +157,60 @@ fn purge_checkpoint_id(db: &Db, peer: &str) -> String {
 }
 
 impl PullCtx<'_> {
-    /// Drain one feed of the peer from its checkpoint. Returns the documents
+    /// Drain one feed of the peer from its checkpoints. Returns the documents
     /// written, the `_changes` rows received, and the position reached.
+    ///
+    /// Each shard keeps its own checkpoint, in that shard's own copy, as
+    /// CouchDB's internal replication does per shard copy: id
+    /// `ae3:<peer>:<shard>:<peer shard uuid>`, value `{seq, source_uuid,
+    /// target_seq}` (`target_seq` is this copy's position once the peer's
+    /// changes up to `seq` were written, which lets a feed translate a
+    /// position from one copy to the other). A checkpoint names the peer's
+    /// copy it read; when the peer's copy is a new one, the peer reads that
+    /// shard from 0 and the checkpoint moves to the new uuid.
     async fn pull_feed(
         &self,
         feed: &Feed,
-        checkpoint_id: &str,
+        peer: usize,
         shutdown: &CancellationToken,
     ) -> Result<(usize, usize, Value)> {
         let db = self.db;
-        let mut since = db
-            .checkpoint_get(checkpoint_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.get("seq").cloned())
-            .unwrap_or_else(|| json!(0));
+        let kind = feed.kind();
+        let mut since: Vec<CopyPos> = Vec::new();
+        // The checkpoint ids found per shard, to replace when the peer's
+        // copy changes.
+        let mut stored: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for shard in feed.mask().shards() {
+            let prefix = format!("{kind}:{peer}:{shard}:");
+            let found = db
+                .shard_checkpoints(shard, &prefix)
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+            if let Some((id, value)) = found.first() {
+                since.push(CopyPos {
+                    node: peer,
+                    shard,
+                    seq: value.get("seq").and_then(Value::as_u64).unwrap_or(0),
+                    uuid: id[prefix.len()..].to_string(),
+                });
+            }
+            stored.insert(shard, found.into_iter().map(|(id, _)| id).collect());
+        }
 
         let mut total = 0usize;
         let mut rows = 0usize;
         loop {
-            // Between batches, so a stop leaves the checkpoint at the last whole
-            // batch and the next pass resumes from there.
+            // Between batches, so a stop leaves the checkpoints at the last
+            // whole batch and the next pass resumes from there.
             if shutdown.is_cancelled() {
                 break;
             }
-            let resp = self.fetch_changes_batch(&since, feed).await?;
+            let token = if since.is_empty() {
+                "0".to_string()
+            } else {
+                encode(&since)
+            };
+            let resp = self.fetch_changes_batch(&token, feed).await?;
             let results = resp
                 .get("results")
                 .and_then(Value::as_array)
@@ -187,20 +228,42 @@ impl PullCtx<'_> {
 
             let last = resp
                 .get("last_seq")
-                .cloned()
+                .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("_changes response has no last_seq"))?;
-            if last.is_null() {
-                return Err(anyhow!("_changes response has null last_seq"));
-            }
+            let last: Vec<CopyPos> = decode(last)
+                .map_err(|e| anyhow!("_changes response has a bad last_seq: {e}"))?
+                .into_iter()
+                .filter(|pos| pos.node == peer && feed.mask().covers(pos.shard))
+                .collect();
             if last == since {
                 break;
             }
-            db.checkpoint_put(checkpoint_id, &json!({ "seq": last }))
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
+            let local = db.shard_seqs();
+            for pos in &last {
+                if since.contains(pos) {
+                    continue;
+                }
+                let id = format!("{kind}:{peer}:{}:{}", pos.shard, pos.uuid);
+                let stale: Vec<String> = stored
+                    .get(&pos.shard)
+                    .into_iter()
+                    .flatten()
+                    .filter(|old| **old != id)
+                    .cloned()
+                    .collect();
+                let value = json!({
+                    "seq": pos.seq,
+                    "source_uuid": pos.uuid,
+                    "target_seq": local.get(pos.shard).map_or(0, |(_, seq)| *seq),
+                });
+                db.put_shard_checkpoint(pos.shard, &id, &value, stale)
+                    .await
+                    .map_err(|e| anyhow!(e.to_string()))?;
+                stored.insert(pos.shard, vec![id]);
+            }
             since = last;
         }
-        Ok((total, rows, since))
+        Ok((total, rows, json!(encode(&since))))
     }
 
     /// Learn of the purges the peer knows of (CouchDB's
@@ -303,14 +366,8 @@ impl PullCtx<'_> {
     }
 
     /// One `_changes` page from the peer.
-    async fn fetch_changes_batch(&self, since: &Value, feed: &Feed) -> Result<Value> {
+    async fn fetch_changes_batch(&self, since: &str, feed: &Feed) -> Result<Value> {
         const BATCH: usize = 1000;
-        // A cluster `_changes` last_seq is an opaque base64 version vector, so
-        // forward whatever the peer gave us rather than parsing it as an integer.
-        let since_param = match since {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
 
         let mut changes = internal_request_raw(
             self.client,
@@ -320,7 +377,7 @@ impl PullCtx<'_> {
             &[&self.db.name, "_changes"],
         )
         .query(&[
-            ("since", since_param.as_str()),
+            ("since", since),
             ("style", "all_docs"),
             ("limit", &BATCH.to_string()),
             ("shards", &feed.mask().query_value()),
@@ -701,13 +758,23 @@ mod tests {
         partial_sent: Arc<AtomicBool>,
     }
 
+    /// The token a single-shard peer (node 0, shard copy "u") reports.
+    fn stub_seq(seq: u64) -> String {
+        encode(&[CopyPos {
+            node: 0,
+            shard: 0,
+            seq,
+            uuid: "u".to_string(),
+        }])
+    }
+
     async fn changes() -> Json<Value> {
         Json(json!({
             "results": [
-                {"seq": 1, "id": "a", "changes": [{"rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]},
-                {"seq": 2, "id": "b", "changes": [{"rev": "1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
+                {"seq": stub_seq(1), "id": "a", "changes": [{"rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]},
+                {"seq": stub_seq(2), "id": "b", "changes": [{"rev": "1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
             ],
-            "last_seq": 2
+            "last_seq": stub_seq(2)
         }))
     }
 
@@ -772,7 +839,7 @@ mod tests {
     async fn pull_stops_between_batches_on_shutdown() {
         async fn asked(State(asked): State<Arc<AtomicBool>>) -> Json<Value> {
             asked.store(true, Ordering::SeqCst);
-            Json(json!({"results": [], "last_seq": 0}))
+            Json(json!({"results": [], "last_seq": stub_seq(0)}))
         }
         let root = std::env::temp_dir().join(format!("douchdb-stop-{}", crate::util::uuid()));
         let db = Db::open(
@@ -876,9 +943,8 @@ mod tests {
         )
         .await;
         assert!(first.is_err(), "partial _bulk_get must fail the pass");
-        let checkpoint_id = checkpoint_id(&db, &peer);
         assert!(
-            db.checkpoint_get(&checkpoint_id).await.unwrap().is_none(),
+            db.shard_checkpoints(0, "ae3:").await.unwrap().is_empty(),
             "checkpoint advanced past a missing revision"
         );
 
@@ -892,17 +958,14 @@ mod tests {
         )
         .await
         .expect("second pass");
-        assert_eq!(second.checkpoint, Some(json!(2)));
+        assert_eq!(second.checkpoint, Some(json!(stub_seq(2))));
         assert!(db
             .get_doc("b", &crate::db::DocOpts::default())
             .await
             .is_ok());
-        let checkpoint = db
-            .checkpoint_get(&checkpoint_id)
-            .await
-            .unwrap()
-            .expect("checkpoint");
-        assert_eq!(checkpoint["seq"], 2);
+        let checkpoints = db.shard_checkpoints(0, "ae3:0:0:u").await.unwrap();
+        assert_eq!(checkpoints.len(), 1, "{checkpoints:?}");
+        assert_eq!(checkpoints[0].1["seq"], 2);
 
         server.abort();
         drop(db);
@@ -935,9 +998,9 @@ mod tests {
             }
             if uri.path().ends_with("_changes") {
                 return Json(json!({
-                    "results": [{"seq": 1, "id": "a",
+                    "results": [{"seq": stub_seq(1), "id": "a",
                                  "changes": [{"rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}],
-                    "last_seq": 1
+                    "last_seq": stub_seq(1)
                 }));
             }
             Json(json!({"results": [{"id": "a", "docs": [{"ok": {
@@ -1006,6 +1069,244 @@ mod tests {
             assert_eq!(secret.as_deref(), Some("test-secret"), "{path}");
         }
 
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A stub peer (node 1) with its own copy of every shard: a uuid and the
+    /// documents in sequence order. It answers `_changes` as a douchdb node
+    /// does, resuming a shard only from a position that names this copy.
+    #[derive(Default)]
+    struct PeerCopies {
+        shards: Vec<(String, Vec<String>)>,
+        /// The position each `_changes` call resumed each shard from.
+        starts: Vec<Vec<(usize, u64)>>,
+    }
+
+    type Peer = Arc<std::sync::Mutex<PeerCopies>>;
+
+    const PEER: usize = 1;
+
+    fn rev_of(id: &str) -> String {
+        format!("1-{}", crate::util::hex(&Md5::digest(id.as_bytes())))
+    }
+
+    async fn peer_changes(
+        State(peer): State<Peer>,
+        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        use crate::since::{decode, encode, CopyPos};
+        let mut peer = peer.lock().unwrap();
+        let since = q
+            .get("since")
+            .filter(|raw| raw.as_str() != "0")
+            .map(|raw| decode(raw).expect("a since token"))
+            .unwrap_or_default();
+        let wanted: Vec<usize> = q["shards"]
+            .split(',')
+            .map(|shard| shard.parse().unwrap())
+            .collect();
+        let mut results = Vec::new();
+        let mut last = Vec::new();
+        let mut starts = Vec::new();
+        for shard in wanted {
+            let (uuid, docs) = peer.shards[shard].clone();
+            let start = since
+                .iter()
+                .find(|pos| pos.node == PEER && pos.shard == shard && pos.uuid == uuid)
+                .map_or(0, |pos| pos.seq);
+            starts.push((shard, start));
+            for (index, id) in docs.iter().enumerate().skip(start as usize) {
+                let pos = CopyPos {
+                    node: PEER,
+                    shard,
+                    seq: index as u64 + 1,
+                    uuid: uuid.clone(),
+                };
+                results.push(json!({
+                    "seq": encode(&[pos]),
+                    "id": id,
+                    "changes": [{"rev": rev_of(id)}],
+                }));
+            }
+            last.push(CopyPos {
+                node: PEER,
+                shard,
+                seq: docs.len() as u64,
+                uuid,
+            });
+        }
+        peer.starts.push(starts);
+        Json(json!({"results": results, "last_seq": encode(&last), "pending": 0}))
+    }
+
+    async fn peer_bulk_get(Json(body): Json<Value>) -> Json<Value> {
+        let results: Vec<Value> = body["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|req| {
+                let id = req["id"].as_str().unwrap();
+                let rev = rev_of(id);
+                let hash = rev.split_once('-').unwrap().1.to_string();
+                json!({"id": id, "docs": [{"ok": {
+                    "_id": id,
+                    "_rev": rev,
+                    "_revisions": {"start": 1, "ids": [hash]},
+                }}]})
+            })
+            .collect();
+        Json(json!({"results": results}))
+    }
+
+    /// A local two-shard database replicating both shards, and a stub peer.
+    async fn two_shard_pair(
+        tag: &str,
+    ) -> (
+        Db,
+        std::path::PathBuf,
+        Peer,
+        Cluster,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            "ae",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .expect("db");
+        let peer: Peer = Arc::default();
+        peer.lock().unwrap().shards = vec![
+            (crate::util::uuid(), Vec::new()),
+            (crate::util::uuid(), Vec::new()),
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new()
+            .route("/ae/_peer_purged_infos", get(no_purges))
+            .route("/ae/_changes", get(peer_changes))
+            .route("/ae/_bulk_get", post(peer_bulk_get))
+            .with_state(peer.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cluster = Cluster {
+            nodes: vec!["http://127.0.0.1:1".to_string(), format!("http://{addr}")],
+            me: 0,
+            n: 2,
+            secret: "test-secret".to_string(),
+        };
+        (db, root, peer, cluster, server)
+    }
+
+    fn ids_for(db: &Db, shard: usize, tag: &str, count: usize) -> Vec<String> {
+        (0..100_000)
+            .map(|i| format!("{tag}{i}"))
+            .filter(|id| db.shard_index(id) == shard)
+            .take(count)
+            .collect()
+    }
+
+    async fn pull_from(db: &Db, cluster: &Cluster) -> PullOutcome {
+        pull(
+            db,
+            &cluster.nodes[PEER],
+            &reqwest::Client::new(),
+            cluster,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("pull")
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_resumes_each_shard_from_its_own_checkpoint() {
+        let (db, root, peer, cluster, server) = two_shard_pair("ae-resume").await;
+        let zero = ids_for(&db, 0, "z", 3);
+        let one = ids_for(&db, 1, "o", 2);
+        {
+            let mut copies = peer.lock().unwrap();
+            copies.shards[0].1 = zero.clone();
+            copies.shards[1].1 = vec![one[0].clone()];
+        }
+        assert_eq!(pull_from(&db, &cluster).await.docs, 4);
+        let uuids: Vec<String> = peer
+            .lock()
+            .unwrap()
+            .shards
+            .iter()
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        let local = db.shard_seqs();
+        for (shard, seq) in [(0usize, 3u64), (1, 1)] {
+            let id = format!("ae3:{PEER}:{shard}:{}", uuids[shard]);
+            let checkpoints = db.shard_checkpoints(shard, &id).await.unwrap();
+            assert_eq!(
+                checkpoints,
+                vec![(
+                    id.clone(),
+                    json!({"seq": seq, "source_uuid": uuids[shard], "target_seq": local[shard].1})
+                )],
+                "shard {shard}"
+            );
+        }
+
+        // Only shard 1 moves on; each shard resumes from its own position.
+        peer.lock().unwrap().shards[1].1.push(one[1].clone());
+        peer.lock().unwrap().starts.clear();
+        assert_eq!(pull_from(&db, &cluster).await.docs, 1);
+        let starts = peer.lock().unwrap().starts.clone();
+        assert_eq!(starts.first(), Some(&vec![(0, 3), (1, 1)]), "{starts:?}");
+        for id in zero.iter().chain(&one) {
+            assert!(db.get_doc(id, &Default::default()).await.is_ok(), "{id}");
+        }
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_peer_shard_with_a_new_uuid_is_pulled_from_zero() {
+        let (db, root, peer, cluster, server) = two_shard_pair("ae-uuid").await;
+        let one = ids_for(&db, 1, "o", 3);
+        peer.lock().unwrap().shards[1].1 = vec![one[0].clone(), one[1].clone()];
+        assert_eq!(pull_from(&db, &cluster).await.docs, 2);
+        let old = peer.lock().unwrap().shards[1].0.clone();
+
+        // The peer's copy of shard 1 is recreated: a new uuid, its own
+        // sequence from 1 again, holding a document this node lacks.
+        let new = crate::util::uuid();
+        {
+            let mut copies = peer.lock().unwrap();
+            copies.shards[1] = (new.clone(), vec![one[2].clone()]);
+            copies.starts.clear();
+        }
+        assert_eq!(pull_from(&db, &cluster).await.docs, 1);
+        let starts = peer.lock().unwrap().starts.clone();
+        assert!(
+            starts.first().is_some_and(|first| first.contains(&(1, 0))),
+            "{starts:?}"
+        );
+        assert!(db.get_doc(&one[2], &Default::default()).await.is_ok());
+        let prefix = format!("ae3:{PEER}:1:");
+        let ids: Vec<String> = db
+            .shard_checkpoints(1, &prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![format!("{prefix}{new}")], "old copy {old}");
         server.abort();
         drop(db);
         let _ = std::fs::remove_dir_all(root);

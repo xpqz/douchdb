@@ -787,7 +787,12 @@ mod tests {
                 ..AllDocsOpts::default()
             };
             assert_eq!(db.all_docs(&page).await.unwrap().rows.len(), 2);
-            assert_eq!(db.changes_pending(0, false, None).await.unwrap(), 3);
+            assert_eq!(
+                db.changes_pending(&crate::db::ShardSince::default(), false, None)
+                    .await
+                    .unwrap(),
+                3
+            );
         };
         let build = |db: Arc<Db>| async move {
             db.put_docs(docs(3), true).await.unwrap();

@@ -18,7 +18,7 @@ pub struct SinceError;
 
 impl std::fmt::Display for SinceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Malformed since parameter")
+        f.write_str("Malformed sequence supplied in 'since' parameter.")
     }
 }
 
@@ -121,7 +121,10 @@ mod tests {
         for bad in ["", "abc", "5", "5-", "5-!!!", "-x", "x-y", "NOW", "5-e30"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
-        assert_eq!(SinceError.to_string(), "Malformed since parameter");
+        assert_eq!(
+            SinceError.to_string(),
+            "Malformed sequence supplied in 'since' parameter."
+        );
     }
 
     #[test]

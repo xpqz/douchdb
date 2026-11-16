@@ -157,6 +157,21 @@ pub(crate) fn json_body(body: &[u8], reason: &str) -> DbResult<Value> {
     serde_json::from_slice::<Value>(body).map_err(|_| ApiError::bad_request(reason))
 }
 
+/// CouchDB's `_changes` rejects a malformed `since` rather than reading it as
+/// 0 (`validate_start_seq`, fabric_view_changes.erl): it must be `now`, the
+/// unquoted `0` or an opaque sequence token (`N-<base64>`) that decodes.
+/// Any other plain integer is malformed too. A token may come quoted, as an
+/// eventsource client sends back the JSON id it was given; `0` and `now`
+/// may not.
+pub(crate) fn parse_since(raw: Option<&str>) -> DbResult<crate::since::Since> {
+    let quoted = raw.and_then(|raw| raw.strip_prefix('"')?.strip_suffix('"'));
+    let parsed = match quoted {
+        Some(token) => crate::since::decode(token).map(crate::since::Since::Token),
+        None => crate::since::parse(raw),
+    };
+    parsed.map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

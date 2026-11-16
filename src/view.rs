@@ -6,7 +6,7 @@
 //! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
-use crate::db::{AllDocsOpts, ApiError, ChangesOpts, Db, DbResult};
+use crate::db::{cursor_valid, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, IndexCursor};
 use crate::index_cache::{Gate, Registry, Slot};
 use crate::js::JsError;
 use crate::util::hex;
@@ -71,7 +71,8 @@ pub struct ViewSpec {
 
 #[derive(Serialize, Deserialize)]
 struct IndexMeta {
-    last_seq: u64,
+    /// How far the index has read each shard.
+    cursor: IndexCursor,
     design: String,
 }
 
@@ -95,7 +96,7 @@ type KeyValue = (Vec<u8>, Vec<u8>);
 
 struct ViewIndex {
     db: Ldb,
-    last_seq: u64,
+    cursor: IndexCursor,
     design: String,
     /// Shard count and partitioning of the database and view, used to split
     /// the cached rows.
@@ -1499,12 +1500,12 @@ impl ViewIndex {
         let meta = db
             .get(b"m")
             .and_then(|bytes| serde_json::from_slice::<IndexMeta>(&bytes).ok());
-        let (last_seq, design) = meta
-            .map(|meta| (meta.last_seq, meta.design))
-            .unwrap_or((0, String::new()));
+        let (cursor, design) = meta
+            .map(|meta| (meta.cursor, meta.design))
+            .unwrap_or_default();
         Ok(ViewIndex {
             db,
-            last_seq,
+            cursor,
             design,
             placement: Placement::shards(1, false),
             cached: None,
@@ -1608,7 +1609,7 @@ impl ViewIndex {
         &mut self,
         changed: Vec<String>,
         by_doc: HashMap<String, Vec<Row>>,
-        last_seq: u64,
+        cursor: IndexCursor,
         design: &str,
     ) -> Result<(), JsError> {
         let mut batch = WriteBatch::default();
@@ -1655,16 +1656,9 @@ impl ViewIndex {
             None => None,
         };
 
-        self.last_seq = last_seq;
+        put_meta(&mut batch, &cursor, design)?;
+        self.cursor = cursor;
         self.design = design.to_string();
-        batch.put(
-            b"m",
-            &serde_json::to_vec(&IndexMeta {
-                last_seq,
-                design: design.to_string(),
-            })
-            .map_err(|error| JsError::Index(error.to_string()))?,
-        );
         self.db
             .write(batch, true)
             .map_err(|error| JsError::Index(error.to_string()))?;
@@ -1677,14 +1671,19 @@ impl ViewIndex {
     /// index nor the whole new one as a single write. Until the last write
     /// records the new design the index matches no design, so a rebuild that
     /// stops part-way is redone by the next query.
-    fn rebuild(&mut self, mut rows: Vec<Row>, last_seq: u64, design: &str) -> Result<(), JsError> {
+    fn rebuild(
+        &mut self,
+        mut rows: Vec<Row>,
+        cursor: IndexCursor,
+        design: &str,
+    ) -> Result<(), JsError> {
         sort_rows(&mut rows);
         let stale = self.scan_keys(b"r/")?;
         self.cached = None;
-        self.last_seq = 0;
+        self.cursor = IndexCursor::default();
         self.design.clear();
         let mut batch = WriteBatch::default();
-        put_meta(&mut batch, 0, "")?;
+        put_meta(&mut batch, &IndexCursor::default(), "")?;
         self.write_batch(batch, false)?;
         for keys in stale.chunks(WRITE_BATCH_ROWS) {
             let mut batch = WriteBatch::default();
@@ -1720,9 +1719,9 @@ impl ViewIndex {
         drop(ordinals);
 
         let mut batch = WriteBatch::default();
-        put_meta(&mut batch, last_seq, design)?;
+        put_meta(&mut batch, &cursor, design)?;
         self.write_batch(batch, true)?;
-        self.last_seq = last_seq;
+        self.cursor = cursor;
         self.design = design.to_string();
         self.cached = Some(Arc::new(ViewRows::from_rows(rows, self.placement)));
         Ok(())
@@ -1738,11 +1737,11 @@ impl ViewIndex {
 /// Rows deleted or written by one batch of a rebuild.
 const WRITE_BATCH_ROWS: usize = 4096;
 
-fn put_meta(batch: &mut WriteBatch, last_seq: u64, design: &str) -> Result<(), JsError> {
+fn put_meta(batch: &mut WriteBatch, cursor: &IndexCursor, design: &str) -> Result<(), JsError> {
     batch.put(
         b"m",
         &serde_json::to_vec(&IndexMeta {
-            last_seq,
+            cursor: cursor.clone(),
             design: design.to_string(),
         })
         .map_err(|error| JsError::Index(error.to_string()))?,
@@ -2034,24 +2033,22 @@ async fn ensure_rows(
         by_partition: db.partitioned && spec.partitioned,
     });
     // Read after the lock: a query that updated the index while this one
-    // waited has moved its last_seq past any sequence read earlier, which
+    // waited has moved its cursor past any position read earlier, which
     // would look like a recreated database and force a full rebuild.
-    // The bound is the changes watermark, not the allocated counter: a write
-    // in flight has taken its sequence but is not readable yet, and an index
-    // that recorded a sequence past it would never see that write.
-    let current_seq = db.changes_watermark(index.last_seq, None);
+    // Each shard is read up to where it is now; writes that land during the
+    // update are left for the next one.
+    let bound = IndexCursor(db.shard_seqs());
     let map = spec.map.clone();
 
     // The map functions and the index writes run on the blocking pool, with
     // the gate and the index lock moved in: they stay held until the work is
     // done even if the request is dropped meanwhile, and the async workers
     // never wait on user JavaScript or on LevelDB.
-    if index.design != design || index.last_seq > current_seq {
-        // Read the bound before scanning, so a write that lands during the
-        // scan stays above it and is picked up by the next update.
-        let bound = db.changes_watermark(0, None);
+    if index.design != design || !cursor_valid(&index.cursor, db) {
         // The documents are read and mapped a page at a time, so a rebuild
         // holds one page of document bodies, not the whole database's.
+        // Writes after `bound` may be read too; the next update reads them
+        // again, which only re-maps them.
         let mut cursor = crate::db::MapCursor::default();
         let mut rows = Vec::new();
         let (mut gate, mut index) = (gate, index);
@@ -2081,66 +2078,62 @@ async fn ensure_rows(
         .await;
     }
 
-    if index.last_seq < current_seq {
-        // The changes are read a page at a time, and each page is applied
-        // and recorded before the next is read, so a long catch-up holds one
-        // page of documents and a failure keeps the pages already applied.
+    if index.cursor != bound {
+        // Each shard is read after its own cursor up to its bound, a page at
+        // a time; each page is applied and recorded before the next is read,
+        // so a long catch-up holds one page of documents and a failure keeps
+        // the pages already applied.
         let (mut gate, mut index) = (gate, index);
-        loop {
-            gate.check()?;
-            let (rows, _) = db
-                .changes_rows_only(&ChangesOpts {
-                    since: index.last_seq,
-                    limit: Some(CHANGES_PAGE),
-                    include_docs: true,
-                    until: Some(current_seq),
-                    ..Default::default()
+        for shard in 0..bound.0.len() {
+            let mut owned = crate::cluster::ShardMask::none(db.q);
+            owned.select(shard);
+            while index.cursor.0[shard].1 < bound.0[shard].1 {
+                gate.check()?;
+                let (rows, last) = db
+                    .changes_rows_only(&ChangesOpts {
+                        since: index.cursor.since(),
+                        limit: Some(CHANGES_PAGE),
+                        include_docs: true,
+                        owned: Some(owned.clone()),
+                        until: Some(bound.since()),
+                        ..Default::default()
+                    })
+                    .await?;
+                let mut cursor = index.cursor.clone();
+                cursor.0[shard].1 = last.get(shard);
+                let (map, design) = (map.clone(), design.clone());
+                (gate, index) = blocking(move || {
+                    gate.check()?;
+                    let mut changed = Vec::new();
+                    let mut docs = Vec::new();
+                    for row in rows {
+                        changed.push(row.id.clone());
+                        if row.id.starts_with("_design/")
+                            || row.id.starts_with("_local/")
+                            || row.deleted
+                        {
+                            continue;
+                        }
+                        if let Some(doc) = row.doc {
+                            docs.push((
+                                row.id,
+                                serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?,
+                            ));
+                        }
+                    }
+                    let rows = run_map(&map, &docs, limits).map_err(|reason| {
+                        ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+                    })?;
+                    let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
+                    for row in rows {
+                        by_doc.entry(row.id.clone()).or_default().push(row);
+                    }
+                    index
+                        .apply(changed, by_doc, cursor, &design)
+                        .map_err(ApiError::from)?;
+                    Ok((gate, index))
                 })
                 .await?;
-            // A short page is the last one, and the index is then current.
-            let upto = match rows.last() {
-                Some(last) if rows.len() >= CHANGES_PAGE => last.seq,
-                _ => current_seq,
-            };
-            let (map, design) = (map.clone(), design.clone());
-            (gate, index) = blocking(move || {
-                gate.check()?;
-                let mut changed = Vec::new();
-                let mut docs = Vec::new();
-                for row in rows {
-                    changed.push(row.id.clone());
-                    if row.id.starts_with("_design/")
-                        || row.id.starts_with("_local/")
-                        || row.deleted
-                    {
-                        continue;
-                    }
-                    if let Some(doc) = row.doc {
-                        docs.push((
-                            row.id,
-                            serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?,
-                        ));
-                    }
-                }
-                let rows = run_map(&map, &docs, limits).map_err(|reason| {
-                    ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-                })?;
-                let mut by_doc: HashMap<String, Vec<Row>> = HashMap::new();
-                for row in rows {
-                    by_doc.entry(row.id.clone()).or_default().push(row);
-                }
-                // Every sequence up to the bound was committed before it was
-                // read and the changes above covered them all, so a gap left
-                // by a write that never finished does not keep the index
-                // behind.
-                index
-                    .apply(changed, by_doc, upto, &design)
-                    .map_err(ApiError::from)?;
-                Ok((gate, index))
-            })
-            .await?;
-            if upto >= current_seq {
-                break;
             }
         }
         return blocking(move || {
@@ -3774,13 +3767,13 @@ mod tests {
         db.put_docs(vec![write("b"), write("c")], true)
             .await
             .unwrap();
-        let caught_up = db.update_seq();
-        holder.last_seq = caught_up;
+        let caught_up = crate::db::IndexCursor(db.shard_seqs());
+        holder.cursor = caught_up.clone();
         drop(holder);
 
         waiting.await.unwrap().unwrap();
         assert_eq!(
-            handle.lock().await.last_seq,
+            handle.lock().await.cursor,
             caught_up,
             "the waiting query rebuilt the index from a stale sequence"
         );
@@ -3876,16 +3869,15 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn a_view_does_not_move_past_a_write_in_flight() {
+    fn two_shard_view_db(tag: &str) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "douchdb-viewflight-{}-{}",
+            "douchdb-{tag}-{}-{}",
             std::process::id(),
             crate::util::uuid()
         ));
         let db = Db::open(
             &root,
-            "viewflight",
+            tag,
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 1000,
@@ -3894,141 +3886,96 @@ mod tests {
             },
         )
         .unwrap();
-        let on_shard = |shard: usize, tag: &str| {
-            (0..10_000)
-                .map(|i| format!("{tag}{i}"))
-                .find(|id| db.shard_index(id) == shard)
-                .expect("document id for shard")
-        };
-        let (a, c, e, d) = (
-            on_shard(0, "a"),
-            on_shard(0, "c"),
-            on_shard(0, "e"),
-            on_shard(1, "d"),
-        );
-        let spec = ViewSpec {
-            map: "function(doc){ emit(doc._id, 1); }".to_string(),
-            reduce: None,
-            partitioned: false,
-        };
-        let limits = ViewQuery::default().limits;
-        let last_seq = |name: &str| {
-            let path = index_path(&db, "_design/v", name);
-            async move {
-                let handle = index_handle(&path).await.unwrap();
-                let seq = handle.lock().await.last_seq;
-                seq
-            }
-        };
-        db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
-        ensure_rows(&db, "_design/v", "inc", &spec, limits)
-            .await
-            .unwrap();
-        let built = last_seq("inc").await;
-
-        // Shard 1 holds an allocated, uncommitted sequence while a later
-        // write on shard 0 commits. An incremental update must stop short.
-        let held = db.start_in_flight_write(1);
-        db.put_docs(vec![json!({"_id": c})], true).await.unwrap();
-        ensure_rows(&db, "_design/v", "inc", &spec, limits)
-            .await
-            .unwrap();
-        let seq = last_seq("inc").await;
-        assert!(
-            (built..held).contains(&seq),
-            "incremental update recorded last_seq {seq}, past the in-flight sequence {held}"
-        );
-
-        // So must a rebuild.
-        let held = db.start_in_flight_write(1);
-        db.put_docs(vec![json!({"_id": e})], true).await.unwrap();
-        ensure_rows(&db, "_design/v", "full", &spec, limits)
-            .await
-            .unwrap();
-        let seq = last_seq("full").await;
-        assert!(
-            seq < held,
-            "rebuild recorded last_seq {seq}, past the in-flight sequence {held}"
-        );
-
-        // Once the shard commits, a later write on it reaches both indexes.
-        db.put_docs(vec![json!({"_id": d})], true).await.unwrap();
-        for name in ["inc", "full"] {
-            let rows = ensure_rows(&db, "_design/v", name, &spec, limits)
-                .await
-                .unwrap();
-            let mut ids: Vec<String> = rows
-                .shards
-                .iter()
-                .flat_map(|shard| shard.blocks.iter().flat_map(|block| block.iter()))
-                .map(|row| row.id.clone())
-                .collect();
-            ids.sort();
-            let mut expected = vec![a.clone(), c.clone(), e.clone(), d.clone()];
-            expected.sort();
-            assert_eq!(ids, expected, "{name} index");
-        }
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
+        (db, root)
     }
 
+    fn view_ids(rows: &ViewRows) -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .shards
+            .iter()
+            .flat_map(|shard| shard.blocks.iter().flat_map(|block| block.iter()))
+            .map(|row| row.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Each shard has its own sequence, so a single number cannot say how far
+    /// an index has read: shard 1's next write has a lower sequence than
+    /// shard 0 has already reached, and must still reach the index.
     #[tokio::test]
-    async fn a_gap_in_the_sequence_does_not_keep_a_view_behind() {
-        let root = std::env::temp_dir().join(format!(
-            "douchdb-viewgap-{}-{}",
-            std::process::id(),
-            crate::util::uuid()
-        ));
-        let db = Db::open(
-            &root,
-            "viewgap",
-            crate::db::DbConfig {
-                q: 2,
-                revs_limit: 1000,
-                shard_map: crate::cluster::ShardMap::single(2),
-                partitioned: false,
-            },
-        )
-        .unwrap();
+    async fn view_update_reads_each_shard_after_its_own_cursor() {
+        let (db, root) = two_shard_view_db("viewcursor");
         let on_shard = |shard: usize, tag: &str| {
             (0..10_000)
                 .map(|i| format!("{tag}{i}"))
                 .find(|id| db.shard_index(id) == shard)
                 .expect("document id for shard")
         };
-        let (a, c) = (on_shard(0, "a"), on_shard(0, "c"));
         let spec = ViewSpec {
             map: "function(doc){ emit(doc._id, 1); }".to_string(),
             reduce: None,
             partitioned: false,
         };
         let limits = ViewQuery::default().limits;
-        db.put_docs(vec![json!({"_id": a})], true).await.unwrap();
+        let mut expected = Vec::new();
+        for tag in ["a", "b", "c"] {
+            let id = on_shard(0, tag);
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+            expected.push(id);
+        }
         ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
             .unwrap();
-
-        // A write commits, then a sequence above it is taken and abandoned,
-        // as by a write whose flush failed. Any later job on the shard
-        // counts the abandoned sequence as settled.
-        db.put_docs(vec![json!({"_id": c})], true).await.unwrap();
-        let abandoned = db.start_in_flight_write(1);
-        db.get_doc(&on_shard(1, "x"), &Default::default())
-            .await
-            .ok();
-        assert_eq!(db.update_seq(), abandoned);
-
-        ensure_rows(&db, "_design/v", "v", &spec, limits)
+        let late = on_shard(1, "d");
+        db.put_docs(vec![json!({"_id": late})], true).await.unwrap();
+        expected.push(late);
+        expected.sort();
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
             .unwrap();
+        assert_eq!(view_ids(&rows), expected);
         let handle = index_handle(&index_path(&db, "_design/v", "v"))
             .await
             .unwrap();
         assert_eq!(
-            handle.lock().await.last_seq,
-            abandoned,
-            "the index stays behind a sequence no write will commit"
+            handle.lock().await.cursor,
+            crate::db::IndexCursor(db.shard_seqs())
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A shard that was cleared is a new copy with a new uuid; an index that
+    /// read the old copy is rebuilt rather than keeping its rows.
+    #[tokio::test]
+    async fn index_rebuilds_when_a_shard_uuid_changes() {
+        let (db, root) = two_shard_view_db("viewuuid");
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let (kept, gone) = (on_shard(0, "k"), on_shard(1, "g"));
+        db.put_docs(vec![json!({"_id": kept}), json!({"_id": gone})], true)
+            .await
+            .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows).len(), 2);
+        db.clear_shards(&[1]).await.unwrap();
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows), vec![kept]);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4806,7 +4753,7 @@ mod tests {
                         value: json!(2),
                     },
                 ],
-                1,
+                IndexCursor(vec![("u".into(), 1)]),
                 "map|",
             )
             .unwrap();
@@ -4823,7 +4770,12 @@ mod tests {
             }],
         );
         index
-            .apply(vec!["a".to_string(), "b".to_string()], by_doc, 2, "map|")
+            .apply(
+                vec!["a".to_string(), "b".to_string()],
+                by_doc,
+                IndexCursor(vec![("u".into(), 2)]),
+                "map|",
+            )
             .unwrap();
         let rows = index.sorted_rows().unwrap();
         assert_eq!(rows.shards[0].len(), 1);
@@ -4877,11 +4829,13 @@ mod tests {
         ];
         {
             let mut index = ViewIndex::open(&dir).unwrap();
-            index.rebuild(rows, 7, "map|").unwrap();
+            index
+                .rebuild(rows, IndexCursor(vec![("u".into(), 7)]), "map|")
+                .unwrap();
         }
         {
             let mut index = ViewIndex::open(&dir).unwrap();
-            assert_eq!(index.last_seq, 7);
+            assert_eq!(index.cursor, IndexCursor(vec![("u".into(), 7)]));
             assert_eq!(index.design, "map|");
             let mut restored = index.load_rows().unwrap();
             restored.sort_by(|a, b| a.id.cmp(&b.id));
@@ -5323,7 +5277,8 @@ mod tests {
 
     /// Shard jobs an incremental view update costs on a three-shard database.
     /// Before: 9 jobs, 3 of them the per-shard `pending` count the index never
-    /// uses. After: 6.
+    /// uses; then 6. With a cursor per shard only the shard that moved is
+    /// read: 1.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_incremental_view_update_skips_the_pending_pass() {
         let root = std::env::temp_dir().join(format!("douchdb-viewpend-{}", crate::util::uuid()));
@@ -5360,7 +5315,7 @@ mod tests {
             .unwrap();
         let (jobs, result) = jobs_for(&db, &query).await;
         assert_eq!(result["total_rows"], json!(2), "{result}");
-        assert_eq!(jobs, 6, "shard jobs for one incremental update");
+        assert_eq!(jobs, 1, "shard jobs for one incremental update");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

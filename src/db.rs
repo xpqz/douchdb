@@ -78,37 +78,47 @@ pub fn shard_index_for(docid: &str, q: u32, partitioned: bool) -> usize {
     shard_index(docid, q)
 }
 
-/// Take the next global sequence for a write staged on one shard. The shard
-/// is marked in flight (`reserved > committed`) *before* the counter moves,
-/// so a changes snapshot that sees the new counter also sees the shard as
-/// in flight. Committed sequences never exceed the counter, so `counter + 1`
-/// is enough to mark it.
-fn allocate_seq(counter: &AtomicU64, reserved: &AtomicU64) -> u64 {
-    reserved.fetch_max(counter.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
-    let seq = counter.fetch_add(1, Ordering::SeqCst) + 1;
-    reserved.fetch_max(seq, Ordering::SeqCst);
-    seq
+/// One position per shard of the database, by shard index: how far a feed
+/// or an index has read each shard's own sequence. A missing entry reads as 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardSince(pub Vec<u64>);
+
+impl ShardSince {
+    pub fn get(&self, shard: usize) -> u64 {
+        self.0.get(shard).copied().unwrap_or(0)
+    }
+
+    fn set(&mut self, shard: usize, seq: u64) {
+        if self.0.len() <= shard {
+            self.0.resize(shard + 1, 0);
+        }
+        self.0[shard] = seq;
+    }
 }
 
-/// Pure form of the changes watermark rule: only shards with an allocated but
-/// uncommitted sequence constrain the cursor, and the cursor never goes below
-/// `since`.
-pub(crate) fn changes_watermark_from(
-    committed: &[u64],
-    reserved: &[u64],
-    since: u64,
-    owned: Option<&ShardMask>,
-) -> u64 {
-    let mut safe = u64::MAX;
-    for index in 0..committed.len().min(reserved.len()) {
-        if !shard_owned(owned, index) {
-            continue;
-        }
-        if reserved[index] > committed[index] {
-            safe = safe.min(committed[index].max(since));
-        }
+/// How far an index (view or search) has read each shard: the shard copy's
+/// uuid and its sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexCursor(pub Vec<(String, u64)>);
+
+impl IndexCursor {
+    /// The positions alone, for a changes read.
+    pub fn since(&self) -> ShardSince {
+        ShardSince(self.0.iter().map(|(_, seq)| *seq).collect())
     }
-    safe
+}
+
+/// Whether an index that has read up to `cursor` can be brought up to date
+/// incrementally: it read these very shard copies (same uuids) and none of
+/// them is behind it. Otherwise it is rebuilt from 0.
+pub fn cursor_valid(cursor: &IndexCursor, db: &Db) -> bool {
+    let current = db.shard_seqs();
+    cursor.0.len() == current.len()
+        && cursor
+            .0
+            .iter()
+            .zip(&current)
+            .all(|((uuid, seq), (now_uuid, now_seq))| uuid == now_uuid && seq <= now_seq)
 }
 
 /// Whether the shard at `index` is selected by an `owned` mask: every shard
@@ -431,13 +441,6 @@ pub struct Db {
     /// coordinating node disappears mid-rebalance.
     rebalance_until: AtomicU64,
     shards: Vec<ShardHandle>,
-    /// Last committed sequence per shard, shared with the shard actors.
-    committed_seq: Vec<Arc<AtomicU64>>,
-    /// Highest sequence allocated but not necessarily committed per shard.
-    reserved_seq: Vec<Arc<AtomicU64>>,
-    /// One global sequence counter for the database. CouchDB's `since` is a
-    /// database-wide cursor, so shard-local counters cannot be used directly.
-    seq: Arc<AtomicU64>,
     /// Pinged by the shard actors after a flushed batch that committed a new
     /// sequence; feeds wait on it instead of polling.
     commits: Arc<tokio::sync::watch::Sender<()>>,
@@ -584,8 +587,6 @@ impl Db {
         };
 
         let mut shards = Vec::new();
-        let mut committed_seq = Vec::with_capacity(file.q as usize);
-        let mut reserved_seq = Vec::with_capacity(file.q as usize);
         let commits = Arc::new(tokio::sync::watch::Sender::new(()));
         for i in 0..file.q {
             let shard = ShardHandle::spawn(
@@ -593,16 +594,9 @@ impl Db {
                 config.revs_limit,
                 commits.clone(),
             )?;
-            committed_seq.push(shard.seq_tracker());
-            reserved_seq.push(shard.reserved_seq());
             shards.push(shard);
         }
 
-        let seq = shards
-            .iter()
-            .map(ShardHandle::initial_seq)
-            .max()
-            .unwrap_or(0);
         let security = load_security(&path)?;
 
         Ok(Db {
@@ -619,9 +613,6 @@ impl Db {
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
             rebalance_until: AtomicU64::new(0),
             shards,
-            committed_seq,
-            reserved_seq,
-            seq: Arc::new(AtomicU64::new(seq)),
             commits,
             validation: std::sync::RwLock::new(None),
             design_generation: AtomicU64::new(0),
@@ -912,17 +903,11 @@ impl Db {
     ///
     /// A copy read earlier is served without a shard job while its shard has
     /// committed nothing since: any write to the document moves the shard's
-    /// committed sequence, so the copy cannot be stale. A write still in
-    /// flight (reserved past committed) is not waited for, and a read that
-    /// starts then is not cached.
+    /// committed sequence, so the copy cannot be stale.
     pub(crate) async fn design_doc(&self, id: &str) -> DbResult<Arc<Value>> {
         let index = self.shard_index(id);
-        // Reserved first: a write that reserves between the two loads commits
-        // a sequence above `reserved`, and then the two differ.
-        let reserved = self.reserved_seq[index].load(Ordering::SeqCst);
-        let committed = self.committed_seq[index].load(Ordering::SeqCst);
-        let quiet = reserved == committed;
-        if quiet {
+        let committed = self.shards[index].committed_seq();
+        {
             let cached = self
                 .design_docs
                 .lock()
@@ -933,7 +918,9 @@ impl Db {
         }
         let epoch = self.design_epoch.load(Ordering::SeqCst);
         let doc = Arc::new(self.get_doc(id, &DocOpts::default()).await?);
-        if quiet {
+        // A write committed while the read ran may or may not be in it; the
+        // copy is cached only when the shard did not move.
+        if self.shards[index].committed_seq() == committed {
             let mut cached = self
                 .design_docs
                 .lock()
@@ -1268,41 +1255,63 @@ impl Db {
         self.shards.iter().map(ShardHandle::body_reads).sum()
     }
 
-    /// Highest sequence that is safe for a changes cursor to publish, taken
-    /// as a snapshot **before** reading any shard.
-    ///
-    /// Sequence numbers are allocated while a shard job is staging, but only
-    /// become visible when that job commits. Different shard actors run
-    /// concurrently, so another shard may publish a higher sequence first. A
-    /// numeric `last_seq` must not advance past a shard's committed sequence
-    /// while that shard has an allocated-but-uncommitted sequence; otherwise
-    /// the next request skips the later-visible row.
-    ///
-    /// Every sequence up to the bound is committed when the snapshot is
-    /// taken, so a read that starts afterwards sees all of them. The bound is
-    /// also capped at the global counter: anything allocated after the
-    /// snapshot is higher and is left for the next request. (Computing this
-    /// after the read is unsafe: a shard read before its commit, but
-    /// committed by the time of the check, no longer holds the cursor back.)
-    pub fn changes_watermark(&self, since: u64, owned: Option<&ShardMask>) -> u64 {
-        // Load the counter first: an allocation it includes has already marked
-        // its shard in flight (see `Stage::next_seq`).
-        let allocated = self.seq.load(Ordering::SeqCst);
-        let committed: Vec<u64> = self
-            .committed_seq
+    /// Every shard's uuid and committed position, by shard index. A position
+    /// is committed once its batch is on disk; every acknowledged write is
+    /// inside it.
+    pub fn shard_seqs(&self) -> Vec<(String, u64)> {
+        self.shards
             .iter()
-            .map(|seq| seq.load(Ordering::SeqCst))
-            .collect();
-        let reserved: Vec<u64> = self
-            .reserved_seq
-            .iter()
-            .map(|seq| seq.load(Ordering::SeqCst))
-            .collect();
-        changes_watermark_from(&committed, &reserved, since, owned).min(allocated)
+            .map(|shard| (shard.uuid(), shard.committed_seq()))
+            .collect()
     }
 
-    /// The shard map this node has not acknowledged yet. `None` when there is
-    /// none; one that cannot be read or parsed is an error.
+    /// Where a feed starts on each shard of this node, for a `since` that
+    /// was parsed already. A token position counts only for the copy it
+    /// names (this node, the same shard, the same uuid); any other shard
+    /// starts from 0, so a cleared or recreated copy is read again in full
+    /// rather than skipped.
+    pub(crate) fn shard_since(&self, me: usize, since: &crate::since::Since) -> ShardSince {
+        use crate::since::Since;
+        match since {
+            Since::Zero => ShardSince(vec![0; self.shards.len()]),
+            Since::Now => ShardSince(self.shard_seqs().into_iter().map(|(_, seq)| seq).collect()),
+            Since::Token(copies) => ShardSince(
+                self.shards
+                    .iter()
+                    .enumerate()
+                    .map(|(index, shard)| {
+                        let uuid = shard.uuid();
+                        copies
+                            .iter()
+                            .find(|copy| {
+                                copy.node == me && copy.shard == index && copy.uuid == uuid
+                            })
+                            .map_or(0, |copy| copy.seq)
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// This node's copies of `shards` at `positions`, as an opaque token.
+    pub(crate) fn local_token(
+        &self,
+        me: usize,
+        shards: &[usize],
+        positions: &ShardSince,
+    ) -> String {
+        let copies: Vec<crate::since::CopyPos> = shards
+            .iter()
+            .map(|&shard| crate::since::CopyPos {
+                node: me,
+                shard,
+                seq: positions.get(shard),
+                uuid: self.shards[shard].uuid(),
+            })
+            .collect();
+        crate::since::encode(&copies)
+    }
+
     pub fn pending_shard_map(&self) -> DbResult<Option<ShardMap>> {
         read_metadata(&self.path.join("pending-shard-map.json"))
     }
@@ -1390,29 +1399,11 @@ impl Db {
         &self.shards[self.shard_index(docid)]
     }
 
-    /// The update sequence a client may be shown: the changes watermark, so
-    /// every write at or below it is committed. The allocated counter can be
-    /// ahead of it (a write in flight has already taken its sequence); a
-    /// client that resumed `_changes` from the counter would skip that write
-    /// once it commits.
-    pub fn update_seq(&self) -> u64 {
-        self.changes_watermark(0, None)
-    }
-
     /// A receiver that changes whenever a write commits on this node. Mark it
     /// seen (`borrow_and_update`) before reading, so a commit that lands
     /// during the read is not missed.
     pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<()> {
         self.commits.subscribe()
-    }
-
-    /// Allocate a sequence on `shard` as a write still in flight would: the
-    /// counter has moved but the shard has not committed it. Any later job on
-    /// that shard counts it as committed, as for a write that never finished,
-    /// so a test must not touch the shard again before the code under test.
-    #[cfg(test)]
-    pub(crate) fn start_in_flight_write(&self, shard: usize) -> u64 {
-        allocate_seq(&self.seq, &self.reserved_seq[shard])
     }
 
     /// Owner and replica list for a document, computed with one shard-map
@@ -1435,12 +1426,14 @@ impl Db {
         // holds its shard's actor while it runs, so reading the flag afterwards
         // would block and report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
-        // Taken before reading the shards: the highest committed sequence of
-        // any one shard can sit above another shard's uncommitted write.
-        let update_seq = self.update_seq();
+        let shard_seqs = self.shard_seqs();
+        let update_seq = shard_seqs
+            .iter()
+            .fold(0u64, |sum, (_, seq)| sum.saturating_add(*seq));
         let mut doc_count = 0;
         let mut deleted_count = 0;
         let mut purge_seq = 0u64;
+        let mut shard_purge_seqs = Vec::with_capacity(self.shards.len());
         let counts = futures::future::join_all(
             self.shards
                 .iter()
@@ -1452,6 +1445,7 @@ impl Db {
             doc_count += docs;
             deleted_count += deleted;
             purge_seq = purge_seq.saturating_add(purged);
+            shard_purge_seqs.push(purged);
         }
         Ok(DbInfo {
             db_name: self.name.clone(),
@@ -1473,6 +1467,8 @@ impl Db {
             uuid: self.uuid.clone(),
             cluster: self.cluster_info(),
             props: self.partitioned.then_some(DbProps { partitioned: true }),
+            shard_seqs,
+            shard_purge_seqs,
         })
     }
 
@@ -1518,9 +1514,6 @@ impl Db {
 
         // A shard error is held back until the validator cache is dropped:
         // earlier shards may already have committed design documents.
-        // The shards are written one after another: each document takes the
-        // next global sequence when its shard stages it, so the order the
-        // shards run in is the order of `_changes` for this batch.
         let mut shard_error = None;
         // A design document's functions compile here, outside any shard job,
         // so the compile never holds a shard's writer.
@@ -1533,14 +1526,12 @@ impl Db {
             if batch.is_empty() {
                 continue;
             }
-            let seq = self.seq.clone();
-            let reserved = self.reserved_seq[shard_idx].clone();
             let verdicts: HashMap<usize, ApiError> = batch
                 .iter()
                 .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
                 .collect();
             let results = match self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts, &seq, &reserved)))
+                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
                 .await
             {
                 Ok(results) => results,
@@ -2220,193 +2211,150 @@ impl Db {
             .collect())
     }
 
-    /// The changes rows, the feed's last sequence, and how many changes remain
-    /// after it.
+    /// The changes rows, each shard's position after them, and how many
+    /// changes remain after those positions.
     pub(crate) async fn changes_rows(
         &self,
         opts: &ChangesOpts,
-    ) -> DbResult<(Vec<ChangeRow>, u64, usize)> {
-        let (rows, last_seq) = self.changes_rows_only(opts).await?;
-        let pending = self
-            .changes_pending(last_seq, opts.descending, opts.owned.as_ref())
-            .await?;
-        Ok((rows, last_seq, pending))
+    ) -> DbResult<(Vec<ChangeRow>, ShardSince, usize)> {
+        let (rows, last, reached) = self.read_changes(opts).await?;
+        let pending = if opts.descending {
+            // A shard the read never reached has everything up to its
+            // start still ahead of it, its newest change included.
+            let mut before = last.clone();
+            for (shard, reached) in reached.iter().enumerate() {
+                if !reached {
+                    before.set(shard, last.get(shard).saturating_add(1));
+                }
+            }
+            self.changes_pending(&before, true, opts.owned.as_ref())
+                .await?
+        } else {
+            self.changes_pending(&last, false, opts.owned.as_ref())
+                .await?
+        };
+        Ok((rows, last, pending))
     }
 
     /// `changes_rows` without `pending`, which costs a further shard job per
     /// shard. For callers that only consume rows, such as index updates.
+    ///
+    /// Each shard's rows come in that shard's own sequence order; there is
+    /// no order across shards (as in CouchDB). The shards are read a page at
+    /// a time in turn, so no job loads more than a page of rows and a limited
+    /// read stops as soon as it has enough. Every shard is read at most up to
+    /// its position in `until`, or else its committed position when the read
+    /// starts.
+    ///
+    /// The positions returned say, per selected shard, how far the rows
+    /// cover it: the last row returned when the limit cut its rows short,
+    /// else the last document scanned, matching or not
+    /// (`couch_changes:changes_enumerator`), and the shard's bound when it
+    /// was read to the end going up. Shards not read keep their `since`.
     pub(crate) async fn changes_rows_only(
         &self,
         opts: &ChangesOpts,
-    ) -> DbResult<(Vec<ChangeRow>, u64)> {
-        let watermark = opts
-            .until
-            .unwrap_or_else(|| self.changes_watermark(opts.since, opts.owned.as_ref()));
-        let selected = self.selected_shards(opts.owned.as_ref());
-        let until = if opts.descending {
-            u64::MAX
-        } else {
-            watermark.min(self.changes_cutoff(&selected, opts).await?)
-        };
-        let mut rows;
-        let scanned_last;
-        match &opts.filter {
-            Some(filter) => {
-                (rows, scanned_last) = self
-                    .filtered_changes(opts, filter, &selected, until)
-                    .await?;
-            }
-            None => {
-                rows = Vec::new();
-                for index in selected {
-                    let shard_opts = opts.clone();
-                    let mut shard_rows = self.shards[index]
-                        .call(move |s| collect_changes(s, &shard_opts, until))
-                        .await?;
-                    rows.append(&mut shard_rows);
-                }
-                rows.sort_by_key(|r| r.seq);
-                // Rows above the watermark are withheld; the next request
-                // re-reads them rather than skipping a later-visible lower
-                // sequence.
-                if !opts.descending {
-                    rows.retain(|row| row.seq <= watermark);
-                }
-                if opts.descending {
-                    rows.reverse();
-                }
-                scanned_last = rows.last().map(|row| row.seq);
-            }
-        }
-        if let Some(limit) = opts.limit {
-            rows.truncate(limit);
-        }
-        // CouchDB's feed position is the last document scanned, matching or
-        // not (`couch_changes:changes_enumerator`), except that a feed which
-        // stopped at its limit ends at its last row.
-        let at_limit = opts
-            .limit
-            .is_some_and(|limit| limit > 0 && rows.len() >= limit);
-        let last_seq = if at_limit {
-            rows.last().map(|r| r.seq)
-        } else {
-            scanned_last.or(rows.last().map(|r| r.seq))
-        }
-        .unwrap_or(opts.since);
-        Ok((rows, last_seq))
+    ) -> DbResult<(Vec<ChangeRow>, ShardSince)> {
+        let (rows, last, _) = self.read_changes(opts).await?;
+        Ok((rows, last))
     }
 
-    /// A filtered read: scans each shard a page at a time, from `since` up or
-    /// from the newest change down, and merges the pages in sequence order,
-    /// filtering as it goes, until `limit` rows match or every shard is
-    /// exhausted. A descending read stops after the newest matches instead of
-    /// reading the whole feed. No single shard job loads more than
-    /// a page of rows (with bodies, for a JS filter). Returns the matching
-    /// rows and the last sequence scanned.
-    async fn filtered_changes(
+    /// `changes_rows_only`, also saying which shards the read reached.
+    async fn read_changes(
         &self,
         opts: &ChangesOpts,
-        filter: &ChangeFilter,
-        selected: &[usize],
-        until: u64,
-    ) -> DbResult<(Vec<ChangeRow>, Option<u64>)> {
-        use std::collections::VecDeque;
-
-        // `limit=0` keeps the single full pass: its `last_seq` is the last
-        // row scanned.
-        let page = match opts.limit {
-            Some(0) => usize::MAX,
-            Some(limit) => limit.clamp(64, 1024),
-            None => 1024,
-        };
-        // Where each shard's next page starts: after this sequence going up,
-        // at or below it going down.
-        let mut cursors = vec![
-            if opts.descending {
-                u64::MAX
-            } else {
-                opts.since
-            };
-            selected.len()
-        ];
-        let mut done = vec![false; selected.len()];
-        let mut buffers: Vec<VecDeque<ChangeRow>> =
-            (0..selected.len()).map(|_| VecDeque::new()).collect();
-        let mut matched: Vec<ChangeRow> = Vec::new();
-        let mut scanned_last = None;
-        loop {
-            for (slot, &index) in selected.iter().enumerate() {
-                if !buffers[slot].is_empty() || done[slot] {
+    ) -> DbResult<(Vec<ChangeRow>, ShardSince, Vec<bool>)> {
+        let bound = self.changes_bound(opts);
+        let selected = self.selected_shards(opts.owned.as_ref());
+        // A descending read starts each shard at its bound, so a shard it
+        // never reaches still has everything below that ahead of it.
+        let mut last = ShardSince(
+            (0..self.shards.len())
+                .map(|shard| {
+                    if opts.descending && selected.contains(&shard) {
+                        bound.get(shard)
+                    } else {
+                        opts.since.get(shard)
+                    }
+                })
+                .collect(),
+        );
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        let mut reached = vec![false; self.shards.len()];
+        let mut rows: Vec<ChangeRow> = Vec::new();
+        // Shards still to read, each with where its next page starts: after
+        // this sequence going up, at or below it going down.
+        let mut open: Vec<(usize, u64)> = selected
+            .into_iter()
+            .map(|index| {
+                let start = if opts.descending {
+                    bound.get(index)
+                } else {
+                    opts.since.get(index)
+                };
+                (index, start)
+            })
+            .collect();
+        while rows.len() < limit && !open.is_empty() {
+            let mut still_open = Vec::with_capacity(open.len());
+            for (index, cursor) in open {
+                let want = limit - rows.len();
+                if want == 0 {
+                    break;
+                }
+                let page = if opts.filter.is_some() {
+                    want.clamp(64, 1024)
+                } else {
+                    want
+                };
+                let shard_opts = opts.clone();
+                let until = bound.get(index);
+                let read = self.shards[index]
+                    .call(move |s| collect_changes(s, &shard_opts, index, cursor, until, page))
+                    .await?;
+                reached[index] = true;
+                let mut matched = match &opts.filter {
+                    Some(filter) => apply_change_filter(read.rows, filter).await?,
+                    None => read.rows,
+                };
+                if matched.len() > want {
+                    // Cut short by the limit: the shard is covered up to the
+                    // last row returned.
+                    matched.truncate(want);
+                    last.set(index, matched.last().map_or(cursor, |row| row.seq));
+                    rows.append(&mut matched);
                     continue;
                 }
-                let mut shard_opts = opts.clone();
-                shard_opts.since = cursors[slot];
-                shard_opts.limit = Some(page);
-                let bound = if opts.descending {
-                    cursors[slot]
-                } else {
-                    until
-                };
-                let rows = self.shards[index]
-                    .call(move |s| collect_changes(s, &shard_opts, bound))
-                    .await?;
-                match rows.last() {
-                    // A page can come back short when unreadable records are
-                    // skipped, so only an empty one ends the shard.
-                    None => done[slot] = true,
-                    Some(last) if opts.descending => {
-                        // Sequence 0 is never allocated, so a page reaching it
-                        // is the shard's last.
-                        match last.seq.checked_sub(1) {
-                            Some(next) => cursors[slot] = next,
-                            None => done[slot] = true,
-                        }
+                rows.append(&mut matched);
+                if let Some(scanned) = read.scanned {
+                    last.set(index, scanned);
+                }
+                if read.exhausted {
+                    if !opts.descending {
+                        last.set(index, until.max(opts.since.get(index)));
                     }
-                    Some(last) => cursors[slot] = last.seq,
+                    continue;
                 }
-                buffers[slot].extend(rows);
-            }
-            // Everything up to the lowest buffered tail (the highest going
-            // down) is complete: no shard can still produce a row beyond it.
-            let tails = buffers
-                .iter()
-                .zip(&done)
-                .filter(|(_, done)| !**done)
-                .filter_map(|(buffer, _)| buffer.back().map(|row| row.seq));
-            let Some(cutoff) = (if opts.descending {
-                tails.max()
-            } else {
-                tails.min()
-            }) else {
-                break;
-            };
-            let reached = |seq: u64| {
-                if opts.descending {
-                    seq >= cutoff
-                } else {
-                    seq <= cutoff
-                }
-            };
-            let mut batch = Vec::new();
-            for buffer in &mut buffers {
-                while buffer.front().is_some_and(|row| reached(row.seq)) {
-                    batch.extend(buffer.pop_front());
+                let next = match read.scanned {
+                    Some(scanned) if opts.descending => scanned.checked_sub(1),
+                    Some(scanned) => Some(scanned),
+                    None => None,
+                };
+                if let Some(next) = next {
+                    still_open.push((index, next));
                 }
             }
-            batch.sort_by_key(|row| row.seq);
-            if opts.descending {
-                batch.reverse();
-            }
-            scanned_last = batch.last().map(|row| row.seq).or(scanned_last);
-            matched.extend(apply_change_filter(batch, filter).await?);
-            if opts
-                .limit
-                .is_some_and(|limit| limit > 0 && matched.len() >= limit)
-            {
-                break;
-            }
+            open = still_open;
         }
-        Ok((matched, scanned_last))
+        Ok((rows, last, reached))
+    }
+
+    /// The bound of each shard for a read: `opts.until`, else the committed
+    /// positions now.
+    fn changes_bound(&self, opts: &ChangesOpts) -> ShardSince {
+        opts.until.clone().unwrap_or_else(|| {
+            ShardSince(self.shards.iter().map(ShardHandle::committed_seq).collect())
+        })
     }
 
     /// Indexes of the shards in `owned`, or every shard.
@@ -2416,47 +2364,14 @@ impl Db {
             .collect()
     }
 
-    /// The highest sequence an ascending, limited, unfiltered changes read can
-    /// return: the `limit`-th lowest latest sequence after the cursor across
-    /// `shards`, read from their indexes alone. Each shard then reads metadata
-    /// only up to it rather than for `limit` rows of its own. Bounding by
-    /// sequence rather than by a per-shard count keeps the merged rows gapless
-    /// when a document moves between the two reads.
-    async fn changes_cutoff(&self, shards: &[usize], opts: &ChangesOpts) -> DbResult<u64> {
-        let Some(limit) = opts.limit else {
-            return Ok(u64::MAX);
-        };
-        if shards.len() < 2 || opts.descending || opts.filter.is_some() || opts.doc_ids.is_some() {
-            return Ok(u64::MAX);
-        }
-        let mut seqs = Vec::new();
-        for &index in shards {
-            let since = opts.since;
-            let mut found = self.shards[index]
-                .call(move |s| {
-                    Ok(s.latest_changes()?
-                        .after(since)
-                        .take(limit)
-                        .map(|(seq, _)| seq)
-                        .collect::<Vec<u64>>())
-                })
-                .await?;
-            seqs.append(&mut found);
-        }
-        if seqs.len() <= limit {
-            return Ok(u64::MAX);
-        }
-        let (_, cutoff, _) = seqs.select_nth_unstable(limit - 1);
-        Ok(*cutoff)
-    }
-
     pub(crate) async fn changes_pending(
         &self,
-        after: u64,
+        after: &ShardSince,
         descending: bool,
         owned: Option<&ShardMask>,
     ) -> DbResult<usize> {
         futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
+            let after = after.get(index);
             self.shards[index]
                 .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
         }))
@@ -2465,16 +2380,38 @@ impl Db {
         .sum::<DbResult<usize>>()
     }
 
-    pub async fn changes(&self, opts: &ChangesOpts) -> DbResult<ChangesList> {
-        let (rows, last_seq, pending) = self.changes_rows(opts).await?;
+    /// The changes feed of this node's copies of the selected shards, with
+    /// every position as an opaque token naming node `me`. With `full_rows`
+    /// each row's `seq` holds every selected shard's position as of that row
+    /// (what a client resumes from); without, only the row's own shard (what
+    /// a coordinator merging nodes needs).
+    pub async fn changes(
+        &self,
+        me: usize,
+        opts: &ChangesOpts,
+        full_rows: bool,
+    ) -> DbResult<ChangesList> {
+        let (rows, last, pending) = self.changes_rows(opts).await?;
+        let selected = self.selected_shards(opts.owned.as_ref());
+        let mut progress = ShardSince(
+            (0..self.shards.len())
+                .map(|shard| opts.since.get(shard))
+                .collect(),
+        );
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             let doc = match row.doc {
                 Some(doc) => Some(serde_json::from_str::<Value>(&doc).map_err(ApiError::internal)?),
                 None => None,
             };
+            progress.set(row.shard, row.seq);
+            let seq = if full_rows {
+                self.local_token(me, &selected, &progress)
+            } else {
+                self.local_token(me, &[row.shard], &progress)
+            };
             results.push(ChangeEntry {
-                seq: Seq::Num(row.seq),
+                seq,
                 id: row.id,
                 changes: row
                     .changes
@@ -2487,21 +2424,19 @@ impl Db {
         }
         Ok(ChangesList {
             results,
-            last_seq: Seq::Num(last_seq),
+            last_seq: self.local_token(me, &selected, &last),
             pending: pending as u64,
         })
     }
 
-    /// Stream changes rows in global sequence order by merging a page at a
-    /// time from each selected shard. The caller serializes rows as they
-    /// arrive, so a full feed does not materialize the whole response.
+    /// Stream changes rows shard by shard, a page at a time, so a full feed
+    /// does not materialize the whole response. After each shard it yields
+    /// that shard's position, the bound it was read to.
     pub(crate) fn changes_stream_arc(
         db: Arc<Db>,
         opts: ChangesOpts,
     ) -> impl futures::Stream<Item = DbResult<ChangesItem>> + 'static {
         async_stream::stream! {
-            use std::collections::VecDeque;
-
             const PAGE: usize = 1024;
             if opts.limit == Some(0) {
                 return;
@@ -2514,98 +2449,56 @@ impl Db {
                 ));
                 return;
             }
-            let selected = db.selected_shards(opts.owned.as_ref());
-            let mut cursors = vec![opts.since; selected.len()];
-            let mut done = vec![false; selected.len()];
-            let mut buffers: Vec<VecDeque<ChangeRow>> =
-                (0..selected.len()).map(|_| VecDeque::new()).collect();
-            let mut emitted = 0usize;
             // One snapshot for the whole stream, taken before any shard read.
-            // The stream ends at the watermark; the client resumes from the
-            // last row it received.
-            let watermark = db.changes_watermark(opts.since, opts.owned.as_ref());
-            let watermark = match db.changes_cutoff(&selected, &opts).await {
-                Ok(cutoff) => watermark.min(cutoff),
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-
-            loop {
-                let mut best: Option<usize> = None;
-                for slot in 0..selected.len() {
-                    while buffers[slot].is_empty() && !done[slot] {
-                        let index = selected[slot];
-                        let mut shard_opts = opts.clone();
-                        shard_opts.since = cursors[slot];
-                        shard_opts.descending = false;
-                        // A shard never needs more rows than the request can
-                        // still return. A filter may discard rows, so it reads
-                        // at least a small page and refills until a row
-                        // survives or the shard is exhausted.
-                        let wanted = match (opts.limit, &opts.filter) {
-                            (Some(limit), None) => limit.saturating_sub(emitted).max(1),
-                            (Some(limit), Some(_)) => {
-                                limit.saturating_sub(emitted).clamp(64, PAGE)
-                            }
-                            _ => PAGE,
-                        };
-                        let requested = PAGE.min(wanted);
-                        shard_opts.limit = Some(requested);
-                        match db.shards[index]
-                            .call(move |shard| collect_changes(shard, &shard_opts, watermark))
-                            .await
-                        {
-                            Ok(mut rows) => {
-                                if rows.is_empty() {
-                                    done[slot] = true;
-                                } else {
-                                    cursors[slot] =
-                                        rows.last().map(|row| row.seq).unwrap_or(cursors[slot]);
-                                    if opts.filter.is_none() && rows.len() < requested {
-                                        // The shard has nothing more at or
-                                        // below the watermark.
-                                        done[slot] = true;
-                                    }
-                                    if let Some(filter) = &opts.filter {
-                                        match apply_change_filter(rows, filter).await {
-                                            Ok(filtered) => rows = filtered,
-                                            Err(error) => {
-                                                yield Err(error);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    buffers[slot].extend(rows);
-                                }
-                            }
+            let bound = db.changes_bound(&opts);
+            let mut emitted = 0usize;
+            for index in db.selected_shards(opts.owned.as_ref()) {
+                let mut cursor = opts.since.get(index);
+                let until = bound.get(index);
+                loop {
+                    // A shard never needs more rows than the request can
+                    // still return. A filter may discard rows, so it reads
+                    // at least a small page.
+                    let left = opts.limit.map_or(usize::MAX, |limit| limit - emitted);
+                    let page = match &opts.filter {
+                        Some(_) => left.clamp(64, PAGE),
+                        None => left.min(PAGE),
+                    };
+                    let shard_opts = opts.clone();
+                    let read = match db.shards[index]
+                        .call(move |shard| collect_changes(shard, &shard_opts, index, cursor, until, page))
+                        .await
+                    {
+                        Ok(read) => read,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    let rows = match &opts.filter {
+                        Some(filter) => match apply_change_filter(read.rows, filter).await {
+                            Ok(rows) => rows,
                             Err(error) => {
                                 yield Err(error);
                                 return;
                             }
+                        },
+                        None => read.rows,
+                    };
+                    for row in rows {
+                        emitted += 1;
+                        yield Ok(ChangesItem::Row(row));
+                        if opts.limit.is_some_and(|limit| emitted >= limit) {
+                            return;
                         }
                     }
-                    if let Some(front) = buffers[slot].front() {
-                        if best
-                            .map(|current| front.seq < buffers[current].front().map(|row| row.seq).unwrap_or(u64::MAX))
-                            .unwrap_or(true)
-                        {
-                            best = Some(slot);
+                    match read.scanned.filter(|_| !read.exhausted) {
+                        Some(scanned) => cursor = scanned,
+                        None => {
+                            yield Ok(ChangesItem::Scanned(index, until.max(opts.since.get(index))));
+                            break;
                         }
                     }
-                }
-                let Some(slot) = best else {
-                    // Every shard is exhausted: report how far the scan got.
-                    let scanned = cursors.iter().copied().max().unwrap_or(opts.since);
-                    yield Ok(ChangesItem::Scanned(scanned));
-                    break;
-                };
-                let row = buffers[slot].pop_front().expect("buffered row");
-                emitted += 1;
-                yield Ok(ChangesItem::Row(row));
-                if opts.limit.map(|limit| emitted >= limit).unwrap_or(false) {
-                    break;
                 }
             }
         }
@@ -2997,19 +2890,71 @@ impl Db {
             .await
     }
 
+    /// The checkpoints kept in shard `shard`'s own copy whose ids start with
+    /// `prefix`. Unlike [`Db::checkpoint_get`] they describe that copy's
+    /// contents, so clearing the shard drops them with it.
+    pub async fn shard_checkpoints(
+        &self,
+        shard: usize,
+        prefix: &str,
+    ) -> DbResult<Vec<(String, Value)>> {
+        let key = checkpoint_key(prefix);
+        let found = self.shards[shard]
+            .call(move |s| Ok(s.scan_from(&key, &key)?))
+            .await?;
+        found
+            .into_iter()
+            .map(|(key, value)| {
+                let id = String::from_utf8_lossy(&key[3..]).into_owned();
+                serde_json::from_slice::<Value>(&value)
+                    .map(|value| (id, value))
+                    .map_err(|error| {
+                        ApiError::new(
+                            500,
+                            "internal_server_error",
+                            format!("corrupt checkpoint: {error}"),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Store a checkpoint in shard `shard`'s own copy, dropping the `stale`
+    /// ones it replaces in the same commit.
+    pub async fn put_shard_checkpoint(
+        &self,
+        shard: usize,
+        id: &str,
+        value: &Value,
+        stale: Vec<String>,
+    ) -> DbResult<()> {
+        let key = checkpoint_key(id);
+        let value = value.clone();
+        self.shards[shard]
+            .call(move |s| {
+                let mut tx = Tx::new();
+                for old in stale {
+                    tx.delete(&checkpoint_key(&old));
+                }
+                tx.put_json(&key, &value)?;
+                s.commit(tx)?;
+                Ok(())
+            })
+            .await
+    }
+
     // ----- maintenance -----------------------------------------------------
 
-    /// Documents purged from this node's shards, summed.
-    pub async fn purge_seq(&self) -> DbResult<u64> {
-        let counts = futures::future::join_all(
+    /// Each shard's purge sequence, by shard index.
+    pub async fn shard_purge_seqs(&self) -> DbResult<Vec<u64>> {
+        futures::future::join_all(
             self.shards
                 .iter()
                 .map(|shard| shard.call(|s| Ok(s.purge_seq()?))),
         )
-        .await;
-        counts
-            .into_iter()
-            .try_fold(0u64, |sum, count| Ok(sum.saturating_add(count?)))
+        .await
+        .into_iter()
+        .collect()
     }
 
     /// The replicas of `shard` other than node `me`: the peers whose purge
@@ -3058,8 +3003,6 @@ impl Db {
             return Ok(false);
         };
         let peers = self.purge_peers(shard, me);
-        let seq_counter = self.seq.clone();
-        let reserved = self.reserved_seq[shard].clone();
         handle
             .call(move |s| {
                 let mut removed = false;
@@ -3073,8 +3016,6 @@ impl Db {
                         &info.revs,
                         PurgeSource::Replayed(&info.uuid),
                         &peers,
-                        &seq_counter,
-                        &reserved,
                     )?;
                     removed |= !gone.is_empty();
                 }
@@ -3189,15 +3130,11 @@ impl Db {
             ));
             ids.push(id);
         }
-        // Purging a document that survives takes a new sequence, so the
-        // shards run one after another to keep that order deterministic.
         let mut done = Vec::new();
         for (index, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
-            let seq_counter = self.seq.clone();
-            let reserved = self.reserved_seq[index].clone();
             let peers = self.purge_peers(index, me);
             done.push(
                 self.shards[index]
@@ -3208,16 +3145,8 @@ impl Db {
                                 let source = assigned
                                     .as_deref()
                                     .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
-                                purge_one(
-                                    s,
-                                    &id,
-                                    &requested,
-                                    source,
-                                    &peers,
-                                    &seq_counter,
-                                    &reserved,
-                                )
-                                .map(|removed| (slot, removed))
+                                purge_one(s, &id, &requested, source, &peers)
+                                    .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
                     })
@@ -3403,8 +3332,6 @@ fn purge_one(
     requested: &[String],
     source: PurgeSource<'_>,
     peers: &[usize],
-    seq_counter: &AtomicU64,
-    reserved: &AtomicU64,
 ) -> DbResult<Vec<String>> {
     let mut tx = Tx::new();
     let meta = match s.get_meta(id) {
@@ -3479,12 +3406,12 @@ fn purge_one(
             let old_seq = meta.seq;
             // Purging the winner changes what a normal read sees,
             // so it is a change as far as `_changes` is concerned.
-            let seq = allocate_seq(seq_counter, reserved);
+            let seq = s.next_seq();
             meta.seq = seq;
             tx.delete(&seq_key(old_seq));
             tx.put(&seq_key(seq), id.as_bytes());
             tx.put_json(&meta_key(id), &meta)?;
-            s.commit_at(tx, Some(seq))?;
+            s.commit(tx)?;
         }
     } else {
         s.commit(tx)?;
@@ -3831,8 +3758,6 @@ fn put_many(
     docs: Vec<(usize, Value)>,
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
-    seq: &Arc<AtomicU64>,
-    reserved: &Arc<AtomicU64>,
 ) -> Vec<(usize, DbResult<WriteOk>)> {
     let mut ops: Ops = Vec::new();
     let mut staged: HashMap<String, DocMeta> = HashMap::new();
@@ -3847,8 +3772,6 @@ fn put_many(
             ops: &mut ops,
             staged: &mut staged,
             origin: &mut origin,
-            seq,
-            reserved,
         };
         match ctx.stage(doc, new_edits, compile_errors.remove(&i)) {
             Ok(value) => results.push((i, Ok(value))),
@@ -3908,13 +3831,11 @@ struct Stage<'a> {
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
     origin: &'a mut HashMap<String, Option<MetaState>>,
-    seq: &'a Arc<AtomicU64>,
-    reserved: &'a Arc<AtomicU64>,
 }
 
 impl Stage<'_> {
-    fn next_seq(&self) -> u64 {
-        allocate_seq(self.seq, self.reserved)
+    fn next_seq(&mut self) -> u64 {
+        self.shard.next_seq()
     }
 
     fn meta(&mut self, id: &str) -> DbResult<Option<DocMeta>> {
@@ -4193,17 +4114,8 @@ fn commit_ops(
     ops: Ops,
     metas: Vec<MetaWrite>,
 ) -> anyhow::Result<()> {
-    let mut last_seq = None;
     let mut tx = Tx::new();
     for (key, value) in ops {
-        if key.starts_with(b"s/") {
-            if let Some(seq) = key[2..10].try_into().ok().map(u64::from_be_bytes) {
-                // A document update emits the new sequence key and then
-                // deletes the old one. Keep the highest, not whichever key
-                // happens to be last in the operation list.
-                last_seq = Some(last_seq.map_or(seq, |current: u64| current.max(seq)));
-            }
-        }
         match value {
             Some(v) => tx.put(&key, &v),
             None => tx.delete(&key),
@@ -4212,7 +4124,7 @@ fn commit_ops(
     for meta in metas {
         tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new, meta.seq);
     }
-    shard.commit_at(tx, last_seq)
+    shard.commit(tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -4276,7 +4188,8 @@ pub(crate) struct AllDocsHead {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChangesOpts {
-    pub since: u64,
+    /// Each shard's position to read after.
+    pub since: ShardSince,
     pub limit: Option<usize>,
     pub include_docs: bool,
     pub style_all_docs: bool,
@@ -4286,10 +4199,10 @@ pub struct ChangesOpts {
     pub conflicts: bool,
     /// Internal cluster filter: only scan shards selected by this mask.
     pub owned: Option<ShardMask>,
-    /// Internal: a watermark the caller already read with `changes_watermark`.
-    /// Rows above it are withheld, and the feed does not take a newer one, so
-    /// a caller that records it as its position has seen every row up to it.
-    pub until: Option<u64>,
+    /// Internal: each shard's position to read up to, taken by the caller
+    /// (an index update reads up to where the shards were when it started).
+    /// Without it a read stops at the committed positions when it starts.
+    pub until: Option<ShardSince>,
 }
 
 /// Server-side `_changes` filters. `_doc_ids` stays in `doc_ids` because it is
@@ -4306,14 +4219,15 @@ impl ChangeFilter {
     }
 }
 
-/// What a changes stream yields: the rows, then, when the scan ran to the end
-/// rather than stopping at the limit, the last sequence it scanned. A filter
-/// may have discarded rows after the last one yielded, and CouchDB's feed
-/// position (`couch_changes:changes_enumerator`) covers them too.
+/// What a changes stream yields: the rows, and after each shard that was read
+/// to its end rather than stopped by the limit, that shard and the position
+/// it was scanned to. A filter may have discarded rows after the last one
+/// yielded, and CouchDB's feed position (`couch_changes:changes_enumerator`)
+/// covers them too.
 #[derive(Debug)]
 pub(crate) enum ChangesItem {
     Row(ChangeRow),
-    Scanned(u64),
+    Scanned(usize, u64),
 }
 
 /// The `_revs_diff` answer: the documents that miss revisions, in the order
@@ -4472,68 +4386,20 @@ impl<'de> serde::Deserialize<'de> for WriteResult {
     }
 }
 
-/// A feed position: a plain sequence number, or the opaque token a cluster
-/// feed reports instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Seq {
-    Num(u64),
-    Token(String),
-}
-
-impl Seq {
-    /// The number, for a position that is one.
-    pub fn as_u64(&self) -> Option<u64> {
-        match self {
-            Seq::Num(seq) => Some(*seq),
-            Seq::Token(_) => None,
-        }
-    }
-}
-
-impl std::fmt::Display for Seq {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Seq::Num(seq) => write!(f, "{seq}"),
-            Seq::Token(token) => f.write_str(token),
-        }
-    }
-}
-
-impl serde::Serialize for Seq {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Seq::Num(seq) => serializer.serialize_u64(*seq),
-            Seq::Token(token) => serializer.serialize_str(token),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Seq {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        match <Value as serde::Deserialize>::deserialize(deserializer)? {
-            Value::Number(number) => number
-                .as_u64()
-                .map(Seq::Num)
-                .ok_or_else(|| D::Error::custom("a sequence must be a non-negative integer")),
-            Value::String(token) => Ok(Seq::Token(token)),
-            _ => Err(D::Error::custom("a sequence must be a number or a string")),
-        }
-    }
-}
-
 /// The `_changes` answer of one pass.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChangesList {
     pub results: Vec<ChangeEntry>,
-    pub last_seq: Seq,
+    /// An opaque token (`crate::since`).
+    pub last_seq: String,
     #[serde(default)]
     pub pending: u64,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChangeEntry {
-    pub seq: Seq,
+    /// An opaque token (`crate::since`).
+    pub seq: String,
     pub id: String,
     pub changes: Vec<ChangeRev>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -4646,6 +4512,37 @@ pub struct DbInfo {
     pub cluster: ClusterInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub props: Option<DbProps>,
+    /// Each shard's uuid and committed position; `update_seq` is their sum.
+    #[serde(skip)]
+    pub shard_seqs: Vec<(String, u64)>,
+    /// Each shard's purge sequence; `purge_seq` is their sum.
+    #[serde(skip)]
+    pub shard_purge_seqs: Vec<u64>,
+}
+
+impl DbInfo {
+    /// The `update_seq` and `purge_seq` of this node's copies as opaque
+    /// tokens naming node `me`, as a standalone node reports them.
+    pub(crate) fn local_tokens(&self, me: usize) -> (String, String) {
+        let copies = |seq: &dyn Fn(usize) -> u64| -> Vec<crate::since::CopyPos> {
+            self.shard_seqs
+                .iter()
+                .enumerate()
+                .map(|(shard, (uuid, _))| crate::since::CopyPos {
+                    node: me,
+                    shard,
+                    seq: seq(shard),
+                    uuid: uuid.clone(),
+                })
+                .collect()
+        };
+        (
+            crate::since::encode(&copies(&|shard| self.shard_seqs[shard].1)),
+            crate::since::encode(&copies(&|shard| {
+                self.shard_purge_seqs.get(shard).copied().unwrap_or(0)
+            })),
+        )
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -4671,6 +4568,8 @@ pub struct DbProps {
 #[derive(Debug)]
 pub(crate) struct ChangeRow {
     pub(crate) id: String,
+    /// The shard the row comes from, and its sequence in that shard.
+    pub(crate) shard: usize,
     pub(crate) seq: u64,
     pub(crate) changes: Vec<(String, bool)>,
     pub(crate) deleted: bool,
@@ -5286,16 +5185,32 @@ async fn apply_change_filter(
     }
 }
 
-/// Change rows from one shard. An ascending read stops at sequence `until`; a
-/// descending one starts at it, so a caller pages back by lowering it.
+/// One page of a shard's changes.
+struct ChangesPage {
+    rows: Vec<ChangeRow>,
+    /// The sequence of the last document examined, row or not.
+    scanned: Option<u64>,
+    /// Whether the page reached the end of the range rather than its size.
+    exhausted: bool,
+}
+
+/// Up to `limit` change rows of shard `index`. Going up, the rows after
+/// `cursor` up to `until`; going down, the rows at or below `cursor`, so a
+/// caller pages back by lowering it.
 fn collect_changes(
     shard: &mut crate::store::Shard,
     opts: &ChangesOpts,
+    index: usize,
+    cursor: u64,
     until: u64,
-) -> DbResult<Vec<ChangeRow>> {
-    let limit = opts.limit.unwrap_or(usize::MAX);
+    limit: usize,
+) -> DbResult<ChangesPage> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(ChangesPage {
+            rows: Vec::new(),
+            scanned: None,
+            exhausted: false,
+        });
     }
 
     // CouchDB returns one row per document at its latest sequence, not one
@@ -5304,16 +5219,16 @@ fn collect_changes(
     // Read only the rows after the cursor, already in sequence order. A
     // descending feed walks back from the newest change.
     let latest = shard.latest_changes()?;
-    let candidates: Vec<(u64, String)> = match &opts.doc_ids {
+    let mut candidates: Vec<(u64, String)> = match &opts.doc_ids {
         Some(ids) => {
             let mut selected: Vec<(u64, String)> = ids
                 .iter()
                 .filter_map(|id| latest.seq_of(id).map(|seq| (seq, id.clone())))
                 .filter(|(seq, _)| {
                     if opts.descending {
-                        *seq <= until
+                        *seq <= cursor
                     } else {
-                        *seq > opts.since && *seq <= until
+                        *seq > cursor && *seq <= until
                     }
                 })
                 .collect();
@@ -5322,22 +5237,26 @@ fn collect_changes(
             if opts.descending {
                 selected.reverse();
             }
-            selected.truncate(limit);
+            selected.truncate(limit.saturating_add(1));
             selected
         }
         None if opts.descending => latest
-            .through(until)
+            .through(cursor)
             .rev()
-            .take(limit)
+            .take(limit.saturating_add(1))
             .map(|(seq, id)| (seq, id.to_string()))
             .collect(),
         None => latest
-            .after(opts.since)
+            .after(cursor)
             .take_while(|(seq, _)| *seq <= until)
-            .take(limit)
+            .take(limit.saturating_add(1))
             .map(|(seq, id)| (seq, id.to_string()))
             .collect(),
     };
+    // One look past the page tells whether the range goes on.
+    let exhausted = candidates.len() <= limit;
+    candidates.truncate(limit);
+    let scanned = candidates.last().map(|(seq, _)| *seq);
 
     shard.add_scanned(candidates.len());
     let mut rows = Vec::with_capacity(candidates.len());
@@ -5420,13 +5339,18 @@ fn collect_changes(
         };
         rows.push(ChangeRow {
             id,
+            shard: index,
             seq,
             changes,
             deleted,
             doc,
         });
     }
-    Ok(rows)
+    Ok(ChangesPage {
+        rows,
+        scanned,
+        exhausted,
+    })
 }
 
 #[cfg(test)]
@@ -5437,10 +5361,8 @@ mod tests {
     fn write_costs(shard: &mut crate::store::Shard, docs: Vec<Value>) -> (usize, usize) {
         let parses = crate::store::meta_parses();
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
-        let seq = Arc::new(AtomicU64::new(shard.seq()));
-        let reserved = Arc::new(AtomicU64::new(0));
         let docs = docs.into_iter().enumerate().collect();
-        for (_, result) in put_many(shard, docs, true, HashMap::new(), &seq, &reserved) {
+        for (_, result) in put_many(shard, docs, true, HashMap::new()) {
             result.unwrap();
         }
         (
@@ -5480,12 +5402,6 @@ mod tests {
         assert!(shard_owned(Some(&mask), 2));
         // A shard beyond the mask is not owned.
         assert!(!shard_owned(Some(&mask), 3));
-        // The watermark ignores shards the mask excludes.
-        assert_eq!(
-            changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, Some(&mask)),
-            u64::MAX
-        );
-        assert_eq!(changes_watermark_from(&[5, 1, 9], &[5, 4, 9], 0, None), 1);
     }
 
     #[test]
@@ -5765,22 +5681,36 @@ mod tests {
         let text = |changes: DbResult<_>| -> String {
             serde_json::to_string(&serde_json::to_value::<&_>(&changes.unwrap()).unwrap()).unwrap()
         };
-        let plain = text(db.changes(&ChangesOpts::default()).await);
+        let token = |seq: u64| db.local_token(0, &[0], &ShardSince(vec![seq]));
+        let plain = text(db.changes(0, &ChangesOpts::default(), true).await);
         assert_eq!(
             plain,
-            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}]},{"seq":3,"id":"b","changes":[{"rev":"2-6b4cac76d0f72a9035d0e6b20c710a24"}],"deleted":true}],"last_seq":3,"pending":0}"#
+            format!(
+                r#"{{"results":[{{"seq":"{}","id":"a","changes":[{{"rev":"1-731bef401491606a3b246ed178e697c1"}}]}},{{"seq":"{}","id":"b","changes":[{{"rev":"2-6b4cac76d0f72a9035d0e6b20c710a24"}}],"deleted":true}}],"last_seq":"{}","pending":0}}"#,
+                token(1),
+                token(3),
+                token(3)
+            )
         );
         let docs = text(
-            db.changes(&ChangesOpts {
-                include_docs: true,
-                limit: Some(1),
-                ..Default::default()
-            })
+            db.changes(
+                0,
+                &ChangesOpts {
+                    include_docs: true,
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                true,
+            )
             .await,
         );
         assert_eq!(
             docs,
-            r#"{"results":[{"seq":1,"id":"a","changes":[{"rev":"1-731bef401491606a3b246ed178e697c1"}],"doc":{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}],"last_seq":1,"pending":1}"#
+            format!(
+                r#"{{"results":[{{"seq":"{}","id":"a","changes":[{{"rev":"1-731bef401491606a3b246ed178e697c1"}}],"doc":{{"_id":"a","_rev":"1-731bef401491606a3b246ed178e697c1","n":1}}}}],"last_seq":"{}","pending":1}}"#,
+                token(1),
+                token(1)
+            )
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -5808,21 +5738,29 @@ mod tests {
             list.results.into_iter().map(|row| row.id).collect()
         };
         let ascending = db
-            .changes(&ChangesOpts {
-                filter: Some(filter.clone()),
-                include_docs: true,
-                ..Default::default()
-            })
+            .changes(
+                0,
+                &ChangesOpts {
+                    filter: Some(filter.clone()),
+                    include_docs: true,
+                    ..Default::default()
+                },
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(ids(ascending), ["d0", "d2", "d4"]);
         let descending = db
-            .changes(&ChangesOpts {
-                filter: Some(filter.clone()),
-                include_docs: true,
-                descending: true,
-                ..Default::default()
-            })
+            .changes(
+                0,
+                &ChangesOpts {
+                    filter: Some(filter.clone()),
+                    include_docs: true,
+                    descending: true,
+                    ..Default::default()
+                },
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(ids(descending), ["d4", "d2", "d0"]);
@@ -6247,17 +6185,21 @@ mod tests {
             "the skipped body was not counted"
         );
 
-        let changes = db.changes(&ChangesOpts::default()).await.unwrap();
+        let changes = db.changes(0, &ChangesOpts::default(), true).await.unwrap();
         assert_eq!(
             row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
             ["a", "bad-body", "c"]
         );
         let before = crate::metrics::corrupt_records_skipped();
         let changes = db
-            .changes(&ChangesOpts {
-                include_docs: true,
-                ..Default::default()
-            })
+            .changes(
+                0,
+                &ChangesOpts {
+                    include_docs: true,
+                    ..Default::default()
+                },
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6904,7 +6846,7 @@ mod tests {
         db.put_docs(docs, true).await.unwrap();
 
         let opts = ChangesOpts {
-            since: 0,
+            since: ShardSince::default(),
             limit: Some(2),
             include_docs: false,
             style_all_docs: false,
@@ -6917,7 +6859,7 @@ mod tests {
         };
         let (rows, last_seq, pending) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(last_seq, 2);
+        assert_eq!(last_seq.get(0), 2);
         assert_eq!(pending, 3, "three documents remain after the page");
 
         let (rows, last_seq, pending) = db
@@ -6928,7 +6870,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(last_seq, 4);
+        assert_eq!(last_seq.get(0), 4);
         assert_eq!(pending, 3, "three older documents remain descending");
 
         drop(db);
@@ -6984,7 +6926,7 @@ mod tests {
 
     fn descending_design_changes(limit: Option<usize>) -> ChangesOpts {
         ChangesOpts {
-            since: 0,
+            since: ShardSince::default(),
             limit,
             include_docs: false,
             style_all_docs: false,
@@ -7003,7 +6945,7 @@ mod tests {
     #[tokio::test]
     async fn descending_filtered_changes_report_last_seq_and_pending() {
         let root = std::env::temp_dir().join(format!("douchdb-descf-{}", crate::util::uuid()));
-        let db = scan_db(&root, "descf", 2, false);
+        let db = scan_db(&root, "descf", 1, false);
         // Sequences 1..=30; the design documents are 5, 12 and 25.
         let docs: Vec<Value> = (1..=30)
             .map(|i| match i {
@@ -7020,14 +6962,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25]);
-        assert_eq!((last_seq, pending), (25, 24));
+        assert_eq!((last_seq.get(0), pending), (25, 24));
 
         let (rows, last_seq, pending) = db
             .changes_rows(&descending_design_changes(Some(2)))
             .await
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12]);
-        assert_eq!((last_seq, pending), (12, 11));
+        assert_eq!((last_seq.get(0), pending), (12, 11));
 
         // Fewer matches than the limit: the whole feed was scanned.
         let (rows, last_seq, pending) = db
@@ -7035,14 +6977,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
-        assert_eq!((last_seq, pending), (1, 0));
+        assert_eq!((last_seq.get(0), pending), (1, 0));
 
         let (rows, last_seq, pending) = db
             .changes_rows(&descending_design_changes(None))
             .await
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
-        assert_eq!((last_seq, pending), (1, 0));
+        assert_eq!((last_seq.get(0), pending), (1, 0));
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -7327,120 +7269,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence() {
-        let q = 4u32;
-        let root = std::env::temp_dir().join(format!("douchdb-watermark-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "watermark",
-            DbConfig {
-                q,
-                revs_limit: 100,
-                shard_map: ShardMap::single(q),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-
-        let ids: Vec<String> = (0..q as usize)
-            .map(|shard| doc_id_for_shard(&db, shard))
-            .collect();
-        let first: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
-        db.put_docs(first, true).await.unwrap();
-        // The second write gets a higher global sequence on shard 0.
-        let later = doc_id_for_shard(&db, 0) + "-later";
-        db.put_docs(vec![json!({"_id": later})], true)
-            .await
-            .unwrap();
-
-        // Both writes are committed: no shard has a pending allocation.
-        for shard in 0..q as usize {
-            assert_eq!(
-                db.committed_seq[shard].load(Ordering::SeqCst),
-                db.reserved_seq[shard].load(Ordering::SeqCst),
-                "shard {shard} sequence bookkeeping"
-            );
-        }
-
-        // Simulate shard 1 staging a write with a sequence that is not visible
-        // yet. A cursor must not advance past shard 1's committed sequence.
-        let lagging = 1usize;
-        let committed = db.committed_seq[lagging].load(Ordering::SeqCst);
-        db.reserved_seq[lagging].store(committed + 100, Ordering::SeqCst);
-        let watermark = db.changes_watermark(0, None);
-        assert_eq!(watermark, committed);
-
-        let opts = ChangesOpts {
-            since: 0,
-            limit: None,
-            include_docs: false,
-            style_all_docs: false,
-            descending: false,
-            doc_ids: None,
-            filter: None,
-            conflicts: false,
-            owned: None,
-            until: None,
-        };
-        let (rows, last_seq, _pending) = db.changes_rows(&opts).await.unwrap();
-        assert!(rows.iter().all(|row| row.seq <= committed), "{rows:?}");
-        assert_eq!(last_seq, committed);
-
-        // Once the simulated write commits, a resumed cursor sees the rows
-        // that were withheld, including the later shard-0 write.
-        db.reserved_seq[lagging].store(committed, Ordering::SeqCst);
-        let resumed = ChangesOpts {
-            since: last_seq,
-            ..opts
-        };
-        let (rows, _, _) = db.changes_rows(&resumed).await.unwrap();
-        assert!(rows.iter().any(|row| row.id == later));
-        assert!(rows.iter().all(|row| row.seq > last_seq));
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn client_visible_update_seq_excludes_uncommitted_allocations() {
-        let q = 2u32;
-        let root = std::env::temp_dir().join(format!("douchdb-updseq-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "updseq",
-            DbConfig {
-                q,
-                revs_limit: 100,
-                shard_map: ShardMap::single(q),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-
-        db.put_docs(vec![json!({"_id": doc_id_for_shard(&db, 0)})], true)
-            .await
-            .unwrap();
-        // Shard 1 has allocated a sequence it has not committed, and shard 0
-        // then commits a higher one.
-        let held = db.start_in_flight_write(1);
-        let later = doc_id_for_shard(&db, 0) + "-later";
-        db.put_docs(vec![json!({"_id": later})], true)
-            .await
-            .unwrap();
-
-        // Neither the `update_seq` reported by GET /db and `since=now` nor
-        // the one in the database info may reach the held sequence, or a
-        // feed resumed from it would skip that write when it commits.
-        assert!(db.update_seq() < held, "update_seq {}", db.update_seq());
-        let info = db.info().await.unwrap();
-        let reported = info.update_seq;
-        assert!(reported < held, "info update_seq {reported}");
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
@@ -7480,10 +7308,10 @@ mod tests {
         assert_eq!(all.rows.len(), 1, "{all:?}");
         assert_eq!(db.info().await.unwrap().doc_count, 1);
 
-        // The changes cursor is not held back by the lost write.
-        assert_eq!(db.changes_watermark(0, None), db.seq.load(Ordering::SeqCst));
+        // The lost write's sequence is a gap; the feed is not held back.
+        let before = db.shard_seqs()[0].1;
         let opts = ChangesOpts {
-            since: 0,
+            since: ShardSince::default(),
             limit: None,
             include_docs: false,
             style_all_docs: false,
@@ -7507,71 +7335,153 @@ mod tests {
         assert_eq!(db.info().await.unwrap().doc_count, 2);
         let (rows, last_seq, _) = db.changes_rows(&opts).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(last_seq, db.seq.load(Ordering::SeqCst));
+        let after = db.shard_seqs()[0].1;
+        assert_eq!(last_seq.get(0), after);
+        // The retried write took a new sequence, past the lost one.
+        assert!(after >= before + 2, "{before} -> {after}");
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn two_shard_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
+        let db = Db::open(
+            &root,
+            tag,
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                shard_map: ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        (db, root)
+    }
+
+    fn ids_on_shard(db: &Db, shard: usize, tag: &str, count: usize) -> Vec<String> {
+        (0..100_000)
+            .map(|i| format!("{tag}{i}"))
+            .filter(|id| db.shard_index(id) == shard)
+            .take(count)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shard_sequences_are_independent() {
+        let (db, root) = two_shard_db("shardseqs");
+        for id in ids_on_shard(&db, 0, "zero", 3) {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        for id in ids_on_shard(&db, 1, "one", 1) {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        let seqs: Vec<u64> = db.shard_seqs().into_iter().map(|(_, seq)| seq).collect();
+        assert_eq!(seqs, vec![3, 1]);
+        let uuids: Vec<String> = db.shard_seqs().into_iter().map(|(uuid, _)| uuid).collect();
+        assert!(uuids.iter().all(|uuid| !uuid.is_empty()), "{uuids:?}");
+        assert_ne!(uuids[0], uuids[1]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An index update reads each shard only up to the position that shard
+    /// had when the update started, and records exactly that position.
+    #[tokio::test]
+    async fn incremental_update_is_bounded_by_each_shards_start_position() {
+        let (db, root) = two_shard_db("bounded");
+        let zero = ids_on_shard(&db, 0, "z", 4);
+        let one = ids_on_shard(&db, 1, "o", 4);
+        for id in zero.iter().take(2).chain(one.iter().take(1)) {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        let bound = ShardSince(db.shard_seqs().into_iter().map(|(_, seq)| seq).collect());
+        for id in zero.iter().skip(2).chain(one.iter().skip(1)) {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        let (rows, last) = db
+            .changes_rows_only(&ChangesOpts {
+                until: Some(bound.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut got: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        got.sort();
+        let mut want: Vec<&str> = zero
+            .iter()
+            .take(2)
+            .chain(one.iter().take(1))
+            .map(String::as_str)
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(last, bound);
+        // Resuming from there reads the rest, shard by shard.
+        let (rows, last) = db
+            .changes_rows_only(&ChangesOpts {
+                since: last,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert_eq!(last, ShardSince(vec![4, 4]));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Rows come back in each shard's own order; a limit stops part-way
+    /// through and the reported positions resume exactly there.
+    #[tokio::test]
+    async fn limited_changes_resume_from_per_shard_positions() {
+        let (db, root) = two_shard_db("perlimit");
+        let mut written = Vec::new();
+        for (zero, one) in ids_on_shard(&db, 0, "z", 5)
+            .into_iter()
+            .zip(ids_on_shard(&db, 1, "o", 5))
+        {
+            db.put_docs(vec![json!({"_id": zero}), json!({"_id": one})], true)
+                .await
+                .unwrap();
+            written.extend([zero, one]);
+        }
+        let mut since = ShardSince::default();
+        let mut seen = Vec::new();
+        loop {
+            let (rows, last, _) = db
+                .changes_rows(&ChangesOpts {
+                    since: since.clone(),
+                    limit: Some(3),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            for shard in 0..2 {
+                let seqs: Vec<u64> = rows
+                    .iter()
+                    .filter(|row| row.shard == shard)
+                    .map(|row| row.seq)
+                    .collect();
+                assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+            }
+            seen.extend(rows.into_iter().map(|row| row.id));
+            since = last;
+        }
+        seen.sort();
+        written.sort();
+        assert_eq!(seen, written);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
 
     use proptest::prelude::*;
 
-    #[test]
-    fn watermark_ignores_settled_and_unowned_shards() {
-        // Nothing in flight: no bound.
-        assert_eq!(changes_watermark_from(&[5, 9], &[5, 9], 0, None), u64::MAX);
-        // Shard 1 is in flight at 9; shard 0 is settled.
-        assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 0, None), 9);
-        // The same in-flight shard is not ours, so it does not hold us back.
-        assert_eq!(
-            changes_watermark_from(
-                &[5, 9],
-                &[5, 12],
-                0,
-                Some(&ShardMask::from_iter([true, false]))
-            ),
-            u64::MAX
-        );
-        // Never below `since`.
-        assert_eq!(changes_watermark_from(&[5, 9], &[5, 12], 20, None), 20);
-    }
-
     proptest! {
-        #[test]
-        fn watermark_respects_every_in_flight_shard(
-            committed in prop::collection::vec(0u64..1000, 1..8),
-            reserved in prop::collection::vec(0u64..1000, 1..8),
-            since in 0u64..1000,
-            owned in prop::option::of(prop::collection::vec(any::<bool>(), 1..8)),
-        ) {
-            let mut reserved = reserved;
-            // Make the two arrays the same shape and ensure reserved >= committed.
-            reserved.resize(committed.len(), 0);
-            for (r, c) in reserved.iter_mut().zip(&committed) {
-                *r = (*r).max(*c);
-            }
-            let mask = owned.map(|mut m| {
-                m.resize(committed.len(), false);
-                ShardMask::from_iter(m)
-            });
-            let watermark = changes_watermark_from(
-                &committed,
-                &reserved,
-                since,
-                mask.as_ref(),
-            );
-
-            // The cursor may advance to the lowest committed sequence of any
-            // owned shard that still has an allocated, uncommitted write, but
-            // never below `since`. With nothing in flight it is unbounded.
-            let expected = (0..committed.len())
-                .filter(|&index| mask.as_ref().is_none_or(|m| m.covers(index)))
-                .filter(|&index| reserved[index] > committed[index])
-                .map(|index| committed[index].max(since))
-                .min()
-                .unwrap_or(u64::MAX);
-            prop_assert_eq!(watermark, expected);
-        }
-
         #[test]
         fn shard_placement_is_deterministic_and_in_range(
             docid in ".{0,80}",
@@ -7709,12 +7619,12 @@ mod tests {
             .apply_purge_infos(0, vec![info.clone()], 0)
             .await
             .unwrap());
-        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert_eq!(db.shard_purge_seqs().await.unwrap().iter().sum::<u64>(), 1);
         assert!(db.get_doc("a", &DocOpts::default()).await.is_err());
 
         db.put_docs(vec![doc], false).await.unwrap();
         assert!(!db.apply_purge_infos(0, vec![info], 0).await.unwrap());
-        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert_eq!(db.shard_purge_seqs().await.unwrap().iter().sum::<u64>(), 1);
         assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
 
         drop(db);
@@ -7772,12 +7682,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(purged["purged"]["bad"], json!([listed]));
-        assert_eq!(db.purge_seq().await.unwrap(), 1);
+        assert_eq!(db.shard_purge_seqs().await.unwrap().iter().sum::<u64>(), 1);
         assert!(!body_exists(&db, "bad", &rev).await);
         assert!(db.get_doc("bad", &DocOpts::default()).await.is_err());
         let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
         assert_eq!(row_ids(&all.json(), "rows"), ["good"]);
-        let changes = db.changes(&ChangesOpts::default()).await.unwrap();
+        let changes = db.changes(0, &ChangesOpts::default(), true).await.unwrap();
         assert_eq!(
             row_ids(&serde_json::to_value(&changes).unwrap(), "results"),
             ["good"]

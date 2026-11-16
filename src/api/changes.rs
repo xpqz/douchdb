@@ -1,7 +1,9 @@
 //! The `_changes` feed and its filters.
 
 use super::*;
-use crate::db::{ChangesItem, ChangesList, Seq};
+use crate::db::{ChangesItem, ChangesList};
+use crate::params::parse_since;
+use crate::since::Since;
 
 /// `limit` for `_changes`, with CouchDB's own messages for a bad value.
 fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
@@ -17,24 +19,6 @@ fn changes_limit(q: &HashMap<String, String>) -> DbResult<Option<usize>> {
             "The limit parameter should be a non-negative integer",
         )),
     }
-}
-
-/// CouchDB's `_changes` rejects a malformed `since` rather than reading it as
-/// 0 (`validate_start_seq`, fabric_view_changes.erl): it must be `now`, the
-/// unquoted `0` or an opaque sequence token (`N-<base64>`) that decodes.
-/// Any other plain integer is malformed too. A peer node's own requests keep
-/// passing the plain per-node sequences the shards use.
-fn validate_since(raw: &str, local_only: bool) -> DbResult<()> {
-    if raw == "now"
-        || raw == "0"
-        || decode_since(raw).is_some()
-        || (local_only && raw.parse::<u64>().is_ok())
-    {
-        return Ok(());
-    }
-    Err(ApiError::bad_request(
-        "Malformed sequence supplied in 'since' parameter.",
-    ))
 }
 
 /// The `heartbeat` parameter in milliseconds; `true` asks for CouchDB's
@@ -107,9 +91,7 @@ async fn parse_feed(
             ))
         }
     };
-    if let Some(raw) = q.get("since") {
-        validate_since(raw, local_only)?;
-    }
+    parse_since(q.get("since").map(String::as_str))?;
     let timeout = changes_timeout(q)?;
     let heartbeat = changes_heartbeat(q)?;
     resolve_changes_filter(db, q).await?;
@@ -217,7 +199,7 @@ fn changes_continuous(
         let mut heartbeat = Heartbeat::new(heartbeat);
         // Where the feed stopped, for the closing line CouchDB sends when
         // a continuous feed times out or reaches its limit.
-        let mut trailer: Option<(Seq, u64)> = None;
+        let mut trailer: Option<(String, u64)> = None;
         let mut wake = db.subscribe_commits();
         let mut poll = true;
         loop {
@@ -246,12 +228,12 @@ fn changes_continuous(
                         last_sent = Some(row.seq.clone());
                         sent_here += 1;
                         let json = serde_json::to_vec(&row).unwrap_or_default();
-                        let line = feed_line(&json, eventsource, Some(&row.seq));
+                        let line = feed_line(&json, eventsource, Some(row.seq.as_str()));
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                         sent += 1;
                     }
                     let unsent = (rows.len() - sent_here) as u64;
-                    query.insert("since".to_string(), reported.to_string());
+                    query.insert("since".to_string(), reported.clone());
                     let end_seq = if unsent > 0 { last_sent.unwrap_or(reported) } else { reported };
                     trailer = Some((end_seq, behind + unsent));
                 }
@@ -483,7 +465,7 @@ async fn wait_for_commit(
 /// One feed entry: an SSE event for `eventsource`, else a JSON line. A change's
 /// event ends with `id: <seq>` as in CouchDB, so a reconnecting client can send
 /// it back as `Last-Event-ID`.
-fn feed_line(json: &[u8], eventsource: bool, seq: Option<&Seq>) -> Vec<u8> {
+fn feed_line(json: &[u8], eventsource: bool, seq: Option<&str>) -> Vec<u8> {
     if !eventsource {
         return [json, b"\n"].concat();
     }
@@ -508,8 +490,18 @@ async fn changes_normal_raw(
     if flag(q, "descending") {
         return None;
     }
+    let me = st.ctx.cluster.me;
+    let since = parse_since(q.get("since").map(String::as_str)).ok()?;
     let mut local_mask = None;
     if st.ctx.cluster.is_clustered() && !local_only {
+        // Only when this node serves every shard itself, and the token (if
+        // any) names no other node's copy: a token resumes on the copies it
+        // names, which takes the cluster path.
+        if let Since::Token(copies) = &since {
+            if copies.iter().any(|copy| copy.node != me) {
+                return None;
+            }
+        }
         let masks = crate::fabric::preferred_shard_masks(&st.ctx, db);
         let active: Vec<usize> = masks
             .iter()
@@ -517,21 +509,24 @@ async fn changes_normal_raw(
             .filter(|(_, mask)| !mask.is_empty())
             .map(|(node, _)| node)
             .collect();
-        if active.len() != 1 || active[0] != st.ctx.cluster.me {
+        if active.len() != 1 || active[0] != me {
             return None;
         }
-        local_mask = Some(masks[st.ctx.cluster.me].clone());
+        local_mask = Some(masks[me].clone());
     }
-    let (mut opts, mut progress) = changes_options(st, db, q, body, headers, local_only)
+    let mut opts = changes_options(st, db, q, body, headers, &since)
         .await
         .ok()?;
-    // A client sees opaque tokens; a peer's own reads stay plain shard seqs.
-    let rewrite = !local_only;
     if let Some(mask) = local_mask {
         opts.owned = Some(mask);
     }
-    let me = st.ctx.cluster.me;
-    let initial_seq = progress.get(me).copied().unwrap_or(0);
+    let selected: Vec<usize> = (0..db.q as usize)
+        .filter(|shard| opts.owned.as_ref().is_none_or(|mask| mask.covers(*shard)))
+        .collect();
+    // A client gets every selected shard's position in each row's seq; a
+    // coordinator merging nodes only that row's shard.
+    let full_rows = !local_only;
+    let mut progress = opts.since.clone();
     let pending_descending = opts.descending;
     let pending_owned = opts.owned.clone();
     let pending_db = db.clone();
@@ -540,15 +535,11 @@ async fn changes_normal_raw(
         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"results\":["));
         let mut buffer = String::with_capacity(64 * 1024);
         let mut first = true;
-        let mut last_seq = initial_seq;
         while let Some(item) = rows.next().await {
             let row = match item {
                 Ok(ChangesItem::Row(row)) => row,
-                Ok(ChangesItem::Scanned(seq)) => {
-                    last_seq = seq;
-                    if let Some(slot) = progress.get_mut(me) {
-                        *slot = seq;
-                    }
+                Ok(ChangesItem::Scanned(shard, seq)) => {
+                    progress.0[shard] = seq;
                     continue;
                 }
                 Err(error) => {
@@ -556,45 +547,30 @@ async fn changes_normal_raw(
                     return;
                 }
             };
-            last_seq = row.seq;
-            let seq = if rewrite {
-                if let Some(slot) = progress.get_mut(me) {
-                    *slot = row.seq;
-                }
-                format!("\"{}\"", crate::fabric::encode_since(&progress))
+            progress.0[row.shard] = row.seq;
+            let token = if full_rows {
+                pending_db.local_token(me, &selected, &progress)
             } else {
-                row.seq.to_string()
+                pending_db.local_token(me, &[row.shard], &progress)
             };
             if !first {
                 buffer.push(',');
             }
             first = false;
-            buffer.push_str(&Db::change_row_json(&row, &seq));
+            buffer.push_str(&Db::change_row_json(&row, &format!("\"{token}\"")));
             if buffer.len() >= 64 * 1024 {
                 yield Ok(Bytes::from(std::mem::take(&mut buffer)));
             }
         }
-        let last_seq_json = if rewrite {
-            crate::fabric::encode_since(&progress)
-        } else {
-            last_seq.to_string()
-        };
+        let last_seq = pending_db.local_token(me, &selected, &progress);
         let pending = pending_db
-            .changes_pending(last_seq, pending_descending, pending_owned.as_ref())
+            .changes_pending(&progress, pending_descending, pending_owned.as_ref())
             .await
             .unwrap_or(0);
-        buffer.push_str("],\"last_seq\":");
-        if rewrite {
-            buffer.push('"');
-            buffer.push_str(&last_seq_json);
-            buffer.push('"');
-        } else {
-            buffer.push_str(&last_seq_json);
-        }
-        buffer.push_str(&format!(",\"pending\":{pending}}}"));
-        if !buffer.is_empty() {
-            yield Ok(Bytes::from(buffer));
-        }
+        buffer.push_str("],\"last_seq\":\"");
+        buffer.push_str(&last_seq);
+        buffer.push_str(&format!("\",\"pending\":{pending}}}"));
+        yield Ok(Bytes::from(buffer));
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -603,58 +579,23 @@ async fn changes_normal_raw(
         .ok()
 }
 
+/// The options of a read of this node's own shards. `since` positions count
+/// only for copies on this node with a matching uuid (`Db::shard_since`).
 async fn changes_options(
     st: &AppState,
     db: &Db,
     q: &HashMap<String, String>,
     body: &[u8],
     headers: &HeaderMap,
-    local_only: bool,
-) -> DbResult<(ChangesOpts, Vec<u64>)> {
-    let n = st.ctx.cluster.nodes.len().max(1);
-    let raw_since = q.get("since").map(String::as_str);
-    let mut progress = if raw_since == Some("now") {
-        if st.ctx.cluster.is_clustered() && !local_only {
-            cluster_update_vector(ClusterRead {
-                ctx: &st.ctx,
-                db,
-                dbname: &db.name,
-                headers,
-            })
-            .await?
-            .0
-        } else {
-            let mut vector = vec![0; n];
-            vector[st.ctx.cluster.me] = db.update_seq();
-            vector
-        }
-    } else if let Some(raw) = raw_since {
-        match decode_since(raw) {
-            Some(mut vector) => {
-                vector.resize(n.max(vector.len()), 0);
-                vector
-            }
-            None => vec![since_component(Some(raw), st.ctx.cluster.me); n],
-        }
-    } else {
-        vec![0; n]
-    };
-    progress.resize(n, 0);
-    // This node always knows its own sequence; a token made elsewhere while it
-    // was down has no position for it, and then it is read from the start.
-    if let Some(slot) = progress.get_mut(st.ctx.cluster.me) {
-        if *slot == crate::fabric::UNKNOWN_SEQ {
-            *slot = 0;
-        }
-    }
-    let since = progress.get(st.ctx.cluster.me).copied().unwrap_or(0);
+    since: &Since,
+) -> DbResult<ChangesOpts> {
     let owned = if st.ctx.cluster.is_internal(headers) {
         q.get("shards").and_then(|raw| parse_shard_mask(raw, db.q))
     } else {
         None
     };
-    let opts = ChangesOpts {
-        since,
+    Ok(ChangesOpts {
+        since: db.shard_since(st.ctx.cluster.me, since),
         limit: changes_limit(q)?,
         include_docs: flag(q, "include_docs"),
         style_all_docs: q.get("style").map(String::as_str) == Some("all_docs"),
@@ -664,8 +605,7 @@ async fn changes_options(
         conflicts: flag(q, "conflicts"),
         owned,
         until: None,
-    };
-    Ok((opts, progress))
+    })
 }
 
 async fn changes_once(
@@ -693,26 +633,12 @@ async fn changes_once(
         )
         .await;
     }
-
-    let (opts, progress) = changes_options(st, db, q, body, headers, local_only).await?;
-    let mut list = db.changes(&opts).await?;
-    if !local_only {
-        // The sequences a client gets are opaque, as in CouchDB 3, where even
-        // one node is a cluster; a peer's own reads stay plain shard seqs.
-        let me = st.ctx.cluster.me;
-        let token = |seq: &mut Seq| {
-            if let Seq::Num(num) = *seq {
-                let mut vector = progress.clone();
-                if let Some(slot) = vector.get_mut(me) {
-                    *slot = num;
-                }
-                *seq = Seq::Token(crate::fabric::encode_since(&vector));
-            }
-        };
-        token(&mut list.last_seq);
-        list.results.iter_mut().for_each(|row| token(&mut row.seq));
-    }
-    Ok(list)
+    let since = parse_since(q.get("since").map(String::as_str))?;
+    let opts = changes_options(st, db, q, body, headers, &since).await?;
+    // The sequences are opaque, as in CouchDB 3, where even one node is a
+    // cluster. A peer's own reads get one shard per row token, which is all a
+    // coordinator merging nodes needs.
+    db.changes(st.ctx.cluster.me, &opts, !local_only).await
 }
 
 #[cfg(test)]

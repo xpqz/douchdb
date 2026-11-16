@@ -297,10 +297,9 @@ fn parse_shard_mask(raw: &str, q: u32) -> Option<ShardMask> {
     Some(mask)
 }
 
-/// The `update_seq` a query reports with `update_seq=true`. In a cluster it is
-/// the opaque vector `GET /db` reports, so it works as a `_changes` since;
-/// otherwise it is this node's sequence as an opaque token, as `GET /db`
-/// reports it.
+/// The `update_seq` a query reports with `update_seq=true`: the opaque token
+/// `GET /db` reports (one position per shard range), so it works as a
+/// `_changes` since.
 async fn query_update_seq(
     st: &AppState,
     db: &Arc<Db>,
@@ -317,7 +316,9 @@ async fn query_update_seq(
         .await?;
         return Ok(json!(seq));
     }
-    Ok(json!(encode_local_seq(&st.ctx.cluster, db.update_seq())))
+    let all: Vec<usize> = (0..db.q as usize).collect();
+    let seqs = crate::db::ShardSince(db.shard_seqs().into_iter().map(|(_, seq)| seq).collect());
+    Ok(json!(db.local_token(st.ctx.cluster.me, &all, &seqs)))
 }
 
 /// The body of `GET /{db}` and the `info` of `_dbs_info`: the database's
