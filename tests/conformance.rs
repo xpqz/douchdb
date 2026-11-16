@@ -16720,9 +16720,15 @@ async fn internal_peer_requests_bypass_the_request_size_limit() {
     let big = json!({"docs": [{"_id": "big", "pad": "x".repeat(2 * 1024 * 1024)}]});
 
     // A client's oversized body is refused: 413, or a reset while it is
-    // still being sent.
-    let client = s
-        .client
+    // still being sent. The server closes that connection without reading
+    // the rest of the body, so the request goes on a client of its own: a
+    // pooled connection would otherwise be reused for the next request and
+    // fail with a broken pipe.
+    let oversized = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("client");
+    let client = oversized
         .post(format!("{}/peersize/_bulk_docs", s.base))
         .json(&big)
         .send()
@@ -18750,6 +18756,12 @@ async fn quorum_read_repairs_a_stale_copy() {
         vec![first.clone()]
     );
 
+    // The coordinator skips a peer its last discovery pass found down while
+    // the others make up `r`, and repairs only the copies that answered.
+    // Node 2 starts after node 1's first pass, so wait until node 1 has seen
+    // both peers up before the read.
+    wait_until_known_up(&nodes[1], &nodes[0].base).await;
+    wait_until_known_up(&nodes[1], &nodes[2].base).await;
     let (status, body) = nodes[1].get("/qrepair/x?r=2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["v"], 2, "{body}");
