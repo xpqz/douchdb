@@ -16596,6 +16596,103 @@ async fn streaming_feed_holds_its_admission_permit_until_the_client_disconnects(
     }
 }
 
+/// Peer-to-peer requests are not client work: each one comes from a request
+/// its coordinator already admitted, or from bounded background work. Like
+/// CouchDB's inter-node traffic, they bypass client admission. A node that
+/// rejoined after a partition used to refuse the backlog of replica writes
+/// queued for it with 429, and silently miss those updates.
+#[tokio::test]
+async fn internal_peer_requests_bypass_client_admission() {
+    let args = vec![
+        "--max-in-flight".to_string(),
+        "1".to_string(),
+        "--cluster-secret".to_string(),
+        "test-cluster-secret".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    let (status, body) = s.put("/peeradmit", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.put("/peeradmit/d1", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A continuous feed holds the only in-flight slot.
+    let mut feed = s
+        .client
+        .get(format!(
+            "{}/peeradmit/_changes?feed=continuous&since=0&timeout=60000",
+            s.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(feed.status(), StatusCode::OK);
+    assert!(feed.chunk().await.unwrap().is_some());
+
+    let (status, body) = s.get("/peeradmit").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = s
+        .req_with(
+            Method::POST,
+            "/peeradmit/_bulk_docs",
+            Some(json!({"docs": [{"_id": "x"}]})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A wrong secret is client traffic and still limited.
+    let forged = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "wrong".to_string()),
+    ];
+    let (status, body) = s.req_with(Method::GET, "/peeradmit", None, &forged).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    drop(feed);
+}
+
+/// The request-size limit is for clients. A peer's forwarded batch passes
+/// whatever its size, as CouchDB's inter-node traffic is not subject to
+/// `max_http_request_size`.
+#[tokio::test]
+async fn internal_peer_requests_bypass_the_request_size_limit() {
+    let args = vec![
+        "--max-request-mb".to_string(),
+        "1".to_string(),
+        "--cluster-secret".to_string(),
+        "test-cluster-secret".to_string(),
+    ];
+    let s = Server::start_with(&args, false);
+    let (status, body) = s.put("/peersize", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let big = json!({"docs": [{"_id": "big", "pad": "x".repeat(2 * 1024 * 1024)}]});
+
+    // A client's oversized body is refused: 413, or a reset while it is
+    // still being sent.
+    let client = s
+        .client
+        .post(format!("{}/peersize/_bulk_docs", s.base))
+        .json(&big)
+        .send()
+        .await;
+    if let Ok(response) = client {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = s
+        .req_with(Method::POST, "/peersize/_bulk_docs", Some(big), &internal)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 #[tokio::test]
 async fn global_admission_limit_protects_capacity_across_users() {
     let users = UsersFile::new(USERS);

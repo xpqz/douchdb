@@ -53,6 +53,8 @@ wasmtime = { version = "50.0.1", optional = true }
 wasmtime-wasi = { version = "50.0.1", optional = true, features = ["p1"] }
 futures = "0.3"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
+tower-layer = "0.3"
+tower-service = "0.3"
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", features = ["http-proto", "reqwest-blocking-client"] }
