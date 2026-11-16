@@ -74,35 +74,6 @@ pub fn parse(raw: Option<&str>) -> Result<Since, SinceError> {
     }
 }
 
-/// An internal-replication checkpoint kept on the pulling (target) node: it
-/// read the source copy `source_uuid` up to `seq`, and the target copy
-/// `target_uuid` was at `target_seq` once those changes were written.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Checkpoint {
-    pub source_uuid: String,
-    pub seq: u64,
-    pub target_uuid: String,
-    pub target_seq: u64,
-}
-
-/// Where to resume the token position `want` on the copy `serving_uuid`, as
-/// CouchDB's `mem3_rep:find_source_seq` does. The same copy resumes at its own
-/// position; another one at the `target_seq` of the latest checkpoint that
-/// recorded a pull from `want`'s copy into it at or before `want.seq`, so it
-/// never skips what that copy has not received; with none, from 0.
-pub fn resume_position(want: &CopyPos, serving_uuid: &str, checkpoints: &[Checkpoint]) -> u64 {
-    if want.uuid == serving_uuid {
-        return want.seq;
-    }
-    checkpoints
-        .iter()
-        .filter(|c| {
-            c.source_uuid == want.uuid && c.target_uuid == serving_uuid && c.seq <= want.seq
-        })
-        .max_by_key(|c| c.seq)
-        .map_or(0, |c| c.target_seq)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,60 +137,5 @@ mod tests {
         assert!(opaque
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-    }
-
-    fn cp(source: &str, seq: u64, target_seq: u64) -> Checkpoint {
-        Checkpoint {
-            source_uuid: source.into(),
-            seq,
-            target_uuid: "serving".into(),
-            target_seq,
-        }
-    }
-
-    fn want(seq: u64) -> CopyPos {
-        CopyPos {
-            node: 0,
-            shard: 1,
-            seq,
-            uuid: "wanted".into(),
-        }
-    }
-
-    #[test]
-    fn resume_on_same_copy_uses_its_position() {
-        assert_eq!(
-            resume_position(&want(9), "wanted", &[cp("wanted", 5, 2)]),
-            9
-        );
-    }
-
-    #[test]
-    fn resume_on_other_copy_uses_the_latest_checkpoint_not_past_the_position() {
-        let checkpoints = [
-            cp("wanted", 4, 3),
-            cp("wanted", 8, 7),
-            cp("wanted", 12, 11),
-            cp("someone-else", 9, 99),
-        ];
-        assert_eq!(resume_position(&want(9), "serving", &checkpoints), 7);
-        assert_eq!(resume_position(&want(8), "serving", &checkpoints), 7);
-        assert_eq!(resume_position(&want(12), "serving", &checkpoints), 11);
-    }
-
-    #[test]
-    fn resume_without_a_matching_checkpoint_is_zero() {
-        assert_eq!(resume_position(&want(9), "serving", &[]), 0);
-        assert_eq!(
-            resume_position(&want(3), "serving", &[cp("wanted", 4, 3)]),
-            0
-        );
-        assert_eq!(
-            resume_position(&want(9), "serving", &[cp("other", 4, 3)]),
-            0
-        );
-        let mut elsewhere = cp("wanted", 4, 3);
-        elsewhere.target_uuid = "another-target".into();
-        assert_eq!(resume_position(&want(9), "serving", &[elsewhere]), 0);
     }
 }
