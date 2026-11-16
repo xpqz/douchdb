@@ -90,7 +90,6 @@ the machinery it built to make LevelDB behave like a transactional store.
 - The shard actor as the single writer and the group commit itself (redb
   amortises nothing across separate transactions; grouping is what makes
   one `fsync` serve many writes).
-- The stale-body sweep in compaction.
 
 ## Behaviour decisions
 
