@@ -162,6 +162,15 @@ pub async fn admit(
     // the `Caller` extractor.
     let principal = st.principal(req.headers());
     req.extensions_mut().insert(principal.clone());
+    // Peer-to-peer traffic is not client work: every such request comes from
+    // one its coordinator already admitted, from the bounded replica writes
+    // that outlive it, or from the background lane. Like CouchDB's inter-node
+    // traffic it is not limited here; refusing it with 429 would make the
+    // copy silently miss the update (a node rejoining after a partition gets
+    // the whole backlog of replica writes at once).
+    if st.ctx.cluster.is_internal(req.headers()) || st.ctx.cluster.is_internal_db(req.headers()) {
+        return next.run(req).await;
+    }
     let lane = crate::admission::Admission::classify(req.method(), req.uri().path());
     match st.admission.try_admit(&principal, lane) {
         Ok(permit) => hold_for_body(permit, next.run(req).await),
@@ -203,6 +212,27 @@ fn hold_for_body(permit: crate::admission::Permit, response: Response) -> Respon
         }
     };
     Response::from_parts(parts, Body::from_stream(held))
+}
+
+/// The request-size limit is for clients. A peer's request (a forwarded
+/// batch, a read repair, an anti-entropy fetch) passes whatever its size, as
+/// CouchDB's inter-node traffic is not subject to `max_http_request_size`.
+pub async fn unlimited_peer_bodies(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use tower_layer::Layer;
+    use tower_service::Service;
+    if st.ctx.cluster.is_internal(req.headers()) || st.ctx.cluster.is_internal_db(req.headers()) {
+        // `Next` is always ready, so the layered service can be called as is.
+        let mut service = axum::extract::DefaultBodyLimit::disable().layer(next);
+        return match service.call(req).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    next.run(req).await
 }
 
 /// CouchDB's `couch_httpd:maybe_add_default_headers/2` (couch_httpd.erl 3.5.0)

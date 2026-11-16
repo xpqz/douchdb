@@ -851,6 +851,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-http",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

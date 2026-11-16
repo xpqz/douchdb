@@ -244,6 +244,12 @@ surface and avoids pretending that a local file edit propagates across a cluster
 - Set the same `--session-secret` on every node if session cookies should work
   across nodes. The cluster secret is not used for sessions.
 - Admission is local to each node.
+- Node-to-node requests (authenticated with the cluster secret) are exempt
+  from every user limit: admission, the per-user and rate buckets, the heavy
+  lane and `--max-request-mb`. Each one comes from a request its coordinator
+  already admitted, from replica writes that outlive it, or from background
+  work. As in CouchDB, whose `chttpd` limits do not apply to inter-node
+  traffic, refusing them would make a copy silently miss updates.
 
 ## Contract tests
 
