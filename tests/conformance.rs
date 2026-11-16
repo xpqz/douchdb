@@ -20049,8 +20049,12 @@ async fn live_changes_cursor_misses_nothing_under_concurrent_writes() {
     for node in nodes.iter() {
         node.fresh_db("livecursor").await;
     }
+    // Pinged after each acknowledged batch; `done` once all are.
+    let written = std::sync::Arc::new(tokio::sync::Notify::new());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = {
         let nodes = nodes.clone();
+        let written = written.clone();
         tokio::spawn(async move {
             for batch in 0..DOCS / BATCH {
                 let docs: Vec<Value> = (0..BATCH)
@@ -20061,35 +20065,49 @@ async fn live_changes_cursor_misses_nothing_under_concurrent_writes() {
                     .post("/livecursor/_bulk_docs", json!({"docs": docs}))
                     .await;
                 assert_eq!(status, StatusCode::CREATED, "{body}");
+                written.notify_waiters();
             }
         })
     };
     let readers: Vec<_> = (0..nodes.len())
         .map(|reader| {
             let nodes = nodes.clone();
+            let (written, done) = (written.clone(), done.clone());
             tokio::spawn(async move {
                 let mut seen = std::collections::HashSet::new();
                 let mut since = "0".to_string();
-                // A long poll returns as soon as anything is there; a reader
-                // that stays empty this many polls in a row has stalled.
-                let mut idle = 0;
-                while seen.len() < DOCS && idle < 120 {
+                // Follow the feed while the writer runs; once it has finished,
+                // a plain read that returns nothing means the reader is at the
+                // end of everything that was written.
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::SeqCst);
                     let (status, body) = nodes[reader]
-                        .get(&format!(
-                            "/livecursor/_changes?feed=longpoll&timeout=5000&limit=700&since={since}"
-                        ))
+                        .get(&format!("/livecursor/_changes?limit=700&since={since}"))
                         .await;
                     assert_eq!(status, StatusCode::OK, "{body}");
                     let ids = feed_ids(&body);
-                    idle = if ids.is_empty() { idle + 1 } else { 0 };
+                    let empty = ids.is_empty();
                     seen.extend(ids);
                     since = body["last_seq"].as_str().expect("last_seq").to_string();
+                    if empty {
+                        if finished {
+                            break;
+                        }
+                        // Caught up with a writer still running: wait for its
+                        // next batch rather than spin.
+                        let wait = written.notified();
+                        if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                            wait.await;
+                        }
+                    }
                 }
                 (reader, seen)
             })
         })
         .collect();
     writer.await.unwrap();
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    written.notify_waiters();
     for reader in readers {
         let (reader, seen) = reader.await.unwrap();
         let missing: Vec<String> = (0..DOCS)

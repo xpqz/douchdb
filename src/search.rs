@@ -759,6 +759,16 @@ fn write_changes(
     finish_writer(writer, cursor)
 }
 
+/// Whether two cursors are over the same shard copies (same uuids, in order).
+fn same_copies(left: &IndexCursor, right: &IndexCursor) -> bool {
+    left.0.len() == right.0.len()
+        && left
+            .0
+            .iter()
+            .zip(&right.0)
+            .all(|((left, _), (right, _))| left == right)
+}
+
 /// Bring the cached index up to date with the changes after its cursor,
 /// re-indexing only the documents that changed.
 async fn update_index(
@@ -768,13 +778,20 @@ async fn update_index(
     gate: Permit,
     mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<Update> {
-    let since = entry
-        .as_ref()
-        .map(|cached| cached.snapshot.meta.cursor.since())
-        .unwrap_or_default();
     // Each shard is read up to where it is now, and the index records
     // exactly that.
     let cursor = IndexCursor(db.shard_seqs());
+    let Some(since) = entry
+        .as_ref()
+        .map(|cached| &cached.snapshot.meta.cursor)
+        .filter(|recorded| same_copies(recorded, &cursor))
+        .map(IndexCursor::since)
+    else {
+        // A shard copy changed (cleared, recreated) since the caller checked
+        // the cursor: its documents may be gone without a change row, so
+        // only a rebuild is right.
+        return Ok(Update::Rebuild(gate, entry));
+    };
     let (changed, live) = indexable_changes(db, since, cursor.since()).await?;
     let source = spec.source.clone();
     let placement = (db.q, db.partitioned);
@@ -2638,6 +2655,72 @@ mod tests {
         }
         db.clear_shards(&[1]).await.unwrap();
         assert_eq!(search().await["total_rows"], 3);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `ensure_index` checks the cursor's uuids, then `update_index` reads
+    /// the shards again. A shard cleared in between must still rebuild the
+    /// index rather than record the new uuid over the old copy's rows. The
+    /// test drives `update_index` directly with the stale entry, as if the
+    /// clear landed between the two reads.
+    #[tokio::test]
+    async fn an_update_that_meets_a_new_shard_uuid_rebuilds() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-race-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open(
+            &root,
+            "searchrace",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let ddoc = on_shard(0, "_design/race");
+        let index = "function(doc){ index('name', doc.name); }";
+        db.put_docs(
+            vec![
+                json!({"_id": ddoc, "indexes": {"idx": {"index": index}}}),
+                json!({"_id": on_shard(1, "gone"), "name": "fig"}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:fig".to_string(),
+            limit: 200,
+            ..SearchRequest::default()
+        };
+        let result = query(&db, &ddoc, "idx", &request, limits).await.unwrap();
+        assert_eq!(result["total_rows"], 1);
+
+        db.clear_shards(&[1]).await.unwrap();
+        let spec = load_spec(&db, &ddoc, "idx").await.unwrap();
+        let gate = build_gate(&db).read().await.unwrap();
+        let entry = index_entry(&index_dir(&db, &ddoc, "idx"))
+            .lock_owned()
+            .await;
+        assert!(entry.is_some(), "the built index is cached");
+        let update = update_index(&db, &spec, limits, gate, entry).await.unwrap();
+        assert!(
+            matches!(update, Update::Rebuild(..)),
+            "an update over a cleared shard must rebuild"
+        );
+        drop(update);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
