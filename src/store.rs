@@ -5,7 +5,10 @@
 //! group's one redb write transaction ([`ShardTxn`]), so a later job sees an
 //! earlier job's writes, and the group commits once, synced
 //! (`Durability::Immediate`, redb's default), before any of its callers hears
-//! back. Read jobs run between groups on a read transaction.
+//! back. Read jobs that need the in-memory indexes run on the actor between
+//! groups, on a read transaction; every other read runs off the actor, on a
+//! read transaction of its own leased from the shard's [`Gate`]
+//! ([`ShardHandle::lease`]), alongside the groups.
 //!
 //! The in-memory indexes (each document's latest sequence, the live ids and
 //! their ranks) describe the committed state only: a group's changes reach
@@ -16,16 +19,14 @@
 mod model_test;
 
 use crate::error::ApiError;
+use crate::gate::{self, Gate, LeaseTxn};
 use crate::kv::{
     self, Table, BODIES, BY_SEQ, CHECKPOINTS, LOCAL, META, PURGED_REVS, PURGE_INFOS, PURGE_UUIDS,
     SETTINGS,
 };
 use crate::revtree::RevTree;
 use anyhow::Result;
-use redb::{
-    Database, Key, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
-    WriteTransaction,
-};
+use redb::{Database, Key, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -358,13 +359,16 @@ struct DocChange {
 /// One shard's file and what the actor keeps in memory about it. It lives on
 /// the actor thread; jobs reach it through a [`ShardTxn`].
 pub struct Shard {
-    db: Database,
+    /// The file, shared with the readers that lease it off the actor.
+    gate: Gate,
     /// The file, for the integrity check when the shard closes; `None` for a
     /// test backend.
     path: Option<PathBuf>,
     name: ShardName,
     /// As of the last commit.
     settings: Settings,
+    /// The `revs_limit` of a shard that has none set.
+    default_revs_limit: u64,
     /// `settings.uuid`, shared with the shard's handle once it has one.
     shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
     /// Live document id -> winning revision, built lazily on the first
@@ -420,7 +424,8 @@ impl Shard {
         name: ShardName,
         revs_limit: u64,
     ) -> Result<Shard> {
-        let txn = db.begin_write()?;
+        let gate = Gate::new(db);
+        let txn = gate.begin_write()?;
         let fresh = {
             drop(txn.open_table(META)?);
             drop(txn.open_table(BY_SEQ)?);
@@ -449,7 +454,7 @@ impl Shard {
             txn.abort()?;
         }
         let settings = {
-            let txn = db.begin_read()?;
+            let txn = gate.begin_read()?;
             let table = txn.open_table(SETTINGS)?;
             let get = |setting: &str| -> Result<Option<Vec<u8>>> {
                 match table.get(setting)? {
@@ -480,10 +485,11 @@ impl Shard {
             }
         };
         Ok(Shard {
-            db,
+            gate,
             path,
             name,
             settings,
+            default_revs_limit: revs_limit,
             shared_uuid: None,
             live: None,
             rank_cursor: None,
@@ -563,8 +569,13 @@ impl Shard {
     /// integrity check, so its next open in this process can skip one; a
     /// failure is logged and leaves the file to be checked on its next open.
     fn close(self) {
-        let Shard { db, path, name, .. } = self;
-        let Some(path) = path else { return };
+        let Shard {
+            gate, path, name, ..
+        } = self;
+        // Waits for the readers' leases to come back.
+        let (Some(db), Some(path)) = (gate.shut(), path) else {
+            return;
+        };
         if let Err(error) = kv::close_verified(db, &path) {
             tracing::error!(
                 db = %name.db,
@@ -595,7 +606,7 @@ impl Shard {
     /// Visit every committed metadata record. A record that does not decode
     /// is reported and skipped; a checksum mismatch fails the walk.
     fn committed_metas(&self, mut visit: impl FnMut(&str, DocMeta)) -> Result<()> {
-        let txn = self.db.begin_read()?;
+        let txn = self.gate.begin_read()?;
         let table = txn.open_table(META)?;
         for entry in table.iter()? {
             let (id, stored) = entry?;
@@ -652,7 +663,7 @@ impl Shard {
         first: Box<dyn ShardJob>,
         mut more: impl FnMut() -> Option<Box<dyn ShardJob>>,
     ) -> (Vec<Reply>, Option<ApiError>) {
-        let txn = match self.db.begin_write() {
+        let txn = match self.gate.begin_write() {
             Ok(txn) => txn,
             Err(error) => {
                 first.fail(ApiError::internal(error));
@@ -696,7 +707,7 @@ impl Shard {
 
     /// Run a read job on a read transaction of the committed state.
     fn run_read(&mut self, job: Box<dyn ShardJob>) -> Option<Reply> {
-        let txn = match self.db.begin_read() {
+        let txn = match self.gate.begin_read() {
             Ok(txn) => txn,
             Err(error) => {
                 job.fail(ApiError::internal(error));
@@ -727,7 +738,7 @@ impl Shard {
         // Documents whose corrupt metadata was already reported this sweep.
         let mut reported: BTreeSet<String> = BTreeSet::new();
         loop {
-            let txn = self.db.begin_write()?;
+            let txn = self.gate.begin_write()?;
             let keys: Vec<(String, String)> = {
                 let bodies = txn.open_table(BODIES)?;
                 let start = match &after {
@@ -1510,7 +1521,7 @@ impl<'s> ShardTxn<'s> {
     /// transaction has written since.
     #[cfg(test)]
     pub(crate) fn committed_local(&self, id: &str) -> Option<Vec<u8>> {
-        let txn = self.shard.db.begin_read().unwrap();
+        let txn = self.shard.gate.begin_read().unwrap();
         let table = txn.open_table(LOCAL).unwrap();
         let stored = table.get(id).unwrap()?;
         Some(kv::unseal(stored.value()).unwrap().to_vec())
@@ -1649,20 +1660,6 @@ impl<'s> ShardTxn<'s> {
             .is_some())
     }
 
-    /// The revisions of `id` that a recorded purge info lists.
-    pub fn purged_revs(&self, id: &str, revs: &[String]) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for rev in revs {
-            if self
-                .get_value(PURGED_REVS, Table::PurgedRevs, (id, rev.as_str()))?
-                .is_some()
-            {
-                out.push(rev.clone());
-            }
-        }
-        Ok(out)
-    }
-
     /// Remove a document whose metadata record cannot be decoded: the record,
     /// its sequence entries and its revision bodies, recorded as the purge
     /// `info`. The counters are recounted, since the record's old state is
@@ -1769,6 +1766,133 @@ impl<'s> ShardTxn<'s> {
         txn.open_table(CHECKPOINTS)?
             .retain(|id, _| !id.starts_with(SHARD_CHECKPOINT_PREFIX))?;
         Ok(())
+    }
+}
+
+/// What reading a document needs, on the actor (a job's [`ShardTxn`]) or
+/// off it (a [`ShardView`] on a lease).
+pub trait DocRead {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>>;
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>>;
+    fn revs_limit(&self) -> Result<u64>;
+    /// Where this shard lives, for logging skipped records.
+    fn name(&self) -> &ShardName;
+}
+
+impl DocRead for ShardTxn<'_> {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>> {
+        ShardTxn::get_meta(self, docid)
+    }
+
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        ShardTxn::get_body(self, docid, rev)
+    }
+
+    fn revs_limit(&self) -> Result<u64> {
+        Ok(ShardTxn::revs_limit(self))
+    }
+
+    fn name(&self) -> &ShardName {
+        ShardTxn::name(self)
+    }
+}
+
+/// What a read off the actor knows of its shard besides the file.
+struct ReadContext {
+    name: ShardName,
+    /// Shared with the shard and its handle (see [`Shard`]).
+    body_reads: Arc<AtomicU64>,
+    default_revs_limit: u64,
+}
+
+/// A shard as a read off the actor sees it: the committed state as of its
+/// lease's transaction. It has none of the actor's in-memory indexes, so
+/// reads that need them (`_changes` `pending`, `_all_docs` `offset` and
+/// `total_rows`, partition counts) stay actor jobs.
+pub struct ShardView<'a, 'l> {
+    txn: &'a LeaseTxn<'l>,
+    shard: &'a ReadContext,
+}
+
+impl DocRead for ShardView<'_, '_> {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>> {
+        match self.txn.get(Table::Meta, &gate::key::text(docid))? {
+            Some(bytes) => Ok(Some(parse_meta(docid, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        self.shard.body_reads.fetch_add(1, Ordering::Relaxed);
+        self.txn.get(Table::Bodies, &gate::key::pair(docid, rev))
+    }
+
+    fn revs_limit(&self) -> Result<u64> {
+        match self
+            .txn
+            .get(Table::Settings, &gate::key::text(REVS_LIMIT))?
+        {
+            Some(bytes) => decode_u64(Table::Settings, &bytes),
+            None => Ok(self.shard.default_revs_limit),
+        }
+    }
+
+    fn name(&self) -> &ShardName {
+        &self.shard.name
+    }
+}
+
+impl ShardView<'_, '_> {
+    /// The revisions of `id` that a recorded purge info lists.
+    pub fn purged_revs(&self, id: &str, revs: &[String]) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for rev in revs {
+            if self
+                .txn
+                .get(Table::PurgedRevs, &gate::key::pair(id, rev))?
+                .is_some()
+            {
+                out.push(rev.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` live documents (id and winning revision) whose ids
+    /// `keep` accepts, in id order, after `after` when it is given, read from
+    /// the metadata records. A record that does not decode is reported and
+    /// skipped; a checksum mismatch fails the read.
+    pub fn live_docs_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let from = match after {
+            Some(after) => Excluded(gate::key::text(after)),
+            None => Unbounded,
+        };
+        self.txn
+            .scan(Table::Meta, (from, Unbounded), false, |id, stored| {
+                let id = gate::key::split_text(id)?;
+                if !keep(id) {
+                    return Ok(true);
+                }
+                match parse_meta(id, stored) {
+                    Ok(meta) => {
+                        if let Some((rev, true)) = meta_state(&meta) {
+                            out.push((id.to_string(), rev));
+                        }
+                    }
+                    Err(corrupt) => self.shard.name.report_corrupt(&corrupt.id, &corrupt),
+                }
+                Ok(out.len() < limit)
+            })?;
+        Ok(out)
     }
 }
 
@@ -1905,8 +2029,12 @@ pub struct ShardHandle {
     seq_tracker: Arc<AtomicU64>,
     /// The shard copy's uuid, which `clear` replaces.
     uuid: Arc<std::sync::RwLock<String>>,
-    /// Jobs submitted to this shard's actor since it opened. Each one is a
-    /// cross-thread hop, so the count is the shard round-trip cost of a request.
+    /// The file, for reads off the actor.
+    gate: Gate,
+    read_context: Arc<ReadContext>,
+    /// Shard round trips since it opened: jobs submitted to its actor and
+    /// reads on leases. Each one is a cross-thread hop, so the count is the
+    /// shard round-trip cost of a request.
     jobs: AtomicU64,
     /// Index entries the shard has walked, shared with the shard.
     scanned: Arc<AtomicU64>,
@@ -1950,7 +2078,7 @@ impl ShardHandle {
     ) -> Result<ShardHandle> {
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Message>(256);
-        type Ready = (u64, Arc<std::sync::RwLock<String>>);
+        type Ready = (u64, Arc<std::sync::RwLock<String>>, Gate, ReadContext);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
         let scanned = Arc::new(AtomicU64::new(0));
@@ -1969,7 +2097,13 @@ impl ShardHandle {
             shard.set_counters(shard_scanned, shard_body_reads);
             let uuid = Arc::new(std::sync::RwLock::new(shard.settings.uuid.clone()));
             shard.shared_uuid = Some(uuid.clone());
-            if ready_tx.send(Ok((shard.seq(), uuid))).is_err() {
+            let context = ReadContext {
+                name: shard.name.clone(),
+                body_reads: Arc::clone(&shard.body_reads),
+                default_revs_limit: shard.default_revs_limit,
+            };
+            let ready = (shard.seq(), uuid, shard.gate.clone(), context);
+            if ready_tx.send(Ok(ready)).is_err() {
                 return;
             }
             let mut next = None;
@@ -2014,7 +2148,7 @@ impl ShardHandle {
             }
             shard.close();
         })?;
-        let (initial_seq, uuid) = ready_rx
+        let (initial_seq, uuid, gate, read_context) = ready_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
@@ -2023,6 +2157,8 @@ impl ShardHandle {
             thread: Some(thread),
             seq_tracker,
             uuid,
+            gate,
+            read_context: Arc::new(read_context),
             jobs: AtomicU64::new(0),
             scanned,
             body_reads,
@@ -2039,7 +2175,7 @@ impl ShardHandle {
         self.body_reads.load(Ordering::Relaxed)
     }
 
-    /// Jobs submitted to this shard's actor so far.
+    /// Shard round trips so far: actor jobs and lease reads.
     pub fn jobs(&self) -> u64 {
         self.jobs.load(Ordering::Relaxed)
     }
@@ -2103,6 +2239,23 @@ impl ShardHandle {
     {
         let (job, answer) = call_job(f);
         self.send(Message::Read(job), answer).await
+    }
+
+    /// Run `f` off the actor, on a read transaction of its own leased from
+    /// the shard's gate, alongside the actor's write groups: for reads that
+    /// need none of the actor's in-memory indexes. It sees the committed
+    /// state as of its start. A streamed read takes one lease per page.
+    pub async fn lease<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&ShardView<'_, '_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        self.jobs.fetch_add(1, Ordering::Relaxed);
+        let shard = Arc::clone(&self.read_context);
+        self.gate
+            .read(move |txn| Ok(f(&ShardView { txn, shard: &shard })))
+            .await
+            .map_err(ApiError::from)?
     }
 
     /// Run a job that has the shard to itself between groups, such as

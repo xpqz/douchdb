@@ -8,7 +8,9 @@
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Rev};
-use crate::store::{meta_state, DocMeta, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn};
+use crate::store::{
+    meta_state, DocMeta, DocRead, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn,
+};
 use crate::util::{hex, uuid};
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -1625,7 +1627,7 @@ impl Db {
         let id = id.to_string();
         let opts = opts.clone();
         self.shard(id.as_str())
-            .read(move |s| read_doc(s, &id, &opts))
+            .lease(move |s| read_doc(s, &id, &opts))
             .await
     }
 
@@ -1648,7 +1650,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].read(move |s| {
+                    self.shards[index].lease(move |s| {
                         Ok(batch
                             .into_iter()
                             .map(|(slot, id)| (slot, read_doc(s, &id, &opts)))
@@ -1693,7 +1695,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].read(move |s| {
+                    self.shards[index].lease(move |s| {
                         batch
                             .into_iter()
                             .filter_map(|id| match all_docs_key_row(s, &id, &opts) {
@@ -2048,21 +2050,12 @@ impl Db {
         while let Some(&index) = shards.get(cursor.shard) {
             let after = cursor.after.take();
             let (docs, last) = self.shards[index]
-                .read(move |s| {
-                    // Build (or reuse) the live map, then read only bodies.
-                    // This avoids decoding every full DocMeta record again for
-                    // each cold view build.
-                    let from = match &after {
-                        Some(after) => std::ops::Bound::Excluded(after.clone()),
-                        None => std::ops::Bound::Unbounded,
-                    };
-                    let metas: Vec<(String, String)> = s
-                        .live_docs()?
-                        .range((from, std::ops::Bound::Unbounded))
-                        .filter(|(id, _)| !id.starts_with("_design/") && !id.starts_with("_local/"))
-                        .take(limit)
-                        .map(|(id, doc)| (id.clone(), doc.rev.clone()))
-                        .collect();
+                .lease(move |s| {
+                    // One page of live documents from the metadata records
+                    // of the lease's snapshot, then their bodies.
+                    let metas = s.live_docs_after(after.as_deref(), limit, |id| {
+                        !id.starts_with("_design/") && !id.starts_with("_local/")
+                    })?;
                     let last = (metas.len() == limit)
                         .then(|| metas.last().map(|(id, _)| id.clone()))
                         .flatten();
@@ -2629,7 +2622,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].read(move |s| {
+                    self.shards[index].lease(move |s| {
                         batch
                             .into_iter()
                             .map(|(slot, id, wanted)| {
@@ -2743,7 +2736,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].read(move |shard| {
+                    self.shards[index].lease(move |shard| {
                         let mut out = Vec::with_capacity(batch.len());
                         for (slot, id, opts) in batch {
                             let rev = opts
@@ -3123,7 +3116,7 @@ impl Db {
                 .map(|(id, revs)| (id.to_string(), revs))
                 .collect();
             let hits = self.shards[index]
-                .read(move |s| {
+                .lease(move |s| {
                     let mut hits = Vec::new();
                     for (id, revs) in docs {
                         for rev in s.purged_revs(&id, &revs)? {
@@ -3279,7 +3272,7 @@ pub fn attachments_unsupported() -> ApiError {
 /// The requested revisions of one document the shard does not have, and the
 /// leaves that could be their ancestors.
 fn revs_diff_one(
-    s: &mut ShardTxn,
+    s: &impl DocRead,
     id: &str,
     wanted: &[String],
 ) -> DbResult<(Vec<String>, Vec<String>)> {
@@ -4650,7 +4643,7 @@ fn canonical_rev(rev: &str) -> String {
 /// Only a decode failure (`ApiError::corrupt`) is skipped: a storage error or
 /// a value failing its checksum, or any other failure, still fails the
 /// request.
-fn skip_corrupt<T>(shard: &ShardTxn, id: &str, result: DbResult<T>) -> DbResult<Option<T>> {
+fn skip_corrupt<T>(shard: &impl DocRead, id: &str, result: DbResult<T>) -> DbResult<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.corrupt => {
@@ -4661,7 +4654,7 @@ fn skip_corrupt<T>(shard: &ShardTxn, id: &str, result: DbResult<T>) -> DbResult<
     }
 }
 
-fn read_doc(shard: &mut ShardTxn, id: &str, opts: &DocOpts) -> DbResult<Value> {
+fn read_doc(shard: &impl DocRead, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
@@ -4739,7 +4732,7 @@ fn read_doc(shard: &mut ShardTxn, id: &str, opts: &DocOpts) -> DbResult<Value> {
 }
 
 fn read_doc_rev(
-    shard: &mut ShardTxn,
+    shard: &impl DocRead,
     id: &str,
     meta: &DocMeta,
     rev: &str,
@@ -4774,7 +4767,7 @@ fn read_doc_rev(
     }
     if opts.revs {
         let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
-        let limit = shard.revs_limit().max(1) as usize;
+        let limit = shard.revs_limit()?.max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
@@ -4791,7 +4784,7 @@ fn read_doc_rev(
     }
     if opts.revs_info {
         let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
-        let limit = shard.revs_limit().max(1) as usize;
+        let limit = shard.revs_limit()?.max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
@@ -4984,7 +4977,7 @@ fn embed_doc_meta(id: &str, rev: &str, body: &[u8]) -> String {
 }
 
 fn all_docs_key_row(
-    shard: &mut ShardTxn,
+    shard: &impl DocRead,
     key: &str,
     opts: &AllDocsOpts,
 ) -> DbResult<Option<DocListRow>> {
@@ -7330,6 +7323,85 @@ mod tests {
             drop(db);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// Document reads (`get_doc`, `get_docs`, `_bulk_get`, `_revs_diff`, the
+    /// view and anti-entropy fetches) run on leases off the shard actor, so
+    /// they answer while a write group holds it, from the committed state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn document_reads_answer_while_a_write_group_holds_the_actor() {
+        let (db, root) = single_shard_db("leased-reads").await;
+        db.set_revs_limit(2).await.unwrap();
+        let mut rev = String::new();
+        for n in 0..3 {
+            let mut doc = json!({"_id": "a", "n": n});
+            if !rev.is_empty() {
+                doc["_rev"] = json!(rev);
+            }
+            let written = db.put_docs(vec![doc], true).await.unwrap();
+            rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        }
+        db.put_docs(vec![json!({"_id": "b"})], true).await.unwrap();
+
+        // A job that holds the actor, and with it the next group, until the
+        // reads are done.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = db.shard_handle(0).call(move |shard| {
+            shard.put_local("held", b"{}")?;
+            entered_tx.send(()).unwrap();
+            release_rx.recv().map_err(ApiError::internal)?;
+            Ok(())
+        });
+        let reads = async {
+            entered_rx.await.unwrap();
+            let opts = DocOpts {
+                revs: true,
+                ..Default::default()
+            };
+            let doc = db.get_doc("a", &opts).await.unwrap();
+            assert_eq!(doc["n"], json!(2));
+            assert_eq!(
+                doc["_revisions"]["ids"].as_array().unwrap().len(),
+                2,
+                "revs_limit applies off the actor"
+            );
+            let docs = db
+                .get_docs(&["a".to_string(), "zz".to_string()], &DocOpts::default())
+                .await
+                .unwrap();
+            assert!(docs[0].is_ok() && docs[1].is_err());
+            let by_id = db.docs_by_ids(&["b".to_string()]).await.unwrap();
+            assert!(by_id.contains_key("b"));
+            let diff = db
+                .revs_diff(&json!({"a": [rev.clone(), "9-ffff"]}))
+                .await
+                .unwrap();
+            assert_eq!(diff.0.len(), 1);
+            assert_eq!(diff.0[0].1.missing, vec!["9-ffff".to_string()]);
+            let got = db
+                .bulk_get(
+                    &json!({"docs": [{"id": "a", "rev": rev.clone()}]}),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(got.results.len(), 1);
+            let pairs = [("a".to_string(), rev.clone())].into_iter().collect();
+            assert!(db.purged_among(&pairs).await.unwrap().is_empty());
+            let page = db
+                .map_docs_page(None, &mut MapCursor::default(), 10)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = page.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, ["a", "b"]);
+            release_tx.send(()).unwrap();
+        };
+        let (held, ()) = tokio::join!(held, reads);
+        held.unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// `_revs_diff` answers in request order, leaves `possible_ancestors` out

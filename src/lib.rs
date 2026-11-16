@@ -14,6 +14,8 @@ pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod etf;
 pub(crate) mod fabric;
+#[doc(hidden)]
+pub mod gate;
 pub(crate) mod health;
 pub(crate) mod hll;
 pub(crate) mod index_cache;
