@@ -4031,6 +4031,54 @@ mod recovery_tests {
         assert_eq!(live, ["a"]);
     }
 
+    /// A commit can report an error and still be on the disk (here, its
+    /// writes reached the disk and only the sync failed). The recovered
+    /// shard serves exactly what the file holds: the landed write, its
+    /// sequence and counters, and the published position advanced to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_commit_that_landed_is_served_after_recovery() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        let mut commits = rig.committed.subscribe();
+        commits.mark_unchanged();
+
+        rig.switch.fail_syncs(ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "landed", 2).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(
+            rig.handle.committed_seq(),
+            2,
+            "the landed commit is published"
+        );
+        assert!(commits.has_changed().unwrap(), "feeds were not woken");
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a"), (2, "landed")]));
+        let (counts, latest) = rig
+            .handle
+            .read(|txn| {
+                let latest: Vec<(u64, String)> = txn
+                    .latest_changes()?
+                    .after(0)
+                    .map(|(seq, id)| (seq, id.to_string()))
+                    .collect();
+                Ok((txn.counts(), latest))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (2, 0));
+        assert_eq!(latest, rows(&[(1, "a"), (2, "landed")]));
+        assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
+        assert_eq!(rig.handle.committed_seq(), 3);
+    }
+
     /// The published position never goes back: a file that comes back
     /// without changes that were acknowledged (here, a disk that ignored
     /// syncs and then lost power) fails the shard instead.

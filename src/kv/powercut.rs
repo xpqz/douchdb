@@ -19,6 +19,8 @@ struct Disk {
     generation: u64,
     /// Every later write and sync fails with this.
     failing: Option<ErrorKind>,
+    /// Every later sync fails with this; writes still succeed.
+    failing_syncs: Option<ErrorKind>,
     /// `sync_data` succeeds without making anything durable.
     syncs_ignored: bool,
 }
@@ -78,9 +80,18 @@ impl PowerSwitch {
         self.disk.lock().unwrap().failing = Some(error);
     }
 
+    /// Make every later `sync_data` fail with `error` while writes still
+    /// succeed: what was written stays in the volatile image, as in a page
+    /// cache, so a commit can report an error and yet be on the disk.
+    pub fn fail_syncs(&self, error: ErrorKind) {
+        self.disk.lock().unwrap().failing_syncs = Some(error);
+    }
+
     /// Let writes and syncs succeed again: the disk has room once more.
     pub fn restore_writes(&self) {
-        self.disk.lock().unwrap().failing = None;
+        let mut disk = self.disk.lock().unwrap();
+        disk.failing = None;
+        disk.failing_syncs = None;
     }
 
     /// Make every later `sync_data` a no-op that reports success: a build
@@ -123,6 +134,9 @@ impl redb::StorageBackend for PowerCut {
 
     fn sync_data(&self) -> Result<(), Error> {
         let mut disk = self.writable()?;
+        if let Some(kind) = disk.failing_syncs {
+            return Err(Error::from(kind));
+        }
         if !disk.syncs_ignored {
             disk.durable = disk.volatile.clone();
         }
