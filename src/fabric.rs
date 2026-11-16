@@ -8,9 +8,10 @@ use crate::cluster_http::{
 };
 use crate::db::{
     AllDocsOpts, ApiError, ChangeEntry, ChangesList, ChangesOpts, Db, DbResult, DocList,
-    DocListRow, DocOpts, Seq, WriteError, WriteResult,
+    DocListRow, DocOpts, WriteError, WriteResult,
 };
-use crate::params::{doc_ids_from, doc_opts, flag, num, resolve_changes_filter};
+use crate::params::{doc_ids_from, doc_opts, flag, num, parse_since, resolve_changes_filter};
+use crate::since::{CopyPos, Since};
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
 use futures::future::join_all;
@@ -1521,25 +1522,6 @@ where
     F: Fn(usize, ShardMask, Round) -> Fut,
     Fut: std::future::Future<Output = DbResult<T>>,
 {
-    scatter_nodes(read, owned_by_node, what, false, &[], fetch).await
-}
-
-/// [`scatter`], optionally also asking the nodes that own no shard (with an
-/// empty mask), so that one round both reads the shards and learns which
-/// nodes answer. Nodes in `avoid` are routed around like nodes known to be
-/// down, as long as every shard keeps a live copy without them.
-async fn scatter_nodes<T, F, Fut>(
-    read: ClusterRead<'_>,
-    owned_by_node: &[ShardMask],
-    what: &str,
-    include_idle: bool,
-    avoid: &[usize],
-    fetch: F,
-) -> DbResult<Vec<(usize, Round, T)>>
-where
-    F: Fn(usize, ShardMask, Round) -> Fut,
-    Fut: std::future::Future<Output = DbResult<T>>,
-{
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
 
@@ -1548,19 +1530,11 @@ where
         .collect();
     let mut excluded: Vec<usize> = Vec::new();
     let mut rerouted: Vec<(usize, ShardMask, Round)> = Vec::new();
-    let mut avoided = known_down.clone();
-    avoided.extend(
-        avoid
-            .iter()
-            .copied()
-            .filter(|node| *node != ctx.cluster.me && !known_down.contains(node)),
-    );
-    for skipped in [avoided, known_down] {
-        if skipped.is_empty() {
-            continue;
-        }
-        let alive: Vec<usize> = (0..nodes).filter(|node| !skipped.contains(node)).collect();
-        if let Ok(groups) = fallback_shard_masks(db, owned_by_node, &skipped, &alive) {
+    if !known_down.is_empty() {
+        let alive: Vec<usize> = (0..nodes)
+            .filter(|node| !known_down.contains(node))
+            .collect();
+        if let Ok(groups) = fallback_shard_masks(db, owned_by_node, &known_down, &alive) {
             if !groups.is_empty() {
                 crate::telemetry::record_degraded_read();
             }
@@ -1568,15 +1542,14 @@ where
                 .into_iter()
                 .map(|(node, mask)| (node, mask, Round::Fallback))
                 .collect();
-            excluded = skipped;
-            break;
+            excluded = known_down;
         }
     }
     let mut requests: Vec<(usize, ShardMask, Round)> = owned_by_node
         .iter()
         .cloned()
         .enumerate()
-        .filter(|(node, mask)| !excluded.contains(node) && (include_idle || !mask.is_empty()))
+        .filter(|(node, mask)| !excluded.contains(node) && !mask.is_empty())
         .map(|(node, mask)| (node, mask, Round::Owner))
         .collect();
     requests.extend(rerouted);
@@ -2618,40 +2591,50 @@ pub(crate) async fn fetch_ddoc_from_replica(
     Err(ApiError::not_found(format!("missing {ddoc}")))
 }
 
-fn last_seq_for_node(seq: &Seq, node: usize) -> Option<u64> {
-    match seq {
-        Seq::Num(seq) => Some(*seq),
-        Seq::Token(token) => decode_since(token)?.get(node).copied(),
+/// Which node reads each shard for a feed resumed from `copies`: the copy the
+/// token names, while it is still a replica and not known to be down, so the
+/// position applies; otherwise the preferred copy, which starts the range
+/// from 0 (CouchDB 3: a feed may replay, never skip).
+fn token_shard_masks(ctx: &ClusterCtx, db: &Db, copies: &[CopyPos]) -> Vec<ShardMask> {
+    let preferred = preferred_shard_masks(ctx, db);
+    let map = db.shard_map();
+    let mut target: Vec<usize> = (0..db.q as usize)
+        .map(|shard| {
+            preferred
+                .iter()
+                .position(|mask| mask.covers(shard))
+                .unwrap_or(0)
+        })
+        .collect();
+    for copy in copies {
+        let usable = copy.shard < target.len()
+            && copy.node < preferred.len()
+            && map.replicas_of(copy.shard as u32).contains(&copy.node)
+            && (copy.node == ctx.cluster.me || !ctx.health.is_down(copy.node));
+        if usable {
+            target[copy.shard] = copy.node;
+        }
     }
+    let mut masks = vec![ShardMask::none(db.q); preferred.len()];
+    for (shard, node) in target.into_iter().enumerate() {
+        masks[node].select(shard);
+    }
+    masks
 }
 
-/// Where a feed stands on shards read from a replica because their preferred
-/// owner failed: `node` served `shards` and had returned changes up to its own
-/// `seq`. The owner's vector slot is in another node's sequence space, so it
-/// cannot carry this progress.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FallbackMark {
-    node: usize,
-    shards: Vec<usize>,
-    seq: u64,
-}
-
-/// A vector slot for a node whose sequence was not known when the token was
-/// made because it did not answer. The node's own sequence at that moment
-/// cannot be learned afterwards, so the slot is not a position: a feed reads
-/// the node's shards from another replica for as long as it can, and only
-/// replays the node from its start when there is no alternative (a feed may
-/// replay, never skip).
-pub(crate) const UNKNOWN_SEQ: u64 = u64::MAX;
-
-/// One stream of changes with its own sequence space: a node reading its
-/// preferred shards, or a node reading shards reassigned from a failed owner.
+/// One node's answer to a cluster feed, with its rows' positions decoded.
 struct ChangeLane {
-    node: usize,
-    /// Index into the marks of a fallback lane; `None` for an owner lane.
-    mark: Option<usize>,
-    rows: std::collections::VecDeque<ChangeEntry>,
-    last: Option<u64>,
+    rows: std::collections::VecDeque<(ChangeEntry, CopyPos)>,
+    /// The node's position on each shard it read, after all its rows.
+    last: Vec<CopyPos>,
+}
+
+fn bad_token(error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        502,
+        "bad_gateway",
+        format!("bad sequence from a peer: {error}"),
+    )
 }
 
 pub(crate) async fn cluster_changes(
@@ -2660,30 +2643,13 @@ pub(crate) async fn cluster_changes(
     body: &[u8],
 ) -> DbResult<ChangesList> {
     let ClusterRead { ctx, db, .. } = read;
-    let n = ctx.cluster.nodes.len();
-    let raw_since = q.get("since").map(String::as_str);
+    let since = parse_since(q.get("since").map(String::as_str))?;
     let limit = num(q, "limit");
-    // `since=now` is resolved by the nodes themselves, in the same round that
-    // reads their changes: each answers for its own sequence space, so no
-    // separate round has to learn the vector first. `limit=0` reads nothing,
-    // so only the vector is needed.
-    let now = raw_since == Some("now") && limit != Some(0);
-    let (mut since, marks) = if now {
-        (vec![0; n], Vec::new())
-    } else if raw_since == Some("now") {
-        cluster_update_vector(read).await?
-    } else if let Some(raw) = raw_since {
-        let vector = match decode_since(raw) {
-            Some(vector) => vector,
-            None => vec![since_component(Some(raw), ctx.cluster.me); n],
-        };
-        (vector, decode_fallbacks(raw, n))
-    } else {
-        (vec![0; n], Vec::new())
+    let named: &[CopyPos] = match &since {
+        Since::Token(copies) => copies,
+        Since::Zero | Since::Now => &[],
     };
-    since.resize(n, 0);
-    let unknown: Vec<usize> = (0..n).filter(|&node| since[node] == UNKNOWN_SEQ).collect();
-    let owned_by_node = preferred_shard_masks(ctx, db);
+    let owned_by_node = token_shard_masks(ctx, db, named);
 
     let doc_ids = doc_ids_from(q, body);
     let change_filter = resolve_changes_filter(db, q).await?;
@@ -2694,196 +2660,117 @@ pub(crate) async fn cluster_changes(
         filter: change_filter.as_ref(),
         q,
     };
-    if limit == Some(0) {
-        return Ok(ChangesList {
-            results: Vec::new(),
-            last_seq: Seq::Token(encode_token(&since, &marks)),
-            pending: 0,
-        });
-    }
-
     let node_limit = if change_filter.is_some() { None } else { limit };
     let since_ref = &since;
-    let marks_ref = &marks;
-    let responses = scatter_nodes(
+    let responses = scatter(
         read,
         &owned_by_node,
         "changes",
-        now,
-        &unknown,
-        |node, mask, round| async move {
-            let shards = mask.shards();
-            if now {
-                if mask.is_empty() {
-                    // Owns no shard: only its sequence is wanted, for its
-                    // slot in the vector.
-                    let (seq, _) = fetch_node_seqs(read, node).await?;
-                    let empty = ChangesList {
-                        results: Vec::new(),
-                        last_seq: Seq::Num(seq),
-                        pending: 0,
-                    };
-                    return Ok((shards, None, empty));
-                }
-                let start = ChangesStart::Now;
-                let value =
-                    fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
-                return Ok((shards, None, value));
-            }
-            // Shards reassigned from a failed owner resume from the mark this
-            // node left for exactly this set of shards, else from the start;
-            // preferred masks are disjoint, so ids do not overlap. A node
-            // whose position was unknown when the token was made is read
-            // from the start too: a feed may replay, never skip.
-            let since = match round {
-                Round::Owner => Some(since_ref[node]).filter(|seq| *seq != UNKNOWN_SEQ),
-                Round::Fallback => marks_ref
-                    .iter()
-                    .find(|mark| mark.node == node && mark.shards == shards)
-                    .map(|mark| mark.seq),
-            }
-            .unwrap_or(0);
-            let start = ChangesStart::At(since);
-            let value = fetch_node_changes(read, changes, node, &mask, start, node_limit).await?;
-            Ok((shards, Some(since), value))
+        |node, mask, _| async move {
+            // A node gets only the positions of its own copies; any shard it
+            // reads without one (it took over from a copy that failed) starts
+            // from 0.
+            let start = match since_ref {
+                Since::Now => Since::Now,
+                Since::Zero => Since::Zero,
+                Since::Token(copies) => Since::Token(
+                    copies
+                        .iter()
+                        .filter(|copy| copy.node == node && mask.covers(copy.shard))
+                        .cloned()
+                        .collect(),
+                ),
+            };
+            let value = fetch_node_changes(read, changes, node, &mask, &start, node_limit).await?;
+            Ok((mask.shards(), start, value))
         },
     )
     .await?;
 
-    let mut progress = since.clone();
-    let mut answered = vec![false; n];
-    let mut fallbacks: Vec<FallbackMark> = Vec::new();
+    // Every shard's position, by shard, so a token lists them in order.
+    let mut progress: BTreeMap<usize, CopyPos> = BTreeMap::new();
     let mut lanes: Vec<ChangeLane> = Vec::new();
     let mut pending = 0;
-    for (node, round, (shards, lane_since, value)) in responses {
+    for (_, _, (shards, start, value)) in responses {
         pending += value.pending;
-        let ChangesList {
-            results: mut rows,
-            last_seq,
-            ..
-        } = value;
-        rows.sort_by_key(|row| row.seq.as_u64().unwrap_or(0));
-        let last = last_seq_for_node(&last_seq, node);
-        // A node that resolved `since=now` itself started just before its
-        // first row, or where it reports having stopped when there is none.
-        let lane_since = lane_since.unwrap_or_else(|| match rows.first() {
-            Some(row) => row.seq.as_u64().unwrap_or(0).saturating_sub(1),
-            None => last.unwrap_or(0),
-        });
-        let mark = match round {
-            Round::Owner => {
-                if let Some(slot) = progress.get_mut(node) {
-                    *slot = if *slot == UNKNOWN_SEQ {
-                        lane_since
-                    } else {
-                        (*slot).max(lane_since)
-                    };
-                }
-                if let Some(seen) = answered.get_mut(node) {
-                    *seen = true;
-                }
-                None
-            }
-            Round::Fallback => {
-                fallbacks.push(FallbackMark {
-                    node,
-                    shards,
-                    seq: lane_since,
-                });
-                Some(fallbacks.len() - 1)
-            }
-        };
-        lanes.push(ChangeLane {
-            node,
-            mark,
-            rows: rows.into(),
-            last,
-        });
-    }
-
-    if now {
-        // A node that gave no answer has no position in this vector.
-        for (slot, _) in progress
-            .iter_mut()
-            .zip(&answered)
-            .filter(|(_, seen)| !**seen)
-        {
-            *slot = UNKNOWN_SEQ;
+        let last = crate::since::decode(&value.last_seq).map_err(bad_token)?;
+        let mut rows = std::collections::VecDeque::with_capacity(value.results.len());
+        for row in value.results {
+            let pos = crate::since::decode(&row.seq)
+                .map_err(bad_token)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| bad_token("a row without a position"))?;
+            rows.push_back((row, pos));
         }
+        for &shard in &shards {
+            let Some(end) = last.iter().find(|pos| pos.shard == shard) else {
+                return Err(bad_token(format!("no position for shard {shard}")));
+            };
+            // Where the node started on this shard: the position it was
+            // sent, if it still names the copy that answered.
+            let seq = match &start {
+                Since::Now => rows
+                    .iter()
+                    .find(|(_, pos)| pos.shard == shard)
+                    .map_or(end.seq, |(_, pos)| pos.seq.saturating_sub(1)),
+                Since::Zero => 0,
+                Since::Token(copies) => copies
+                    .iter()
+                    .find(|copy| copy.shard == shard && copy.uuid == end.uuid)
+                    .map_or(0, |copy| copy.seq),
+            };
+            progress.insert(shard, CopyPos { seq, ..end.clone() });
+        }
+        lanes.push(ChangeLane { rows, last });
     }
 
     let limit = limit.unwrap_or(usize::MAX);
     let mut out = Vec::new();
-    loop {
+    while out.len() < limit {
         let mut progressed = false;
         for lane in &mut lanes {
-            let Some(mut row) = lane.rows.pop_front() else {
-                continue;
-            };
-            progressed = true;
-            let shard_seq = row.seq.as_u64().unwrap_or(0);
-            let safe = lane.last.map_or(shard_seq, |seq| shard_seq.min(seq));
-            match lane.mark {
-                None => {
-                    if let Some(slot) = progress.get_mut(lane.node) {
-                        *slot = (*slot).max(safe);
-                    }
-                }
-                Some(mark) => {
-                    if let Some(mark) = fallbacks.get_mut(mark) {
-                        mark.seq = mark.seq.max(safe);
-                    }
-                }
-            }
-            row.seq = Seq::Token(encode_token(&progress, &fallbacks));
-            out.push(row);
             if out.len() >= limit {
                 break;
             }
+            let Some((mut row, pos)) = lane.rows.pop_front() else {
+                continue;
+            };
+            progressed = true;
+            progress.insert(pos.shard, pos);
+            row.seq = encode_progress(&progress);
+            out.push(row);
         }
-        if out.len() >= limit || !progressed {
+        if !progressed {
             break;
         }
     }
-    // A lane whose rows were all returned has also scanned past them: a filter
-    // may have discarded documents after its last row, or all of them, and
-    // CouchDB's feed position covers every document scanned
+    // A shard whose rows were all returned has also been scanned past them:
+    // a filter may have discarded documents after its last row, or all of
+    // them, and CouchDB's feed position covers every document scanned
     // (`couch_changes:changes_enumerator`).
-    for lane in lanes.iter().filter(|lane| lane.rows.is_empty()) {
-        let Some(last) = lane.last else {
-            continue;
-        };
-        match lane.mark {
-            None => {
-                if let Some(slot) = progress.get_mut(lane.node) {
-                    *slot = (*slot).max(last);
-                }
-            }
-            Some(mark) => {
-                if let Some(mark) = fallbacks.get_mut(mark) {
-                    mark.seq = mark.seq.max(last);
-                }
+    for lane in &lanes {
+        for end in &lane.last {
+            if !lane.rows.iter().any(|(_, pos)| pos.shard == end.shard) {
+                progress.insert(end.shard, end.clone());
             }
         }
     }
     // Rows fetched but not returned are still to come.
     pending += lanes.iter().map(|lane| lane.rows.len() as u64).sum::<u64>();
 
-    // Shard masks are disjoint, so each document's change is produced by
-    // exactly one lane.
+    // Each shard is read by exactly one node, so each document's change
+    // comes from exactly one lane.
     Ok(ChangesList {
         results: out,
-        last_seq: Seq::Token(encode_token(&progress, &fallbacks)),
+        last_seq: encode_progress(&progress),
         pending,
     })
 }
 
-/// Where a node starts reading changes.
-#[derive(Clone, Copy)]
-pub(crate) enum ChangesStart {
-    At(u64),
-    /// The node's current sequence, as it is when the node handles the call.
-    Now,
+fn encode_progress(progress: &BTreeMap<usize, CopyPos>) -> String {
+    let copies: Vec<CopyPos> = progress.values().cloned().collect();
+    crate::since::encode(&copies)
 }
 
 pub(crate) async fn fetch_node_changes(
@@ -2891,7 +2778,7 @@ pub(crate) async fn fetch_node_changes(
     changes: ChangesFetch<'_>,
     node: usize,
     mask: &ShardMask,
-    start: ChangesStart,
+    start: &Since,
     limit: Option<usize>,
 ) -> DbResult<ChangesList> {
     let ClusterRead {
@@ -2908,33 +2795,28 @@ pub(crate) async fn fetch_node_changes(
         q,
     } = changes;
     if node == ctx.cluster.me {
-        let since = match start {
-            ChangesStart::At(since) => since,
-            ChangesStart::Now => db.update_seq(),
+        let opts = ChangesOpts {
+            since: db.shard_since(node, start),
+            limit,
+            include_docs,
+            style_all_docs,
+            descending: false,
+            doc_ids: doc_ids.map(|ids| ids.to_vec()),
+            filter: filter.cloned(),
+            conflicts: flag(q, "conflicts"),
+            owned: Some(mask.clone()),
+            until: None,
         };
-        return db
-            .changes(&ChangesOpts {
-                since,
-                limit,
-                include_docs,
-                style_all_docs,
-                descending: false,
-                doc_ids: doc_ids.map(|ids| ids.to_vec()),
-                filter: filter.cloned(),
-                conflicts: flag(q, "conflicts"),
-                owned: Some(mask.clone()),
-                until: None,
-            })
-            .await;
+        return db.changes(node, &opts, false).await;
     }
 
     let peer = &ctx.cluster.nodes[node];
     let selected = mask.query_value();
-    // A peer reads `since=now` against its own sequence, with or without this
-    // change: the forwarded form of the request has always accepted it.
     let since = match start {
-        ChangesStart::At(since) => since.to_string(),
-        ChangesStart::Now => "now".to_string(),
+        Since::Now => "now".to_string(),
+        Since::Zero => "0".to_string(),
+        Since::Token(copies) if copies.is_empty() => "0".to_string(),
+        Since::Token(copies) => crate::since::encode(copies),
     };
     let mut params: Vec<(&str, String)> = vec![("since", since), ("shards", selected)];
     if let Some(limit) = limit {
@@ -3009,9 +2891,12 @@ pub(crate) async fn fetch_node_changes(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
-/// One node's current update sequence and purge sequence: its own, or what
-/// the peer reports in the same answer.
-async fn fetch_node_seqs(read: ClusterRead<'_>, node: usize) -> DbResult<(u64, u64)> {
+/// One node's copies of every shard: uuid, committed position and purge
+/// sequence, by shard index. Its own, or what the peer reports.
+async fn fetch_node_shards(
+    read: ClusterRead<'_>,
+    node: usize,
+) -> DbResult<Vec<(String, u64, u64)>> {
     let ClusterRead {
         ctx,
         db,
@@ -3019,7 +2904,13 @@ async fn fetch_node_seqs(read: ClusterRead<'_>, node: usize) -> DbResult<(u64, u
         headers,
     } = read;
     if node == ctx.cluster.me {
-        return Ok((db.update_seq(), db.purge_seq().await?));
+        let purge_seqs = db.shard_purge_seqs().await?;
+        return Ok(db
+            .shard_seqs()
+            .into_iter()
+            .zip(purge_seqs)
+            .map(|((uuid, seq), purged)| (uuid, seq, purged))
+            .collect());
     }
     let peer = &ctx.cluster.nodes[node];
     let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
@@ -3036,210 +2927,53 @@ async fn fetch_node_seqs(read: ClusterRead<'_>, node: usize) -> DbResult<(u64, u
         .json::<Value>()
         .await
         .map_err(|e| bad(e.to_string()))?;
-    let update_seq = body["update_seq"]
-        .as_u64()
-        .ok_or_else(|| bad(format!("{peer}: no update_seq")))?;
-    let purge_seq = body["purge_seq"]
-        .as_u64()
-        .ok_or_else(|| bad(format!("{peer}: no purge_seq")))?;
-    Ok((update_seq, purge_seq))
-}
-
-/// Current per-node update_seq vector, plus fallback marks for the shards of
-/// any node that did not answer. Used for `since=now` and for the `update_seq`
-/// reported in `GET /db`.
-///
-/// Like CouchDB's `fabric_db_info`, an unreachable node is fine while another
-/// replica holds each of its shards; the feed then reads those shards from the
-/// replica, so the mark starts at that replica's current sequence. When some
-/// shard has no live copy the answer is 412 `nodedown` / `progress not
-/// possible`. The unreachable node's own slot is [`UNKNOWN_SEQ`], so after it
-/// returns its changes are neither replayed nor skipped wholesale.
-pub(crate) async fn cluster_update_vector(
-    read: ClusterRead<'_>,
-) -> DbResult<(Vec<u64>, Vec<FallbackMark>)> {
-    let (vector, marks, _) = cluster_seq_vectors(read).await?;
-    Ok((vector, marks))
-}
-
-/// [`cluster_update_vector`] plus the per-node purge sequence vector, which
-/// the same peer answers carry; a node that did not answer counts as 0.
-pub(crate) async fn cluster_seq_vectors(
-    read: ClusterRead<'_>,
-) -> DbResult<(Vec<u64>, Vec<FallbackMark>, Vec<u64>)> {
-    let ClusterRead { ctx, db, .. } = read;
-    let nodes = ctx.cluster.nodes.len();
-    // Every node is asked, including one discovery marked down: the mark may
-    // be stale, and a node that is up must report its own position. Skipping
-    // it would put 0 in its slot of the vectors, though the shards it owns are
-    // readable from a replica.
-    let mut seqs: Vec<Option<u64>> = vec![None; nodes];
-    let mut purge_seqs: Vec<u64> = vec![0; nodes];
-    let answers = crate::cluster_http::in_one_round(futures::future::join_all(
-        (0..nodes).map(|node| async move { fetch_node_seqs(read, node).await.ok() }),
-    ))
-    .await;
-    for (node, answer) in answers.into_iter().enumerate() {
-        seqs[node] = answer.map(|(seq, _)| seq);
-        purge_seqs[node] = answer.map_or(0, |(_, purged)| purged);
-    }
-    let failed: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_none()).collect();
-    let alive: Vec<usize> = (0..nodes).filter(|node| seqs[*node].is_some()).collect();
-    let vector: Vec<u64> = seqs.iter().map(|seq| seq.unwrap_or(0)).collect();
-    if failed.is_empty() {
-        return Ok((vector, Vec::new(), purge_seqs));
-    }
-    let groups = fallback_shard_masks(db, &preferred_shard_masks(ctx, db), &failed, &alive)?;
-    let marks = groups
-        .into_iter()
-        .map(|(node, mask)| FallbackMark {
-            node,
-            shards: mask.shards(),
-            seq: vector.get(node).copied().unwrap_or(0),
-        })
-        .collect();
-    let vector = vector
-        .into_iter()
-        .zip(&seqs)
-        .map(|(seq, answer)| answer.map_or(UNKNOWN_SEQ, |_| seq))
-        .collect();
-    Ok((vector, marks, purge_seqs))
+    serde_json::from_value(body["shards"].clone())
+        .map_err(|e| bad(format!("{peer}: no shard positions: {e}")))
 }
 
 /// The `update_seq` and `purge_seq` that `GET /db` reports in a cluster, and
-/// that a query reports with `update_seq=true`: the opaque per-node vectors,
-/// one fan-out to the peers. A node that did not answer has no position to
-/// report; 0 makes a feed resumed from here replay it, never skip it.
+/// that a query reports with `update_seq=true`: opaque tokens holding one
+/// copy of every shard range, as CouchDB's `fabric_db_info` builds them, in
+/// one fan-out to the nodes. The preferred copy is used where it answered,
+/// else another replica; a range with no copy answering is 412 `nodedown`.
 pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(String, String)> {
-    let (vector, marks, purge_vector) = cluster_seq_vectors(read).await?;
-    let vector: Vec<u64> = vector
-        .into_iter()
-        .map(|seq| if seq == UNKNOWN_SEQ { 0 } else { seq })
-        .collect();
-    Ok((
-        encode_token(&vector, &marks),
-        encode_token(&purge_vector, &[]),
-    ))
-}
-
-pub(crate) fn encode_since(vector: &[u64]) -> String {
-    encode_token(vector, &[])
-}
-
-/// The sequence a standalone or local read reports: this node's `seq` in its
-/// slot of a vector, in the same opaque form a cluster feed uses.
-pub(crate) fn encode_local_seq(cluster: &crate::cluster::Cluster, seq: u64) -> String {
-    let mut vector = vec![0; cluster.nodes.len().max(1)];
-    if let Some(slot) = vector.get_mut(cluster.me) {
-        *slot = seq;
-    }
-    encode_since(&vector)
-}
-
-/// A sequence token as CouchDB writes one (`pack_seqs` in
-/// fabric_view_changes.erl): `<sum>-<base64url>`. The sum is only a hint for
-/// people; the opaque part is the per-node vector (`v1:` and the node
-/// sequences, comma separated), then `~node:shard.shard:seq` for each fallback
-/// mark.
-pub(crate) fn encode_token(vector: &[u64], marks: &[FallbackMark]) -> String {
-    use base64::Engine as _;
-    use std::fmt::Write as _;
-
-    // This runs once per change row in a feed, so it builds the body in one
-    // buffer.
-    let mut body = String::with_capacity(3 + vector.len() * 12);
-    body.push_str("v1:");
-    let mut sum = 0u64;
-    for (index, seq) in vector.iter().enumerate() {
-        if index > 0 {
-            body.push(',');
-        }
-        let _ = write!(body, "{seq}");
-        if *seq != UNKNOWN_SEQ {
-            sum = sum.saturating_add(*seq);
-        }
-    }
-    for mark in marks {
-        let _ = write!(body, "~{}:", mark.node);
-        for (index, shard) in mark.shards.iter().enumerate() {
-            if index > 0 {
-                body.push('.');
-            }
-            let _ = write!(body, "{shard}");
-        }
-        let _ = write!(body, ":{}", mark.seq);
-        sum = sum.saturating_add(mark.seq);
-    }
-    let mut out = String::with_capacity(24 + body.len() * 4 / 3);
-    let _ = write!(out, "{sum}-");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_string(body.as_bytes(), &mut out);
-    out
-}
-
-/// The text inside a token: what CouchDB's `unpack_seq_regex_match` keeps
-/// (surrounding quotes and the `<sum>-` prefix dropped), decoded. `None` for
-/// anything that is not one of our tokens.
-fn token_body(raw: &str) -> Option<String> {
-    use base64::Engine as _;
-
-    let raw = raw.trim_matches('"');
-    let opaque = match raw.split_once('-') {
-        Some((sum, rest)) if !sum.is_empty() && sum.bytes().all(|b| b.is_ascii_digit()) => rest,
-        _ => raw,
-    };
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(opaque)
-        .ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-/// The fallback marks of a since token; malformed or out-of-cluster
-/// marks are dropped, which only makes that fallback start from the beginning.
-pub(crate) fn decode_fallbacks(raw: &str, nodes: usize) -> Vec<FallbackMark> {
-    let Some(body) = token_body(raw) else {
-        return Vec::new();
-    };
-    let Some(rest) = body.strip_prefix("v1:") else {
-        return Vec::new();
-    };
-    rest.split('~')
-        .skip(1)
-        .filter_map(|part| {
-            let mut fields = part.split(':');
-            let node: usize = fields.next()?.parse().ok()?;
-            let shards: Option<Vec<usize>> = fields
-                .next()?
-                .split('.')
-                .map(|shard| shard.parse().ok())
-                .collect();
-            let seq: u64 = fields.next()?.parse().ok()?;
-            (node < nodes && fields.next().is_none()).then_some(FallbackMark {
-                node,
-                shards: shards?,
-                seq,
+    let ClusterRead { ctx, db, .. } = read;
+    let nodes = ctx.cluster.nodes.len();
+    // Every node is asked, including one discovery marked down: the mark may
+    // be stale.
+    let answers: Vec<Option<Vec<(String, u64, u64)>>> =
+        crate::cluster_http::in_one_round(futures::future::join_all(
+            (0..nodes).map(|node| async move { fetch_node_shards(read, node).await.ok() }),
+        ))
+        .await;
+    let preferred = preferred_shard_masks(ctx, db);
+    let map = db.shard_map();
+    let mut seqs = Vec::with_capacity(db.q as usize);
+    let mut purges = Vec::with_capacity(db.q as usize);
+    for shard in 0..db.q as usize {
+        let owner = preferred.iter().position(|mask| mask.covers(shard));
+        let (node, (uuid, seq, purged)) = owner
+            .into_iter()
+            .chain(map.replicas_of(shard as u32).iter().copied())
+            .find_map(|node| {
+                let copy = answers.get(node)?.as_ref()?.get(shard)?;
+                Some((node, copy.clone()))
             })
-        })
-        .collect()
-}
-
-/// Decodes a since token into its per-node sequence vector. Anything else is
-/// not one of ours (`None`).
-pub(crate) fn decode_since(raw: &str) -> Option<Vec<u64>> {
-    let body = token_body(raw)?;
-    let rest = body.strip_prefix("v1:")?;
-    let rest = rest.split('~').next().unwrap_or(rest);
-    rest.split(',').map(|part| part.parse().ok()).collect()
-}
-
-pub(crate) fn since_component(raw: Option<&str>, index: usize) -> u64 {
-    let Some(raw) = raw else { return 0 };
-    let raw = raw.trim_matches('"');
-    if let Ok(seq) = raw.parse::<u64>() {
-        return seq;
+            .ok_or_else(nodedown)?;
+        seqs.push(CopyPos {
+            node,
+            shard,
+            seq,
+            uuid: uuid.clone(),
+        });
+        purges.push(CopyPos {
+            node,
+            shard,
+            seq: purged,
+            uuid,
+        });
     }
-    decode_since(raw)
-        .and_then(|vector| vector.get(index).copied())
-        .unwrap_or(0)
+    Ok((crate::since::encode(&seqs), crate::since::encode(&purges)))
 }
 
 // ---------------------------------------------------------------------------
@@ -3792,29 +3526,6 @@ mod tests {
         assert!(adoptable_peer_map(&ours, 1, 3));
         assert!(adoptable_peer_map(&ours, 5, 3));
         assert!(!adoptable_peer_map(&ours, 6, 3));
-    }
-
-    #[test]
-    fn since_token_round_trips_fallback_marks() {
-        let marks = vec![FallbackMark {
-            node: 1,
-            shards: vec![0, 3],
-            seq: 42,
-        }];
-        let token = encode_token(&[5, 0, 7], &marks);
-        // CouchDB's shape: the sum of the sequences, then base64url.
-        let (sum, opaque) = token.split_once('-').unwrap();
-        assert_eq!(sum, "54");
-        assert!(opaque
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
-        assert_eq!(decode_since(&format!("\"{token}\"")), Some(vec![5, 0, 7]));
-        assert_eq!(decode_since(&token), Some(vec![5, 0, 7]));
-        assert_eq!(decode_fallbacks(&token, 3), marks);
-        assert!(decode_fallbacks(&token, 1).is_empty());
-        assert!(decode_fallbacks("v1:5,0,7~1:0.3:42", 3).is_empty());
-        assert_eq!(decode_since("v1:5,0,7"), None);
-        assert!(decode_fallbacks("7", 3).is_empty());
     }
 
     fn doc(rev: &str, start: u64, ids: &[&str], deleted: bool) -> Value {

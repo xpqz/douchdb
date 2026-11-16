@@ -32,6 +32,13 @@ const PURGE_SEQ_KEY: &[u8] = b"z/purge_seq";
 const DEFAULT_PURGED_INFOS_LIMIT: u64 = 1000;
 const PURGED_INFOS_LIMIT_KEY: &[u8] = b"z/purged_infos_limit";
 
+/// This copy's uuid (see [`Shard::uuid`]).
+const UUID_KEY: &[u8] = b"z/uuid";
+
+/// Checkpoint ids under this prefix describe this shard copy's own contents
+/// (anti-entropy per shard), so clearing the shard drops them.
+pub const SHARD_CHECKPOINT_PREFIX: &[u8] = b"ck/ae3";
+
 /// `pc/<node>`: the purge sequence replica `node` has confirmed reading.
 fn purge_checkpoint_key(node: usize) -> Vec<u8> {
     key(b"pc/", &node.to_string())
@@ -267,7 +274,7 @@ impl Fenwick {
 pub struct Tx {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// Metadata writes whose before and after states the caller already
-    /// knows, by index into `ops`. `commit_at` would otherwise read and decode
+    /// knows, by index into `ops`. `commit` would otherwise read and decode
     /// both records to learn them.
     known: std::collections::HashMap<usize, MetaChange>,
 }
@@ -368,7 +375,6 @@ fn seek_last(iter: &mut rusty_leveldb::DBIterator, prefix: &[u8]) -> Result<()> 
 
 struct JobMark {
     pending: usize,
-    seq: u64,
     docs: u64,
     deleted: u64,
 }
@@ -380,8 +386,18 @@ struct JobMark {
 pub struct Shard {
     db: DB,
     name: ShardName,
+    /// The last sequence this shard handed out. It only moves forward, even
+    /// past writes that were never persisted, so a reader that saw a staged
+    /// row can never meet its sequence again on another document.
     seq: u64,
-    seq_tracker: Option<Arc<AtomicU64>>,
+    /// The `z/seq` value of the last batch written to disk: the position up
+    /// to which this shard's changes are committed.
+    persisted_seq: u64,
+    /// Identity of this copy of the shard: created with it, replaced when it
+    /// is cleared, so a position is never applied to another copy.
+    uuid: String,
+    /// `uuid`, shared with the shard's handle once it has one.
+    shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
     revs_limit: u64,
     purged_infos_limit: u64,
     /// Number of live documents, maintained on every metadata write so `GET
@@ -581,6 +597,27 @@ impl Shard {
                 path.display()
             );
         }
+        let stored_uuid = db_get_checked(&mut db, UUID_KEY)?
+            .map(|bytes| {
+                String::from_utf8(bytes).map_err(|_| {
+                    anyhow::anyhow!("corrupt shard {}: unreadable uuid", path.display())
+                })
+            })
+            .transpose()?;
+        // A fresh shard records its sequence alongside its uuid, so that once
+        // compaction moves these keys into table files the probe above still
+        // finds sequence state.
+        let uuid = match (stored_uuid, stored_seq) {
+            (Some(uuid), Some(_)) => uuid,
+            (stored_uuid, _) => {
+                let uuid = stored_uuid.unwrap_or_else(crate::util::uuid);
+                let mut batch = WriteBatch::default();
+                batch.put(UUID_KEY, uuid.as_bytes());
+                batch.put(b"z/seq", &seq.to_be_bytes());
+                db.write(batch, true)?;
+                uuid
+            }
+        };
         let revs_limit = db_get_checked(&mut db, b"z/revs_limit")?
             .filter(|b| b.len() == 8)
             .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
@@ -628,7 +665,9 @@ impl Shard {
             db,
             name: ShardName::of(path),
             seq,
-            seq_tracker: None,
+            persisted_seq: seq,
+            shared_uuid: None,
+            uuid,
             revs_limit,
             purged_infos_limit,
             docs,
@@ -666,15 +705,21 @@ impl Shard {
         self.db.flush().unwrap();
     }
 
-    pub fn seq(&self) -> u64 {
+    /// Take the next sequence of this shard for a write. Sequences are
+    /// shard-local, as in CouchDB: each shard counts its own changes.
+    pub fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
         self.seq
     }
 
-    /// Share the shard's last committed sequence with the database so changes
-    /// cursors can use a safe cross-shard watermark.
-    pub fn set_seq_tracker(&mut self, tracker: Arc<AtomicU64>) {
-        tracker.fetch_max(self.seq, Ordering::SeqCst);
-        self.seq_tracker = Some(tracker);
+    /// The position up to which this shard's changes are on disk.
+    pub fn persisted_seq(&self) -> u64 {
+        self.persisted_seq
+    }
+
+    /// This copy's identity.
+    pub fn uuid(&self) -> &str {
+        &self.uuid
     }
 
     /// Live and deleted document counts for this shard.
@@ -1231,10 +1276,8 @@ impl Shard {
         self.get_checked(&body_key(docid, rev))
     }
 
-    /// Every key/value pair under `prefix`, starting at `start`. Only used by
-    /// tests now; production paths use `scan_range_while` so they can stop
-    /// early.
-    #[cfg(test)]
+    /// Every key/value pair under `prefix`, starting at `start`. For small
+    /// key ranges; large ones use `scan_range_while` so they can stop early.
     pub fn scan_from(&mut self, prefix: &[u8], start: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
         self.scan_range_while(prefix, Some(start), false, |key, value| {
@@ -1353,17 +1396,11 @@ impl Shard {
         Ok(())
     }
 
-    pub fn commit(&mut self, tx: Tx) -> Result<()> {
-        self.commit_at(tx, None)
-    }
-
-    /// Commit, recording `seq` as this shard's last written sequence. Sequence
-    /// numbers are global to the database, so a shard stores the latest one it
-    /// happened to write; the database takes the max across shards on open.
+    /// Commit, recording the shard's sequence (`next_seq`) with the batch.
     ///
     /// The operations are queued rather than written: the shard actor merges
     /// everything queued while it drains its mailbox into one synced batch.
-    pub fn commit_at(&mut self, mut tx: Tx, seq: Option<u64>) -> Result<()> {
+    pub fn commit(&mut self, mut tx: Tx) -> Result<()> {
         // Read every old record before changing anything, so a read or decode
         // error leaves the shard exactly as it was. Earlier operations in this
         // same transaction count as the old value, so batched updates to one
@@ -1399,12 +1436,6 @@ impl Shard {
         }
         drop(written);
 
-        if let Some(seq) = seq {
-            self.seq = seq;
-        }
-        if let Some(tracker) = &self.seq_tracker {
-            tracker.fetch_max(self.seq, Ordering::SeqCst);
-        }
         tx.ops
             .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
         states.push(None);
@@ -1485,7 +1516,6 @@ impl Shard {
     fn job_mark(&self) -> JobMark {
         JobMark {
             pending: self.pending.len(),
-            seq: self.seq,
             docs: self.docs,
             deleted: self.deleted,
         }
@@ -1497,13 +1527,16 @@ impl Shard {
     /// overlay is rebuilt from what remains, and the counters are restored.
     /// The lazily built in-memory indexes may have been updated halfway, so
     /// they are dropped and rebuild from disk plus the overlay on next use.
+    /// The sequence is not rewound: the job's sequences become a gap, and
+    /// the high mark is queued again so it is persisted with the group.
     fn rollback_to(&mut self, mark: JobMark) {
         self.pending.truncate(mark.pending);
+        self.pending
+            .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
         self.overlay.clear();
         for (key, value) in &self.pending {
             self.overlay.insert(key.clone(), value.clone());
         }
-        self.seq = mark.seq;
         self.docs = mark.docs;
         self.deleted = mark.deleted;
         self.release_indexes();
@@ -1515,7 +1548,14 @@ impl Shard {
             return Ok(());
         }
         let mut batch = WriteBatch::default();
+        let mut written_seq = None;
         for (key, value) in self.pending.drain(..) {
+            if key == b"z/seq" {
+                written_seq = value
+                    .as_deref()
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(u64::from_be_bytes);
+            }
             match value {
                 Some(value) => batch.put(&key, &value),
                 None => batch.delete(&key),
@@ -1543,6 +1583,9 @@ impl Shard {
             anyhow::bail!(message);
         }
         self.overlay.clear();
+        if let Some(seq) = written_seq {
+            self.persisted_seq = self.persisted_seq.max(seq);
+        }
         Ok(())
     }
 
@@ -1555,15 +1598,15 @@ impl Shard {
     /// overlay and counters described operations that never happened, and the
     /// lazily built indexes were updated alongside them.
     ///
-    /// The shared committed-sequence tracker is left alone. It only moves
-    /// forward and readers may already have passed the lost sequences; those
-    /// are now gaps, which `_changes` tolerates (every update already leaves
-    /// one) and which keep `reserved == committed`, so no watermark stalls.
+    /// The sequence is not rewound: a reader may already have seen the lost
+    /// rows' sequences, so they become a gap rather than being handed out
+    /// again. The next commit persists the high mark.
     fn restore_from_disk(&mut self) -> Result<()> {
         self.pending.clear();
         self.overlay.clear();
         self.release_indexes();
-        self.seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
+        self.persisted_seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
+        self.seq = self.seq.max(self.persisted_seq);
         self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
         self.deleted = read_counter(&mut self.db, b"z/doc_deleted_count")?.unwrap_or(0);
         Ok(())
@@ -1577,7 +1620,9 @@ impl Shard {
 
     /// Drop all document data from this local shard, preserving only the
     /// shard's revs-limit setting. Used after a shard has moved elsewhere and
-    /// anti-entropy has seeded the new replicas.
+    /// anti-entropy has seeded the new replicas. What is left is a new copy:
+    /// it gets a new uuid, and the anti-entropy checkpoints that described
+    /// the old copy's contents go with it.
     pub fn clear(&mut self) -> Result<()> {
         let mut keys = Vec::new();
         {
@@ -1587,7 +1632,7 @@ impl Shard {
             while let Some((key, _)) = iter.current() {
                 if key.as_ref() != b"z/revs_limit"
                     && key.as_ref() != PURGED_INFOS_LIMIT_KEY
-                    && !key.starts_with(b"ck/")
+                    && (!key.starts_with(b"ck/") || key.starts_with(SHARD_CHECKPOINT_PREFIX))
                 {
                     keys.push(key.to_vec());
                 }
@@ -1603,10 +1648,17 @@ impl Shard {
         // Keep the sequence (so numbers never go backwards and `open` still
         // finds sequence state next to the table files) and persist the
         // emptied counters.
+        let uuid = crate::util::uuid();
         batch.put(b"z/seq", &self.seq.to_be_bytes());
+        batch.put(UUID_KEY, uuid.as_bytes());
         batch.put(b"z/doc_count", &0u64.to_be_bytes());
         batch.put(b"z/doc_deleted_count", &0u64.to_be_bytes());
         self.db.write(batch, true)?;
+        self.persisted_seq = self.seq;
+        if let Some(shared) = &self.shared_uuid {
+            *shared.write().unwrap_or_else(|poison| poison.into_inner()) = uuid.clone();
+        }
+        self.uuid = uuid;
         self.docs = 0;
         self.deleted = 0;
         self.release_indexes();
@@ -1719,10 +1771,11 @@ type Job = Box<dyn FnOnce(&mut Shard) -> Ack + Send>;
 pub struct ShardHandle {
     tx: Option<mpsc::Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    initial_seq: u64,
+    /// The shard's committed position: its sequence as of the last batch
+    /// flushed to disk.
     seq_tracker: Arc<AtomicU64>,
-    /// Highest sequence allocated for a write on this shard, committed or not.
-    reserved_seq: Arc<AtomicU64>,
+    /// The shard copy's uuid, which `clear` replaces.
+    uuid: Arc<std::sync::RwLock<String>>,
     /// Jobs submitted to this shard's actor since it opened. Each one is a
     /// cross-thread hop, so the count is the shard round-trip cost of a request.
     jobs: AtomicU64,
@@ -1748,7 +1801,8 @@ impl ShardHandle {
         );
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Job>(256);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u64>>();
+        type Ready = (u64, Arc<std::sync::RwLock<String>>);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
         let scanned = Arc::new(AtomicU64::new(0));
         let shard_scanned = scanned.clone();
@@ -1763,11 +1817,10 @@ impl ShardHandle {
                     return;
                 }
             };
-            let initial_seq = shard.seq();
-            tracker.store(initial_seq, Ordering::SeqCst);
-            shard.set_seq_tracker(tracker.clone());
             shard.set_counters(shard_scanned, shard_body_reads);
-            if ready_tx.send(Ok(initial_seq)).is_err() {
+            let uuid = Arc::new(std::sync::RwLock::new(shard.uuid().to_string()));
+            shard.shared_uuid = Some(uuid.clone());
+            if ready_tx.send(Ok((shard.persisted_seq(), uuid))).is_err() {
                 return;
             }
             // Group commit: run a job, then everything already queued, and
@@ -1785,6 +1838,9 @@ impl ShardHandle {
                 }
                 let _ = shard.flush_pending();
                 let flush_error = shard.take_flush_failure();
+                // Published before any caller hears back, so a write that
+                // was acknowledged is inside the committed position.
+                tracker.fetch_max(shard.persisted_seq(), Ordering::SeqCst);
                 if tracker.load(Ordering::SeqCst) > before {
                     committed.send_replace(());
                 }
@@ -1794,15 +1850,15 @@ impl ShardHandle {
             }
             let _ = shard.flush_pending();
         })?;
-        let initial_seq = ready_rx
+        let (initial_seq, uuid) = ready_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
+        seq_tracker.store(initial_seq, Ordering::SeqCst);
         Ok(ShardHandle {
             tx: Some(tx),
             thread: Some(thread),
-            initial_seq,
             seq_tracker,
-            reserved_seq: Arc::new(AtomicU64::new(initial_seq)),
+            uuid,
             jobs: AtomicU64::new(0),
             scanned,
             body_reads,
@@ -1824,19 +1880,17 @@ impl ShardHandle {
         self.jobs.load(Ordering::Relaxed)
     }
 
-    /// Sequence number this shard had when it was opened.
-    pub fn initial_seq(&self) -> u64 {
-        self.initial_seq
+    /// The shard's committed position.
+    pub fn committed_seq(&self) -> u64 {
+        self.seq_tracker.load(Ordering::SeqCst)
     }
 
-    /// Shared last committed sequence for this shard.
-    pub fn seq_tracker(&self) -> Arc<AtomicU64> {
-        self.seq_tracker.clone()
-    }
-
-    /// Shared highest allocated sequence for this shard.
-    pub fn reserved_seq(&self) -> Arc<AtomicU64> {
-        self.reserved_seq.clone()
+    /// The shard copy's uuid.
+    pub fn uuid(&self) -> String {
+        self.uuid
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Run a job on the shard task, which owns the database handle.
@@ -1847,8 +1901,6 @@ impl ShardHandle {
     {
         self.jobs.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
-        let seq_tracker = self.seq_tracker.clone();
-        let reserved_seq = self.reserved_seq.clone();
         let job: Job = Box::new(move |shard| {
             // A panic must fail only this job's caller, never kill the shard
             // actor (every later call would then answer "shard task is gone").
@@ -1869,12 +1921,6 @@ impl ShardHandle {
                     ))
                 }
             };
-            // The job is over, so any sequence it reserved but did not commit
-            // (it panicked, or returned an error after allocating) never
-            // will be. Count it as committed so the changes watermark does not
-            // wait on it forever; this only leaves a gap in the sequence
-            // numbers.
-            seq_tracker.fetch_max(reserved_seq.load(Ordering::SeqCst), Ordering::SeqCst);
             Box::new(move |flush_error: Option<String>| {
                 let result = match flush_error {
                     Some(message) => Err(ApiError::new(500, "internal_server_error", message)),
@@ -1966,7 +2012,7 @@ mod panic_tests {
         move |shard| {
             let mut tx = Tx::new();
             tx.put(key, b"v");
-            shard.commit_at(tx, None).map_err(ApiError::from)
+            shard.commit(tx).map_err(ApiError::from)
         }
     }
 
@@ -1981,33 +2027,37 @@ mod panic_tests {
         handle.call(|_| Ok(())).await.unwrap();
     }
 
+    /// A sequence a panicked or failed job took is a gap: it is never handed
+    /// out again, and the committed position moves past it once persisted.
     #[tokio::test]
-    async fn a_panicked_reservation_does_not_hold_back_the_committed_sequence() {
+    async fn a_sequence_taken_by_a_failed_job_is_never_reused() {
         let handle = handle();
-        let reserved = handle.reserved_seq();
-        let committed = handle.seq_tracker();
         let result: std::result::Result<(), ApiError> = handle
-            .call(move |_| {
-                reserved.fetch_max(5, Ordering::SeqCst);
-                panic!("after reserving");
+            .call(|shard| {
+                shard.next_seq();
+                panic!("after taking a sequence");
             })
             .await;
         assert!(result.is_err());
-        assert!(committed.load(Ordering::SeqCst) >= handle.reserved_seq().load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn an_errored_reservation_does_not_hold_back_the_committed_sequence() {
-        let handle = handle();
-        let reserved = handle.reserved_seq();
         let result: std::result::Result<(), ApiError> = handle
-            .call(move |_| {
-                reserved.fetch_max(5, Ordering::SeqCst);
-                Err(ApiError::bad_request("failed after reserving"))
+            .call(|shard| {
+                shard.next_seq();
+                Err(ApiError::bad_request("failed after taking a sequence"))
             })
             .await;
         assert!(result.is_err());
-        assert!(handle.seq_tracker().load(Ordering::SeqCst) >= 5);
+        let next = handle
+            .call(|shard| {
+                let seq = shard.next_seq();
+                let mut tx = Tx::new();
+                tx.put(b"k/after", b"v");
+                shard.commit(tx)?;
+                Ok(seq)
+            })
+            .await
+            .unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(handle.committed_seq(), 3);
     }
 
     #[tokio::test]
@@ -2149,7 +2199,7 @@ mod scan_tests {
             .unwrap();
         tx.put(&body_key("a", "1-b/c"), b"{}");
         tx.put(&body_key("a/1-b", "2-z"), b"{}");
-        shard.commit_at(tx, Some(1)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
 
         shard.compact().unwrap();
@@ -2191,7 +2241,7 @@ mod scan_tests {
             tx.put(&body_key(id, &new.to_string()), b"{}");
         }
         tx.put(&body_key("ghost/x", &old.to_string()), b"{}");
-        shard.commit_at(tx, Some(1)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
 
         shard.compact().unwrap();
@@ -2224,14 +2274,14 @@ mod scan_tests {
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
         tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
         tx.put_json(&meta_key("c"), &meta(true, 3)).unwrap();
-        shard.commit_at(tx, Some(3)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(shard.counts(), (2, 1));
 
         // Turn a live doc into a deleted one, and purge another entirely.
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(true, 4)).unwrap();
         tx.delete(&meta_key("b"));
-        shard.commit_at(tx, Some(4)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(shard.counts(), (0, 2));
 
         shard.flush_pending().unwrap();
@@ -2255,16 +2305,18 @@ mod scan_tests {
         let dir = temp_shard_dir("flush-fail");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit_at(tx, Some(1)).unwrap();
+        tx.put_json(&meta_key("a"), &meta(false, shard.next_seq()))
+            .unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         // Build the lazy indexes so the failure has to repair them too.
         assert_eq!(live_ids(&mut shard), vec!["a"]);
         assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
 
         let mut tx = Tx::new();
-        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
-        shard.commit_at(tx, Some(2)).unwrap();
+        tx.put_json(&meta_key("b"), &meta(false, shard.next_seq()))
+            .unwrap();
+        shard.commit(tx).unwrap();
         shard.inject_flush_failure();
         assert!(shard.flush_pending().is_err());
 
@@ -2273,13 +2325,15 @@ mod scan_tests {
             "unwritten doc visible"
         );
         assert_eq!(shard.counts(), (1, 0));
-        assert_eq!(shard.seq(), 1);
+        // The lost write's sequence is a gap, never handed out again.
+        assert_eq!(shard.seq, 2);
+        assert_eq!(shard.persisted_seq(), 1);
         assert_eq!(live_ids(&mut shard), vec!["a"]);
         assert_eq!(shard.latest_changes().unwrap().seq_of("b"), None);
 
         let mut tx = Tx::new();
         tx.put_json(&meta_key("c"), &meta(false, 3)).unwrap();
-        shard.commit_at(tx, Some(3)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         drop(shard);
         let mut shard = Shard::open(&dir, 1000).unwrap();
@@ -2304,13 +2358,42 @@ mod scan_tests {
     }
 
     #[test]
+    fn shard_uuid_survives_reopen() {
+        let dir = temp_shard_dir("uuid-reopen");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let uuid = shard.uuid().to_string();
+        assert_eq!(uuid.len(), 32, "{uuid}");
+        let mut tx = Tx::new();
+        let seq = shard.next_seq();
+        tx.put_json(&meta_key("a"), &meta(false, seq)).unwrap();
+        shard.commit(tx).unwrap();
+        shard.flush_pending().unwrap();
+        drop(shard);
+
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.uuid(), uuid);
+        assert_eq!(shard.next_seq(), 2, "the sequence continues after reopen");
+        // A cleared shard is a new copy: positions in the old one mean
+        // nothing in it.
+        shard.clear().unwrap();
+        assert_ne!(shard.uuid(), uuid);
+        let cleared = shard.uuid().to_string();
+        drop(shard);
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.uuid(), cleared);
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cleared_shard_reopens_and_keeps_its_sequence() {
         let dir = temp_shard_dir("clear-reopen");
         let mut shard = Shard::open(&dir, 1000).unwrap();
+        shard.seq = 7;
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
         tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
-        shard.commit_at(tx, Some(7)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         shard.db.compact_range(&[], &[]).unwrap();
         assert!(has_tables(&dir));
@@ -2331,7 +2414,7 @@ mod scan_tests {
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit_at(tx, Some(1)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         shard.db.compact_range(&[], &[]).unwrap();
         shard.db.delete(b"z/seq").unwrap();
@@ -2344,12 +2427,27 @@ mod scan_tests {
     }
 
     #[test]
+    fn fresh_shard_reopens_after_compaction() {
+        let dir = temp_shard_dir("fresh-compact");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let uuid = shard.uuid().to_string();
+        shard.db.compact_range(&[], &[]).unwrap();
+        drop(shard);
+        assert!(has_tables(&dir));
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.seq, 0);
+        assert_eq!(shard.uuid(), uuid);
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn local_only_shard_reopens() {
         let dir = temp_shard_dir("local-only");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
         tx.put(&local_key("x"), b"{}");
-        shard.commit_at(tx, None).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         shard.db.compact_range(&[], &[]).unwrap();
         drop(shard);
@@ -2365,8 +2463,9 @@ mod scan_tests {
         let dir = temp_shard_dir("corrupt-meta");
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit_at(tx, Some(1)).unwrap();
+        tx.put_json(&meta_key("a"), &meta(false, shard.next_seq()))
+            .unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         shard.put_raw(&meta_key("p:bad"), b"{not json");
 
@@ -2383,9 +2482,9 @@ mod scan_tests {
         // guess what it used to be.
         let mut tx = Tx::new();
         tx.put_json(&meta_key("p:bad"), &meta(false, 2)).unwrap();
-        assert!(shard.commit_at(tx, Some(2)).is_err());
+        assert!(shard.commit(tx).is_err());
         assert_eq!(shard.counts(), (1, 0));
-        assert_eq!(shard.seq(), 1);
+        assert_eq!(shard.seq, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2395,7 +2494,7 @@ mod scan_tests {
         let mut shard = Shard::open(&dir, 1000).unwrap();
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit_at(tx, Some(1)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         shard.put_raw(&meta_key("p:bad"), b"{not json");
         shard.delete_raw(b"z/doc_count");
@@ -2430,14 +2529,14 @@ mod scan_tests {
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
         tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
-        shard.commit_at(tx, Some(2)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(live_ids(&mut shard), ["a"]);
 
         // Once built, the index follows deletions and new writes.
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(true, 3)).unwrap();
         tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
-        shard.commit_at(tx, Some(4)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(live_ids(&mut shard), ["c"]);
         shard.flush_pending().unwrap();
         drop(shard);
@@ -2449,7 +2548,7 @@ mod scan_tests {
 
         let mut tx = Tx::new();
         tx.put_json(&meta_key("d"), &meta(false, 5)).unwrap();
-        shard.commit_at(tx, Some(5)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(live_ids(&mut shard), ["c", "d"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2464,7 +2563,7 @@ mod scan_tests {
             seq += 1;
             tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
         }
-        shard.commit_at(tx, Some(seq)).unwrap();
+        shard.commit(tx).unwrap();
         let probes = ["a", "d", "e", "j", "z", "c", "f", "a", "h"];
         let check = |shard: &mut Shard| {
             for probe in probes {
@@ -2488,7 +2587,7 @@ mod scan_tests {
             seq += 1;
             let mut tx = Tx::new();
             tx.put_json(&meta_key(id), &meta(deleted, seq)).unwrap();
-            shard.commit_at(tx, Some(seq)).unwrap();
+            shard.commit(tx).unwrap();
             check(&mut shard);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2501,7 +2600,7 @@ mod scan_tests {
         let mut tx = Tx::new();
         tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
         tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
-        shard.commit_at(tx, Some(2)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
 
         // An update, a new document and a purge, committed with the index
@@ -2510,7 +2609,7 @@ mod scan_tests {
         tx.put_json(&meta_key("a"), &meta(false, 3)).unwrap();
         tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
         tx.delete(&meta_key("b"));
-        shard.commit_at(tx, Some(4)).unwrap();
+        shard.commit(tx).unwrap();
         assert!(shard.latest.is_some(), "the index was dropped, not updated");
         let latest = shard.latest_changes().unwrap();
         assert_eq!(latest.seq_of("a"), Some(3));
@@ -2532,7 +2631,7 @@ mod scan_tests {
             tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
         }
         tx.put_json(&meta_key("p:3"), &meta(true, 6)).unwrap();
-        shard.commit_at(tx, Some(6)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
 
         let observe = |shard: &mut Shard| {
@@ -2567,7 +2666,7 @@ mod scan_tests {
         let mut tx = Tx::new();
         tx.put_json(&meta_key("p:0"), &meta(false, 7)).unwrap();
         tx.put_json(&meta_key("z"), &meta(true, 8)).unwrap();
-        shard.commit_at(tx, Some(8)).unwrap();
+        shard.commit(tx).unwrap();
         assert_eq!(shard.index_entries(), 0, "a write rebuilt the indexes");
         assert_eq!(live_ids(&mut shard), ["a", "p:0", "p:1", "p:2", "q:1"]);
         assert_eq!(shard.partition_counts("p").unwrap(), (3, 1));
@@ -2590,13 +2689,13 @@ mod scan_tests {
         for id in ["a", "c", "e"] {
             tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
         }
-        shard.commit_at(tx, Some(1)).unwrap();
+        shard.commit(tx).unwrap();
         shard.flush_pending().unwrap();
         let mut tx = Tx::new();
         for id in ["b", "d"] {
             tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
         }
-        shard.commit_at(tx, Some(2)).unwrap();
+        shard.commit(tx).unwrap();
 
         let mut forward = Vec::new();
         shard
@@ -2654,7 +2753,7 @@ mod scan_tests {
         for seq in 1..=5u64 {
             let mut tx = Tx::new();
             tx.put(&seq_key(seq), format!("doc{seq}").as_bytes());
-            shard.commit_at(tx, Some(seq)).unwrap();
+            shard.commit(tx).unwrap();
             // Sequences 1-3 on disk, 4-5 still in the overlay.
             if seq == 3 {
                 shard.flush_pending().unwrap();
@@ -2776,7 +2875,7 @@ mod scan_tests {
                 tx.put(&seq_key(seq), id.as_bytes());
                 seqs[n] = seq;
             }
-            shard.commit_at(tx, Some(seq)).unwrap();
+            shard.commit(tx).unwrap();
             shard.flush_pending().unwrap();
             // Roll the memtable over into a table without compacting the
             // existing ones (the range lies beyond every key in the shard).

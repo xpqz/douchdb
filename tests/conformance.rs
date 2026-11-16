@@ -1575,39 +1575,32 @@ fn is_couch_seq(value: &Value) -> bool {
     }
 }
 
-/// The token a node reports for these per-node sequences (`pack_seqs` in
-/// CouchDB): `<sum>-<base64url>` over douchdb's own body.
-fn seq_token(seqs: &[u64]) -> String {
-    use base64::Engine as _;
-    let list: Vec<String> = seqs.iter().map(u64::to_string).collect();
-    let body = format!("v1:{}", list.join(","));
-    format!(
-        "{}-{}",
-        seqs.iter().sum::<u64>(),
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
-    )
+/// The visible prefix of a sequence token (`pack_seqs` in CouchDB): the sum of
+/// the shard positions it holds.
+fn seq_sum(token: &str) -> u64 {
+    token
+        .split_once('-')
+        .and_then(|(sum, _)| sum.parse().ok())
+        .expect("a sequence token")
 }
 
-/// The per-node sequences inside a token from `seq_token`.
-fn seq_vector(token: &str) -> Vec<u64> {
-    use base64::Engine as _;
-    let body = token
-        .split_once('-')
-        .and_then(|(_, opaque)| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(opaque)
-                .ok()
-        })
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_default();
-    body.strip_prefix("v1:")
-        .unwrap_or_default()
-        .split('~')
-        .next()
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|seq| seq.parse().ok())
-        .collect()
+/// Each row's shard and sequence in a full ascending feed from 0, by id:
+/// each row's position differs from the one before only in its own shard.
+fn change_positions(body: &Value) -> HashMap<String, (usize, u64)> {
+    let mut before: HashMap<usize, u64> = HashMap::new();
+    let mut out = HashMap::new();
+    for row in body["results"].as_array().expect("results") {
+        let copies = seq_copies(row["seq"].as_str().expect("row seq"));
+        let moved: Vec<(usize, u64)> = copies
+            .iter()
+            .filter(|copy| before.get(&copy.1).copied().unwrap_or(0) != copy.2)
+            .map(|copy| (copy.1, copy.2))
+            .collect();
+        assert_eq!(moved.len(), 1, "{row}");
+        before.insert(moved[0].0, moved[0].1);
+        out.insert(row["id"].as_str().unwrap().to_string(), moved[0]);
+    }
+    out
 }
 
 fn feed_ids(body: &Value) -> Vec<String> {
@@ -1768,7 +1761,13 @@ async fn standalone_changes_resume_exactly_from_last_seq_across_a_restart() {
             s.restart();
         }
     }
-    assert_eq!(seen, &ids[..4], "no change missed or repeated");
+    // Four distinct changes of the first five; rows have no order across
+    // shards.
+    let mut first = seen.clone();
+    first.sort();
+    first.dedup();
+    assert_eq!(first.len(), 4, "no change repeated: {seen:?}");
+    assert!(first.iter().all(|id| ids[..5].contains(id)), "{seen:?}");
 
     // The token outlives the process: new writes land after it, in order.
     s.kill();
@@ -1777,7 +1776,10 @@ async fn standalone_changes_resume_exactly_from_last_seq_across_a_restart() {
         s.put(&format!("/resume/{id}"), json!({})).await;
     }
     let (_, body) = s.get(&format!("/resume/_changes?since={since}")).await;
-    assert_eq!(feed_ids(&body), &ids[4..], "{body}");
+    let mut all = seen.clone();
+    all.extend(feed_ids(&body));
+    all.sort();
+    assert_eq!(all, ids, "no change missed or repeated: {body}");
     let (_, info) = s.get("/resume").await;
     assert!(is_couch_seq(&info["update_seq"]), "{info}");
     let update_seq = info["update_seq"].as_str().unwrap_or_default();
@@ -1835,7 +1837,15 @@ async fn eventsource_events_carry_ids_and_resume_from_last_event_id() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     let got: Vec<&str> = data.iter().filter_map(|row| row["id"].as_str()).collect();
-    assert_eq!(got, ["b", "c"], "{resumed}");
+    // The rows after the first event, in the order the first feed sent them.
+    let sent: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(got, sent[1..].to_vec(), "{resumed}");
 }
 
 #[tokio::test]
@@ -1883,7 +1893,11 @@ async fn changes_returns_latest_per_document_and_pending() {
         .get("/latest/_changes?since=0&limit=1&descending=true")
         .await;
     assert_eq!(descending["results"].as_array().unwrap().len(), 1);
-    assert_eq!(descending["results"][0]["id"], "b");
+    // No order across shards: either document's newest change may come first.
+    assert!(
+        ["a", "b"].contains(&descending["results"][0]["id"].as_str().unwrap()),
+        "{descending}"
+    );
     assert_eq!(descending["pending"], 1);
 
     let (_, all_docs) = s
@@ -2104,7 +2118,9 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let (_, all) = s.get("/chscanned/_changes").await;
-    assert_eq!(all["last_seq"], json!(seq_token(&[4])), "{all}");
+    // The head: four writes, whatever shards they landed on.
+    let head = all["last_seq"].as_str().unwrap().to_string();
+    assert_eq!(seq_sum(&head), 4, "{all}");
 
     let lines = |text: &str| -> Vec<Value> {
         text.lines()
@@ -2114,7 +2130,8 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
     };
     // `none` matches nothing; `first` matches only the first document, so the
     // documents scanned after the last match still count.
-    let two = seq_token(&[2]);
+    // Part-way through the feed: the position as of its second row.
+    let two = all["results"][1]["seq"].as_str().unwrap().to_string();
     for (filter, since, matched) in [
         ("none", "0", 0),
         ("none", two.as_str(), 0),
@@ -2135,7 +2152,7 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
                     Some(matched),
                     "{label}"
                 );
-                assert_eq!(body["last_seq"], json!(seq_token(&[4])), "{label}");
+                assert_eq!(body["last_seq"], json!(head), "{label}");
             }
         }
         let text = s
@@ -2153,13 +2170,12 @@ async fn every_changes_feed_reports_the_scanned_position_when_nothing_matches() 
         let rows = lines(&text);
         assert_eq!(
             rows.last(),
-            Some(&json!({"last_seq": seq_token(&[4]), "pending": 0})),
+            Some(&json!({"last_seq": head, "pending": 0})),
             "{filter} continuous since {since}: {text}"
         );
     }
 
     // A feed already at the head has scanned nothing and stays there.
-    let head = seq_token(&[4]);
     let (_, body) = s
         .get(&format!("/chscanned/_changes?filter=f/none&since={head}"))
         .await;
@@ -4275,15 +4291,33 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
         "resumed feed starts after last_seq"
     );
 
-    // Descending still returns the newest rows, not the first ones scanned.
+    // Descending returns the requested number of distinct rows, each shard's
+    // newest first. (Rows have no order across shards, so which shard's
+    // come first is open.)
     let (_, body) = s.get("/ranges/_changes?descending=true&limit=2").await;
-    let ids: Vec<&str> = body["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["d", "b"]);
+    let ids = feed_ids(&body);
+    assert_eq!(ids.len(), 2, "{body}");
+    assert_ne!(ids[0], ids[1], "{body}");
+    let (_, all) = s.get("/ranges/_changes").await;
+    let positions = change_positions(&all);
+    let mut by_shard: std::collections::BTreeMap<usize, Vec<u64>> = Default::default();
+    for id in &ids {
+        let (shard, seq) = positions[id];
+        by_shard.entry(shard).or_default().push(seq);
+    }
+    for (shard, seqs) in by_shard {
+        let mut newest: Vec<u64> = positions
+            .values()
+            .filter(|(of, _)| *of == shard)
+            .map(|(_, seq)| *seq)
+            .collect();
+        newest.sort_unstable_by(|a, b| b.cmp(a));
+        newest.truncate(seqs.len());
+        assert_eq!(
+            seqs, newest,
+            "shard {shard} rows are not its newest: {body}"
+        );
+    }
 
     // The live-document map is maintained after it has been built.
     let (_, doc) = s.get("/ranges/c").await;
@@ -4440,11 +4474,8 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
         .unwrap();
     let rows = lines(&text);
     assert_eq!(rows.len(), 3, "{text}");
-    assert_eq!(
-        rows[2],
-        json!({"last_seq": seq_token(&[2]), "pending": 0}),
-        "{text}"
-    );
+    assert_eq!(rows[2]["pending"], 0, "{text}");
+    assert_eq!(seq_sum(rows[2]["last_seq"].as_str().unwrap()), 2, "{text}");
 
     // The same trailer closes a feed that reached its limit, at once rather
     // than after the next wake-up: with the longest timeout the server
@@ -4467,9 +4498,10 @@ async fn continuous_changes_ends_with_a_last_seq_trailer() {
     .expect("a feed at its limit stayed open");
     let rows = lines(&text);
     assert_eq!(rows.len(), 2, "{text}");
+    // It ends where its one row ends.
     assert_eq!(
         rows[1],
-        json!({"last_seq": seq_token(&[1]), "pending": 1}),
+        json!({"last_seq": rows[0]["seq"], "pending": 1}),
         "{text}"
     );
 }
@@ -4502,11 +4534,8 @@ async fn changes_feed_live_is_continuous() {
         .collect();
     assert_eq!(rows.len(), 2, "{text}");
     assert_eq!(rows[0]["id"], "a", "{text}");
-    assert_eq!(
-        rows[1],
-        json!({"last_seq": seq_token(&[1]), "pending": 0}),
-        "{text}"
-    );
+    assert_eq!(rows[1]["pending"], 0, "{text}");
+    assert_eq!(seq_sum(rows[1]["last_seq"].as_str().unwrap()), 1, "{text}");
 }
 
 #[tokio::test]
@@ -4557,16 +4586,27 @@ async fn changes_revs_diff_and_bulk_get() {
     let (status, body) = s.get("/rep/_changes").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
-    assert_eq!(body["results"][0]["id"], "a");
-    assert_eq!(body["results"][0]["changes"][0]["rev"], a["rev"]);
+    let a_row = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "a")
+        .unwrap();
+    assert_eq!(a_row["changes"][0]["rev"], a["rev"]);
     assert_eq!(body["pending"], 0);
 
+    // Rows have no order across shards; resuming from the first row's seq
+    // returns the other document.
+    let first = body["results"][0]["id"].as_str().unwrap().to_string();
     let since = body["results"][0]["seq"].as_str().unwrap().to_string();
     let (_, body) = s
         .get(&format!("/rep/_changes?since={since}&include_docs=true"))
         .await;
     assert_eq!(body["results"].as_array().unwrap().len(), 1);
-    assert_eq!(body["results"][0]["doc"]["x"], 2);
+    assert_eq!(
+        body["results"][0]["doc"]["x"],
+        if first == "a" { 2 } else { 1 }
+    );
     assert!(body["results"][0]["doc"].get("_revisions").is_none());
 
     let (status, body) = s
@@ -5425,7 +5465,8 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     let (_, r) = s.put("/purgeseq/b", json!({"v": 1})).await;
     let rev_b = r["rev"].as_str().unwrap().to_string();
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(seq_token(&[0])), "{info}");
+    assert!(is_couch_seq(&info["purge_seq"]), "{info}");
+    assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 0, "{info}");
 
     let (status, body) = s
         .post("/purgeseq/_purge", json!({"a": [rev_a], "b": [rev_b]}))
@@ -5439,13 +5480,15 @@ async fn purge_response_has_null_purge_seq_and_db_info_counts_purges() {
     );
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(seq_token(&[2])), "{info}");
+    assert!(is_couch_seq(&info["purge_seq"]), "{info}");
+    assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 2, "{info}");
 
     // A purge that removes nothing does not advance it.
     let (_, body) = s.post("/purgeseq/_purge", json!({"a": ["1-x"]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = s.get("/purgeseq").await;
-    assert_eq!(info["purge_seq"], json!(seq_token(&[2])), "{info}");
+    assert!(is_couch_seq(&info["purge_seq"]), "{info}");
+    assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 2, "{info}");
 }
 
 #[tokio::test]
@@ -6933,10 +6976,11 @@ async fn cluster_peer_round_trip_baseline() {
     // (one call per other node, one round), whatever the age of any cache.
     let put = measure_peer_trips(&nodes, Method::PUT, "/trips/new1", Some(json!({"n": 1}))).await;
     assert_eq!(put, (2, 1, 0), "single-doc PUT");
-    // Every node holds a copy of every shard, so a read, a listing or a view
-    // is served from local data without a scatter. A document read still asks
-    // a second replica (`r=2`) and `since=now` still asks every peer for its
-    // sequence.
+    // Every node holds a copy of every shard, so a read, a listing, a view
+    // or a feed is served from local data without a scatter. A document read
+    // still asks a second replica (`r=2`). `since=now` is a position on the
+    // coordinator's own copies (it used to ask every peer for its sequence:
+    // 2 calls, 1 round).
     assert_eq!(
         peer_trip_reads(&nodes).await,
         vec![
@@ -6944,7 +6988,7 @@ async fn cluster_peer_round_trip_baseline() {
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
-            ("changes_since_now", (2, 1, 0)),
+            ("changes_since_now", (0, 0, 0)),
         ]
     );
 }
@@ -7001,9 +7045,9 @@ async fn cluster_peer_traffic_uses_http2() {
 
 /// With one copy of each shard the coordinator must scatter to the nodes
 /// that own shards. Which nodes those are depends on placement, so the
-/// assertions are relations that hold for any placement: a listing, a map view
-/// and a reduce view cost one scatter round (none if the node owns every
-/// shard), and `since=now` is one round that asks every peer once.
+/// assertions are relations that hold for any placement: a listing, a map view,
+/// a reduce view and a `since=now` feed cost one scatter round (none if the
+/// node owns every shard).
 #[tokio::test]
 async fn cluster_peer_scatter_baseline_with_one_replica() {
     let nodes = peer_trip_cluster(1).await;
@@ -7019,10 +7063,9 @@ async fn cluster_peer_scatter_baseline_with_one_replica() {
     assert_eq!(scatter.1, u64::from(scatter.0 > 0), "{reads:?}");
     assert_eq!(trips("map_view"), scatter, "{reads:?}");
     assert_eq!(trips("reduce_view"), scatter, "{reads:?}");
-    // Each peer is asked once, in the same round: a peer that owns shards
-    // answers `since=now` for them and reports its own sequence in that reply,
-    // and a peer that owns none is only asked for its sequence.
-    assert_eq!(trips("changes_since_now"), (2, 1, 0), "{reads:?}");
+    // `since=now` asks the nodes that own shards, for their own copies'
+    // positions, in the same single round; a node that owns none is not asked.
+    assert_eq!(trips("changes_since_now"), scatter, "{reads:?}");
 }
 
 /// With a node down, a write makes no validator calls: the calls are the
@@ -7058,10 +7101,8 @@ async fn cluster_peer_round_trip_baseline_with_a_node_down() {
             ("all_docs_limit_100", (0, 0, 0)),
             ("map_view", (0, 0, 0)),
             ("reduce_view", (0, 0, 0)),
-            // The sequence read asks the node discovery reports down too, in
-            // the same round: the mark may be stale, and a node that is up
-            // must report its own position.
-            ("changes_since_now", (2, 1, 0)),
+            // `since=now` is a position on the coordinator's own copies.
+            ("changes_since_now", (0, 0, 0)),
         ]
     );
 }
@@ -7153,9 +7194,12 @@ async fn cluster_scatter_skips_a_node_discovery_reports_down() {
     let (status, body) = nodes[0].get("/trips/_all_docs?limit=100").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"], expected["rows"]);
+    // A feed scatters to the preferred copies again, the recovered node's
+    // included, as a listing does.
+    let listing = measure_peer_trips(&nodes, Method::GET, "/trips/_all_docs?limit=100", None).await;
     let since_now =
         measure_peer_trips(&nodes, Method::GET, "/trips/_changes?since=now", None).await;
-    assert_eq!(since_now, (2, 1, 0), "the recovered node is asked again");
+    assert_eq!(since_now, listing, "the recovered node is asked again");
 }
 
 /// Between `kill()` and `restart()` the node's port is free for anyone to
@@ -7384,7 +7428,7 @@ async fn cluster_query_update_seq_is_the_opaque_vector() {
 }
 
 // In a cluster `purge_seq` in `GET /db` is built like `update_seq`: an opaque
-// per-node token (CouchDB packs per-shard purge seqs with
+// token over one copy of each shard range (CouchDB packs per-shard purge seqs with
 // `fabric_view_changes:pack_seqs`, fabric_db_info.erl).
 #[tokio::test]
 async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
@@ -7395,12 +7439,14 @@ async fn cluster_db_info_purge_seq_is_an_opaque_per_node_token() {
     let (_, r) = nodes[0].put("/clpurge/a", json!({"v": 1})).await;
     let rev = r["rev"].as_str().unwrap().to_string();
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!(seq_token(&[0, 0])), "{info}");
+    assert!(is_couch_seq(&info["purge_seq"]), "{info}");
+    assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 0, "{info}");
 
     let (_, body) = nodes[0].post("/clpurge/_purge", json!({"a": [rev]})).await;
     assert_eq!(body["purge_seq"], Value::Null, "{body}");
     let (_, info) = nodes[0].get("/clpurge").await;
-    assert_eq!(info["purge_seq"], json!(seq_token(&[1, 1])), "{info}");
+    // One copy of each shard range: the purge counts once.
+    assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 1, "{info}");
 }
 
 // A peer that discovery marked down and that has since come back stays marked
@@ -7420,8 +7466,8 @@ async fn cluster_db_info_seqs_include_a_node_wrongly_marked_down() {
     assert_eq!(status, StatusCode::CREATED);
     let (_, expected) = nodes[0].get("/clinfostale").await;
     assert_eq!(
-        expected["purge_seq"],
-        json!(seq_token(&[1, 1])),
+        seq_sum(expected["purge_seq"].as_str().unwrap()),
+        1,
         "{expected}"
     );
 
@@ -7629,7 +7675,7 @@ async fn cluster_one_purge_counts_once_on_every_copy() {
     }
     for node in &nodes {
         let (_, info) = node.get("/clpurgeonce").await;
-        assert_eq!(info["purge_seq"], json!(seq_token(&[1, 1])), "{info}");
+        assert_eq!(seq_sum(info["purge_seq"].as_str().unwrap()), 1, "{info}");
     }
 }
 
@@ -14944,7 +14990,9 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
             break;
         }
         for row in rows {
-            let seq = seq_vector(row["seq"].as_str().expect("opaque seq"))[0];
+            // Each row moves one shard's position forward, so the visible
+            // sum of the positions only grows.
+            let seq = seq_sum(row["seq"].as_str().expect("opaque seq"));
             assert!(
                 seq > last_seq,
                 "changes rows out of order: {seq} after {last_seq}"
@@ -14953,7 +15001,7 @@ async fn changes_pagination_resumes_across_interleaved_shard_pages() {
             seen.push(row["id"].as_str().unwrap().to_string());
         }
         let next = body["last_seq"].as_str().expect("opaque last_seq");
-        assert!(seq_vector(next)[0] >= last_seq, "last_seq went backwards");
+        assert!(seq_sum(next) >= last_seq, "last_seq went backwards");
         if next == since {
             break;
         }
@@ -16672,9 +16720,15 @@ async fn internal_peer_requests_bypass_the_request_size_limit() {
     let big = json!({"docs": [{"_id": "big", "pad": "x".repeat(2 * 1024 * 1024)}]});
 
     // A client's oversized body is refused: 413, or a reset while it is
-    // still being sent.
-    let client = s
-        .client
+    // still being sent. The server closes that connection without reading
+    // the rest of the body, so the request goes on a client of its own: a
+    // pooled connection would otherwise be reused for the next request and
+    // fail with a broken pipe.
+    let oversized = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("client");
+    let client = oversized
         .post(format!("{}/peersize/_bulk_docs", s.base))
         .json(&big)
         .send()
@@ -18702,6 +18756,12 @@ async fn quorum_read_repairs_a_stale_copy() {
         vec![first.clone()]
     );
 
+    // The coordinator skips a peer its last discovery pass found down while
+    // the others make up `r`, and repairs only the copies that answered.
+    // Node 2 starts after node 1's first pass, so wait until node 1 has seen
+    // both peers up before the read.
+    wait_until_known_up(&nodes[1], &nodes[0].base).await;
+    wait_until_known_up(&nodes[1], &nodes[2].base).await;
     let (status, body) = nodes[1].get("/qrepair/x?r=2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["v"], 2, "{body}");
@@ -19873,4 +19933,461 @@ async fn post_db_enforces_design_admin_vdu_and_local_routing() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["v"], 1);
+}
+
+/// The shard copies inside an opaque sequence token: `(node, shard, seq,
+/// uuid)` per shard range. Only these tests look inside; clients must not.
+fn seq_copies(token: &str) -> Vec<(usize, usize, u64, String)> {
+    use base64::Engine as _;
+    let opaque = token
+        .split_once('-')
+        .map(|(_, opaque)| opaque)
+        .unwrap_or("");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(opaque)
+        .unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn since_token_round_trips() {
+    let s = Server::start(false);
+    s.fresh_db("roundtrip").await;
+    for i in 0..6 {
+        s.put(&format!("/roundtrip/d{i}"), json!({})).await;
+    }
+    let (_, all) = s.get("/roundtrip/_changes").await;
+    assert_eq!(feed_ids(&all).len(), 6, "{all}");
+    let last = all["last_seq"]
+        .as_str()
+        .expect("opaque last_seq")
+        .to_string();
+    assert!(is_couch_seq(&all["last_seq"]), "{all}");
+    // Fed back, the token reads nothing and comes back unchanged.
+    let (status, body) = s.get(&format!("/roundtrip/_changes?since={last}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(feed_ids(&body).is_empty(), "{body}");
+    assert_eq!(body["last_seq"], json!(last));
+    // Every row's seq resumes after that row: together they cover the feed
+    // exactly once.
+    let mut seen = Vec::new();
+    for row in all["results"].as_array().unwrap() {
+        let since = row["seq"].as_str().expect("opaque row seq");
+        let (_, after) = s.get(&format!("/roundtrip/_changes?since={since}")).await;
+        let rest = feed_ids(&after);
+        assert!(!rest.contains(&row["id"].as_str().unwrap().to_string()));
+        seen.push((row["id"].as_str().unwrap().to_string(), rest.len()));
+    }
+    let lens: Vec<usize> = seen.iter().map(|(_, n)| *n).collect();
+    assert_eq!(lens, vec![5, 4, 3, 2, 1, 0], "{seen:?}");
+}
+
+#[tokio::test]
+async fn since_zero_and_now_match_couchdb() {
+    let s = Server::start(false);
+    s.fresh_db("zeronow").await;
+    for id in ["a", "b", "c"] {
+        s.put(&format!("/zeronow/{id}"), json!({})).await;
+    }
+    let (_, zero) = s.get("/zeronow/_changes?since=0").await;
+    assert_eq!(feed_ids(&zero).len(), 3, "{zero}");
+    let (_, none) = s.get("/zeronow/_changes").await;
+    assert_eq!(feed_ids(&none).len(), 3, "{none}");
+    let (_, now) = s.get("/zeronow/_changes?since=now").await;
+    assert!(feed_ids(&now).is_empty(), "{now}");
+    assert!(is_couch_seq(&now["last_seq"]), "{now}");
+    assert_eq!(now["last_seq"], zero["last_seq"], "now is where 0 ends");
+    s.put("/zeronow/d", json!({})).await;
+    let since = now["last_seq"].as_str().unwrap();
+    let (_, after) = s.get(&format!("/zeronow/_changes?since={since}")).await;
+    assert_eq!(feed_ids(&after), vec!["d"], "{after}");
+}
+
+#[tokio::test]
+async fn malformed_since_is_400() {
+    use base64::Engine as _;
+    let s = Server::start(false);
+    s.fresh_db("badsince").await;
+    s.put("/badsince/a", json!({})).await;
+    let b64 = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+    let not_json = format!("1-{}", b64("v1:1"));
+    let wrong_shape = format!("1-{}", b64("{\"a\":1}"));
+    let (_, page) = s.get("/badsince/_changes").await;
+    let good = page["last_seq"].as_str().unwrap().to_string();
+    let truncated = good[..good.len() - 3].to_string();
+    for since in [
+        "1",
+        "-1",
+        "abc",
+        "",
+        "5-abc",
+        "%220%22",
+        "now1",
+        "NOW",
+        not_json.as_str(),
+        wrong_shape.as_str(),
+        truncated.as_str(),
+    ] {
+        let (status, body) = s.get(&format!("/badsince/_changes?since={since}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{since}: {body}");
+        assert_eq!(body["error"], "bad_request", "{since}");
+        assert_eq!(
+            body["reason"], "Malformed sequence supplied in 'since' parameter.",
+            "{since}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_seq_is_opaque_and_usable_as_since() {
+    let s = Server::start(false);
+    s.fresh_db("updseq").await;
+    for id in ["a", "b"] {
+        s.put(&format!("/updseq/{id}"), json!({})).await;
+    }
+    let (_, info) = s.get("/updseq").await;
+    assert!(is_couch_seq(&info["update_seq"]), "{info}");
+    let update_seq = info["update_seq"].as_str().unwrap().to_string();
+    // Two writes, two shards' positions summed in the visible prefix.
+    assert!(update_seq.starts_with("2-"), "{update_seq}");
+    let (_, body) = s.get(&format!("/updseq/_changes?since={update_seq}")).await;
+    assert!(feed_ids(&body).is_empty(), "{body}");
+    s.put("/updseq/c", json!({})).await;
+    let (_, body) = s.get(&format!("/updseq/_changes?since={update_seq}")).await;
+    assert_eq!(feed_ids(&body), vec!["c"], "{body}");
+    let (_, query) = s.get("/updseq/_all_docs?update_seq=true").await;
+    let (_, info) = s.get("/updseq").await;
+    assert_eq!(query["update_seq"], info["update_seq"], "{query}");
+}
+
+#[tokio::test]
+async fn since_from_a_recreated_database_restarts() {
+    let s = Server::start(false);
+    s.fresh_db("recreated").await;
+    for id in ["a", "b", "c"] {
+        s.put(&format!("/recreated/{id}"), json!({})).await;
+    }
+    let (_, body) = s.get("/recreated/_changes").await;
+    let old = body["last_seq"].as_str().unwrap().to_string();
+    let (status, _) = s.delete("/recreated").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = s.put("/recreated", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for id in ["x", "y"] {
+        s.put(&format!("/recreated/{id}"), json!({})).await;
+    }
+    // The old positions name shard copies that no longer exist: the feed
+    // starts over rather than skipping the new database's first writes.
+    let (status, body) = s.get(&format!("/recreated/_changes?since={old}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ids = feed_ids(&body);
+    ids.sort();
+    assert_eq!(ids, vec!["x", "y"], "{body}");
+}
+
+/// A coordinator given a token from a database since deleted and recreated
+/// starts every shard copy the token no longer names at 0, in its row
+/// positions too. The old positions must never be applied to the new copies:
+/// following the feed row by row from the old token delivers every current
+/// document. The same ids are written before and after, so each new shard
+/// reaches the old one's position and an old position would skip it all.
+#[tokio::test]
+async fn cluster_since_from_a_recreated_database_delivers_every_document() {
+    let nodes = start_cluster_sharded(2, 4, 2);
+    let ids: Vec<String> = (0..16).map(|i| format!("r{i:02}")).collect();
+    let docs = || -> Vec<Value> { ids.iter().map(|id| json!({"_id": id})).collect() };
+    for node in &nodes {
+        node.fresh_db("recluster").await;
+    }
+    let (status, body) = nodes[0]
+        .post("/recluster/_bulk_docs", json!({"docs": docs()}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, body) = nodes[0].get("/recluster/_changes").await;
+    let old = body["last_seq"].as_str().unwrap().to_string();
+    assert!(
+        seq_copies(&old).iter().all(|copy| copy.2 > 0),
+        "every shard holds a document: {old}"
+    );
+
+    for node in &nodes {
+        node.fresh_db("recluster").await;
+    }
+    let (status, body) = nodes[0]
+        .post("/recluster/_bulk_docs", json!({"docs": docs()}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Follow the feed through node 1 one row at a time, resuming from each
+    // row's own position.
+    let mut since = old;
+    let mut seen = Vec::new();
+    for _ in 0..=ids.len() {
+        let (status, body) = nodes[1]
+            .get(&format!("/recluster/_changes?limit=1&since={since}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let Some(row) = body["results"].as_array().unwrap().first() else {
+            break;
+        };
+        seen.push(row["id"].as_str().unwrap().to_string());
+        since = row["seq"].as_str().unwrap().to_string();
+    }
+    seen.sort();
+    assert_eq!(seen, ids, "documents skipped or repeated");
+}
+
+/// Readers on every node follow a feed by passing each `last_seq` back while
+/// batches land on all shards at once. Per-shard positions must not let a
+/// reader pass a write it has not seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_changes_cursor_misses_nothing_under_concurrent_writes() {
+    const DOCS: usize = 20_000;
+    const BATCH: usize = 500;
+    let nodes = std::sync::Arc::new(start_cluster_sharded(3, 4, 2));
+    for node in nodes.iter() {
+        node.fresh_db("livecursor").await;
+    }
+    // Pinged after each acknowledged batch; `done` once all are.
+    let written = std::sync::Arc::new(tokio::sync::Notify::new());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let nodes = nodes.clone();
+        let written = written.clone();
+        tokio::spawn(async move {
+            for batch in 0..DOCS / BATCH {
+                let docs: Vec<Value> = (0..BATCH)
+                    .map(|i| json!({"_id": format!("d{:05}", batch * BATCH + i)}))
+                    .collect();
+                let node = &nodes[batch % nodes.len()];
+                let (status, body) = node
+                    .post("/livecursor/_bulk_docs", json!({"docs": docs}))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                written.notify_waiters();
+            }
+        })
+    };
+    let readers: Vec<_> = (0..nodes.len())
+        .map(|reader| {
+            let nodes = nodes.clone();
+            let (written, done) = (written.clone(), done.clone());
+            tokio::spawn(async move {
+                let mut seen = std::collections::HashSet::new();
+                let mut since = "0".to_string();
+                // Follow the feed while the writer runs; once it has finished,
+                // a plain read that returns nothing means the reader is at the
+                // end of everything that was written.
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::SeqCst);
+                    let (status, body) = nodes[reader]
+                        .get(&format!("/livecursor/_changes?limit=700&since={since}"))
+                        .await;
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    let ids = feed_ids(&body);
+                    let empty = ids.is_empty();
+                    seen.extend(ids);
+                    since = body["last_seq"].as_str().expect("last_seq").to_string();
+                    if empty {
+                        if finished {
+                            break;
+                        }
+                        // Caught up with a writer still running: wait for its
+                        // next batch rather than spin.
+                        let wait = written.notified();
+                        if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                            wait.await;
+                        }
+                    }
+                }
+                (reader, seen)
+            })
+        })
+        .collect();
+    writer.await.unwrap();
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    written.notify_waiters();
+    for reader in readers {
+        let (reader, seen) = reader.await.unwrap();
+        let missing: Vec<String> = (0..DOCS)
+            .map(|i| format!("d{i:05}"))
+            .filter(|id| !seen.contains(id))
+            .take(10)
+            .collect();
+        assert!(missing.is_empty(), "reader {reader} missed {missing:?}");
+    }
+}
+
+/// A token resumes each shard range on the copy it names, even when the
+/// coordinator would prefer another: nothing is replayed.
+#[tokio::test]
+async fn cluster_since_resumes_on_the_same_copy() {
+    let nodes = start_cluster_sharded(2, 4, 2);
+    for node in &nodes {
+        node.fresh_db("samecopy").await;
+    }
+    let docs: Vec<Value> = (0..12).map(|i| json!({"_id": format!("s{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/samecopy/_bulk_docs", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = nodes[0].get("/samecopy/_changes").await;
+    assert_eq!(feed_ids(&body).len(), 12, "{body}");
+    let token = body["last_seq"].as_str().unwrap().to_string();
+    let copies = seq_copies(&token);
+    assert_eq!(copies.len(), 4, "{copies:?}");
+    // Node 0 holds every shard, so it read them all itself.
+    assert!(copies.iter().all(|copy| copy.0 == 0), "{copies:?}");
+    // Node 1 holds every shard too, but resumes on node 0's copies.
+    let (status, body) = nodes[1]
+        .get(&format!("/samecopy/_changes?since={token}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(feed_ids(&body).is_empty(), "replayed: {body}");
+    assert_eq!(body["last_seq"], json!(token));
+}
+
+/// When the copy a token names is down, its range is read again from the
+/// start on another copy: rows may repeat, none may be skipped.
+#[tokio::test]
+async fn cluster_since_replays_a_range_when_its_copy_is_down() {
+    let mut nodes = start_cluster_sharded(2, 4, 2);
+    for node in &nodes {
+        node.fresh_db("replayrange").await;
+    }
+    let first: Vec<Value> = (0..8).map(|i| json!({"_id": format!("a{i}")})).collect();
+    let (status, _) = nodes[0]
+        .post("/replayrange/_bulk_docs", json!({"docs": first}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = nodes[0].get("/replayrange/_changes").await;
+    let token = body["last_seq"].as_str().unwrap().to_string();
+    assert!(seq_copies(&token).iter().all(|copy| copy.0 == 0));
+    let later: Vec<Value> = (0..8).map(|i| json!({"_id": format!("b{i}")})).collect();
+    let (status, _) = nodes[1]
+        .post("/replayrange/_bulk_docs", json!({"docs": later}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    nodes[0].kill();
+    let (status, body) = nodes[1]
+        .get(&format!("/replayrange/_changes?since={token}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids = feed_ids(&body);
+    for i in 0..8 {
+        assert!(ids.contains(&format!("b{i}")), "skipped b{i}: {body}");
+    }
+    let copies = seq_copies(body["last_seq"].as_str().unwrap());
+    assert!(copies.iter().all(|copy| copy.0 == 1), "{copies:?}");
+}
+
+/// Write `docs` to `node` only: the forwarded marker keeps the write local.
+async fn write_locally(node: &Server, db: &str, docs: Vec<Value>) {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_bulk_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// A write only the serving copy holds (a write that reached one replica
+/// alone) may sit below the checkpoint of its pull from the named copy. Resuming
+/// at that checkpoint would skip it: a replay is allowed, a skip never.
+#[tokio::test]
+async fn cluster_since_never_skips_a_write_only_the_serving_copy_had() {
+    let mut nodes = start_cluster_sharded(2, 1, 2);
+    for node in &nodes {
+        node.fresh_db("noskip").await;
+    }
+    write_locally(&nodes[1], "noskip", vec![json!({"_id": "L"})]).await;
+    write_locally(&nodes[0], "noskip", vec![json!({"_id": "X"})]).await;
+    // Node 1 pulls X from node 0; the checkpoint's target position is above L.
+    sync_node(&nodes[1], "noskip").await;
+    // Read node 0's feed to its end: its copy lacks L.
+    let (_, body) = nodes[0].get("/noskip/_changes").await;
+    assert_eq!(feed_ids(&body), vec!["X".to_string()], "{body}");
+    let token = body["last_seq"].as_str().unwrap().to_string();
+    assert!(seq_copies(&token).iter().all(|copy| copy.0 == 0));
+    let dead = nodes[0].base.clone();
+    nodes[0].kill();
+    wait_until_known_down(&nodes[1], &dead).await;
+    let (status, body) = nodes[1]
+        .get(&format!("/noskip/_changes?since={token}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        feed_ids(&body).contains(&"L".to_string()),
+        "skipped L: {body}"
+    );
+}
+
+/// The node's count of `_changes` reads (`changes_once`) since it started.
+async fn changes_reads(s: &Server) -> u64 {
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    metrics["feeds"]["changes_once"]
+        .as_u64()
+        .expect("changes_once")
+}
+
+/// A long-poll from `since=now` that a write wakes must report the write.
+/// Each wake used to resolve `now` again, so the write was already behind it
+/// and the feed answered nothing with a `last_seq` past the write.
+///
+/// The first write is made once the feed has started its first read. If that
+/// read resolved `now` after the write, the write is rightly not reported and
+/// the feed reads again on its wake; a second write is then made, which the
+/// feed must report.
+#[tokio::test]
+async fn longpoll_since_now_reports_the_write_that_wakes_it() {
+    let s = Server::start(false);
+    s.fresh_db("lpnow").await;
+    let (status, body) = s.put("/lpnow/before", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for heartbeat in ["", "&heartbeat=10"] {
+        let base = changes_reads(&s).await;
+        let poll = tokio::spawn({
+            let client = s.client.clone();
+            let url = format!(
+                "{}/lpnow/_changes?feed=longpoll&since=now&timeout=30000{heartbeat}",
+                s.base
+            );
+            async move {
+                let text = client.get(url).send().await.unwrap().text().await.unwrap();
+                let last = text.lines().rfind(|line| !line.trim().is_empty());
+                serde_json::from_str::<Value>(last.expect("an answer")).unwrap()
+            }
+        });
+        while changes_reads(&s).await < base + 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut written = vec![format!("first{heartbeat}")];
+        let (status, body) = s.put(&format!("/lpnow/{}", written[0]), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        while !poll.is_finished() {
+            if written.len() == 1 && changes_reads(&s).await >= base + 2 {
+                written.push(format!("second{heartbeat}"));
+                let (status, body) = s.put(&format!("/lpnow/{}", written[1]), json!({})).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let body = poll.await.unwrap();
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.is_empty(), "the feed skipped {written:?}: {body}");
+        assert!(
+            ids.iter().all(|id| written.iter().any(|w| w == id)),
+            "{ids:?} {written:?}"
+        );
+    }
 }

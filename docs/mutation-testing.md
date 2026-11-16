@@ -91,7 +91,7 @@ and asserts that the named test fails:
 | Path | Mutation | Test |
 | --- | --- | --- |
 | default write quorum | `n/2+1` -> `n` | `cluster_default_write_quorum_is_a_majority` |
-| changes watermark | `min` -> `max` | `changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence` |
+| changes bound | committed position -> unbounded | `incremental_update_is_bounded_by_each_shards_start_position` |
 | winner selection | live-before-deleted -> deleted-before-live | `conflicting_branches_both_remain` |
 | role check | role match -> always true | `security_object_enforces_members_admins_roles_and_all_dbs_filtering` |
 | reduce skip | requested skip -> 0 | `views_map_reduce_collation_and_query_options` |

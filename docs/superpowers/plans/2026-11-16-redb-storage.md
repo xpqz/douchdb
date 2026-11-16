@@ -73,6 +73,16 @@ One task because every consumer of the sequence changes together; a partial swit
 
 ### Task A3: Resume on another copy through checkpoints
 
+> **Superseded.** This task was implemented and then reverted. The
+> `resume_position` rule below is inverted: it translates through a
+> checkpoint of the serving copy reading the named copy, which says nothing
+> about changes the serving copy took from elsewhere below its `target_seq`,
+> so a resumed feed could skip them. A feed whose copy cannot serve now
+> replays that range from 0 on the serving copy. The correct translation
+> needs the serving copy's push history to the named copy (the direction of
+> CouchDB's `mem3_rep:find_source_seq`) and is issue #52. The original text
+> is kept below for the record; do not implement it.
+
 **Files:**
 - Modify: `src/fabric.rs` (cluster `_changes` when a token's copy cannot serve), `src/since.rs`.
 - Test: `src/since.rs`, `tests/conformance.rs`.

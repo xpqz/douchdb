@@ -74,9 +74,16 @@
                                (pr-str wrong))
                           {:nodes wrong :exists? exists?})))))))
 
+(def create-timeout-ms
+  "Socket timeout for creating the database. Creation fsyncs the database's
+  metadata files, and on a shared disk still writing back a fresh image build
+  each fsync can take seconds; the client operations keep the short default."
+  60000)
+
 (defn ensure-db!
   [node name]
-  (let [response (http/request :put (str (node-url node) "/" name))]
+  (let [response (binding [http/*timeout-ms* create-timeout-ms]
+                   (http/request :put (str (node-url node) "/" name)))]
     (when-not (#{200 201 202 412} (:status response))
       (throw (ex-info (str "could not create database " name " on " node)
                       {:response response})))))
