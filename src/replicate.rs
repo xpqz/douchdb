@@ -163,11 +163,13 @@ impl PullCtx<'_> {
     /// Each shard keeps its own checkpoint, in that shard's own copy, as
     /// CouchDB's internal replication does per shard copy: id
     /// `ae3:<peer>:<shard>:<peer shard uuid>`, value `{seq, source_uuid,
-    /// target_seq}` (`target_seq` is this copy's position once the peer's
-    /// changes up to `seq` were written, which lets a feed translate a
-    /// position from one copy to the other). A checkpoint names the peer's
-    /// copy it read; when the peer's copy is a new one, the peer reads that
-    /// shard from 0 and the checkpoint moves to the new uuid.
+    /// target_seq}`. `target_seq` is this copy's position once the peer's
+    /// changes up to `seq` were written. Nothing reads it today: it is
+    /// recorded for issue #52, whose translation of a feed position onto
+    /// another copy needs the serving copy's push history to the named copy
+    /// (the direction of CouchDB's `mem3_rep:find_source_seq`). A checkpoint
+    /// names the peer's copy it read; when the peer's copy is a new one, the
+    /// peer reads that shard from 0 and the checkpoint moves to the new uuid.
     async fn pull_feed(
         &self,
         feed: &Feed,
