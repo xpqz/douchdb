@@ -115,9 +115,11 @@ correctness before speed). Marked here so they can be checked.
    identity (a uuid created with the shard file, and its epochs), so a
    position is never applied to a copy that was cleared, re-seeded or
    recreated. When a feed must read a range from a different copy (node down,
-   placement change), it translates the position through the internal
-   replication checkpoints, as `mem3_rep:find_source_seq` does, and otherwise
-   restarts that range from 0. Replay is allowed; skipping never is. This
+   placement change), the range restarts from 0 on that copy (replay, never
+   skip). Translating the position as `mem3_rep:find_source_seq` does needs
+   the serving copy's push history to the named copy, which douchdb does not
+   record yet: a named gap, tracked as a follow-up. Replay is allowed;
+   skipping never is. This
    replaces `FallbackMark`/`UNKNOWN_SEQ` and the per-node vector.
 2. **Counts and offsets come from the same snapshot as the rows**, as
    CouchDB's B-tree reductions do. Reads that need `LatestChanges` or the

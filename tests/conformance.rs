@@ -20181,3 +20181,48 @@ async fn cluster_since_replays_a_range_when_its_copy_is_down() {
     let copies = seq_copies(body["last_seq"].as_str().unwrap());
     assert!(copies.iter().all(|copy| copy.0 == 1), "{copies:?}");
 }
+
+/// Write `docs` to `node` only: the forwarded marker keeps the write local.
+async fn write_locally(node: &Server, db: &str, docs: Vec<Value>) {
+    let response = node
+        .client
+        .post(format!("{}/{db}/_bulk_docs", node.base))
+        .header("x-douchdb-forwarded", "1")
+        .header("x-douchdb-secret", "test-cluster-secret")
+        .json(&json!({"docs": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// A write only the serving copy holds (a write that reached one replica
+/// alone) may sit below the checkpoint of its pull from the named copy. Resuming
+/// at that checkpoint would skip it: a replay is allowed, a skip never.
+#[tokio::test]
+async fn cluster_since_never_skips_a_write_only_the_serving_copy_had() {
+    let mut nodes = start_cluster_sharded(2, 1, 2);
+    for node in &nodes {
+        node.fresh_db("noskip").await;
+    }
+    write_locally(&nodes[1], "noskip", vec![json!({"_id": "L"})]).await;
+    write_locally(&nodes[0], "noskip", vec![json!({"_id": "X"})]).await;
+    // Node 1 pulls X from node 0; the checkpoint's target position is above L.
+    sync_node(&nodes[1], "noskip").await;
+    // Read node 0's feed to its end: its copy lacks L.
+    let (_, body) = nodes[0].get("/noskip/_changes").await;
+    assert_eq!(feed_ids(&body), vec!["X".to_string()], "{body}");
+    let token = body["last_seq"].as_str().unwrap().to_string();
+    assert!(seq_copies(&token).iter().all(|copy| copy.0 == 0));
+    let dead = nodes[0].base.clone();
+    nodes[0].kill();
+    wait_until_known_down(&nodes[1], &dead).await;
+    let (status, body) = nodes[1]
+        .get(&format!("/noskip/_changes?since={token}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        feed_ids(&body).contains(&"L".to_string()),
+        "skipped L: {body}"
+    );
+}
