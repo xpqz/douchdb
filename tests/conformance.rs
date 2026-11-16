@@ -1584,6 +1584,25 @@ fn seq_sum(token: &str) -> u64 {
         .expect("a sequence token")
 }
 
+/// Each row's shard and sequence in a full ascending feed from 0, by id:
+/// each row's position differs from the one before only in its own shard.
+fn change_positions(body: &Value) -> HashMap<String, (usize, u64)> {
+    let mut before: HashMap<usize, u64> = HashMap::new();
+    let mut out = HashMap::new();
+    for row in body["results"].as_array().expect("results") {
+        let copies = seq_copies(row["seq"].as_str().expect("row seq"));
+        let moved: Vec<(usize, u64)> = copies
+            .iter()
+            .filter(|copy| before.get(&copy.1).copied().unwrap_or(0) != copy.2)
+            .map(|copy| (copy.1, copy.2))
+            .collect();
+        assert_eq!(moved.len(), 1, "{row}");
+        before.insert(moved[0].0, moved[0].1);
+        out.insert(row["id"].as_str().unwrap().to_string(), moved[0]);
+    }
+    out
+}
+
 fn feed_ids(body: &Value) -> Vec<String> {
     body["results"]
         .as_array()
@@ -4272,17 +4291,30 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
         "resumed feed starts after last_seq"
     );
 
-    // Descending returns the requested number of distinct rows. (Rows have
-    // no order across shards, so which shard's newest come first is open.)
+    // Descending returns the requested number of distinct rows, each shard's
+    // newest first. (Rows have no order across shards, so which shard's
+    // come first is open.)
     let (_, body) = s.get("/ranges/_changes?descending=true&limit=2").await;
-    let mut ids: Vec<&str> = body["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["id"].as_str().unwrap())
-        .collect();
-    ids.dedup();
+    let ids = feed_ids(&body);
     assert_eq!(ids.len(), 2, "{body}");
+    assert_ne!(ids[0], ids[1], "{body}");
+    let (_, all) = s.get("/ranges/_changes").await;
+    let positions = change_positions(&all);
+    let mut by_shard: std::collections::BTreeMap<usize, Vec<u64>> = Default::default();
+    for id in &ids {
+        let (shard, seq) = positions[id];
+        by_shard.entry(shard).or_default().push(seq);
+    }
+    for (shard, seqs) in by_shard {
+        let mut newest: Vec<u64> = positions
+            .values()
+            .filter(|(of, _)| *of == shard)
+            .map(|(_, seq)| *seq)
+            .collect();
+        newest.sort_unstable_by(|a, b| b.cmp(a));
+        newest.truncate(seqs.len());
+        assert_eq!(seqs, newest, "shard {shard} rows are not its newest: {body}");
+    }
 
     // The live-document map is maintained after it has been built.
     let (_, doc) = s.get("/ranges/c").await;
