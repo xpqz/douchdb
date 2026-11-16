@@ -7520,7 +7520,10 @@ async fn cluster_purge_reaches_every_replica() {
     for node in &nodes {
         node.fresh_db("clpurgeall").await;
     }
-    let (status, r) = nodes[0].put("/clpurgeall/a", json!({"v": 1})).await;
+    // `w=3`: answered once every copy holds the revision. At the default
+    // quorum the third copy's write may still be in flight, and a purge
+    // reaching that copy first would be undone when the write lands.
+    let (status, r) = nodes[0].put("/clpurgeall/a?w=3", json!({"v": 1})).await;
     assert_eq!(status, StatusCode::CREATED, "{r}");
     let rev = r["rev"].as_str().unwrap().to_string();
     for node in &nodes {
