@@ -69,9 +69,8 @@ where behaviour is best-effort, it says so.
   revision. It does not emit one row for every historical sequence entry.
 - `since` accepts `0`, `now` or an opaque `<sum>-<base64url>` token, as
   CouchDB does; another plain integer is a 400. Every sequence douchdb reports
-  is such a token. In a cluster it holds a version vector so a partial fan-out
-  resumes without skipping a document; standalone it holds the node's one
-  sequence.
+  is such a token: it holds a position for each shard range, on a named shard
+  copy, standalone and in a cluster alike.
 - `limit` counts documents. `descending=true` returns newest documents first
   and, as in CouchDB 3.5, ignores `since`.
 - `pending` is the number of documents after `last_seq` in the requested
@@ -85,9 +84,15 @@ where behaviour is best-effort, it says so.
 - Continuous, longpoll and SSE feeds are at-least-once. Clients must dedupe by
   document id and revision, and must not assume a row is delivered exactly
   once.
-- A numeric cursor is watermarked across shards: it never advances past a shard
-  with an allocated-but-uncommitted sequence. A resumed feed may re-read a row
-  but does not skip one.
+- Each shard has its own sequence. A read advances a shard's position only
+  over rows it returned, or, when it read the shard to the end, up to that
+  shard's committed position at the start of the read, so a position never
+  passes a change the feed did not return. Rows from different shards are not
+  in one global order.
+- In a cluster a token resumes each range on the copy it names. A range whose
+  named copy is down, or was replaced, replays from 0 on another copy; resuming
+  from a checkpoint there, as CouchDB does, is issue #52.
+- A resumed feed may re-read rows but never skips one.
 
 ## `_all_docs`
 

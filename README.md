@@ -572,10 +572,11 @@ router; there is no coordinator role.
   requested quorum acknowledges; the remaining writes continue detached. Reads
   fan out to the replica set and enforce the requested read quorum; `?r=1` is the
   local fast path when a replica is unavailable.
-- Numeric `_changes` cursors are watermarked across shards: a cursor is not
-  advanced past a sequence that another shard has allocated but not yet
-  committed. Overlapping writes can therefore cause a short re-read, but not a
-  skipped document. Cluster feeds keep their opaque version-vector cursor.
+- `_changes` sequences are opaque tokens holding each shard copy's position.
+  A shard's position advances only over rows the feed returned, or up to the
+  shard's committed position when the read started, so a resumed feed may
+  re-read rows but never skips one. A range whose named copy is down or was
+  replaced replays from 0 (issue #52 tracks CouchDB-style resume).
 - `?w=` / `?r=` select write and read quorum. The default read quorum is
   `r = (n/2)+1`; `?r=1` is the local fast path. A read that reaches fewer than
   `r` replicas returns `503 quorum_not_met`, a deliberate departure from
@@ -613,9 +614,10 @@ router; there is no coordinator role.
   node needs them to evaluate views over its local shards.
 - Database creation and deletion are broadcast to all configured nodes; design
   documents are replicated to every node so views can run against any shard.
-- `_changes` and `GET /db` return a version vector, wrapped as an opaque
-  `<sum>-<base64url>` token, for `since` / `update_seq`, so a client that saw
-  a partial fan-out resumes without skipping changes.
+- `_changes` and `GET /db` return each shard range's position on a named
+  copy, wrapped as an opaque `<sum>-<base64url>` token, for `since` /
+  `update_seq`, so a client that saw a partial fan-out resumes without
+  skipping changes.
 
 All nodes must use identical `--nodes`, `--q`, `--n`, `--cluster-secret` and
 `--admin` credentials. The cluster secret authenticates internal routing headers,
@@ -665,14 +667,15 @@ reports how many requests from other nodes it served per protocol under
   `?cleanup=true`.
 - **AP by default, but not unconditionally available.** Concurrent writes
   converge through CouchDB revision trees; there is no Raft and no global
-  ordering beyond version vectors. A default quorum read can return `503` during
+  ordering beyond per-shard positions. A default quorum read can return `503` during
   a partition; `?r=1` is the explicit local-availability trade-off.
 - **Best-effort database lifecycle.** A node that is offline during a database
   create or drop is not repaired automatically.
 - **Node-local operations.** `_purge`, `_compact` and `_revs_limit` act only on
   the node that receives them.
-- **Per-node version vectors.** `since` is keyed by node, not by shard replica;
-  resumption is still exact, but the vector is coarser than CouchDB's.
+- **Failover replays a range.** A `since` token names a shard copy; when that
+  copy is down or was replaced, its range replays from 0 on another copy
+  rather than resuming from a checkpoint as CouchDB does (issue #52).
 - **No inter-node TLS or service accounts.** Nodes trust each other on the
   network; use a private network or a proxy if that matters.
 - **Rebalance is not consensus.** `POST /_node/_local/_dbs/{db}/rebalance`
@@ -1036,7 +1039,7 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
-- Version vectors are keyed per node, not per shard replica.
+- A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
 - `_compact` still blocks the owning shard actor, but runs through
   `block_in_place` so it does not pin a Tokio worker; at 10 GB the shard stall is
   ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency` bounds
