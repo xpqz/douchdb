@@ -696,6 +696,12 @@ impl Db {
         }
     }
 
+    /// One shard's actor, for tests that run jobs on it directly.
+    #[cfg(test)]
+    pub(crate) fn shard_handle(&self, index: usize) -> &ShardHandle {
+        &self.shards[index]
+    }
+
     /// Entries the shards hold in their live and latest-changes indexes.
     #[cfg(test)]
     pub async fn index_entries(&self) -> usize {

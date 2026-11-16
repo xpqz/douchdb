@@ -3946,6 +3946,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A job that took a sequence and then panicked leaves a gap at the end
+    /// of its shard: the shard's committed position is past its last change.
+    /// Catching up to that position must still finish, at the shard's
+    /// position, with no row to read up to it.
+    #[tokio::test]
+    async fn view_catch_up_finishes_over_a_trailing_sequence_gap() {
+        let (db, root) = two_shard_view_db("viewgap");
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let mut expected = vec![on_shard(0, "a"), on_shard(1, "b")];
+        for id in &expected {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+
+        let late = on_shard(1, "c");
+        db.put_docs(vec![json!({"_id": late})], true).await.unwrap();
+        expected.push(late);
+        expected.sort();
+        let before = db.shard_seqs()[1].1;
+        let failed = db
+            .shard_handle(1)
+            .call(|shard| -> Result<(), ApiError> {
+                shard.next_seq();
+                panic!("job failed after taking a sequence");
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(db.shard_seqs()[1].1, before + 1, "the gap is committed");
+
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows), expected);
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.lock().await.cursor,
+            crate::db::IndexCursor(db.shard_seqs())
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A shard that was cleared is a new copy with a new uuid; an index that
     /// read the old copy is rebuilt rather than keeping its rows.
     #[tokio::test]
