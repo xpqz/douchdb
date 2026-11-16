@@ -106,6 +106,17 @@ impl IndexCursor {
     pub fn since(&self) -> ShardSince {
         ShardSince(self.0.iter().map(|(_, seq)| *seq).collect())
     }
+
+    /// Whether two cursors are over the same shard copies (same uuids, in
+    /// order).
+    pub fn same_copies(&self, other: &IndexCursor) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|((left, _), (right, _))| left == right)
+    }
 }
 
 /// Whether an index that has read up to `cursor` can be brought up to date

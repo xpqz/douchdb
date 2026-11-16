@@ -759,16 +759,6 @@ fn write_changes(
     finish_writer(writer, cursor)
 }
 
-/// Whether two cursors are over the same shard copies (same uuids, in order).
-fn same_copies(left: &IndexCursor, right: &IndexCursor) -> bool {
-    left.0.len() == right.0.len()
-        && left
-            .0
-            .iter()
-            .zip(&right.0)
-            .all(|((left, _), (right, _))| left == right)
-}
-
 /// Bring the cached index up to date with the changes after its cursor,
 /// re-indexing only the documents that changed.
 async fn update_index(
@@ -784,7 +774,7 @@ async fn update_index(
     let Some(since) = entry
         .as_ref()
         .map(|cached| &cached.snapshot.meta.cursor)
-        .filter(|recorded| same_copies(recorded, &cursor))
+        .filter(|recorded| recorded.same_copies(&cursor))
         .map(IndexCursor::since)
     else {
         // A shard copy changed (cleared, recreated) since the caller checked

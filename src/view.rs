@@ -2044,46 +2044,13 @@ async fn ensure_rows(
     // the gate and the index lock moved in: they stay held until the work is
     // done even if the request is dropped meanwhile, and the async workers
     // never wait on user JavaScript or on LevelDB.
-    if index.design != design || !cursor_valid(&index.cursor, db) {
-        // The documents are read and mapped a page at a time, so a rebuild
-        // holds one page of document bodies, not the whole database's.
-        // Writes after `bound` may be read too; the next update reads them
-        // again, which only re-maps them.
-        let mut cursor = crate::db::MapCursor::default();
-        let mut rows = Vec::new();
-        let (mut gate, mut index) = (gate, index);
-        loop {
-            let docs = db.map_docs_page(None, &mut cursor, CHANGES_PAGE).await?;
-            if docs.is_empty() {
-                break;
-            }
-            let map = map.clone();
-            // Between pages, so a deleted database is noticed.
-            (gate, index, rows) = blocking(move || {
-                gate.check()?;
-                rows.extend(run_map_json(&map, &docs, limits).map_err(|reason| {
-                    ApiError::new(500, "view_error", format!("map function failed: {reason}"))
-                })?);
-                Ok((gate, index, rows))
-            })
-            .await?;
-        }
-        return blocking(move || {
-            gate.check()?;
-            index
-                .rebuild(rows, bound, &design)
-                .and_then(|()| index.sorted_rows())
-                .map_err(ApiError::from)
-        })
-        .await;
-    }
-
-    if index.cursor != bound {
+    let (mut gate, mut index) = (gate, index);
+    let mut rebuild = index.design != design || !cursor_valid(&index.cursor, db);
+    if !rebuild && index.cursor != bound {
         // Each shard is read after its own cursor up to its bound, a page at
         // a time; each page is applied and recorded before the next is read,
         // so a long catch-up holds one page of documents and a failure keeps
         // the pages already applied.
-        let (mut gate, mut index) = (gate, index);
         for shard in 0..bound.0.len() {
             let mut owned = crate::cluster::ShardMask::none(db.q);
             owned.select(shard);
@@ -2136,9 +2103,53 @@ async fn ensure_rows(
                 .await?;
             }
         }
+        // A shard cleared or recreated since the cursor was checked is a new
+        // copy: its documents may be gone without a change row, so rows
+        // caught up from it cannot be served. As a search index does, check
+        // that the copies are still the ones the index records, and rebuild
+        // at once if not.
+        if index.cursor.same_copies(&IndexCursor(db.shard_seqs())) {
+            return blocking(move || {
+                let _gate = gate;
+                index.sorted_rows().map_err(ApiError::from)
+            })
+            .await;
+        }
+        rebuild = true;
+    }
+
+    if rebuild {
+        // The documents are read and mapped a page at a time, so a rebuild
+        // holds one page of document bodies, not the whole database's.
+        // The positions are read again first, so they name the copies the
+        // documents are read from even when a shard changed since `bound`.
+        // Writes after them may be read too; the next update reads them
+        // again, which only re-maps them.
+        let bound = IndexCursor(db.shard_seqs());
+        let mut cursor = crate::db::MapCursor::default();
+        let mut rows = Vec::new();
+        loop {
+            let docs = db.map_docs_page(None, &mut cursor, CHANGES_PAGE).await?;
+            if docs.is_empty() {
+                break;
+            }
+            let map = map.clone();
+            // Between pages, so a deleted database is noticed.
+            (gate, index, rows) = blocking(move || {
+                gate.check()?;
+                rows.extend(run_map_json(&map, &docs, limits).map_err(|reason| {
+                    ApiError::new(500, "view_error", format!("map function failed: {reason}"))
+                })?);
+                Ok((gate, index, rows))
+            })
+            .await?;
+        }
         return blocking(move || {
-            let _gate = gate;
-            index.sorted_rows().map_err(ApiError::from)
+            gate.check()?;
+            index
+                .rebuild(rows, bound, &design)
+                .and_then(|()| index.sorted_rows())
+                .map_err(ApiError::from)
         })
         .await;
     }
@@ -3992,6 +4003,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(view_ids(&rows), expected);
+        let handle = index_handle(&index_path(&db, "_design/v", "v"))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.lock().await.cursor,
+            crate::db::IndexCursor(db.shard_seqs())
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A shard cleared after the update checked the index's cursor, while it
+    /// catches up, is a new copy whose documents left no change rows. The
+    /// update notices the new copy and rebuilds at once, as a search index
+    /// does, rather than serving the cleared documents until the next query.
+    #[tokio::test]
+    async fn view_rebuilds_at_once_when_a_shard_is_cleared_during_catch_up() {
+        let (db, root) = two_shard_view_db("viewclearrace");
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let kept = on_shard(0, "k");
+        db.put_docs(vec![json!({"_id": kept}), json!({"_id": on_shard(1, "g")})], true)
+            .await
+            .unwrap();
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows).len(), 2);
+        // Shard 1 has a change to catch up on.
+        db.put_docs(vec![json!({"_id": on_shard(1, "h")})], true)
+            .await
+            .unwrap();
+
+        // Hold shard 1's actor with a job that clears the shard once released.
+        // The update's read of shard 1 queues behind it, after the update has
+        // checked its cursor; only then is the clear let through.
+        let shard = db.shard_handle(1);
+        let queued = shard.jobs();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let clear = shard.call(move |s| {
+            held.recv().map_err(ApiError::internal)?;
+            s.clear().map_err(ApiError::from)
+        });
+        let update = ensure_rows(&db, "_design/v", "v", &spec, limits);
+        let let_clear_through = async {
+            while shard.jobs() < queued + 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            release.send(()).unwrap();
+        };
+        let (cleared, rows, ()) = tokio::join!(clear, update, let_clear_through);
+        cleared.unwrap();
+        assert_eq!(view_ids(&rows.unwrap()), vec![kept]);
         let handle = index_handle(&index_path(&db, "_design/v", "v"))
             .await
             .unwrap();
