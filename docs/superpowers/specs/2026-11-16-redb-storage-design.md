@@ -164,20 +164,44 @@ term's MD5 as it reads it. So:
 
 ## Database creation and deletion
 
-- **Create:** make the database directory and every shard file; write shard
-  0's `settings` (shard map, security, q, n) and commit it `Immediate` last;
-  then `fsync` the database directory (new shard files) and its parent (the
-  new directory); only then acknowledge. The committed `settings` row in
-  shard 0 is the marker that the database exists.
-- **Recovery on start:** a database directory whose shard 0 has no committed
-  `settings` row, or that is missing a shard file, was partially created. It
-  is removed, and the parent directory is `fsync`ed. It never appears in
-  `_all_dbs`.
-- **Delete:** rename the directory to a tombstone name, `fsync` the parent,
-  acknowledge, then remove the tombstone in the background. A tombstone left
-  by a crash is removed on start.
+- **Create in staging, then publish.** Build the database in a staging
+  directory whose name no database can have (a leading `.`, e.g.
+  `.creating-<uuid>`): every shard file, shard 0's `settings` (shard map,
+  security, q, n) committed `Immediate` last, then `fsync` the staging
+  directory. Publish with one `rename` to the database's directory name and
+  `fsync` the parent. Acknowledge only after that.
+- **Delete by tombstone.** Rename the database directory to
+  `.deleted-<uuid>`, `fsync` the parent, acknowledge, then remove it in the
+  background.
+- **Recovery on start removes only staging and tombstone directories**
+  (`.creating-*`, `.deleted-*`), then `fsync`s the parent. Nothing under a
+  published database name is ever removed by recovery.
+- **A published database with a missing or unopenable shard fails closed:**
+  requests to it return 500, it stays listed, and every remaining file is left
+  untouched for inspection or repair. Damage is never mistaken for an
+  interrupted create.
 - View and search index files are rebuildable from the shards, so losing a
   newly created one costs a rebuild, not data; they need no directory sync.
+- Tests: crash at every step of create and delete (staging, publish,
+  tombstone); remove or damage one shard file of an established database and
+  check it fails closed with its other files intact.
+
+## The shard handle gate
+
+Readers use the shard's `Database` off the actor, but a file can only be
+reopened once every handle to it is gone: a live clone keeps the database,
+and redb's exclusive file lock, open. So readers never hold the `Database`
+directly. They take a **lease** from the shard's gate (a clone valid for one
+request step) and give it back when that step ends. Long reads (streamed
+`_changes`, `_all_docs`, view and anti-entropy pages) take a lease per page,
+not per feed.
+
+To reopen, the actor **closes the gate** (new lease requests wait),
+**drains** it (waits until every outstanding lease is returned), drops the
+handle, reopens, rebuilds its in-memory state, and **opens the gate**.
+Waiting readers then continue on the new handle. Failed-commit recovery and
+the compaction swap both go through this. Test: recovery and swap while a
+reader holds a lease; the reopen waits for it, then succeeds.
 
 ## Failed commits
 
@@ -186,12 +210,11 @@ redb fails every later write on a handle after an I/O error during commit
 on the next open. Policy:
 
 1. The group's jobs all fail (unchanged).
-2. The shard actor drops its `Database` handle. Readers holding a clone finish
-   or fail on their own; no new reads are handed the old handle.
-3. The actor reopens the file (redb runs recovery), rebuilds its in-memory
-   indexes (`LatestChanges`, live-key rank) and settings from the committed
-   tables, and resumes.
-4. If reopening fails, the shard fails closed: every request to it returns
+2. The actor reopens through the gate (close, drain, drop, reopen): redb runs
+   recovery, and the actor rebuilds its in-memory indexes (`LatestChanges`,
+   live-key rank) and settings from the committed tables, then reopens the
+   gate.
+3. If reopening fails, the shard fails closed: every request to it returns
    500 until the database is next opened. It is never left half-usable in the
    cache.
 
@@ -199,25 +222,38 @@ on the next open. Policy:
 
 Online, as CouchDB's compactor does; the shard keeps serving throughout.
 
-1. Open a read transaction (a snapshot) at the shard's current sequence S, and
-   copy the live data into a new file `shard-NNNN.compact.redb`: every
-   document's metadata and only its leaf bodies (CouchDB drops non-leaf
-   bodies), `_local` docs, purge records, checkpoints, settings and the
-   shard's sequence and uuid.
-2. Catch up: copy what changed after S from the live file's `by_seq` table
-   into the new file, repeatedly, until the remaining gap is small.
-3. Swap, briefly on the shard actor: copy the last changes, `fsync` the new
-   file, rename it over the live file, `fsync` the directory, reopen, and
-   carry on. Readers holding the old handle finish on their snapshot.
-4. A crash at any point leaves the live file untouched; a leftover
+1. **Start a journal.** From now on, after each commit succeeds, the actor
+   records every key the transaction inserted, updated or removed, in every
+   table (`meta`, `by_seq`, `bodies`, `local`, `settings`, `checkpoints`,
+   `purge_*`). An aborted transaction records nothing. The journal is the only
+   catch-up mechanism, so purges, `_local` and settings changes, checkpoint
+   writes and deletions of any kind cannot be missed.
+2. **Copy a snapshot.** Open a read transaction and copy the live data into
+   `shard-NNNN.compact.redb`: every document's metadata and only its leaf
+   bodies (CouchDB drops non-leaf bodies), and all other tables whole,
+   including the shard's sequence and uuid.
+3. **Catch up from the journal.** Take the keys recorded so far, read each
+   one's current value from a fresh snapshot of the live file, and apply it to
+   the new file: present means upsert, absent means delete. A body key is
+   copied only if it is still a leaf. Repeat until a round is small.
+4. **Swap through the gate.** On the actor, with writes paused: apply the
+   remaining journal keys, `fsync` the new file, close and drain the gate,
+   rename the new file over the live one, `fsync` the directory, reopen, open
+   the gate, stop the journal.
+5. **Crash safety.** Until the rename, the live file is untouched; a leftover
    `.compact.redb` is deleted on start, as CouchDB discards a half-built
-   `.compact` file.
+   `.compact` file. After the rename, the new file is complete.
 
 The shard file's uuid is preserved, since the data and sequences are the same,
 so `since` tokens and index cursors stay valid across compaction.
-`Database::compact()` is not used. Tests: compact under concurrent writes and
-reads, with a crash at each step; nothing acknowledged is lost, and feeds
-neither skip nor repeat beyond what CouchDB allows.
+`Database::compact()` is not used.
+
+Tests: compaction with each kind of mutation landing during the copy, during
+catch-up and during the final swap: document update, deletion (tombstone),
+purge of a document copied earlier (must not reappear), `_local` put and
+delete, security and settings changes, checkpoint writes, purge-info
+trimming. Plus a crash at each step. Nothing acknowledged is lost, nothing
+purged returns, and feeds neither skip nor repeat beyond what CouchDB allows.
 
 ## Index cursors (views and search)
 
