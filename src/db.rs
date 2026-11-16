@@ -2258,10 +2258,11 @@ impl Db {
     ///
     /// Each shard's rows come in that shard's own sequence order; there is
     /// no order across shards (as in CouchDB). The shards are read a page at
-    /// a time in turn, so no job loads more than a page of rows and a limited
-    /// read stops as soon as it has enough. Every shard is read at most up to
-    /// its position in `until`, or else its committed position when the read
-    /// starts.
+    /// a time in turn, and a limited read stops as soon as it has enough. A
+    /// filtered read's page is 64 to 1024 rows; an unfiltered read's is the
+    /// rows still wanted, so without a limit each shard is read whole in one
+    /// job. Every shard is read at most up to its position in `until`, or
+    /// else its committed position when the read starts.
     ///
     /// The positions returned say, per selected shard, how far the rows
     /// cover it: the last row returned when the limit cut its rows short,
@@ -7015,6 +7016,70 @@ mod tests {
             .unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [25, 12, 5]);
         assert_eq!((last_seq.get(0), pending), (1, 0));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same over two shards, read newest first one shard after the
+    /// other: each shard's position is the lowest sequence scanned on it, or
+    /// its last row's when the limit cut its rows short, or its bound when
+    /// the read never reached it; `pending` counts what lies below each.
+    #[tokio::test]
+    async fn descending_filtered_changes_report_each_shards_position_and_pending() {
+        let root = std::env::temp_dir().join(format!("douchdb-descf2-{}", crate::util::uuid()));
+        let db = scan_db(&root, "descf2", 2, false);
+        let on_shard = |shard: usize, prefix: &str| {
+            (0..10_000)
+                .map(|i| format!("{prefix}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("id for shard")
+        };
+        // Shard 0: plain 1, design 2, plain 3, plain 4.
+        // Shard 1: design 1, plain 2, design 3, plain 4.
+        let shard0 = [
+            on_shard(0, "p0-"),
+            on_shard(0, "_design/a"),
+            on_shard(0, "p1-"),
+            on_shard(0, "p2-"),
+        ];
+        let shard1 = [
+            on_shard(1, "_design/c"),
+            on_shard(1, "q0-"),
+            on_shard(1, "_design/b"),
+            on_shard(1, "q1-"),
+        ];
+        for id in shard0.iter().chain(&shard1) {
+            db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        }
+        assert_eq!(
+            db.shard_seqs().iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            [4, 4]
+        );
+        let read = |limit| {
+            let db = &db;
+            async move {
+                let (rows, last, pending) = db
+                    .changes_rows(&descending_design_changes(limit))
+                    .await
+                    .unwrap();
+                let rows: Vec<(usize, u64)> = rows.iter().map(|r| (r.shard, r.seq)).collect();
+                (rows, (last.get(0), last.get(1)), pending)
+            }
+        };
+
+        // Shard 0 is scanned to its start; shard 1 is never reached, so its
+        // four changes are all still ahead.
+        assert_eq!(read(Some(1)).await, (vec![(0, 2)], (1, 4), 4));
+        // Shard 1's rows are cut by the limit after its newest design
+        // document: the two changes below it are still ahead.
+        assert_eq!(read(Some(2)).await, (vec![(0, 2), (1, 3)], (1, 3), 2));
+        // Fewer matches than the limit: both shards were scanned.
+        assert_eq!(
+            read(Some(10)).await,
+            (vec![(0, 2), (1, 3), (1, 1)], (1, 1), 0)
+        );
+        assert_eq!(read(None).await, (vec![(0, 2), (1, 3), (1, 1)], (1, 1), 0));
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
