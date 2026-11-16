@@ -39,6 +39,20 @@ that are exposed by large bulk imports and changes-feed reads:
    value branch already did. Regression test:
    `db_impl::tests::test_db_impl_get_ignores_neighbouring_tombstone`.
 
+6. **Compaction split a user key's versions across levels.** Versions of one
+   user key can end one table of a level and start the next. Upstream's
+   `setup_other_inputs` took only the tables the size or seek trigger picked,
+   so a compaction could move the newer versions one level down while the
+   older ones stayed behind. `Version::get` stops at the first level holding
+   the key, so point reads then returned the older value; iterators, which
+   merge every level, still saw the newer one. The fix ports LevelDB 1.23's
+   `AddBoundaryInputs` (`add_boundary_inputs` in `version_set.rs`), applied
+   at the same four points. Regression test:
+   `db_impl::tests::test_db_impl_point_reads_survive_compaction_of_split_user_keys`.
+   Found by the nightly Jepsen partition soak (#46): a node's point reads
+   returned a document revision dozens of updates old while `_all_docs` and
+   the files on disk held the newest.
+
 ## Upstream status of each patch
 
 Each patch has its own gate: it can be dropped only when a published
@@ -56,6 +70,7 @@ Nothing below has been filed upstream yet (filing needs approval).
 | 3d | `filter_policy.name() == "_"` skips the filter block (bloom disabled) | `table_builder.rs` | No; issue text drafted |
 | 4 | Deletion branch compares user keys | `version.rs` | No; issue text drafted |
 | 5 | Skipmap nodes owned via raw pointers (Miri/Stacked Borrows) | `skipmap.rs` | No; issue text drafted |
+| 6 | Compaction boundary inputs (`AddBoundaryInputs`) | `version_set.rs` | No; issue text drafted |
 
 The fork can be removed only when **every** row is upstreamed and released, or
 the dependency is replaced; see `docs/storage-dependency.md`.

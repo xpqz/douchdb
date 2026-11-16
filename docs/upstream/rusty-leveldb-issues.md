@@ -49,6 +49,19 @@ an older table holds it. The value branch already compares keys. Fix: require
 the found user key to equal the looked-up key in the deletion branch too.
 Regression test: `db_impl::tests::test_db_impl_get_ignores_neighbouring_tombstone`.
 
+## Patch 6: compaction moves newer versions of a key below older ones
+
+When a user key's versions are split across two adjacent tables of a level,
+`VersionSet::setup_other_inputs` compacts only the table the trigger picked.
+The newer versions move to the next level and the older ones stay, so
+`Version::get` (which stops at the first level holding the key) returns a stale
+value while iterators return the newest. LevelDB fixed this in 1.23 with
+`AddBoundaryInputs`; port it. Reproduction: overwrite 300 keys 20,000 times with
+`write_buffer_size = max_file_size = 32 KiB` and `block_size = 1 KiB`, and
+compare point reads with the last value written; a stale read appears after
+about 8,000 to 12,000 writes. Regression test:
+`db_impl::tests::test_db_impl_point_reads_survive_compaction_of_split_user_keys`.
+
 ## Patch 1: LRU list undefined behaviour
 
 Already reported upstream as PR #69 (open, unmerged at the time of writing).

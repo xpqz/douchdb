@@ -369,10 +369,16 @@ impl VersionSet {
         let current = current.borrow();
 
         let level = compaction.level;
+        add_boundary_inputs(&self.cmp, &current.files[level], &mut compaction.inputs[0]);
         let (mut smallest, mut largest) = get_range(&self.cmp, compaction.inputs[0].iter());
 
         // Set up level+1 inputs.
         compaction.inputs[1] = current.overlapping_inputs(level + 1, &smallest, &largest);
+        add_boundary_inputs(
+            &self.cmp,
+            &current.files[level + 1],
+            &mut compaction.inputs[1],
+        );
 
         let (mut allstart, mut alllimit) = get_range(
             &self.cmp,
@@ -384,7 +390,8 @@ impl VersionSet {
         // Check if we can add more inputs in the current level without having to compact more
         // inputs from level+1.
         if !compaction.inputs[1].is_empty() {
-            let expanded0 = current.overlapping_inputs(level, &allstart, &alllimit);
+            let mut expanded0 = current.overlapping_inputs(level, &allstart, &alllimit);
+            add_boundary_inputs(&self.cmp, &current.files[level], &mut expanded0);
             let inputs1_size = total_size(compaction.inputs[1].iter());
             let expanded0_size = total_size(expanded0.iter());
             // ...if we picked up more files in the current level, and the total size is acceptable
@@ -392,7 +399,8 @@ impl VersionSet {
                 && (inputs1_size + expanded0_size) < 25 * self.opt.max_file_size
             {
                 let (new_start, new_limit) = get_range(&self.cmp, expanded0.iter());
-                let expanded1 = current.overlapping_inputs(level + 1, &new_start, &new_limit);
+                let mut expanded1 = current.overlapping_inputs(level + 1, &new_start, &new_limit);
+                add_boundary_inputs(&self.cmp, &current.files[level + 1], &mut expanded1);
                 if expanded1.len() == compaction.num_inputs(1) {
                     log!(
                         self.opt.log,
@@ -966,6 +974,47 @@ fn get_range<'a, C: Cmp, I: Iterator<Item = &'a FileMetaHandle>>(
         }
     }
     (smallest.unwrap(), largest.unwrap())
+}
+
+/// Add to `inputs` every file of `level_files` that continues the user key at
+/// which the inputs end (LevelDB's `AddBoundaryInputs`, 1.23).
+///
+/// Versions of one user key can be split across two adjacent files of a level:
+/// the newer ones end the first file and the older ones start the next. A
+/// compaction that takes only the first file moves the newer versions one level
+/// down while the older ones stay behind, and a point read, which stops at the
+/// first level holding the key, then returns the older value.
+fn add_boundary_inputs(
+    cmp: &InternalKeyCmp,
+    level_files: &[FileMetaHandle],
+    inputs: &mut Vec<FileMetaHandle>,
+) {
+    let Some(mut largest) = inputs
+        .iter()
+        .map(|f| f.borrow().largest.clone())
+        .max_by(|a, b| cmp.cmp(a, b))
+    else {
+        return;
+    };
+    loop {
+        let boundary = level_files
+            .iter()
+            .filter(|f| {
+                let f = f.borrow();
+                cmp.cmp(&f.smallest, &largest) == Ordering::Greater
+                    && cmp.cmp_inner(
+                        parse_internal_key(&f.smallest).2,
+                        parse_internal_key(&largest).2,
+                    ) == Ordering::Equal
+            })
+            .min_by(|a, b| cmp.cmp(&a.borrow().smallest, &b.borrow().smallest))
+            .cloned();
+        let Some(file) = boundary else {
+            return;
+        };
+        largest = file.borrow().largest.clone();
+        inputs.push(file);
+    }
 }
 
 #[cfg(test)]

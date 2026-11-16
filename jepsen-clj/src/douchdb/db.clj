@@ -101,11 +101,13 @@
   (teardown! [_ test node]
     (let [nodes (:nodes test)
           name (or (:db-name test) (db-name))]
+      (if (= "1" (System/getenv "DOUCHDB_KEEP_CLUSTER"))
+        (info "DOUCHDB_KEEP_CLUSTER=1: keeping database" name "for inspection")
       (try
         (delete-db! node name)
         (wait-for-db nodes name false 60000)
         (catch Exception e
-          (warn e "database teardown did not complete cleanly"))))))
+          (warn e "database teardown did not complete cleanly")))))))
 
 (defn douchdb []
   (->DouchDB))

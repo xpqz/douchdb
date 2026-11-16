@@ -1836,6 +1836,47 @@ mod tests {
     /// A point read must not treat a tombstone for a neighbouring key as a
     /// deletion of the key being read. A newer table can cover the key's
     /// range, miss the key itself and hold a tombstone for the next key.
+    /// Versions of one user key can end one level-1 table and start the next.
+    /// A compaction that took only the first table used to move the newer
+    /// versions to level 2 while the older ones stayed in level 1, and a point
+    /// read, which stops at the first level holding the key, returned the older
+    /// value. Many overwrites with tiny tables force that split.
+    #[test]
+    fn test_db_impl_point_reads_survive_compaction_of_split_user_keys() {
+        let mut opt = options::for_test();
+        opt.log = None;
+        opt.filter_policy = Rc::new(Box::new(crate::filter::NoFilterPolicy::new()));
+        opt.write_buffer_size = 32 * 1024;
+        opt.max_file_size = 32 * 1024;
+        opt.block_size = 1024;
+        let mut db = DB::open("db", opt).unwrap();
+        let mut latest: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for version in 0..20_000u64 {
+            let key = format!("m/k-{}", next() % 300).into_bytes();
+            let mut value = format!("{version}:").into_bytes();
+            value.resize(100 + (next() % 2500) as usize, b'x');
+            db.put(&key, &value).unwrap();
+            latest.insert(key, value);
+            if version % 7 == 0 {
+                let probe = format!("m/k-{}", next() % 300).into_bytes();
+                let snap = db.get_snapshot();
+                let got = db.get_at(&snap, &probe).unwrap().map(|b| b.to_vec());
+                assert!(
+                    got == latest.get(&probe).cloned(),
+                    "after {version} writes a point read of {} returned a stale version",
+                    String::from_utf8_lossy(&probe)
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_db_impl_get_ignores_neighbouring_tombstone() {
         let mut opt = options::for_test();
