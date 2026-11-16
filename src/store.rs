@@ -14,6 +14,12 @@
 //! their ranks) describe the committed state only: a group's changes reach
 //! them after its commit has succeeded, so a reader on the actor sees exactly
 //! what is on disk.
+//!
+//! After an I/O error redb fails every later write on that handle. A shard
+//! whose commit failed, or whose handle an I/O error left failing, reopens
+//! its file through the gate and reloads its state from what is committed
+//! ([`Shard::recover`]); if the file cannot be reopened the shard fails
+//! closed ([`ShardState::Failed`]).
 
 #[cfg(test)]
 mod model_test;
@@ -26,7 +32,10 @@ use crate::kv::{
 };
 use crate::revtree::RevTree;
 use anyhow::Result;
-use redb::{Database, Key, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{
+    Database, Key, ReadTransaction, ReadableDatabase, ReadableTable, StorageError, TableDefinition,
+    TransactionError, WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,11 +103,39 @@ pub struct LiveDoc {
 
 /// Counts plus an optional content digest for rebalance verification.
 #[derive(Clone, Debug, Default)]
-pub struct ShardState {
+pub struct ShardSummary {
     pub docs: u64,
     pub deleted: u64,
     pub seq: u64,
     pub digest: Option<String>,
+}
+
+/// Whether a shard serves requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShardState {
+    Serving,
+    /// Its file could not be reopened after a failed commit (see
+    /// [`Shard::recover`]): every request to the shard answers 500 with this
+    /// reason until the database is next opened.
+    Failed(String),
+}
+
+/// Opens the shard's file: once when the shard starts and again whenever
+/// it recovers.
+type Opener = Box<dyn FnMut() -> Result<Database> + Send>;
+
+/// Whether `error` is an I/O failure of the storage, after which redb fails
+/// every later write on that handle (`StorageError::PreviousIo`) until the
+/// file is reopened.
+fn io_failure(error: &anyhow::Error) -> bool {
+    let io = |error: &StorageError| matches!(error, StorageError::Io(_) | StorageError::PreviousIo);
+    error.chain().any(|cause| {
+        cause.downcast_ref::<StorageError>().is_some_and(io)
+            || matches!(
+                cause.downcast_ref::<TransactionError>(),
+                Some(TransactionError::Storage(storage)) if io(storage)
+            )
+    })
 }
 
 /// Each document's latest sequence, indexed both ways: by id to update it
@@ -347,6 +384,53 @@ struct Settings {
     purged_infos_limit: u64,
 }
 
+/// The settings committed in `db`; a shard without a `revs_limit` of its
+/// own has `default_revs_limit`.
+fn load_settings(db: &Database, name: &ShardName, default_revs_limit: u64) -> Result<Settings> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(SETTINGS)?;
+    let get = |setting: &str| -> Result<Option<Vec<u8>>> {
+        match table.get(setting)? {
+            Some(stored) => Ok(Some(unsealed(Table::Settings, stored.value())?.to_vec())),
+            None => Ok(None),
+        }
+    };
+    let required = |setting: &str| -> Result<Vec<u8>> {
+        get(setting)?.ok_or_else(|| {
+            anyhow::anyhow!("corrupt shard {}/{}: no {setting}", name.db, name.shard)
+        })
+    };
+    let number = |bytes: Vec<u8>| decode_u64(Table::Settings, &bytes);
+    Ok(Settings {
+        uuid: String::from_utf8(required(UUID)?)
+            .map_err(|_| anyhow::anyhow!("Settings table: the uuid is not UTF-8"))?,
+        seq: number(required(SEQ)?)?,
+        docs: number(required(DOC_COUNT)?)?,
+        deleted: number(required(DELETED_COUNT)?)?,
+        revs_limit: get(REVS_LIMIT)?
+            .map(number)
+            .transpose()?
+            .unwrap_or(default_revs_limit),
+        purged_infos_limit: get(PURGED_INFOS_LIMIT)?
+            .map(number)
+            .transpose()?
+            .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT),
+    })
+}
+
+/// The answer to every request to the shard `name` while it is `state`
+/// [`ShardState::Failed`].
+fn failed(name: &ShardName, state: &ShardState) -> Option<ApiError> {
+    match state {
+        ShardState::Serving => None,
+        ShardState::Failed(reason) => Some(ApiError::new(
+            500,
+            "internal_server_error",
+            format!("shard {}/{} has failed: {reason}", name.db, name.shard),
+        )),
+    }
+}
+
 /// One document's change, for the in-memory indexes once its group commits.
 struct DocChange {
     id: String,
@@ -361,6 +445,11 @@ struct DocChange {
 pub struct Shard {
     /// The file, shared with the readers that lease it off the actor.
     gate: Gate,
+    /// Opens the file again when the shard recovers.
+    open: Opener,
+    /// Shared with the shard's handle, which answers for a failed shard
+    /// without a round trip.
+    state: Arc<std::sync::RwLock<ShardState>>,
     /// The file, for the integrity check when the shard closes; `None` for a
     /// test backend.
     path: Option<PathBuf>,
@@ -406,26 +495,26 @@ pub struct Shard {
 impl Shard {
     /// Open (creating if absent) the shard file at `path`.
     pub fn open(path: &Path, revs_limit: u64, cache_bytes: usize) -> Result<Shard> {
-        let db = kv::open(path, cache_bytes)?;
+        let file = path.to_path_buf();
         Shard::over(
-            db,
+            Box::new(move || Ok(kv::open(&file, cache_bytes)?)),
             Some(path.to_path_buf()),
             ShardName::of(path),
             revs_limit,
         )
     }
 
-    /// A shard over an open database. A new file gets every table, a uuid,
-    /// its sequence and counters in one transaction, so a read never finds a
-    /// table missing and a file with a uuid always has the rest.
+    /// A shard over the database `open` opens. A new file gets every table,
+    /// a uuid, its sequence and counters in one transaction, so a read never
+    /// finds a table missing and a file with a uuid always has the rest.
     fn over(
-        db: Database,
+        mut open: Opener,
         path: Option<PathBuf>,
         name: ShardName,
         revs_limit: u64,
     ) -> Result<Shard> {
-        let gate = Gate::new(db);
-        let txn = gate.begin_write()?;
+        let db = open()?;
+        let txn = db.begin_write()?;
         let fresh = {
             drop(txn.open_table(META)?);
             drop(txn.open_table(BY_SEQ)?);
@@ -453,39 +542,11 @@ impl Shard {
         } else {
             txn.abort()?;
         }
-        let settings = {
-            let txn = gate.begin_read()?;
-            let table = txn.open_table(SETTINGS)?;
-            let get = |setting: &str| -> Result<Option<Vec<u8>>> {
-                match table.get(setting)? {
-                    Some(stored) => Ok(Some(unsealed(Table::Settings, stored.value())?.to_vec())),
-                    None => Ok(None),
-                }
-            };
-            let required = |setting: &str| -> Result<Vec<u8>> {
-                get(setting)?.ok_or_else(|| {
-                    anyhow::anyhow!("corrupt shard {}/{}: no {setting}", name.db, name.shard)
-                })
-            };
-            let number = |bytes: Vec<u8>| decode_u64(Table::Settings, &bytes);
-            Settings {
-                uuid: String::from_utf8(required(UUID)?)
-                    .map_err(|_| anyhow::anyhow!("Settings table: the uuid is not UTF-8"))?,
-                seq: number(required(SEQ)?)?,
-                docs: number(required(DOC_COUNT)?)?,
-                deleted: number(required(DELETED_COUNT)?)?,
-                revs_limit: get(REVS_LIMIT)?
-                    .map(number)
-                    .transpose()?
-                    .unwrap_or(revs_limit),
-                purged_infos_limit: get(PURGED_INFOS_LIMIT)?
-                    .map(number)
-                    .transpose()?
-                    .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT),
-            }
-        };
+        let settings = load_settings(&db, &name, revs_limit)?;
         Ok(Shard {
-            gate,
+            gate: Gate::new(db),
+            open,
+            state: Arc::new(std::sync::RwLock::new(ShardState::Serving)),
             path,
             name,
             settings,
@@ -502,6 +563,116 @@ impl Shard {
             #[cfg(test)]
             fail_write_after: None,
         })
+    }
+
+    /// Recover from a failed commit, or from an I/O error that left the
+    /// handle failing every write: reopen the file through the gate (close
+    /// it, wait for every lease, drop the handle, open the file again, which
+    /// runs redb's recovery and the integrity check), reload the settings
+    /// from what is committed, and drop the in-memory indexes, which rebuild
+    /// from the committed tables on next use. The gate opens only once the
+    /// settings have loaded, so no read sees the file half recovered. If the
+    /// file cannot be opened, or it lost a change that was acknowledged
+    /// (its sequence is behind the one published), the shard fails closed:
+    /// [`ShardState::Failed`] until the database is next opened.
+    ///
+    /// Runs on the actor, between groups. Every recovery comes through here,
+    /// so whatever must learn that the file was reopened (a running
+    /// compaction's journal) is told here.
+    fn recover(&mut self, cause: &str) {
+        tracing::warn!(
+            db = %self.name.db,
+            shard = %self.name.shard,
+            cause,
+            "reopening the shard file"
+        );
+        let Shard {
+            gate,
+            open,
+            name,
+            settings,
+            default_revs_limit,
+            ..
+        } = self;
+        let mut loaded = None;
+        let reopened = gate.reopen(|| {
+            let db = open()?;
+            let found = load_settings(&db, name, *default_revs_limit)?;
+            // A commit that reported an error may still have landed, so the
+            // file may be ahead of what was published; never behind it.
+            anyhow::ensure!(
+                found.seq >= settings.seq,
+                "the file's sequence {} is behind the committed {}",
+                found.seq,
+                settings.seq
+            );
+            loaded = Some(found);
+            Ok(db)
+        });
+        self.release_indexes();
+        match (reopened, loaded) {
+            (Ok(()), Some(found)) => {
+                if found.uuid != self.settings.uuid {
+                    if let Some(shared) = &self.shared_uuid {
+                        *shared.write().unwrap_or_else(|poison| poison.into_inner()) =
+                            found.uuid.clone();
+                    }
+                }
+                self.settings = found;
+            }
+            (reopened, _) => {
+                let reason = match reopened {
+                    Err(error) => format!("{error:#}"),
+                    Ok(()) => "the shard file reopened without its settings".to_string(),
+                };
+                tracing::error!(
+                    db = %self.name.db,
+                    shard = %self.name.shard,
+                    error = %reason,
+                    "the shard file could not be reopened; the shard fails closed"
+                );
+                // Never served again: the gate is shut, or shut here.
+                drop(self.gate.shut());
+                *self
+                    .state
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner()) = ShardState::Failed(reason);
+            }
+        }
+    }
+
+    /// Whether the file's handle fails every write after an I/O error.
+    fn poisoned(&self) -> bool {
+        match self.gate.begin_write() {
+            Ok(txn) => {
+                drop(txn);
+                false
+            }
+            Err(error) => io_failure(&error),
+        }
+    }
+
+    /// The answer to every request while the shard has failed.
+    fn failure(&self) -> Option<ApiError> {
+        failed(
+            &self.name,
+            &self
+                .state
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    /// A write transaction for a group; a handle that an I/O error left
+    /// failing every write (a read, or compaction, met it) is reopened first.
+    fn begin_group(&mut self) -> Result<WriteTransaction> {
+        match self.gate.begin_write() {
+            Err(error) if io_failure(&error) => {
+                self.recover(&format!("{error:#}"));
+                self.gate.begin_write()
+            }
+            begun => begun,
+        }
     }
 
     /// The shard's committed position.
@@ -525,15 +696,27 @@ impl Shard {
         }
     }
 
-    /// A shard over a test backend.
+    /// A shard over a test disk, reopened over what the disk then holds.
     #[cfg(test)]
-    pub(crate) fn over_backend(backend: kv::powercut::PowerCut, revs_limit: u64) -> Result<Shard> {
-        let db = kv::open_with(backend, 1 << 20)?;
+    pub(crate) fn over_backend(
+        switch: &kv::powercut::PowerSwitch,
+        revs_limit: u64,
+    ) -> Result<Shard> {
+        let switch = switch.clone();
+        Shard::over_test_opener(
+            Box::new(move || Ok(kv::open_with(switch.backend(), 1 << 20)?)),
+            revs_limit,
+        )
+    }
+
+    /// A shard over the test databases `open` opens.
+    #[cfg(test)]
+    fn over_test_opener(open: Opener, revs_limit: u64) -> Result<Shard> {
         let name = ShardName {
             db: "test".to_string(),
             shard: "shard-0000".to_string(),
         };
-        Shard::over(db, None, name, revs_limit)
+        Shard::over(open, None, name, revs_limit)
     }
 
     /// Run `f` as a group of its own and answer.
@@ -663,7 +846,7 @@ impl Shard {
         first: Box<dyn ShardJob>,
         mut more: impl FnMut() -> Option<Box<dyn ShardJob>>,
     ) -> (Vec<Reply>, Option<ApiError>) {
-        let txn = match self.gate.begin_write() {
+        let txn = match self.begin_group() {
             Ok(txn) => txn,
             Err(error) => {
                 first.fail(ApiError::internal(error));
@@ -686,6 +869,7 @@ impl Shard {
                 next = more();
             }
         }
+        let mut commit_failed = false;
         let error = match aborted {
             Some(error) => {
                 // Dropping the transaction aborts it. A panicking job may
@@ -695,6 +879,7 @@ impl Shard {
                 Some(error)
             }
             None => txn.commit().err().map(|error| {
+                commit_failed = true;
                 ApiError::new(
                     500,
                     "internal_server_error",
@@ -702,6 +887,12 @@ impl Shard {
                 )
             }),
         };
+        // Before anyone hears back, so a retry meets the recovered file.
+        if let Some(error) = &error {
+            if commit_failed || self.poisoned() {
+                self.recover(&error.reason);
+            }
+        }
         (replies, error)
     }
 
@@ -1274,9 +1465,9 @@ impl<'s> ShardTxn<'s> {
         Ok(crate::util::hex(&hasher.finalize()))
     }
 
-    pub fn state(&self, with_digest: bool) -> Result<ShardState> {
+    pub fn summary(&self, with_digest: bool) -> Result<ShardSummary> {
         let (docs, deleted) = self.counts();
-        Ok(ShardState {
+        Ok(ShardSummary {
             docs,
             deleted,
             seq: self.staged.seq,
@@ -2013,8 +2204,21 @@ enum Message {
     /// A job that only reads, on the committed state.
     Read(Box<dyn ShardJob>),
     /// A job that has the shard to itself between groups and opens its own
-    /// transactions.
-    Alone(Box<dyn FnOnce(&mut Shard) + Send>),
+    /// transactions; handed the error instead when the shard has failed.
+    Alone(AloneJob),
+}
+
+/// A job run alone: handed the shard, or the error to answer with.
+type AloneJob = Box<dyn FnOnce(std::result::Result<&mut Shard, ApiError>) + Send>;
+
+impl Message {
+    /// Answer with `error` without running.
+    fn fail(self, error: ApiError) {
+        match self {
+            Message::Write(job) | Message::Read(job) => job.fail(error),
+            Message::Alone(job) => job(Err(error)),
+        }
+    }
 }
 
 /// Every shard is owned by exactly one dedicated OS thread, its only writer:
@@ -2029,6 +2233,8 @@ pub struct ShardHandle {
     seq_tracker: Arc<AtomicU64>,
     /// The shard copy's uuid, which `clear` replaces.
     uuid: Arc<std::sync::RwLock<String>>,
+    /// Shared with the shard.
+    state: Arc<std::sync::RwLock<ShardState>>,
     /// The file, for reads off the actor.
     gate: Gate,
     read_context: Arc<ReadContext>,
@@ -2062,11 +2268,12 @@ impl ShardHandle {
         })
     }
 
-    /// A shard over a test backend, on a new actor thread.
+    /// A shard over a test disk, on a new actor thread.
     #[cfg(test)]
-    pub(crate) fn over_backend(backend: kv::powercut::PowerCut) -> Result<ShardHandle> {
+    pub(crate) fn over_backend(switch: &kv::powercut::PowerSwitch) -> Result<ShardHandle> {
+        let switch = switch.clone();
         ShardHandle::spawn_with("shard-test".to_string(), Default::default(), move || {
-            Shard::over_backend(backend, 1000)
+            Shard::over_backend(&switch, 1000)
         })
     }
 
@@ -2078,7 +2285,13 @@ impl ShardHandle {
     ) -> Result<ShardHandle> {
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Message>(256);
-        type Ready = (u64, Arc<std::sync::RwLock<String>>, Gate, ReadContext);
+        type Ready = (
+            u64,
+            Arc<std::sync::RwLock<String>>,
+            Arc<std::sync::RwLock<ShardState>>,
+            Gate,
+            ReadContext,
+        );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
         let scanned = Arc::new(AtomicU64::new(0));
@@ -2102,7 +2315,13 @@ impl ShardHandle {
                 body_reads: Arc::clone(&shard.body_reads),
                 default_revs_limit: shard.default_revs_limit,
             };
-            let ready = (shard.seq(), uuid, shard.gate.clone(), context);
+            let ready = (
+                shard.seq(),
+                uuid,
+                Arc::clone(&shard.state),
+                shard.gate.clone(),
+                context,
+            );
             if ready_tx.send(Ok(ready)).is_err() {
                 return;
             }
@@ -2115,10 +2334,15 @@ impl ShardHandle {
                         None => break,
                     },
                 };
+                if let Some(error) = shard.failure() {
+                    message.fail(error);
+                    continue;
+                }
                 match message {
                     // Group commit: run a job, then every write job already
                     // queued, commit once (synced), and only then answer. A
                     // queued read ends the group and runs after its commit.
+                    // A failed commit is recovered from before the answers.
                     Message::Write(job) => {
                         let (replies, error) = shard.run_group(job, || match rx.try_recv() {
                             Ok(Message::Write(job)) => Some(job),
@@ -2143,12 +2367,18 @@ impl ShardHandle {
                             reply(None);
                         }
                     }
-                    Message::Alone(job) => job(&mut shard),
+                    Message::Alone(job) => {
+                        job(Ok(&mut shard));
+                        // Its own commits (compaction's) may have failed.
+                        if shard.poisoned() {
+                            shard.recover("an I/O error in a job run alone");
+                        }
+                    }
                 }
             }
             shard.close();
         })?;
-        let (initial_seq, uuid, gate, read_context) = ready_rx
+        let (initial_seq, uuid, state, gate, read_context) = ready_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
@@ -2157,6 +2387,7 @@ impl ShardHandle {
             thread: Some(thread),
             seq_tracker,
             uuid,
+            state,
             gate,
             read_context: Arc::new(read_context),
             jobs: AtomicU64::new(0),
@@ -2193,6 +2424,19 @@ impl ShardHandle {
             .clone()
     }
 
+    /// Whether the shard serves requests.
+    pub fn state(&self) -> ShardState {
+        self.state
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The answer to every request while the shard has failed.
+    fn failure(&self) -> Option<ApiError> {
+        failed(&self.read_context.name, &self.state())
+    }
+
     /// Jobs waiting in this shard's queue, for tests that line jobs up into
     /// one group.
     #[cfg(test)]
@@ -2208,6 +2452,9 @@ impl ShardHandle {
         answer: oneshot::Receiver<std::result::Result<R, ApiError>>,
     ) -> std::result::Result<R, ApiError> {
         self.jobs.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
         let tx = self
             .tx
             .as_ref()
@@ -2251,6 +2498,9 @@ impl ShardHandle {
         F: FnOnce(&ShardView<'_, '_>) -> std::result::Result<R, ApiError> + Send + 'static,
     {
         self.jobs.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
         let shard = Arc::clone(&self.read_context);
         self.gate
             .read(move |txn| Ok(f(&ShardView { txn, shard: &shard })))
@@ -2266,9 +2516,11 @@ impl ShardHandle {
         F: FnOnce(&mut Shard) -> std::result::Result<R, ApiError> + Send + 'static,
     {
         let (reply, answer) = oneshot::channel();
-        let job = Box::new(move |shard: &mut Shard| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard)))
-                .unwrap_or_else(|payload| Err(panicked(payload)));
+        let job = Box::new(move |shard: std::result::Result<&mut Shard, ApiError>| {
+            let result = shard.and_then(|shard| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard)))
+                    .unwrap_or_else(|payload| Err(panicked(payload)))
+            });
             let _ = reply.send(result);
         });
         self.send(Message::Alone(job), answer).await
@@ -3066,17 +3318,13 @@ pub(crate) mod tests {
     /// the cut is wholly there or wholly gone.
     #[tokio::test]
     async fn acknowledged_writes_survive_a_power_cut() {
-        let (backend, switch) = PowerCut::new();
-        let mut backend = Some(backend);
+        let (_, switch) = PowerCut::new();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         // Every acknowledged write: local id -> value.
         let mut acknowledged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut groups: Vec<Vec<String>> = Vec::new();
         for round in 0..12u64 {
-            let handle = Arc::new(
-                ShardHandle::over_backend(backend.take().unwrap_or_else(|| switch.backend()))
-                    .unwrap(),
-            );
+            let handle = Arc::new(ShardHandle::over_backend(&switch).unwrap());
             let writes = 20 + rng.below(40);
             let cut_after = rng.below(writes);
             let mut tasks = Vec::new();
@@ -3118,7 +3366,7 @@ pub(crate) mod tests {
             }
             drop(handle);
 
-            let mut shard = Shard::over_backend(switch.backend(), 1000).unwrap();
+            let mut shard = Shard::over_backend(&switch, 1000).unwrap();
             let (docs, locals) = shard
                 .read(|txn| {
                     let docs: BTreeSet<String> = txn.live_docs()?.keys().cloned().collect();
@@ -3590,5 +3838,439 @@ mod group_tests {
         assert!(result.is_err());
         assert_eq!(locals(&handle).await, ["before"]);
         cleanup(handle, file);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::tests::{write_doc, CACHE};
+    use super::*;
+    use crate::kv::powercut::{PowerCut, PowerSwitch};
+    use std::io::ErrorKind;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{mpsc::UnboundedReceiver, watch};
+
+    /// A shard on its own actor over a test disk. Every open after the
+    /// first (a recovery) reports on `opening` whether `held` was set, then
+    /// waits for `go`.
+    struct Rig {
+        switch: PowerSwitch,
+        handle: Arc<ShardHandle>,
+        held: Arc<AtomicBool>,
+        opening: UnboundedReceiver<bool>,
+        go: std::sync::mpsc::Sender<()>,
+        committed: Arc<watch::Sender<()>>,
+    }
+
+    fn rig() -> Rig {
+        let (_, switch) = PowerCut::new();
+        let held = Arc::new(AtomicBool::new(false));
+        let (opening_tx, opening) = tokio::sync::mpsc::unbounded_channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let committed: Arc<watch::Sender<()>> = Default::default();
+        let disk = switch.clone();
+        let lease_held = Arc::clone(&held);
+        let mut first = true;
+        let open: Opener = Box::new(move || {
+            if !std::mem::take(&mut first) {
+                let _ = opening_tx.send(lease_held.load(Ordering::SeqCst));
+                go_rx.recv()?;
+            }
+            Ok(kv::open_with(disk.backend(), CACHE)?)
+        });
+        let handle = ShardHandle::spawn_with(
+            "shard-recovery".to_string(),
+            Arc::clone(&committed),
+            move || Shard::over_test_opener(open, 1000),
+        )
+        .unwrap();
+        Rig {
+            switch,
+            handle: Arc::new(handle),
+            held,
+            opening,
+            go,
+            committed,
+        }
+    }
+
+    /// Write a new document `id`; its sequence.
+    async fn put(handle: &ShardHandle, id: &str, n: u64) -> std::result::Result<u64, ApiError> {
+        let id = id.to_string();
+        handle
+            .call(move |txn| {
+                write_doc(txn, &id, false, b"{}", n)?;
+                Ok(txn.staged.seq)
+            })
+            .await
+    }
+
+    /// A write on a full disk, started.
+    fn put_on_full_disk(
+        rig: &Rig,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<std::result::Result<u64, ApiError>> {
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let handle = Arc::clone(&rig.handle);
+        tokio::spawn(async move { put(&handle, id, 99).await })
+    }
+
+    /// Wait until the shard reopens its file, failing if `write` is answered
+    /// first: the answer to a failed commit comes after the recovery.
+    async fn reopening<T: std::fmt::Debug>(
+        rig: &mut Rig,
+        write: &mut tokio::task::JoinHandle<std::result::Result<T, ApiError>>,
+    ) -> bool {
+        tokio::select! {
+            held = rig.opening.recv() => held.unwrap(),
+            answer = write => panic!("answered without reopening the file: {answer:?}"),
+        }
+    }
+
+    /// The sequence index in a lease of its own: (sequence, id) pairs.
+    async fn by_seq(handle: &ShardHandle) -> Vec<(u64, String)> {
+        handle
+            .lease(|s| {
+                let mut rows = Vec::new();
+                s.txn.scan(Table::BySeq, .., false, |key, id| {
+                    rows.push((gate::key::split_seq(key)?, String::from_utf8(id.to_vec())?));
+                    Ok(true)
+                })?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+    }
+
+    fn rows(ids: &[(u64, &str)]) -> Vec<(u64, String)> {
+        ids.iter().map(|(seq, id)| (*seq, id.to_string())).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_commit_reopens_the_shard_and_keeps_acknowledged_writes() {
+        let mut rig = rig();
+        assert_eq!(put(&rig.handle, "a", 1).await.unwrap(), 1);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing
+            .await
+            .unwrap()
+            .expect_err("a write to a full disk was acknowledged");
+        assert_eq!(error.status, 500, "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.committed_seq(), 2);
+        assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
+        assert_eq!(
+            by_seq(&rig.handle).await,
+            rows(&[(1, "a"), (2, "b"), (3, "c")])
+        );
+        let counts = rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+        assert_eq!(counts, (3, 0));
+
+        // And on disk.
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a", "b", "c"]);
+        assert_eq!(shard.seq(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shard_that_cannot_reopen_fails_closed() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        // A job queued behind the recovery.
+        let queued = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.read(|txn| Ok(txn.counts())).await }
+        });
+        while rig.handle.queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+        // The disk is still full, so the file cannot be opened.
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        let error = queued.await.unwrap().unwrap_err();
+        assert!(error.reason.contains("has failed"), "{error:?}");
+        assert!(
+            matches!(rig.handle.state(), ShardState::Failed(_)),
+            "{:?}",
+            rig.handle.state()
+        );
+
+        // Room on the disk again does not bring it back: every request
+        // fails until the database is next opened.
+        rig.switch.restore_writes();
+        fn failed<T: std::fmt::Debug>(result: std::result::Result<T, ApiError>) {
+            let error = result.expect_err("a failed shard answered");
+            assert_eq!(error.status, 500, "{error:?}");
+        }
+        failed(put(&rig.handle, "b", 2).await);
+        failed(rig.handle.read(|txn| Ok(txn.counts())).await);
+        failed(rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await);
+        failed(rig.handle.alone(|shard| Ok(shard.seq())).await);
+        assert_eq!(rig.handle.committed_seq(), 1);
+
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a"]);
+    }
+
+    /// The published position never goes back: a file that comes back
+    /// without changes that were acknowledged (here, a disk that ignored
+    /// syncs and then lost power) fails the shard instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reopened_file_missing_acknowledged_changes_fails_closed() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        rig.switch.ignore_syncs();
+        put(&rig.handle, "b", 2).await.unwrap();
+        rig.switch.cut();
+
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "c", 3).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        match rig.handle.state() {
+            ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
+            state => panic!("served a file that lost acknowledged changes: {state:?}"),
+        }
+        assert_eq!(rig.handle.committed_seq(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_waits_for_a_reader_holding_a_lease() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            let held = Arc::clone(&rig.held);
+            async move {
+                handle
+                    .lease(move |s| {
+                        held.store(true, Ordering::SeqCst);
+                        let found = s.get_meta("a")?.is_some();
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        held.store(false, Ordering::SeqCst);
+                        Ok(found)
+                    })
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        // The recovery has closed the gate and waits for the lease.
+        rig.handle.gate.closed().await;
+        release_tx.send(()).unwrap();
+        assert!(
+            !reopening(&mut rig, &mut failing).await,
+            "reopened while a lease was out"
+        );
+        assert!(reader.await.unwrap().unwrap());
+
+        // A read asked for during the reopen waits, then runs on the new file.
+        let waiting = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await }
+        });
+        rig.handle.gate.waiting_reads(1).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        assert!(waiting.await.unwrap().unwrap());
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_io_error_inside_a_group_reopens_the_shard() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        // Too big for the page cache: its pages reach the disk, and fail,
+        // before the group gets to commit.
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move {
+                handle
+                    .call(|txn| write_doc(txn, "big", false, &vec![b'x'; 8 << 20], 2))
+                    .await
+            }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert_eq!(error.status, 500, "{error:?}");
+        assert!(
+            !error.reason.starts_with("shard commit failed"),
+            "the write did not fail before the commit: {error:?}"
+        );
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a"), (2, "b")]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_left_failing_by_a_job_run_alone_is_reopened() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let failed = rig
+            .handle
+            .alone(|shard| {
+                let commit = || -> Result<()> {
+                    let txn = shard.gate.begin_write()?;
+                    txn.open_table(LOCAL)?
+                        .insert("x", kv::seal(b"x").as_slice())?;
+                    txn.commit()?;
+                    Ok(())
+                };
+                commit().map_err(ApiError::from)
+            })
+            .await;
+        assert!(failed.is_err());
+        // The job has answered; the actor reopens the file before the next
+        // job, a read, which would otherwise meet the failing handle.
+        let mut next = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.read(|txn| Ok(txn.counts())).await }
+        });
+        reopening(&mut rig, &mut next).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(next.await.unwrap().unwrap(), (1, 0));
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+    }
+
+    #[test]
+    fn a_handle_left_failing_is_reopened_before_the_next_group() {
+        let (_, switch) = PowerCut::new();
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        shard
+            .write(|txn| write_doc(txn, "a", false, b"{}", 1))
+            .unwrap();
+        // A commit outside any group fails, and the handle with it.
+        switch.fail_writes(ErrorKind::StorageFull);
+        let txn = shard.gate.begin_write().unwrap();
+        txn.open_table(LOCAL)
+            .unwrap()
+            .insert("x", kv::seal(b"x").as_slice())
+            .unwrap();
+        assert!(txn.commit().is_err());
+        switch.restore_writes();
+        assert!(shard.poisoned());
+
+        shard
+            .write(|txn| write_doc(txn, "b", false, b"{}", 2))
+            .unwrap();
+        assert!(!shard.poisoned());
+        assert_eq!(shard.seq(), 2);
+        assert_eq!(*shard.state.read().unwrap(), ShardState::Serving);
+    }
+
+    /// A continuous feed reading the sequence index a page (one lease) at a
+    /// time up to the published committed position, open across a recovery:
+    /// it does not hold up the reopen, and gets every acknowledged change
+    /// once, in order, and nothing of the failed group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_continuous_feed_survives_recovery_without_skipping() {
+        let mut rig = rig();
+        for n in 1..=5 {
+            put(&rig.handle, &format!("d{n}"), n).await.unwrap();
+        }
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let feed = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            let mut commits = rig.committed.subscribe();
+            let mut hold = Some((entered_tx, release_rx));
+            async move {
+                let mut seen: Vec<(u64, String)> = Vec::new();
+                let (mut cursor, mut published) = (0, 0);
+                while seen.len() < 10 {
+                    let bound = handle.committed_seq();
+                    assert!(bound >= published, "the committed position went back");
+                    published = bound;
+                    if cursor == bound {
+                        commits.changed().await.unwrap();
+                        continue;
+                    }
+                    // The page after d4 keeps its lease until released.
+                    let held = if cursor == 4 { hold.take() } else { None };
+                    let page = handle
+                        .lease(move |s| {
+                            let mut page = Vec::new();
+                            let range = gate::key::seq(cursor + 1)..=gate::key::seq(bound);
+                            s.txn.scan(Table::BySeq, range, false, |key, id| {
+                                let id = String::from_utf8(id.to_vec())?;
+                                page.push((gate::key::split_seq(key)?, id));
+                                Ok(page.len() < 2)
+                            })?;
+                            if let Some((entered, release)) = held {
+                                entered.send(()).unwrap();
+                                release.recv().unwrap();
+                            }
+                            Ok(page)
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!page.is_empty(), "nothing after {cursor} up to {bound}");
+                    for (seq, id) in page {
+                        assert!(
+                            seq > cursor && seq <= bound,
+                            "{seq} outside ({cursor}, {bound}]"
+                        );
+                        cursor = seq;
+                        seen.push((seq, id));
+                    }
+                }
+                seen
+            }
+        });
+        entered_rx.await.unwrap();
+
+        // The commit fails while the feed holds a page's lease; the reopen
+        // waits for that page only, not for the feed.
+        let mut failing = put_on_full_disk(&rig, "lost");
+        rig.handle.gate.closed().await;
+        release_tx.send(()).unwrap();
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        assert!(!feed.is_finished());
+
+        for n in 6..=10 {
+            assert_eq!(put(&rig.handle, &format!("d{n}"), n).await.unwrap(), n);
+        }
+        let expected: Vec<(u64, String)> = (1..=10).map(|n| (n, format!("d{n}"))).collect();
+        assert_eq!(feed.await.unwrap(), expected);
     }
 }

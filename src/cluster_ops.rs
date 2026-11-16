@@ -4,7 +4,7 @@
 use crate::cluster::ShardMap;
 use crate::cluster_http::{internal_request, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db, DbResult};
-use crate::store::ShardState;
+use crate::store::ShardSummary;
 use axum::http::{header, HeaderMap, StatusCode};
 use futures::future::join_all;
 use serde_json::{json, Value};
@@ -209,7 +209,7 @@ async fn fetch_shard_states(
     node: usize,
     headers: &HeaderMap,
     with_digest: bool,
-) -> Option<Vec<ShardState>> {
+) -> Option<Vec<ShardSummary>> {
     if node == ctx.cluster.me {
         return db.shard_states(with_digest).await.ok();
     }
@@ -228,7 +228,7 @@ async fn fetch_shard_states(
     let value = send_peer(request).await.ok()?.json::<Value>().await.ok()?;
     let mut out = Vec::new();
     for row in value["shards"].as_array()? {
-        out.push(ShardState {
+        out.push(ShardSummary {
             docs: row.get("docs").and_then(Value::as_u64).unwrap_or(0),
             deleted: row.get("deleted").and_then(Value::as_u64).unwrap_or(0),
             seq: row.get("seq").and_then(Value::as_u64).unwrap_or(0),
@@ -258,7 +258,7 @@ async fn fetch_states(
     nodes: &[usize],
     headers: &HeaderMap,
     with_digest: bool,
-) -> Vec<Option<Vec<ShardState>>> {
+) -> Vec<Option<Vec<ShardSummary>>> {
     let fetched = crate::cluster_http::in_one_round(futures::future::join_all(
         nodes
             .iter()
@@ -311,21 +311,21 @@ fn remaining(deadline: std::time::Instant) -> std::time::Duration {
     deadline.saturating_duration_since(std::time::Instant::now())
 }
 
-fn same_shard_content(left: &ShardState, right: &ShardState) -> bool {
+fn same_shard_content(left: &ShardSummary, right: &ShardSummary) -> bool {
     left.docs == right.docs && left.deleted == right.deleted && left.digest == right.digest
 }
 
 /// Per-shard source digest, or `None` while old replicas disagree, are
 /// unreachable, or did not produce a digest.
 fn source_required(
-    states: &[Option<Vec<ShardState>>],
+    states: &[Option<Vec<ShardSummary>>],
     old_map: &ShardMap,
     q: u32,
     require_digest: bool,
-) -> Option<Vec<ShardState>> {
+) -> Option<Vec<ShardSummary>> {
     let mut required = Vec::with_capacity(q as usize);
     for shard in 0..q {
-        let mut chosen: Option<&ShardState> = None;
+        let mut chosen: Option<&ShardSummary> = None;
         for node in old_map.replicas_of(shard) {
             // Every old owner must answer; otherwise a replica that is merely
             // unreachable could be dropped while it still holds newer writes.
@@ -358,7 +358,7 @@ async fn stable_source_states(
     headers: &HeaderMap,
     grace: std::time::Duration,
     shutdown: &CancellationToken,
-) -> DbResult<Vec<ShardState>> {
+) -> DbResult<Vec<ShardSummary>> {
     let deadline = std::time::Instant::now() + grace;
     let owners = owners_of(&[old_map]);
     let mut delay = Backoff::new(100, 1_000);

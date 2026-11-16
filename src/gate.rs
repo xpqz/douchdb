@@ -163,7 +163,8 @@ enum Phase {
     Open,
     /// A reopen is under way: new reads wait for it.
     Closed,
-    /// The file is closed for good, or a reopen failed: reads fail.
+    /// The file is closed for good, or a reopen failed or panicked: reads
+    /// fail, and the gate never opens again.
     Shut,
 }
 
@@ -379,6 +380,15 @@ impl LeaseTxn<'_> {
     }
 }
 
+/// What a panic's payload says.
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 impl Gate {
     /// A gate, open, over `db`.
     pub fn new(db: Database) -> Gate {
@@ -430,15 +440,10 @@ impl Gate {
         .await;
         match ran {
             Ok(result) => result,
-            Err(error) if error.is_panic() => {
-                let payload = error.into_panic();
-                let reason = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                Err(anyhow!("shard read panicked: {reason}"))
-            }
+            Err(error) if error.is_panic() => Err(anyhow!(
+                "shard read panicked: {}",
+                panic_reason(&*error.into_panic())
+            )),
             Err(error) => Err(anyhow!("shard read did not run: {error}")),
         }
     }
@@ -485,21 +490,43 @@ impl Gate {
 
     /// Close the gate, wait until every lease is back, drop the database,
     /// open the one `open` returns and open the gate on it. Reads asked for
-    /// meanwhile wait, then run on the new database. If `open` fails the
-    /// gate stays shut and every read fails. Blocks: call it from the
-    /// shard's own thread (or the blocking pool), holding no transaction.
+    /// meanwhile wait, then run on the new database. If `open` fails or
+    /// panics, the gate is shut and every read fails (a panic is returned as
+    /// an error). A gate already shut stays shut: the reopen fails without
+    /// calling `open`. Blocks: call it from the shard's own thread (or the
+    /// blocking pool), holding no transaction.
     pub fn reopen(&self, open: impl FnOnce() -> Result<Database>) -> Result<()> {
-        self.set_phase(Phase::Closed);
-        let old = self.inner.drain().db.take();
-        drop(old);
-        match open() {
+        {
+            let _state = self.inner.lock();
+            if *self.inner.phase.borrow() == Phase::Shut {
+                anyhow::bail!("the shard file is closed");
+            }
+            self.inner.phase.send_replace(Phase::Closed);
+        }
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let old = self.inner.drain().db.take();
+            drop(old);
+            open()
+        }))
+        .unwrap_or_else(|payload| {
+            Err(anyhow!(
+                "reopening the shard file panicked: {}",
+                panic_reason(&*payload)
+            ))
+        });
+        let mut state = self.inner.lock();
+        match opened {
+            // Shut meanwhile: the new database is dropped, not served.
+            Ok(_) if *self.inner.phase.borrow() == Phase::Shut => {
+                Err(anyhow!("the shard file is closed"))
+            }
             Ok(db) => {
-                self.inner.lock().db = Some(db);
-                self.set_phase(Phase::Open);
+                state.db = Some(db);
+                self.inner.phase.send_replace(Phase::Open);
                 Ok(())
             }
             Err(error) => {
-                self.set_phase(Phase::Shut);
+                self.inner.phase.send_replace(Phase::Shut);
                 Err(error)
             }
         }
@@ -875,6 +902,106 @@ mod tests {
             let result = gate.read(move |txn| txn.get(table, &key)).await;
             assert!(result.is_err(), "{table:?}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_open_shuts_the_gate_and_fails_waiting_reads() {
+        let scratch = Scratch::new("panic");
+        let path = scratch.file("shard-0000.redb");
+        let gate = Gate::new(database(&path, "a", "1"));
+
+        let (opening_tx, opening_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reopening = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.reopen(|| {
+                    opening_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    panic!("open blew up");
+                })
+            }
+        });
+        opening_rx.await.unwrap();
+        let waiting = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.read(|txn| txn.len(Table::Meta)).await }
+        });
+        gate.waiting_reads(1).await;
+        go_tx.send(()).unwrap();
+
+        let error = reopening
+            .join()
+            .expect("the panic was caught")
+            .expect_err("a panicking open reopened the gate");
+        assert!(format!("{error:#}").contains("open blew up"), "{error:#}");
+        let error = waiting
+            .await
+            .unwrap()
+            .expect_err("a waiting read ran after a panicking open");
+        assert!(format!("{error:#}").contains("closed"), "{error:#}");
+        let error = gate
+            .read(|txn| txn.len(Table::Meta))
+            .await
+            .expect_err("a read ran after a panicking open");
+        assert!(format!("{error:#}").contains("closed"), "{error:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gate_shut_during_a_reopen_stays_shut() {
+        let scratch = Scratch::new("shut-during");
+        let path = scratch.file("shard-0000.redb");
+        let gate = Gate::new(database(&path, "a", "1"));
+
+        let (opening_tx, opening_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let reopening = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.reopen(|| {
+                    opening_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(kv::open(&path, CACHE)?)
+                })
+            }
+        });
+        opening_rx.await.unwrap();
+        // The old database is already gone; the new one is never served.
+        assert!(gate.shut().is_none());
+        go_tx.send(()).unwrap();
+        reopening
+            .join()
+            .unwrap()
+            .expect_err("a reopen opened a gate shut meanwhile");
+        assert!(gate.read(|txn| txn.len(Table::Meta)).await.is_err());
+        assert!(gate.shut().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shut_gate_is_not_reopened() {
+        let scratch = Scratch::new("shut-reopen");
+        let path = scratch.file("shard-0000.redb");
+        let gate = Gate::new(database(&path, "a", "1"));
+        drop(gate.shut().expect("the open database"));
+
+        let called = Arc::new(AtomicBool::new(false));
+        let reopening = gate.clone();
+        let flag = Arc::clone(&called);
+        tokio::task::spawn_blocking(move || {
+            reopening.reopen(|| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(kv::open(&path, CACHE)?)
+            })
+        })
+        .await
+        .unwrap()
+        .expect_err("a shut gate reopened");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "opened a file for a shut gate"
+        );
+        assert!(gate.read(|txn| txn.len(Table::Meta)).await.is_err());
+        assert!(gate.shut().is_none());
     }
 
     #[tokio::test]

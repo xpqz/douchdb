@@ -1430,12 +1430,15 @@ impl Db {
         Ok(out)
     }
 
-    pub async fn shard_states(&self, with_digest: bool) -> DbResult<Vec<crate::store::ShardState>> {
+    pub async fn shard_states(
+        &self,
+        with_digest: bool,
+    ) -> DbResult<Vec<crate::store::ShardSummary>> {
         let mut out = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
             out.push(
                 shard
-                    .read(move |s| s.state(with_digest).map_err(ApiError::from))
+                    .read(move |s| s.summary(with_digest).map_err(ApiError::from))
                     .await?,
             );
         }

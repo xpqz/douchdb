@@ -30,7 +30,8 @@ pub struct PowerCut {
     generation: u64,
 }
 
-/// The test's handle on the disk under a [`PowerCut`].
+/// The test's handle on the disk under a [`PowerCut`]. Clones share the disk.
+#[derive(Clone)]
 pub struct PowerSwitch {
     disk: Arc<Mutex<Disk>>,
 }
@@ -75,6 +76,11 @@ impl PowerSwitch {
     /// full disk).
     pub fn fail_writes(&self, error: ErrorKind) {
         self.disk.lock().unwrap().failing = Some(error);
+    }
+
+    /// Let writes and syncs succeed again: the disk has room once more.
+    pub fn restore_writes(&self) {
+        self.disk.lock().unwrap().failing = None;
     }
 
     /// Make every later `sync_data` a no-op that reports success: a build
