@@ -4313,7 +4313,10 @@ async fn all_docs_ranges_and_changes_limits_after_deletes() {
             .collect();
         newest.sort_unstable_by(|a, b| b.cmp(a));
         newest.truncate(seqs.len());
-        assert_eq!(seqs, newest, "shard {shard} rows are not its newest: {body}");
+        assert_eq!(
+            seqs, newest,
+            "shard {shard} rows are not its newest: {body}"
+        );
     }
 
     // The live-document map is maintained after it has been built.

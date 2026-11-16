@@ -7053,7 +7053,10 @@ mod tests {
             db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
         }
         assert_eq!(
-            db.shard_seqs().iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            db.shard_seqs()
+                .iter()
+                .map(|(_, seq)| *seq)
+                .collect::<Vec<_>>(),
             [4, 4]
         );
         let read = |limit| {
@@ -7099,7 +7102,10 @@ mod tests {
                 .unwrap();
         }
         let positions = |token: &str| {
-            db.shard_since(0, &crate::since::Since::Token(crate::since::decode(token).unwrap()))
+            db.shard_since(
+                0,
+                &crate::since::Since::Token(crate::since::decode(token).unwrap()),
+            )
         };
         let opts = ChangesOpts {
             descending: true,

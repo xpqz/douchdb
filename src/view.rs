@@ -4034,9 +4034,12 @@ mod tests {
         };
         let limits = ViewQuery::default().limits;
         let kept = on_shard(0, "k");
-        db.put_docs(vec![json!({"_id": kept}), json!({"_id": on_shard(1, "g")})], true)
-            .await
-            .unwrap();
+        db.put_docs(
+            vec![json!({"_id": kept}), json!({"_id": on_shard(1, "g")})],
+            true,
+        )
+        .await
+        .unwrap();
         let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
             .await
             .unwrap();
