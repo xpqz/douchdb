@@ -118,6 +118,9 @@ pub enum ShardState {
     /// [`Shard::recover`]): every request to the shard answers 500 with this
     /// reason until the database is next opened.
     Failed(String),
+    /// Its database was deleted: every request answers `not_found`, as
+    /// CouchDB answers for a database that is gone.
+    Deleted,
 }
 
 /// Opens the shard's file: once when the shard starts and again whenever
@@ -384,6 +387,87 @@ struct Settings {
     purged_infos_limit: u64,
 }
 
+/// Give a new file every table, a uuid, its sequence and counters in one
+/// transaction, so a read never finds a table missing and a file with a uuid
+/// always has the rest. A file that has them already is left alone.
+fn init_tables(db: &Database) -> Result<()> {
+    let txn = db.begin_write()?;
+    let fresh = {
+        drop(txn.open_table(META)?);
+        drop(txn.open_table(BY_SEQ)?);
+        drop(txn.open_table(BODIES)?);
+        drop(txn.open_table(LOCAL)?);
+        drop(txn.open_table(PURGE_INFOS)?);
+        drop(txn.open_table(PURGED_REVS)?);
+        drop(txn.open_table(PURGE_UUIDS)?);
+        drop(txn.open_table(CHECKPOINTS)?);
+        let mut settings = txn.open_table(SETTINGS)?;
+        // Only a new file has no settings at all; one that lost some is
+        // damaged, and fails in `load_settings` rather than starting over.
+        if settings.first()?.is_none() {
+            settings.insert(UUID, kv::seal(crate::util::uuid().as_bytes()).as_slice())?;
+            for counter in [SEQ, DOC_COUNT, DELETED_COUNT] {
+                settings.insert(counter, kv::seal(&0u64.to_be_bytes()).as_slice())?;
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if fresh {
+        txn.commit()?;
+    } else {
+        txn.abort()?;
+    }
+    Ok(())
+}
+
+/// Create the shard file at `path` with every table and its settings, and
+/// return it open. Fails if a file is there already.
+pub fn create_file(path: &Path, cache_bytes: usize) -> Result<Database> {
+    let db = kv::create(path, cache_bytes)?;
+    init_tables(&db)?;
+    Ok(db)
+}
+
+/// Store `rows` in the settings table of `db` in one transaction, committed
+/// durably (redb's default, `Immediate`), for a file no shard has open.
+pub fn put_settings(db: &Database, rows: &[(&str, Vec<u8>)]) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut settings = txn.open_table(SETTINGS)?;
+        for (name, value) in rows {
+            settings.insert(*name, kv::seal(value).as_slice())?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// The committed settings whose names start with `prefix`, checked against
+/// their checksums.
+fn settings_in(txn: &ReadTransaction, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let table = txn.open_table(SETTINGS)?;
+    let mut rows = Vec::new();
+    for entry in table.range(prefix..)? {
+        let (name, stored) = entry?;
+        let name = name.value();
+        if !name.starts_with(prefix) {
+            break;
+        }
+        rows.push((
+            name.to_string(),
+            unsealed(Table::Settings, stored.value())?.to_vec(),
+        ));
+    }
+    Ok(rows)
+}
+
+/// [`settings_in`] the file `db`, for one no shard has open.
+pub fn read_settings(db: &Database, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    settings_in(&db.begin_read()?, prefix)
+}
+
 /// The settings committed in `db`; a shard without a `revs_limit` of its
 /// own has `default_revs_limit`.
 fn load_settings(db: &Database, name: &ShardName, default_revs_limit: u64) -> Result<Settings> {
@@ -428,6 +512,7 @@ fn failed(name: &ShardName, state: &ShardState) -> Option<ApiError> {
             "internal_server_error",
             format!("shard {}/{} has failed: {reason}", name.db, name.shard),
         )),
+        ShardState::Deleted => Some(ApiError::db_not_found()),
     }
 }
 
@@ -493,7 +578,7 @@ pub struct Shard {
 }
 
 impl Shard {
-    /// Open (creating if absent) the shard file at `path`.
+    /// Open the existing shard file at `path` (see [`create_file`]).
     pub fn open(path: &Path, revs_limit: u64, cache_bytes: usize) -> Result<Shard> {
         let file = path.to_path_buf();
         Shard::over(
@@ -514,34 +599,7 @@ impl Shard {
         revs_limit: u64,
     ) -> Result<Shard> {
         let db = open()?;
-        let txn = db.begin_write()?;
-        let fresh = {
-            drop(txn.open_table(META)?);
-            drop(txn.open_table(BY_SEQ)?);
-            drop(txn.open_table(BODIES)?);
-            drop(txn.open_table(LOCAL)?);
-            drop(txn.open_table(PURGE_INFOS)?);
-            drop(txn.open_table(PURGED_REVS)?);
-            drop(txn.open_table(PURGE_UUIDS)?);
-            drop(txn.open_table(CHECKPOINTS)?);
-            let mut settings = txn.open_table(SETTINGS)?;
-            // Only a new file has no settings at all; one that lost some is
-            // damaged, and fails below rather than starting over.
-            if settings.first()?.is_none() {
-                settings.insert(UUID, kv::seal(crate::util::uuid().as_bytes()).as_slice())?;
-                for counter in [SEQ, DOC_COUNT, DELETED_COUNT] {
-                    settings.insert(counter, kv::seal(&0u64.to_be_bytes()).as_slice())?;
-                }
-                true
-            } else {
-                false
-            }
-        };
-        if fresh {
-            txn.commit()?;
-        } else {
-            txn.abort()?;
-        }
+        init_tables(&db)?;
         let settings = load_settings(&db, &name, revs_limit)?;
         Ok(Shard {
             gate: Gate::new(db),
@@ -767,6 +825,12 @@ impl Shard {
                 "shard file failed its integrity check on close"
             );
         }
+    }
+
+    /// Close the file of a deleted database without checking it: it will
+    /// never be opened again, so there is nothing to record.
+    fn discard(self) {
+        drop(self.gate.shut());
     }
 
     /// Share the handle's counters as this shard's scanned-entries and
@@ -1265,6 +1329,16 @@ impl<'s> ShardTxn<'s> {
 
     pub fn purged_infos_limit(&self) -> u64 {
         self.staged.purged_infos_limit
+    }
+
+    /// Store `value` under the setting `name`, with this group's commit.
+    pub fn put_setting(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        self.put_value(SETTINGS, name, value)
+    }
+
+    /// Remove the setting `name`, with this group's commit.
+    pub fn remove_setting(&mut self, name: &str) -> Result<()> {
+        self.remove_value(SETTINGS, name)
     }
 
     pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {
@@ -2206,6 +2280,9 @@ enum Message {
     /// A job that has the shard to itself between groups and opens its own
     /// transactions; handed the error instead when the shard has failed.
     Alone(AloneJob),
+    /// Stop: the database is deleted. The file is closed unchecked, and the
+    /// sender hears once it is.
+    Close(oneshot::Sender<()>),
 }
 
 /// A job run alone: handed the shard, or the error to answer with.
@@ -2217,6 +2294,7 @@ impl Message {
         match self {
             Message::Write(job) | Message::Read(job) => job.fail(error),
             Message::Alone(job) => job(Err(error)),
+            Message::Close(done) => drop(done),
         }
     }
 }
@@ -2326,6 +2404,7 @@ impl ShardHandle {
                 return;
             }
             let mut next = None;
+            let mut deleted = None;
             loop {
                 let message = match next.take() {
                     Some(message) => message,
@@ -2335,10 +2414,16 @@ impl ShardHandle {
                     },
                 };
                 if let Some(error) = shard.failure() {
-                    message.fail(error);
-                    continue;
+                    if !matches!(message, Message::Close(_)) {
+                        message.fail(error);
+                        continue;
+                    }
                 }
                 match message {
+                    Message::Close(done) => {
+                        deleted = Some(done);
+                        break;
+                    }
                     // Group commit: run a job, then every write job already
                     // queued, commit once (synced), and only then answer. A
                     // queued read ends the group and runs after its commit.
@@ -2376,7 +2461,13 @@ impl ShardHandle {
                     }
                 }
             }
-            shard.close();
+            match deleted {
+                Some(done) => {
+                    shard.discard();
+                    let _ = done.send(());
+                }
+                None => shard.close(),
+            }
         })?;
         let (initial_seq, uuid, state, gate, read_context) = ready_rx
             .recv()
@@ -2446,46 +2537,80 @@ impl ShardHandle {
             .map_or(0, |tx| tx.max_capacity() - tx.capacity())
     }
 
-    async fn send<R>(
+    /// Queue `message` and wait for its `answer`. The future borrows
+    /// nothing from the handle, so it can be moved into a task of its own.
+    fn send<R: Send + 'static>(
         &self,
         message: Message,
         answer: oneshot::Receiver<std::result::Result<R, ApiError>>,
-    ) -> std::result::Result<R, ApiError> {
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static {
         self.jobs.fetch_add(1, Ordering::Relaxed);
-        if let Some(error) = self.failure() {
-            return Err(error);
+        let queue = match self.failure() {
+            Some(error) => Err(error),
+            None => self
+                .tx
+                .clone()
+                .ok_or_else(|| ApiError::new(500, "internal_server_error", "shard task is gone")),
+        };
+        async move {
+            queue?
+                .send(message)
+                .await
+                .map_err(|_| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
+            answer.await.map_err(|_| {
+                ApiError::new(500, "internal_server_error", "shard task dropped reply")
+            })?
         }
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
-        tx.send(message)
-            .await
-            .map_err(|_| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
-        answer
-            .await
-            .map_err(|_| ApiError::new(500, "internal_server_error", "shard task dropped reply"))?
     }
 
     /// Run a job that may write, in the next group commit; it answers once
     /// the group has committed.
-    pub async fn call<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
+    pub fn call<R, F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static
     where
         R: Send + 'static,
         F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
     {
         let (job, answer) = call_job(f);
-        self.send(Message::Write(job), answer).await
+        self.send(Message::Write(job), answer)
     }
 
     /// Run a job that only reads, on the committed state.
-    pub async fn read<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
+    pub fn read<R, F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static
     where
         R: Send + 'static,
         F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
     {
         let (job, answer) = call_job(f);
-        self.send(Message::Read(job), answer).await
+        self.send(Message::Read(job), answer)
+    }
+
+    /// Stop the shard because its database is deleted, and wait until its
+    /// file is closed. From then on every request answers `not_found`, also
+    /// through handles cloned before, and the file is never closed again, so
+    /// nothing can record it as verified after the database is gone.
+    pub async fn close_deleted(&self) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = ShardState::Deleted;
+        let (done, closed) = oneshot::channel();
+        if let Some(tx) = &self.tx {
+            if tx.send(Message::Close(done)).await.is_ok() {
+                // A dropped sender means the actor is gone, file closed.
+                let _ = closed.await;
+            }
+        }
+    }
+
+    /// The committed settings whose names start with `prefix`.
+    pub fn settings(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        settings_in(&self.gate.begin_read()?, prefix)
     }
 
     /// Run `f` off the actor, on a read transaction of its own leased from
@@ -2548,11 +2673,13 @@ pub(crate) mod tests {
 
     pub(crate) const CACHE: usize = 1 << 20;
 
-    /// A shard file in a fresh directory of its own.
+    /// A new shard file in a fresh directory of its own.
     pub(crate) fn temp_file(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("shard-0000.redb")
+        let file = dir.join("shard-0000.redb");
+        drop(create_file(&file, CACHE).unwrap());
+        file
     }
 
     fn remove(file: &Path) {

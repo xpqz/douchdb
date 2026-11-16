@@ -33,12 +33,150 @@ pub const META_FIELDS: [&str; 9] = [
     "_local_seq",
 ];
 
+/// Names of the database's own settings, kept in the settings table of
+/// shard 0 beside that shard's own.
+const DB_SETTINGS: &str = "db/";
+/// [`DbRecord`].
+const INFO_SETTING: &str = "db/info";
+/// The active [`ShardMap`].
+const SHARD_MAP_SETTING: &str = "db/shard_map";
+/// `{"version": .., "security": ..}`.
+const SECURITY_SETTING: &str = "db/security";
+/// A [`ShardMap`] this node has not had acknowledged; absent when none is.
+const PENDING_SHARD_MAP_SETTING: &str = "db/pending_shard_map";
+
+/// Page cache for reading a closed database's settings: a few pages.
+const PEEK_CACHE: usize = 1 << 20;
+
+/// What a database is, fixed when it is created.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct DbFile {
+struct DbRecord {
     q: u32,
     uuid: String,
     instance_start_time: String,
     partitioned: bool,
+}
+
+/// What a new database is created with.
+pub struct DbSettings {
+    pub q: u32,
+    pub partitioned: bool,
+    pub shard_map: ShardMap,
+}
+
+impl DbSettings {
+    /// The settings `config` asks for. A configured placement for another
+    /// shard count is replaced by one that keeps every shard here.
+    pub fn of(config: &DbConfig) -> DbSettings {
+        let q = config.q.max(1);
+        DbSettings {
+            q,
+            partitioned: config.partitioned,
+            shard_map: placement_for(config, q),
+        }
+    }
+
+    /// The rows shard 0 of a new database is given, committed last when it
+    /// is created: what it is, where its shards live, and an empty security
+    /// object. Every one is required when the database opens.
+    pub(crate) fn rows(&self) -> DbResult<Vec<(&'static str, Vec<u8>)>> {
+        let info = DbRecord {
+            q: self.q,
+            uuid: uuid(),
+            instance_start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+                .to_string(),
+            partitioned: self.partitioned,
+        };
+        Ok(vec![
+            (INFO_SETTING, to_json(&info)?),
+            (SHARD_MAP_SETTING, to_json(&self.shard_map)?),
+            (SECURITY_SETTING, security_json(0, &json!({}))?),
+        ])
+    }
+}
+
+/// The configured placement of a database with `q` shards: the one
+/// `config` carries when it is for `q` shards, else every shard here.
+fn placement_for(config: &DbConfig, q: u32) -> ShardMap {
+    if config.shard_map.q == q {
+        config.shard_map.clone()
+    } else {
+        ShardMap::single(q)
+    }
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> DbResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn security_json(version: u64, security: &Value) -> DbResult<Vec<u8>> {
+    to_json(&json!({"version": version, "security": security}))
+}
+
+/// A database's settings as shard 0 stores them.
+struct Stored {
+    info: DbRecord,
+    shard_map: ShardMap,
+    security: (u64, Value),
+    pending_shard_map: Option<ShardMap>,
+}
+
+impl Stored {
+    /// Parse the `db/` settings of the database at `path`. Every one but the
+    /// pending map is required: a database is created with all of them, so
+    /// one missing or unreadable is damage and an error, never a default
+    /// (an empty security object would make the database public).
+    fn parse(path: &Path, rows: Vec<(String, Vec<u8>)>) -> DbResult<Stored> {
+        let mut rows: HashMap<String, Vec<u8>> = rows.into_iter().collect();
+        let mut take = |name: &str| rows.remove(name);
+        fn parse<T: serde::de::DeserializeOwned>(
+            path: &Path,
+            name: &str,
+            bytes: Option<Vec<u8>>,
+        ) -> DbResult<T> {
+            let bytes = bytes.ok_or_else(|| setting_error(path, name, "missing"))?;
+            serde_json::from_slice(&bytes).map_err(|error| setting_error(path, name, error))
+        }
+        let info: DbRecord = parse(path, INFO_SETTING, take(INFO_SETTING))?;
+        if info.q == 0 {
+            return Err(setting_error(path, INFO_SETTING, "no shards"));
+        }
+        let shard_map: ShardMap = parse(path, SHARD_MAP_SETTING, take(SHARD_MAP_SETTING))?;
+        if !shard_map.is_valid(info.q, shard_map.node_count) {
+            return Err(setting_error(
+                path,
+                SHARD_MAP_SETTING,
+                "not a valid shard map",
+            ));
+        }
+        let stored: Value = parse(path, SECURITY_SETTING, take(SECURITY_SETTING))?;
+        let security = match (
+            stored.get("version").and_then(Value::as_u64),
+            stored.get("security"),
+        ) {
+            (Some(version), Some(security)) => (version, security.clone()),
+            _ => {
+                return Err(setting_error(
+                    path,
+                    SECURITY_SETTING,
+                    "expected an object with `version` and `security`",
+                ))
+            }
+        };
+        let pending_shard_map = match take(PENDING_SHARD_MAP_SETTING) {
+            Some(bytes) => Some(parse(path, PENDING_SHARD_MAP_SETTING, Some(bytes))?),
+            None => None,
+        };
+        Ok(Stored {
+            info,
+            shard_map,
+            security,
+            pending_shard_map,
+        })
+    }
 }
 
 /// One staged write of a document batch, applied once the whole batch is
@@ -177,14 +315,21 @@ pub fn validate_partition(partition: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// Log a metadata file that cannot be used and return the 500 for it. The
-/// client sees the file name only; the log carries the full path.
-fn metadata_error(path: &Path, error: impl std::fmt::Display) -> ApiError {
-    tracing::error!(file = %path.display(), %error, "database metadata is unusable");
+/// Log a database setting that cannot be used and return the 500 for it.
+/// The client sees the setting's name only; the log carries the path.
+fn setting_error(path: &Path, setting: &str, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(db = %path.display(), setting, %error, "database setting is unusable");
+    ApiError::new(500, "internal_server_error", format!("{setting}: {error}"))
+}
+
+/// Log a shard file that cannot be opened or read and return the 500 for
+/// it: the database fails closed, and the file is left as it is.
+fn shard_error(file: &Path, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(file = %file.display(), %error, "shard file is unusable");
     ApiError::new(
         500,
         "internal_server_error",
-        format!("{}: {error}", file_name(path)),
+        format!("{}: {error}", file_name(file)),
     )
 }
 
@@ -194,131 +339,17 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Read and parse one metadata file. `None` means it does not exist; one that
-/// cannot be read or parsed is a 500, never a default.
-fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option<T>> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| metadata_error(path, error)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(metadata_error(path, error)),
-    }
-}
-
-fn clear_error(path: &Path, error: &dyn std::fmt::Display) -> ApiError {
-    ApiError::new(
-        500,
-        "internal_server_error",
-        format!("{}: {error}", file_name(path)),
-    )
-}
-
-/// Serialize `value` and replace `path` with it atomically; see
-/// [`write_atomic`].
-fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
-    let write_error = |error: &dyn std::fmt::Display| {
-        tracing::error!(file = %path.display(), %error, "cannot write database metadata");
-        ApiError::new(
-            500,
-            "internal_server_error",
-            format!("{}: {error}", file_name(path)),
-        )
-    };
-    let bytes = serde_json::to_vec(value).map_err(|error| write_error(&error))?;
-    write_atomic(path, &bytes).map_err(|error| write_error(&error))
-}
-
-/// Temporary files of writes in flight in this process. Cleanup of stale
-/// temporary files must not remove one of these.
-static LIVE_TEMPS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
-    std::sync::Mutex::new(None);
-
-fn live_temps() -> std::sync::MutexGuard<'static, Option<std::collections::HashSet<PathBuf>>> {
-    LIVE_TEMPS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// A temporary file being written; it counts as in flight until dropped,
-/// which is after the caller has renamed or removed it.
-struct LiveTemp(PathBuf);
-
-impl LiveTemp {
-    fn register(path: PathBuf) -> LiveTemp {
-        live_temps()
-            .get_or_insert_with(Default::default)
-            .insert(path.clone());
-        LiveTemp(path)
-    }
-}
-
-impl Drop for LiveTemp {
-    fn drop(&mut self) {
-        if let Some(set) = live_temps().as_mut() {
-            set.remove(&self.0);
-        }
-    }
-}
-
-/// Whether `name` is one `write_temp` produces: `.<name>.<pid>.<n>.tmp`.
-fn is_temp_name(name: &str) -> bool {
-    let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
-        return false;
-    };
-    let mut parts = stem.rsplitn(3, '.');
-    let numeric = |part: Option<&str>| {
-        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    };
-    let (counter, pid, target) = (parts.next(), parts.next(), parts.next());
-    numeric(counter) && numeric(pid) && target.is_some_and(|t| !t.is_empty())
-}
-
-/// Remove the temporary files of interrupted writes from `dir` (not its
-/// subdirectories). Only names matching [`is_temp_name`] go, and never one a
-/// write in this process is still using, so this is safe while the directory
-/// is in use; whether the pid in a name is alive is not considered. A file
-/// that cannot be removed is logged, not an error.
-pub(crate) fn remove_stale_temps(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_str().is_some_and(is_temp_name) {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        // Hold the registry while removing: a write registers its file before
-        // creating it, so a file that is not registered here is not in use.
-        let live = live_temps();
-        if live.as_ref().is_some_and(|set| set.contains(&path)) {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(file = %path.display(), "removed stale temporary file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(file = %path.display(), %error, "cannot remove stale temporary file")
-            }
-        }
-    }
-}
-
-/// Write `bytes` to a temporary file next to `path` and fsync it. A crash
-/// before the caller publishes it leaves only the temporary file behind.
-fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveTemp> {
+/// Write `bytes` to a new temporary file next to `path` and fsync it. A
+/// crash before the caller publishes it leaves only the temporary file.
+fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
     use std::io::Write;
     static TEMPS: AtomicU64 = AtomicU64::new(0);
-    let temp = LiveTemp::register(path.with_file_name(format!(
+    let temp = path.with_file_name(format!(
         ".{}.{}.{}.tmp",
         file_name(path),
         std::process::id(),
         TEMPS.fetch_add(1, Ordering::Relaxed)
-    )));
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -328,34 +359,39 @@ fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveT
     }
     #[cfg(not(unix))]
     let _ = private;
-    let written = options.open(&temp.0).and_then(|mut file| {
+    let written = options.open(&temp).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()
     });
     match written {
         Ok(()) => Ok(temp),
         Err(error) => {
-            let _ = std::fs::remove_file(&temp.0);
+            let _ = std::fs::remove_file(&temp);
             Err(error)
         }
     }
 }
 
-/// Make a rename or link in the directory of `path` durable.
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+/// Make the renames, links and new entries in directory `dir` durable.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let dir = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
         std::fs::File::open(dir)?.sync_all()
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = dir;
         Ok(())
     }
+}
+
+/// Make a rename or link in the directory of `path` durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    sync_dir(
+        path.parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
 }
 
 /// Replace `path` with `bytes` so that a reader, or a restart after a crash,
@@ -364,8 +400,8 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 /// then fsync the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, false)?;
-    if let Err(error) = std::fs::rename(&temp.0, path) {
-        let _ = std::fs::remove_file(&temp.0);
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
     sync_parent(path)
@@ -376,30 +412,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// all: it is written to a temporary file and hard-linked into place.
 pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, true)?;
-    let linked = std::fs::hard_link(&temp.0, path);
-    let _ = std::fs::remove_file(&temp.0);
+    let linked = std::fs::hard_link(&temp, path);
+    let _ = std::fs::remove_file(&temp);
     linked?;
     sync_parent(path)
-}
-
-/// Read the stored security object. No file is an empty object; a file that
-/// is there but unusable is an error, since falling back to `{}` would make
-/// the database public.
-fn load_security(path: &Path) -> DbResult<(u64, Value)> {
-    let versioned = path.join("security-versioned.json");
-    if let Some(stored) = read_metadata::<Value>(&versioned)? {
-        return match (
-            stored.get("version").and_then(Value::as_u64),
-            stored.get("security"),
-        ) {
-            (Some(version), Some(security)) => Ok((version, security.clone())),
-            _ => Err(metadata_error(
-                &versioned,
-                "expected an object with `version` and `security`",
-            )),
-        };
-    }
-    Ok((0, json!({})))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -447,8 +463,19 @@ pub struct Db {
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
-    shard_map: std::sync::RwLock<ShardMap>,
-    security: std::sync::RwLock<(u64, Value)>,
+    /// The database's settings in memory, as shard 0 stores them. Each is
+    /// shared with the task that stores a new value and installs it once
+    /// it is durable (see `store_setting`).
+    shard_map: Arc<std::sync::RwLock<ShardMap>>,
+    security: Arc<std::sync::RwLock<(u64, Value)>>,
+    pending_shard_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    /// Held from reading a setting to installing its replacement, so two
+    /// updates on this node never interleave.
+    setting_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Set when `open` put the configured placement in place of a map
+    /// stored for another cluster size, until `store_replaced_shard_map`
+    /// stores it.
+    map_replaced: AtomicBool,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
     compact_running: AtomicBool,
@@ -540,8 +567,10 @@ pub fn db_dir_name(name: &str) -> String {
     name.replace('/', "%2F")
 }
 
-/// The file of shard `index` of the database in `dir`.
-fn shard_file(dir: &Path, index: u32) -> PathBuf {
+/// The file of shard `index` of the database in `dir`. Built only here,
+/// from the data root, so a file has one spelling everywhere, which is what
+/// `kv` remembers verification by.
+pub(crate) fn shard_file(dir: &Path, index: u32) -> PathBuf {
     dir.join(format!("shard-{index:04}.redb"))
 }
 
@@ -558,88 +587,63 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
 }
 
 impl Db {
+    /// Open the database `name`, which must exist (see
+    /// `state::create_db_staged`). Every shard file is opened as it is: one
+    /// that is missing or cannot be opened fails the open with a 500 and is
+    /// left untouched, never replaced, so damage is not mistaken for a new
+    /// database. Blocking: shard files are checked on their first open.
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         let path = db_path(root, name);
-        remove_stale_temps(&path);
-        if let Ok(indexes) = std::fs::read_dir(path.join("_search_indexes")) {
-            for index in indexes.flatten() {
-                remove_stale_temps(&index.path());
-            }
+        if !path.is_dir() {
+            return Err(ApiError::db_not_found());
         }
-        let db_file = path.join("db.json");
-        let file: DbFile = match read_metadata(&db_file)? {
-            Some(file) => file,
-            None => {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))?;
-                let file = DbFile {
-                    q: config.q.max(1),
-                    uuid: uuid(),
-                    instance_start_time: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros()
-                        .to_string(),
-                    partitioned: config.partitioned,
-                };
-                write_json_atomic(&db_file, &file)?;
-                file
-            }
-        };
-
-        let map_path = path.join("shard-map.json");
-        let stored_map: Option<ShardMap> = read_metadata(&map_path)?;
-        if let Some(map) = &stored_map {
-            if !map.is_valid(file.q, map.node_count) {
-                return Err(metadata_error(&map_path, "not a valid shard map"));
-            }
-        }
-        let shard_map = match stored_map {
-            Some(map) if map.node_count == config.shard_map.node_count => map,
-            stored => {
-                // A database without a shard map yet (a new one, or one
-                // interrupted before the map was written), and one stored for a
-                // different cluster size, start from the configured placement,
-                // which is then persisted.
-                if stored.is_some() {
-                    tracing::warn!(
-                        file = %map_path.display(),
-                        "shard map is for a different cluster size; replacing it"
-                    );
-                }
-                let map = if config.shard_map.q == file.q {
-                    config.shard_map.clone()
-                } else {
-                    ShardMap::single(file.q)
-                };
-                write_json_atomic(&map_path, &map)?;
-                map
-            }
-        };
-
-        let mut shards = Vec::new();
         let commits = Arc::new(tokio::sync::watch::Sender::new(()));
-        for i in 0..file.q {
-            let shard = ShardHandle::spawn(
-                shard_file(&path, i),
+        let spawn = |index: u32| {
+            let file = shard_file(&path, index);
+            ShardHandle::spawn(
+                &file,
                 config.revs_limit,
                 config.cache_bytes,
                 commits.clone(),
-            )?;
-            shards.push(shard);
+            )
+            .map_err(|error| shard_error(&file, format!("{error:#}")))
+        };
+        let first = spawn(0)?;
+        let rows = first
+            .settings(DB_SETTINGS)
+            .map_err(|error| shard_error(&shard_file(&path, 0), format!("{error:#}")))?;
+        let stored = Stored::parse(&path, rows)?;
+        let q = stored.info.q;
+        let mut shards = vec![first];
+        for index in 1..q {
+            shards.push(spawn(index)?);
         }
 
-        let security = load_security(&path)?;
+        // A map stored for a different cluster size gives way to the
+        // configured placement (see `store_replaced_shard_map`).
+        let map_replaced = stored.shard_map.node_count != config.shard_map.node_count;
+        let shard_map = if map_replaced {
+            tracing::warn!(
+                db = %path.display(),
+                "shard map is for a different cluster size; using the configured placement"
+            );
+            placement_for(&config, q)
+        } else {
+            stored.shard_map
+        };
 
         Ok(Db {
             name: name.to_string(),
             path,
-            q: file.q.max(1),
-            partitioned: file.partitioned,
-            uuid: file.uuid,
-            instance_start_time: file.instance_start_time,
-            shard_map: std::sync::RwLock::new(shard_map),
-            security: std::sync::RwLock::new(security),
+            q,
+            partitioned: stored.info.partitioned,
+            uuid: stored.info.uuid,
+            instance_start_time: stored.info.instance_start_time,
+            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
+            security: Arc::new(std::sync::RwLock::new(stored.security)),
+            pending_shard_map: Arc::new(std::sync::RwLock::new(stored.pending_shard_map)),
+            setting_writes: Arc::default(),
+            map_replaced: AtomicBool::new(map_replaced),
             compact_running: AtomicBool::new(false),
             migration_map: std::sync::RwLock::new(None),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -655,64 +659,72 @@ impl Db {
         })
     }
 
-    /// Open a database that is already on disk. Unlike `open`, a missing
-    /// database is an error and nothing is created, so a request that races a
-    /// drop cannot bring the database back.
-    pub fn open_existing(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
+    /// Open the database, creating it first (staged, as a client's create
+    /// does) when it does not exist.
+    #[cfg(test)]
+    pub fn open_or_create(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         if !Db::exists(root, name) {
-            return Err(ApiError::db_not_found());
+            crate::state::create_db_staged(root, name, &DbSettings::of(&config))?;
         }
         Db::open(root, name, config)
     }
 
+    /// Whether database `name` exists: its directory is published. Whether
+    /// its files can be opened is for the open to find out.
     pub fn exists(root: &Path, name: &str) -> bool {
-        db_path(root, name).join("db.json").is_file()
+        db_path(root, name).is_dir()
     }
 
-    /// The security object of a database that need not be open: what its
-    /// directory holds, which is what an open one holds in memory too, since
-    /// it is written before it is installed.
-    pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
-        if !Db::exists(root, name) {
+    /// The settings of a database that is not open, read from shard 0
+    /// through `kv::peek`, which checks the file only when an open would
+    /// and leaves it as verified as it found it. `None` when the file is
+    /// open: the database is being opened or closed, so ask it instead.
+    /// Blocking.
+    fn read_stored(root: &Path, name: &str) -> DbResult<Option<Stored>> {
+        let path = db_path(root, name);
+        if !path.is_dir() {
             return Err(ApiError::db_not_found());
         }
-        load_security(&db_path(root, name)).map(|(_, security)| security)
+        let file = shard_file(&path, 0);
+        match crate::kv::peek(&file, PEEK_CACHE, |db| {
+            crate::store::read_settings(db, DB_SETTINGS)
+        }) {
+            Ok(Ok(rows)) => Stored::parse(&path, rows).map(Some),
+            Ok(Err(error)) => Err(shard_error(&file, format!("{error:#}"))),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(None),
+            // Deleted meanwhile.
+            Err(_) if !path.is_dir() => Err(ApiError::db_not_found()),
+            Err(error) => Err(shard_error(&file, error)),
+        }
     }
 
-    /// What `open` would settle on for placement, read from the directory
-    /// without opening the database. `None` when `open` would have to rewrite
-    /// the shard map (none stored, or one for a different cluster size), so
-    /// the caller must open the database instead.
+    /// The security object of a database that is not open; `None` when it
+    /// is open after all (see `read_stored`). Blocking.
+    pub fn read_security(root: &Path, name: &str) -> DbResult<Option<Value>> {
+        Ok(Db::read_stored(root, name)?.map(|stored| stored.security.1))
+    }
+
+    /// What `open` would settle on for placement, read without opening the
+    /// database. `None` when only an open can say: the database is open
+    /// (see `read_stored`), or its map is for another cluster size, which
+    /// `open` replaces. Blocking.
     pub fn read_closed_meta(
         root: &Path,
         name: &str,
         node_count: usize,
     ) -> DbResult<Option<ClosedMeta>> {
-        let path = db_path(root, name);
-        let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
-            return Err(ApiError::db_not_found());
-        };
-        let map_path = path.join("shard-map.json");
-        let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
+        let Some(stored) = Db::read_stored(root, name)? else {
             return Ok(None);
         };
-        if shard_map.node_count != node_count || !shard_map.is_valid(file.q, shard_map.node_count) {
+        if stored.shard_map.node_count != node_count {
             return Ok(None);
         }
         Ok(Some(ClosedMeta {
-            q: file.q.max(1),
-            partitioned: file.partitioned,
-            shard_map,
-            pending_shard_map: Db::has_pending_shard_map(root, name)?,
+            q: stored.info.q,
+            partitioned: stored.info.partitioned,
+            shard_map: stored.shard_map,
+            pending_shard_map: stored.pending_shard_map.is_some(),
         }))
-    }
-
-    /// Whether a shard map this node has not acknowledged is waiting on disk.
-    pub fn has_pending_shard_map(root: &Path, name: &str) -> DbResult<bool> {
-        Ok(
-            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json"))?
-                .is_some(),
-        )
     }
 
     /// Drop every shard's lazily built indexes so an idle database holds none
@@ -775,22 +787,13 @@ impl Db {
         }
     }
 
-    pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
-        // A file created later under the same name is a new one, which its
-        // first open checks.
-        if let Ok(files) = std::fs::read_dir(db_path(root, name)) {
-            for file in files.flatten() {
-                if file.path().extension().is_some_and(|ext| ext == "redb") {
-                    crate::kv::forget_verified(&file.path());
-                }
-            }
-        }
-        match std::fs::remove_dir_all(db_path(root, name)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(ApiError::db_not_found())
-            }
-            Err(error) => Err(metadata_error(&db_path(root, name), error)),
+    /// Stop every shard of a database being deleted and wait until their
+    /// files are closed (see `ShardHandle::close_deleted`). Handles cloned
+    /// before get `not_found` from then on.
+    pub async fn close_deleted(&self) {
+        self.mark_deleted();
+        for shard in &self.shards {
+            shard.close_deleted().await;
         }
     }
 
@@ -998,18 +1001,48 @@ impl Db {
         self.design_generation.load(Ordering::SeqCst)
     }
 
+    /// Store database setting `name` (removing it for `None`) in shard 0,
+    /// then `install` it in memory. Both run in a task of their own, so a
+    /// caller that stops waiting cannot leave memory behind what is on disk;
+    /// `writing`, the guard of `setting_writes`, is released only once the
+    /// value is installed.
+    async fn store_setting(
+        &self,
+        writing: tokio::sync::OwnedMutexGuard<()>,
+        name: &'static str,
+        value: Option<Vec<u8>>,
+        install: impl FnOnce() + Send + 'static,
+    ) -> DbResult<()> {
+        let write = self.shards[0].call(move |txn| {
+            match &value {
+                Some(value) => txn.put_setting(name, value),
+                None => txn.remove_setting(name),
+            }
+            .map_err(ApiError::from)
+        });
+        tokio::spawn(async move {
+            let _writing = writing;
+            write.await?;
+            install();
+            Ok(())
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("storing {name}: {error}")))?
+    }
+
+    async fn lock_settings(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.setting_writes.clone().lock_owned().await
+    }
+
     /// Replace the security object with a client-supplied one, one version
     /// newer than the current one. Returns the version it was stored at.
-    pub fn set_security(&self, value: Value) -> DbResult<u64> {
+    pub async fn set_security(&self, value: Value) -> DbResult<u64> {
         // Pick the version under the lock: two concurrent writes on this node
         // must not share a version, or the tiebreak could drop an acknowledged
         // one.
-        let mut current = self
-            .security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let version = current.0.saturating_add(1);
-        self.store_security(&mut current, version, value)?;
+        let writing = self.lock_settings().await;
+        let version = self.security_versioned().0.saturating_add(1);
+        self.store_security(writing, version, value).await?;
         Ok(version)
     }
 
@@ -1017,11 +1050,9 @@ impl Db {
     /// Equal versions are ordered by the canonical form of the object so that
     /// concurrent updates settle on the same winner on every node. Returns
     /// whether the object is now the stored one.
-    pub fn set_security_versioned(&self, version: u64, value: Value) -> DbResult<bool> {
-        let mut current = self
-            .security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+    pub async fn set_security_versioned(&self, version: u64, value: Value) -> DbResult<bool> {
+        let writing = self.lock_settings().await;
+        let current = self.security_versioned();
         if version < current.0 {
             return Ok(false);
         }
@@ -1032,23 +1063,25 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        self.store_security(&mut current, version, value)?;
+        self.store_security(writing, version, value).await?;
         Ok(true)
     }
 
     /// Persist and install a security object; the caller holds the lock.
-    fn store_security(
+    async fn store_security(
         &self,
-        current: &mut (u64, Value),
+        writing: tokio::sync::OwnedMutexGuard<()>,
         version: u64,
         value: Value,
     ) -> DbResult<()> {
-        write_json_atomic(
-            &self.path.join("security-versioned.json"),
-            &json!({"version": version, "security": value}),
-        )?;
-        *current = (version, value);
-        Ok(())
+        let bytes = security_json(version, &value)?;
+        let security = self.security.clone();
+        self.store_setting(writing, SECURITY_SETTING, Some(bytes), move || {
+            *security
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = (version, value);
+        })
+        .await
     }
 
     pub fn shard_map(&self) -> ShardMap {
@@ -1078,17 +1111,15 @@ impl Db {
         }
     }
 
-    pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
+    pub async fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
         }
-        // Hold the lock across compare, persist and swap, so two calls on
-        // this node cannot interleave and leave the file and the in-memory
+        // Hold the lock across compare, persist and install, so two calls on
+        // this node cannot interleave and leave the stored and the in-memory
         // map disagreeing.
-        let mut current = self
-            .shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let writing = self.lock_settings().await;
+        let current = self.shard_map();
         if shard_map.version < current.version {
             return Ok(false);
         }
@@ -1101,7 +1132,7 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        self.store_shard_map(&mut current, shard_map)?;
+        self.store_shard_map(writing, shard_map).await?;
         Ok(true)
     }
 
@@ -1109,24 +1140,44 @@ impl Db {
     /// current one, and return it with that version. The version is picked
     /// under the lock, as `set_security` does, so two concurrent updates on
     /// this node never share one.
-    pub fn set_next_shard_map(&self, mut shard_map: ShardMap) -> DbResult<ShardMap> {
+    pub async fn set_next_shard_map(&self, mut shard_map: ShardMap) -> DbResult<ShardMap> {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
         }
-        let mut current = self
-            .shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        shard_map.version = current.version.saturating_add(1);
-        self.store_shard_map(&mut current, shard_map.clone())?;
+        let writing = self.lock_settings().await;
+        shard_map.version = self.shard_map().version.saturating_add(1);
+        self.store_shard_map(writing, shard_map.clone()).await?;
         Ok(shard_map)
     }
 
+    /// Store the placement `open` put in place of a map stored for another
+    /// cluster size, so later opens and reads of the closed database find
+    /// it. Nothing to do when the stored map was kept; a failure leaves it
+    /// to be stored on the next call.
+    pub async fn store_replaced_shard_map(&self) -> DbResult<()> {
+        if !self.map_replaced.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let writing = self.lock_settings().await;
+        let stored = self.store_shard_map(writing, self.shard_map()).await;
+        if stored.is_err() {
+            self.map_replaced.store(true, Ordering::SeqCst);
+        }
+        stored
+    }
+
     /// Persist and install a shard map; the caller holds the lock.
-    fn store_shard_map(&self, current: &mut ShardMap, shard_map: ShardMap) -> DbResult<()> {
-        write_json_atomic(&self.path.join("shard-map.json"), &shard_map)?;
-        *current = shard_map;
-        Ok(())
+    async fn store_shard_map(
+        &self,
+        writing: tokio::sync::OwnedMutexGuard<()>,
+        shard_map: ShardMap,
+    ) -> DbResult<()> {
+        let bytes = to_json(&shard_map)?;
+        let current = self.shard_map.clone();
+        self.store_setting(writing, SHARD_MAP_SETTING, Some(bytes), move || {
+            *current.write().unwrap_or_else(|poison| poison.into_inner()) = shard_map;
+        })
+        .await
     }
 
     /// The migration target while a rebalance freeze is running. A map left
@@ -1359,25 +1410,34 @@ impl Db {
         crate::since::encode(&copies)
     }
 
-    pub fn pending_shard_map(&self) -> DbResult<Option<ShardMap>> {
-        read_metadata(&self.path.join("pending-shard-map.json"))
+    /// The shard map this node has not had acknowledged, if any.
+    pub fn pending_shard_map(&self) -> Option<ShardMap> {
+        self.pending_shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
-    pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
-        write_json_atomic(&self.path.join("pending-shard-map.json"), map)
+    pub async fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
+        self.store_pending_shard_map(Some(map.clone())).await
     }
 
-    /// Remove the pending shard map and make the removal durable. Already
-    /// gone is fine; any other failure is an error, since the map would
-    /// otherwise reappear or be retried as if still pending.
-    pub fn clear_pending_shard_map(&self) -> DbResult<()> {
-        let path = self.path.join("pending-shard-map.json");
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(clear_error(&path, &error)),
+    /// Remove the pending shard map, durably. Nothing pending is fine.
+    pub async fn clear_pending_shard_map(&self) -> DbResult<()> {
+        self.store_pending_shard_map(None).await
+    }
+
+    async fn store_pending_shard_map(&self, map: Option<ShardMap>) -> DbResult<()> {
+        let writing = self.lock_settings().await;
+        if map.is_none() && self.pending_shard_map().is_none() {
+            return Ok(());
         }
-        sync_parent(&path).map_err(|error| clear_error(&path, &error))
+        let bytes = map.as_ref().map(to_json).transpose()?;
+        let pending = self.pending_shard_map.clone();
+        self.store_setting(writing, PENDING_SHARD_MAP_SETTING, bytes, move || {
+            *pending.write().unwrap_or_else(|poison| poison.into_inner()) = map;
+        })
+        .await
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
@@ -5473,7 +5533,7 @@ mod tests {
 
     async fn single_shard_db(name: &str) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             name,
             DbConfig {
@@ -5504,7 +5564,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
         let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "stem",
             DbConfig {
@@ -5540,7 +5600,7 @@ mod tests {
     async fn local_docs_spread_over_shards_and_checkpoints_stay_out_of_the_listing() {
         let root =
             std::env::temp_dir().join(format!("douchdb-local-shards-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "local-shards",
             DbConfig {
@@ -5971,7 +6031,7 @@ mod tests {
     async fn streamed_all_docs_match_the_buffered_reply() {
         let root = std::env::temp_dir().join(format!("douchdb-stream-{}", crate::util::uuid()));
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "stream",
                 DbConfig {
@@ -6151,7 +6211,7 @@ mod tests {
         let empty_root =
             std::env::temp_dir().join(format!("douchdb-stream-empty-{}", crate::util::uuid()));
         let empty = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &empty_root,
                 "empty",
                 DbConfig {
@@ -6283,7 +6343,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
         let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "valfail",
             DbConfig {
@@ -6330,8 +6390,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn security_versions_order_updates_and_survive_reopen() {
+    #[tokio::test]
+    async fn security_versions_order_updates_and_survive_reopen() {
         let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
@@ -6340,21 +6400,22 @@ mod tests {
             shard_map: ShardMap::balanced(1, 1, 1),
             partitioned: false,
         };
-        let db = Db::open(&root, "sec", config()).unwrap();
+        let db = Db::open_or_create(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (0, json!({})));
 
-        assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
-        assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
+        assert_eq!(db.set_security(json!({"a": 1})).await.unwrap(), 1);
+        assert!(db.set_security_versioned(3, json!({"a": 3})).await.unwrap());
         // Older versions are rejected; equal ones are ordered by canonical form.
-        assert!(!db.set_security_versioned(2, json!({"a": 2})).unwrap());
-        assert!(!db.set_security_versioned(3, json!({"a": 2})).unwrap());
-        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
-        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
+        assert!(!db.set_security_versioned(2, json!({"a": 2})).await.unwrap());
+        assert!(!db.set_security_versioned(3, json!({"a": 2})).await.unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).await.unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).await.unwrap());
         assert_eq!(db.security(), json!({"a": 4}));
         drop(db);
 
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (3, json!({"a": 4})));
+        drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6368,40 +6429,73 @@ mod tests {
         }
     }
 
-    fn open_error(file: &str, contents: &[u8]) -> ApiError {
-        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::util::uuid()));
-        drop(Db::open(&root, "meta", meta_config()).unwrap());
-        std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
-        let error = match Db::open(&root, "meta", meta_config()) {
-            Ok(_) => panic!("{file} with {contents:?} opened"),
-            Err(error) => error,
-        };
-        // The corrupt file is left for the operator, not overwritten.
-        assert_eq!(
-            std::fs::read(db_path(&root, "meta").join(file)).unwrap(),
-            contents
-        );
-        std::fs::remove_dir_all(root).ok();
-        error
-    }
-
+    /// Every database setting but the pending map is written when the
+    /// database is created, so one that is missing or does not parse is
+    /// damage: the open fails with a 500 naming it, never falls back to a
+    /// default (an empty security object would make the database public),
+    /// and the file is left as it is.
     #[test]
-    fn corrupt_metadata_fails_open_with_a_server_error() {
-        for (file, contents) in [
-            ("db.json", &b"{ not json"[..]),
-            ("shard-map.json", b"{ not json"),
-            ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
-            ("security-versioned.json", b"{ not json"),
-            ("security-versioned.json", br#"{"version":1}"#),
-        ] {
-            let error = open_error(file, contents);
-            assert_eq!(error.status, 500, "{file}: {}", error.reason);
-            assert!(error.reason.contains(file), "{file}: {}", error.reason);
+    fn a_missing_or_unusable_database_setting_fails_open_with_a_server_error() {
+        let broken: [(&str, Option<&[u8]>); 7] = [
+            (INFO_SETTING, None),
+            (INFO_SETTING, Some(b"{ not json")),
+            (SHARD_MAP_SETTING, None),
+            (
+                SHARD_MAP_SETTING,
+                Some(br#"{"q":1,"node_count":1,"replicas":[]}"#),
+            ),
+            (SECURITY_SETTING, None),
+            (SECURITY_SETTING, Some(br#"{"version":1}"#)),
+            (PENDING_SHARD_MAP_SETTING, Some(b"{ not json")),
+        ];
+        for (setting, value) in broken {
+            let root =
+                std::env::temp_dir().join(format!("douchdb-badsetting-{}", crate::util::uuid()));
+            drop(Db::open_or_create(&root, "meta", meta_config()).unwrap());
+            let file = shard_file(&db_path(&root, "meta"), 0);
+            let db = crate::kv::open(&file, 1 << 20).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(crate::kv::SETTINGS).unwrap();
+                match value {
+                    Some(bytes) => {
+                        table
+                            .insert(setting, crate::kv::seal(bytes).as_slice())
+                            .unwrap();
+                    }
+                    None => {
+                        table.remove(setting).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+            drop(db);
+
+            let error = match Db::open(&root, "meta", meta_config()) {
+                Ok(_) => panic!("{setting} = {value:?} opened"),
+                Err(error) => error,
+            };
+            assert_eq!(error.status, 500, "{setting}: {}", error.reason);
+            assert!(
+                error.reason.contains(setting),
+                "{setting}: {}",
+                error.reason
+            );
+            let closed = Db::read_security(&root, "meta").map(|_| ());
+            assert_eq!(closed.unwrap_err().status, 500, "{setting} read closed");
+            // Left as it was for the operator, not repaired or defaulted.
+            let db = crate::kv::open(&file, 1 << 20).unwrap();
+            let left = crate::store::read_settings(&db, setting).unwrap();
+            let left = left.into_iter().find(|(name, _)| name == setting);
+            assert_eq!(left.map(|(_, bytes)| bytes).as_deref(), value, "{setting}");
+            drop(db);
+            crate::kv::forget_verified(&file);
+            std::fs::remove_dir_all(root).ok();
         }
     }
 
-    #[test]
-    fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_equal_version_shard_maps_leave_disk_and_memory_in_step() {
         let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 2,
@@ -6411,36 +6505,35 @@ mod tests {
             partitioned: false,
         };
         for round in 0..40 {
-            let db = Db::open(&root, &format!("race{round}"), config()).unwrap();
-            let maps: Vec<ShardMap> = (0..3)
-                .map(|node| ShardMap {
-                    q: 2,
-                    node_count: 3,
-                    replicas: vec![vec![node], vec![node]],
-                    version: 9,
+            let name = format!("race{round}");
+            let db = Arc::new(Db::open_or_create(&root, &name, config()).unwrap());
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let racers: Vec<_> = (0..3)
+                .map(|node| {
+                    let (db, barrier) = (db.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        db.set_shard_map(ShardMap {
+                            q: 2,
+                            node_count: 3,
+                            replicas: vec![vec![node], vec![node]],
+                            version: 9,
+                        })
+                        .await
+                        .unwrap();
+                    })
                 })
                 .collect();
-            let barrier = std::sync::Barrier::new(maps.len());
-            std::thread::scope(|scope| {
-                for map in &maps {
-                    let (db, barrier) = (&db, &barrier);
-                    scope.spawn(move || {
-                        barrier.wait();
-                        db.set_shard_map(map.clone()).unwrap();
-                    });
-                }
-            });
-            // The tiebreak winner is the greatest placement, and the file on
-            // disk is the one in memory.
-            let stored: ShardMap =
-                serde_json::from_slice(&std::fs::read(db.path.join("shard-map.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                db.shard_map().replicas,
-                vec![vec![2], vec![2]],
-                "round {round}"
-            );
-            assert_eq!(stored, db.shard_map(), "round {round}");
+            for racer in racers {
+                racer.await.unwrap();
+            }
+            // The tiebreak winner is the greatest placement, and what is
+            // stored is what is in memory.
+            let in_memory = db.shard_map();
+            assert_eq!(in_memory.replicas, vec![vec![2], vec![2]], "round {round}");
+            drop(db);
+            let stored = Db::read_closed_meta(&root, &name, 3).unwrap().unwrap();
+            assert_eq!(stored.shard_map, in_memory, "round {round}");
         }
         std::fs::remove_dir_all(root).ok();
     }
@@ -6466,9 +6559,9 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn open_removes_stale_temporary_files_and_nothing_else() {
-        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+    #[tokio::test]
+    async fn the_pending_shard_map_is_stored_and_cleared_durably() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
@@ -6476,155 +6569,47 @@ mod tests {
             shard_map: ShardMap::single(1),
             partitioned: false,
         };
-        let db = Db::open(&root, "stale", config()).unwrap();
-        let dir = db.path.clone();
-        drop(db);
-
-        // Temporary files an interrupted write_atomic left behind, from
-        // another process and from one that happened to share our pid.
-        let foreign = format!(".db.json.{}.7.tmp", std::process::id().wrapping_add(1));
-        let same_pid = format!(".shard-map.json.{}.0.tmp", std::process::id());
-        let search = dir.join("_search_indexes").join("abc");
-        std::fs::create_dir_all(&search).unwrap();
-        let stale_search = search.join(".douchdb-search-meta.json.1.2.tmp");
-        for stale in [
-            dir.join(&foreign),
-            dir.join(&same_pid),
-            stale_search.clone(),
-        ] {
-            std::fs::write(stale, b"partial").unwrap();
-        }
-        // Names that merely resemble the pattern are left alone.
-        let keep = [
-            "db.json.1.2.tmp",
-            ".db.json.x.2.tmp",
-            ".db.json.1.tmp",
-            ".db.json.1.2.tmp.bak",
-            ".notes.tmp",
-        ];
-        for name in keep {
-            std::fs::write(dir.join(name), b"keep").unwrap();
-        }
-        let before = names_in(&dir);
-
-        let db = Db::open(&root, "stale", config()).unwrap();
-        drop(db);
-
-        let mut expected: Vec<String> = before
-            .into_iter()
-            .filter(|name| *name != foreign && *name != same_pid)
-            .collect();
-        expected.sort();
-        assert_eq!(names_in(&dir), expected);
-        assert!(!stale_search.exists());
-        for name in keep {
-            assert!(dir.join(name).exists(), "{name} was removed");
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn cleanup_spares_a_temporary_file_a_write_is_using() {
-        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("meta.json");
-        let live = write_temp(&target, b"partial", false).unwrap();
-        let stale = dir.join(".meta.json.1.1.tmp");
-        std::fs::write(&stale, b"old").unwrap();
-        remove_stale_temps(&dir);
-        assert!(live.0.exists(), "a temporary file in use was removed");
-        assert!(!stale.exists());
-        std::fs::remove_file(&live.0).unwrap();
-        drop(live);
-        remove_stale_temps(&dir);
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn an_unusable_pending_shard_map_is_an_error_not_none() {
-        let root =
-            std::env::temp_dir().join(format!("douchdb-pending-bad-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "pending",
-            DbConfig {
-                q: 1,
-                revs_limit: 100,
-                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
-                shard_map: ShardMap::single(1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-        let pending = db.path.join("pending-shard-map.json");
-        let is_err = |text: String| text.starts_with("Err");
-
-        // Missing is the legitimate "nothing pending".
-        assert_eq!(format!("{:?}", db.pending_shard_map()), "Ok(None)");
-        assert_eq!(
-            format!("{:?}", Db::has_pending_shard_map(&root, "pending")),
-            "Ok(false)"
-        );
-
-        // Content that does not parse.
-        std::fs::write(&pending, b"{not json").unwrap();
-        assert!(is_err(format!("{:?}", db.pending_shard_map())));
-        assert!(is_err(format!(
-            "{:?}",
-            Db::has_pending_shard_map(&root, "pending")
-        )));
-
-        // A read error that is not NotFound: a directory in place of the file.
-        std::fs::remove_file(&pending).unwrap();
-        std::fs::create_dir(&pending).unwrap();
-        assert!(is_err(format!("{:?}", db.pending_shard_map())));
-        assert!(is_err(format!(
-            "{:?}",
-            Db::has_pending_shard_map(&root, "pending")
-        )));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn destroy_answers_not_found_only_for_a_missing_database() {
-        let root = std::env::temp_dir().join(format!("douchdb-destroy-{}", crate::util::uuid()));
-        std::fs::create_dir_all(&root).unwrap();
-        assert_eq!(Db::destroy(&root, "gone").unwrap_err().status, 404);
-
-        // A path that exists but is not a directory cannot be removed as one.
-        std::fs::write(db_path(&root, "stuck"), b"not a directory").unwrap();
-        assert_eq!(Db::destroy(&root, "stuck").unwrap_err().status, 500);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn clear_pending_shard_map_reports_what_it_cannot_remove() {
-        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "pending",
-            DbConfig {
-                q: 1,
-                revs_limit: 100,
-                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
-                shard_map: ShardMap::single(1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-        let pending = db.path.join("pending-shard-map.json");
-
+        let db = Db::open_or_create(&root, "pending", config()).unwrap();
         // Nothing pending is not an error.
-        db.clear_pending_shard_map().unwrap();
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
 
-        db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
-        assert!(db.pending_shard_map().unwrap().is_some());
-        db.clear_pending_shard_map().unwrap();
-        assert!(db.pending_shard_map().unwrap().is_none());
+        db.set_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
+        assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
+        drop(db);
+        let closed = Db::read_closed_meta(&root, "pending", 1).unwrap().unwrap();
+        assert!(closed.pending_shard_map);
 
-        // A path that cannot be unlinked is an error, not a silent success.
-        std::fs::create_dir(&pending).unwrap();
-        assert!(db.clear_pending_shard_map().is_err());
+        let db = Db::open(&root, "pending", config()).unwrap();
+        assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
+        drop(db);
+        let closed = Db::read_closed_meta(&root, "pending", 1).unwrap().unwrap();
+        assert!(!closed.pending_shard_map);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A shard of a database whose shard 0 is cleared (it moved elsewhere)
+    /// keeps the database's own settings, which live beside its own.
+    #[tokio::test]
+    async fn clearing_shard_0_keeps_the_database_settings() {
+        let root = std::env::temp_dir().join(format!("douchdb-clear0-{}", crate::util::uuid()));
+        let db = Db::open_or_create(&root, "clear0", meta_config()).unwrap();
+        db.set_security(json!({"members": {"names": ["a"]}}))
+            .await
+            .unwrap();
+        db.set_pending_shard_map(&ShardMap::balanced(1, 1, 1))
+            .await
+            .unwrap();
+        db.clear_shards(&[0]).await.unwrap();
+        drop(db);
+        let db = Db::open(&root, "clear0", meta_config()).unwrap();
+        assert_eq!(db.security(), json!({"members": {"names": ["a"]}}));
+        assert!(db.pending_shard_map().is_some());
+        drop(db);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6683,52 +6668,56 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn concurrent_client_shard_maps_get_distinct_versions() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_client_shard_maps_get_distinct_versions() {
         let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "next",
-            DbConfig {
-                q: 2,
-                revs_limit: 100,
-                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
-                shard_map: ShardMap::balanced(2, 3, 1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
+        let db = Arc::new(
+            Db::open_or_create(
+                &root,
+                "next",
+                DbConfig {
+                    q: 2,
+                    revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: ShardMap::balanced(2, 3, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
         let start = db.shard_map().version;
-        let versions: Vec<u64> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|node| {
-                    let db = &db;
-                    scope.spawn(move || {
-                        db.set_next_shard_map(ShardMap {
-                            q: 2,
-                            node_count: 3,
-                            replicas: vec![vec![node % 3], vec![node % 3]],
-                            version: 0,
-                        })
-                        .unwrap()
-                        .version
+        let racers: Vec<_> = (0..8)
+            .map(|node| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    db.set_next_shard_map(ShardMap {
+                        q: 2,
+                        node_count: 3,
+                        replicas: vec![vec![node % 3], vec![node % 3]],
+                        version: 0,
                     })
+                    .await
+                    .unwrap()
+                    .version
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let mut sorted = versions.clone();
-        sorted.sort();
-        assert_eq!(sorted, (start + 1..=start + 8).collect::<Vec<_>>());
+            })
+            .collect();
+        let mut versions = Vec::new();
+        for racer in racers {
+            versions.push(racer.await.unwrap());
+        }
+        versions.sort();
+        assert_eq!(versions, (start + 1..=start + 8).collect::<Vec<_>>());
         assert_eq!(db.shard_map().version, start + 8);
+        drop(db);
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn equal_version_shard_maps_converge_on_one_winner() {
+    #[tokio::test]
+    async fn equal_version_shard_maps_converge_on_one_winner() {
         let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::util::uuid()));
         let open = |name: &str| {
-            Db::open(
+            Db::open_or_create(
                 &root,
                 name,
                 DbConfig {
@@ -6751,15 +6740,16 @@ mod tests {
         let b = map(vec![vec![1], vec![1]]);
 
         let first = open("tie-a");
-        assert!(first.set_shard_map(a.clone()).unwrap());
-        let first_accepts_b = first.set_shard_map(b.clone()).unwrap();
+        assert!(first.set_shard_map(a.clone()).await.unwrap());
+        let first_accepts_b = first.set_shard_map(b.clone()).await.unwrap();
         let second = open("tie-b");
-        assert!(second.set_shard_map(b.clone()).unwrap());
-        let second_accepts_a = second.set_shard_map(a.clone()).unwrap();
+        assert!(second.set_shard_map(b.clone()).await.unwrap());
+        let second_accepts_a = second.set_shard_map(a.clone()).await.unwrap();
 
         // Exactly one of the two competing maps wins on both replicas.
         assert_ne!(first_accepts_b, second_accepts_a);
         assert_eq!(first.shard_map().replicas, second.shard_map().replicas);
+        drop((first, second));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6776,7 +6766,7 @@ mod tests {
             replicas: vec![vec![1], vec![1]],
             ..active.clone()
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "stale-mig",
             DbConfig {
@@ -6819,7 +6809,7 @@ mod tests {
             replicas: vec![vec![1], vec![1]],
             ..active.clone()
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "mig-id",
             DbConfig {
@@ -6851,7 +6841,7 @@ mod tests {
     #[tokio::test]
     async fn design_documents_replicate_to_every_node() {
         let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "placement",
             DbConfig {
@@ -6887,7 +6877,7 @@ mod tests {
     #[tokio::test]
     async fn changes_limit_reports_pending_documents() {
         let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "pending",
             DbConfig {
@@ -6937,7 +6927,7 @@ mod tests {
     }
 
     fn scan_db(root: &std::path::Path, name: &str, q: u32, partitioned: bool) -> Db {
-        Db::open(
+        Db::open_or_create(
             root,
             name,
             DbConfig {
@@ -7273,7 +7263,7 @@ mod tests {
             let q = 2u32;
             let root =
                 std::env::temp_dir().join(format!("douchdb-info-wire-{}", crate::util::uuid()));
-            let db = Db::open(
+            let db = Db::open_or_create(
                 &root,
                 "infowire",
                 DbConfig {
@@ -7413,7 +7403,7 @@ mod tests {
     async fn revs_diff_serializes_in_request_order() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-revs-wire-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "revswire",
             DbConfig {
@@ -7453,7 +7443,7 @@ mod tests {
     async fn per_document_answers_survive_the_per_shard_fan_out() {
         let q = 4u32;
         let root = std::env::temp_dir().join(format!("douchdb-fan-out-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "fanout",
             DbConfig {
@@ -7575,7 +7565,7 @@ mod tests {
     async fn failed_shard_commit_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "flushfail",
             DbConfig {
@@ -7652,7 +7642,7 @@ mod tests {
 
     fn two_shard_db(tag: &str) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             tag,
             DbConfig {
@@ -7817,7 +7807,7 @@ mod tests {
 
     fn purge_test_db(name: &str, shard_map: ShardMap) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             name,
             DbConfig {

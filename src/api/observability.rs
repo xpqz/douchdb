@@ -4,7 +4,6 @@
 //! re-exports them so route registration stays in one place.
 
 use super::{flag, internal_request, query, send_peer, AdminOnly, AppState};
-use crate::db::Db;
 use crate::health::FsHealth;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
@@ -40,9 +39,9 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// Probe the data root: list it, write and remove a scratch file, and check
-/// that every database directory still carries a parseable `db.json`. Opening
-/// every database would be far more expensive. Blocking; call it from
-/// `spawn_blocking`.
+/// that every database directory still holds a shard 0 file that is not
+/// empty, where its settings live. Opening every database would be far more
+/// expensive. Blocking; call it from `spawn_blocking`.
 fn probe_fs(root: &std::path::Path) -> FsHealth {
     let readable = std::fs::read_dir(root).is_ok();
     let probe = root.join(format!(".health-{}", crate::util::uuid()));
@@ -51,12 +50,15 @@ fn probe_fs(root: &std::path::Path) -> FsHealth {
     let mut unreadable = 0u64;
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            let db_file = entry.path().join("db.json");
-            if db_file.is_file()
-                && std::fs::read(&db_file)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .is_none()
+            let is_db = entry.path().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::db::dir_name_to_db_name)
+                    .is_some_and(|name| crate::dbname::valid_db_name(&name));
+            let shard = crate::db::shard_file(&entry.path(), 0);
+            if is_db
+                && !std::fs::metadata(&shard).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
             {
                 unreadable += 1;
             }
@@ -282,18 +284,19 @@ async fn check_storage(st: &AppState, detailed: bool) -> (Value, usize, u64) {
 
 /// Databases whose shard map a peer has not acknowledged.
 async fn check_placement(st: &AppState) -> Value {
-    // From disk, so a database that is not open counts too.
-    let names = st.db_names().await;
-    let root = st.root.clone();
-    let pending = tokio::task::spawn_blocking(move || {
-        names
-            .iter()
-            // A pending map that cannot be read is as unsettled as one waiting.
-            .filter(|name| !matches!(Db::has_pending_shard_map(&root, name), Ok(false)))
-            .count()
-    })
-    .await
-    .unwrap_or(0);
+    // From each database's shard 0 when it is not open, so a database that
+    // is not open counts too.
+    let mut pending = 0;
+    for name in st.db_names().await {
+        // A pending map that cannot be read is as unsettled as one waiting.
+        if st
+            .placement(&name)
+            .await
+            .map_or(true, |placed| placed.pending_shard_map)
+        {
+            pending += 1;
+        }
+    }
     json!({
         "name": "placement",
         "status": if pending == 0 { "ok" } else { "degraded" },
@@ -1210,19 +1213,27 @@ pub async fn health_public(State(st): State<Arc<AppState>>) -> Response {
 mod tests {
     use super::*;
 
+    /// A database directory whose shard 0, where its settings live, is
+    /// missing or empty counts as unreadable; staging directories are not
+    /// databases.
     #[test]
-    fn probe_fs_counts_unreadable_db_json() {
+    fn probe_fs_counts_databases_without_a_shard_0() {
         let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::util::uuid()));
-        let good = dir.join("good");
-        let bad = dir.join("bad");
-        assert!(std::fs::create_dir_all(&good).is_ok());
-        assert!(std::fs::create_dir_all(&bad).is_ok());
-        assert!(std::fs::write(good.join("db.json"), b"{}").is_ok());
-        assert!(std::fs::write(bad.join("db.json"), b"not json").is_ok());
+        for (db, shard) in [
+            ("good", Some(&b"x"[..])),
+            ("empty", Some(b"")),
+            ("missing", None),
+            (".creating-1", None),
+        ] {
+            assert!(std::fs::create_dir_all(dir.join(db)).is_ok());
+            if let Some(bytes) = shard {
+                assert!(std::fs::write(dir.join(db).join("shard-0000.redb"), bytes).is_ok());
+            }
+        }
         let health = probe_fs(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(health.readable && health.writable);
-        assert_eq!(health.unreadable, 1);
+        assert_eq!(health.unreadable, 2);
     }
 
     /// A scrape used to open every database, evicting and re-opening all but

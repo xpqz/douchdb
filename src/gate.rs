@@ -604,8 +604,14 @@ mod tests {
             Scratch(dir)
         }
 
+        /// The file `name` in the directory, created empty if it is not
+        /// there yet.
         fn file(&self, name: &str) -> PathBuf {
-            self.0.join(name)
+            let path = self.0.join(name);
+            if !path.exists() {
+                drop(kv::create(&path, CACHE).unwrap());
+            }
+            path
         }
     }
 

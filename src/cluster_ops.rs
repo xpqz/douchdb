@@ -25,7 +25,7 @@ pub(crate) async fn set_security_everywhere(
     value: Value,
     headers: &HeaderMap,
 ) -> DbResult<bool> {
-    let version = db.set_security(value.clone())?;
+    let version = db.set_security(value.clone()).await?;
     if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
         return Ok(true);
     }
@@ -119,7 +119,7 @@ pub(crate) async fn apply_shard_map(
     }
     let internal = ctx.cluster.is_internal(headers);
     if internal {
-        if !db.set_shard_map(map.clone())? {
+        if !db.set_shard_map(map.clone()).await? {
             return Err(shard_map_rejected());
         }
     } else {
@@ -140,10 +140,10 @@ pub(crate) async fn apply_shard_map(
                 error.reason
             );
         }
-        map = db.set_next_shard_map(map)?;
+        map = db.set_next_shard_map(map).await?;
     }
     if internal {
-        db.clear_pending_shard_map()?;
+        db.clear_pending_shard_map().await?;
         return Ok((map, false));
     }
 
@@ -195,9 +195,9 @@ pub(crate) async fn apply_shard_map(
     let quorum = ctx.cluster.nodes.len().max(1) / 2 + 1;
     let pending = acknowledgements < quorum;
     if pending {
-        db.set_pending_shard_map(&map)?;
+        db.set_pending_shard_map(&map).await?;
     } else {
-        db.clear_pending_shard_map()?;
+        db.clear_pending_shard_map().await?;
     }
     crate::telemetry::record_shard_map_update(pending);
     Ok((map, pending))
@@ -648,7 +648,7 @@ async fn activate_map_everywhere(
     headers: &HeaderMap,
 ) -> DbResult<ShardMap> {
     let old = db.shard_map();
-    let map = &db.set_next_shard_map(target.clone())?;
+    let map = &db.set_next_shard_map(target.clone()).await?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
@@ -674,6 +674,7 @@ async fn activate_map_everywhere(
     // the target map also accept the old placement again.
     let rollback = db
         .set_next_shard_map(old)
+        .await
         .unwrap_or_else(|_| db.shard_map());
     for peer in &peers {
         let request = internal_request(
@@ -854,7 +855,7 @@ mod tests {
             replicas: vec![vec![0], vec![0]],
             version: 1,
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "activate",
             DbConfig {
@@ -877,7 +878,7 @@ mod tests {
             replicas: vec![vec![0, 1], vec![0, 1]],
             ..active.clone()
         };
-        let current = db.set_next_shard_map(interloper).unwrap();
+        let current = db.set_next_shard_map(interloper).await.unwrap();
         assert_eq!(current.version, 2);
 
         let ctx = ClusterCtx {
@@ -919,7 +920,7 @@ mod tests {
             ..old_map.clone()
         };
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "stop",
                 DbConfig {

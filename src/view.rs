@@ -3738,7 +3738,7 @@ mod tests {
             crate::util::uuid()
         ));
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "viewseq",
                 crate::db::DbConfig {
@@ -3804,7 +3804,7 @@ mod tests {
             crate::util::uuid()
         ));
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "viewgate",
                 crate::db::DbConfig {
@@ -3888,7 +3888,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             tag,
             crate::db::DbConfig {
@@ -4986,7 +4986,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_slow_reduce_does_not_block_the_runtime() {
         let root = std::env::temp_dir().join(format!("douchdb-slowred-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "slow",
             crate::db::DbConfig {
@@ -5057,7 +5057,7 @@ mod tests {
     async fn open_view_indexes_stay_within_the_cap() {
         let _cap = crate::index_cache::CapGuard::new(8).await;
         let root = std::env::temp_dir().join(format!("douchdb-cap-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "cap",
             crate::db::DbConfig {
@@ -5101,7 +5101,7 @@ mod tests {
         // gate over it is evicted, whoever owns it. Run with them excluded.
         let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root = std::env::temp_dir().join(format!("douchdb-forget-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "forget",
             crate::db::DbConfig {
@@ -5182,7 +5182,7 @@ mod tests {
             shard_map: crate::cluster::ShardMap::single(1),
             partitioned: false,
         };
-        let db = Arc::new(Db::open(&root, "cancel", config()).unwrap());
+        let db = Arc::new(Db::open_or_create(&root, "cancel", config()).unwrap());
         db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
             .await
             .unwrap();
@@ -5228,7 +5228,7 @@ mod tests {
         // A database recreated under the name has a fresh gate and serves.
         drop(db);
         std::fs::remove_dir_all(&root).unwrap();
-        let db = Db::open(&root, "cancel", config()).unwrap();
+        let db = Db::open_or_create(&root, "cancel", config()).unwrap();
         db.put_docs(vec![json!({"_id": "b", "n": 2})], true)
             .await
             .unwrap();
@@ -5262,7 +5262,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_slow_map_does_not_block_the_runtime() {
         let root = std::env::temp_dir().join(format!("douchdb-slowmap-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "slow",
             crate::db::DbConfig {
@@ -5348,7 +5348,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_view_query_on_a_current_index_takes_the_fewest_shard_jobs() {
         let root = std::env::temp_dir().join(format!("douchdb-viewjobs-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "jobs",
             crate::db::DbConfig {
@@ -5424,7 +5424,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_incremental_view_update_skips_the_pending_pass() {
         let root = std::env::temp_dir().join(format!("douchdb-viewpend-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "pend",
             crate::db::DbConfig {
@@ -5548,7 +5548,7 @@ mod tests {
         let mut per_p = Vec::new();
         for partitions in [2usize, 6] {
             let root = std::env::temp_dir().join(format!("douchdb-pvisit-{}", crate::util::uuid()));
-            let db = Db::open(
+            let db = Db::open_or_create(
                 &root,
                 "pvisit",
                 crate::db::DbConfig {
@@ -5620,7 +5620,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cached_design_document_follows_every_change() {
         let root = std::env::temp_dir().join(format!("douchdb-viewspec-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "spec",
             crate::db::DbConfig {

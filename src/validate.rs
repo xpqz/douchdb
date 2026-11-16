@@ -241,7 +241,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "validate",
             crate::db::DbConfig {
@@ -364,7 +364,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "validate",
             crate::db::DbConfig {

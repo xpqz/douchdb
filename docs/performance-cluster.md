@@ -298,7 +298,7 @@ correct keys, a range window and a cluster-wide offset.
 ### Shard-map metadata and movement (#47)
 
 Each database now carries a mem3-style shard map: one ordered replica list per
-shard, persisted as `shard-map.json` and cached in memory. It defaults to the
+shard, stored in the settings table of the database's shard 0 and cached in memory. It defaults to the
 balanced mem3-style placement (#77), and all routing, anti-entropy filters and owner filters
 read it.
 
@@ -707,8 +707,8 @@ local path.
 
 Shard maps now carry a monotonic `version`. External updates increment it,
 peers reject older versions, and the PUT response includes `"pending": true`
-when fewer than a metadata quorum acknowledged. The coordinator persists a
-`pending-shard-map.json`, and anti-entropy reconciles versions with peers:
+when fewer than a metadata quorum acknowledged. The coordinator stores the
+map as pending in shard 0's settings, and anti-entropy reconciles versions with peers:
 newer maps are pulled, older peers are pushed, and the pending marker clears
 once a metadata quorum acknowledges. A test takes two of three nodes down,
 observes a pending version-3 update, restarts one peer, and verifies the map

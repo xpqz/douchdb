@@ -304,9 +304,11 @@ mod tests {
             let db = st.create_db(&name, false, None, None).await.unwrap();
             if n % 2 == 0 {
                 db.set_security(json!({"members": {"names": ["bob"]}}))
+                    .await
                     .unwrap();
             } else {
                 db.set_security(json!({"members": {"names": ["alice"]}}))
+                    .await
                     .unwrap();
             }
             names.push(name);

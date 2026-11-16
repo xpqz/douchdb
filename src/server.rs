@@ -398,6 +398,9 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
         );
     }
     std::fs::create_dir_all(&args.data)?;
+    // Finish the creates and deletes a crash interrupted before serving.
+    let data = args.data.clone();
+    tokio::task::spawn_blocking(move || crate::state::recover_root(&data)).await??;
 
     let advertise = advertise_url(args);
     let auth = build_auth(args)?;

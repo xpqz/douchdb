@@ -1905,7 +1905,7 @@ mod tests {
     async fn open_search_indexes_stay_within_the_cap() {
         let _cap = crate::index_cache::CapGuard::new(8).await;
         let root = std::env::temp_dir().join(format!("douchdb-search-cap-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchcap",
             crate::db::DbConfig {
@@ -1951,7 +1951,7 @@ mod tests {
     async fn forget_db_waits_for_a_search_in_flight() {
         let root =
             std::env::temp_dir().join(format!("douchdb-search-forget-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchforget",
             crate::db::DbConfig {
@@ -2037,7 +2037,7 @@ mod tests {
         };
         let ddoc = json!({"_id": "_design/s", "indexes": {"idx": {
             "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}});
-        let db = Arc::new(Db::open(&root, "searchcancel", config()).unwrap());
+        let db = Arc::new(Db::open_or_create(&root, "searchcancel", config()).unwrap());
         db.put_docs(
             vec![json!({"_id": "a", "name": "apple"}), ddoc.clone()],
             true,
@@ -2082,7 +2082,7 @@ mod tests {
         // A database recreated under the name has a fresh gate and serves.
         drop(db);
         std::fs::remove_dir_all(&root).unwrap();
-        let db = Db::open(&root, "searchcancel", config()).unwrap();
+        let db = Db::open_or_create(&root, "searchcancel", config()).unwrap();
         db.put_docs(vec![json!({"_id": "b", "name": "apple"}), ddoc], true)
             .await
             .unwrap();
@@ -2224,7 +2224,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchpending",
             crate::db::DbConfig {
@@ -2276,7 +2276,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchrandom",
             crate::db::DbConfig {
@@ -2385,7 +2385,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchpassed",
             crate::db::DbConfig {
@@ -2431,7 +2431,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchdeadline",
             crate::db::DbConfig {
@@ -2473,7 +2473,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchupdate",
             crate::db::DbConfig {
@@ -2599,7 +2599,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchcursor",
             crate::db::DbConfig {
@@ -2670,7 +2670,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchrace",
             crate::db::DbConfig {
@@ -2732,7 +2732,7 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchdamaged",
             crate::db::DbConfig {

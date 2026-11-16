@@ -117,12 +117,61 @@ fn lock(flag: &Mutex<bool>) -> MutexGuard<'_, bool> {
     flag.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Open (creating if absent) the redb file at `path` with a page cache of
+/// Open the existing redb file at `path` with a page cache of
 /// `cache_bytes`. The open runs a full integrity check, failing with
 /// `StorageError::Corrupted` on a damaged file, unless the file passed
 /// [`close_verified`] when it last closed in this process.
+///
+/// A file that is not there is an error, never created: only [`create`]
+/// makes files, so a shard that went missing is never replaced by an empty
+/// one. An empty file is refused for the same reason (redb would initialise
+/// it as new).
 pub fn open(path: &Path, cache_bytes: usize) -> Result<Database> {
     open_file(path, cache_bytes, |file| file)
+}
+
+/// Create a new redb file at `path`, failing if one is there already. A new
+/// file needs no integrity check, and nothing about it is remembered: its
+/// first [`open`] checks it.
+pub fn create(path: &Path, cache_bytes: usize) -> Result<Database> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    builder(cache_bytes, false).create_with_backend(FileBackend::new(file)?)
+}
+
+/// The existing, non-empty file at `path`, opened for redb.
+fn existing_file(path: &Path) -> Result<std::fs::File> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Err(StorageError::Corrupted(format!("{} is empty", path.display())).into());
+    }
+    Ok(file)
+}
+
+/// Run `read` on the closed file at `path` and close it again, leaving it
+/// as verified as it was, so metadata of a database that is not open can
+/// be read without a full integrity check every time. The open checks the
+/// file when [`open`] would; a session that only read a file that passed
+/// its check (then or at an earlier close) leaves it verified. `read` must
+/// not write.
+///
+/// The file's lock is held throughout, so an [`open`] or [`close_verified`]
+/// of the same path waits for it; a file open elsewhere fails with
+/// `DatabaseError::DatabaseAlreadyOpen`. Like [`open`], it never creates the
+/// file.
+pub fn peek<R>(path: &Path, cache_bytes: usize, read: impl FnOnce(&Database) -> R) -> Result<R> {
+    let flag = verified_flag(path);
+    let mut verified = lock(&flag);
+    let check = !std::mem::replace(&mut *verified, false);
+    let db =
+        builder(cache_bytes, check).create_with_backend(FileBackend::new(existing_file(path)?)?)?;
+    let result = read(&db);
+    db.close()?;
+    *verified = true;
+    Ok(result)
 }
 
 /// [`open`] through the backend `wrap` makes of the file.
@@ -136,12 +185,7 @@ fn open_file<B: StorageBackend>(
     let flag = verified_flag(path);
     let mut verified = lock(&flag);
     let check = !std::mem::replace(&mut *verified, false);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let file = existing_file(path)?;
     let db = builder(cache_bytes, check).create_with_backend(wrap(FileBackend::new(file)?));
     drop(verified);
     db
@@ -192,6 +236,12 @@ pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     }
 }
 
+/// Whether the file at `path` would open without the full check.
+#[cfg(test)]
+pub(crate) fn is_verified(path: &Path) -> bool {
+    *lock(&verified_flag(path))
+}
+
 /// Forget that the file at `path` was verified, because it has been replaced
 /// (compaction swap, delete, recreate): its next open runs the check.
 pub fn forget_verified(path: &Path) {
@@ -215,7 +265,9 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("douchdb-kv-{tag}-{}", crate::util::uuid()));
             std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
+            let scratch = Scratch(dir);
+            drop(create(&scratch.file(), CACHE).unwrap());
+            scratch
         }
 
         fn file(&self) -> PathBuf {
@@ -392,7 +444,7 @@ mod tests {
     }
 
     fn verified(path: &Path) -> bool {
-        *lock(&verified_flag(path))
+        is_verified(path)
     }
 
     #[test]
@@ -427,6 +479,83 @@ mod tests {
         damage(&path);
         let error = open(&path, CACHE).expect_err("a damaged file opened");
         assert!(is_corrupted(&error), "{error:?}");
+    }
+
+    #[test]
+    fn a_first_peek_checks_a_file_damaged_while_closed() {
+        let scratch = Scratch::new("peek-damaged");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        fill(&db, 200);
+        drop(db);
+        damage(&path);
+        let error = peek(&path, CACHE, |_| ()).expect_err("a damaged file was read");
+        assert!(is_corrupted(&error), "{error:?}");
+        assert!(!verified(&path));
+    }
+
+    /// A peek reads a closed file without costing a full check every time:
+    /// once it has passed one, the file stays verified, and an open after
+    /// it reads little.
+    #[test]
+    fn a_peek_leaves_a_checked_file_verified() {
+        let scratch = Scratch::new("peek-verified");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        fill(&db, 4000);
+        drop(db);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(!verified(&path));
+
+        let read = peek(&path, CACHE, |db| get(db, "doc-000007")).unwrap();
+        assert!(read.is_some());
+        assert!(verified(&path), "the checked peek did not record it");
+        peek(&path, CACHE, |_| ()).unwrap();
+        assert!(verified(&path), "a peek of a verified file forgot it");
+        let reopened = bytes_read_by_open(&path);
+        assert!(reopened < size / 50, "{reopened} of {size} bytes read");
+    }
+
+    /// Only `create` makes files: an open or a peek of a missing file fails
+    /// and leaves none behind, and an empty file (which redb would take for
+    /// a new one) is refused as it is.
+    #[test]
+    fn open_and_peek_never_create_a_file() {
+        let scratch = Scratch::new("no-create");
+        let missing = scratch.0.join("missing.redb");
+        assert!(open(&missing, CACHE).is_err());
+        assert!(peek(&missing, CACHE, |_| ()).is_err());
+        assert!(!missing.exists());
+
+        let empty = scratch.0.join("empty.redb");
+        std::fs::write(&empty, b"").unwrap();
+        let error = open(&empty, CACHE).expect_err("an empty file opened");
+        assert!(is_corrupted(&error), "{error:?}");
+        assert!(peek(&empty, CACHE, |_| ()).is_err());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+
+        let made = scratch.0.join("made.redb");
+        drop(create(&made, CACHE).unwrap());
+        assert!(create(&made, CACHE).is_err(), "create replaced a file");
+        drop(open(&made, CACHE).unwrap());
+    }
+
+    /// A peek of a file open elsewhere in the process is refused by redb's
+    /// lock, never a second session on it; the caller asks the open
+    /// database instead.
+    #[test]
+    fn a_peek_of_an_open_file_is_refused() {
+        let scratch = Scratch::new("peek-open");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        put(&db, "k", b"v");
+        let error = peek(&path, CACHE, |_| ()).expect_err("an open file was peeked");
+        assert!(
+            matches!(error, DatabaseError::DatabaseAlreadyOpen),
+            "{error:?}"
+        );
+        assert_eq!(get(&db, "k"), Some(b"v".to_vec()));
+        drop(db);
     }
 
     #[test]

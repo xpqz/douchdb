@@ -3644,25 +3644,93 @@ async fn slash_database_and_parent_name_coexist() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// A db.json that does not parse is a server-side fault, not a missing
-/// database: the client gets 500 and the file is left for the operator.
+/// A shard 0 that is not a database file (where the database's settings
+/// live) is a server-side fault, not a missing database: the client gets
+/// 500, the database stays listed and the file is left for the operator.
 #[tokio::test]
-async fn corrupt_db_json_is_a_server_error_not_a_404() {
+async fn a_damaged_shard_file_is_a_server_error_not_a_404() {
     let mut s = Server::start(false);
     let (status, body) = s.put("/corruptmeta", json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     s.kill();
-    let db_json = s.dir.join("corruptmeta").join("db.json");
-    std::fs::write(&db_json, b"{ not json").expect("corrupt db.json");
+    let shard = s.dir.join("corruptmeta").join("shard-0000.redb");
+    std::fs::write(&shard, b"not a database").expect("damage the shard");
 
     s.restart();
     let (status, body) = s.get("/corruptmeta").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let (status, names) = s.get("/_all_dbs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(names, json!(["corruptmeta"]));
     assert_eq!(
-        std::fs::read(&db_json).expect("db.json"),
-        b"{ not json",
-        "the corrupt file must not be overwritten"
+        std::fs::read(&shard).expect("shard"),
+        b"not a database",
+        "the damaged file must not be overwritten"
     );
+}
+
+/// Names that need encoding as directories (Review Focus 2) are created,
+/// listed, deleted and recovered exactly like plain ones, and staging and
+/// tombstone directories left by a crash never collide with them. CouchDB
+/// requires a name to begin with a letter, so `$x` and `(y)+z` themselves
+/// are refused; their characters are exercised inside legal names.
+#[tokio::test]
+async fn names_needing_encoding_create_list_delete_and_recover() {
+    let mut s = Server::start(false);
+    for illegal in ["%24x", "%28y%29%2Bz"] {
+        let (status, body) = s.put(&format!("/{illegal}"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{illegal}: {body}");
+        assert_eq!(body["error"], "illegal_database_name", "{illegal}");
+    }
+    let names = ["a/b", "b$x", "c(y)+z"];
+    let encoded = ["a%2Fb", "b%24x", "c%28y%29%2Bz"];
+    for path in encoded {
+        let (status, body) = s.put(&format!("/{path}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, body) = s.put(&format!("/{path}/doc"), json!({"v": path})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+    }
+    let (_, listed) = s.get("/_all_dbs").await;
+    assert_eq!(listed, json!(names));
+
+    // A crash left a staging and a tombstone directory behind; one of each
+    // even carries a database's directory name inside.
+    s.kill();
+    for leftover in [".creating-1", ".deleted-2"] {
+        let dir = s.dir.join(leftover);
+        std::fs::create_dir_all(dir.join("a%2Fb")).expect("leftover");
+    }
+    s.restart();
+    let (_, listed) = s.get("/_all_dbs").await;
+    assert_eq!(listed, json!(names), "after recovery");
+    assert!(!s.dir.join(".creating-1").exists());
+    assert!(!s.dir.join(".deleted-2").exists());
+    for (path, name) in encoded.iter().zip(names) {
+        let (status, body) = s.get(&format!("/{path}/doc")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["v"], *path);
+        let (status, info) = s.get(&format!("/{path}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {info}");
+        assert_eq!(info["db_name"], name);
+    }
+
+    for path in encoded {
+        let (status, body) = s.req(Method::DELETE, &format!("/{path}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    let (_, listed) = s.get("/_all_dbs").await;
+    assert_eq!(listed, json!([]));
+    s.restart();
+    let (_, listed) = s.get("/_all_dbs").await;
+    assert_eq!(listed, json!([]), "a deleted database came back");
+    for path in encoded {
+        let (status, _) = s.get(&format!("/{path}/doc")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        let (status, body) = s.put(&format!("/{path}"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{path} again: {body}");
+        let (_, info) = s.get(&format!("/{path}")).await;
+        assert_eq!(info["doc_count"], 0, "{path}: a recreated database is new");
+    }
 }
 
 #[tokio::test]
@@ -8479,6 +8547,20 @@ async fn cluster_shard_map_moves_data_between_nodes() {
     assert_eq!(body["value"], "moved");
 }
 
+/// Whether `node` holds a shard map for `db` that peers have not
+/// acknowledged, as its local metrics report it.
+async fn pending_shard_map(node: &Server, db: &str) -> bool {
+    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    let entry = metrics["databases"]
+        .as_array()
+        .and_then(|dbs| dbs.iter().find(|entry| entry["name"] == db))
+        .unwrap_or_else(|| panic!("no metrics for {db}: {metrics}"));
+    entry["pending_shard_map"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("no pending_shard_map for {db}: {entry}"))
+}
+
 #[tokio::test]
 async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
     let mut nodes = start_cluster_with(3, "1", 1);
@@ -8510,11 +8592,7 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(pending["version"], 3);
     assert_eq!(pending["pending"], true);
-    assert!(nodes[0]
-        .dir
-        .join("meta")
-        .join("pending-shard-map.json")
-        .is_file());
+    assert!(pending_shard_map(&nodes[0], "meta").await);
 
     nodes[1].restart();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -8531,9 +8609,8 @@ async fn cluster_shard_map_versions_reconcile_after_peer_returns() {
     }
     // The peer may adopt the map on its own pass before ours has seen it
     // current, so the marker clears on whichever pass counts the quorum.
-    let marker = nodes[0].dir.join("meta").join("pending-shard-map.json");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while marker.exists() {
+    while pending_shard_map(&nodes[0], "meta").await {
         assert!(
             std::time::Instant::now() < deadline,
             "pending map was not cleared after quorum acknowledgement"

@@ -286,7 +286,7 @@ pub async fn db_security_put(
     if let Err(error) = validate_security(value) {
         return fail(error);
     }
-    match db.set_security_versioned(version, value.clone()) {
+    match db.set_security_versioned(version, value.clone()).await {
         Ok(true) => ok(),
         Ok(false) => fail(ApiError::new(
             409,
@@ -454,6 +454,7 @@ pub async fn metadata_sync(
             accepted.security = validate_security(&entry.security).is_ok()
                 && db
                     .set_security_versioned(entry.version, entry.security)
+                    .await
                     .unwrap_or(false);
         }
         reply.accepted.insert(name, accepted);
