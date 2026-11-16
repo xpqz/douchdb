@@ -16,10 +16,10 @@
 #[cfg(test)]
 mod powercut;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use redb::backends::FileBackend;
 use redb::{Builder, Database, DatabaseError, StorageBackend, StorageError, TableDefinition};
@@ -95,16 +95,26 @@ pub fn unseal(stored: &[u8]) -> std::result::Result<&[u8], Corrupt> {
     }
 }
 
-/// Files that passed an integrity check when they last closed in this
-/// process, and so can open without one. An open takes its file out, so
-/// only a [`close_verified`] puts it back: a file closed any other way is
-/// checked on its next open. The lock is held across an open (decision and
-/// file open, integrity check included) and across a verified close's
-/// release and record, so opens are serialised on it.
-static VERIFIED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+/// Per file: whether it passed an integrity check when it last closed in
+/// this process, and so can open without one. An open clears the flag, so
+/// only a [`close_verified`] sets it again: a file closed any other way is
+/// checked on its next open.
+///
+/// Each file has its own lock, held across an open (decision, file open,
+/// integrity check) and across a verified close's release and record, so
+/// those are atomic for that file while files never wait on each other. The
+/// map's lock is held only to find a file's entry.
+static VERIFIED: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<bool>>>>> =
+    LazyLock::new(Default::default);
 
-fn verified_set() -> MutexGuard<'static, HashSet<PathBuf>> {
-    VERIFIED.lock().unwrap_or_else(PoisonError::into_inner)
+/// The verification flag of the file at `path`, for the caller to lock.
+fn verified_flag(path: &Path) -> Arc<Mutex<bool>> {
+    let mut files = VERIFIED.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(files.entry(path.to_path_buf()).or_default())
+}
+
+fn lock(flag: &Mutex<bool>) -> MutexGuard<'_, bool> {
+    flag.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Open (creating if absent) the redb file at `path` with a page cache of
@@ -123,8 +133,9 @@ fn open_file<B: StorageBackend>(
 ) -> Result<Database> {
     // Held until the file is open: a close_verified of this path finishing
     // between the decision and the open would mark this session verified.
-    let mut verified = verified_set();
-    let check = !verified.remove(path);
+    let flag = verified_flag(path);
+    let mut verified = lock(&flag);
+    let check = !std::mem::replace(&mut *verified, false);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -153,44 +164,37 @@ fn builder(cache_bytes: usize, check_integrity: bool) -> Builder {
 /// Close `db`, the file at `path`, after a full integrity check. A file that
 /// passes opens without the check later in this process; one that fails (or
 /// had to be repaired), or whose close fails, is checked again on its next
-/// open, and the error is returned. Call it off the request path, with no transaction open: the
-/// check reads the whole file.
+/// open, and the error is returned. Call it off the request path, with no
+/// transaction open: the check reads the whole file.
 pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     let outcome = db.check_integrity();
     // Held from the release of the file until it is recorded: an open of
-    // this path in between would be marked verified by the insert below. A
+    // this path in between would be marked verified by the record below. A
     // close that fails leaves the file for its next open to recover, so it
     // is not verified either.
-    let mut verified = verified_set();
+    let flag = verified_flag(path);
+    let mut verified = lock(&flag);
     let closed = db.close();
+    *verified = false;
     match outcome {
         Ok(true) => {
-            if let Err(error) = closed {
-                verified.remove(path);
-                return Err(error);
-            }
-            verified.insert(path.to_path_buf());
+            closed?;
+            *verified = true;
             Ok(())
         }
-        Ok(false) => {
-            verified.remove(path);
-            Err(StorageError::Corrupted(format!(
-                "{} failed its integrity check and was repaired",
-                path.display()
-            ))
-            .into())
-        }
-        Err(error) => {
-            verified.remove(path);
-            Err(error)
-        }
+        Ok(false) => Err(StorageError::Corrupted(format!(
+            "{} failed its integrity check and was repaired",
+            path.display()
+        ))
+        .into()),
+        Err(error) => Err(error),
     }
 }
 
 /// Forget that the file at `path` was verified, because it has been replaced
 /// (compaction swap, delete, recreate): its next open runs the check.
 pub fn forget_verified(path: &Path) {
-    verified_set().remove(path);
+    *lock(&verified_flag(path)) = false;
 }
 
 #[cfg(test)]
@@ -200,7 +204,7 @@ mod tests {
     use redb::{ReadableDatabase, TableError};
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
 
     /// A temporary directory, removed when dropped.
     struct Scratch(PathBuf);
@@ -303,12 +307,12 @@ mod tests {
         }
     }
 
-    /// Whether another thread could change the verified set right now. When
-    /// it could, a racing open or close is run in place; when the set is
-    /// held, the race cannot happen there and the caller runs that step
+    /// Whether another thread could change `path`'s verification right now.
+    /// When it could, a racing open or close is run in place; when the flag
+    /// is held, the race cannot happen there and the caller runs that step
     /// after instead.
-    fn set_is_free() -> bool {
-        VERIFIED.try_lock().is_ok()
+    fn file_is_free(path: &Path) -> bool {
+        verified_flag(path).try_lock().is_ok()
     }
 
     /// Bytes read by an `open` of `path` (with its usual verified-set rule),
@@ -387,7 +391,7 @@ mod tests {
     }
 
     fn verified(path: &Path) -> bool {
-        verified_set().contains(path)
+        *lock(&verified_flag(path))
     }
 
     #[test]
@@ -500,7 +504,7 @@ mod tests {
             hook: Mutex::new(Some(Box::new(move || {
                 // Another thread opens the file between its release and
                 // close_verified recording it.
-                if set_is_free() {
+                if file_is_free(&racer_path) {
                     *racer.lock().unwrap() = Some(open(&racer_path, CACHE).unwrap());
                 }
             }))),
@@ -529,7 +533,7 @@ mod tests {
             // The first session closes verified between this open deciding
             // to check and opening the file.
             let first = first.lock().unwrap().take().unwrap();
-            if set_is_free() {
+            if file_is_free(&path) {
                 close_verified(first, &path).unwrap();
             } else {
                 drop(first);
@@ -542,6 +546,47 @@ mod tests {
             "verified while a session that will not end in close_verified is open"
         );
         drop(second);
+    }
+
+    #[test]
+    fn an_open_of_one_path_does_not_hold_up_another() {
+        let (first, other) = (Scratch::new("hold-first"), Scratch::new("hold-other"));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let held = std::thread::spawn({
+            let path = first.file();
+            move || {
+                open_file(&path, CACHE, |inner| {
+                    // Inside the open's locked section until released.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    inner
+                })
+                .map(drop)
+            }
+        });
+        entered_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let unrelated = std::thread::spawn({
+            let path = other.file();
+            move || {
+                let db = open(&path, CACHE).unwrap();
+                close_verified(db, &path).unwrap();
+                done_tx.send(()).unwrap();
+            }
+        });
+        // The pass criterion is the completion signal, received while the
+        // first open is still held. The bound only keeps a regression from
+        // hanging the suite; it is never what a passing run waits for.
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(120));
+        release_tx.send(()).unwrap();
+        held.join().unwrap().unwrap();
+        unrelated.join().unwrap();
+        assert!(
+            finished.is_ok(),
+            "an open and close of another path waited for this path's open"
+        );
     }
 
     #[test]
