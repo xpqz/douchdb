@@ -620,8 +620,8 @@ async fn concurrent_create_of_one_database_gives_one_201() {
 }
 
 /// A database that exists on disk but is not open yet is opened once, however
-/// many first requests arrive together; a second open would hit the LevelDB
-/// LOCK and answer 500.
+/// many first requests arrive together; a second open would hit a shard
+/// file's lock and answer 500.
 #[tokio::test]
 async fn concurrent_first_requests_share_one_open() {
     let mut s = Server::start(false);

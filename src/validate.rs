@@ -247,6 +247,7 @@ mod tests {
             crate::db::DbConfig {
                 q,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(q),
                 partitioned: false,
             },
@@ -369,6 +370,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },

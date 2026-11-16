@@ -1,18 +1,14 @@
 //! Database and document semantics: revisions, conflicts, changes feeds.
 //!
-//! All writes for one request are staged as an ordered list of (key, value)
-//! operations and applied as a single LevelDB `WriteBatch`, so a `_bulk_docs`
-//! of a thousand documents costs one OS flush, not a thousand. rusty-leveldb
-//! does not fsync, so this is process-crash durability, not power-loss
-//! durability.
+//! All writes for one request are staged, validated, and then written into
+//! the shard's group commit (one synced redb transaction for every request
+//! queued together), so a `_bulk_docs` of a thousand documents costs one
+//! `fsync`, not a thousand, and is acknowledged only once it is durable.
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Rev};
-use crate::store::{
-    body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, DocMeta, LiveDoc,
-    MetaState, PurgeInfo, Shard, ShardHandle, Tx,
-};
+use crate::store::{meta_state, DocMeta, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn};
 use crate::util::{hex, uuid};
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -43,8 +39,23 @@ struct DbFile {
     partitioned: bool,
 }
 
-/// Staged operations for one atomic commit.
-type Ops = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+/// One staged write of a document batch, applied once the whole batch is
+/// staged.
+enum Op {
+    /// A revision's body.
+    Body {
+        id: String,
+        rev: String,
+        body: Vec<u8>,
+    },
+    /// The document's change at this sequence.
+    Seq { seq: u64, id: String },
+    /// The document's previous change, superseded.
+    Unseq(u64),
+}
+
+/// Staged writes for one atomic commit.
+type Ops = Vec<Op>;
 
 /// Shard slot for a document id. Kept free so cluster code can map a view row
 /// back to its owning shard without an open database handle.
@@ -487,6 +498,8 @@ pub struct MapCursor {
 pub struct DbConfig {
     pub q: u32,
     pub revs_limit: u64,
+    /// Page cache of each shard file (`--cache-mb`).
+    pub cache_bytes: usize,
     pub shard_map: ShardMap,
     pub partitioned: bool,
 }
@@ -523,6 +536,11 @@ fn now_millis() -> u64 {
 /// ordinary filename characters on every supported platform.
 pub fn db_dir_name(name: &str) -> String {
     name.replace('/', "%2F")
+}
+
+/// The file of shard `index` of the database in `dir`.
+fn shard_file(dir: &Path, index: u32) -> PathBuf {
+    dir.join(format!("shard-{index:04}.redb"))
 }
 
 /// The data-root directory of database `name`.
@@ -601,8 +619,9 @@ impl Db {
         let commits = Arc::new(tokio::sync::watch::Sender::new(()));
         for i in 0..file.q {
             let shard = ShardHandle::spawn(
-                path.join(format!("shard-{i:04}")),
+                shard_file(&path, i),
                 config.revs_limit,
+                config.cache_bytes,
                 commits.clone(),
             )?;
             shards.push(shard);
@@ -699,7 +718,7 @@ impl Db {
     pub async fn release_indexes(&self) {
         for shard in &self.shards {
             let _ = shard
-                .call(|shard| {
+                .read(|shard| {
                     shard.release_indexes();
                     Ok(())
                 })
@@ -719,7 +738,7 @@ impl Db {
         let mut total = 0;
         for shard in &self.shards {
             total += shard
-                .call(|shard| Ok(shard.index_entries()))
+                .read(|shard| Ok(shard.index_entries()))
                 .await
                 .unwrap_or(0);
         }
@@ -755,6 +774,15 @@ impl Db {
     }
 
     pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
+        // A file created later under the same name is a new one, which its
+        // first open checks.
+        if let Ok(files) = std::fs::read_dir(db_path(root, name)) {
+            for file in files.flatten() {
+                if file.path().extension().is_some_and(|ext| ext == "redb") {
+                    crate::kv::forget_verified(&file.path());
+                }
+            }
+        }
         match std::fs::remove_dir_all(db_path(root, name)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -823,7 +851,7 @@ impl Db {
         let shard = &self.shards[self.partition_shard(partition)];
         let partition = partition.to_string();
         shard
-            .call(move |s| s.partition_counts(&partition).map_err(ApiError::from))
+            .read(move |s| s.partition_counts(&partition).map_err(ApiError::from))
             .await
     }
 
@@ -869,7 +897,7 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
-            let (mut found, corrupt) = shard.call(|s| Ok(s.design_docs()?)).await?;
+            let (mut found, corrupt) = shard.read(|s| Ok(s.design_docs()?)).await?;
             if let Some(id) = corrupt.first() {
                 // Skipping it would let writes through unvalidated.
                 return Err(ApiError::corrupt(format!(
@@ -886,7 +914,7 @@ impl Db {
             let shard = &self.shards[self.shard_index(&id)];
             let id_for_shard = id.clone();
             let doc = shard
-                .call(move |s| {
+                .read(move |s| {
                     let Some(meta) = s.get_meta(&id_for_shard)? else {
                         return Ok(None);
                     };
@@ -1395,7 +1423,7 @@ impl Db {
     pub async fn shard_counts(&self) -> DbResult<Vec<(u64, u64)>> {
         let mut out = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
-            out.push(shard.call(|s| Ok(s.counts())).await?);
+            out.push(shard.read(|s| Ok(s.counts())).await?);
         }
         Ok(out)
     }
@@ -1405,7 +1433,7 @@ impl Db {
         for shard in &self.shards {
             out.push(
                 shard
-                    .call(move |s| s.state(with_digest).map_err(ApiError::from))
+                    .read(move |s| s.state(with_digest).map_err(ApiError::from))
                     .await?,
             );
         }
@@ -1454,7 +1482,7 @@ impl Db {
         let counts = futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok((s.counts(), s.purge_seq()?)))),
+                .map(|shard| shard.read(|s| Ok((s.counts(), s.purge_seq()?)))),
         )
         .await;
         for counted in counts {
@@ -1597,7 +1625,7 @@ impl Db {
         let id = id.to_string();
         let opts = opts.clone();
         self.shard(id.as_str())
-            .call(move |s| read_doc(s, &id, &opts))
+            .read(move |s| read_doc(s, &id, &opts))
             .await
     }
 
@@ -1620,7 +1648,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].read(move |s| {
                         Ok(batch
                             .into_iter()
                             .map(|(slot, id)| (slot, read_doc(s, &id, &opts)))
@@ -1665,7 +1693,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].read(move |s| {
                         batch
                             .into_iter()
                             .filter_map(|id| match all_docs_key_row(s, &id, &opts) {
@@ -1759,7 +1787,7 @@ impl Db {
                 })
                 .map(|(_, shard)| {
                     let opts = opts.clone();
-                    shard.call(move |s| {
+                    shard.read(move |s| {
                         let docs = all_docs_live_total(s, &opts)?;
                         let (rows, offset) = collect_all_docs(s, &opts, take)?;
                         Ok((rows, offset, docs))
@@ -1819,7 +1847,7 @@ impl Db {
             }
             let shard_opts = opts.clone();
             let (before, docs) = shard
-                .call(move |s| {
+                .read(move |s| {
                     let docs = all_docs_live_total(s, &shard_opts)?;
                     Ok((all_docs_before_start(s, &shard_opts)?, docs))
                 })
@@ -1858,7 +1886,7 @@ impl Db {
                         let shard = &db.shards[index];
                         async move {
                             shard
-                                .call(move |s| {
+                                .read(move |s| {
                                     let scanned =
                                         scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
                                     let last = scanned.last().map(|row| row.id.clone());
@@ -1932,7 +1960,7 @@ impl Db {
                             let mut wanted = cursor.buffer.split_off(cursor.loaded);
                             rests.push(wanted.split_off(taken[*slot] - cursor.loaded));
                             let shard_opts = opts.clone();
-                            fetches.push(db.shards[cursor.index].call(move |s| {
+                            fetches.push(db.shards[cursor.index].read(move |s| {
                                 load_all_docs(s, wanted.into_iter().collect(), &shard_opts)
                             }));
                         }
@@ -2020,7 +2048,7 @@ impl Db {
         while let Some(&index) = shards.get(cursor.shard) {
             let after = cursor.after.take();
             let (docs, last) = self.shards[index]
-                .call(move |s| {
+                .read(move |s| {
                     // Build (or reuse) the live map, then read only bodies.
                     // This avoids decoding every full DocMeta record again for
                     // each cold view build.
@@ -2098,14 +2126,14 @@ impl Db {
             } else {
                 let partition = partition.clone();
                 total_rows = self.shards[shard]
-                    .call(move |s| s.partition_live_count(&partition).map_err(ApiError::from))
+                    .read(move |s| s.partition_live_count(&partition).map_err(ApiError::from))
                     .await?;
             }
         } else {
             let counts =
                 futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| all_docs_live_total(s, &opts))
+                    self.shards[index].read(move |s| all_docs_live_total(s, &opts))
                 }))
                 .await;
             for count in counts {
@@ -2201,7 +2229,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].read(move |s| {
                         let rows = batch
                             .into_iter()
                             .map(|(slot, key)| {
@@ -2328,7 +2356,7 @@ impl Db {
                 let shard_opts = opts.clone();
                 let until = bound.get(index);
                 let read = self.shards[index]
-                    .call(move |s| collect_changes(s, &shard_opts, index, cursor, until, page))
+                    .read(move |s| collect_changes(s, &shard_opts, index, cursor, until, page))
                     .await?;
                 reached[index] = true;
                 let mut matched = match &opts.filter {
@@ -2391,7 +2419,7 @@ impl Db {
         futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
             let after = after.get(index);
             self.shards[index]
-                .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
+                .read(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
         }))
         .await
         .into_iter()
@@ -2497,7 +2525,7 @@ impl Db {
                     };
                     let shard_opts = opts.clone();
                     let read = match db.shards[index]
-                        .call(move |shard| collect_changes(shard, &shard_opts, index, cursor, until, page))
+                        .read(move |shard| collect_changes(shard, &shard_opts, index, cursor, until, page))
                         .await
                     {
                         Ok(read) => read,
@@ -2601,7 +2629,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].call(move |s| {
+                    self.shards[index].read(move |s| {
                         batch
                             .into_iter()
                             .map(|(slot, id, wanted)| {
@@ -2715,7 +2743,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].call(move |shard| {
+                    self.shards[index].read(move |shard| {
                         let mut out = Vec::with_capacity(batch.len());
                         for (slot, id, opts) in batch {
                             let rev = opts
@@ -2761,7 +2789,7 @@ impl Db {
     pub async fn local_get(&self, id: &str) -> DbResult<Option<Value>> {
         let id = id.to_string();
         self.local_shard(&id)
-            .call(move |s| read_local(s, &id))
+            .read(move |s| read_local(s, &id))
             .await
     }
 
@@ -2868,7 +2896,7 @@ impl Db {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| shard_owned(owned, *index))
-                .map(|(_, shard)| shard.call(list_local)),
+                .map(|(_, shard)| shard.read(list_local)),
         )
         .await;
         let mut docs: Vec<(String, Value)> = Vec::new();
@@ -2891,9 +2919,9 @@ impl Db {
     /// `_local_docs`, and they live on the first shard whatever the
     /// placement.
     pub async fn checkpoint_get(&self, id: &str) -> DbResult<Option<Value>> {
-        let key = checkpoint_key(id);
+        let id = id.to_string();
         self.shards[0]
-            .call(move |s| match s.get_checked(&key)? {
+            .read(move |s| match s.get_checkpoint(&id)? {
                 Some(bytes) => serde_json::from_slice::<Value>(&bytes)
                     .map(Some)
                     .map_err(|error| {
@@ -2909,15 +2937,10 @@ impl Db {
     }
 
     pub async fn checkpoint_put(&self, id: &str, value: &Value) -> DbResult<()> {
-        let key = checkpoint_key(id);
-        let value = value.clone();
+        let id = id.to_string();
+        let value = serde_json::to_vec(value).map_err(ApiError::internal)?;
         self.shards[0]
-            .call(move |s| {
-                let mut tx = Tx::new();
-                tx.put_json(&key, &value)?;
-                s.commit(tx)?;
-                Ok(())
-            })
+            .call(move |s| Ok(s.put_checkpoint(&id, &value)?))
             .await
     }
 
@@ -2929,14 +2952,13 @@ impl Db {
         shard: usize,
         prefix: &str,
     ) -> DbResult<Vec<(String, Value)>> {
-        let key = checkpoint_key(prefix);
+        let prefix = prefix.to_string();
         let found = self.shards[shard]
-            .call(move |s| Ok(s.scan_from(&key, &key)?))
+            .read(move |s| Ok(s.checkpoints(&prefix)?))
             .await?;
         found
             .into_iter()
-            .map(|(key, value)| {
-                let id = String::from_utf8_lossy(&key[3..]).into_owned();
+            .map(|(id, value)| {
                 serde_json::from_slice::<Value>(&value)
                     .map(|value| (id, value))
                     .map_err(|error| {
@@ -2959,16 +2981,14 @@ impl Db {
         value: &Value,
         stale: Vec<String>,
     ) -> DbResult<()> {
-        let key = checkpoint_key(id);
-        let value = value.clone();
+        let id = id.to_string();
+        let value = serde_json::to_vec(value).map_err(ApiError::internal)?;
         self.shards[shard]
             .call(move |s| {
-                let mut tx = Tx::new();
                 for old in stale {
-                    tx.delete(&checkpoint_key(&old));
+                    s.remove_checkpoint(&old)?;
                 }
-                tx.put_json(&key, &value)?;
-                s.commit(tx)?;
+                s.put_checkpoint(&id, &value)?;
                 Ok(())
             })
             .await
@@ -2981,7 +3001,7 @@ impl Db {
         futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok(s.purge_seq()?))),
+                .map(|shard| shard.read(|s| Ok(s.purge_seq()?))),
         )
         .await
         .into_iter()
@@ -3012,10 +3032,12 @@ impl Db {
         let reads = self.shards.iter().enumerate().map(|(index, shard)| {
             let after = since.get(index).copied().unwrap_or(0);
             shard.call(move |s| {
+                // Read before writing, so a failed read fails only this job.
+                let purged = s.purged_since(after)?;
                 if let Some(node) = reader {
                     s.report_purge_checkpoint(node, after)?;
                 }
-                Ok(s.purged_since(after)?)
+                Ok(purged)
             })
         });
         futures::future::join_all(reads).await.into_iter().collect()
@@ -3101,7 +3123,7 @@ impl Db {
                 .map(|(id, revs)| (id.to_string(), revs))
                 .collect();
             let hits = self.shards[index]
-                .call(move |s| {
+                .read(move |s| {
                     let mut hits = Vec::new();
                     for (id, revs) in docs {
                         for rev in s.purged_revs(&id, &revs)? {
@@ -3202,7 +3224,7 @@ impl Db {
         self.compact_running.store(true, Ordering::SeqCst);
         let result = async {
             for shard in &self.shards {
-                shard.call(|s| s.compact().map_err(ApiError::from)).await?;
+                shard.alone(|s| s.compact().map_err(ApiError::from)).await?;
             }
             Ok(())
         }
@@ -3211,19 +3233,18 @@ impl Db {
         result
     }
 
+    /// Every acknowledged write is already synced (each group commit is), so
+    /// there is nothing left to flush.
     pub async fn ensure_full_commit(&self) -> DbResult<Value> {
-        for shard in &self.shards {
-            shard.call(|s| s.flush().map_err(ApiError::from)).await?;
-        }
         Ok(json!({ "ok": true, "instance_start_time": self.instance_start_time }))
     }
 
     pub async fn get_revs_limit(&self) -> DbResult<u64> {
-        self.shards[0].call(|s| Ok(s.revs_limit())).await
+        self.shards[0].read(|s| Ok(s.revs_limit())).await
     }
 
     pub async fn get_purged_infos_limit(&self) -> DbResult<u64> {
-        self.shards[0].call(|s| Ok(s.purged_infos_limit())).await
+        self.shards[0].read(|s| Ok(s.purged_infos_limit())).await
     }
 
     pub async fn set_purged_infos_limit(&self, limit: u64) -> DbResult<()> {
@@ -3258,7 +3279,7 @@ pub fn attachments_unsupported() -> ApiError {
 /// The requested revisions of one document the shard does not have, and the
 /// leaves that could be their ancestors.
 fn revs_diff_one(
-    s: &mut crate::store::Shard,
+    s: &mut ShardTxn,
     id: &str,
     wanted: &[String],
 ) -> DbResult<(Vec<String>, Vec<String>)> {
@@ -3358,13 +3379,12 @@ impl<'a> PurgeSource<'a> {
 /// `Assigned` uuid is a fresh purge whose uuid the coordinator chose, so every
 /// copy records the same one (fabric_doc_purge.erl).
 fn purge_one(
-    s: &mut crate::store::Shard,
+    s: &mut ShardTxn,
     id: &str,
     requested: &[String],
     source: PurgeSource<'_>,
     peers: &[usize],
 ) -> DbResult<Vec<String>> {
-    let mut tx = Tx::new();
     let meta = match s.get_meta(id) {
         Ok(meta) => meta,
         Err(error)
@@ -3391,12 +3411,13 @@ fn purge_one(
                 id: id.to_string(),
                 revs: requested.to_vec(),
             };
-            s.record_purge(&mut tx, &info, peers)?;
-            s.commit(tx)?;
+            s.record_purge(&info, peers)?;
         }
         return Ok(Vec::new());
     };
+    let old_state = meta_state(&meta);
     let mut removed = Vec::new();
+    let mut dead_bodies = Vec::new();
     // Like CouchDB, purge leaves only: each takes its unshared
     // ancestors with it, and a listed non-leaf revision is
     // ignored and not reported.
@@ -3406,11 +3427,11 @@ fn purge_one(
         if gone.is_empty() {
             continue;
         }
-        for dead in &gone {
-            tx.delete(&body_key(id, dead));
-        }
+        dead_bodies.extend(gone);
         removed.push(rev.clone());
     }
+    // The purge info is recorded first: it reads the shard's purge state,
+    // and a job reads everything before its first write.
     if matches!(source, PurgeSource::Replayed(_)) || !removed.is_empty() {
         let info = match source {
             PurgeSource::Replayed(uuid) => PurgeInfo {
@@ -3424,28 +3445,29 @@ fn purge_one(
                 revs: removed.clone(),
             },
         };
-        s.record_purge(&mut tx, &info, peers)?;
+        s.record_purge(&info, peers)?;
     }
-    if !removed.is_empty() {
-        if meta.tree.is_empty() {
-            tx.delete(&meta_key(id));
-            if meta.seq != 0 {
-                tx.delete(&seq_key(meta.seq));
-            }
-            s.commit(tx)?;
-        } else {
-            let old_seq = meta.seq;
-            // Purging the winner changes what a normal read sees,
-            // so it is a change as far as `_changes` is concerned.
-            let seq = s.next_seq();
-            meta.seq = seq;
-            tx.delete(&seq_key(old_seq));
-            tx.put(&seq_key(seq), id.as_bytes());
-            tx.put_json(&meta_key(id), &meta)?;
-            s.commit(tx)?;
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    for dead in &dead_bodies {
+        s.remove_body(id, dead)?;
+    }
+    if meta.tree.is_empty() {
+        if meta.seq != 0 {
+            s.remove_seq(meta.seq)?;
         }
+        s.remove_meta(id, old_state)?;
     } else {
-        s.commit(tx)?;
+        let old_seq = meta.seq;
+        // Purging the winner changes what a normal read sees,
+        // so it is a change as far as `_changes` is concerned.
+        let seq = s.next_seq();
+        meta.seq = seq;
+        s.remove_seq(old_seq)?;
+        s.put_seq(seq, id)?;
+        let bytes = meta_bytes(&meta).map_err(ApiError::internal)?;
+        s.put_meta(id, &bytes, old_state, meta_state(&meta), seq)?;
     }
     Ok(removed)
 }
@@ -3592,7 +3614,7 @@ async fn compile_design_docs(
                 continue;
             }
             let stored = shard
-                .call(move |shard| {
+                .read(move |shard| {
                     Ok(candidates
                         .into_iter()
                         .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
@@ -3624,7 +3646,7 @@ fn compile_needed(obj: &Map<String, Value>) -> bool {
 /// Whether `Stage::stage_replicated` would find this replicated revision
 /// already stored, and so never validate it. Anything malformed is "not
 /// stored": the stage reports its own error for it.
-fn replicated_is_stored(shard: &mut crate::store::Shard, doc: Value) -> bool {
+fn replicated_is_stored(shard: &mut ShardTxn, doc: Value) -> bool {
     let Ok(SplitDoc {
         id, rev, revisions, ..
     }) = split_doc(doc)
@@ -3785,7 +3807,7 @@ fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
 }
 
 fn put_many(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     docs: Vec<(usize, Value)>,
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
@@ -3833,7 +3855,7 @@ fn put_many(
         if let Ok(bytes) = meta_bytes(meta) {
             let old = origin.get(id).cloned().flatten();
             metas.push(MetaWrite {
-                key: meta_key(id),
+                id: id.clone(),
                 bytes,
                 old,
                 new: meta_state(meta),
@@ -3857,14 +3879,14 @@ fn put_many(
     results
 }
 
-struct Stage<'a> {
-    shard: &'a mut crate::store::Shard,
+struct Stage<'a, 's> {
+    shard: &'a mut ShardTxn<'s>,
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
     origin: &'a mut HashMap<String, Option<MetaState>>,
 }
 
-impl Stage<'_> {
+impl Stage<'_, '_> {
     fn next_seq(&mut self) -> u64 {
         self.shard.next_seq()
     }
@@ -3962,13 +3984,17 @@ impl Stage<'_> {
         let seq = self.next_seq();
         meta.seq = seq;
 
-        self.ops.push((
-            body_key(&id, &rev),
-            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
-        ));
-        self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
+        self.ops.push(Op::Body {
+            id: id.clone(),
+            rev: rev.clone(),
+            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+        });
+        self.ops.push(Op::Seq {
+            seq,
+            id: id.clone(),
+        });
         if old_seq != 0 {
-            self.ops.push((seq_key(old_seq), None));
+            self.ops.push(Op::Unseq(old_seq));
         }
         self.flush_meta(&id, &meta);
 
@@ -4012,17 +4038,21 @@ impl Stage<'_> {
             meta.tree.merge_path(&path, deleted);
         }
 
-        self.ops.push((
-            body_key(&id, &rev),
-            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
-        ));
+        self.ops.push(Op::Body {
+            id: id.clone(),
+            rev: rev.clone(),
+            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+        });
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
-            self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
+            self.ops.push(Op::Seq {
+                seq,
+                id: id.clone(),
+            });
             if old_seq != 0 {
-                self.ops.push((seq_key(old_seq), None));
+                self.ops.push(Op::Unseq(old_seq));
             }
             self.flush_meta(&id, &meta);
         }
@@ -4132,30 +4162,27 @@ fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
 /// A document's metadata record, with the state it replaces and the state it
 /// leaves.
 struct MetaWrite {
-    key: Vec<u8>,
+    id: String,
     bytes: Vec<u8>,
     old: Option<MetaState>,
     new: Option<MetaState>,
     seq: u64,
 }
 
-/// Commit a batch's operations and its documents' metadata records.
-fn commit_ops(
-    shard: &mut crate::store::Shard,
-    ops: Ops,
-    metas: Vec<MetaWrite>,
-) -> anyhow::Result<()> {
-    let mut tx = Tx::new();
-    for (key, value) in ops {
-        match value {
-            Some(v) => tx.put(&key, &v),
-            None => tx.delete(&key),
+/// Write a staged batch's operations and its documents' metadata records.
+/// Everything was read and validated while staging, so this only writes.
+fn commit_ops(shard: &mut ShardTxn, ops: Ops, metas: Vec<MetaWrite>) -> anyhow::Result<()> {
+    for op in ops {
+        match op {
+            Op::Body { id, rev, body } => shard.put_body(&id, &rev, &body)?,
+            Op::Seq { seq, id } => shard.put_seq(seq, &id)?,
+            Op::Unseq(seq) => shard.remove_seq(seq)?,
         }
     }
     for meta in metas {
-        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new, meta.seq);
+        shard.put_meta(&meta.id, &meta.bytes, meta.old, meta.new, meta.seq)?;
     }
-    shard.commit(tx)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4620,13 +4647,10 @@ fn canonical_rev(rev: &str) -> String {
 
 /// In a listing, a document whose stored record cannot be decoded is skipped,
 /// logged and counted so one bad record does not fail the whole request.
-/// Only a decode failure (`ApiError::corrupt`) is skipped: an error from
-/// LevelDB itself, or any other failure, still fails the request.
-fn skip_corrupt<T>(
-    shard: &crate::store::Shard,
-    id: &str,
-    result: DbResult<T>,
-) -> DbResult<Option<T>> {
+/// Only a decode failure (`ApiError::corrupt`) is skipped: a storage error or
+/// a value failing its checksum, or any other failure, still fails the
+/// request.
+fn skip_corrupt<T>(shard: &ShardTxn, id: &str, result: DbResult<T>) -> DbResult<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.corrupt => {
@@ -4637,7 +4661,7 @@ fn skip_corrupt<T>(
     }
 }
 
-fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
+fn read_doc(shard: &mut ShardTxn, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
@@ -4715,7 +4739,7 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
 }
 
 fn read_doc_rev(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     id: &str,
     meta: &DocMeta,
     rev: &str,
@@ -4822,7 +4846,7 @@ fn keys_page(opts: &AllDocsOpts, keys: &[Value]) -> Vec<Value> {
 
 /// The `total_rows` of one shard: its live documents, or those of the query's
 /// partition or `count_range`.
-fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<u64> {
+fn all_docs_live_total(shard: &mut ShardTxn, opts: &AllDocsOpts) -> DbResult<u64> {
     Ok(match (&opts.partition, &opts.count_range) {
         (Some(partition), _) => shard.partition_live_count(partition)?,
         (None, Some((first, last))) => shard.live_range_count(first, last)? as u64,
@@ -4830,7 +4854,7 @@ fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> D
     })
 }
 
-fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
+fn all_docs_before_start(shard: &mut ShardTxn, opts: &AllDocsOpts) -> DbResult<usize> {
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);
     };
@@ -4854,7 +4878,7 @@ fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) ->
 /// already returned (or the start of the range), so a later page continues
 /// where the last one stopped.
 fn scan_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &AllDocsOpts,
     after: Option<&str>,
     take: usize,
@@ -4910,7 +4934,7 @@ fn scan_all_docs(
 /// Attach each row's document when the query asks for them, leaving out any
 /// whose record is corrupt.
 fn load_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     rows: Vec<AllDocsRow>,
     opts: &AllDocsOpts,
 ) -> DbResult<Vec<AllDocsRow>> {
@@ -4934,7 +4958,7 @@ fn load_all_docs(
 }
 
 fn collect_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &AllDocsOpts,
     take: usize,
 ) -> DbResult<(Vec<AllDocsRow>, usize)> {
@@ -4960,7 +4984,7 @@ fn embed_doc_meta(id: &str, rev: &str, body: &[u8]) -> String {
 }
 
 fn all_docs_key_row(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     key: &str,
     opts: &AllDocsOpts,
 ) -> DbResult<Option<DocListRow>> {
@@ -5007,8 +5031,8 @@ fn local_rev_number(doc: &Value) -> Option<u64> {
         .ok()
 }
 
-fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
-    match s.get_checked(&local_key(id))? {
+fn read_local(s: &mut ShardTxn, id: &str) -> DbResult<Option<Value>> {
+    match s.get_local(id)? {
         Some(bytes) => serde_json::from_slice::<Value>(&bytes)
             .map(Some)
             .map_err(|error| corrupt_local(id, error)),
@@ -5016,7 +5040,7 @@ fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
     }
 }
 
-fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
+fn write_local(s: &mut ShardTxn, id: &str, mut body: Value) -> DbResult<WriteOk> {
     // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
     // from the supplied `_rev`, absent meaning 0, and never conflicts: the
     // stored revision is not consulted.
@@ -5034,24 +5058,20 @@ fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
         obj.insert("_id".into(), json!(format!("_local/{id}")));
         obj.insert("_rev".into(), json!(rev));
     }
-    let mut tx = Tx::new();
-    tx.put_json(&local_key(id), &body)?;
-    s.commit(tx)?;
+    s.put_local(id, &serde_json::to_vec(&body).map_err(ApiError::internal)?)?;
     Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
-fn delete_local(s: &mut Shard, id: &str) -> DbResult<WriteOk> {
-    if s.get_checked(&local_key(id))?.is_none() {
+fn delete_local(s: &mut ShardTxn, id: &str) -> DbResult<WriteOk> {
+    if s.get_local(id)?.is_none() {
         return Err(ApiError::not_found("missing"));
     }
-    let mut tx = Tx::new();
-    tx.delete(&local_key(id));
-    s.commit(tx)?;
+    s.remove_local(id)?;
     Ok(WriteOk::new(format!("_local/{id}"), "0-0".to_string()))
 }
 
 /// Keep a copy of a local document as it is, unless a newer one is stored.
-fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
+fn install_local(s: &mut ShardTxn, id: &str, doc: Value) -> DbResult<WriteOk> {
     let Some(incoming) = local_rev_number(&doc) else {
         return Err(ApiError::bad_request("Invalid rev format"));
     };
@@ -5062,37 +5082,20 @@ fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
         .unwrap_or_default()
         .to_string();
     if held.is_none_or(|held| held < incoming) {
-        let mut tx = Tx::new();
-        tx.put_json(&local_key(id), &doc)?;
-        s.commit(tx)?;
+        s.put_local(id, &serde_json::to_vec(&doc).map_err(ApiError::internal)?)?;
     }
     Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
 /// Every local document of one shard, with its `_local/` id.
-fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
-    let mut docs: Vec<(String, Value)> = Vec::new();
-    let mut corrupt = None;
-    s.scan_range_while(b"l/", None, false, |key, value| {
-        let Some(id) = key
-            .strip_prefix(b"l/")
-            .and_then(|id| std::str::from_utf8(id).ok())
-        else {
-            return true;
-        };
-        match serde_json::from_slice::<Value>(value) {
-            Ok(doc) => docs.push((format!("_local/{id}"), doc)),
-            Err(error) => {
-                corrupt = Some(corrupt_local(id, error));
-                return false;
-            }
-        }
-        true
-    })?;
-    match corrupt {
-        Some(error) => Err(error),
-        None => Ok(docs),
-    }
+fn list_local(s: &mut ShardTxn) -> DbResult<Vec<(String, Value)>> {
+    s.locals()?
+        .into_iter()
+        .map(|(id, doc)| match serde_json::from_slice::<Value>(&doc) {
+            Ok(doc) => Ok((format!("_local/{id}"), doc)),
+            Err(error) => Err(corrupt_local(&id, error)),
+        })
+        .collect()
 }
 
 /// Select and render `_local_docs` rows from every local document, which
@@ -5229,7 +5232,7 @@ struct ChangesPage {
 /// `cursor` up to `until`; going down, the rows at or below `cursor`, so a
 /// caller pages back by lowering it.
 fn collect_changes(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &ChangesOpts,
     index: usize,
     cursor: u64,
@@ -5393,7 +5396,10 @@ mod tests {
         let parses = crate::store::meta_parses();
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
         let docs = docs.into_iter().enumerate().collect();
-        for (_, result) in put_many(shard, docs, true, HashMap::new()) {
+        let results = shard
+            .write(move |s| Ok(put_many(s, docs, true, HashMap::new())))
+            .unwrap();
+        for (_, result) in results {
             result.unwrap();
         }
         (
@@ -5407,21 +5413,25 @@ mod tests {
     /// each decode or encode it again: five decodes and two encodes per update.
     #[test]
     fn a_write_decodes_the_metadata_once_and_encodes_it_once() {
-        let dir = std::env::temp_dir().join(format!("douchdb-write-cost-{}", uuid()));
-        let mut shard = crate::store::Shard::open(&dir, 1000).unwrap();
+        let file = crate::store::tests::temp_file("write-cost");
+        let mut shard = crate::store::tests::open(&file);
 
         // A new document has no stored metadata to decode.
         let costs = write_costs(&mut shard, vec![json!({"_id": "a", "n": 1})]);
         assert_eq!(costs, (0, 1), "create");
 
-        let rev = shard.get_meta("a").unwrap().unwrap().tree.winner().unwrap();
+        let rev = shard
+            .read(|s| Ok(s.get_meta("a")?.unwrap().tree.winner().unwrap()))
+            .unwrap();
         let update = vec![json!({"_id": "a", "_rev": rev, "n": 2})];
         assert_eq!(write_costs(&mut shard, update), (1, 1), "update");
 
         // Each document in a batch costs the same.
         let batch = vec![json!({"_id": "b"}), json!({"_id": "c"})];
         assert_eq!(write_costs(&mut shard, batch), (0, 2), "batch");
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     #[test]
@@ -5473,6 +5483,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -5503,6 +5514,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 2,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -5538,6 +5550,7 @@ mod tests {
             DbConfig {
                 q: 4,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(4),
                 partitioned: false,
             },
@@ -5862,7 +5875,7 @@ mod tests {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&local_key("bad"), b"{not json");
+                shard.put_raw(crate::kv::LOCAL, "bad", b"{not json");
                 Ok(())
             })
             .await
@@ -5899,7 +5912,7 @@ mod tests {
         let (db, root) = single_shard_db("ddoc-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&meta_key("_design/v"), b"{not json");
+                shard.put_raw(crate::kv::META, "_design/v", b"{not json");
                 Ok(())
             })
             .await
@@ -5968,6 +5981,7 @@ mod tests {
                 DbConfig {
                     q: 3,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(3, 1, 1),
                     partitioned: false,
                 },
@@ -5985,7 +5999,7 @@ mod tests {
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
-                s.put_raw(&body_key(bad_id, &bad_rev), b"{not json");
+                s.put_raw(crate::kv::BODIES, (bad_id, bad_rev.as_str()), b"{not json");
                 Ok(())
             })
             .await
@@ -6147,6 +6161,7 @@ mod tests {
                 DbConfig {
                     q: 3,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(3, 1, 1),
                     partitioned: false,
                 },
@@ -6171,7 +6186,7 @@ mod tests {
         // indexes, so the first scan meets it.
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&meta_key("bad-meta"), b"{not json");
+                shard.put_raw(crate::kv::META, "bad-meta", b"{not json");
                 Ok(())
             })
             .await
@@ -6191,7 +6206,11 @@ mod tests {
         let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
-                shard.put_raw(&body_key("bad-body", &corrupt_rev), b"{not json");
+                shard.put_raw(
+                    crate::kv::BODIES,
+                    ("bad-body", corrupt_rev.as_str()),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6274,6 +6293,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::balanced(2, 1, 1),
                 partitioned: false,
             },
@@ -6291,7 +6311,7 @@ mod tests {
 
         db.shards[1]
             .call(|shard| {
-                shard.inject_flush_failure();
+                shard.inject_commit_failure();
                 Ok(())
             })
             .await
@@ -6320,6 +6340,7 @@ mod tests {
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(1, 1, 1),
             partitioned: false,
         };
@@ -6345,6 +6366,7 @@ mod tests {
         DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(1, 1, 1),
             partitioned: false,
         }
@@ -6388,6 +6410,7 @@ mod tests {
         let config = || DbConfig {
             q: 2,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(2, 3, 1),
             partitioned: false,
         };
@@ -6453,6 +6476,7 @@ mod tests {
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::single(1),
             partitioned: false,
         };
@@ -6530,6 +6554,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -6585,6 +6610,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -6670,6 +6696,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::balanced(2, 3, 1),
                 partitioned: false,
             },
@@ -6711,6 +6738,7 @@ mod tests {
                 DbConfig {
                     q: 2,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(2, 2, 1),
                     partitioned: false,
                 },
@@ -6758,6 +6786,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active.clone(),
                 partitioned: false,
             },
@@ -6800,6 +6829,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active,
                 partitioned: false,
             },
@@ -6831,6 +6861,7 @@ mod tests {
             DbConfig {
                 q: 4,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::balanced(4, 3, 1),
                 partitioned: false,
             },
@@ -6866,6 +6897,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -6915,6 +6947,7 @@ mod tests {
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned,
             },
@@ -7250,6 +7283,7 @@ mod tests {
                 DbConfig {
                     q,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::single(q),
                     partitioned,
                 },
@@ -7310,6 +7344,7 @@ mod tests {
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7349,6 +7384,7 @@ mod tests {
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7418,8 +7454,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A storage error part way through writing a batch fails the whole
+    /// batch, though `put_many` turns it into per-document results: none of
+    /// its documents is readable, its sequences are not committed, and the
+    /// shard takes the batch afterwards.
     #[tokio::test]
-    async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
+    async fn a_write_failing_inside_a_batch_fails_the_batch_and_leaves_none_of_it() {
+        let (db, root) = single_shard_db("batch-write-fail").await;
+        db.put_docs(vec![json!({"_id": "kept"})], true)
+            .await
+            .unwrap();
+        let before = db.shard_seqs()[0].1;
+        // Bodies and sequence rows of the first two documents get through.
+        db.shards[0]
+            .call(|s| {
+                s.inject_write_failure(4);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let batch = vec![
+            json!({"_id": "x"}),
+            json!({"_id": "y"}),
+            json!({"_id": "z"}),
+        ];
+        let failed = db.put_docs(batch.clone(), true).await;
+        assert!(failed.is_err(), "{failed:?}");
+        for id in ["x", "y", "z"] {
+            let read = db.get_doc(id, &DocOpts::default()).await;
+            assert_eq!(read.unwrap_err().status, 404, "{id}");
+        }
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(all.rows.len(), 1, "{all:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
+        assert_eq!(db.shard_seqs()[0].1, before, "no sequence was committed");
+
+        let written = db.put_docs(batch, true).await.unwrap();
+        assert!(written.iter().all(WriteResult::is_ok), "{written:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 4);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_shard_commit_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
         let db = Db::open(
@@ -7428,6 +7506,7 @@ mod tests {
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7445,7 +7524,7 @@ mod tests {
 
         db.shards[0]
             .call(|s| {
-                s.inject_flush_failure();
+                s.inject_commit_failure();
                 Ok(())
             })
             .await
@@ -7458,7 +7537,8 @@ mod tests {
         assert_eq!(all.rows.len(), 1, "{all:?}");
         assert_eq!(db.info().await.unwrap().doc_count, 1);
 
-        // The lost write's sequence is a gap; the feed is not held back.
+        // Nothing of the lost write is committed, its sequence included;
+        // the feed is not held back.
         let before = db.shard_seqs()[0].1;
         let opts = ChangesOpts {
             since: ShardSince::default(),
@@ -7487,8 +7567,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let after = db.shard_seqs()[0].1;
         assert_eq!(last_seq.get(0), after);
-        // The retried write took a new sequence, past the lost one.
-        assert!(after >= before + 2, "{before} -> {after}");
+        // The retried write takes the sequence the failed one never
+        // committed, which no reader saw.
+        assert_eq!(after, before + 1, "{before} -> {after}");
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -7502,6 +7583,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(2),
                 partitioned: false,
             },
@@ -7666,6 +7748,7 @@ mod tests {
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map,
                 partitioned: false,
             },
@@ -7786,10 +7869,10 @@ mod tests {
     async fn put_then_corrupt_meta(db: &Db, id: &str) -> String {
         let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
         let rev = written[0].json()["rev"].as_str().unwrap().to_string();
-        let key = meta_key(id);
+        let id = id.to_string();
         db.shards[0]
             .call(move |s| {
-                s.put_raw(&key, b"{not json");
+                s.put_raw(crate::kv::META, id.as_str(), b"{not json");
                 Ok(())
             })
             .await

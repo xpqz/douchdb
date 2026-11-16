@@ -860,6 +860,7 @@ mod tests {
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active.clone(),
                 partitioned: false,
             },
@@ -924,6 +925,7 @@ mod tests {
                 DbConfig {
                     q: 2,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: old_map.clone(),
                     partitioned: false,
                 },

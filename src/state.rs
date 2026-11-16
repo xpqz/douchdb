@@ -254,7 +254,7 @@ pub struct AppState {
     pub dbs: RwLock<HashMap<String, OpenDb>>,
     /// One lock per database name. Open, create and drop of a name run one at
     /// a time, so a name is never opened twice (the second open would fail on
-    /// the LevelDB lock) and a drop cannot interleave with a create or open.
+    /// a shard file's lock) and a drop cannot interleave with a create or open.
     pub db_locks: NameLocks,
     /// How many times a database has been opened from disk, creation
     /// included. A closed database that is asked for again counts once more.
@@ -314,6 +314,8 @@ pub struct Config {
     pub default_admin_only: bool,
     /// Databases kept open between requests; see `AppState::close_idle`.
     pub max_open_dbs: usize,
+    /// Page cache of each shard file (`--cache-mb`).
+    pub cache_bytes: usize,
     /// How often an idle standalone `_changes` feed re-checks when no commit
     /// wakes it; see [`LOCAL_FEED_RECHECK`].
     pub local_feed_recheck: std::time::Duration,
@@ -373,6 +375,7 @@ impl AppState {
             DbConfig {
                 q: self.config.q,
                 revs_limit: self.config.revs_limit,
+                cache_bytes: self.config.cache_bytes,
                 shard_map: self.ctx.cluster.shard_map(name, self.config.q),
                 partitioned: false,
             },
@@ -425,8 +428,8 @@ impl AppState {
     /// Dropping a `Db` joins its shard actor threads, which waits for their
     /// queued work, so the drop runs on the blocking pool and not on an async
     /// worker. The name's lock travels with it: a request that wants the
-    /// database back waits for the drop, so it never meets a LevelDB lock
-    /// that is still held.
+    /// database back waits for the drop, so it never meets a shard file's
+    /// lock that is still held.
     async fn close_idle(&self) {
         self.close_over_cap().await;
         self.release_idle_indexes().await;
@@ -547,6 +550,7 @@ impl AppState {
             DbConfig {
                 q: q.unwrap_or(self.config.q),
                 revs_limit: self.config.revs_limit,
+                cache_bytes: self.config.cache_bytes,
                 shard_map: self.ctx.cluster.shard_map_n(
                     name,
                     q.unwrap_or(self.config.q),
@@ -574,6 +578,8 @@ impl AppState {
         // can no longer take a fresh gate and reach the index directories.
         if let Some(open) = self.dbs.write().await.remove(name) {
             open.db.mark_deleted();
+            // Closing a shard checks its whole file: not on the request path.
+            tokio::task::spawn_blocking(move || drop(open));
         }
         let path = crate::db::db_path(&self.root, name);
         crate::view::forget_db(&path).await;
@@ -655,6 +661,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
             view_memory_mb: 1,
             default_admin_only: true,
             max_open_dbs,
+            cache_bytes: DEFAULT_CACHE_MB << 20,
             // A test must not be answered by this fallback: with it out of
             // reach, a feed that does not wake for a commit hangs instead of
             // passing late.

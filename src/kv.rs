@@ -14,7 +14,7 @@
 //!   same process, so reopening an idle database costs no full read.
 
 #[cfg(test)]
-mod powercut;
+pub(crate) mod powercut;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -149,6 +149,7 @@ fn open_file<B: StorageBackend>(
 
 /// Open a database over `backend`. With no path to remember a verification
 /// by, the open always runs the full integrity check.
+#[cfg(test)]
 pub fn open_with(backend: impl StorageBackend, cache_bytes: usize) -> Result<Database> {
     builder(cache_bytes, true).create_with_backend(backend)
 }

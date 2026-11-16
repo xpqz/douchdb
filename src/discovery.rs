@@ -292,6 +292,7 @@ mod tests {
                 view_memory_mb: 1,
                 default_admin_only: true,
                 max_open_dbs: 256,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
             },
             ctx: ClusterCtx {

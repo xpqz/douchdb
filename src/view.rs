@@ -3744,6 +3744,7 @@ mod tests {
                 crate::db::DbConfig {
                     q: 1,
                     revs_limit: 1000,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: crate::cluster::ShardMap::single(1),
                     partitioned: false,
                 },
@@ -3809,6 +3810,7 @@ mod tests {
                 crate::db::DbConfig {
                     q: 1,
                     revs_limit: 1000,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: crate::cluster::ShardMap::single(1),
                     partitioned: false,
                 },
@@ -3892,6 +3894,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },
@@ -3957,7 +3960,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A job that took a sequence and then panicked leaves a gap at the end
+    /// A job that took a sequence and wrote no change leaves a gap at the end
     /// of its shard: the shard's committed position is past its last change.
     /// Catching up to that position must still finish, at the shard's
     /// position, with no row to read up to it.
@@ -3989,14 +3992,13 @@ mod tests {
         expected.push(late);
         expected.sort();
         let before = db.shard_seqs()[1].1;
-        let failed = db
-            .shard_handle(1)
+        db.shard_handle(1)
             .call(|shard| -> Result<(), ApiError> {
                 shard.next_seq();
-                panic!("job failed after taking a sequence");
+                Ok(())
             })
-            .await;
-        assert!(failed.is_err());
+            .await
+            .unwrap();
         assert_eq!(db.shard_seqs()[1].1, before + 1, "the gap is committed");
 
         let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
@@ -4990,6 +4992,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -5060,6 +5063,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -5103,6 +5107,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -5173,6 +5178,7 @@ mod tests {
         let config = || crate::db::DbConfig {
             q: 1,
             revs_limit: 1000,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: crate::cluster::ShardMap::single(1),
             partitioned: false,
         };
@@ -5262,6 +5268,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -5347,6 +5354,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -5422,6 +5430,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 3,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(3),
                 partitioned: false,
             },
@@ -5545,6 +5554,7 @@ mod tests {
                 crate::db::DbConfig {
                     q: 1,
                     revs_limit: 1000,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: crate::cluster::ShardMap::single(1),
                     partitioned: true,
                 },
@@ -5616,6 +5626,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },

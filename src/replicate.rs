@@ -814,6 +814,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::balanced(2, 2, 1),
                 partitioned: false,
             },
@@ -850,6 +851,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -905,6 +907,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -1019,6 +1022,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -1179,6 +1183,7 @@ mod tests {
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },

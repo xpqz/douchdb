@@ -184,6 +184,7 @@ fn build_state(
         view_memory_mb: args.view_memory_mb,
         default_admin_only,
         max_open_dbs: args.max_open_dbs,
+        cache_bytes: args.cache_mb << 20,
         local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
     };
     Ok(Arc::new(AppState {
