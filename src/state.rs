@@ -114,6 +114,9 @@ pub struct FeedStats {
 /// database here holds a thread and several file descriptors per shard.
 pub const DEFAULT_MAX_OPEN_DBS: usize = 256;
 
+/// Default for `--cache-mb`, the page cache of each shard file.
+pub const DEFAULT_CACHE_MB: usize = 16;
+
 /// An open database and when it was last asked for.
 pub struct OpenDb {
     db: Arc<Db>,

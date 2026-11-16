@@ -32,6 +32,10 @@ hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "se
 hyper = { version = "1", default-features = false }
 sha2 = "0.10"
 rusty-leveldb = "4"
+# Durable storage engine replacing rusty-leveldb (docs/superpowers/specs/2026-11-16-redb-storage-design.md).
+redb = "4.6"
+# Per-value checksums on every stored redb value (kv::seal).
+crc32c = "0.6"
 serde = { version = "1", features = ["derive", "rc"] }
 # preserve_order is load-bearing: CouchDB's rev hash depends on JSON key order.
 # arbitrary_precision keeps integers beyond i64/u64 exact, including rev hashes.
@@ -78,6 +82,12 @@ opt-level = 1
 opt-level = 1
 [profile.dev.package.wasmi_collections]
 opt-level = 1
+
+# redb's debug assertions walk every page of a cleanly closed file on open
+# (`mark_allocated_page_for_debug`), so a debug build cannot show that a
+# verified reopen skips the full read (kv::tests). Release builds never do it.
+[profile.dev.package.redb]
+debug-assertions = false
 
 # TEMPORARY local fork: UB-free LRU list (upstream PR #69) and duplicate-key
 # eviction. Published 4.0.2 corrupts the cache on Linux ARM64 release builds.
