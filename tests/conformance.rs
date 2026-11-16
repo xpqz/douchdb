@@ -20226,3 +20226,69 @@ async fn cluster_since_never_skips_a_write_only_the_serving_copy_had() {
         "skipped L: {body}"
     );
 }
+
+/// The node's count of `_changes` reads (`changes_once`) since it started.
+async fn changes_reads(s: &Server) -> u64 {
+    let (status, metrics) = s.get("/_node/_local/_metrics").await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    metrics["feeds"]["changes_once"]
+        .as_u64()
+        .expect("changes_once")
+}
+
+/// A long-poll from `since=now` that a write wakes must report the write.
+/// Each wake used to resolve `now` again, so the write was already behind it
+/// and the feed answered nothing with a `last_seq` past the write.
+///
+/// The first write is made once the feed has started its first read. If that
+/// read resolved `now` after the write, the write is rightly not reported and
+/// the feed reads again on its wake; a second write is then made, which the
+/// feed must report.
+#[tokio::test]
+async fn longpoll_since_now_reports_the_write_that_wakes_it() {
+    let s = Server::start(false);
+    s.fresh_db("lpnow").await;
+    let (status, body) = s.put("/lpnow/before", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for heartbeat in ["", "&heartbeat=10"] {
+        let base = changes_reads(&s).await;
+        let poll = tokio::spawn({
+            let client = s.client.clone();
+            let url = format!(
+                "{}/lpnow/_changes?feed=longpoll&since=now&timeout=30000{heartbeat}",
+                s.base
+            );
+            async move {
+                let text = client.get(url).send().await.unwrap().text().await.unwrap();
+                let last = text.lines().rfind(|line| !line.trim().is_empty());
+                serde_json::from_str::<Value>(last.expect("an answer")).unwrap()
+            }
+        });
+        while changes_reads(&s).await < base + 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut written = vec![format!("first{heartbeat}")];
+        let (status, body) = s.put(&format!("/lpnow/{}", written[0]), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        while !poll.is_finished() {
+            if written.len() == 1 && changes_reads(&s).await >= base + 2 {
+                written.push(format!("second{heartbeat}"));
+                let (status, body) = s.put(&format!("/lpnow/{}", written[1]), json!({})).await;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let body = poll.await.unwrap();
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.is_empty(), "the feed skipped {written:?}: {body}");
+        assert!(
+            ids.iter().all(|id| written.iter().any(|w| w == id)),
+            "{ids:?} {written:?}"
+        );
+    }
+}

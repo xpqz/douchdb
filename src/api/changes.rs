@@ -303,7 +303,7 @@ fn changes_longpoll_stream(
     } = opts;
     let mut heartbeat = Heartbeat::new(heartbeat);
     let dbname = req.name.to_string();
-    let query = req.q.clone();
+    let mut query = req.q.clone();
     let body = Bytes::copy_from_slice(req.body);
     let headers = req.headers.clone();
     let principal = req.principal.clone();
@@ -329,7 +329,11 @@ fn changes_longpoll_stream(
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
                     break;
                 }
-                Ok(_) => {}
+                // Read on from where this poll ended, so `since=now` is not
+                // resolved again past a write that wakes the feed.
+                Ok(value) => {
+                    query.insert("since".to_string(), value.last_seq);
+                }
                 Err(error) => {
                     let mut line = serde_json::to_vec(&json!({
                         "error": error.error,
@@ -370,12 +374,13 @@ async fn changes_longpoll(
     let started = std::time::Instant::now();
     let mut wake = db.subscribe_commits();
     let no_heartbeat = Heartbeat::new(None);
+    let mut q = q.clone();
     loop {
         if !still_allowed(st, db, principal) {
             return access_denied(principal);
         }
         wake.borrow_and_update();
-        match changes_once(st, db, dbname, q, body, headers, opts.local_only).await {
+        match changes_once(st, db, dbname, &q, body, headers, opts.local_only).await {
             Ok(v) if !v.results.is_empty() => {
                 if !still_allowed(st, db, principal) {
                     return access_denied(principal);
@@ -391,7 +396,11 @@ async fn changes_longpoll(
                 }
                 return json_of(StatusCode::OK, &v);
             }
-            Ok(_) => {}
+            // Read on from where this poll ended, so `since=now` is not
+            // resolved again past a write that wakes the feed.
+            Ok(v) => {
+                q.insert("since".to_string(), v.last_seq);
+            }
             Err(e) => return fail(e),
         }
         // A tick that only had to notice a security change needs no new read.
