@@ -42,7 +42,9 @@ where behaviour is best-effort, it says so.
 - Read repair, as in `fabric_doc_open`: when the replicas that answered a
   quorum read disagree, the coordinator writes each one the leaves it lacks
   (as replicated changes, with their history) before it replies. Replicas
-  that agree get no write. A failed repair does not fail the read;
+  that agree get no write. A copy whose purge infos list a repaired revision
+  leaves it out, so read repair never undoes a purge. A failed repair does
+  not fail the read;
   anti-entropy catches the copy up. A read of one explicit `rev`, `open_revs`
   and `revs_info` reads do not repair.
 - The winner is the live leaf with the highest position, then the greatest
@@ -174,7 +176,7 @@ where behaviour is best-effort, it says so.
 | `validate_doc_update` rejects and accepts writes | `validate_doc_update_rejects_writes_like_couchdb`, `cluster_validation_functions_follow_design_docs_across_shards`, `cluster_node_that_missed_a_design_doc_enforces_it_after_anti_entropy`, `validate::tests::design_validators_reject_and_accept_documents` |
 | `_changes` latest row, limit, pending, pagination | `changes_returns_latest_per_document_and_pending`, `all_docs_ranges_and_changes_limits_after_deletes`, `differential/run.py --changes` |
 | Cluster write/read quorums and `503`/`202` | `cluster_honours_w_and_r_quorum_parameters`, `quorum_read_prefers_tombstone_over_stale_live_replica`, `quorum_read_preserves_conditional_and_explicit_revision_semantics` |
-| Read repair | `quorum_read_repairs_a_stale_copy`, `quorum_read_repairs_every_conflict_branch`, `fabric::tests::read_repair_plan_*` |
+| Read repair | `quorum_read_repairs_a_stale_copy`, `quorum_read_repairs_every_conflict_branch`, `quorum_read_repair_does_not_undo_a_purge`, `fabric::tests::read_repair_plan_*` |
 | Conflict winner, leaf retention and revision ancestry | `quorum_read_prefers_conflict_winner_across_replicas`, `quorum_reconciliation_is_coordinator_independent`, `quorum_merges_ancestry_across_replicas_with_different_history_lengths`, `differential/run.py --conflicts` |
 | Tombstones and conflict replication | `deleted_leaf_cannot_be_updated_by_rev`, `anti_entropy_replicates_conflicts_and_tombstones` |
 | `_revs_limit` pruning and returned history | `revs_limit_truncates_each_revisions_path`, `differential/run.py --conflicts` |

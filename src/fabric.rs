@@ -625,6 +625,45 @@ fn replicated_body(doc: &Value) -> Value {
     body
 }
 
+/// Marks an internal `_bulk_docs` as a read repair: the receiving copy
+/// applies it with `Db::put_read_repair`, which leaves purged revisions out.
+pub(crate) const READ_REPAIR_HEADER: &str = "x-douchdb-read-repair";
+
+/// Send one peer its read repair as an internal `new_edits=false` batch.
+async fn send_read_repair(
+    ctx: &ClusterCtx,
+    peer: &str,
+    dbname: &str,
+    docs: &[Value],
+    headers: &HeaderMap,
+) -> DbResult<Vec<WriteResult>> {
+    let request = internal_request_raw(
+        &ctx.client,
+        &ctx.cluster.secret,
+        reqwest::Method::POST,
+        peer,
+        &[dbname, "_bulk_docs"],
+    )
+    .header(READ_REPAIR_HEADER, "1")
+    .json(&BulkBody {
+        docs,
+        new_edits: false,
+    });
+    let request = forward_client_auth(request, headers);
+    let response = send_peer(request)
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(ApiError::new(status, "read_repair_failed", text));
+    }
+    response
+        .json::<Vec<WriteResult>>()
+        .await
+        .map_err(|e| ApiError::new(502, "bad_gateway", format!("{peer}: {e}")))
+}
+
 /// Write each replica the leaves it lacks, as replicated changes, and wait
 /// for the writes before the read replies, as `fabric_doc_open` does. A
 /// failed repair does not fail the read; anti-entropy catches the copy up.
@@ -640,18 +679,9 @@ pub(crate) async fn read_repair(
     let ctx = &st.ctx;
     let writes = plan.into_iter().map(|(node, docs)| async move {
         let result = if node == ctx.cluster.me {
-            db.put_docs(docs, false).await
+            db.put_read_repair(docs).await
         } else {
-            forward_bulk_owned(
-                ctx.client.clone(),
-                ctx.cluster.secret.clone(),
-                ctx.cluster.nodes[node].clone(),
-                db.name.clone(),
-                docs,
-                false,
-                headers.clone(),
-            )
-            .await
+            send_read_repair(ctx, &ctx.cluster.nodes[node], &db.name, &docs, headers).await
         };
         match result {
             Ok(results) => {

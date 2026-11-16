@@ -18618,6 +18618,53 @@ async fn quorum_read_repairs_a_stale_copy() {
     }
 }
 
+/// Read repair must not undo a purge: a copy that purged a revision refuses
+/// it from a repair, as anti-entropy does (`fabric_rpc:read_repair_filter`).
+/// Node 0 purges; the other copies have not heard of it yet. Node 0 is then
+/// the coordinator once (it repairs its own copy in-process) and a target
+/// once (node 1 sends it the repair).
+#[tokio::test]
+async fn quorum_read_repair_does_not_undo_a_purge() {
+    let nodes = start_cluster_with(3, "3600", 3);
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    for (round, coordinator) in [0usize, 1].into_iter().enumerate() {
+        let db = format!("qreppurge{round}");
+        for node in &nodes {
+            node.fresh_db(&db).await;
+        }
+        let (status, body) = nodes[0]
+            .post(
+                &format!("/{db}/_bulk_docs?w=3"),
+                json!({"docs": [{"_id": "x", "v": 1}]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let rev = body[0]["rev"].as_str().unwrap().to_string();
+
+        let (status, body) = nodes[0]
+            .req_with(
+                Method::POST,
+                &format!("/{db}/_purge"),
+                Some(json!({"x": [rev.clone()]})),
+                &internal,
+            )
+            .await;
+        assert!(status.is_success(), "{status} {body}");
+        assert!(local_leaves(&nodes[0], &db, "x").await.is_empty());
+        assert_eq!(local_leaves(&nodes[1], &db, "x").await, vec![rev.clone()]);
+
+        let (status, body) = nodes[coordinator].get(&format!("/{db}/x?r=3")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            local_leaves(&nodes[0], &db, "x").await.is_empty(),
+            "read repair coordinated by node {coordinator} brought the purged revision back"
+        );
+    }
+}
+
 /// Read repair carries every leaf, not only the winner: each copy ends up
 /// with both conflict branches.
 #[tokio::test]

@@ -115,6 +115,13 @@ async fn write_bulk_batch(
     if writable.is_empty() {
         return Ok((Vec::new(), false));
     }
+    if st.ctx.cluster.is_internal(headers)
+        && !new_edits
+        && headers.contains_key(crate::fabric::READ_REPAIR_HEADER)
+    {
+        let results = db.put_read_repair(writable).await?;
+        return Ok((results.into_iter().map(Some).collect(), false));
+    }
     if !st.ctx.cluster.is_clustered() || st.ctx.cluster.is_internal(headers) {
         // A forwarded batch has already been placed by its coordinator; write
         // it to this node's shards and let the coordinator count the ack.

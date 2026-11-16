@@ -3083,6 +3083,29 @@ impl Db {
             .await
     }
 
+    /// Apply a read repair to this copy: the given leaves as replicated
+    /// changes, except those this copy's purge infos list. A purged revision
+    /// stays purged, as anti-entropy keeps it (`fabric_rpc:read_repair_filter`).
+    pub async fn put_read_repair(&self, docs: Vec<Value>) -> DbResult<Vec<WriteResult>> {
+        let pair = |doc: &Value| {
+            Some((
+                doc.get("_id")?.as_str()?.to_string(),
+                doc.get("_rev")?.as_str()?.to_string(),
+            ))
+        };
+        let pairs: std::collections::BTreeSet<(String, String)> =
+            docs.iter().filter_map(pair).collect();
+        let purged = self.purged_among(&pairs).await?;
+        let docs: Vec<Value> = docs
+            .into_iter()
+            .filter(|doc| pair(doc).is_none_or(|pair| !purged.contains(&pair)))
+            .collect();
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.put_docs(docs, false).await
+    }
+
     /// The `(id, rev)` pairs among `pairs` that a purge info lists.
     pub async fn purged_among(
         &self,
