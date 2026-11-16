@@ -73,7 +73,7 @@ the machinery it built to make LevelDB behave like a transactional store.
 | Readers walk the committed tree while the updater writes | every read is a job on the shard actor | reads open a `ReadTransaction` (a snapshot) on the caller's task, concurrently with the writer | read jobs routed through the actor |
 | `by_id`, `by_seq`, `_local`, purge trees | key prefixes `m/`, `s/`, `b/`, `l/`, purge and checkpoint prefixes in one keyspace | typed tables: `meta` (id → DocMeta), `by_seq` (seq → id), `bodies` ((id, rev) → body), `local`, `purge_infos`, `purged_revs`, `purge_uuids`, `checkpoints`, `settings` | prefix builders and parsers, `prefix_successor`, `seek_last`, prefix scans |
 | Per-shard `update_seq`; database `since` is an opaque token of every shard's position | one global counter per database allocated across shards, with `committed_seq`/`reserved_seq` watermarks so a cursor never passes an uncommitted write | each shard has its own sequence, assigned inside its write transaction; a shard's feed is exactly its committed snapshot; database `since`/`last_seq`/`update_seq` are opaque tokens holding each shard's position (single node and cluster alike) | the global counter, `allocate_seq`, `committed_seq`, `reserved_seq`, `changes_watermark*`, the cross-shard global-order merge |
-| Header/page checksums, recovery on open | `paranoid_checks`, "tables but no `z/seq`" corruption probe, fault script aimed at LevelDB files | redb's XXH3 Merkle checksums and automatic repair on open; `Builder::set_check_integrity_on_open(true)` | the corruption probes, `had_tables` heuristics |
+| Header/page checksums, recovery on open | `paranoid_checks`, "tables but no `z/seq`" corruption probe, fault script aimed at LevelDB files | redb's XXH3 Merkle checksums and automatic repair on open; full integrity check on first open per process and on idle close | the corruption probes, `had_tables` heuristics |
 | Doc counts via B-tree reductions | counters updated by hand beside each write, recount on open | counters in `settings`, updated in the same write transaction so they cannot drift (`meta.len()` is O(1) and may replace one of them) | the recount-on-open path |
 | Security object, shard map kept inside databases | `db.json`, `shard-map.json`, `pending-shard-map.json`, `security-versioned.json` with atomic-write and temp-file cleanup | rows in the `settings` table of shard 0's file (written in a transaction) | the JSON metadata files, `write_json_atomic`, stale-temp cleanup |
 | `_compact` rewrites the file, dropping non-leaf bodies | stale-body sweep, then LevelDB `compact_range` | online copy-and-swap, as CouchDB (see "Compaction") | `compact_range`, the in-place sweep |
@@ -151,12 +151,26 @@ term's MD5 as it reads it. So:
   metadata, bodies, sequence entries, `_local` docs, purge records, settings,
   view rows. A mismatch is a corruption error (500, fail closed), never a
   miss. This is one encode/decode pair used by every table.
-- **`set_check_integrity_on_open(true)`** on every shard and view file, so a
-  file damaged while closed fails to open (`StorageError::Corrupted`) rather
-  than being trusted or panicking. Its cost on reopen is accepted.
+- **A full integrity check (every page's checksum) runs on the first open of
+  each file in a process, and again when an idle database is closed** —
+  not on every open. The first-open check (`set_check_integrity_on_open`)
+  catches damage done while douchdb was down: a damaged file fails to open
+  (`StorageError::Corrupted`) rather than being trusted or panicking. The
+  close-time check (`Database::check_integrity` while the gate is drained and
+  the file is closing anyway) runs in the background, off the request path.
+  A file that passed its close-time check is recorded as verified, so its
+  next open in the same process skips the check; one that failed it is
+  re-checked on its next open and fails closed. Reopening an idle database
+  therefore costs no full read. (Decision 2026-11-16: every-open checks
+  would make each reopen of a large idle database, and every anti-entropy
+  pass over cold ones, read the whole file.)
 - **Guarantee, stated narrowly:** a damaged *value* is detected when read. A
   damaged *tree page* (a branch page, which can misroute a lookup into a
-  false "not found") is detected at the next open, not at read time. This is
+  false "not found") is detected by the next integrity check: when its idle
+  database closes, or on the first open after a restart, not at read time.
+  Damage done from outside douchdb to a file that is closed while the server
+  keeps running goes unnoticed until a read hits a damaged value or the
+  process restarts. This is
   weaker than CouchDB, which checksums tree nodes too, and is documented as
   such in `docs/consistency.md`.
 - Tests corrupt a file **while it is open** (bytes of a value page and of a

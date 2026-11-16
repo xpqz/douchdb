@@ -14,7 +14,7 @@
 
 - redb `= "4.6"`; every write transaction commits with `Durability::Immediate` (the default; never set `None`).
 - Every stored value carries a CRC32C appended on write and verified on every read; a mismatch is a corruption error (HTTP 500), never a miss.
-- `Builder::set_check_integrity_on_open(true)` on every shard and view file.
+- Full integrity check on the **first open of each file in a process** (`Builder::set_check_integrity_on_open(true)`) and on **idle close** (`Database::check_integrity`, in the background, gate drained); a file that passed its close-time check opens without the check later in the same process. Never on every open.
 - `ConcurrencyMode::ExclusiveWriter` (default) on every file.
 - Page cache per file: shard files `--cache-mb` (new flag, default 16), view files a fixed 4 MiB.
 - File names: shard `<db>/shard-NNNN.redb`; view `<db>/_view_indexes/<md5>.redb`; compaction `shard-NNNN.compact.redb`; staging `.creating-<uuid>`; tombstone `.deleted-<uuid>` (a leading `.` no database name can have).
@@ -98,10 +98,10 @@ One task because every consumer of the sequence changes together; a partial swit
 - Test: `src/kv.rs` tests.
 
 **Interfaces:**
-- Produces: `pub fn open(path: &Path, cache_bytes: usize) -> Result<redb::Database>` (sets integrity-on-open and cache size); `pub fn open_with(backend: impl redb::StorageBackend, cache_bytes: usize) -> Result<redb::Database>`; table definitions, every value `&[u8]` holding sealed bytes: `META: TableDefinition<&str, &[u8]>` (id → DocMeta JSON), `BY_SEQ: <u64, &[u8]>` (seq → id), `BODIES: <(&str, &str), &[u8]>` ((id, rev) → body), `LOCAL: <&str, &[u8]>`, `PURGE_INFOS: <u64, &[u8]>`, `PURGED_REVS: <(&str, &str), &[u8]>` (→ purge seq as 8 bytes BE), `PURGE_UUIDS: <&str, &[u8]>` (→ purge seq), `CHECKPOINTS: <&str, &[u8]>`, `SETTINGS: <&str, &[u8]>`; `pub fn seal(value: &[u8]) -> Vec<u8>` and `pub fn unseal(stored: &[u8]) -> Result<&[u8], Corrupt>` (CRC32C, little-endian, appended).
+- Produces: `pub fn open(path: &Path, cache_bytes: usize) -> Result<redb::Database>` (sets the cache size; enables the integrity check unless `path` is in the process-wide verified set); `pub fn close_verified(db: redb::Database, path: &Path) -> Result<()>` (runs `check_integrity` and records `path` as verified on success, removes it on failure; called off the request path when an idle database closes); the verified set is `static VERIFIED: Mutex<HashSet<PathBuf>>`, and a path leaves it whenever its file is replaced (compaction swap, delete, recreate); `pub fn open_with(backend: impl redb::StorageBackend, cache_bytes: usize) -> Result<redb::Database>`; table definitions, every value `&[u8]` holding sealed bytes: `META: TableDefinition<&str, &[u8]>` (id → DocMeta JSON), `BY_SEQ: <u64, &[u8]>` (seq → id), `BODIES: <(&str, &str), &[u8]>` ((id, rev) → body), `LOCAL: <&str, &[u8]>`, `PURGE_INFOS: <u64, &[u8]>`, `PURGED_REVS: <(&str, &str), &[u8]>` (→ purge seq as 8 bytes BE), `PURGE_UUIDS: <&str, &[u8]>` (→ purge seq), `CHECKPOINTS: <&str, &[u8]>`, `SETTINGS: <&str, &[u8]>`; `pub fn seal(value: &[u8]) -> Vec<u8>` and `pub fn unseal(stored: &[u8]) -> Result<&[u8], Corrupt>` (CRC32C, little-endian, appended).
 - Produces (test only): `PowerCut::new() -> (PowerCut, PowerSwitch)`; `PowerSwitch::cut(&self)` discards every write since the last `sync_data`; `PowerSwitch::fail_writes(&self, error: std::io::ErrorKind)` makes later writes fail (used for `ENOSPC`); the backend survives the cut so it can be reopened.
 
-- [ ] **Step 1: Failing tests.** `unseal_rejects_a_flipped_bit`; `committed_writes_survive_a_power_cut` (commit, cut, reopen: present); `uncommitted_writes_vanish_in_a_power_cut`; `a_build_without_sync_loses_data` (a backend whose `sync_data` is a no-op loses the commit after a cut — proves the test can fail).
+- [ ] **Step 1: Failing tests.** `first_open_rejects_a_file_damaged_while_closed`; `reopen_after_a_verified_close_skips_the_check` (observed through a counting backend: the reopen reads only the header, not every page); `a_failed_close_check_forces_a_check_on_the_next_open`; `unseal_rejects_a_flipped_bit`; `committed_writes_survive_a_power_cut` (commit, cut, reopen: present); `uncommitted_writes_vanish_in_a_power_cut`; `a_build_without_sync_loses_data` (a backend whose `sync_data` is a no-op loses the commit after a cut — proves the test can fail).
 - [ ] **Step 2: Run** `cargo test --lib -- kv::` — FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `cargo test --lib -- kv::` — PASS.
@@ -189,7 +189,7 @@ One task because every consumer of the sequence changes together; a partial swit
 - Modify: `scripts/storage_faults.py` (redb single files: SIGKILL mid-write, truncation, bit flips in a value page and a branch page, removed shard file, damage while open), `.github/workflows/*.yml` if the script's invocation changes.
 - Test: the script itself, run locally (≤ 15 min).
 
-- [ ] **Step 1: Rewrite the scenarios** with split acceptance: SIGKILL keeps every acknowledged document; deliberate damage fails closed (500 or refused open), never wrong data, never a crash loop; damage to a value while open is a 500 on read; damage to a branch page while open is detected at the next open (spec's documented limit).
+- [ ] **Step 1: Rewrite the scenarios** with split acceptance: SIGKILL keeps every acknowledged document; deliberate damage fails closed (500 or refused open), never wrong data, never a crash loop; damage to a value while open is a 500 on read; damage to a branch page while open is detected by the next integrity check (idle close, or the first open after a restart; spec's documented limit).
 - [ ] **Step 2: Run** `timeout 900 python3 scripts/storage_faults.py` against a release build — every scenario PASS.
 - [ ] **Step 3: Commit** `Fault-test redb storage`.
 
