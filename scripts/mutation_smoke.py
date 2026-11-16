@@ -32,11 +32,11 @@ MUTATIONS = [
         ["cargo", "test", "--locked", "--test", "conformance", "cluster_default_write_quorum_is_a_majority"],
     ),
     (
-        "changes watermark cap",
+        "changes bound past the committed positions",
         "src/db.rs",
-        "            safe = safe.min(committed[index].max(since));",
-        "            safe = safe.max(committed[index].max(since));",
-        ["cargo", "test", "--locked", "--lib", "changes_cursor_stops_at_allocated_but_uncommitted_shard_sequence"],
+        "            ShardSince(self.shards.iter().map(ShardHandle::committed_seq).collect())",
+        "            ShardSince(self.shards.iter().map(|_| u64::MAX).collect())",
+        ["cargo", "test", "--locked", "--lib", "incremental_update_is_bounded_by_each_shards_start_position"],
     ),
     (
         "winner prefers deleted revisions",
