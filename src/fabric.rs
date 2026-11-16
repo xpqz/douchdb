@@ -11,7 +11,7 @@ use crate::db::{
     DocListRow, DocOpts, WriteError, WriteResult,
 };
 use crate::params::{doc_ids_from, doc_opts, flag, num, parse_since, resolve_changes_filter};
-use crate::since::{CopyPos, Since};
+use crate::since::{Checkpoint, CopyPos, Since};
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
 use futures::future::join_all;
@@ -2673,13 +2673,22 @@ pub(crate) async fn cluster_changes(
             let start = match since_ref {
                 Since::Now => Since::Now,
                 Since::Zero => Since::Zero,
-                Since::Token(copies) => Since::Token(
-                    copies
+                Since::Token(copies) => {
+                    let mut own: Vec<CopyPos> = copies
                         .iter()
                         .filter(|copy| copy.node == node && mask.covers(copy.shard))
                         .cloned()
-                        .collect(),
-                ),
+                        .collect();
+                    // A shard it took over from another copy resumes where
+                    // that copy's position maps to, instead of from 0.
+                    let taken: Vec<CopyPos> = copies
+                        .iter()
+                        .filter(|copy| copy.node != node && mask.covers(copy.shard))
+                        .cloned()
+                        .collect();
+                    own.extend(translated_positions(read, node, &taken).await);
+                    Since::Token(own)
+                }
             };
             let value = fetch_node_changes(read, changes, node, &mask, &start, node_limit).await?;
             Ok((mask.shards(), start, value))
@@ -2766,6 +2775,103 @@ pub(crate) async fn cluster_changes(
         last_seq: encode_progress(&progress),
         pending,
     })
+}
+
+/// What a serving node holds for resuming one shard's token position: its
+/// copy's uuid and its checkpoints of pulls from the position's copy.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ResumeInputs {
+    shard: usize,
+    uuid: String,
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// This node's [`ResumeInputs`] for the token positions `wants`: the
+/// internal-replication checkpoints (`ae3:`, never the design-only `ae3d:`)
+/// of pulls from each wanted copy.
+pub(crate) async fn local_resume_inputs(db: &Db, wants: &[CopyPos]) -> DbResult<Vec<ResumeInputs>> {
+    let uuids = db.shard_seqs();
+    let mut inputs = Vec::new();
+    for want in wants {
+        let Some((uuid, _)) = uuids.get(want.shard) else {
+            continue;
+        };
+        let prefix = format!("ae3:{}:{}:{}", want.node, want.shard, want.uuid);
+        let found = db.shard_checkpoints(want.shard, &prefix).await?;
+        let checkpoints = found
+            .iter()
+            .filter_map(|(_, value)| {
+                Some(Checkpoint {
+                    source_uuid: value.get("source_uuid")?.as_str()?.to_string(),
+                    seq: value.get("seq")?.as_u64()?,
+                    target_uuid: uuid.clone(),
+                    target_seq: value.get("target_seq")?.as_u64()?,
+                })
+            })
+            .collect();
+        inputs.push(ResumeInputs {
+            shard: want.shard,
+            uuid: uuid.clone(),
+            checkpoints,
+        });
+    }
+    Ok(inputs)
+}
+
+/// The positions on `node`'s own copies that the `taken` token positions, on
+/// other nodes' copies, translate to through the checkpoints `node` holds. One
+/// internal request when `node` is a peer. Shards with no translation (or if
+/// the checkpoints cannot be had) are left out and read from 0: a replay,
+/// never a skip.
+async fn translated_positions(
+    read: ClusterRead<'_>,
+    node: usize,
+    taken: &[CopyPos],
+) -> Vec<CopyPos> {
+    if taken.is_empty() {
+        return Vec::new();
+    }
+    let ClusterRead {
+        ctx,
+        db,
+        dbname,
+        headers,
+    } = read;
+    let inputs = if node == ctx.cluster.me {
+        local_resume_inputs(db, taken).await.ok()
+    } else {
+        let request = internal_request(
+            ctx,
+            reqwest::Method::GET,
+            &ctx.cluster.nodes[node],
+            &[dbname],
+            Some(headers),
+        )
+        .header("x-douchdb-resume", crate::since::encode(taken));
+        match send_peer(request).await {
+            Ok(response) if response.status().is_success() => response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_value(body["resume"].clone()).ok()),
+            _ => None,
+        }
+    };
+    let mut positions = Vec::new();
+    for input in inputs.unwrap_or_default() {
+        for want in taken.iter().filter(|want| want.shard == input.shard) {
+            let seq = crate::since::resume_position(want, &input.uuid, &input.checkpoints);
+            if seq > 0 {
+                positions.push(CopyPos {
+                    node,
+                    shard: input.shard,
+                    seq,
+                    uuid: input.uuid.clone(),
+                });
+            }
+        }
+    }
+    positions
 }
 
 fn encode_progress(progress: &BTreeMap<usize, CopyPos>) -> String {

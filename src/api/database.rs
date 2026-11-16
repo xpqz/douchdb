@@ -194,6 +194,22 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             .collect();
         return json(StatusCode::OK, json!({ "shards": shards }));
     }
+    if st.ctx.cluster.is_internal(headers) {
+        if let Some(wants) = headers
+            .get("x-douchdb-resume")
+            .and_then(|value| value.to_str().ok())
+        {
+            // The checkpoints this node holds for pulls from the copies a
+            // coordinator's token names, so it can resume them here.
+            let Ok(wants) = crate::since::decode(wants) else {
+                return fail(ApiError::new(400, "bad_request", "bad x-douchdb-resume"));
+            };
+            return match crate::fabric::local_resume_inputs(db, &wants).await {
+                Ok(inputs) => json(StatusCode::OK, json!({ "resume": inputs })),
+                Err(e) => fail(e),
+            };
+        }
+    }
     match db.info().await {
         Ok(info) => {
             if st.ctx.cluster.is_internal(headers) {
