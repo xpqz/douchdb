@@ -404,13 +404,12 @@ impl AppState {
         if let Some(db) = self.open_db_if_cached(name).await {
             return Ok(Placement::of_open(db));
         }
-        let root = self.root.clone();
-        let owned = name.to_string();
         let nodes = self.ctx.cluster.nodes.len().max(1);
-        let closed =
-            tokio::task::spawn_blocking(move || Db::read_closed_meta(&root, &owned, nodes))
-                .await
-                .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))??;
+        let closed = self
+            .read_closed(name, move |root, name| {
+                Db::read_closed_meta(root, name, nodes)
+            })
+            .await?;
         match closed {
             Some(meta) => Ok(Placement {
                 q: meta.q,
@@ -517,17 +516,39 @@ impl AppState {
         if let Some(open) = self.dbs.read().await.get(name) {
             return Some(open.db.security());
         }
-        let (root, owned) = (self.root.clone(), name.to_string());
-        match blocking(move || Db::read_security(&root, &owned)).await {
-            Ok(Ok(Some(security))) => Some(security),
-            // Being opened or closed right now: ask the open database.
-            Ok(Ok(None)) => {
+        match self.read_closed(name, Db::read_security).await {
+            Ok(Some(security)) => Some(security),
+            // Open after all: ask the open database.
+            Ok(None) => {
                 let security = self.db_cold(name).await.ok().map(|db| db.security());
                 self.release_cold().await;
                 security
             }
-            Ok(Err(_)) | Err(_) => None,
+            Err(_) => None,
         }
+    }
+
+    /// `read` the settings of database `name` while it is closed, on the
+    /// blocking pool. `read` answers `None` when the file is open (or only
+    /// an open can say): then this waits for the name's lock, so an open or
+    /// idle close in progress finishes, and reads again unless the database
+    /// is now open. `None` means: ask the open database.
+    async fn read_closed<T: Send + 'static>(
+        &self,
+        name: &str,
+        read: impl Fn(&Path, &str) -> DbResult<Option<T>> + Clone + Send + 'static,
+    ) -> DbResult<Option<T>> {
+        let (root, owned) = (self.root.clone(), name.to_string());
+        let first = read.clone();
+        if let Some(found) = blocking(move || first(&root, &owned)).await?? {
+            return Ok(Some(found));
+        }
+        let _guard = self.db_locks.lock(name).await;
+        if self.open_db_if_cached(name).await.is_some() {
+            return Ok(None);
+        }
+        let (root, owned) = (self.root.clone(), name.to_string());
+        blocking(move || read(&root, &owned)).await?
     }
 
     /// Create a database with `q` shards and `n` copies of each; `None`
@@ -613,8 +634,9 @@ impl AppState {
     }
 
     /// Every database: each directory of the data root that stands for a
-    /// legal database name. Staging and tombstone directories cannot (a
-    /// leading `.`), and a database whose files are damaged is still one.
+    /// legal database name and holds a shard file (see `db::is_db_dir`).
+    /// Staging and tombstone directories cannot (a leading `.`), and a
+    /// database whose files are damaged is still one.
     pub async fn db_names(&self) -> Vec<String> {
         let root = self.root.clone();
         blocking(move || {
@@ -622,7 +644,7 @@ impl AppState {
                 .into_iter()
                 .flatten()
                 .flatten()
-                .filter(|entry| entry.path().is_dir())
+                .filter(|entry| crate::db::is_db_dir(&entry.path()))
                 .filter_map(|entry| {
                     entry
                         .file_name()
@@ -788,6 +810,11 @@ fn build_staged(
         });
     }
     reached(root, Step::Published);
+    // New files under these names: their first open checks them, whatever
+    // an earlier file of the name left recorded.
+    for index in 0..q {
+        crate::kv::forget_verified(&shard_file(&path, index));
+    }
     sync_dir(root).map_err(|error| io_error(root, error))?;
     reached(root, Step::PublishSynced);
     Ok(())
@@ -798,6 +825,17 @@ fn build_staged(
 /// or by `recover_root` after a crash. Blocking; its shards must be closed.
 pub fn delete_db(root: &Path, name: &str) -> DbResult<()> {
     let path = db_path(root, name);
+    if !crate::db::is_db_dir(&path) {
+        return Err(ApiError::db_not_found());
+    }
+    // The shard files, named before they move: their names are forgotten
+    // below whatever happens after the rename.
+    let files: Vec<PathBuf> = std::fs::read_dir(&path)
+        .map_err(|error| io_error(&path, error))?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "redb"))
+        .map(|entry| path.join(entry.file_name()))
+        .collect();
     let tombstone = root.join(format!("{TOMBSTONE_PREFIX}{}", crate::util::uuid()));
     match std::fs::rename(&path, &tombstone) {
         Ok(()) => {}
@@ -806,19 +844,16 @@ pub fn delete_db(root: &Path, name: &str) -> DbResult<()> {
         }
         Err(error) => return Err(io_error(&path, error)),
     }
+    // A file created later under one of these names is a new one, which its
+    // first open checks. Forgotten straight after the rename, so neither a
+    // failed sync below nor a read of a closed file (`kv::peek`, which holds
+    // the file's lock) that ran before can leave one recorded.
+    for file in &files {
+        crate::kv::forget_verified(file);
+    }
     reached(root, Step::Tombstoned);
     sync_dir(root).map_err(|error| io_error(root, error))?;
     reached(root, Step::TombstoneSynced);
-    // A file created later under one of these names is a new one, which its
-    // first open checks. Forgotten after the rename, so a read of a closed
-    // file (`kv::peek`) that ran before cannot record it afterwards.
-    if let Ok(files) = std::fs::read_dir(&tombstone) {
-        for file in files.flatten() {
-            if file.path().extension().is_some_and(|ext| ext == "redb") {
-                crate::kv::forget_verified(&path.join(file.file_name()));
-            }
-        }
-    }
     tokio::task::spawn_blocking(move || {
         if let Err(error) = std::fs::remove_dir_all(&tombstone) {
             tracing::warn!(path = %tombstone.display(), %error, "cannot remove a deleted database");
@@ -1254,11 +1289,14 @@ mod tests {
     /// opens with every document.
     #[tokio::test]
     async fn a_missing_shard_fails_closed_and_keeps_the_other_files() {
-        let damage: [(&str, Option<&[u8]>); 4] = [
+        let damage: [(&str, Option<&[u8]>); 5] = [
             ("shard-0001.redb", None),
             ("shard-0000.redb", None),
             ("shard-0001.redb", Some(&[0xab; 8192])),
             ("shard-0001.redb", Some(b"")),
+            // A redb file whose shard lost its settings: damage only the
+            // shard layer can see.
+            ("shard-0001.redb", Some(b"settings")),
         ];
         for (file, replacement) in damage {
             let root = scratch_root("fail-closed");
@@ -1273,6 +1311,17 @@ mod tests {
             let original = std::fs::read(dir.join(file)).unwrap();
             match replacement {
                 None => std::fs::remove_file(dir.join(file)).unwrap(),
+                Some(b"settings") => {
+                    let db = crate::kv::open(&dir.join(file), 1 << 20).unwrap();
+                    let txn = db.begin_write().unwrap();
+                    txn.open_table(crate::kv::SETTINGS)
+                        .unwrap()
+                        .retain(|_, _| false)
+                        .unwrap();
+                    txn.commit().unwrap();
+                    drop(db);
+                    crate::kv::forget_verified(&dir.join(file));
+                }
                 Some(bytes) => std::fs::write(dir.join(file), bytes).unwrap(),
             }
             let files = entries(&dir);
@@ -1284,9 +1333,25 @@ mod tests {
 
             let st = restart(&root);
             assert_eq!(st.db_names().await, ["m"], "{file}");
+            let error = st.db("m").await.err().expect("a damaged database opened");
+            assert_eq!(error.status, 500, "{file}: {}", error.reason);
+            // Each request after the first opens the healthy files read-only
+            // and closes none of them with a check: not a byte changes, and
+            // the files stay verified.
+            let first = entries(&dir)
+                .into_iter()
+                .map(|name| (name.clone(), std::fs::read(dir.join(&name)).unwrap()))
+                .collect::<Vec<_>>();
             for _ in 0..2 {
                 let error = st.db("m").await.err().expect("a damaged database opened");
                 assert_eq!(error.status, 500, "{file}: {}", error.reason);
+            }
+            for (name, bytes) in &first {
+                let now = std::fs::read(dir.join(name)).unwrap();
+                assert!(now == *bytes, "{file}: a request wrote to {name}");
+            }
+            if file != "shard-0000.redb" {
+                assert!(crate::kv::is_verified(&shard_file(&dir, 0)), "{file}");
             }
             // Placement lives in shard 0: readable while shard 0 is.
             let placement = st.placement("m").await.err().map(|error| error.status);
@@ -1295,11 +1360,21 @@ mod tests {
             drop(st);
             recover_root(&root).unwrap();
             assert_eq!(entries(&dir), files, "{file}: files created or removed");
-            assert_eq!(
-                std::fs::read(dir.join(file)).ok(),
-                damaged,
-                "{file}: the damaged file was changed"
-            );
+            if replacement == Some(b"settings") {
+                // A redb file is opened, once writable, to be checked; its
+                // shard is not filled in again.
+                let db = crate::kv::open(&dir.join(file), 1 << 20).unwrap();
+                let txn = redb::ReadableDatabase::begin_read(&db).unwrap();
+                let settings = txn.open_table(crate::kv::SETTINGS).unwrap();
+                assert!(redb::ReadableTable::first(&settings).unwrap().is_none());
+                drop((settings, txn, db));
+            } else {
+                assert_eq!(
+                    std::fs::read(dir.join(file)).ok(),
+                    damaged,
+                    "{file}: the damaged file was changed"
+                );
+            }
             if file == "shard-0000.redb" {
                 // Nothing healthy was opened: every file is as it was.
                 for (name, bytes) in &others {
@@ -1379,6 +1454,85 @@ mod tests {
         );
         drop(fresh);
         st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The delete forgets the verification of its files straight after the
+    /// rename, so a crash or a failed sync after it cannot leave a recreated
+    /// file's first open unchecked; publishing a database forgets its new
+    /// files' names too, whatever an earlier file there left recorded.
+    #[tokio::test]
+    async fn delete_and_create_forget_every_shard_file() {
+        let root = scratch_root("forget");
+        let st = test_state(root.clone(), 8);
+        drop(st.create_db("f", false, Some(2), None).await.unwrap());
+        drop(st);
+        // Closed idle, both files verified.
+        let files: Vec<PathBuf> = (0..2)
+            .map(|i| shard_file(&db_path(&root, "f"), i))
+            .collect();
+        assert!(files.iter().all(|file| crate::kv::is_verified(file)));
+
+        stop_at(&root, Step::Tombstoned);
+        let st = test_state(root.clone(), 8);
+        assert!(st.drop_db("f").await.is_err(), "not stopped");
+        clear_stops(&root);
+        for file in &files {
+            assert!(
+                !crate::kv::is_verified(file),
+                "{} still verified",
+                file.display()
+            );
+        }
+        drop(st);
+
+        // Removed by hand while verified; the new files must be checked.
+        let st = restart(&root);
+        drop(st.create_db("f", false, Some(2), None).await.unwrap());
+        drop(st);
+        assert!(files.iter().all(|file| crate::kv::is_verified(file)));
+        std::fs::remove_dir_all(db_path(&root, "f")).unwrap();
+        create_db_staged(
+            &root,
+            "f",
+            &DbSettings {
+                q: 2,
+                partitioned: false,
+                shard_map: crate::cluster::ShardMap::single(2),
+            },
+        )
+        .unwrap();
+        for file in &files {
+            assert!(
+                !crate::kv::is_verified(file),
+                "{} still verified",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A directory is a database when it holds a shard file. One that only
+    /// has a legal name, like `lost+found` at the root of a volume, is not
+    /// listed and does not exist; creating its name answers 412, since
+    /// publishing cannot replace a directory that is not empty.
+    #[tokio::test]
+    async fn a_directory_without_shard_files_is_not_a_database() {
+        let root = scratch_root("not-a-db");
+        std::fs::create_dir_all(root.join("lost+found")).unwrap();
+        std::fs::write(root.join("lost+found").join("#1234"), b"x").unwrap();
+        let st = test_state(root.clone(), 8);
+        assert!(st.db_names().await.is_empty());
+        assert_eq!(st.db("lost+found").await.err().map(|e| e.status), Some(404));
+        assert_eq!(st.drop_db("lost+found").await.unwrap_err().status, 404);
+        let error = st.create_db("lost+found", false, None, None).await.err();
+        assert_eq!(error.map(|e| e.status), Some(412));
+        assert_eq!(
+            entries(&root),
+            ["lost+found"],
+            "a staging directory was left"
+        );
+        assert_eq!(entries(&root.join("lost+found")), ["#1234"]);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -152,6 +152,28 @@ where behaviour is best-effort, it says so.
 - Static membership: nodes and placement are configuration, not a consensus
   protocol. There is no online membership change.
 
+## Databases
+
+- A database is a directory under the data root holding its shard files
+  (`shard-NNNN.redb`). Its own settings (shard count, shard map, security
+  object, a pending shard map) are rows in shard 0's settings table.
+- A create builds the database in a `.creating-<uuid>` directory, commits
+  shard 0's settings last, syncs it and renames it to the database's name,
+  then syncs the data root; it is acknowledged only after that. A delete
+  renames the directory to `.deleted-<uuid>` and syncs the root before it is
+  acknowledged; the files are removed in the background. A crash leaves at
+  most one of those directories, which the next start removes. Nothing under
+  a database's own name is removed on start.
+- A database with a missing or damaged shard file fails closed: it stays
+  listed, requests to it answer 500, and its files are not recreated,
+  repaired or removed.
+- A directory counts as a database when it holds at least one shard file, so
+  a directory that only has a legal name (`lost+found` at a volume root) is
+  ignored. The residual case: a database that lost *every* shard file is no
+  longer listed and answers 404, and creating its name answers 412, because
+  the leftover directory is not empty and a new database cannot be renamed
+  over it. Remove or restore the directory by hand.
+
 ## Durability
 
 - Acknowledged writes survive a process crash (`kill -9`) because they reach

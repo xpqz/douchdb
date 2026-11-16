@@ -574,6 +574,45 @@ pub(crate) fn shard_file(dir: &Path, index: u32) -> PathBuf {
     dir.join(format!("shard-{index:04}.redb"))
 }
 
+/// Whether `name` is a shard file's name, `shard-NNNN.redb`.
+fn is_shard_file_name(name: &str) -> bool {
+    name.strip_prefix("shard-")
+        .and_then(|rest| rest.strip_suffix(".redb"))
+        .is_some_and(|digits| digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `dir` holds a database: a directory with at least one shard
+/// file. A database that lost some of its shards (shard 0 included) is
+/// still one, and fails closed when opened. A directory that merely has a
+/// legal name (`lost+found` at the root of a volume) is not. One that lost
+/// every shard file is not either: it is neither listed nor found, and a
+/// create of its name answers 412, since publishing a new database cannot
+/// replace a directory that is not empty.
+pub(crate) fn is_db_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(is_shard_file_name)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+    })
+}
+
+/// Peek shard `index` of the database in `dir` (see `kv::peek`): what
+/// `read` returns, or a 500 naming the file when it is missing, damaged or
+/// open elsewhere.
+fn peek_shard<R>(
+    dir: &Path,
+    index: u32,
+    read: impl FnOnce(&dyn redb::ReadableDatabase) -> anyhow::Result<R>,
+) -> DbResult<R> {
+    let file = shard_file(dir, index);
+    match crate::kv::peek(&file, PEEK_CACHE, read) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(shard_error(&file, format!("{error:#}"))),
+        Err(error) => Err(shard_error(&file, error)),
+    }
+}
+
 /// The data-root directory of database `name`.
 pub fn db_path(root: &Path, name: &str) -> PathBuf {
     root.join(db_dir_name(name))
@@ -593,30 +632,47 @@ impl Db {
     /// left untouched, never replaced, so damage is not mistaken for a new
     /// database. Blocking: shard files are checked on their first open.
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
-        let path = db_path(root, name);
-        if !path.is_dir() {
+        if !Db::exists(root, name) {
             return Err(ApiError::db_not_found());
         }
+        let path = db_path(root, name);
+        crate::search::remove_stale_temps(&path);
+        // Every file is checked with a peek before any is opened for
+        // writing: a damaged database fails here, its healthy files opened
+        // read-only once verified, so a request to it neither writes to
+        // them nor reads them in full again.
+        let rows = peek_shard(&path, 0, |db| {
+            crate::store::check_file(db, &shard_file(&path, 0))?;
+            crate::store::read_settings(db, DB_SETTINGS)
+        })?;
+        let stored = Stored::parse(&path, rows)?;
+        let q = stored.info.q;
+        for index in 1..q {
+            peek_shard(&path, index, |db| {
+                crate::store::check_file(db, &shard_file(&path, index))
+            })?;
+        }
+
         let commits = Arc::new(tokio::sync::watch::Sender::new(()));
-        let spawn = |index: u32| {
+        let mut shards = Vec::new();
+        for index in 0..q {
             let file = shard_file(&path, index);
-            ShardHandle::spawn(
+            match ShardHandle::spawn(
                 &file,
                 config.revs_limit,
                 config.cache_bytes,
                 commits.clone(),
-            )
-            .map_err(|error| shard_error(&file, format!("{error:#}")))
-        };
-        let first = spawn(0)?;
-        let rows = first
-            .settings(DB_SETTINGS)
-            .map_err(|error| shard_error(&shard_file(&path, 0), format!("{error:#}")))?;
-        let stored = Stored::parse(&path, rows)?;
-        let q = stored.info.q;
-        let mut shards = vec![first];
-        for index in 1..q {
-            shards.push(spawn(index)?);
+            ) {
+                Ok(shard) => shards.push(shard),
+                Err(error) => {
+                    // Closed unchecked, as a damaged database's healthy
+                    // shards are not to be read in full on every request.
+                    for shard in shards {
+                        shard.discard();
+                    }
+                    return Err(shard_error(&file, format!("{error:#}")));
+                }
+            }
         }
 
         // A map stored for a different cluster size gives way to the
@@ -669,10 +725,10 @@ impl Db {
         Db::open(root, name, config)
     }
 
-    /// Whether database `name` exists: its directory is published. Whether
-    /// its files can be opened is for the open to find out.
+    /// Whether database `name` exists: see [`is_db_dir`]. Whether its files
+    /// can be opened is for the open to find out.
     pub fn exists(root: &Path, name: &str) -> bool {
-        db_path(root, name).is_dir()
+        is_db_dir(&db_path(root, name))
     }
 
     /// The settings of a database that is not open, read from shard 0
@@ -681,10 +737,10 @@ impl Db {
     /// open: the database is being opened or closed, so ask it instead.
     /// Blocking.
     fn read_stored(root: &Path, name: &str) -> DbResult<Option<Stored>> {
-        let path = db_path(root, name);
-        if !path.is_dir() {
+        if !Db::exists(root, name) {
             return Err(ApiError::db_not_found());
         }
+        let path = db_path(root, name);
         let file = shard_file(&path, 0);
         match crate::kv::peek(&file, PEEK_CACHE, |db| {
             crate::store::read_settings(db, DB_SETTINGS)

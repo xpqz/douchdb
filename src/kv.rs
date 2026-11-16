@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use redb::backends::FileBackend;
-use redb::{Builder, Database, DatabaseError, StorageBackend, StorageError, TableDefinition};
+use redb::{
+    Builder, Database, DatabaseError, ReadableDatabase, StorageBackend, StorageError,
+    TableDefinition,
+};
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
 
@@ -151,23 +154,38 @@ fn existing_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// Run `read` on the closed file at `path` and close it again, leaving it
-/// as verified as it was, so metadata of a database that is not open can
-/// be read without a full integrity check every time. The open checks the
-/// file when [`open`] would; a session that only read a file that passed
-/// its check (then or at an earlier close) leaves it verified. `read` must
-/// not write.
+/// Run `read` on the closed file at `path` and close it again, so the
+/// settings of a database that is not open can be read without a full
+/// integrity check every time.
+///
+/// A file not verified in this process is opened as [`open`] would open it,
+/// with the full check, and left verified once that passed and `read` (which
+/// only reads) is done: this is the one writable open a probed file gets. A
+/// verified file is opened read-only, which redb does without modifying it,
+/// so repeated probes never write and stay verified.
 ///
 /// The file's lock is held throughout, so an [`open`] or [`close_verified`]
 /// of the same path waits for it; a file open elsewhere fails with
 /// `DatabaseError::DatabaseAlreadyOpen`. Like [`open`], it never creates the
 /// file.
-pub fn peek<R>(path: &Path, cache_bytes: usize, read: impl FnOnce(&Database) -> R) -> Result<R> {
+pub fn peek<R>(
+    path: &Path,
+    cache_bytes: usize,
+    read: impl FnOnce(&dyn ReadableDatabase) -> R,
+) -> Result<R> {
     let flag = verified_flag(path);
     let mut verified = lock(&flag);
-    let check = !std::mem::replace(&mut *verified, false);
+    if *verified {
+        let file = OpenOptions::new().read(true).open(path)?;
+        if file.metadata()?.len() == 0 {
+            return Err(StorageError::Corrupted(format!("{} is empty", path.display())).into());
+        }
+        let db =
+            builder(cache_bytes, false).open_read_only_with_backend(FileBackend::new(file)?)?;
+        return Ok(read(&db));
+    }
     let db =
-        builder(cache_bytes, check).create_with_backend(FileBackend::new(existing_file(path)?)?)?;
+        builder(cache_bytes, true).create_with_backend(FileBackend::new(existing_file(path)?)?)?;
     let result = read(&db);
     db.close()?;
     *verified = true;
@@ -507,10 +525,23 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(!verified(&path));
 
-        let read = peek(&path, CACHE, |db| get(db, "doc-000007")).unwrap();
-        assert!(read.is_some());
+        let read = peek(&path, CACHE, |db| {
+            let txn = db.begin_read().unwrap();
+            let table = txn.open_table(META).unwrap();
+            table.get("doc-000007").unwrap().is_some()
+        })
+        .unwrap();
+        assert!(read);
         assert!(verified(&path), "the checked peek did not record it");
+        // A peek of a verified file opens it read-only: not a byte changes.
+        let before = std::fs::read(&path).unwrap();
         peek(&path, CACHE, |_| ()).unwrap();
+        peek(&path, CACHE, |_| ()).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a verified peek wrote"
+        );
         assert!(verified(&path), "a peek of a verified file forgot it");
         let reopened = bytes_read_by_open(&path);
         assert!(reopened < size / 50, "{reopened} of {size} bytes read");

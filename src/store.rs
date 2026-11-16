@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -464,8 +464,56 @@ fn settings_in(txn: &ReadTransaction, prefix: &str) -> Result<Vec<(String, Vec<u
 }
 
 /// [`settings_in`] the file `db`, for one no shard has open.
-pub fn read_settings(db: &Database, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+pub fn read_settings(db: &dyn ReadableDatabase, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
     settings_in(&db.begin_read()?, prefix)
+}
+
+/// Fail unless `db` is a whole shard file: every table there, and the
+/// settings it was created with. A file that lost any of them is damaged,
+/// never taken for a new one and filled in again (that would give it a new
+/// uuid and zeroed counters).
+pub fn check_file(db: &dyn ReadableDatabase, file: &Path) -> Result<()> {
+    check_shard(db, &ShardName::of(file))
+}
+
+fn check_shard(db: &dyn ReadableDatabase, name: &ShardName) -> Result<()> {
+    let txn = db.begin_read()?;
+    let missing = |table: &'static str| {
+        move |error: redb::TableError| {
+            anyhow::anyhow!(
+                "corrupt shard {}/{}: no {table} table: {error}",
+                name.db,
+                name.shard
+            )
+        }
+    };
+    drop(txn.open_table(META).map_err(missing("meta"))?);
+    drop(txn.open_table(BY_SEQ).map_err(missing("by_seq"))?);
+    drop(txn.open_table(BODIES).map_err(missing("bodies"))?);
+    drop(txn.open_table(LOCAL).map_err(missing("local"))?);
+    drop(
+        txn.open_table(PURGE_INFOS)
+            .map_err(missing("purge_infos"))?,
+    );
+    drop(
+        txn.open_table(PURGED_REVS)
+            .map_err(missing("purged_revs"))?,
+    );
+    drop(
+        txn.open_table(PURGE_UUIDS)
+            .map_err(missing("purge_uuids"))?,
+    );
+    drop(
+        txn.open_table(CHECKPOINTS)
+            .map_err(missing("checkpoints"))?,
+    );
+    let settings = txn.open_table(SETTINGS).map_err(missing("settings"))?;
+    for required in [UUID, SEQ, DOC_COUNT, DELETED_COUNT] {
+        if settings.get(required)?.is_none() {
+            anyhow::bail!("corrupt shard {}/{}: no {required}", name.db, name.shard);
+        }
+    }
+    Ok(())
 }
 
 /// The settings committed in `db`; a shard without a `revs_limit` of its
@@ -599,7 +647,7 @@ impl Shard {
         revs_limit: u64,
     ) -> Result<Shard> {
         let db = open()?;
-        init_tables(&db)?;
+        check_shard(&db, &name)?;
         let settings = load_settings(&db, &name, revs_limit)?;
         Ok(Shard {
             gate: Gate::new(db),
@@ -762,7 +810,12 @@ impl Shard {
     ) -> Result<Shard> {
         let switch = switch.clone();
         Shard::over_test_opener(
-            Box::new(move || Ok(kv::open_with(switch.backend(), 1 << 20)?)),
+            Box::new(move || {
+                // A fresh test disk is a new file, made as `create_file` makes one.
+                let db = kv::open_with(switch.backend(), 1 << 20)?;
+                init_tables(&db)?;
+                Ok(db)
+            }),
             revs_limit,
         )
     }
@@ -2306,6 +2359,9 @@ impl Message {
 /// so redb's file lock is released before `drop` returns.
 pub struct ShardHandle {
     tx: Option<mpsc::Sender<Message>>,
+    /// Set by `discard`: the actor closes the file without the close-time
+    /// check and records nothing.
+    discard: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The shard's committed position: its sequence as of the last commit.
     seq_tracker: Arc<AtomicU64>,
@@ -2362,6 +2418,8 @@ impl ShardHandle {
         open: impl FnOnce() -> Result<Shard> + Send + 'static,
     ) -> Result<ShardHandle> {
         let seq_tracker = Arc::new(AtomicU64::new(0));
+        let discard = Arc::new(AtomicBool::new(false));
+        let discarded = discard.clone();
         let (tx, mut rx) = mpsc::channel::<Message>(256);
         type Ready = (
             u64,
@@ -2466,6 +2524,7 @@ impl ShardHandle {
                     shard.discard();
                     let _ = done.send(());
                 }
+                None if discarded.load(Ordering::SeqCst) => shard.discard(),
                 None => shard.close(),
             }
         })?;
@@ -2475,6 +2534,7 @@ impl ShardHandle {
         seq_tracker.store(initial_seq, Ordering::SeqCst);
         Ok(ShardHandle {
             tx: Some(tx),
+            discard,
             thread: Some(thread),
             seq_tracker,
             uuid,
@@ -2590,6 +2650,16 @@ impl ShardHandle {
         self.send(Message::Read(job), answer)
     }
 
+    /// Close the shard without the close-time integrity check, for a
+    /// database whose open failed: the file is left as it is and its
+    /// verification as the open left it (consumed, never recorded), so a
+    /// damaged database costs no full read of its healthy shards per
+    /// request. Waits until the file is closed.
+    pub fn discard(self) {
+        self.discard.store(true, Ordering::SeqCst);
+        drop(self);
+    }
+
     /// Stop the shard because its database is deleted, and wait until its
     /// file is closed. From then on every request answers `not_found`, also
     /// through handles cloned before, and the file is never closed again, so
@@ -2606,11 +2676,6 @@ impl ShardHandle {
                 let _ = closed.await;
             }
         }
-    }
-
-    /// The committed settings whose names start with `prefix`.
-    pub fn settings(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        settings_in(&self.gate.begin_read()?, prefix)
     }
 
     /// Run `f` off the actor, on a read transaction of its own leased from
@@ -2890,6 +2955,50 @@ pub(crate) mod tests {
         assert_eq!(counts(&mut shard), (0, 2), "counters survive reopen");
         drop(shard);
         remove(&file);
+    }
+
+    /// A shard file that lost a table, or every setting, is damaged: it
+    /// used to be filled in again on open (a new uuid, zeroed counters),
+    /// now the open fails and the file is left as it is.
+    #[test]
+    fn a_shard_missing_a_table_or_its_settings_fails_to_open() {
+        for damage in ["bodies", "settings"] {
+            let file = temp_file("no-table");
+            {
+                let db = kv::open(&file, CACHE).unwrap();
+                let txn = db.begin_write().unwrap();
+                if damage == "bodies" {
+                    txn.delete_table(BODIES).unwrap();
+                } else {
+                    txn.open_table(SETTINGS)
+                        .unwrap()
+                        .retain(|_, _| false)
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            let error = Shard::open(&file, 1000, CACHE)
+                .err()
+                .expect("must refuse to open");
+            assert!(
+                error.to_string().contains("corrupt shard"),
+                "{damage}: {error}"
+            );
+            let db = kv::open(&file, CACHE).unwrap();
+            let txn = db.begin_read().unwrap();
+            if damage == "bodies" {
+                assert!(txn.open_table(BODIES).is_err(), "the table was recreated");
+            } else {
+                let settings = txn.open_table(SETTINGS).unwrap();
+                assert!(
+                    settings.first().unwrap().is_none(),
+                    "settings were refilled"
+                );
+            }
+            drop(txn);
+            drop(db);
+            remove(&file);
+        }
     }
 
     /// The settings a fresh file is created with are its state: one that
@@ -3949,6 +4058,22 @@ mod group_tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
+    /// A handle closed normally is checked and recorded verified; one
+    /// discarded (a database whose open failed) is closed unchecked and
+    /// records nothing.
+    #[tokio::test]
+    async fn a_discarded_handle_closes_its_file_unchecked() {
+        let (handle, file) = handle("discard");
+        let handle = Arc::into_inner(handle).unwrap();
+        handle.discard();
+        assert!(!kv::is_verified(&file), "a discarded shard was verified");
+        let reopened = ShardHandle::spawn(&file, 1000, tests::CACHE, Default::default()).unwrap();
+        drop(reopened);
+        assert!(kv::is_verified(&file), "a normal close was not verified");
+        kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
     #[tokio::test]
     async fn data_written_before_a_panic_survives_and_the_partial_job_is_discarded() {
         let (handle, file) = handle("partial");
@@ -4003,7 +4128,10 @@ mod recovery_tests {
                 let _ = opening_tx.send(lease_held.load(Ordering::SeqCst));
                 go_rx.recv()?;
             }
-            Ok(kv::open_with(disk.backend(), CACHE)?)
+            // The first open makes the file, as `create_file` would.
+            let db = kv::open_with(disk.backend(), CACHE)?;
+            init_tables(&db)?;
+            Ok(db)
         });
         let handle = ShardHandle::spawn_with(
             "shard-recovery".to_string(),

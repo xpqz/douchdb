@@ -39,8 +39,8 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// Probe the data root: list it, write and remove a scratch file, and check
-/// that every database directory still holds a shard 0 file that is not
-/// empty, where its settings live. Opening every database would be far more
+/// that every database directory (one holding a shard file) still holds a
+/// shard 0 that is not empty, where its settings live. Opening every database would be far more
 /// expensive. Blocking; call it from `spawn_blocking`.
 fn probe_fs(root: &std::path::Path) -> FsHealth {
     let readable = std::fs::read_dir(root).is_ok();
@@ -50,7 +50,7 @@ fn probe_fs(root: &std::path::Path) -> FsHealth {
     let mut unreadable = 0u64;
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            let is_db = entry.path().is_dir()
+            let is_db = crate::db::is_db_dir(&entry.path())
                 && entry
                     .file_name()
                     .to_str()
@@ -1214,8 +1214,8 @@ mod tests {
     use super::*;
 
     /// A database directory whose shard 0, where its settings live, is
-    /// missing or empty counts as unreadable; staging directories are not
-    /// databases.
+    /// missing or empty counts as unreadable; staging directories and
+    /// directories without a shard file are not databases.
     #[test]
     fn probe_fs_counts_databases_without_a_shard_0() {
         let dir = std::env::temp_dir().join(format!("douchdb-fsprobe-{}", crate::util::uuid()));
@@ -1224,12 +1224,17 @@ mod tests {
             ("empty", Some(b"")),
             ("missing", None),
             (".creating-1", None),
+            ("lost+found", None),
         ] {
             assert!(std::fs::create_dir_all(dir.join(db)).is_ok());
             if let Some(bytes) = shard {
                 assert!(std::fs::write(dir.join(db).join("shard-0000.redb"), bytes).is_ok());
             }
         }
+        // A database that lost shard 0 still has its other shards; a
+        // directory with no shard file at all is no database.
+        assert!(std::fs::write(dir.join("missing").join("shard-0001.redb"), b"x").is_ok());
+        assert!(std::fs::write(dir.join(".creating-1").join("shard-0001.redb"), b"x").is_ok());
         let health = probe_fs(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(health.readable && health.writable);
