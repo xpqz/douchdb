@@ -151,7 +151,7 @@ pub(super) async fn doc_request(req: DbRequest<'_>, rest: &str) -> Response {
                 return response;
             }
         } else {
-            return quorum_read(&st.ctx, db, &docid, q, headers, read_quorum).await;
+            return quorum_read(st, db, &docid, q, headers, read_quorum).await;
         }
     }
 

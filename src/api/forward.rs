@@ -4,8 +4,9 @@
 use super::{doc_response, etag_matches, fail};
 use crate::cluster_http::{forward_client_auth, peer_url, percent_encode, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db};
-use crate::fabric::{reconcile_leaves, replica_docs};
+use crate::fabric::{read_repair, read_repair_plan, reconcile_leaves, replica_docs};
 use crate::params::flag;
+use crate::state::AppState;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
@@ -96,7 +97,7 @@ pub(crate) fn unavailable(response: &Response) -> bool {
 
 /// `?r=N` reads from several replicas and returns the winning revision.
 pub(crate) async fn quorum_read(
-    ctx: &ClusterCtx,
+    st: &AppState,
     db: &Db,
     docid: &str,
     q: &HashMap<String, String>,
@@ -109,10 +110,16 @@ pub(crate) async fn quorum_read(
     let requested_rev = q.get("rev").cloned();
     let open_all = requested_rev.is_none();
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
-    let (reachable, docs) = replica_docs(ctx, db, docid, q, headers, open_all, r).await;
-    if let Some(error) = read_quorum_failure(reachable, r, q) {
+    let answers = replica_docs(&st.ctx, db, docid, q, headers, open_all, r).await;
+    if let Some(error) = read_quorum_failure(answers.len(), r, q) {
         return fail(error);
     }
+    // Only an all-leaves read sees every replica's whole set of leaves; a read
+    // of one explicit revision cannot tell what a replica lacks.
+    if open_all {
+        read_repair(st, db, read_repair_plan(&answers), headers).await;
+    }
+    let docs: Vec<Value> = answers.into_iter().flat_map(|(_, docs)| docs).collect();
     if docs.is_empty() {
         return fail(ApiError::not_found("missing"));
     }
@@ -194,8 +201,8 @@ pub(crate) async fn quorum_reachable(
     r: usize,
 ) -> Option<Response> {
     let r = r.min(db.replicas_of_doc(docid).len()).max(1);
-    let (reachable, _) = replica_docs(ctx, db, docid, q, headers, false, r).await;
-    read_quorum_failure(reachable, r, q).map(fail)
+    let answers = replica_docs(ctx, db, docid, q, headers, false, r).await;
+    read_quorum_failure(answers.len(), r, q).map(fail)
 }
 
 /// The error for a read that reached fewer than `r` replicas. When some
