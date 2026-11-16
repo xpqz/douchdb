@@ -426,16 +426,15 @@ impl KindStats {
 const META_FILE: &str = "douchdb-search-meta.json";
 
 /// Remove the temporary files a crash left behind while writing an index's
-/// metadata, in every search index of the database at `db_path`:
-/// `.douchdb-search-meta.json.<pid>.<n>.tmp` of another process. This
-/// process's own are skipped, since a write of them may be in flight; a
-/// leftover from an earlier process that had the same pid stays. Blocking.
+/// metadata (`.douchdb-search-meta.json.<pid>.<n>.tmp`), in every search
+/// index of the database at `db_path`, whatever process wrote them. Run
+/// only where no metadata write can be in flight: at start-up, before the
+/// node serves (`state::recover_root`). Blocking.
 pub(crate) fn remove_stale_temps(db_path: &Path) {
     let Ok(indexes) = std::fs::read_dir(db_path.join("_search_indexes")) else {
         return;
     };
     let prefix = format!(".{META_FILE}.");
-    let ours = std::process::id().to_string();
     for index in indexes.flatten() {
         let Ok(files) = std::fs::read_dir(index.path()) else {
             continue;
@@ -451,7 +450,7 @@ pub(crate) fn remove_stale_temps(db_path: &Path) {
                 continue;
             };
             let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-            if !numeric(pid) || !numeric(counter) || pid == ours {
+            if !numeric(pid) || !numeric(counter) {
                 continue;
             }
             if file.file_type().is_ok_and(|kind| kind.is_file()) {
@@ -1947,10 +1946,11 @@ mod tests {
 
     /// Every index ever searched used to stay open, with all its stored
     /// documents, until the database was deleted.
-    /// Opening a database removes the temporary metadata files a crashed
-    /// process left in its search indexes, and nothing else.
+    /// Start-up recovery removes the temporary metadata files a crashed
+    /// process left in the search indexes, whatever pid they carry (in a
+    /// container the server is pid 1 every time), and nothing else.
     #[test]
-    fn open_removes_stale_search_meta_temporary_files() {
+    fn recovery_removes_stale_search_meta_temporary_files() {
         let root = std::env::temp_dir().join(format!("douchdb-searchtmp-{}", crate::util::uuid()));
         let config = || crate::db::DbConfig {
             q: 1,
@@ -1964,21 +1964,27 @@ mod tests {
             .join("_search_indexes")
             .join("abc");
         std::fs::create_dir_all(&index).unwrap();
-        let foreign = format!(".{META_FILE}.{}.7.tmp", std::process::id().wrapping_add(1));
-        let ours = format!(".{META_FILE}.{}.0.tmp", std::process::id());
+        let stale = [
+            format!(".{META_FILE}.{}.7.tmp", std::process::id().wrapping_add(1)),
+            format!(".{META_FILE}.{}.0.tmp", std::process::id()),
+            format!(".{META_FILE}.1.3.tmp"),
+        ];
         let keep = [
-            ours.as_str(),
             META_FILE,
             ".douchdb-search-meta.json.x.2.tmp",
             ".douchdb-search-meta.json.1.tmp",
             ".other.json.1.2.tmp",
         ];
-        std::fs::write(index.join(&foreign), b"partial").unwrap();
+        for name in &stale {
+            std::fs::write(index.join(name), b"partial").unwrap();
+        }
         for name in keep {
             std::fs::write(index.join(name), b"keep").unwrap();
         }
-        drop(Db::open(&root, "tmp", config()).unwrap());
-        assert!(!index.join(&foreign).exists(), "the stale file stayed");
+        crate::state::recover_root(&root).unwrap();
+        for name in &stale {
+            assert!(!index.join(name).exists(), "{name} stayed");
+        }
         for name in keep {
             assert!(index.join(name).exists(), "{name} was removed");
         }

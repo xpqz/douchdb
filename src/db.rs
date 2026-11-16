@@ -339,17 +339,16 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Numbers the temporary files of this process.
+static TEMPS: AtomicU64 = AtomicU64::new(0);
+
 /// Write `bytes` to a new temporary file next to `path` and fsync it. A
-/// crash before the caller publishes it leaves only the temporary file.
+/// crash before the caller publishes it leaves only the temporary file. A
+/// name already taken (a leftover of an earlier process that had this pid,
+/// as a container's pid 1 always does) is skipped for the next one, never
+/// written over or removed.
 fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    static TEMPS: AtomicU64 = AtomicU64::new(0);
-    let temp = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        file_name(path),
-        std::process::id(),
-        TEMPS.fetch_add(1, Ordering::Relaxed)
-    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -359,11 +358,20 @@ fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathB
     }
     #[cfg(not(unix))]
     let _ = private;
-    let written = options.open(&temp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    match written {
+    let (temp, mut file) = loop {
+        let temp = path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            file_name(path),
+            std::process::id(),
+            TEMPS.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    match file.write_all(bytes).and_then(|()| file.sync_all()) {
         Ok(()) => Ok(temp),
         Err(error) => {
             let _ = std::fs::remove_file(&temp);
@@ -636,7 +644,6 @@ impl Db {
             return Err(ApiError::db_not_found());
         }
         let path = db_path(root, name);
-        crate::search::remove_stale_temps(&path);
         // Every file is checked with a peek before any is opened for
         // writing: a damaged database fails here, its healthy files opened
         // read-only once verified, so a request to it neither writes to
@@ -6601,6 +6608,33 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// Temporary files an earlier process with this pid left (a container
+    /// runs the server as pid 1 every time) under the next names do not
+    /// make a write fail, and are neither written over nor removed.
+    #[test]
+    fn write_atomic_skips_temporary_names_already_taken() {
+        let dir = std::env::temp_dir().join(format!("douchdb-taken-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("meta.json");
+        let next = TEMPS.load(Ordering::Relaxed);
+        let taken: Vec<String> = (next..next + 64)
+            .map(|n| format!(".meta.json.{}.{n}.tmp", std::process::id()))
+            .collect();
+        for name in &taken {
+            std::fs::write(dir.join(name), b"leftover").unwrap();
+        }
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        for name in &taken {
+            assert_eq!(
+                std::fs::read(dir.join(name)).unwrap(),
+                b"leftover",
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

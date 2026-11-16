@@ -863,11 +863,18 @@ pub fn delete_db(root: &Path, name: &str) -> DbResult<()> {
 }
 
 /// Finish what a crash interrupted, before the node serves: remove every
-/// staging and tombstone directory under `root`, then sync it. Nothing
-/// under a database's own name is touched, whatever state it is in.
+/// staging and tombstone directory under `root`, then sync it, and the
+/// temporary files of search index metadata writes in each database.
+/// Nothing else under a database's own name is touched, whatever state it
+/// is in.
 pub fn recover_root(root: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
+        if crate::db::is_db_dir(&entry.path()) {
+            // No search index is open yet, so no metadata write can be in
+            // flight: every temporary file there is a crash's leftover.
+            crate::search::remove_stale_temps(&entry.path());
+        }
         let interrupted = entry.file_name().to_str().is_some_and(|name| {
             name.starts_with(STAGING_PREFIX) || name.starts_with(TOMBSTONE_PREFIX)
         });
@@ -1392,6 +1399,66 @@ mod tests {
             drop(st);
             for index in 0..2 {
                 crate::kv::forget_verified(&shard_file(&dir, index));
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// A shard whose own settings are damaged (a row failing its checksum,
+    /// one that does not parse) is found by the peek before any shard is
+    /// opened for writing: after the first failing request, later ones
+    /// write to no file and read none in full (every file stays verified,
+    /// so it is opened read-only).
+    #[tokio::test]
+    async fn damaged_shard_settings_fail_closed_without_touching_files() {
+        // (q, shard, setting, stored bytes): a SEQ that fails its checksum
+        // on shard 1, and a revs_limit that is not a number on shard 0.
+        let damage: [(u32, u32, &str, Vec<u8>); 2] = [
+            (2, 1, "seq", b"not sealed".to_vec()),
+            (1, 0, "revs_limit", crate::kv::seal(b"abc")),
+        ];
+        for (q, shard, setting, bytes) in damage {
+            let root = scratch_root("bad-row");
+            let st = test_state(root.clone(), 8);
+            let db = st.create_db("d", false, Some(q), None).await.unwrap();
+            db.put_docs(vec![json!({"_id": "x"})], true).await.unwrap();
+            drop(db);
+            drop(st);
+            let dir = db_path(&root, "d");
+            let file = shard_file(&dir, shard);
+            let db = crate::kv::open(&file, 1 << 20).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(crate::kv::SETTINGS)
+                .unwrap()
+                .insert(setting, bytes.as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+            drop(db);
+
+            let st = restart(&root);
+            let error = st.db("d").await.err().expect("a damaged database opened");
+            assert_eq!(error.status, 500, "{setting}: {}", error.reason);
+            let files: Vec<PathBuf> = (0..q).map(|index| shard_file(&dir, index)).collect();
+            let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+            for _ in 0..2 {
+                let error = st.db("d").await.err().expect("a damaged database opened");
+                assert_eq!(error.status, 500, "{setting}: {}", error.reason);
+            }
+            for (file, bytes) in files.iter().zip(&before) {
+                assert!(
+                    std::fs::read(file).unwrap() == *bytes,
+                    "{setting}: a request wrote to {}",
+                    file.display()
+                );
+                assert!(
+                    crate::kv::is_verified(file),
+                    "{setting}: {}",
+                    file.display()
+                );
+            }
+            drop(st);
+            for file in &files {
+                crate::kv::forget_verified(file);
             }
             let _ = std::fs::remove_dir_all(root);
         }

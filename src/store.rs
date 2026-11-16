@@ -468,15 +468,23 @@ pub fn read_settings(db: &dyn ReadableDatabase, prefix: &str) -> Result<Vec<(Str
     settings_in(&db.begin_read()?, prefix)
 }
 
-/// Fail unless `db` is a whole shard file: every table there, and the
-/// settings it was created with. A file that lost any of them is damaged,
-/// never taken for a new one and filled in again (that would give it a new
-/// uuid and zeroed counters).
+/// Fail where opening the shard file `db` would: [`check_shard`] for a
+/// file no shard has open, so a peek finds every damage an open would.
 pub fn check_file(db: &dyn ReadableDatabase, file: &Path) -> Result<()> {
-    check_shard(db, &ShardName::of(file))
+    // The default revs limit only fills in an absent setting: any will do.
+    check_shard(db, &ShardName::of(file), 1).map(drop)
 }
 
-fn check_shard(db: &dyn ReadableDatabase, name: &ShardName) -> Result<()> {
+/// What opening a shard reads, and the one check of it: every table there,
+/// and the settings it was created with, each matching its checksum and
+/// parsing. A file that lost or damaged any of them fails, never taken for
+/// a new one and filled in again (that would give it a new uuid and zeroed
+/// counters). Both the open and [`check_file`] go through here.
+fn check_shard(
+    db: &dyn ReadableDatabase,
+    name: &ShardName,
+    default_revs_limit: u64,
+) -> Result<Settings> {
     let txn = db.begin_read()?;
     let missing = |table: &'static str| {
         move |error: redb::TableError| {
@@ -507,19 +515,17 @@ fn check_shard(db: &dyn ReadableDatabase, name: &ShardName) -> Result<()> {
         txn.open_table(CHECKPOINTS)
             .map_err(missing("checkpoints"))?,
     );
-    let settings = txn.open_table(SETTINGS).map_err(missing("settings"))?;
-    for required in [UUID, SEQ, DOC_COUNT, DELETED_COUNT] {
-        if settings.get(required)?.is_none() {
-            anyhow::bail!("corrupt shard {}/{}: no {required}", name.db, name.shard);
-        }
-    }
-    Ok(())
+    drop(txn.open_table(SETTINGS).map_err(missing("settings"))?);
+    load_settings(&txn, name, default_revs_limit)
 }
 
 /// The settings committed in `db`; a shard without a `revs_limit` of its
 /// own has `default_revs_limit`.
-fn load_settings(db: &Database, name: &ShardName, default_revs_limit: u64) -> Result<Settings> {
-    let txn = db.begin_read()?;
+fn load_settings(
+    txn: &ReadTransaction,
+    name: &ShardName,
+    default_revs_limit: u64,
+) -> Result<Settings> {
     let table = txn.open_table(SETTINGS)?;
     let get = |setting: &str| -> Result<Option<Vec<u8>>> {
         match table.get(setting)? {
@@ -647,8 +653,7 @@ impl Shard {
         revs_limit: u64,
     ) -> Result<Shard> {
         let db = open()?;
-        check_shard(&db, &name)?;
-        let settings = load_settings(&db, &name, revs_limit)?;
+        let settings = check_shard(&db, &name, revs_limit)?;
         Ok(Shard {
             gate: Gate::new(db),
             open,
@@ -703,7 +708,7 @@ impl Shard {
         let mut loaded = None;
         let reopened = gate.reopen(|| {
             let db = open()?;
-            let found = load_settings(&db, name, *default_revs_limit)?;
+            let found = check_shard(&db, name, *default_revs_limit)?;
             // A commit that reported an error may still have landed, so the
             // file may be ahead of what was published; never behind it.
             anyhow::ensure!(
