@@ -98,7 +98,9 @@ pub fn unseal(stored: &[u8]) -> std::result::Result<&[u8], Corrupt> {
 /// Files that passed an integrity check when they last closed in this
 /// process, and so can open without one. An open takes its file out, so
 /// only a [`close_verified`] puts it back: a file closed any other way is
-/// checked on its next open.
+/// checked on its next open. The lock is held across an open (decision and
+/// file open, integrity check included) and across a verified close's
+/// release and record, so opens are serialised on it.
 static VERIFIED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
 fn verified_set() -> MutexGuard<'static, HashSet<PathBuf>> {
@@ -119,14 +121,19 @@ fn open_file<B: StorageBackend>(
     cache_bytes: usize,
     wrap: impl FnOnce(FileBackend) -> B,
 ) -> Result<Database> {
-    let check = !verified_set().remove(path);
+    // Held until the file is open: a close_verified of this path finishing
+    // between the decision and the open would mark this session verified.
+    let mut verified = verified_set();
+    let check = !verified.remove(path);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
-    builder(cache_bytes, check).create_with_backend(wrap(FileBackend::new(file)?))
+    let db = builder(cache_bytes, check).create_with_backend(wrap(FileBackend::new(file)?));
+    drop(verified);
+    db
 }
 
 /// Open a database over `backend`. With no path to remember a verification
@@ -150,20 +157,23 @@ fn builder(cache_bytes: usize, check_integrity: bool) -> Builder {
 /// check reads the whole file.
 pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     let outcome = db.check_integrity();
-    // A close that fails leaves the file for its next open to recover, so it
+    // Held from the release of the file until it is recorded: an open of
+    // this path in between would be marked verified by the insert below. A
+    // close that fails leaves the file for its next open to recover, so it
     // is not verified either.
+    let mut verified = verified_set();
     let closed = db.close();
     match outcome {
         Ok(true) => {
             if let Err(error) = closed {
-                forget_verified(path);
+                verified.remove(path);
                 return Err(error);
             }
-            verified_set().insert(path.to_path_buf());
+            verified.insert(path.to_path_buf());
             Ok(())
         }
         Ok(false) => {
-            forget_verified(path);
+            verified.remove(path);
             Err(StorageError::Corrupted(format!(
                 "{} failed its integrity check and was repaired",
                 path.display()
@@ -171,7 +181,7 @@ pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
             .into())
         }
         Err(error) => {
-            forget_verified(path);
+            verified.remove(path);
             Err(error)
         }
     }
@@ -247,6 +257,58 @@ mod tests {
         fn close(&self) -> std::result::Result<(), std::io::Error> {
             self.inner.close()
         }
+    }
+
+    /// A file backend that runs a hook once redb has closed it: the moment a
+    /// [`close_verified`] has released the file but may not yet have
+    /// recorded it.
+    struct OnClose {
+        inner: FileBackend,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl std::fmt::Debug for OnClose {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OnClose").finish_non_exhaustive()
+        }
+    }
+
+    impl StorageBackend for OnClose {
+        fn len(&self) -> std::result::Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+
+        fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+            self.inner.set_len(len)
+        }
+
+        fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
+            self.inner.sync_data()
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
+            self.inner.write(offset, data)
+        }
+
+        fn close(&self) -> std::result::Result<(), std::io::Error> {
+            let closed = self.inner.close();
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            closed
+        }
+    }
+
+    /// Whether another thread could change the verified set right now. When
+    /// it could, a racing open or close is run in place; when the set is
+    /// held, the race cannot happen there and the caller runs that step
+    /// after instead.
+    fn set_is_free() -> bool {
+        VERIFIED.try_lock().is_ok()
     }
 
     /// Bytes read by an `open` of `path` (with its usual verified-set rule),
@@ -421,6 +483,65 @@ mod tests {
         let table = txn.open_table(META).unwrap();
         let stored = table.get("doc-000001").unwrap().unwrap();
         assert_eq!(unseal(stored.value()), Err(Corrupt));
+    }
+
+    #[test]
+    fn an_open_racing_a_verified_close_is_not_left_verified() {
+        let scratch = Scratch::new("race-close");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        fill(&db, 10);
+        drop(db);
+
+        let second: Arc<Mutex<Option<Database>>> = Arc::default();
+        let (racer, racer_path) = (Arc::clone(&second), path.clone());
+        let db = open_file(&path, CACHE, |inner| OnClose {
+            inner,
+            hook: Mutex::new(Some(Box::new(move || {
+                // Another thread opens the file between its release and
+                // close_verified recording it.
+                if set_is_free() {
+                    *racer.lock().unwrap() = Some(open(&racer_path, CACHE).unwrap());
+                }
+            }))),
+        })
+        .unwrap();
+        close_verified(db, &path).unwrap();
+        let mut second = second.lock().unwrap().take();
+        if second.is_none() {
+            second = Some(open(&path, CACHE).unwrap());
+        }
+        assert!(
+            !verified(&path),
+            "verified while a session that will not end in close_verified is open"
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn a_verified_close_racing_an_open_does_not_verify_that_open() {
+        let scratch = Scratch::new("race-open");
+        let path = scratch.file();
+        let first = open(&path, CACHE).unwrap();
+        fill(&first, 10);
+        let first = Mutex::new(Some(first));
+        let second = open_file(&path, CACHE, |inner| {
+            // The first session closes verified between this open deciding
+            // to check and opening the file.
+            let first = first.lock().unwrap().take().unwrap();
+            if set_is_free() {
+                close_verified(first, &path).unwrap();
+            } else {
+                drop(first);
+            }
+            inner
+        })
+        .unwrap();
+        assert!(
+            !verified(&path),
+            "verified while a session that will not end in close_verified is open"
+        );
+        drop(second);
     }
 
     #[test]
