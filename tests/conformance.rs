@@ -20038,6 +20038,58 @@ async fn since_from_a_recreated_database_restarts() {
     assert_eq!(ids, vec!["x", "y"], "{body}");
 }
 
+/// A coordinator given a token from a database since deleted and recreated
+/// starts every shard copy the token no longer names at 0, in its row
+/// positions too. The old positions must never be applied to the new copies:
+/// following the feed row by row from the old token delivers every current
+/// document. The same ids are written before and after, so each new shard
+/// reaches the old one's position and an old position would skip it all.
+#[tokio::test]
+async fn cluster_since_from_a_recreated_database_delivers_every_document() {
+    let nodes = start_cluster_sharded(2, 4, 2);
+    let ids: Vec<String> = (0..16).map(|i| format!("r{i:02}")).collect();
+    let docs = || -> Vec<Value> { ids.iter().map(|id| json!({"_id": id})).collect() };
+    for node in &nodes {
+        node.fresh_db("recluster").await;
+    }
+    let (status, body) = nodes[0]
+        .post("/recluster/_bulk_docs", json!({"docs": docs()}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, body) = nodes[0].get("/recluster/_changes").await;
+    let old = body["last_seq"].as_str().unwrap().to_string();
+    assert!(
+        seq_copies(&old).iter().all(|copy| copy.2 > 0),
+        "every shard holds a document: {old}"
+    );
+
+    for node in &nodes {
+        node.fresh_db("recluster").await;
+    }
+    let (status, body) = nodes[0]
+        .post("/recluster/_bulk_docs", json!({"docs": docs()}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Follow the feed through node 1 one row at a time, resuming from each
+    // row's own position.
+    let mut since = old;
+    let mut seen = Vec::new();
+    for _ in 0..=ids.len() {
+        let (status, body) = nodes[1]
+            .get(&format!("/recluster/_changes?limit=1&since={since}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let Some(row) = body["results"].as_array().unwrap().first() else {
+            break;
+        };
+        seen.push(row["id"].as_str().unwrap().to_string());
+        since = row["seq"].as_str().unwrap().to_string();
+    }
+    seen.sort();
+    assert_eq!(seen, ids, "documents skipped or repeated");
+}
+
 /// Readers on every node follow a feed by passing each `last_seq` back while
 /// batches land on all shards at once. Per-shard positions must not let a
 /// reader pass a write it has not seen.
