@@ -22,7 +22,9 @@ the machinery it built to make LevelDB behave like a transactional store.
 
 - Every acknowledged write is durable: each commit is `Durability::Immediate`
   (redb's default; the commit `fsync`s before it returns), as CouchDB syncs
-  every commit.
+  every commit. Creating or deleting a database is durable too: file
+  `fsync` does not persist a new directory entry, so the directories involved
+  are `fsync`ed as well (see "Database creation and deletion").
 - Use everything redb provides and delete what douchdb built in its place.
   Write as little new code as possible.
 - Follow current CouchDB wherever the change touches behaviour, without
@@ -35,7 +37,9 @@ the machinery it built to make LevelDB behave like a transactional store.
   douchdb is likely faster than CouchDB anyway; that is not a goal.
 - Migrating existing data. No earlier douchdb data or binaries exist
   (standing rule); there is no upgrade path and no compatibility code.
-- Re-architecting search (Tantivy) or anything that does not touch storage.
+- Re-architecting search (Tantivy) beyond its change cursor, or anything else
+  that does not touch storage. (View and search *cursors* are in scope; see
+  "Index cursors".)
 - Grouping view indexes per design document (CouchDB's `.view` file per
   signature). Out of scope; noted as a follow-up.
 
@@ -72,7 +76,7 @@ the machinery it built to make LevelDB behave like a transactional store.
 | Header/page checksums, recovery on open | `paranoid_checks`, "tables but no `z/seq`" corruption probe, fault script aimed at LevelDB files | redb's XXH3 Merkle checksums and automatic repair on open; `Builder::set_check_integrity_on_open(true)` | the corruption probes, `had_tables` heuristics |
 | Doc counts via B-tree reductions | counters updated by hand beside each write, recount on open | counters in `settings`, updated in the same write transaction so they cannot drift (`meta.len()` is O(1) and may replace one of them) | the recount-on-open path |
 | Security object, shard map kept inside databases | `db.json`, `shard-map.json`, `pending-shard-map.json`, `security-versioned.json` with atomic-write and temp-file cleanup | rows in the `settings` table of shard 0's file (written in a transaction) | the JSON metadata files, `write_json_atomic`, stale-temp cleanup |
-| `_compact` rewrites the file, dropping non-leaf bodies | stale-body sweep, then LevelDB `compact_range` | same sweep (it is CouchDB semantics), then `Database::compact()`; it needs exclusive access, so the shard briefly closes to readers and the writer, as CouchDB swaps files | `compact_range` calls |
+| `_compact` rewrites the file, dropping non-leaf bodies | stale-body sweep, then LevelDB `compact_range` | online copy-and-swap, as CouchDB (see "Compaction") | `compact_range`, the in-place sweep |
 | View file per design doc | one LevelDB per view | one redb file per view (unchanged granularity) | LevelDB usage in `view.rs` |
 | Internal replication (`mem3_sync`) per shard copy | anti-entropy checkpoints per peer over a numeric local seq | checkpoints per (peer, shard) over that shard's sequence | per-peer global-seq checkpoint logic |
 
@@ -100,8 +104,7 @@ the machinery it built to make LevelDB behave like a transactional store.
 - **File locking:** redb's default `ConcurrencyMode::ExclusiveWriter` locks
   the file; a second process opening a shard fails, replacing LevelDB's
   `LOCK`.
-- **Integrity on open:** enabled. Unclean shutdown is repaired by redb on
-  open; unrepairable corruption fails the open (fail closed), as today.
+- **Integrity:** see "Corruption detection".
 
 ## Calls made after the builder review
 
@@ -124,12 +127,7 @@ correctness before speed). Marked here so they can be checked.
    the committed state agree. Every other read (document, `_bulk_get`,
    `_revs_diff`, `open_revs`, quorum reads, view and anti-entropy fetches) runs
    on its own read transaction off the actor.
-3. **Corruption is detected on read, as CouchDB's `couch_file` checks each
-   term's MD5.** The builder first establishes whether redb 4.6 verifies page
-   checksums on read. If it does, no integrity check runs on open. If it does
-   not, `set_check_integrity_on_open(true)` is enabled and its cost on reopen
-   is accepted (correctness before speed). `storage_faults.py` bit-flip
-   scenarios decide it: they must fail closed.
+3. **Corruption detection:** see the section of that name.
 4. **A job validates before it writes.** It reads and decodes every record it
    will change before its first insert into the shared write transaction, as
    `commit_at` does today. Ordinary per-document failures (conflicts,
@@ -142,16 +140,121 @@ correctness before speed). Marked here so they can be checked.
    is bounded by `--max-open-dbs` × q × the per-file size; the throughput
    comparison runs with the defaults.
 
+## Corruption detection
+
+redb 4.6 checksums every page at commit (an XXH3 Merkle tree) but, as far as
+its source shows, verifies them only in its integrity walk, not on ordinary
+reads; a plain open of a damaged file may even panic. CouchDB checks each
+term's MD5 as it reads it. So:
+
+- **Every stored value carries an application checksum** (a 32-bit CRC32C,
+  appended on write, verified on every read), in every table: document
+  metadata, bodies, sequence entries, `_local` docs, purge records, settings,
+  view rows. A mismatch is a corruption error (500, fail closed), never a
+  miss. This is one encode/decode pair used by every table.
+- **`set_check_integrity_on_open(true)`** on every shard and view file, so a
+  file damaged while closed fails to open (`StorageError::Corrupted`) rather
+  than being trusted or panicking. Its cost on reopen is accepted.
+- **Guarantee, stated narrowly:** a damaged *value* is detected when read. A
+  damaged *tree page* (a branch page, which can misroute a lookup into a
+  false "not found") is detected at the next open, not at read time. This is
+  weaker than CouchDB, which checksums tree nodes too, and is documented as
+  such in `docs/consistency.md`.
+- Tests corrupt a file **while it is open** (bytes of a value page and of a
+  branch page) as well as while closed, and assert the outcomes above.
+
+## Database creation and deletion
+
+- **Create:** make the database directory and every shard file; write shard
+  0's `settings` (shard map, security, q, n) and commit it `Immediate` last;
+  then `fsync` the database directory (new shard files) and its parent (the
+  new directory); only then acknowledge. The committed `settings` row in
+  shard 0 is the marker that the database exists.
+- **Recovery on start:** a database directory whose shard 0 has no committed
+  `settings` row, or that is missing a shard file, was partially created. It
+  is removed, and the parent directory is `fsync`ed. It never appears in
+  `_all_dbs`.
+- **Delete:** rename the directory to a tombstone name, `fsync` the parent,
+  acknowledge, then remove the tombstone in the background. A tombstone left
+  by a crash is removed on start.
+- View and search index files are rebuildable from the shards, so losing a
+  newly created one costs a rebuild, not data; they need no directory sync.
+
+## Failed commits
+
+redb fails every later write on a handle after an I/O error during commit
+(`StorageError::PreviousIo`); its allocator state is then marked for rebuild
+on the next open. Policy:
+
+1. The group's jobs all fail (unchanged).
+2. The shard actor drops its `Database` handle. Readers holding a clone finish
+   or fail on their own; no new reads are handed the old handle.
+3. The actor reopens the file (redb runs recovery), rebuilds its in-memory
+   indexes (`LatestChanges`, live-key rank) and settings from the committed
+   tables, and resumes.
+4. If reopening fails, the shard fails closed: every request to it returns
+   500 until the database is next opened. It is never left half-usable in the
+   cache.
+
+## Compaction
+
+Online, as CouchDB's compactor does; the shard keeps serving throughout.
+
+1. Open a read transaction (a snapshot) at the shard's current sequence S, and
+   copy the live data into a new file `shard-NNNN.compact.redb`: every
+   document's metadata and only its leaf bodies (CouchDB drops non-leaf
+   bodies), `_local` docs, purge records, checkpoints, settings and the
+   shard's sequence and uuid.
+2. Catch up: copy what changed after S from the live file's `by_seq` table
+   into the new file, repeatedly, until the remaining gap is small.
+3. Swap, briefly on the shard actor: copy the last changes, `fsync` the new
+   file, rename it over the live file, `fsync` the directory, reopen, and
+   carry on. Readers holding the old handle finish on their snapshot.
+4. A crash at any point leaves the live file untouched; a leftover
+   `.compact.redb` is deleted on start, as CouchDB discards a half-built
+   `.compact` file.
+
+The shard file's uuid is preserved, since the data and sequences are the same,
+so `since` tokens and index cursors stay valid across compaction.
+`Database::compact()` is not used. Tests: compact under concurrent writes and
+reads, with a crash at each step; nothing acknowledged is lost, and feeds
+neither skip nor repeat beyond what CouchDB allows.
+
+## Index cursors (views and search)
+
+Both index kinds today persist one numeric cursor and read the database's
+changes as numeric `(since, until]` ranges (`search.rs`, `view.rs`). With
+per-shard sequences a single number would skip changes from slower shards, so:
+
+- Each view index and each search index persists **one cursor per shard**:
+  that shard's sequence plus the shard file's identity (uuid). Views store it
+  in the index's own redb file, in the same transaction as the rows; search
+  stores it in the Tantivy commit payload, as today.
+- An incremental update reads each shard's changes after its cursor, up to
+  that shard's committed sequence at the start of the update, and advances
+  each shard's cursor to exactly what it applied.
+- A stored uuid that no longer matches the shard file (cleared, re-seeded,
+  recreated) invalidates the index, which rebuilds from 0.
+
 ## Testing
 
 - **Model test (the one that found the LevelDB bug):** random puts, deletes,
   group commits, concurrent snapshot reads, reopen and compaction against a
   shard, compared with an in-memory model. Runs in CI.
-- **Durability test:** kill a node mid-write (no clean shutdown) many times;
-  every acknowledged write must be present on reopen. The existing
-  `scripts/storage_faults.py` is rewritten for redb's single file: SIGKILL,
-  kill during compaction, truncation, bit flips. Every scenario must keep all
-  acknowledged documents or fail closed.
+- **Power cut (the failure that motivated this):** a test `StorageBackend`
+  (redb lets the caller supply the layer behind a file) that keeps writes in
+  memory until `sync_data` and can "lose power", discarding everything not
+  yet synced. Random workloads, power cut at random points, reopen: every
+  acknowledged write is present. A build that skipped `fsync` fails it.
+  SIGKILL alone cannot catch this, because the kernel's page cache survives.
+- **Process crash:** `scripts/storage_faults.py`, rewritten for redb's single
+  file, kills nodes mid-write and mid-compaction.
+- **Acceptance is split.** Crashes and power cuts: every acknowledged write
+  must be recovered, no exceptions. Deliberate damage (truncation, bit flips,
+  removed files): the affected shard must fail closed; recovering data is not
+  required.
+- **Creation and deletion:** crash at each step of create and delete; on
+  restart no partial database is listed, and every acknowledged create is.
 - **Per-shard sequences:** conformance tests for opaque `since` round-trips,
   `_changes` with overlapping writes (the 150,959-document live-cursor
   scenario must miss nothing), `limit`/`descending`/filters, and cluster
