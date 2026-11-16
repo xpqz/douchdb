@@ -89,8 +89,8 @@ CI compiles the harness in the `clojure:tools-deps-bookworm` image with
 `clojure -M -e "(require 'douchdb.core)"`. It does not run a fault-injection
 test, because that needs a Docker socket and several minutes.
 
-Set `DOUCHDB_KEEP_CLUSTER=1` to leave the node containers running after the
-run. Node stdout is always copied to `jepsen-clj/logs/`, and Jepsen histories
+Set `DOUCHDB_KEEP_CLUSTER=1` to leave the node containers and the test
+database in place after the run, for inspection. Node stdout is always copied to `jepsen-clj/logs/`, and Jepsen histories
 and checker results are written under `jepsen-clj/store/`.
 
 ## What runs

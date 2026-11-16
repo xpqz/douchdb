@@ -103,6 +103,7 @@ docker run --rm \
   -e "DOUCHDB_DB=${DB}" \
   -e "DOUCHDB_NETWORK=${NETWORK}" \
   -e "DOUCHDB_CLUSTER_SECRET=${SECRET}" \
+  -e "DOUCHDB_KEEP_CLUSTER=${KEEP}" \
   -w /work \
   "${RUNNER}" \
   clojure -M -m douchdb.core \
