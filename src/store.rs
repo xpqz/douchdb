@@ -597,14 +597,24 @@ impl Shard {
                 path.display()
             );
         }
-        let uuid = match db_get_checked(&mut db, UUID_KEY)? {
-            Some(bytes) => String::from_utf8(bytes).map_err(|_| {
-                anyhow::anyhow!("corrupt shard {}: unreadable uuid", path.display())
-            })?,
-            None => {
-                let uuid = crate::util::uuid();
-                db.put(UUID_KEY, uuid.as_bytes())?;
-                db.flush()?;
+        let stored_uuid = db_get_checked(&mut db, UUID_KEY)?
+            .map(|bytes| {
+                String::from_utf8(bytes).map_err(|_| {
+                    anyhow::anyhow!("corrupt shard {}: unreadable uuid", path.display())
+                })
+            })
+            .transpose()?;
+        // A fresh shard records its sequence alongside its uuid, so that once
+        // compaction moves these keys into table files the probe above still
+        // finds sequence state.
+        let uuid = match (stored_uuid, stored_seq) {
+            (Some(uuid), Some(_)) => uuid,
+            (stored_uuid, _) => {
+                let uuid = stored_uuid.unwrap_or_else(crate::util::uuid);
+                let mut batch = WriteBatch::default();
+                batch.put(UUID_KEY, uuid.as_bytes());
+                batch.put(b"z/seq", &seq.to_be_bytes());
+                db.write(batch, true)?;
                 uuid
             }
         };
@@ -2413,6 +2423,21 @@ mod scan_tests {
         assert!(has_tables(&dir));
         let error = Shard::open(&dir, 1000).err().expect("must refuse to open");
         assert!(error.to_string().contains("corrupt shard"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_shard_reopens_after_compaction() {
+        let dir = temp_shard_dir("fresh-compact");
+        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let uuid = shard.uuid().to_string();
+        shard.db.compact_range(&[], &[]).unwrap();
+        drop(shard);
+        assert!(has_tables(&dir));
+        let shard = Shard::open(&dir, 1000).unwrap();
+        assert_eq!(shard.seq, 0);
+        assert_eq!(shard.uuid(), uuid);
+        drop(shard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
