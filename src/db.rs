@@ -1747,9 +1747,6 @@ impl Db {
             }
         }
 
-        // A shard error is held back until the validator cache is dropped:
-        // earlier shards may already have committed design documents.
-        let mut shard_error = None;
         // A design document's functions compile here, outside any shard job,
         // so the compile never holds a shard's writer.
         let mut compile_errors = if touches_design {
@@ -1757,22 +1754,27 @@ impl Db {
         } else {
             HashMap::new()
         };
-        for (shard_idx, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let verdicts: HashMap<usize, ApiError> = batch
-                .iter()
-                .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
-                .collect();
-            let results = match self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
-                .await
-            {
+        // Every shard's batch is sent at once; each commits on its own.
+        let calls = grouped
+            .into_iter()
+            .enumerate()
+            .filter(|(_, batch)| !batch.is_empty())
+            .map(|(shard_idx, batch)| {
+                let verdicts: HashMap<usize, ApiError> = batch
+                    .iter()
+                    .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
+                    .collect();
+                self.shards[shard_idx].call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
+            });
+        // The lowest shard's error is held back until the validator cache is
+        // dropped: the other shards may have committed design documents.
+        let mut shard_error = None;
+        for answer in futures::future::join_all(calls).await {
+            let results = match answer {
                 Ok(results) => results,
                 Err(error) => {
-                    shard_error = Some(error);
-                    break;
+                    shard_error = shard_error.or(Some(error));
+                    continue;
                 }
             };
             for (i, result) in results {
@@ -6611,6 +6613,100 @@ mod tests {
         assert_eq!(db.validation_functions().await.unwrap().len(), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A request's shards commit together: shard 1 commits while shard 0's
+    /// writer is held.
+    #[tokio::test]
+    async fn shards_of_one_request_commit_concurrently() {
+        let (db, root) = two_shard_db("concurrent");
+        let db = Arc::new(db);
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holding = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                db.shards[0]
+                    .alone(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = held.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started.await.unwrap();
+
+        let ids = [doc_id_for_shard(&db, 0), doc_id_for_shard(&db, 1)];
+        let request = tokio::spawn({
+            let db = Arc::clone(&db);
+            let docs = ids.iter().map(|id| json!({"_id": id})).collect::<Vec<_>>();
+            async move { db.put_docs(docs, true).await }
+        });
+        while db.shards[1].committed_seq() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(db.shards[0].committed_seq(), 0, "shard 0 is held");
+
+        release.send(()).unwrap();
+        holding.await.unwrap().unwrap();
+        let out = request.await.unwrap().unwrap();
+        for (result, id) in out.iter().zip(&ids) {
+            let result = result.json();
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["id"], id.as_str(), "{result}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every shard of a request answers before the request does: a failing
+    /// shard 0 fails the request with its own error, shard 1's documents
+    /// still commit, and the validator cache is dropped.
+    #[tokio::test]
+    async fn one_failing_shard_fails_the_request_after_both_answer() {
+        let (db, root) = two_shard_db("onefails");
+        let design_id = (0..10_000)
+            .map(|i| format!("_design/d{i}"))
+            .find(|id| db.shard_index(id) == 1)
+            .expect("design id on shard 1");
+        let failing_id = doc_id_for_shard(&db, 0);
+        let plain_id = doc_id_for_shard(&db, 1);
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        let generation = db.design_generation();
+
+        db.shards[0]
+            .call(|shard| {
+                shard.inject_commit_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db
+            .put_docs(
+                vec![
+                    json!({"_id": failing_id}),
+                    json!({"_id": design_id, "validate_doc_update": "function(){}"}),
+                    json!({"_id": plain_id}),
+                ],
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 500, "{error:?}");
+        assert_eq!(
+            error.reason, "shard commit failed: injected commit failure",
+            "{error:?}"
+        );
+
+        let opts = DocOpts::default();
+        assert!(db.get_doc(&failing_id, &opts).await.is_err());
+        db.get_doc(&plain_id, &opts).await.unwrap();
+        db.get_doc(&design_id, &opts).await.unwrap();
+        assert_ne!(db.design_generation(), generation);
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
