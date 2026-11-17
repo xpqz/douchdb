@@ -192,7 +192,16 @@ stored bytes, in the same tables and batches, with the same two-phase
 The bulk write path work moved per-document work off the shard actor. It also
 commits a request's shards concurrently, streams the revision hash into MD5,
 opens each table once per job, and starts the local and remote cluster writes
-together.
+together. It then trimmed what the actor does per document while staging a
+job:
+
+- one slot per distinct id, found by sorting, in place of three `String`-keyed
+  hash maps, with each document's metadata changed in place instead of cloned
+  in and out;
+- the new revision formatted once, before the job, and written into a new
+  document's tree directly;
+- revision ids rendered as hex without a `format!` per byte;
+- no pruning walk for a tree of roots only, which every new document has.
 
 Column definitions:
 
@@ -202,56 +211,58 @@ Column definitions:
   the rounds.
 - **Before** is `3210349`, measured before the job timer also counted
   beginning the transaction, so its jobs/insert reads slightly low.
-- **After** is `4d1f3d1`.
+- **Task 7** is `4d1f3d1` in its own run. **Now** is the head of the bulk
+  write path, measured in the same rounds as `4d1f3d1` and the floor.
+- **Now ÷ 4d1f3d1** is the median of the same-round ratios of job time.
 - **docs/s** is end to end, the floor's docs/s in parentheses.
 
-| q / batch / clients | Before docs/s | After docs/s | Before jobs/insert | After jobs/insert | After syncs/commit (douchdb / floor) | After KB/commit (douchdb / floor) |
-|---|---:|---:|---:|---:|---:|---:|
-| q1 / 250 / 1 | 8,511 (12,326) | 11,449 (16,504) | 3.31 | 1.72 | 2.02 / 2.02 | 881 / 897 |
-| q1 / 1,000 / 1 | 18,056 (35,865) | 16,469 (26,140) | 3.58 | 1.52 | 2.09 / 2.09 | 2,588 / 2,651 |
-| q1 / 10,000 / 1 | 21,002 (49,459) | 25,669 (45,566) | 2.68 | 1.40 | 2.81 / 2.81 | 41,434 / 41,189 |
-| q2 / 250 / 1 | 5,998 (9,343) | 8,214 (11,185) | 3.30 | 1.59 | 2.02 / 2.02 | 474 / 482 |
-| q2 / 1,000 / 1 | 14,088 (31,064) | 16,203 (26,815) | 2.51 | 1.60 | 2.08 / 2.08 | 1,308 / 1,336 |
-| q2 / 10,000 / 1 | 18,441 (37,732) | 27,720 (49,858) | 2.03 | 1.35 | 2.75 / 2.75 | 16,834 / 16,567 |
-| q1 / 250 / 4 | 14,985 (12,326) | 24,941 (16,504) | 3.08 | 1.65 | 2.07 / 2.02 | 2,310 / 897 |
-| q1 / 1,000 / 4 | 25,296 (35,865) | 20,146 (26,140) | 3.52 | 2.89 | 2.33 / 2.09 | 11,950 / 2,651 |
-| q1 / 10,000 / 4 | 20,004 (49,459) | 34,341 (45,566) | 3.02 | 1.47 | 4.60 / 2.81 | 131,666 / 41,189 |
-| q2 / 250 / 4 | 14,960 (9,343) | 16,803 (11,185) | 3.09 | 1.36 | 2.04 / 2.02 | 844 / 482 |
-| q2 / 1,000 / 4 | 21,184 (31,064) | 33,749 (26,815) | 2.09 | 1.35 | 2.21 / 2.08 | 3,278 / 1,336 |
-| q2 / 10,000 / 4 | — | 48,014 (49,858) | — | 1.88 | 4.40 / 2.75 | 63,870 / 16,567 |
+| q / batch / clients | Before jobs/insert | Task 7 jobs/insert | Now jobs/insert | Now ÷ 4d1f3d1 | Now docs/s | Now syncs/commit (douchdb / floor) | Now KB/commit (douchdb / floor) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q1 / 250 / 1 | 3.31 | 1.72 | **1.03** | 0.65 | 14,913 (18,275) | 2.02 / 2.02 | 882 / 897 |
+| q1 / 1,000 / 1 | 3.58 | 1.52 | **1.15** | 0.62 | 25,874 (40,660) | 2.09 / 2.09 | 2,597 / 2,651 |
+| q1 / 10,000 / 1 | 2.68 | 1.40 | **1.08** | 0.73 | 31,100 (53,910) | 2.81 / 2.81 | 41,591 / 41,189 |
+| q2 / 250 / 1 | 3.30 | 1.59 | **0.90** | 0.64 | 8,189 (8,750) | 2.02 / 2.02 | 475 / 482 |
+| q2 / 1,000 / 1 | 2.51 | 1.60 | **0.96** | 0.64 | 21,569 (27,244) | 2.08 / 2.08 | 1,311 / 1,336 |
+| q2 / 10,000 / 1 | 2.03 | 1.35 | **1.14** | 0.74 | 28,205 (53,099) | 2.75 / 2.75 | 16,936 / 16,567 |
+| q1 / 250 / 4 | 3.08 | 1.65 | 1.02 | 0.64 | 31,032 (17,969) | 2.07 / 2.02 | 2,210 / 897 |
+| q1 / 1,000 / 4 | 3.52 | 2.89 | 1.49 | 0.67 | 41,730 (40,557) | 2.29 / 2.09 | 10,029 / 2,651 |
+| q1 / 10,000 / 4 | 3.02 | 1.47 | 1.21 | 0.77 | 44,749 (53,580) | 4.60 / 2.81 | 132,846 / 41,189 |
+| q2 / 250 / 4 | 3.09 | 1.36 | 0.91 | 0.76 | 15,610 (10,484) | 2.04 / 2.02 | 832 / 482 |
+| q2 / 1,000 / 4 | 2.09 | 1.35 | 1.10 | 0.68 | 36,056 (36,964) | 2.23 / 2.08 | 3,700 / 1,336 |
+| q2 / 10,000 / 4 | — | 1.88 | 1.62 | 0.92 | 50,506 (48,684) | 4.40 / 2.75 | 64,409 / 16,567 |
 
 Conditions:
 
 - Release builds, `--n 1`, `--cache-mb 16` (the floor's cache is the same).
 - Apple M2 Pro, data on an external APFS disk.
-- The machine was heavily loaded throughout, with load averages of 11–57.
-- Before is one round per configuration.
-- After is the median of 3 interleaved rounds per configuration, except:
-  - q1/250 has 7 rounds;
-  - q2/10,000 has 7 rounds;
-  - q1/10,000 has 13 rounds.
-- Under that load, single rounds varied by up to 2×. Read docs/s as
+- Now: 5 interleaved rounds per one-client configuration and 3 per
+  four-client one, with the order of the two builds rotated each round.
+- The q=1 rows ran at load averages of 2–3 and their rounds agree closely
+  (q1/1,000/1: 1.13–1.15). The q=2 rows ran at load averages of 10–37 and
+  single rounds vary widely (q2/10,000/1: 0.98–1.34). Read docs/s as
   indicative only. The jobs/insert ratios come from the same round, and the
   sync and byte counts are exact.
 
 What the numbers say:
 
-- **Job time.** The shard actor's job time fell from 2.0–3.6× the floor's
-  insert time to 1.35–1.72× with one client.
-  - The goal was 1.15×, so it is not met at any batch size or q.
-  - A sampled profile of the shard actor at q=1, one client, accounts for the
-    rest. Its inserts (bodies, by_seq, metadata) cost 5.6, 5.8 and
-    11.2 µs/doc at 250, 1,000 and 10,000 documents per batch, about the
-    floor's whole insert time.
-  - The excess is staging, 4.7–5.7 µs/doc. `RevTree::merge_path` is
-    1.5–1.8 µs/doc of it. Reading the metadata, pruning and encoding the
-    record are together 0.6–1.0 µs/doc. The rest is spread across hashing,
-    allocation and formatting.
+- **Job time.** With one client the shard actor's job time is now 0.90–1.15×
+  the floor's insert time, against a goal of 1.15×, which it meets at every
+  size and q; q=1 with 1,000 documents is at the limit. It was 2.0–3.6×
+  before the bulk write path work and 1.35–1.72× after Task 7. The trimmed
+  staging alone cut job time by 26–38% against `4d1f3d1` in the same rounds.
+  - A sampled profile of the shard actor at q=1, one client, splits the job
+    as follows. The inserts (bodies, by_seq, metadata) are 79–89% of it.
+    Staging, which includes building the tree, encoding the record and
+    pruning, is 9–16%, down from 26–41%. Reading the metadata is 3–6%.
+  - With four clients a group serves 2.2–3.4 requests and its job time is
+    0.91–1.62× the floor's; those rows are not judged against the goal.
 - **Syncs and bytes.**
   - With one client, syncs per commit equal the floor's at every size and q.
-  - Bytes per commit are within 2% of the floor's: 1–3% under at 250 and
-    1,000 documents, 0.6–1.7% over at 10,000.
-  - With four clients a group serves 2–4 requests (3.2 at 10,000 documents),
+  - Bytes per commit are within 2.2% of the floor's: 1.5–2.0% under at 250
+    and 1,000 documents, 1.0–2.2% over at 10,000.
+  - The metadata records of a job are now written in the order their
+    documents arrive, as the floor writes them, instead of in hash map order.
+  - With four clients a group serves 2.2–3.4 requests (3.2 at 10,000 documents),
     so its syncs and bytes per commit are not comparable with the floor's
     single batch.
 - **Sorted inserts were measured and not kept.** Sorting each job's bodies by
