@@ -112,9 +112,12 @@ correctness before speed). Marked here so they can be checked.
 
 1. **Cluster `since` tokens follow CouchDB 3.** An entry is keyed by shard
    copy (node, shard range) and carries that copy's sequence plus a copy
-   identity (a uuid created with the shard file, and its epochs), so a
-   position is never applied to a copy that was cleared, re-seeded or
-   recreated. When a feed must read a range from a different copy (node down,
+   identity, so a position is never applied to a copy that was cleared,
+   re-seeded or recreated. The identity is a uuid created with the shard file
+   (`since::CopyPos` holds node, shard, sequence and uuid). Unlike CouchDB,
+   no epochs are needed: clearing a copy gives it a new uuid even though it
+   keeps its sequence, and a recreated file gets a new uuid, so the uuid alone
+   tells a different copy apart. When a feed must read a range from a different copy (node down,
    placement change), the range restarts from 0 on that copy (replay, never
    skip). Translating the position as `mem3_rep:find_source_seq` does needs
    the serving copy's push history to the named copy, which douchdb does not
