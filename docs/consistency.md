@@ -246,7 +246,5 @@ where behaviour is best-effort, it says so.
 
 - Exact CouchDB client-suite coverage is tracked in #122.
 - Mutation testing of critical paths is tracked in #121.
-- Cluster-version-vector `pending` is reported as zero; only the single-node
-  feed has an exact pending count.
 - Tree-page damage to a file that stays open is only found by the next
   integrity check (see Durability above).
