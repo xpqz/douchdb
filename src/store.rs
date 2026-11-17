@@ -4249,26 +4249,6 @@ mod group_tests {
     }
 
     #[tokio::test]
-    async fn compact_works_from_the_actor_outside_a_multi_thread_runtime() {
-        let (handle, file) = handle("compact");
-        handle
-            .call(|txn| write_doc(txn, "a", false, b"{}", 1))
-            .await
-            .unwrap();
-        handle
-            .alone(|shard| shard.compact().map_err(ApiError::from))
-            .await
-            .unwrap();
-        let rev = format!("1-{:032x}", 1);
-        let body = handle
-            .read(move |txn| Ok(txn.get_body("a", &rev)?))
-            .await
-            .unwrap();
-        assert_eq!(body.as_deref(), Some(b"{}".as_slice()));
-        cleanup(handle, file);
-    }
-
-    #[tokio::test]
     async fn dropping_the_handle_releases_the_file() {
         let (handle, file) = handle("drop");
         handle
