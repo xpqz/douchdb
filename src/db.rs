@@ -654,6 +654,11 @@ impl Db {
             return Err(ApiError::db_not_found());
         }
         let path = db_path(root, name);
+        // A shard file renamed in place (a compaction swap whose directory
+        // sync failed) is made durable before any write is acknowledged.
+        sync_dir(&path).map_err(|error| {
+            ApiError::internal(format!("cannot sync {}: {error}", path.display()))
+        })?;
         // Every file is checked with a peek before any is opened for
         // writing: a damaged database fails here, its healthy files opened
         // read-only once verified, so a request to it neither writes to

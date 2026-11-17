@@ -308,15 +308,18 @@ pub(crate) fn is_verified(path: &Path) -> bool {
 /// Move the closed file `from` over `to` and sync their directory, carrying
 /// over whether `from` passed [`close_verified`]: the compaction swap checks
 /// the new file before it takes the shard's name, so the shard's first open
-/// of it skips the full read. Call it with `to` closed.
+/// of it skips the full read. The flag moves only once the directory sync
+/// has made the rename durable. Call it with `to` closed.
 pub fn rename_verified(from: &Path, to: &Path) -> Result<()> {
     let (source, target) = (verified_flag(from), verified_flag(to));
     let (mut source, mut target) = (lock(&source), lock(&target));
     std::fs::rename(from, to)?;
-    *target = std::mem::take(&mut *source);
+    let verified = std::mem::take(&mut *source);
+    *target = false;
     if let Some(dir) = to.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }
+    *target = verified;
     Ok(())
 }
 
@@ -588,6 +591,33 @@ mod tests {
             "an unchecked file took a verified name"
         );
         drop(open(&live, CACHE).unwrap());
+    }
+
+    /// A rename is not durable until its directory is synced: a file whose
+    /// directory sync failed is checked on its next open, whichever file
+    /// held the name before.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_whose_directory_sync_fails_leaves_the_name_unverified() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("rename-sync");
+        let (live, next) = (scratch.file(), scratch.0.join("shard-0000.compact.redb"));
+        close_verified(open(&live, CACHE).unwrap(), &live).unwrap();
+        close_verified(create(&next, CACHE).unwrap(), &next).unwrap();
+        // Writable but not readable: the rename goes through and opening
+        // the directory to sync it fails.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let renamed = rename_verified(&next, &live);
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root ignores the mode; the sync then simply succeeds.
+        if renamed.is_err() {
+            assert!(!next.exists(), "the rename itself went through");
+            assert!(
+                !is_verified(&live),
+                "an unsynced rename kept a verified name"
+            );
+            assert!(!is_verified(&next));
+        }
     }
 
     #[test]
