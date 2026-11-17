@@ -437,7 +437,8 @@ fn check_http() -> Value {
 }
 
 /// Health is deliberately explicit about what is checked. It says nothing
-/// about power-loss durability: rusty-leveldb does not fsync.
+/// about durability or corruption: those are the storage layer's guarantees
+/// (see `docs/durability.md`), not something a health probe establishes.
 async fn local_health(st: &AppState, detailed: bool) -> Value {
     let snapshot = crate::metrics::snapshot();
     let process = &snapshot["process"];

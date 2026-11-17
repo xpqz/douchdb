@@ -882,8 +882,7 @@ async fn update_index(
 
 /// An index's files, written without fsync. A search index is derived from
 /// the database: one a crash damages fails its checksums when it is next
-/// opened and is rebuilt, so a commit does not wait for the disk. (The
-/// database's own storage does not sync either.)
+/// opened and is rebuilt, so a commit does not wait for the disk.
 #[derive(Clone, Debug)]
 struct UnsyncedDirectory {
     inner: MmapDirectory,

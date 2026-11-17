@@ -74,8 +74,9 @@ Warm views also improved as a side effect: every view query calls `GET /db` for
 the current update sequence, and that now reads counters instead of scanning all
 metadata. Single-document write throughput is within run-to-run variance; the
 counters add one metadata read and JSON decode per written document, which is
-small relative to the group-commit flush. rusty-leveldb does not fsync; the
-write numbers are OS-buffered, not power-loss durable.
+small relative to the group-commit flush. The write numbers in this
+document were measured on the earlier storage engine, which did not fsync, so
+they are OS-buffered; douchdb now fsyncs every commit.
 
 ### View map pass (#31)
 
@@ -102,7 +103,7 @@ open view index.
 
 Ascending `_all_docs` range queries now use a sorted in-memory map of live
 document ids to winning revisions. It is built lazily on the first range query
-per shard and updated on writes, so there is no extra LevelDB write on the
+per shard and updated on writes, so there is no extra storage write on the
 ingestion path.
 
 | Operation | Before (#33) | After (#33) |
@@ -115,7 +116,7 @@ A far-away `startkey` no longer walks and decodes metadata to compute `offset`;
 the index answers it with a BTreeMap range count. Descending `_all_docs` still
 uses the metadata scan. The first range query on a shard pays a one-time
 metadata scan to build the map; the numbers above include it. The index adds no
-LevelDB writes; after it is built, writes pay an in-memory BTreeMap update
+storage writes; after it is built, writes pay an in-memory BTreeMap update
 (bulk ingestion measured within ~2% of the previous throughput).
 
 ### View builds from the live map (#35)
@@ -175,8 +176,7 @@ surface and deadline/memory limits.
 ## Reading the numbers
 
 - **Single-document writes** are dominated by the group-commit flush path.
-  rusty-leveldb does not fsync by default, so these are OS-buffered writes, not
-  power-loss durable. With
+  These numbers predate redb and fsynced commits; they are OS-buffered writes. With
   one client they reach ~3.6k/s; eight concurrent clients get ~5.9k/s. More than
   eight writers mostly increases queueing latency (p99 3 ms → 41 ms) rather than
   throughput. Live/deleted counters are updated in the same batch as the

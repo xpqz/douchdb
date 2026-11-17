@@ -5341,7 +5341,7 @@ mod tests {
 
     /// A view index closed for idleness is checked as it closes, so its next
     /// open skips the check; a removed one is forgotten, so a new file under
-    /// its name is checked. An index directory of the old (LevelDB) format
+    /// its name is checked. An index directory that is not a redb file
     /// is never read, and cleanup removes it.
     #[tokio::test]
     async fn an_evicted_view_closes_verified_and_a_removed_one_is_forgotten() {

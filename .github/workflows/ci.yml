@@ -44,10 +44,6 @@ jobs:
           python3 scripts/storage_faults.py --bin target/release/douchdb
       - name: Critical-path mutation smoke
         run: python3 scripts/mutation_smoke.py
-      # Temporary vendored patch; remove with the rest of vendor/ per
-      # docs/storage-dependency.md (issue #105).
-      - name: Vendored storage tests
-        run: "cargo test --manifest-path vendor/rusty-leveldb/Cargo.toml"
       - name: Jepsen harness syntax
         run: python3 -m py_compile jepsen/*.py
       - name: Fuzz targets compile

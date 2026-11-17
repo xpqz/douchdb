@@ -199,7 +199,8 @@ its connection. Jepsen's checker treats those as possibly having happened.
   uses `r=2`/`w=2` explicitly so a single failed node leaves a working
   majority.
 - The checker verifies linearizability, not durability across power loss.
-  rusty-leveldb does not fsync; see `../docs/storage-dependency.md`.
+  Every commit is fsynced (see `../docs/durability.md`), but no fault in
+  this harness cuts power.
 
 ## Files
 

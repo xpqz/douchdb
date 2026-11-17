@@ -2,7 +2,7 @@
 name = "douchdb"
 version = "0.2.6"
 edition = "2021"
-description = "CouchDB wire-compatible document database on LevelDB"
+description = "CouchDB wire-compatible document database on redb"
 license = "Apache-2.0"
 authors = ["Stefan Kruger"]
 
@@ -31,8 +31,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "que
 hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 hyper = { version = "1", default-features = false }
 sha2 = "0.10"
-rusty-leveldb = "4"
-# Durable storage engine replacing rusty-leveldb (docs/superpowers/specs/2026-11-16-redb-storage-design.md).
+# Durable storage engine (docs/superpowers/specs/2026-11-16-redb-storage-design.md).
 redb = "4.6"
 # Per-value checksums on every stored redb value (kv::seal).
 crc32c = "0.6"
@@ -88,9 +87,3 @@ opt-level = 1
 # verified reopen skips the full read (kv::tests). Release builds never do it.
 [profile.dev.package.redb]
 debug-assertions = false
-
-# TEMPORARY local fork: UB-free LRU list (upstream PR #69) and duplicate-key
-# eviction. Published 4.0.2 corrupts the cache on Linux ARM64 release builds.
-# Revisit/remove per docs/storage-dependency.md, tracked by issue #105.
-[patch.crates-io]
-rusty-leveldb = { path = "vendor/rusty-leveldb" }

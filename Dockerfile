@@ -6,7 +6,6 @@ FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
 COPY src ./src
 COPY ui ./ui
 # `src/js.rs` embeds the checked-in QuickJS WASI runner, and `src/view.rs` and

@@ -1,4 +1,4 @@
-//! douchdb: a CouchDB wire-compatible database on LevelDB.
+//! douchdb: a CouchDB wire-compatible database on redb.
 
 pub(crate) mod admission;
 pub(crate) mod api;

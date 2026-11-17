@@ -79,82 +79,29 @@ talks to the published node ports through the Docker bridge.
 
 ## Durability caveat
 
-**The write comparison is not durability-equivalent.** CouchDB 3.x removed
-`delayed_commits`; every write is a full commit (CouchDB 3.0 upgrade note
-`#2208`). douchdb uses rusty-leveldb 4.0.2, whose `DB::write(batch, true)`
-only flushes a `BufWriter` to the operating-system page cache. The crate has no
-`fsync`, `fdatasync`, `sync_all` or `sync_data` call at all.
+**The measured write numbers below predate the storage change and are not
+durability-equivalent.** They were taken on the earlier storage engine, which
+acknowledged after writing to the OS page cache without `fsync`. douchdb now
+stores shards in redb and every commit is a durable two-phase commit that syncs
+before the write is acknowledged, as CouchDB 3.x does (it removed
+`delayed_commits`; CouchDB 3.0 upgrade note `#2208`). Write rows should be
+re-measured before being quoted.
 
-Measured directly with:
-
-```sh
-strace -f -e trace=fsync,fdatasync target/release/douchdb ...
-curl -X PUT .../db/doc1
-```
-
-the successful PUT produced **zero** `fsync`/`fdatasync` syscalls. A process
-crash preserves the data because it is in the page cache, but a host crash or
-power loss can lose acknowledged writes.
-
-Therefore:
-
-- **Read, view, `_all_docs` and `_changes` comparisons are meaningful.**
-- **Write throughput comparisons are not equal-durability.** They compare
-  CouchDB full commits against douchdb OS-buffered writes.
-- douchdb intentionally follows rusty-leveldb's default no-fsync behaviour.
-  That is a valid deployment choice, but it means these write numbers are a
-  different durability class. A durable-mode benchmark would need an fsynced
-  LevelDB log or WAL; CouchDB 3.x cannot be switched back to delayed commits.
+- **Read, view, `_all_docs` and `_changes` comparisons were meaningful then and
+  still indicate the shape.**
+- **Write throughput rows compare CouchDB full commits against the old
+  OS-buffered writes.** They are not an equal-durability result.
 
 The table below keeps the measured numbers, but write rows should be read with
 that caveat.
 
-## Results
-
-| Operation | CouchDB | douchdb | douchdb / CouchDB |
-|---|---:|---:|---:|
-| Sequential PUT * | 96 req/s | 1,198 req/s | **12.5×** |
-| Concurrent PUT, 8 clients * | 238 req/s | 3,547 req/s | **14.9×** |
-| `_bulk_docs`, 250 docs * | 6,255 docs/s | 29,984 docs/s | **4.8×** |
-| Sequential GET | 743 req/s | 1,774 req/s | **2.4×** |
-| Concurrent GET, 8 clients | 2,572 req/s | 4,997 req/s | **1.9×** |
-| `_bulk_get`, 250 docs | 20,917 docs/s | 64,155 docs/s | **3.1×** |
-| `_all_docs?limit=100` | 259 req/s | 693 req/s | **2.7×** |
-| `_all_docs?startkey&limit=100` | 315 req/s | 862 req/s | **2.7×** |
-| `_all_docs` keys=100 | 63 req/s | 749 req/s | **11.9×** |
-| `_changes?limit=1000` | 31 req/s | 293 req/s | **9.6×** |
-| Full `_changes` (9,501 rows) | 3.8 req/s | 210 req/s | **56×** |
-| `_changes?style=all_docs` | 3.5 req/s | 227 req/s | **66×** |
-| `_changes?include_docs` | 2.3 req/s | 46.9 req/s | **20×** |
-| `style=all_docs&include_docs` | 2.3 req/s | 49.0 req/s | **21×** |
-| Database info | 628 req/s | 1,338 req/s | **2.1×** |
-| Cold view build | 755 ms | 52.6 ms | **14.4× faster** |
-| Warm view map | 176 req/s | 410 req/s | **2.3×** |
-| Warm map-only view | 127 req/s | 276 req/s | **2.2×** |
-| Warm reduce view | 294 req/s | 394 req/s | **1.3×** |
-
-Latency at p50:
-
-| Operation | CouchDB | douchdb |
-|---|---:|---:|
-| Sequential PUT | 8.91 ms | 0.79 ms |
-| Concurrent PUT | 28.4 ms | 1.96 ms |
-| Sequential GET | 1.32 ms | 0.56 ms |
-| `_all_docs` keys=100 | 14.8 ms | 1.31 ms |
-| `_changes?limit=1000` | 32.4 ms | 3.26 ms |
-| Full `_changes` | 255 ms | 4.30 ms |
-| `_changes?include_docs` | 404 ms | 20.4 ms |
-| Cold view build | 755 ms | 52.6 ms |
-| Warm view map | 3.82 ms | 2.36 ms |
-| Warm reduce view | 2.69 ms | 2.45 ms |
-
 ## Reading the results
 
-* Write rows are not durability-equivalent: CouchDB fsyncs every commit while
-  douchdb currently acknowledges after writing to the OS page cache.
+* Write rows are not durability-equivalent: they were measured before douchdb
+  fsynced every commit, as CouchDB does.
 
 - douchdb's replica-write fan-out is faster in this container setup, but part
-  of the write gap is its default no-fsync LevelDB behaviour.
+  of the write gap was the earlier storage engine's lack of fsync.
 - With that caveat, the read-only and index paths show douchdb ahead by roughly
   2–3× for point/range reads, 9–10× for limited changes and much more for full
   changes. Write ratios must not be quoted as an apples-to-apples durability
@@ -184,5 +131,5 @@ Latency at p50:
 - Basic auth was used. Session cookies changed CouchDB point-read latency by
   only a few percent, so auth is not the explanation for the large read and
   changes differences.
-- douchdb follows rusty-leveldb's default and does not fsync. The write numbers
-  are throughput measurements of OS-buffered commits, not durable commits.
+- The write numbers are throughput measurements of OS-buffered commits on the
+  earlier storage engine, not durable commits; douchdb now fsyncs every commit.

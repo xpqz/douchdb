@@ -46,10 +46,10 @@ A health response looks like:
 ```
 
 Checks are graded `ok`, `degraded` (warning) or `critical`. The overall status is
-the worst check. Power-loss durability is explicitly not claimed:
-`rusty-leveldb` does not fsync, so health checks establish process/storage
-readiness, not crash-recovery correctness for a particular dataset and not fsync
-semantics. Process-crash recovery is covered by tests, not by health.
+the worst check. Health checks establish process/storage
+readiness, not crash-recovery correctness for a particular dataset and not
+storage integrity; durability and corruption detection are the storage layer's
+guarantees (see [durability.md](durability.md)). Process-crash recovery is covered by tests, not by health.
 
 ### Metrics collected
 
@@ -278,4 +278,4 @@ HTTP metrics. Replace `debug` with your normal OTLP backend exporter.
 - No `Last-Event-ID`-style replay for telemetry; it is observability, not
   durable auditing.
 - In-process counters reset on restart and are not persisted.
-- Power-loss durability is not claimed; `rusty-leveldb` does not fsync.
+- Health says nothing about durability; see [durability.md](durability.md).

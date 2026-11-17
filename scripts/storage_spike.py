@@ -2,14 +2,14 @@
 """10 GB storage spike for douchdb.
 
 Measures the thing the plan is unsure about: what a single shard actor costs
-when LevelDB is large and compacts. The workload is deliberately unfriendly:
+when the shard file is large and `_compact` runs. The workload is deliberately unfriendly:
 
   * incompressible payloads (base64 of random bytes), so Snappy cannot turn
     10 GB of logical data into a few MB on disk;
   * several concurrent writers, so the shard actor's group commit is exercised;
   * a latency probe running before and during `_compact`, which measures the
-    p99 a client sees while compaction owns the `&mut self` shard handle;
-  * a SIGKILL/restart at the end to confirm the synced WriteBatches were real.
+    p99 a client sees while `_compact` runs on the shard actor;
+  * a SIGKILL/restart at the end to confirm acknowledged commits survived.
 
 Run it against a release build:
 
