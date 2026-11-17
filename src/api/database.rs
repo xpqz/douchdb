@@ -702,22 +702,31 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
     let db = st.db(&name).await;
     // Claimed before the name leaves the queue, so `GET /db` never finds
     // the compaction in neither.
-    let claimed = db.as_ref().is_ok_and(|db| db.claim_compaction());
+    let claim = db.as_ref().ok().and_then(|db| db.claim_compaction());
     st.compactions_queued
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&name);
-    match db {
-        Ok(db) if claimed => {
-            if let Err(error) = db.run_compaction().await {
-                tracing::error!(db = %name, error = %error.reason, "compaction failed");
+    match (&db, claim) {
+        (Ok(db), Some(claim)) => {
+            if let Err(error) = db.run_compaction(claim).await {
+                // A database deleted under its compaction is no fault.
+                if db.check_live().is_err() {
+                    tracing::warn!(db = %name, error = %error.reason, "compaction stopped: database deleted");
+                } else {
+                    tracing::error!(db = %name, error = %error.reason, "compaction failed");
+                }
             }
         }
-        Ok(_) => {}
-        Err(error) => {
+        (Ok(_), None) => {}
+        // Deleted while it waited.
+        (Err(error), _) if error.status == 404 => {
             tracing::warn!(db = %name, error = %error.reason, "compaction not started");
         }
-    }
+        (Err(error), _) => {
+            tracing::error!(db = %name, error = %error.reason, "compaction not started");
+        }
+    };
 }
 
 /// `POST /{db}/_ensure_full_commit`.

@@ -633,6 +633,16 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
     (!name.contains('%')).then_some(name)
 }
 
+/// A running compaction of a database, from [`Db::claim_compaction`]: the
+/// database reports `compact_running` until this is dropped.
+pub struct CompactionClaim<'a>(&'a AtomicBool);
+
+impl Drop for CompactionClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Db {
     /// Open the database `name`, which must exist (see
     /// `state::create_db_staged`). Every shard file is opened as it is: one
@@ -3366,10 +3376,10 @@ impl Db {
     /// left to finish, as CouchDB leaves one: this returns at once.
     #[cfg(test)]
     pub async fn compact(&self) -> DbResult<()> {
-        if !self.claim_compaction() {
-            return Ok(());
+        match self.claim_compaction() {
+            Some(claim) => self.run_compaction(claim).await,
+            None => Ok(()),
         }
-        self.run_compaction().await
     }
 
     /// Whether a compaction of this database is running.
@@ -3377,26 +3387,23 @@ impl Db {
         self.compact_running.load(Ordering::SeqCst)
     }
 
-    /// Mark a compaction as running, unless one already is. From here until
-    /// [`Db::run_compaction`] ends, `GET /db` reports it and the database
-    /// stays open.
-    pub fn claim_compaction(&self) -> bool {
+    /// Mark a compaction as running, unless one already is. Until the claim
+    /// is dropped, however the compaction ends (a panic included), `GET /db`
+    /// reports it and the database stays open.
+    pub fn claim_compaction(&self) -> Option<CompactionClaim<'_>> {
         self.compact_running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+            .then_some(CompactionClaim(&self.compact_running))
     }
 
-    /// Run the compaction [`Db::claim_compaction`] claimed.
-    pub async fn run_compaction(&self) -> DbResult<()> {
-        let result = async {
-            for shard in &self.shards {
-                crate::store::compact::compact_shard(shard).await?;
-            }
-            Ok(())
+    /// Run the compaction `claim` claimed.
+    pub async fn run_compaction(&self, claim: CompactionClaim<'_>) -> DbResult<()> {
+        for shard in &self.shards {
+            crate::store::compact::compact_shard(shard).await?;
         }
-        .await;
-        self.compact_running.store(false, Ordering::SeqCst);
-        result
+        drop(claim);
+        Ok(())
     }
 
     /// The `_active_tasks` entries of this database's running compaction on
@@ -8255,6 +8262,26 @@ mod tests {
             .unwrap();
         db.compact().await.unwrap();
         assert_eq!(db.info().await.unwrap().doc_count, 2);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A compaction that panics must not leave its database compacting: it
+    /// would report `compact_running` and never close again.
+    #[tokio::test]
+    async fn a_panicking_compaction_releases_its_claim() {
+        let (db, root) = purge_test_db("compact-panic", ShardMap::single(1));
+        let db = Arc::new(db);
+        let held = Arc::clone(&db);
+        let panicked = tokio::spawn(async move {
+            let _claim = held.claim_compaction().expect("nothing else compacts");
+            panic!("the compaction panicked");
+        })
+        .await;
+        assert!(panicked.is_err());
+        assert!(db.quiescent());
+        assert!(!db.info().await.unwrap().compact_running);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
