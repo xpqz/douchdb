@@ -1560,18 +1560,9 @@ impl<'s> ShardTxn<'s> {
         self.remove_value(SETTINGS, Table::Settings, name)
     }
 
-    /// The settings whose names start with `prefix`, in name order.
-    pub fn settings(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut out = Vec::new();
-        let from = (Included(prefix), Unbounded);
-        self.scan(SETTINGS, Table::Settings, from, false, |name, value| {
-            if !name.starts_with(prefix) {
-                return Ok(false);
-            }
-            out.push((name.to_string(), value.to_vec()));
-            Ok(true)
-        })?;
-        Ok(out)
+    /// The setting `name`, if there is one.
+    pub fn get_setting(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get_value(SETTINGS, Table::Settings, name)
     }
 
     pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {

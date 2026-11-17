@@ -172,36 +172,6 @@ impl Stored {
             pending_shard_map,
         })
     }
-
-    /// Whether the stored shard map is for a cluster of `node_count` nodes.
-    /// One for another size gives way to the configured placement (see
-    /// `store_replaced_shard_map`).
-    fn map_fits(&self, node_count: usize) -> bool {
-        self.shard_map.node_count == node_count
-    }
-
-    /// Put these settings in memory in place of those there, as reopening
-    /// the database would: the shard map only when it fits the cluster of
-    /// the one in memory, which otherwise is the configured placement.
-    fn install(
-        self,
-        shard_map: &std::sync::RwLock<ShardMap>,
-        security: &std::sync::RwLock<(u64, Value)>,
-        pending_shard_map: &std::sync::RwLock<Option<ShardMap>>,
-    ) {
-        let mut map = shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if self.map_fits(map.node_count) {
-            *map = self.shard_map;
-        }
-        *security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = self.security;
-        *pending_shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = self.pending_shard_map;
-    }
 }
 
 /// One staged write of a document batch, applied once the whole batch is
@@ -724,7 +694,7 @@ impl Db {
 
         // A map stored for a different cluster size gives way to the
         // configured placement (see `store_replaced_shard_map`).
-        let map_replaced = !stored.map_fits(config.shard_map.node_count);
+        let map_replaced = stored.shard_map.node_count != config.shard_map.node_count;
         let shard_map = if map_replaced {
             tracing::warn!(
                 db = %path.display(),
@@ -1119,10 +1089,12 @@ impl Db {
     /// value is installed.
     ///
     /// A write that fails may still have landed (a commit can report an
-    /// error and be on the disk), so memory then takes every setting from
-    /// what shard 0 holds once it has recovered, and the caller still hears
-    /// the error. If they cannot be read back, memory keeps what clients
-    /// were last told until the database reopens.
+    /// error and be on the disk), so the setting is then read back from
+    /// shard 0 once it has recovered, and installed if it is what was
+    /// written; the caller still hears the error. Every other setting
+    /// already matched the disk, as `writing` admits no other write. If it
+    /// cannot be read back, memory keeps what clients were last told until
+    /// the database reopens.
     async fn store_setting(
         &self,
         writing: tokio::sync::OwnedMutexGuard<()>,
@@ -1130,6 +1102,7 @@ impl Db {
         value: Option<Vec<u8>>,
         install: impl FnOnce() + Send + 'static,
     ) -> DbResult<()> {
+        let attempted = value.clone();
         let write = self.shards[0].call(move |txn| {
             match &value {
                 Some(value) => txn.put_setting(name, value),
@@ -1137,29 +1110,25 @@ impl Db {
             }
             .map_err(ApiError::from)
         });
-        // Made here, as the task cannot borrow the shard; sent only if the
-        // write fails. An actor job, so it runs after the recovery.
-        let read_back = self.shards[0].read(|txn| Ok(txn.settings(DB_SETTINGS)?));
+        // Made here, as the task cannot borrow the shard, so it counts as a
+        // shard job even when the write succeeds and it is never sent. An
+        // actor job, so it runs after the recovery.
+        let read_back = self.shards[0].read(move |txn| Ok(txn.get_setting(name)?));
         let path = self.path.clone();
-        let shard_map = self.shard_map.clone();
-        let security = self.security.clone();
-        let pending_shard_map = self.pending_shard_map.clone();
         tokio::spawn(async move {
             let _writing = writing;
             let Err(error) = write.await else {
                 install();
                 return Ok(());
             };
-            match read_back
-                .await
-                .and_then(|rows| Stored::parse(&path, rows))
-            {
-                Ok(stored) => stored.install(&shard_map, &security, &pending_shard_map),
-                Err(read) => tracing::error!(
+            match read_back.await {
+                Ok(stored) if stored == attempted => install(),
+                Ok(_) => {}
+                Err(read) => tracing::warn!(
                     db = %path.display(),
                     setting = name,
                     error = %read.reason,
-                    "the settings cannot be read back after a failed write; memory keeps the last acknowledged ones"
+                    "the setting cannot be read back after a failed write; memory keeps the last acknowledged one"
                 ),
             }
             Err(error)
@@ -6983,10 +6952,7 @@ mod tests {
             },
         )
         .unwrap();
-        let rows = db.shards[0]
-            .read(|s| Ok(s.settings(DB_SETTINGS)?))
-            .await
-            .unwrap();
+        let rows = stored_rows(&db).await;
         let (_, switch) = crate::kv::powercut::PowerCut::new();
         drop(Shard::create_over_backend(&switch, 1000).unwrap());
         let disk = ShardHandle::over_backend(&switch).unwrap();
@@ -7000,6 +6966,27 @@ mod tests {
         .unwrap();
         db.shards[0] = disk;
         (db, root, switch)
+    }
+
+    /// The `db/` settings shard 0 holds, read through its actor.
+    async fn stored_rows(db: &Db) -> Vec<(String, Vec<u8>)> {
+        db.shards[0]
+            .read(|s| {
+                let mut rows = Vec::new();
+                for name in [
+                    INFO_SETTING,
+                    SHARD_MAP_SETTING,
+                    SECURITY_SETTING,
+                    PENDING_SHARD_MAP_SETTING,
+                ] {
+                    if let Some(value) = s.get_setting(name)? {
+                        rows.push((name.to_string(), value));
+                    }
+                }
+                Ok(rows)
+            })
+            .await
+            .unwrap()
     }
 
     /// A settings write whose commit reports an error yet lands (its pages
@@ -7019,11 +7006,9 @@ mod tests {
         let error = db.set_security(landed.clone()).await.unwrap_err();
         assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
 
-        let on_disk = db.shards[0]
-            .read(|s| Ok(s.settings(DB_SETTINGS)?))
-            .await
-            .unwrap();
-        let on_disk = Stored::parse(&root, on_disk).unwrap().security;
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
         assert_eq!(on_disk, (version + 1, landed.clone()), "the write landed");
         assert_eq!(db.security_versioned(), on_disk);
 
@@ -7035,6 +7020,29 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(db.security_versioned(), (version + 1, landed));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A shard map whose write fails yet lands is the one in memory, here
+    /// one for another cluster size than the map it replaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_shard_map_write_that_landed_is_what_memory_holds() {
+        let (db, root, switch) = db_on_test_disk("landedmap").await;
+        assert_eq!(db.shard_map().node_count, 1);
+
+        switch.fail_one_sync_after(1, std::io::ErrorKind::Other);
+        let error = db
+            .set_next_shard_map(ShardMap::balanced(1, 2, 1))
+            .await
+            .unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .shard_map;
+        assert_eq!(on_disk.node_count, 2, "the write landed");
+        assert_eq!(db.shard_map(), on_disk);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
