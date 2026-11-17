@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// A request against one database, as `db_rest` hands it to a handler.
 #[derive(Clone, Copy)]
 pub(crate) struct DbRequest<'a> {
-    pub st: &'a AppState,
+    pub st: &'a Arc<AppState>,
     pub db: &'a Arc<Db>,
     pub name: &'a str,
     pub method: &'a Method,

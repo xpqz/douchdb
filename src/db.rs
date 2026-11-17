@@ -3372,6 +3372,11 @@ impl Db {
         self.run_compaction().await
     }
 
+    /// Whether a compaction of this database is running.
+    pub fn compacting(&self) -> bool {
+        self.compact_running.load(Ordering::SeqCst)
+    }
+
     /// Mark a compaction as running, unless one already is. From here until
     /// [`Db::run_compaction`] ends, `GET /db` reports it and the database
     /// stays open.

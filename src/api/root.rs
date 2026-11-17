@@ -255,9 +255,11 @@ pub async fn dbs_info(
             results.push(json!({"key": key, "error": "bad_request"}));
             continue;
         };
+        let queued = st.compaction_queued(name);
         match st.db(name).await {
             Ok(db) => match db.info().await {
-                Ok(info) => {
+                Ok(mut info) => {
+                    info.compact_running |= queued;
                     let (seq, purge_seq) = info.local_tokens(st.ctx.cluster.me);
                     match info_json(&info, &seq, &purge_seq) {
                         Ok(info) => results.push(json!({"key": name, "info": info})),

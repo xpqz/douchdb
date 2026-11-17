@@ -8,7 +8,7 @@ use crate::dbname::{illegal_db_name, valid_db_name};
 use crate::health::FsHealthCache;
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -273,6 +273,9 @@ pub struct AppState {
     pub admission: Arc<crate::admission::Admission>,
     /// Bound the compactions running at once on this node; the rest wait.
     pub compaction: Arc<tokio::sync::Semaphore>,
+    /// The databases whose compaction waits for a slot. They wait by name,
+    /// not held open, so `max_open_dbs` still bounds the open databases.
+    pub compactions_queued: std::sync::Mutex<HashSet<String>>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,
     /// Cancelled when the server starts shutting down. Streaming feeds end
@@ -330,6 +333,14 @@ pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_se
 // state
 
 impl AppState {
+    /// Whether a compaction of `name` waits for a slot.
+    pub fn compaction_queued(&self, name: &str) -> bool {
+        self.compactions_queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    }
+
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         self.open_db(name, true).await
     }
@@ -979,6 +990,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
         admission: Arc::new(crate::admission::Admission::new(Default::default())),
         compaction: Arc::new(tokio::sync::Semaphore::new(1)),
+        compactions_queued: Default::default(),
     })
 }
 

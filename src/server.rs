@@ -197,6 +197,7 @@ fn build_state(
         fs_health: Default::default(),
         config,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(args.compact_concurrency)),
+        compactions_queued: Default::default(),
         admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
             max_in_flight: args.max_in_flight,
             per_user_in_flight: args.per_user_in_flight,

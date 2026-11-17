@@ -311,6 +311,7 @@ mod tests {
             cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
             admission: Arc::new(crate::admission::Admission::new(Default::default())),
             compaction: Arc::new(tokio::sync::Semaphore::new(1)),
+            compactions_queued: Default::default(),
         })
     }
 
