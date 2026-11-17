@@ -8518,4 +8518,49 @@ mod tests {
             }
         }
     }
+
+    /// A write counts its shard group, the time spent in its jobs and its
+    /// commit, and the commit's two syncs (two-phase). The counters are
+    /// process-wide, so the test reruns itself alone in a child process:
+    /// no other test's commits land between the snapshots.
+    #[tokio::test]
+    async fn shard_metrics_count_groups_and_syncs() {
+        const CHILD: &str = "DOUCHDB_SHARD_METRICS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "db::tests::shard_metrics_count_groups_and_syncs",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (db, root) = single_shard_db("shard-metrics").await;
+        // The first commit grows the new file, and redb syncs a growth
+        // once more; the second is a plain two-phase commit.
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let before = crate::metrics::snapshot()["shard"].clone();
+        db.put_docs(vec![json!({"_id": "b", "n": 1})], true)
+            .await
+            .unwrap();
+        let after = crate::metrics::snapshot()["shard"].clone();
+        let delta = |name: &str| after[name].as_u64().unwrap() - before[name].as_u64().unwrap();
+        assert!(delta("groups") >= 1, "{before} {after}");
+        assert_eq!(delta("syncs"), 2 * delta("groups"), "{before} {after}");
+        assert!(delta("jobs_us") > 0, "{before} {after}");
+        assert!(delta("commit_us") > 0, "{before} {after}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

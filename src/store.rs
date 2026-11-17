@@ -46,6 +46,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 /// Jobs one group commit takes at most.
@@ -1027,6 +1028,7 @@ impl Shard {
         let mut txn = ShardTxn::new(self, Txn::Write(Box::new(txn)));
         let mut replies = Vec::new();
         let mut next = Some(first);
+        let jobs_started = Instant::now();
         let mut aborted = None;
         while let Some(job) = next.take() {
             txn.begin_job();
@@ -1040,6 +1042,8 @@ impl Shard {
                 next = more();
             }
         }
+        let jobs_us = jobs_started.elapsed().as_micros() as u64;
+        let commit_started = Instant::now();
         let mut commit_failed = false;
         let error = match aborted {
             Some(error) => {
@@ -1058,6 +1062,7 @@ impl Shard {
                 )
             }),
         };
+        crate::metrics::record_shard_group(jobs_us, commit_started.elapsed().as_micros() as u64);
         // Before anyone hears back, so a retry meets the recovered file.
         if let Some(error) = &error {
             if commit_failed || self.poisoned() {
