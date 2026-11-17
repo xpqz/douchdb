@@ -55,7 +55,7 @@ impl Term {
         out
     }
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             // CouchDB passes minor_version 1, which predates UTF-8 atoms: this
             // is Latin-1 ATOM_EXT, not the modern SMALL_ATOM_UTF8_EXT. All the
@@ -202,6 +202,22 @@ fn decimal_magnitude(raw: &str) -> (bool, Vec<u8>) {
     (negative && !zero, magnitude)
 }
 
+fn number_term(n: &serde_json::Number) -> Term {
+    if let Some(i) = n.as_i64() {
+        Term::Int(i)
+    } else if let Some(u) = n.as_u64() {
+        Term::UInt(u)
+    } else if crate::json::is_integer(n.as_str()) {
+        let (negative, magnitude) = decimal_magnitude(n.as_str());
+        Term::BigInt {
+            negative,
+            magnitude,
+        }
+    } else {
+        Term::Float(n.as_f64().unwrap_or(0.0))
+    }
+}
+
 /// Convert a JSON value to the term CouchDB's `jiffy` would have produced.
 ///
 /// Objects become Erlang proplists (`{Props}`) in document order, *not* maps:
@@ -214,21 +230,7 @@ pub fn from_json(value: &serde_json::Value) -> Term {
         Value::Null => Term::Atom("null"),
         Value::Bool(true) => Term::Atom("true"),
         Value::Bool(false) => Term::Atom("false"),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Term::Int(i)
-            } else if let Some(u) = n.as_u64() {
-                Term::UInt(u)
-            } else if crate::json::is_integer(n.as_str()) {
-                let (negative, magnitude) = decimal_magnitude(n.as_str());
-                Term::BigInt {
-                    negative,
-                    magnitude,
-                }
-            } else {
-                Term::Float(n.as_f64().unwrap_or(0.0))
-            }
-        }
+        Value::Number(n) => number_term(n),
         Value::String(s) => Term::Binary(s.as_bytes().to_vec()),
         Value::Array(a) => Term::List(a.iter().map(from_json).collect()),
         Value::Object(map) => Term::Tuple(vec![Term::List(
@@ -237,6 +239,122 @@ pub fn from_json(value: &serde_json::Value) -> Term {
                 .collect(),
         )]),
     }
+}
+
+/// Buffered bytes in front of a digest, so scalars are encoded without a
+/// call into the hasher each.
+struct Sink<'a, D> {
+    buf: Vec<u8>,
+    hasher: &'a mut D,
+}
+
+impl<D: md5::Digest> Sink<'_, D> {
+    fn flush(&mut self) {
+        self.hasher.update(&self.buf);
+        self.buf.clear();
+    }
+
+    fn maybe_flush(&mut self) {
+        if self.buf.len() >= 8192 {
+            self.flush();
+        }
+    }
+
+    fn binary(&mut self, bytes: &[u8]) {
+        self.buf.push(BINARY_EXT);
+        self.buf.extend((bytes.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(bytes);
+        self.maybe_flush();
+    }
+
+    fn members<'v>(
+        &mut self,
+        members: impl Iterator<Item = (&'v String, &'v serde_json::Value)> + Clone,
+    ) {
+        let count = members.clone().count();
+        self.buf.extend([SMALL_TUPLE_EXT, 1]);
+        if count == 0 {
+            self.buf.push(NIL_EXT);
+            return;
+        }
+        self.buf.push(LIST_EXT);
+        self.buf.extend((count as u32).to_be_bytes());
+        for (key, value) in members {
+            self.buf.extend([SMALL_TUPLE_EXT, 2]);
+            self.binary(key.as_bytes());
+            self.value(value);
+        }
+        self.buf.push(NIL_EXT);
+    }
+
+    /// The same bytes as `from_json(value).encode_into(..)`.
+    fn value(&mut self, value: &serde_json::Value) {
+        use serde_json::Value;
+
+        match value {
+            Value::Null => Term::Atom("null").encode_into(&mut self.buf),
+            Value::Bool(b) => {
+                Term::Atom(if *b { "true" } else { "false" }).encode_into(&mut self.buf)
+            }
+            Value::Number(n) => number_term(n).encode_into(&mut self.buf),
+            Value::String(s) => self.binary(s.as_bytes()),
+            Value::Array(items) if items.is_empty() => self.buf.push(NIL_EXT),
+            Value::Array(items) => {
+                // A short list of integers 0..=255 is a STRING_EXT; see
+                // `Term::encode_into`.
+                let bytes: Option<Vec<u8>> = (items.len() <= u16::MAX as usize)
+                    .then(|| {
+                        items
+                            .iter()
+                            .map(|item| match item {
+                                Value::Number(n) => number_term(n).as_byte(),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .flatten();
+                match bytes {
+                    Some(bytes) => {
+                        self.buf.push(STRING_EXT);
+                        self.buf.extend((bytes.len() as u16).to_be_bytes());
+                        self.buf.extend_from_slice(&bytes);
+                    }
+                    None => {
+                        self.buf.push(LIST_EXT);
+                        self.buf.extend((items.len() as u32).to_be_bytes());
+                        for item in items {
+                            self.value(item);
+                        }
+                        self.buf.push(NIL_EXT);
+                    }
+                }
+            }
+            Value::Object(map) => self.members(map.iter()),
+        }
+        self.maybe_flush();
+    }
+}
+
+/// Feed a revision's term to `hasher`: `head` (an encoded prefix, version
+/// byte included, ending where the body goes), the body object made of
+/// `members`, and the empty attachment list.
+///
+/// The bytes are exactly those of the five-element term
+/// `[Deleted, OldStart, OldRev, Body, []]` that `Term::encode` produces, but no
+/// term tree is built.
+pub fn hash_revision<'v>(
+    hasher: &mut impl md5::Digest,
+    head: &[u8],
+    members: impl Iterator<Item = (&'v String, &'v serde_json::Value)> + Clone,
+) {
+    let mut sink = Sink {
+        buf: head.to_vec(),
+        hasher,
+    };
+    sink.members(members);
+    // The empty attachment list, then the end of the outer list.
+    sink.buf.extend([NIL_EXT, NIL_EXT]);
+    sink.flush();
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
-use crate::rev::{new_revid, Rev};
+use crate::rev::{new_revid_doc, Rev};
 use crate::store::{
     meta_state, DocMeta, DocRead, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn,
 };
@@ -4241,10 +4241,10 @@ impl Stage<'_, '_> {
             .unwrap_or(0)
             + 1;
 
-        let rev_id = hex(&new_revid(
+        let rev_id = hex(&new_revid_doc(
             deleted,
             parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
-            &body,
+            body.as_object().expect("body is an object"),
         ));
         let rev = format!("{pos}-{rev_id}");
 
