@@ -493,10 +493,10 @@ the bulk of the growth.
   the embedded WASI runner, a GitHub Actions workflow runs
   fmt/clippy/tests/both wasm backends/container build, search rebuilds are
   serialized per index and run on the blocking pool, and `_compact` has a
-  configurable node-wide concurrency bound, a visible `compact_running` flag,
-  and runs the blocking storage call through `block_in_place` so it does not
-  pin a Tokio worker. Non-Linux process RSS and thread metrics are explicitly
-  `null` until a platform collector is added. Observability handlers
+  configurable node-wide concurrency bound and a visible `compact_running`
+  flag. (Compaction is now an interim sweep that holds each shard's actor for
+  its whole run; see "Compaction placement".) Non-Linux process RSS and
+  thread metrics are explicitly `null` until a platform collector is added. Observability handlers
   moved out of `api.rs` into `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
   token users and roles; `_security` uses CouchDB's `admins`/`members` names and

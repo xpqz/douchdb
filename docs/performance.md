@@ -205,8 +205,9 @@ surface and deadline/memory limits.
   for a GET.
 - **Compaction** is negligible on this small, mostly append-only dataset
   (0.1 s). The 10 GB spike in [PLAN.md](../PLAN.md#storage-spike) is the relevant
-  compaction measurement: a shard stalls for ~27 s while `compact_range` owns
-  the actor.
+  compaction measurement, taken on the earlier storage engine. `_compact` is
+  now an interim sweep that holds each shard's actor for its whole run, so
+  that shard's writes queue behind it; online compaction is the next phase.
 
 ## Caveats
 

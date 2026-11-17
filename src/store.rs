@@ -1059,10 +1059,12 @@ impl Shard {
     /// CouchDB keeps them readable until compaction and then drops them;
     /// leaves (conflicts and tombstones included) always stay.
     ///
-    /// Runs on the actor between groups, one write transaction per
-    /// [`BODY_SWEEP_BATCH`] bodies, so memory stays bounded and writes queue
-    /// behind one batch at most. The file does not shrink: redb reuses the
-    /// freed pages.
+    /// Runs on the actor as one job run alone, holding it for the whole
+    /// sweep: the shard's writes and actor reads queue behind it until it
+    /// ends (reads on leases carry on). It commits one write transaction
+    /// per [`BODY_SWEEP_BATCH`] bodies, so memory stays bounded. The file
+    /// does not shrink: redb reuses the freed pages. Online compaction is
+    /// the next phase.
     pub fn compact(&mut self) -> Result<()> {
         let mut after: Option<(String, String)> = None;
         // Documents whose corrupt metadata was already reported this sweep.

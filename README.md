@@ -1039,11 +1039,12 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
-- `_compact` still blocks the owning shard actor, but runs through
-  `block_in_place` so it does not pin a Tokio worker; at 10 GB the shard stall is
-  ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency` bounds
-  concurrent compactions across databases, and `GET /db` reports
-  `compact_running`.
+- `_compact` is an interim sweep that deletes non-leaf bodies. It runs as one
+  job holding each shard's actor for its whole run, so that shard's writes and
+  actor reads queue behind it (reads on their own transactions carry on); the
+  file does not shrink, as redb reuses the freed pages. Online compaction is
+  the next phase. `--compact-concurrency` bounds concurrent compactions across
+  databases, and `GET /db` reports `compact_running`.
 - No Mango or lists/shows. Attachments are not supported.
 
 ## License
