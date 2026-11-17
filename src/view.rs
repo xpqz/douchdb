@@ -1653,47 +1653,60 @@ fn create_file(path: &Path) -> Result<Database, JsError> {
     Ok(db)
 }
 
-/// The view file at `path`, created if there is none. A file that fails its
-/// integrity check is deleted and replaced by an empty one, which the caller
+/// The cursor and design a view file records.
+type State = (IndexCursor, String);
+
+/// The view file at `path` and the state it records, created if there is
+/// none. A file that fails its integrity check, or whose recorded state fails
+/// its checksum, is deleted and replaced by an empty one, which the caller
 /// rebuilds from the shards: a view index is derived data. The caller holds
 /// the index's only handle, so nothing else has the file open.
-fn open_file(path: &Path) -> Result<Database, JsError> {
+fn open_file(path: &Path) -> Result<(Database, State), JsError> {
     if !path.try_exists().map_err(index_error)? {
-        return create_file(path);
+        return Ok((create_file(path)?, State::default()));
     }
-    match crate::kv::open(path, VIEW_CACHE_BYTES) {
-        Ok(db) => Ok(db),
-        Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(reason))) => {
-            tracing::warn!(
-                file = %path.display(),
-                %reason,
-                "view index failed its integrity check; deleting it to rebuild"
-            );
-            crate::kv::forget_verified(path);
-            std::fs::remove_file(path).map_err(index_error)?;
-            create_file(path)
-        }
-        Err(error) => Err(index_error(error)),
-    }
+    let damage = match crate::kv::open(path, VIEW_CACHE_BYTES) {
+        // Closed again, when damaged, before the file is removed.
+        Ok(db) => match read_state(&db)? {
+            Ok(state) => return Ok((db, state)),
+            Err(damage) => damage.to_string(),
+        },
+        Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(reason))) => reason,
+        Err(error) => return Err(index_error(error)),
+    };
+    tracing::warn!(
+        file = %path.display(),
+        reason = %damage,
+        "view index is damaged; deleting it to rebuild"
+    );
+    crate::kv::forget_verified(path);
+    std::fs::remove_file(path).map_err(index_error)?;
+    Ok((create_file(path)?, State::default()))
 }
 
-/// The cursor and design a view file records.
-fn read_state(db: &Database) -> Result<(IndexCursor, String), JsError> {
+/// The state a view file records. The outer error is a failure to read it;
+/// the inner one a value that fails its checksum or does not decode, which
+/// means the file is damaged.
+fn read_state(db: &Database) -> Result<Result<State, JsError>, JsError> {
     let txn = db.begin_read().map_err(index_error)?;
     let meta = txn.open_table(META).map_err(index_error)?;
-    let design = match meta.get(DESIGN).map_err(index_error)? {
-        Some(stored) => {
-            String::from_utf8(unsealed(stored.value())?.to_vec()).map_err(index_error)?
-        }
-        None => String::new(),
-    };
     let positions = txn.open_table(CURSOR).map_err(index_error)?;
+    let design = match meta.get(DESIGN).map_err(index_error)? {
+        Some(stored) => unsealed(stored.value())
+            .and_then(|design| String::from_utf8(design.to_vec()).map_err(index_error)),
+        None => Ok(String::new()),
+    };
     let mut cursor = Vec::new();
     for entry in positions.iter().map_err(index_error)? {
         let (_, stored) = entry.map_err(index_error)?;
-        cursor.push(serde_json::from_slice(unsealed(stored.value())?).map_err(index_error)?);
+        let position = unsealed(stored.value())
+            .and_then(|position| serde_json::from_slice(position).map_err(index_error));
+        match position {
+            Ok(position) => cursor.push(position),
+            Err(damage) => return Ok(Err(damage)),
+        }
     }
-    Ok((IndexCursor(cursor), design))
+    Ok(design.map(|design| (IndexCursor(cursor), design)))
 }
 
 /// Record `cursor` and `design` in the transaction that writes the rows they
@@ -1719,17 +1732,22 @@ impl ViewIndex {
     fn open(path: &Path, retired: Arc<AtomicBool>) -> Result<Self, JsError> {
         // An eviction may still be closing the file.
         wait_closed(path);
-        let db = open_file(path)?;
-        let mut index = Self::over(db)?;
+        let (db, state) = open_file(path)?;
+        let mut index = Self::with_state(db, state);
         index.file = Some(path.to_path_buf());
         index.retired = retired;
         Ok(index)
     }
 
     /// An index over an open view file, with the state it records.
+    #[cfg(test)]
     fn over(db: Database) -> Result<Self, JsError> {
-        let (cursor, design) = read_state(&db)?;
-        Ok(ViewIndex {
+        let state = read_state(&db)??;
+        Ok(Self::with_state(db, state))
+    }
+
+    fn with_state(db: Database, (cursor, design): State) -> Self {
+        ViewIndex {
             db: Some(db),
             file: None,
             retired: Arc::default(),
@@ -1737,7 +1755,7 @@ impl ViewIndex {
             design,
             placement: Placement::shards(1, false),
             cached: None,
-        })
+        }
     }
 
     /// The open file, reopened if a failed write closed it. A reopened index
@@ -1750,8 +1768,8 @@ impl ViewIndex {
                     .file
                     .as_deref()
                     .ok_or_else(|| JsError::Index("the view index is closed".to_string()))?;
-                let db = open_file(file)?;
-                (self.cursor, self.design) = read_state(&db)?;
+                let (db, state) = open_file(file)?;
+                (self.cursor, self.design) = state;
                 self.cached = None;
                 db
             }
@@ -5308,6 +5326,9 @@ mod tests {
     /// left out of the result.
     #[tokio::test]
     async fn a_corrupt_view_row_is_a_500_not_a_missing_row() {
+        // Other tests lower the registries' shared cap, and an idle index
+        // over it is evicted and closed in the background, whoever owns it.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root =
             std::env::temp_dir().join(format!("douchdb-viewcorrupt-{}", crate::util::uuid()));
         let db = Db::open_or_create(
@@ -5460,6 +5481,9 @@ mod tests {
     /// the query that found it answers from the rebuilt index.
     #[tokio::test]
     async fn a_view_file_that_fails_its_check_is_rebuilt() {
+        // Other tests lower the registries' shared cap, and an idle index
+        // over it is evicted and closed in the background, whoever owns it.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         const MARKER: &str = "<<douchdb-view-damage-marker>>";
         let root = std::env::temp_dir().join(format!("douchdb-viewdamage-{}", crate::util::uuid()));
         let db = Db::open_or_create(
@@ -5526,6 +5550,87 @@ mod tests {
         indexes().remove(&path);
         assert!(!crate::kv::is_verified(&path));
         drop(crate::kv::open(&path, VIEW_CACHE_BYTES).unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A design or cursor value that fails its checksum when a closed view
+    /// file is opened (the pages themselves are intact, so redb's check
+    /// passes) is damage too: the file is deleted and rebuilt, and the query
+    /// answers from the rebuilt index.
+    #[tokio::test]
+    async fn a_view_file_whose_state_fails_its_seal_is_rebuilt() {
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        let root = std::env::temp_dir().join(format!("douchdb-viewseal-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "viewseal",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let docs = (0..20)
+            .map(|n| json!({"_id": format!("d{n:02}"), "n": n}))
+            .collect();
+        db.put_docs(docs, true).await.unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let before = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(before["total_rows"], 20, "{before}");
+        let path = index_path(&db, "_design/d", "v");
+
+        for damage in ["design", "cursor"] {
+            // A mis-sealed value, written through redb and closed for good.
+            {
+                let handle = index_handle(&path).await.unwrap();
+                let index = handle.lock().await;
+                let file = index.db.as_ref().unwrap();
+                let txn = file.begin_write().unwrap();
+                let mut sealed = crate::kv::seal(br#"["x",1]"#);
+                sealed[0] ^= 0x20;
+                if damage == "design" {
+                    txn.open_table(META)
+                        .unwrap()
+                        .insert(DESIGN, sealed.as_slice())
+                        .unwrap();
+                } else {
+                    txn.open_table(CURSOR)
+                        .unwrap()
+                        .insert(1, sealed.as_slice())
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            indexes().remove(&path);
+
+            let after = query_with_spec(&db, "_design/d", "v", &spec, &query)
+                .await
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "damaged {damage}: rebuilt index answers differently"
+            );
+            indexes().remove(&path);
+            let file = crate::kv::open(&path, VIEW_CACHE_BYTES).unwrap();
+            let (cursor, _) = read_state(&file)
+                .unwrap()
+                .expect("the state is still damaged");
+            assert_eq!(cursor, IndexCursor(db.shard_seqs()), "damaged {damage}");
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
