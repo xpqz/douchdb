@@ -437,6 +437,9 @@ impl Directory for Files {
         std::fs::rename(from, to)
     }
 
+    /// No test in this process can observe a real directory fsync; the
+    /// tests cover the call to it in [`rename_verified_in`], through the
+    /// test disk.
     fn sync(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::File::open(dir)?.sync_all()
     }
