@@ -433,6 +433,25 @@ impl AppState {
     /// worker. The name's lock travels with it: a request that wants the
     /// database back waits for the drop, so it never meets a shard file's
     /// lock that is still held.
+    /// Close every open database and view file as the process exits, off
+    /// the async threads. Each database joins its shard actors, which finish
+    /// their queued writes first, so a restart finds every acknowledged
+    /// write. Nothing is integrity-checked on the way out: the check reads
+    /// every file whole, and the verification it records dies with the
+    /// process (the next start checks each file on its first open anyway).
+    pub(crate) async fn close_for_exit(&self) {
+        let open = std::mem::take(&mut *self.dbs.write().await);
+        for db in open.values() {
+            db.db.skip_close_checks();
+        }
+        let root = self.root.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(open);
+            crate::view::close_indexes_for_exit(&root);
+        })
+        .await;
+    }
+
     async fn close_idle(&self) {
         self.close_over_cap().await;
         self.release_idle_indexes().await;
@@ -1150,6 +1169,51 @@ mod tests {
         assert!(!path.join("_search_indexes").exists());
         drop((stale, fresh));
         st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Process exit closes the shard files without the close-time integrity
+    /// check, which reads the whole file and whose result dies with the
+    /// process, and closes the open view files cleanly (also unchecked), so
+    /// they do not need redb's recovery on the next start.
+    #[tokio::test]
+    async fn exit_closes_files_unchecked_and_views_cleanly() {
+        // Other tests lower the registries' shared cap, and an index over it
+        // is evicted and closed in the background, whoever owns it.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        let root = scratch_root("exit-close");
+        let st = test_state(root.clone(), 8);
+        let db = st.create_db("exit", false, Some(2), None).await.unwrap();
+        let ddoc = json!({"_id": "_design/d",
+            "views": {"v": {"map": "function(doc) { emit(doc.n, null); }"}}});
+        db.put_docs(vec![json!({"_id": "a", "n": 1}), ddoc], true)
+            .await
+            .unwrap();
+        let rows = crate::view::query(&db, "_design/d", "v", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(rows["total_rows"], 1, "{rows}");
+        let views: Vec<PathBuf> = std::fs::read_dir(db.path.join("_view_indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(views.len(), 1, "{views:?}");
+        drop(db);
+
+        st.close_for_exit().await;
+        for shard in 0..2 {
+            let file = shard_file(&db_path(&root, "exit"), shard);
+            assert!(
+                !crate::kv::is_verified(&file),
+                "{} was integrity-checked at exit",
+                file.display()
+            );
+        }
+        // redb's header flags follow its 9-byte magic number; bit 2 is set
+        // while the file is open and cleared by a clean close.
+        let header = std::fs::read(&views[0]).unwrap();
+        assert_eq!(header[9] & 2, 0, "the view file was left needing recovery");
+        drop(st);
         let _ = std::fs::remove_dir_all(root);
     }
 

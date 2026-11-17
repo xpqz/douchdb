@@ -803,6 +803,14 @@ impl Db {
         }
     }
 
+    /// Close the shard files without the close-time integrity check when the
+    /// last handle to this database goes: the process is exiting.
+    pub fn skip_close_checks(&self) {
+        for shard in &self.shards {
+            shard.skip_close_check();
+        }
+    }
+
     /// One shard's actor, for tests that run jobs on it directly.
     #[cfg(test)]
     pub(crate) fn shard_handle(&self, index: usize) -> &ShardHandle {

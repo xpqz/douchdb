@@ -1512,6 +1512,15 @@ pub async fn forget_db(db_path: &Path) {
     gates().retain(|path| path != db_path);
 }
 
+/// Close the open view files under `root` as the process exits: retired, so
+/// each closes cleanly (redb's next open needs no recovery) without the
+/// close-time integrity check, whose result would die with the process. An
+/// index a request still holds closes the same way when it lets go.
+/// Blocking.
+pub fn close_indexes_for_exit(root: &Path) {
+    indexes().retain(|path| !path.starts_with(root));
+}
+
 /// A view file closing in the background, and whether it has closed.
 #[derive(Default)]
 struct Closing {

@@ -426,7 +426,7 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
         for task in tasks {
             let _ = task.await;
         }
-        close_databases(&state).await;
+        state.close_for_exit().await;
         Ok(())
     };
     tokio::select! {
@@ -439,15 +439,4 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
             SHUTDOWN_DEADLINE.as_secs()
         )),
     }
-}
-
-/// Drop every open database off the async threads. Each one joins its shard
-/// actors, which finish their queued writes first, so a restart finds every
-/// acknowledged write.
-async fn close_databases(state: &AppState) {
-    let open = std::mem::take(&mut *state.dbs.write().await);
-    if open.is_empty() {
-        return;
-    }
-    let _ = tokio::task::spawn_blocking(move || drop(open)).await;
 }

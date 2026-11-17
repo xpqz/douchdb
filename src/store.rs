@@ -2360,12 +2360,13 @@ impl Message {
 /// Every shard is owned by exactly one dedicated OS thread, its only writer:
 /// its calls are synchronous file I/O that must not run on Tokio workers.
 /// Dropping the handle closes the queue, lets the thread finish the queued
-/// jobs, and waits for it to close the file (after a full integrity check),
-/// so redb's file lock is released before `drop` returns.
+/// jobs, and waits for it to close the file (after a full integrity check,
+/// unless `skip_close_check` was called), so redb's file lock is released
+/// before `drop` returns.
 pub struct ShardHandle {
     tx: Option<mpsc::Sender<Message>>,
-    /// Set by `discard`: the actor closes the file without the close-time
-    /// check and records nothing.
+    /// Set by `discard` and `skip_close_check`: the actor closes the file
+    /// without the close-time check and records nothing.
     discard: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The shard's committed position: its sequence as of the last commit.
@@ -2661,8 +2662,15 @@ impl ShardHandle {
     /// damaged database costs no full read of its healthy shards per
     /// request. Waits until the file is closed.
     pub fn discard(self) {
-        self.discard.store(true, Ordering::SeqCst);
+        self.skip_close_check();
         drop(self);
+    }
+
+    /// Close the file without the close-time integrity check once the last
+    /// handle goes, for a process that is exiting: the check reads the
+    /// whole file, and what it records dies with the process.
+    pub fn skip_close_check(&self) {
+        self.discard.store(true, Ordering::SeqCst);
     }
 
     /// Stop the shard because its database is deleted, and wait until its

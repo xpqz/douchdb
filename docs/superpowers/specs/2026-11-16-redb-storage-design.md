@@ -163,7 +163,8 @@ term's MD5 as it reads it. So:
   A file that passed its close-time check is recorded as verified, so its
   next open in the same process skips the check; one that failed it is
   re-checked on its next open and fails closed. Reopening an idle database
-  therefore costs no full read. (Decision 2026-11-16: every-open checks
+  therefore costs no full read. Process exit closes shard and view files
+  cleanly but unchecked: the record dies with the process. (Decision 2026-11-16: every-open checks
   would make each reopen of a large idle database, and every anti-entropy
   pass over cold ones, read the whole file.)
 - **Every write transaction commits in two phases**
