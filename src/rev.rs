@@ -7,6 +7,19 @@ use md5::{Digest, Md5};
 use serde_json::Value;
 use std::fmt;
 
+/// Fields CouchDB strips before hashing a document body.
+pub const META_FIELDS: [&str; 9] = [
+    "_id",
+    "_rev",
+    "_revisions",
+    "_deleted",
+    "_attachments",
+    "_conflicts",
+    "_deleted_conflicts",
+    "_revs_info",
+    "_local_seq",
+];
+
 #[derive(Clone, Debug)]
 pub struct Rev {
     pub pos: u64,
@@ -110,7 +123,7 @@ fn new_revid(deleted: bool, parent: Option<&Rev>, body: &Value) -> [u8; 16] {
 }
 
 /// Like [`new_revid`], for the members of a whole document: every key that is
-/// not in [`META_FIELDS`](crate::db::META_FIELDS) is the body, in order. The
+/// not in [`META_FIELDS`] is the body, in order. The
 /// hash is fed without building the body or its term.
 pub fn new_revid_doc(
     deleted: bool,
@@ -136,7 +149,7 @@ pub fn new_revid_doc(
         &mut hasher,
         &head,
         doc.iter()
-            .filter(|(key, _)| !crate::db::META_FIELDS.contains(&key.as_str())),
+            .filter(|(key, _)| !META_FIELDS.contains(&key.as_str())),
     );
     hasher.finalize().into()
 }
@@ -282,7 +295,7 @@ mod tests {
         let parent = Rev::parse("3-aabbccddeeff00112233445566778899").unwrap();
         for doc in &docs {
             let mut body = doc.clone();
-            body.retain(|k, _| !crate::db::META_FIELDS.contains(&k.as_str()));
+            body.retain(|k, _| !META_FIELDS.contains(&k.as_str()));
             let body = Value::Object(body);
             for deleted in [false, true] {
                 for parent in [None, Some(&parent)] {

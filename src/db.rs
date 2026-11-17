@@ -21,18 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Fields CouchDB strips before hashing a document body.
-pub const META_FIELDS: [&str; 9] = [
-    "_id",
-    "_rev",
-    "_revisions",
-    "_deleted",
-    "_attachments",
-    "_conflicts",
-    "_deleted_conflicts",
-    "_revs_info",
-    "_local_seq",
-];
+pub use crate::rev::META_FIELDS;
 
 /// Names of the database's own settings, kept in the settings table of
 /// shard 0 beside that shard's own.
