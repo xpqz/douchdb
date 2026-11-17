@@ -1576,6 +1576,7 @@ mod tests {
             matches!(failed, crate::store::ShardState::Failed(_)),
             "{failed:?}"
         );
+        assert!(handle.gate.is_shut());
         // A request asks for a retry, which must not reopen the file.
         assert!(handle.lease(|s| Ok(s.txn.len(Table::Meta)?)).await.is_err());
         assert!(handle.barrier().await.unwrap().is_err());
