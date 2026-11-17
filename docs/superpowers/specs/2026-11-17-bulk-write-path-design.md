@@ -1,6 +1,6 @@
 # Bulk write path: as fast as redb allows
 
-Date: 2026-11-17. Status: draft for approval.
+Date: 2026-11-17. Status: approved 2026-11-17; implemented (see docs/performance.md, 'Bulk write path against the redb floor').
 
 ## Intent
 

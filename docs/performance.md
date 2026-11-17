@@ -213,8 +213,11 @@ Column definitions:
   beginning the transaction, so its jobs/insert reads slightly low.
 - **Now** is `8dbade9`, the build with the staging trimmed. It ran in the
   same rounds as `4d1f3d1` (the work before the staging was trimmed) and the
-  floor. The later `2c03501` adds a `Rev::parse` only on the update path,
-  which this create-only import never reaches.
+  floor. The head was not re-measured. The later `2c03501` and `4f67e2b`
+  change only an edit over a revision at position `u64::MAX`, plus a
+  `checked_add` for the next position, in `prepare` (before the shard job,
+  off the actor) and in the shard's staging (one add per document, on the
+  actor).
 - **Now ÷ 4d1f3d1** is the median of the same-round ratios of job time.
 - **docs/s** is end to end, the floor's docs/s in parentheses.
 
@@ -245,6 +248,20 @@ Conditions:
   single rounds vary widely (q2/10,000/1: 0.98–1.34). Read docs/s as
   indicative only. The jobs/insert ratios come from the same round, and the
   sync and byte counts are exact.
+
+Caveat on the floor: it is not a strict lower bound.
+`examples/redb_floor.rs` inserts the body, by_seq and meta rows of each
+document in turn, interleaving the three tables, and its insert span also
+times opening SETTINGS and the two settings inserts. douchdb writes table by
+table, and its settings writes fall in `commit_us`, not `jobs_us`. Ratios near
+or below 1 (the q=2 rows at 0.90 and 0.96) therefore partly reflect the floor,
+and q1/1,000/1 (median 1.146) is at the limit within measurement precision,
+not clearly under it. Aligning the floor and re-measuring is issue #95.
+
+End to end, with one client, douchdb runs at 0.53-0.94x the floor's docs/s
+(q1: 0.82, 0.64, 0.58; q2: 0.94, 0.79, 0.53 at 250, 1,000 and 10,000
+documents), up from roughly 0.42-0.69. The gap is request parsing and HTTP,
+which the floor does not pay.
 
 What the numbers say:
 

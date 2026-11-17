@@ -1471,7 +1471,8 @@ impl<'s> ShardTxn<'s> {
         K::SelfType<'k>: KeyBytes,
     {
         let journaled = self.journaled.len();
-        (self.journaled).extend(entries.clone().map(|(key, _)| (table, key.key_bytes())));
+        self.journaled
+            .extend(entries.clone().map(|(key, _)| (table, key.key_bytes())));
         if self.journaled.len() == journaled {
             return Ok(());
         }
@@ -1507,7 +1508,8 @@ impl<'s> ShardTxn<'s> {
         K::SelfType<'k>: KeyBytes,
     {
         let journaled = self.journaled.len();
-        (self.journaled).extend(keys.clone().map(|key| (table, key.key_bytes())));
+        self.journaled
+            .extend(keys.clone().map(|key| (table, key.key_bytes())));
         if self.journaled.len() == journaled {
             return Ok(());
         }
