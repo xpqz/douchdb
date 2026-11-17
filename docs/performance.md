@@ -211,8 +211,10 @@ Column definitions:
   the rounds.
 - **Before** is `3210349`, measured before the job timer also counted
   beginning the transaction, so its jobs/insert reads slightly low.
-- **Now** is the head of the bulk write path. It ran in the same rounds as
-  `4d1f3d1` (the work before the staging was trimmed) and the floor.
+- **Now** is `8dbade9`, the build with the staging trimmed. It ran in the
+  same rounds as `4d1f3d1` (the work before the staging was trimmed) and the
+  floor. The later `2c03501` adds a `Rev::parse` only on the update path,
+  which this create-only import never reaches.
 - **Now ÷ 4d1f3d1** is the median of the same-round ratios of job time.
 - **docs/s** is end to end, the floor's docs/s in parentheses.
 
@@ -238,16 +240,18 @@ Conditions:
 - Now: 5 interleaved rounds per one-client configuration and 3 per
   four-client one, with the order of the two builds rotated each round.
 - The q=1 rows ran at load averages of 2–3 and their rounds agree closely
-  (q1/1,000/1: 1.13–1.15). The q=2 rows ran at load averages of 10–37 and
+  (q1/1,000/1: 1.12–1.16; one round in five, at 1.155, was over 1.15, and the
+  median, 1.146, passes). The q=2 rows ran at load averages of 10–37 and
   single rounds vary widely (q2/10,000/1: 0.98–1.34). Read docs/s as
   indicative only. The jobs/insert ratios come from the same round, and the
   sync and byte counts are exact.
 
 What the numbers say:
 
-- **Job time.** With one client the shard actor's job time is now 0.90–1.15×
-  the floor's insert time, against a goal of 1.15×, which it meets at every
-  size and q; q=1 with 1,000 documents is just under the limit, at 1.146. It
+- **Job time.** With one client the shard actor's median job time is now
+  0.90–1.146× the floor's insert time, against a goal of 1.15×, which the
+  medians meet at every size and q; q=1 with 1,000 documents is just under the
+  limit, at 1.146. It
   was 2.0–3.6× before the bulk write path work, and `4d1f3d1` measured
   1.47–1.84× in the same rounds (1.35–1.72× in an earlier, more loaded run).
   The trimmed staging alone cut job time by 26–38% against `4d1f3d1` in the
@@ -255,7 +259,7 @@ What the numbers say:
   - A sampled profile of the shard actor at q=1, one client, splits the job
     as follows. The inserts (bodies, by_seq, metadata) are 79–89% of it.
     Staging, which includes building the tree, encoding the record and
-    pruning, is 9–16%, down from 26–41%. Reading the metadata is 3–6%.
+    pruning, is 8–16%, down from 26–41%. Reading the metadata is 2–6%.
   - With four clients a group serves 2.2–3.4 requests and its job time is
     0.91–1.62× the floor's; those rows are not judged against the goal.
 - **Syncs and bytes.**
@@ -267,14 +271,16 @@ What the numbers say:
   - With four clients a group serves 2.2–3.4 requests (3.2 at 10,000 documents),
     so its syncs and bytes per commit are not comparable with the floor's
     single batch.
-- **Sorted inserts were measured and not kept.** Sorting each job's bodies by
+- **Sorted inserts were measured and not kept.** They were measured on
+  `4d1f3d1`, before the staging was trimmed. Sorting each job's bodies by
   `(id, rev)` and its metadata by id before inserting had these effects:
   - It cut bytes per commit by 8–16% everywhere.
   - It cut job time at 10,000 documents with one client, by 16% at q=1 and
     32% at q=2 (paired medians).
   - It made q=1, 10,000 documents, four clients 23% slower. That held in 10 of
     13 paired rounds, including rounds with the build order alternated.
-  - The rule for keeping it was a gain at every 10,000-document configuration.
+  - The rule for keeping it was a gain of at least 10% at 10,000 documents and
+    no loss at 250 or 1,000; the four-client loss at 10,000 failed it.
 
 ## JavaScript sandbox throughput
 
