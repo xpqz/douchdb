@@ -4258,7 +4258,7 @@ impl Stage<'_, '_> {
             None => Vec::new(),
         };
         let parent = parent.as_deref().and_then(Rev::parse);
-        let pos = parent.as_ref().map_or(0, |p| p.pos) + 1;
+        let pos = parent.as_ref().map_or(0, |p| p.pos).wrapping_add(1);
 
         // The prepared revision is for the client's parent. Without `_rev`
         // over a deleted winner the parent is the winner, and the revision is
@@ -4280,13 +4280,21 @@ impl Stage<'_, '_> {
             }
         };
 
-        let meta = slot.staging();
-        if parent_path.is_empty() {
-            meta.tree.merge_root(rev.clone(), deleted);
+        // Past the last position the revision does not parse: the edit fails
+        // before anything is staged.
+        let path = if parent_path.is_empty() {
+            None
         } else {
+            let leaf =
+                Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
             let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
-            path.extend(Rev::parse(&rev));
-            meta.tree.merge_path(&path, deleted);
+            path.push(leaf);
+            Some(path)
+        };
+        let meta = slot.staging();
+        match path {
+            None => meta.tree.merge_root(rev.clone(), deleted),
+            Some(path) => meta.tree.merge_path(&path, deleted),
         }
         let old_seq = meta.seq;
         let seq = self.next_seq();
@@ -5759,6 +5767,51 @@ mod tests {
         assert!(results.iter().all(|(_, result)| result.is_ok()));
         let opened = opens(&mut shard) - before;
         assert!(opened <= 5, "{opened} table opens");
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// An edit over a revision at the last position has no next position:
+    /// the document fails and nothing of it is stored.
+    #[test]
+    fn an_edit_past_the_last_position_fails_its_document() {
+        let file = crate::store::tests::temp_file("last-position");
+        let mut shard = crate::store::tests::open(&file);
+        let last = format!("{}-a", u64::MAX);
+        let put = |shard: &mut crate::store::Shard, doc: Value, new_edits: bool| {
+            let job = vec![(0, prepare(&doc, doc_id(&doc).unwrap(), new_edits).unwrap())];
+            let mut out = shard
+                .write(move |s| Ok(put_many(s, job, new_edits, HashMap::new())))
+                .unwrap();
+            out.pop().unwrap().1
+        };
+        put(&mut shard, json!({"_id": "x", "_rev": last}), false).unwrap();
+        let before = shard
+            .read(|s| {
+                Ok((
+                    serde_json::to_string(&s.get_meta("x")?).unwrap(),
+                    s.by_seq()?,
+                ))
+            })
+            .unwrap();
+        for deleted in [false, true] {
+            let edit = json!({"_id": "x", "_rev": last, "_deleted": deleted});
+            let error = put(&mut shard, edit, true).unwrap_err();
+            assert_eq!(
+                (error.status, error.reason.as_str()),
+                (400, "Invalid rev format")
+            );
+        }
+        let after = shard
+            .read(|s| {
+                Ok((
+                    serde_json::to_string(&s.get_meta("x")?).unwrap(),
+                    s.by_seq()?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(after, before);
         drop(shard);
         crate::kv::forget_verified(&file);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
