@@ -180,6 +180,89 @@ Caveats:
 - Concurrent single-document writes share commits poorly under the synced
   group commit; that is issue #90.
 
+### Bulk write path against the redb floor
+
+`scripts/bulk_bench.py` imports the airline fixture (150,959 documents)
+through `_bulk_docs` into a fresh single node, and interleaves the import with
+`examples/redb_floor`. The floor is a bare redb program that writes the same
+stored bytes, in the same tables and batches, with the same two-phase
+`Immediate` commits. The shard figures come from the `shard` counters of
+`/_node/_local/_metrics`.
+
+The bulk write path work moved per-document work off the shard actor. It also
+commits a request's shards concurrently, streams the revision hash into MD5,
+opens each table once per job, and starts the local and remote cluster writes
+together.
+
+Column definitions:
+
+- **jobs/insert** is the shard actors' job time (`shard.jobs_us`, syncs
+  excluded) divided by the floor's insert time (begin to last insert, syncs
+  excluded), both per document and from the same round. It is the median over
+  the rounds.
+- **Before** is `3210349`, measured before the job timer also counted
+  beginning the transaction, so its jobs/insert reads slightly low.
+- **After** is `4d1f3d1`.
+- **docs/s** is end to end, the floor's docs/s in parentheses.
+
+| q / batch / clients | Before docs/s | After docs/s | Before jobs/insert | After jobs/insert | After syncs/commit (douchdb / floor) | After KB/commit (douchdb / floor) |
+|---|---:|---:|---:|---:|---:|---:|
+| q1 / 250 / 1 | 8,511 (12,326) | 11,449 (16,504) | 3.31 | 1.72 | 2.02 / 2.02 | 881 / 897 |
+| q1 / 1,000 / 1 | 18,056 (35,865) | 16,469 (26,140) | 3.58 | 1.52 | 2.09 / 2.09 | 2,588 / 2,651 |
+| q1 / 10,000 / 1 | 21,002 (49,459) | 25,669 (45,566) | 2.68 | 1.40 | 2.81 / 2.81 | 41,434 / 41,189 |
+| q2 / 250 / 1 | 5,998 (9,343) | 8,214 (11,185) | 3.30 | 1.59 | 2.02 / 2.02 | 474 / 482 |
+| q2 / 1,000 / 1 | 14,088 (31,064) | 16,203 (26,815) | 2.51 | 1.60 | 2.08 / 2.08 | 1,308 / 1,336 |
+| q2 / 10,000 / 1 | 18,441 (37,732) | 27,720 (49,858) | 2.03 | 1.35 | 2.75 / 2.75 | 16,834 / 16,567 |
+| q1 / 250 / 4 | 14,985 (12,326) | 24,941 (16,504) | 3.08 | 1.65 | 2.07 / 2.02 | 2,310 / 897 |
+| q1 / 1,000 / 4 | 25,296 (35,865) | 20,146 (26,140) | 3.52 | 2.89 | 2.33 / 2.09 | 11,950 / 2,651 |
+| q1 / 10,000 / 4 | 20,004 (49,459) | 34,341 (45,566) | 3.02 | 1.47 | 4.60 / 2.81 | 131,666 / 41,189 |
+| q2 / 250 / 4 | 14,960 (9,343) | 16,803 (11,185) | 3.09 | 1.36 | 2.04 / 2.02 | 844 / 482 |
+| q2 / 1,000 / 4 | 21,184 (31,064) | 33,749 (26,815) | 2.09 | 1.35 | 2.21 / 2.08 | 3,278 / 1,336 |
+| q2 / 10,000 / 4 | — | 48,014 (49,858) | — | 1.88 | 4.40 / 2.75 | 63,870 / 16,567 |
+
+Conditions:
+
+- Release builds, `--n 1`, `--cache-mb 16` (the floor's cache is the same).
+- Apple M2 Pro, data on an external APFS disk.
+- The machine was heavily loaded throughout, with load averages of 11–57.
+- Before is one round per configuration.
+- After is the median of 3 interleaved rounds per configuration, except:
+  - q1/250 has 7 rounds;
+  - q2/10,000 has 7 rounds;
+  - q1/10,000 has 13 rounds.
+- Under that load, single rounds varied by up to 2×. Read docs/s as
+  indicative only. The jobs/insert ratios come from the same round, and the
+  sync and byte counts are exact.
+
+What the numbers say:
+
+- **Job time.** The shard actor's job time fell from 2.0–3.6× the floor's
+  insert time to 1.35–1.72× with one client.
+  - The goal was 1.15×, so it is not met at any batch size or q.
+  - A sampled profile of the shard actor at q=1, one client, accounts for the
+    rest. Its inserts (bodies, by_seq, metadata) cost 5.6, 5.8 and
+    11.2 µs/doc at 250, 1,000 and 10,000 documents per batch, about the
+    floor's whole insert time.
+  - The excess is staging, 4.7–5.7 µs/doc. `RevTree::merge_path` is
+    1.5–1.8 µs/doc of it. Reading the metadata, pruning and encoding the
+    record are together 0.6–1.0 µs/doc. The rest is spread across hashing,
+    allocation and formatting.
+- **Syncs and bytes.**
+  - With one client, syncs per commit equal the floor's at every size and q.
+  - Bytes per commit are within 2% of the floor's: 1–3% under at 250 and
+    1,000 documents, 0.6–1.7% over at 10,000.
+  - With four clients a group serves 2–4 requests (3.2 at 10,000 documents),
+    so its syncs and bytes per commit are not comparable with the floor's
+    single batch.
+- **Sorted inserts were measured and not kept.** Sorting each job's bodies by
+  `(id, rev)` and its metadata by id before inserting had these effects:
+  - It cut bytes per commit by 8–16% everywhere.
+  - It cut job time at 10,000 documents with one client, by 16% at q=1 and
+    32% at q=2 (paired medians).
+  - It made q=1, 10,000 documents, four clients 23% slower. That held in 10 of
+    13 paired rounds, including rounds with the build order alternated.
+  - The rule for keeping it was a gain at every 10,000-document configuration.
+
 ## JavaScript sandbox throughput
 
 Design-document map/reduce/search-index work can run in four places: in-process
