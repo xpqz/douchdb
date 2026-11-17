@@ -43,28 +43,18 @@ impl Serialize for Body<'_> {
 
 /// Split a client document into its metadata and body, with the errors and
 /// in the order `couch_doc` reports them, serialise its body and, for a new
-/// edit, compute its revision id.
-pub(crate) fn prepare(doc: &Value, new_edits: bool) -> DbResult<Prepared> {
+/// edit, compute its revision id. `id` is the document's id as the caller
+/// checked it, generated when the document has no `_id`.
+pub(crate) fn prepare(doc: &Value, id: String, new_edits: bool) -> DbResult<Prepared> {
     validate_doc(doc)?;
     let Some(obj) = doc.as_object() else {
         return Err(ApiError::bad_request("Document must be a JSON object"));
     };
-    let mut id = None;
     let mut rev = None;
     let mut deleted = false;
     let mut revisions = None;
     for (key, value) in obj {
         match key.as_str() {
-            "_id" => match value {
-                Value::String(s) => id = Some(s),
-                _ => {
-                    return Err(ApiError::new(
-                        400,
-                        "illegal_docid",
-                        "Document id must be a string",
-                    ))
-                }
-            },
             "_rev" => match value {
                 Value::String(s) => rev = Some(s),
                 _ => return Err(ApiError::bad_request("Invalid rev format")),
@@ -73,14 +63,6 @@ pub(crate) fn prepare(doc: &Value, new_edits: bool) -> DbResult<Prepared> {
             "_revisions" => revisions = Some(value),
             _ => {}
         }
-    }
-    let id = id.cloned().unwrap_or_else(crate::util::uuid);
-    if id.is_empty() {
-        return Err(ApiError::new(
-            400,
-            "illegal_docid",
-            "Document id must not be empty",
-        ));
     }
     let body = serde_json::to_vec(&Body(obj)).map_err(ApiError::internal)?;
     let members = id.starts_with("_design/").then(|| {
@@ -116,83 +98,174 @@ pub(crate) fn prepare(doc: &Value, new_edits: bool) -> DbResult<Prepared> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::split_doc;
     use serde_json::json;
 
-    fn same_error(got: &crate::error::ApiError, want: &crate::error::ApiError) {
-        assert_eq!(
-            (got.status, got.error, &got.reason),
-            (want.status, want.error, &want.reason)
-        );
+    fn prepared(doc: &Value, new_edits: bool) -> Prepared {
+        let id = doc["_id"].as_str().unwrap().to_string();
+        prepare(doc, id, new_edits).unwrap_or_else(|e| panic!("{doc}: {e:?}"))
     }
 
     #[test]
-    fn prepare_matches_split_doc() {
-        let cases: Vec<Value> =
-            serde_json::from_str(include_str!("../tests/golden/bulk_write.json")).unwrap();
-        let mut docs: Vec<(Value, bool)> = Vec::new();
-        for case in &cases {
-            for request in case["requests"].as_array().unwrap() {
-                let new_edits = request["new_edits"].as_bool().unwrap();
-                for doc in request["docs"].as_array().unwrap() {
-                    docs.push((doc.clone(), new_edits));
-                }
-            }
-        }
-        // Nothing but metadata: the body is `{}`.
-        docs.push((
-            json!({"_id": "m", "_rev": "1-a", "_deleted": true, "_conflicts": []}),
-            true,
-        ));
-        docs.push((json!({"_id": "r", "_replication_id": "x", "k": 1}), true));
-        let mut checked = 0;
-        for (doc, new_edits) in docs {
-            let prepared = prepare(&doc, new_edits);
-            match split_doc(doc.clone()) {
-                Ok(split) => {
-                    let prepared = prepared.unwrap_or_else(|e| panic!("{doc}: {e:?}"));
-                    assert_eq!(prepared.id, split.id, "{doc}");
-                    assert_eq!(prepared.rev, split.rev, "{doc}");
-                    assert_eq!(prepared.deleted, split.deleted, "{doc}");
-                    let revisions = if new_edits { None } else { split.revisions };
-                    assert_eq!(prepared.revisions, revisions, "{doc}");
-                    let design = split.id.starts_with("_design/");
-                    assert_eq!(
-                        prepared.members.as_ref(),
-                        design.then_some(&split.body),
-                        "{doc}"
-                    );
-                    assert_eq!(
-                        prepared.body,
-                        serde_json::to_vec(&Value::Object(split.body)).unwrap(),
-                        "{doc}"
-                    );
-                    checked += 1;
-                }
-                Err(want) => same_error(&prepared.err().unwrap(), &want),
-            }
-        }
-        assert!(checked > 20, "{checked}");
-    }
-
-    #[test]
-    fn prepare_errors_match_split_doc() {
-        let docs = [
-            json!([1]),
-            json!("doc"),
-            json!({"_id": 5}),
-            json!({"_id": "a", "_rev": 1}),
-            json!({"_id": ""}),
-            json!({"_id": "a", "_attachments": {}}),
-            json!({"_id": "a", "_bogus": 1}),
-            json!({"_id": "a", "_deleted": "yes"}),
-            json!({"_id": "a", "_revisions": {"start": "x"}}),
+    fn prepare_splits_metadata_from_the_body() {
+        let upper = "2-AABBCCDDEEFF00112233445566778899";
+        let lower = "2-aabbccddeeff00112233445566778899";
+        let revisions = json!({"start": 2, "ids": ["aabbccddeeff00112233445566778899", "b"]});
+        // (document, new_edits, rev, deleted, revisions, body)
+        let cases = [
+            (
+                json!({"_id": "a", "n": 1}),
+                true,
+                None,
+                false,
+                None,
+                r#"{"n":1}"#,
+            ),
+            (
+                json!({"_id": "a", "n": 1}),
+                false,
+                None,
+                false,
+                None,
+                r#"{"n":1}"#,
+            ),
+            (
+                json!({"z": 1, "_id": "c", "a": {"y": 2, "b": [3, 1]}, "s": "\u{e9}"}),
+                true,
+                None,
+                false,
+                None,
+                r#"{"z":1,"a":{"y":2,"b":[3,1]},"s":"é"}"#,
+            ),
+            (
+                json!({"_id": "a", "_rev": upper, "v": 2}),
+                true,
+                Some(lower),
+                false,
+                None,
+                r#"{"v":2}"#,
+            ),
+            (
+                json!({"_id": "a", "_rev": upper, "v": 2}),
+                false,
+                Some(upper),
+                false,
+                None,
+                r#"{"v":2}"#,
+            ),
+            (
+                json!({"_id": "a", "_rev": lower, "_deleted": true, "why": "kept"}),
+                true,
+                Some(lower),
+                true,
+                None,
+                r#"{"why":"kept"}"#,
+            ),
+            // Nothing but metadata: the body is `{}`.
+            (
+                json!({"_id": "m", "_rev": "1-a", "_deleted": true, "_conflicts": [], "_revisions": revisions}),
+                true,
+                Some("1-a"),
+                true,
+                None,
+                "{}",
+            ),
+            (
+                json!({"_id": "m", "_rev": "1-a", "_deleted": true, "_conflicts": [], "_revisions": revisions}),
+                false,
+                Some("1-a"),
+                true,
+                Some(revisions.clone()),
+                "{}",
+            ),
+            (
+                json!({"_id": "r", "_replication_id": "x", "k": 1}),
+                true,
+                None,
+                false,
+                None,
+                r#"{"_replication_id":"x","k":1}"#,
+            ),
+            (
+                json!({"_id": "a", "_deleted": false, "big": 1.0, "n": -0.0}),
+                false,
+                None,
+                false,
+                None,
+                r#"{"big":1.0,"n":-0.0}"#,
+            ),
         ];
-        for doc in docs {
+        for (doc, new_edits, rev, deleted, revisions, body) in cases {
+            let prepared = prepared(&doc, new_edits);
+            assert_eq!(prepared.id, doc["_id"].as_str().unwrap(), "{doc}");
+            assert_eq!(prepared.rev.as_deref(), rev, "{doc} {new_edits}");
+            assert_eq!(prepared.deleted, deleted, "{doc}");
+            assert_eq!(prepared.revisions, revisions, "{doc} {new_edits}");
+            assert_eq!(String::from_utf8(prepared.body).unwrap(), body, "{doc}");
+            assert_eq!(prepared.members, None, "{doc}");
+        }
+    }
+
+    #[test]
+    fn prepare_keeps_design_members() {
+        let doc = json!({"_id": "_design/d", "_rev": "1-a", "views": {"v": {"map": "f"}}, "language": "javascript"});
+        for new_edits in [true, false] {
+            let prepared = prepared(&doc, new_edits);
+            let members = json!({"views": {"v": {"map": "f"}}, "language": "javascript"});
+            assert_eq!(prepared.members.as_ref(), members.as_object());
+            assert_eq!(
+                String::from_utf8(prepared.body).unwrap(),
+                r#"{"views":{"v":{"map":"f"}},"language":"javascript"}"#
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_rejects_malformed_documents() {
+        let bad_request = (400, "bad_request");
+        let doc_validation = (400, "doc_validation");
+        let cases = [
+            (json!([1]), bad_request, "Document must be a JSON object"),
+            (json!("doc"), bad_request, "Document must be a JSON object"),
+            (
+                json!({"_id": "a", "_rev": 1}),
+                bad_request,
+                "Invalid rev format",
+            ),
+            (
+                json!({"_id": "a", "_attachments": {}}),
+                bad_request,
+                "douchdb does not support attachments",
+            ),
+            (
+                json!({"_id": "a", "_bogus": 1}),
+                doc_validation,
+                "Bad special document member: _bogus",
+            ),
+            (
+                json!({"_id": "a", "_deleted": "yes"}),
+                doc_validation,
+                "Bad special document member: _deleted",
+            ),
+            (
+                json!({"_id": "a", "_revisions": {"start": "x"}}),
+                doc_validation,
+                "_revisions.start isn't an integer.",
+            ),
+            // The members are checked before `_rev`'s type.
+            (
+                json!({"_id": "a", "_rev": 1, "_bogus": 1}),
+                doc_validation,
+                "Bad special document member: _bogus",
+            ),
+        ];
+        for (doc, (status, error), reason) in cases {
             for new_edits in [true, false] {
-                let want = split_doc(doc.clone()).err().unwrap();
-                let got = prepare(&doc, new_edits).err().unwrap();
-                same_error(&got, &want);
+                let got = prepare(&doc, "a".to_string(), new_edits).err().unwrap();
+                assert_eq!(
+                    (got.status, got.error, got.reason.as_str()),
+                    (status, error, reason),
+                    "{doc} {new_edits}"
+                );
             }
         }
     }
@@ -201,29 +274,24 @@ mod tests {
     fn prepared_hash_is_for_the_client_parent() {
         let parent = "2-aabbccddeeff00112233445566778899";
         let doc = json!({"_id": "a", "_rev": parent, "z": 1, "a": [1, 2]});
-        let prepared = prepare(&doc, true).unwrap();
         let want = new_revid_doc(false, Rev::parse(parent).as_ref(), doc.as_object().unwrap());
-        assert_eq!(prepared.rev_hash, Some(want));
+        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
 
         let doc = json!({"_id": "a", "_deleted": true, "k": "v"});
-        let prepared = prepare(&doc, true).unwrap();
         let want = new_revid_doc(true, None, doc.as_object().unwrap());
-        assert_eq!(prepared.rev_hash, Some(want));
+        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
 
         // An upper-case `_rev` names the same parent as its lower-case form.
         let doc = json!({"_id": "a", "_rev": "2-AABBCCDDEEFF00112233445566778899"});
-        let prepared = prepare(&doc, true).unwrap();
-        assert_eq!(prepared.rev.as_deref(), Some(parent));
         let want = new_revid_doc(false, Rev::parse(parent).as_ref(), doc.as_object().unwrap());
-        assert_eq!(prepared.rev_hash, Some(want));
+        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
 
         // A replicated write keeps its revision; the shard computes none.
-        let prepared = prepare(&doc, false).unwrap();
-        assert_eq!(
-            prepared.rev.as_deref(),
-            Some("2-AABBCCDDEEFF00112233445566778899")
-        );
-        assert_eq!(prepared.rev_hash, None);
+        assert_eq!(prepared(&doc, false).rev_hash, None);
+
+        // Not a revision: no hash, and the shard rejects the document.
+        let doc = json!({"_id": "a", "_rev": "nope"});
+        assert_eq!(prepared(&doc, true).rev_hash, None);
     }
 
     /// The shard recomputes a hash from the stored body bytes when it picks a
@@ -240,7 +308,7 @@ mod tests {
         let parent = Rev::parse("3-aabbccddeeff00112233445566778899").unwrap();
         for text in texts {
             let doc = crate::json::from_slice(text.as_bytes()).unwrap();
-            let prepared = prepare(&doc, true).unwrap();
+            let prepared = prepared(&doc, true);
             let decoded = crate::db::body_members(&prepared.body).unwrap();
             assert_eq!(
                 new_revid_doc(prepared.deleted, Some(&parent), &decoded),

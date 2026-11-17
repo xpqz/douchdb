@@ -39,6 +39,9 @@ pub const META_FIELDS: [&str; 9] = [
 const DB_SETTINGS: &str = "db/";
 /// A write with more documents than this prepares them on the blocking pool.
 const PREPARE_INLINE_MAX: usize = 1000;
+/// How many writes prepared their documents on the blocking pool.
+#[cfg(test)]
+static BLOCKING_PREPARES: AtomicU64 = AtomicU64::new(0);
 /// [`DbRecord`].
 const INFO_SETTING: &str = "db/info";
 /// The active [`ShardMap`].
@@ -1721,10 +1724,12 @@ impl Db {
         let prepare_all = move |pending: Vec<(usize, String, D)>| {
             pending
                 .into_iter()
-                .map(|(i, id, doc)| (i, id, prepare(doc.borrow(), new_edits)))
+                .map(|(i, id, doc)| (i, id.clone(), prepare(doc.borrow(), id, new_edits)))
                 .collect::<Vec<_>>()
         };
         let prepared = if pending.len() > PREPARE_INLINE_MAX {
+            #[cfg(test)]
+            BLOCKING_PREPARES.fetch_add(1, Ordering::SeqCst);
             tokio::task::spawn_blocking(move || prepare_all(pending))
                 .await
                 .map_err(ApiError::internal)?
@@ -4040,81 +4045,9 @@ fn doc_id(doc: &Value) -> DbResult<String> {
     }
 }
 
-/// A client document split into its metadata fields and its body: the
-/// reference for [`prepare`].
-#[cfg(test)]
-pub(crate) struct SplitDoc {
-    pub(crate) id: String,
-    pub(crate) rev: Option<String>,
-    pub(crate) deleted: bool,
-    pub(crate) revisions: Option<Value>,
-    pub(crate) body: Map<String, Value>,
-}
-
 /// The decoded body members of a stored or prepared body.
 pub(crate) fn body_members(body: &[u8]) -> DbResult<Map<String, Value>> {
     serde_json::from_slice(body).map_err(ApiError::internal)
-}
-
-#[cfg(test)]
-pub(crate) fn split_doc(doc: Value) -> DbResult<SplitDoc> {
-    /// `_id`/`_rev`/... are document metadata, not body. `_conflicts` and
-    /// friends are read-only decorations a client may echo back.
-    const META: [&str; 9] = META_FIELDS;
-
-    validate_doc(&doc)?;
-    let Value::Object(obj) = doc else {
-        return Err(ApiError::bad_request("Document must be a JSON object"));
-    };
-
-    let mut id = None;
-    let mut rev = None;
-    let mut deleted = false;
-    let mut revisions = None;
-    let mut body = Map::new();
-
-    // One ordered pass. `serde_json::Map::remove` is a `swap_remove`, which
-    // would silently reorder the body and change the revision hash.
-    for (key, value) in obj {
-        match key.as_str() {
-            "_id" => match value {
-                Value::String(s) => id = Some(s),
-                _ => {
-                    return Err(ApiError::new(
-                        400,
-                        "illegal_docid",
-                        "Document id must be a string",
-                    ))
-                }
-            },
-            "_rev" => match value {
-                Value::String(s) => rev = Some(s),
-                _ => return Err(ApiError::bad_request("Invalid rev format")),
-            },
-            "_deleted" => deleted = matches!(value, Value::Bool(true)),
-            "_revisions" => revisions = Some(value),
-            k if META.contains(&k) => {}
-            _ => {
-                body.insert(key, value);
-            }
-        }
-    }
-
-    let id = id.unwrap_or_else(uuid);
-    if id.is_empty() {
-        return Err(ApiError::new(
-            400,
-            "illegal_docid",
-            "Document id must not be empty",
-        ));
-    }
-    Ok(SplitDoc {
-        id,
-        rev,
-        deleted,
-        revisions,
-        body,
-    })
 }
 
 /// A stored revision tree whose parent links loop, reported as corruption.
@@ -5718,7 +5651,7 @@ mod tests {
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
         let docs = docs
             .iter()
-            .map(|doc| prepare(doc, true).unwrap())
+            .map(|doc| prepare(doc, doc_id(doc).unwrap(), true).unwrap())
             .enumerate()
             .collect();
         let results = shard
@@ -8597,12 +8530,17 @@ mod tests {
             .collect();
         docs[7] = json!({"_id": "bad", "_rev": 5});
         docs[8] = json!({"n": 8});
+        let blocking = BLOCKING_PREPARES.load(Ordering::SeqCst);
         let out = db.put_docs(docs, true).await.unwrap();
+        assert!(BLOCKING_PREPARES.load(Ordering::SeqCst) > blocking);
         assert_eq!(out.len(), count);
         for (i, result) in out.iter().enumerate() {
             let result = serde_json::to_value(result).unwrap();
             match i {
-                7 => assert_eq!(result["reason"], "Invalid rev format", "{result}"),
+                7 => {
+                    assert_eq!(result["id"], "bad", "{result}");
+                    assert_eq!(result["reason"], "Invalid rev format", "{result}");
+                }
                 8 => {
                     let id = result["id"].as_str().unwrap();
                     let doc = db.get_doc(id, &DocOpts::default()).await.unwrap();
