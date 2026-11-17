@@ -1,0 +1,750 @@
+[
+  {
+    "name": "new_docs",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "n": 1
+          },
+          {
+            "_id": "b",
+            "text": "x",
+            "nested": {
+              "k": [
+                1,
+                2
+              ],
+              "e": null
+            }
+          },
+          {
+            "_id": "_bad"
+          },
+          {
+            "_id": ""
+          },
+          {
+            "_id": "c",
+            "z": 1,
+            "a": 2
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-731bef401491606a3b246ed178e697c1"
+        },
+        {
+          "ok": true,
+          "id": "b",
+          "rev": "1-18d3eb39c474972b6d490acf35b0512e"
+        },
+        {
+          "error": "illegal_docid",
+          "reason": "Only reserved document ids may start with underscore."
+        },
+        {
+          "error": "illegal_docid",
+          "reason": "Document id must be a string"
+        },
+        {
+          "ok": true,
+          "id": "c",
+          "rev": "1-d52bdd402cc303c280999ab1bc128464"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-731bef401491606a3b246ed178e697c1",
+        "body": "{\"n\":1}"
+      },
+      {
+        "id": "b",
+        "rev": "1-18d3eb39c474972b6d490acf35b0512e",
+        "body": "{\"text\":\"x\",\"nested\":{\"k\":[1,2],\"e\":null}}"
+      },
+      {
+        "id": "c",
+        "rev": "1-d52bdd402cc303c280999ab1bc128464",
+        "body": "{\"z\":1,\"a\":2}"
+      }
+    ]
+  },
+  {
+    "name": "updates",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 1
+          },
+          {
+            "_id": "b",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "v": 2
+          },
+          {
+            "_id": "b",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "v": 2,
+            "extra": true
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "_rev": "2-d0df861eb528e79690cd2ff3c4d394f3",
+            "v": 3
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        },
+        {
+          "ok": true,
+          "id": "b",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "2-d0df861eb528e79690cd2ff3c4d394f3"
+        },
+        {
+          "ok": true,
+          "id": "b",
+          "rev": "2-e2dc8e8e24bb5566fffeaa649a900291"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "3-c50a32451890a3f1c3e423334cc92745"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "b",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "a",
+        "rev": "2-d0df861eb528e79690cd2ff3c4d394f3",
+        "body": "{\"v\":2}"
+      },
+      {
+        "id": "b",
+        "rev": "2-e2dc8e8e24bb5566fffeaa649a900291",
+        "body": "{\"v\":2,\"extra\":true}"
+      },
+      {
+        "id": "a",
+        "rev": "3-c50a32451890a3f1c3e423334cc92745",
+        "body": "{\"v\":3}"
+      }
+    ]
+  },
+  {
+    "name": "deletions",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 1
+          },
+          {
+            "_id": "b",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "_deleted": true
+          },
+          {
+            "_id": "b",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "_deleted": true,
+            "why": "kept body"
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "c",
+            "_deleted": true
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        },
+        {
+          "ok": true,
+          "id": "b",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "2-d9b15b235a7d0afdfe6058d5fb8afbd1"
+        },
+        {
+          "ok": true,
+          "id": "b",
+          "rev": "2-700e974acc0ca425566a0bf3ee8dedf4"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "c",
+          "rev": "1-de715bf126efc93d225d9e3f8e8eb81a"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "b",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "a",
+        "rev": "2-d9b15b235a7d0afdfe6058d5fb8afbd1",
+        "body": "{}"
+      },
+      {
+        "id": "b",
+        "rev": "2-700e974acc0ca425566a0bf3ee8dedf4",
+        "body": "{\"why\":\"kept body\"}"
+      },
+      {
+        "id": "c",
+        "rev": "1-de715bf126efc93d225d9e3f8e8eb81a",
+        "body": "{}"
+      }
+    ]
+  },
+  {
+    "name": "conflicts",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 2
+          },
+          {
+            "_id": "a",
+            "_rev": "1-00000000000000000000000000000000",
+            "v": 3
+          },
+          {
+            "_id": "a",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "v": 4
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "v": 5
+          },
+          {
+            "_id": "nope",
+            "_rev": "1-11111111111111111111111111111111"
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        }
+      ],
+      [
+        {
+          "id": "a",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        },
+        {
+          "id": "a",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        },
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "2-01133d22d49cabf2ef915469923909c4"
+        }
+      ],
+      [
+        {
+          "id": "a",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        },
+        {
+          "id": "nope",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "a",
+        "rev": "1-00000000000000000000000000000000",
+        "body": null
+      },
+      {
+        "id": "a",
+        "rev": "2-01133d22d49cabf2ef915469923909c4",
+        "body": "{\"v\":4}"
+      },
+      {
+        "id": "nope",
+        "rev": "1-11111111111111111111111111111111",
+        "body": null
+      }
+    ]
+  },
+  {
+    "name": "recreate_over_deleted_winner",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "_rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+            "_deleted": true
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": "again"
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "2-d9b15b235a7d0afdfe6058d5fb8afbd1"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "3-4ba47718d9d5234b684e4a38932f8c3e"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      },
+      {
+        "id": "a",
+        "rev": "2-d9b15b235a7d0afdfe6058d5fb8afbd1",
+        "body": "{}"
+      },
+      {
+        "id": "a",
+        "rev": "3-4ba47718d9d5234b684e4a38932f8c3e",
+        "body": "{\"v\":\"again\"}"
+      }
+    ]
+  },
+  {
+    "name": "same_id_twice",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "a",
+            "v": 1
+          },
+          {
+            "_id": "a",
+            "v": 2
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "a",
+          "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727"
+        },
+        {
+          "id": "a",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "a",
+        "rev": "1-7a7e4b29f3af401e69b6f86e4c26b727",
+        "body": "{\"v\":1}"
+      }
+    ]
+  },
+  {
+    "name": "design_conflict_beats_compile_error",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "_design/d",
+            "views": {
+              "v": {
+                "map": "function(doc){ emit(doc._id, 1); }"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "_design/d",
+            "views": {
+              "v": {
+                "map": "function(doc){ emit( }"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "_design/d",
+          "rev": "1-47c75ebbf8ea06011f2bb5ba67ce9075"
+        }
+      ],
+      [
+        {
+          "id": "_design/d",
+          "error": "conflict",
+          "reason": "Document update conflict."
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "_design/d",
+        "rev": "1-47c75ebbf8ea06011f2bb5ba67ce9075",
+        "body": "{\"views\":{\"v\":{\"map\":\"function(doc){ emit(doc._id, 1); }\"}}}"
+      }
+    ]
+  },
+  {
+    "name": "design_compile_error",
+    "requests": [
+      {
+        "new_edits": true,
+        "docs": [
+          {
+            "_id": "_design/e",
+            "views": {
+              "v": {
+                "map": "function(doc){ emit( }"
+              }
+            }
+          },
+          {
+            "_id": "_design/f",
+            "views": {
+              "v": {
+                "map": "function(doc){ emit(doc._id, null); }",
+                "reduce": "function(keys, values){ return ( }"
+              }
+            }
+          },
+          {
+            "_id": "ok",
+            "n": 1
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "id": "_design/e",
+          "error": "compilation_error",
+          "reason": "Compilation of the map function in the 'v' view failed: SyntaxError: unexpected token in expression: '}' (function(doc){ emit( })"
+        },
+        {
+          "id": "_design/f",
+          "error": "compilation_error",
+          "reason": "Compilation of the reduce function in the 'v' view failed: SyntaxError: unexpected token in expression: '}' (function(keys, values){ return ( })"
+        },
+        {
+          "ok": true,
+          "id": "ok",
+          "rev": "1-731bef401491606a3b246ed178e697c1"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "ok",
+        "rev": "1-731bef401491606a3b246ed178e697c1",
+        "body": "{\"n\":1}"
+      }
+    ]
+  },
+  {
+    "name": "replicated_body_bytes_preserved",
+    "requests": [
+      {
+        "new_edits": false,
+        "docs": [
+          {
+            "_id": "r",
+            "_rev": "2-9b2c4e7f0a1d3c5b7e9f1a2b3c4d5e6f",
+            "_revisions": {
+              "start": 2,
+              "ids": [
+                "9b2c4e7f0a1d3c5b7e9f1a2b3c4d5e6f",
+                "0123456789abcdef0123456789abcdef"
+              ]
+            },
+            "z": 1,
+            "a": {
+              "y": 2,
+              "b": 1
+            },
+            "big": 1.0000000000000000001,
+            "s": "é",
+            "arr": [
+              3,
+              1,
+              2
+            ]
+          },
+          {
+            "_id": "s",
+            "_rev": "1-fedcba9876543210fedcba9876543210",
+            "é": "ü",
+            "n": -0.0,
+            "e": 1e+400
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "r",
+          "rev": "2-9b2c4e7f0a1d3c5b7e9f1a2b3c4d5e6f"
+        },
+        {
+          "ok": true,
+          "id": "s",
+          "rev": "1-fedcba9876543210fedcba9876543210"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "r",
+        "rev": "2-9b2c4e7f0a1d3c5b7e9f1a2b3c4d5e6f",
+        "body": "{\"z\":1,\"a\":{\"y\":2,\"b\":1},\"big\":1.0000000000000000001,\"s\":\"é\",\"arr\":[3,1,2]}"
+      },
+      {
+        "id": "s",
+        "rev": "1-fedcba9876543210fedcba9876543210",
+        "body": "{\"é\":\"ü\",\"n\":-0.0,\"e\":1e+400}"
+      }
+    ]
+  },
+  {
+    "name": "replicated_known_rev",
+    "requests": [
+      {
+        "new_edits": false,
+        "docs": [
+          {
+            "_id": "k",
+            "_rev": "1-abcdefabcdefabcdefabcdefabcdefab",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": false,
+        "docs": [
+          {
+            "_id": "k",
+            "_rev": "1-abcdefabcdefabcdefabcdefabcdefab",
+            "v": 1
+          }
+        ]
+      },
+      {
+        "new_edits": false,
+        "docs": [
+          {
+            "_id": "k",
+            "_rev": "1-abcdefabcdefabcdefabcdefabcdefab",
+            "v": "different body"
+          }
+        ]
+      }
+    ],
+    "responses": [
+      [
+        {
+          "ok": true,
+          "id": "k",
+          "rev": "1-abcdefabcdefabcdefabcdefabcdefab"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "k",
+          "rev": "1-abcdefabcdefabcdefabcdefabcdefab"
+        }
+      ],
+      [
+        {
+          "ok": true,
+          "id": "k",
+          "rev": "1-abcdefabcdefabcdefabcdefabcdefab"
+        }
+      ]
+    ],
+    "stored_bodies": [
+      {
+        "id": "k",
+        "rev": "1-abcdefabcdefabcdefabcdefabcdefab",
+        "body": "{\"v\":1}"
+      }
+    ]
+  }
+]

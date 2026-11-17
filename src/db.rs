@@ -7,11 +7,12 @@
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
-use crate::rev::{new_revid, Rev};
+use crate::prepare::{prepare, Prepared};
+use crate::rev::{new_revid_doc, Rev};
 use crate::store::{
-    meta_state, DocMeta, DocRead, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn,
+    meta_state, DocMeta, DocRead, LiveDoc, MetaState, MetaWrite, PurgeInfo, ShardHandle, ShardTxn,
 };
-use crate::util::{hex, uuid};
+use crate::util::uuid;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -20,22 +21,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Fields CouchDB strips before hashing a document body.
-pub const META_FIELDS: [&str; 9] = [
-    "_id",
-    "_rev",
-    "_revisions",
-    "_deleted",
-    "_attachments",
-    "_conflicts",
-    "_deleted_conflicts",
-    "_revs_info",
-    "_local_seq",
-];
+pub use crate::rev::META_FIELDS;
 
 /// Names of the database's own settings, kept in the settings table of
 /// shard 0 beside that shard's own.
 const DB_SETTINGS: &str = "db/";
+/// A write with more documents than this prepares them on the blocking pool.
+const PREPARE_INLINE_MAX: usize = 1000;
+/// How many writes prepared their documents on the blocking pool.
+#[cfg(test)]
+static BLOCKING_PREPARES: AtomicU64 = AtomicU64::new(0);
 /// [`DbRecord`].
 const INFO_SETTING: &str = "db/info";
 /// The active [`ShardMap`].
@@ -1670,47 +1665,77 @@ impl Db {
 
     // ----- documents -------------------------------------------------------
 
-    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<WriteResult>> {
-        if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
+    pub async fn put_docs<D>(&self, docs: Vec<D>, new_edits: bool) -> DbResult<Vec<WriteResult>>
+    where
+        D: std::borrow::Borrow<Value> + Send + 'static,
+    {
+        if docs
+            .iter()
+            .any(|doc| doc.borrow().get("_attachments").is_some())
+        {
             return Err(attachments_unsupported());
         }
         let touches_design = docs.iter().any(|doc| {
-            doc.get("_id")
+            doc.borrow()
+                .get("_id")
                 .and_then(Value::as_str)
                 .map(|id| id.starts_with("_design/"))
                 .unwrap_or(false)
         });
         let mut out: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
-        let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
+        let mut grouped: Vec<Vec<(usize, Prepared)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
         let mut locals: Vec<(usize, Value)> = Vec::new();
+        let mut pending: Vec<(usize, String, D)> = Vec::new();
         for (i, doc) in docs.into_iter().enumerate() {
+            let value = doc.borrow();
             // `_local/` documents have no revision tree and no sequence; they
             // are applied to the shard of their id further down.
-            if doc
+            if value
                 .get("_id")
                 .and_then(Value::as_str)
                 .is_some_and(|id| id.starts_with("_local/"))
             {
-                locals.push((i, doc));
+                locals.push((i, value.clone()));
                 continue;
             }
-            match doc_id(&doc) {
+            match doc_id(value) {
                 Ok(id) => match self.validate_doc_id(&id) {
-                    Ok(()) => {
-                        ids[i] = Some(id.clone());
-                        grouped[self.shard_index(&id)].push((i, doc));
-                    }
+                    Ok(()) => pending.push((i, id, doc)),
                     Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
                 },
                 Err(e) => out[i] = Some(WriteResult::error(None, e)),
             }
         }
+        // Splitting, serialising and hashing happen here, not on the shard's
+        // writer; a large batch uses the blocking pool.
+        let prepare_all = move |pending: Vec<(usize, String, D)>| {
+            pending
+                .into_iter()
+                .map(|(i, id, doc)| (i, id.clone(), prepare(doc.borrow(), id, new_edits)))
+                .collect::<Vec<_>>()
+        };
+        let prepared = if pending.len() > PREPARE_INLINE_MAX {
+            #[cfg(test)]
+            BLOCKING_PREPARES.fetch_add(1, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || prepare_all(pending))
+                .await
+                .map_err(ApiError::internal)?
+        } else {
+            prepare_all(pending)
+        };
+        for (i, id, result) in prepared {
+            match result {
+                Ok(doc) => {
+                    let shard = self.shard_index(&doc.id);
+                    ids[i] = Some(doc.id.clone());
+                    grouped[shard].push((i, doc));
+                }
+                Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
+            }
+        }
 
-        // A shard error is held back until the validator cache is dropped:
-        // earlier shards may already have committed design documents.
-        let mut shard_error = None;
         // A design document's functions compile here, outside any shard job,
         // so the compile never holds a shard's writer.
         let mut compile_errors = if touches_design {
@@ -1718,22 +1743,27 @@ impl Db {
         } else {
             HashMap::new()
         };
-        for (shard_idx, batch) in grouped.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let verdicts: HashMap<usize, ApiError> = batch
-                .iter()
-                .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
-                .collect();
-            let results = match self.shards[shard_idx]
-                .call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
-                .await
-            {
+        // Every shard's batch is sent at once; each commits on its own.
+        let calls = grouped
+            .into_iter()
+            .enumerate()
+            .filter(|(_, batch)| !batch.is_empty())
+            .map(|(shard_idx, batch)| {
+                let verdicts: HashMap<usize, ApiError> = batch
+                    .iter()
+                    .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
+                    .collect();
+                self.shards[shard_idx].call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
+            });
+        // The lowest shard's error is held back until the validator cache is
+        // dropped: the other shards may have committed design documents.
+        let mut shard_error = None;
+        for answer in futures::future::join_all(calls).await {
+            let results = match answer {
                 Ok(results) => results,
                 Err(error) => {
-                    shard_error = Some(error);
-                    break;
+                    shard_error = shard_error.or(Some(error));
+                    continue;
                 }
             };
             for (i, result) in results {
@@ -3856,31 +3886,32 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
 /// skipped too, as `Stage::stage_replicated` never validates it.
 async fn compile_design_docs(
     shards: &[crate::store::ShardHandle],
-    grouped: &[Vec<(usize, Value)>],
+    grouped: &[Vec<(usize, Prepared)>],
     new_edits: bool,
 ) -> DbResult<HashMap<usize, ApiError>> {
     let mut pending: Vec<(usize, usize, Map<String, Value>)> = Vec::new();
+    // For `new_edits=false`: each candidate's id and revision fields.
+    let mut revs: HashMap<usize, (String, Option<String>, Option<Value>)> = HashMap::new();
     for (shard_idx, batch) in grouped.iter().enumerate() {
         for (i, doc) in batch {
-            let Some(obj) = doc.as_object() else { continue };
-            let Some(id) = obj.get("_id").and_then(Value::as_str) else {
+            let Some(members) = &doc.members else {
                 continue;
             };
-            let deleted = obj.get("_deleted") == Some(&Value::Bool(true));
-            if id.starts_with("_design/")
-                && compile_needed(obj)
-                && validate_design_doc(id, deleted, obj).is_ok()
+            if compile_needed(members) && validate_design_doc(&doc.id, doc.deleted, members).is_ok()
             {
-                pending.push((*i, shard_idx, obj.clone()));
+                pending.push((*i, shard_idx, members.clone()));
+                if !new_edits {
+                    revs.insert(*i, (doc.id.clone(), doc.rev.clone(), doc.revisions.clone()));
+                }
             }
         }
     }
     if !new_edits {
         for (shard_idx, shard) in shards.iter().enumerate() {
-            let candidates: Vec<(usize, Value)> = pending
+            let candidates: Vec<_> = pending
                 .iter()
                 .filter(|(_, owner, _)| *owner == shard_idx)
-                .map(|(i, _, doc)| (*i, Value::Object(doc.clone())))
+                .filter_map(|(i, _, _)| revs.remove(i).map(|fields| (*i, fields)))
                 .collect();
             if candidates.is_empty() {
                 continue;
@@ -3889,7 +3920,9 @@ async fn compile_design_docs(
                 .read(move |shard| {
                     Ok(candidates
                         .into_iter()
-                        .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
+                        .filter(|(_, (id, rev, revisions))| {
+                            replicated_is_stored(shard, id, rev.clone(), revisions.as_ref())
+                        })
                         .map(|(i, _)| i)
                         .collect::<Vec<usize>>())
                 })
@@ -3918,17 +3951,16 @@ fn compile_needed(obj: &Map<String, Value>) -> bool {
 /// Whether `Stage::stage_replicated` would find this replicated revision
 /// already stored, and so never validate it. Anything malformed is "not
 /// stored": the stage reports its own error for it.
-fn replicated_is_stored(shard: &mut ShardTxn, doc: Value) -> bool {
-    let Ok(SplitDoc {
-        id, rev, revisions, ..
-    }) = split_doc(doc)
-    else {
+fn replicated_is_stored(
+    shard: &mut ShardTxn,
+    id: &str,
+    rev: Option<String>,
+    revisions: Option<&Value>,
+) -> bool {
+    let Ok((rev, _)) = revisions_path(rev, revisions) else {
         return false;
     };
-    let Ok((rev, _)) = revisions_path(rev, revisions.as_ref()) else {
-        return false;
-    };
-    matches!(shard.get_meta(&id), Ok(Some(meta)) if meta.tree.contains(&rev))
+    matches!(shard.get_meta(id), Ok(Some(meta)) if meta.tree.contains(&rev))
 }
 
 /// Every compile of a view function with the name of the thread that ran it,
@@ -4004,73 +4036,9 @@ fn doc_id(doc: &Value) -> DbResult<String> {
     }
 }
 
-/// A client document split into its metadata fields and its body.
-struct SplitDoc {
-    id: String,
-    rev: Option<String>,
-    deleted: bool,
-    revisions: Option<Value>,
-    body: Map<String, Value>,
-}
-
-fn split_doc(doc: Value) -> DbResult<SplitDoc> {
-    /// `_id`/`_rev`/... are document metadata, not body. `_conflicts` and
-    /// friends are read-only decorations a client may echo back.
-    const META: [&str; 9] = META_FIELDS;
-
-    validate_doc(&doc)?;
-    let Value::Object(obj) = doc else {
-        return Err(ApiError::bad_request("Document must be a JSON object"));
-    };
-
-    let mut id = None;
-    let mut rev = None;
-    let mut deleted = false;
-    let mut revisions = None;
-    let mut body = Map::new();
-
-    // One ordered pass. `serde_json::Map::remove` is a `swap_remove`, which
-    // would silently reorder the body and change the revision hash.
-    for (key, value) in obj {
-        match key.as_str() {
-            "_id" => match value {
-                Value::String(s) => id = Some(s),
-                _ => {
-                    return Err(ApiError::new(
-                        400,
-                        "illegal_docid",
-                        "Document id must be a string",
-                    ))
-                }
-            },
-            "_rev" => match value {
-                Value::String(s) => rev = Some(s),
-                _ => return Err(ApiError::bad_request("Invalid rev format")),
-            },
-            "_deleted" => deleted = matches!(value, Value::Bool(true)),
-            "_revisions" => revisions = Some(value),
-            k if META.contains(&k) => {}
-            _ => {
-                body.insert(key, value);
-            }
-        }
-    }
-
-    let id = id.unwrap_or_else(uuid);
-    if id.is_empty() {
-        return Err(ApiError::new(
-            400,
-            "illegal_docid",
-            "Document id must not be empty",
-        ));
-    }
-    Ok(SplitDoc {
-        id,
-        rev,
-        deleted,
-        revisions,
-        body,
-    })
+/// The decoded body members of a stored or prepared body.
+pub(crate) fn body_members(body: &[u8]) -> DbResult<Map<String, Value>> {
+    serde_json::from_slice(body).map_err(ApiError::internal)
 }
 
 /// A stored revision tree whose parent links loop, reported as corruption.
@@ -4080,27 +4048,60 @@ fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
 
 fn put_many(
     shard: &mut ShardTxn,
-    docs: Vec<(usize, Value)>,
+    docs: Vec<(usize, Prepared)>,
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
 ) -> Vec<(usize, DbResult<WriteOk>)> {
-    let mut ops: Ops = Vec::new();
-    let mut staged: HashMap<String, DocMeta> = HashMap::new();
-    // What each staged document's record held in the shard before this batch.
-    let mut origin: HashMap<String, Option<MetaState>> = HashMap::new();
-    let mut results = Vec::new();
+    let mut ops: Ops = Vec::with_capacity(docs.len() * 2);
+    let mut results = Vec::with_capacity(docs.len());
+    // One slot per distinct id, in id order; `slot_of[k]` is the `k`th
+    // document's.
+    let mut by_id: Vec<usize> = (0..docs.len()).collect();
+    by_id.sort_unstable_by(|&a, &b| docs[a].1.id.cmp(&docs[b].1.id));
+    let mut ids: Vec<&str> = Vec::with_capacity(docs.len());
+    let mut slot_of = vec![0; docs.len()];
+    for k in by_id {
+        let id = docs[k].1.id.as_str();
+        if ids.last() != Some(&id) {
+            ids.push(id);
+        }
+        slot_of[k] = ids.len() - 1;
+    }
+    // Every document's stored metadata, read in one pass before staging. If
+    // a record cannot be read, each document reads its own instead, so the
+    // failure is only theirs.
+    let mut slots: Vec<Slot> = match shard.get_metas(&ids) {
+        Ok(metas) => metas
+            .into_iter()
+            .map(|meta| Slot {
+                meta: meta.unwrap_or_default(),
+                read: true,
+                origin: None,
+            })
+            .collect(),
+        Err(_) => ids.iter().map(|_| Slot::default()).collect(),
+    };
+    // The staged slots with their ids, in the order they were first staged.
+    let mut staged: Vec<(usize, String)> = Vec::with_capacity(slots.len());
 
-    for (i, doc) in docs {
+    for ((i, doc), k) in docs.into_iter().zip(slot_of) {
         let mark = ops.len();
+        let slot = &mut slots[k];
+        let was_staged = slot.origin.is_some();
         let mut ctx = Stage {
             shard,
             ops: &mut ops,
-            staged: &mut staged,
-            origin: &mut origin,
         };
-        match ctx.stage(doc, new_edits, compile_errors.remove(&i)) {
-            Ok(value) => results.push((i, Ok(value))),
+        match ctx.stage(doc, new_edits, compile_errors.remove(&i), slot) {
+            Ok(value) => {
+                if !was_staged && slot.origin.is_some() {
+                    staged.push((k, value.id.clone()));
+                }
+                results.push((i, Ok(value)));
+            }
             Err(e) => {
+                // Staging changes a slot only after its last fallible step.
+                debug_assert_eq!(slot.origin.is_some(), was_staged, "failed document staged");
                 ops.truncate(mark);
                 results.push((i, Err(e)));
             }
@@ -4113,24 +4114,26 @@ fn put_many(
     let limit = shard.revs_limit();
     // Each document's record is written once, here, in its final form.
     let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
-    for (id, meta) in staged.iter_mut() {
+    for (k, id) in staged {
+        let Slot {
+            mut meta, origin, ..
+        } = std::mem::take(&mut slots[k]);
         // The batch's bodies and sequence numbers are already staged, so a
         // tree that cannot be pruned fails the whole batch rather than being
         // written back as if it were valid.
         if let Err(e) = meta.tree.prune(limit) {
-            let message = corrupt_tree(id, e).reason;
+            let message = corrupt_tree(&id, e).reason;
             return results
                 .into_iter()
                 .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
                 .collect();
         }
-        if let Ok(bytes) = meta_bytes(meta) {
-            let old = origin.get(id).cloned().flatten();
+        if let Ok(bytes) = meta_bytes(&meta) {
             metas.push(MetaWrite {
-                id: id.clone(),
+                id,
                 bytes,
-                old,
-                new: meta_state(meta),
+                old: origin.flatten(),
+                new: meta_state(&meta),
                 seq: meta.seq,
             });
         }
@@ -4151,11 +4154,34 @@ fn put_many(
     results
 }
 
+/// One document id of a batch being staged.
+#[derive(Default)]
+struct Slot {
+    /// The document's metadata, empty when it has none: as stored until a
+    /// document of the batch is staged, then as staged.
+    meta: DocMeta,
+    /// Whether `meta` was read; false until then when the one-pass read
+    /// failed.
+    read: bool,
+    /// Set when the first document is staged: what the record held before
+    /// the batch.
+    origin: Option<Option<MetaState>>,
+}
+
+impl Slot {
+    /// The metadata to change for a document being staged; everything that
+    /// can fail must come first.
+    fn staging(&mut self) -> &mut DocMeta {
+        if self.origin.is_none() {
+            self.origin = Some(meta_state(&self.meta));
+        }
+        &mut self.meta
+    }
+}
+
 struct Stage<'a, 's> {
     shard: &'a mut ShardTxn<'s>,
     ops: &'a mut Ops,
-    staged: &'a mut HashMap<String, DocMeta>,
-    origin: &'a mut HashMap<String, Option<MetaState>>,
 }
 
 impl Stage<'_, '_> {
@@ -4163,68 +4189,55 @@ impl Stage<'_, '_> {
         self.shard.next_seq()
     }
 
-    fn meta(&mut self, id: &str) -> DbResult<Option<DocMeta>> {
-        if let Some(m) = self.staged.get(id) {
-            return Ok(Some(m.clone()));
-        }
-        let meta = self.shard.get_meta(id)?;
-        self.origin
-            .entry(id.to_string())
-            .or_insert_with(|| meta.as_ref().and_then(meta_state));
-        Ok(meta)
-    }
-
-    /// Record the document's new metadata. `put_many` writes it, once, after
-    /// the whole batch is staged and pruned.
-    fn flush_meta(&mut self, id: &str, meta: &DocMeta) {
-        self.staged.insert(id.to_string(), meta.clone());
-    }
-
     /// `compile_error` is the design document's compile verdict, computed
     /// before the shard job; it is raised where the structural check is.
     fn stage(
         &mut self,
-        doc: Value,
+        doc: Prepared,
         new_edits: bool,
         compile_error: Option<ApiError>,
+        slot: &mut Slot,
     ) -> DbResult<WriteOk> {
-        let doc = split_doc(doc)?;
-        let mut meta = self.meta(&doc.id)?.unwrap_or_default();
-        if !new_edits {
-            return self.stage_replicated(doc, meta, compile_error);
+        if !slot.read {
+            slot.meta = self.shard.get_meta(&doc.id)?.unwrap_or_default();
+            slot.read = true;
         }
-        let SplitDoc {
+        if !new_edits {
+            return self.stage_replicated(doc, slot, compile_error);
+        }
+        let Prepared {
             id,
-            rev: parent_rev,
+            rev: client_rev,
             deleted,
-            revisions: _,
             body,
+            members,
+            new_rev,
+            ..
         } = doc;
-        let parent_rev = parent_rev.map(|rev| canonical_rev(&rev));
-        let body = Value::Object(body);
+        let tree = &slot.meta.tree;
 
-        let parent = match parent_rev {
+        let parent = match &client_rev {
             Some(rev) => {
-                if Rev::parse(&rev).is_none() {
+                if Rev::parse(rev).is_none() {
                     return Err(ApiError::bad_request("Invalid rev format"));
                 }
-                if !meta.tree.contains(&rev) || !meta.tree.is_leaf(&rev) {
+                if !tree.contains(rev) || !tree.is_leaf(rev) {
                     return Err(ApiError::conflict());
                 }
-                if meta.tree.is_deleted(&rev) {
+                if tree.is_deleted(rev) {
                     return Err(ApiError::conflict());
                 }
-                Some(rev)
+                Some(rev.clone())
             }
-            None => match meta.tree.winner() {
-                Some(winner) if !meta.tree.is_deleted(&winner) => return Err(ApiError::conflict()),
+            None => match tree.winner() {
+                Some(winner) if !tree.is_deleted(&winner) => return Err(ApiError::conflict()),
                 other => other,
             },
         };
 
         // CouchDB validates a design document only once its revision is known
         // to be the right one: a conflict wins over a malformed member.
-        if let Value::Object(members) = &body {
+        if let Some(members) = &members {
             validate_design_doc(&id, deleted, members)?;
             if let Some(error) = compile_error {
                 return Err(error);
@@ -4232,26 +4245,42 @@ impl Stage<'_, '_> {
         }
 
         let parent_path = match parent.as_ref() {
-            Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
+            Some(p) => tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
             None => Vec::new(),
         };
-        let pos = parent
-            .as_ref()
-            .and_then(|p| Rev::parse(p).map(|r| r.pos))
-            .unwrap_or(0)
-            + 1;
+        let parent = parent.as_deref().and_then(Rev::parse);
+        let pos = parent.as_ref().map_or(0, |p| p.pos).checked_add(1);
 
-        let rev_id = hex(&new_revid(
-            deleted,
-            parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
-            &body,
-        ));
-        let rev = format!("{pos}-{rev_id}");
+        // The prepared revision is for the client's parent. Without `_rev`
+        // over a deleted winner the parent is the winner, and the revision is
+        // computed here, from the body.
+        let rev = match (new_rev, &client_rev, &parent) {
+            (Some(rev), Some(_), _) | (Some(rev), None, None) => rev,
+            _ => {
+                let members = match members {
+                    Some(members) => members,
+                    None => body_members(&body)?,
+                };
+                let hash = new_revid_doc(deleted, parent.as_ref(), &members);
+                // No revision follows one at the last position.
+                let pos = pos.ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
+                let leaf = Rev {
+                    pos,
+                    id: hash.to_vec(),
+                    hex: true,
+                };
+                leaf.to_string()
+            }
+        };
 
-        let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
-        path.push(Rev::parse(&rev).expect("valid rev"));
-
-        meta.tree.merge_path(&path, deleted);
+        let meta = slot.staging();
+        if parent_path.is_empty() {
+            meta.tree.merge_root(rev.clone(), deleted);
+        } else {
+            let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
+            path.extend(Rev::parse(&rev));
+            meta.tree.merge_path(&path, deleted);
+        }
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
@@ -4259,7 +4288,7 @@ impl Stage<'_, '_> {
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
-            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+            body,
         });
         self.ops.push(Op::Seq {
             seq,
@@ -4268,27 +4297,27 @@ impl Stage<'_, '_> {
         if old_seq != 0 {
             self.ops.push(Op::Unseq(old_seq));
         }
-        self.flush_meta(&id, &meta);
 
         Ok(WriteOk::new(id, rev))
     }
 
     fn stage_replicated(
         &mut self,
-        doc: SplitDoc,
-        mut meta: DocMeta,
+        doc: Prepared,
+        slot: &mut Slot,
         compile_error: Option<ApiError>,
     ) -> DbResult<WriteOk> {
-        let SplitDoc {
+        let Prepared {
             id,
             rev,
             deleted,
             revisions,
             body,
+            members,
+            ..
         } = doc;
-        let body = Value::Object(body);
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
-        let known = meta.tree.contains(&rev);
+        let known = slot.meta.tree.contains(&rev);
         // A revision that is only an ancestor on a stored path has no body
         // yet; the replicated write supplies it.
         if known && self.shard.get_body(&id, &rev)?.is_some() {
@@ -4297,7 +4326,7 @@ impl Stage<'_, '_> {
         // A replicated design document is validated too (couch_db:
         // prep_and_validate_replicated_updates), unless it is already stored.
         if !known {
-            if let Value::Object(members) = &body {
+            if let Some(members) = &members {
                 validate_design_doc(&id, deleted, members)?;
                 if let Some(error) = compile_error {
                     return Err(error);
@@ -4305,17 +4334,14 @@ impl Stage<'_, '_> {
             }
         }
 
-        let changed = !known;
-        if changed {
-            meta.tree.merge_path(&path, deleted);
-        }
-
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
-            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+            body,
         });
-        if changed {
+        if !known {
+            let meta = slot.staging();
+            meta.tree.merge_path(&path, deleted);
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
@@ -4326,7 +4352,6 @@ impl Stage<'_, '_> {
             if old_seq != 0 {
                 self.ops.push(Op::Unseq(old_seq));
             }
-            self.flush_meta(&id, &meta);
         }
 
         Ok(WriteOk::new(id, rev))
@@ -4431,29 +4456,25 @@ fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(meta)
 }
 
-/// A document's metadata record, with the state it replaces and the state it
-/// leaves.
-struct MetaWrite {
-    id: String,
-    bytes: Vec<u8>,
-    old: Option<MetaState>,
-    new: Option<MetaState>,
-    seq: u64,
-}
-
-/// Write a staged batch's operations and its documents' metadata records.
-/// Everything was read and validated while staging, so this only writes.
+/// Write a staged batch's operations and its documents' metadata records,
+/// opening each table once. Everything was read and validated while staging,
+/// so this only writes.
 fn commit_ops(shard: &mut ShardTxn, ops: Ops, metas: Vec<MetaWrite>) -> anyhow::Result<()> {
-    for op in ops {
+    let (mut bodies, mut seqs, mut unseqs) = (Vec::new(), Vec::new(), Vec::new());
+    for op in &ops {
         match op {
-            Op::Body { id, rev, body } => shard.put_body(&id, &rev, &body)?,
-            Op::Seq { seq, id } => shard.put_seq(seq, &id)?,
-            Op::Unseq(seq) => shard.remove_seq(seq)?,
+            Op::Body { id, rev, body } => bodies.push((id.as_str(), rev.as_str(), body.as_slice())),
+            Op::Seq { seq, id } => seqs.push((*seq, id.as_str())),
+            Op::Unseq(seq) => unseqs.push(*seq),
         }
     }
-    for meta in metas {
-        shard.put_meta(&meta.id, &meta.bytes, meta.old, meta.new, meta.seq)?;
-    }
+    shard.put_bodies(&bodies)?;
+    // A superseded sequence is one from before the batch or one an earlier
+    // document of the batch took, never a later one's: adding them all, then
+    // removing, leaves by_seq as writing them in order did.
+    shard.put_seqs(&seqs)?;
+    shard.remove_seqs(&unseqs)?;
+    shard.put_metas(metas)?;
     Ok(())
 }
 
@@ -5667,7 +5688,11 @@ mod tests {
     fn write_costs(shard: &mut crate::store::Shard, docs: Vec<Value>) -> (usize, usize) {
         let parses = crate::store::meta_parses();
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
-        let docs = docs.into_iter().enumerate().collect();
+        let docs = docs
+            .iter()
+            .map(|doc| prepare(doc, doc_id(doc).unwrap(), true).unwrap())
+            .enumerate()
+            .collect();
         let results = shard
             .write(move |s| Ok(put_many(s, docs, true, HashMap::new())))
             .unwrap();
@@ -5701,6 +5726,261 @@ mod tests {
         // Each document in a batch costs the same.
         let batch = vec![json!({"_id": "b"}), json!({"_id": "c"})];
         assert_eq!(write_costs(&mut shard, batch), (0, 2), "batch");
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A bulk job opens each table once: the metadata to read it, then the
+    /// bodies, by_seq and metadata to write, and the commit the settings.
+    #[test]
+    fn a_bulk_job_opens_each_table_once() {
+        let file = crate::store::tests::temp_file("table-opens");
+        let mut shard = crate::store::tests::open(&file);
+        let opens = |shard: &mut crate::store::Shard| shard.write(|s| Ok(s.table_opens())).unwrap();
+        let before = opens(&mut shard);
+        let docs = (0..500)
+            .map(|n| {
+                let doc = json!({"_id": format!("doc{n:03}"), "n": n});
+                prepare(&doc, doc_id(&doc).unwrap(), true).unwrap()
+            })
+            .enumerate()
+            .collect();
+        let results = shard
+            .write(move |s| Ok(put_many(s, docs, true, HashMap::new())))
+            .unwrap();
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        let opened = opens(&mut shard) - before;
+        assert!(opened <= 5, "{opened} table opens");
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// An edit over a revision at the last position has no next position:
+    /// the document fails and nothing of it is stored.
+    #[test]
+    fn an_edit_past_the_last_position_fails_its_document() {
+        let file = crate::store::tests::temp_file("last-position");
+        let mut shard = crate::store::tests::open(&file);
+        let last = format!("{}-a", u64::MAX);
+        let put = |shard: &mut crate::store::Shard, doc: Value, new_edits: bool| {
+            let job = vec![(0, prepare(&doc, doc_id(&doc).unwrap(), new_edits).unwrap())];
+            let mut out = shard
+                .write(move |s| Ok(put_many(s, job, new_edits, HashMap::new())))
+                .unwrap();
+            out.pop().unwrap().1
+        };
+        put(&mut shard, json!({"_id": "x", "_rev": last}), false).unwrap();
+        let before = shard
+            .read(|s| {
+                Ok((
+                    serde_json::to_string(&s.get_meta("x")?).unwrap(),
+                    s.by_seq()?,
+                ))
+            })
+            .unwrap();
+        for deleted in [false, true] {
+            let edit = json!({"_id": "x", "_rev": last, "_deleted": deleted});
+            let error = put(&mut shard, edit, true).unwrap_err();
+            assert_eq!(
+                (error.status, error.reason.as_str()),
+                (400, "Invalid rev format")
+            );
+        }
+        let after = shard
+            .read(|s| {
+                Ok((
+                    serde_json::to_string(&s.get_meta("x")?).unwrap(),
+                    s.by_seq()?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(after, before);
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A batch stores what its documents store written one per batch: the
+    /// same results, metadata records, sequences and counts, whatever repeats
+    /// an id, fails, or replicates a revision the batch or the shard holds.
+    #[test]
+    fn a_batch_stores_what_its_documents_store_one_at_a_time() {
+        let hex = |n: u8| format!("{n:02x}").repeat(16);
+        let batches: [(bool, Vec<Value>); 3] = [
+            (true, vec![json!({"_id": "a"}), json!({"_id": "c", "n": 1})]),
+            (
+                true,
+                vec![
+                    json!({"_id": "b", "_deleted": true}),
+                    json!({"_id": "a"}),
+                    json!({"_id": "a", "_rev": "1-967a00dff5e02add41819138abb3284d", "v": 2}),
+                    json!({"_id": "a", "_rev": "1-967a00dff5e02add41819138abb3284d"}),
+                    json!({"_id": "b"}),
+                    json!({"_id": "c", "_rev": "bad"}),
+                    json!({"_id": "d", "_deleted": true}),
+                    json!({"_id": "d"}),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    json!({"_id": "a", "_revisions": {"start": 3, "ids": [hex(3), hex(2), hex(1)]}}),
+                    json!({"_id": "a", "_revisions": {"start": 3, "ids": [hex(3), hex(2), hex(1)]}}),
+                    json!({"_id": "c", "_rev": "1-967a00dff5e02add41819138abb3284d"}),
+                    json!({"_id": "e", "_revisions": {"start": 2, "ids": [hex(5), hex(4)]}, "_deleted": true}),
+                    json!({"_id": "e", "_rev": format!("2-{}", hex(6))}),
+                    json!({"_id": "f"}),
+                ],
+            ),
+        ];
+        let state = |by_batch: bool| {
+            let file = crate::store::tests::temp_file("batch-vs-single");
+            let mut shard = crate::store::tests::open(&file);
+            let mut results = Vec::new();
+            for (new_edits, docs) in &batches {
+                let docs: Vec<Prepared> = docs
+                    .iter()
+                    .map(|doc| prepare(doc, doc_id(doc).unwrap(), *new_edits).unwrap())
+                    .collect();
+                let jobs: Vec<Vec<Prepared>> = if by_batch {
+                    vec![docs]
+                } else {
+                    docs.into_iter().map(|doc| vec![doc]).collect()
+                };
+                for job in jobs {
+                    let new_edits = *new_edits;
+                    let job = job.into_iter().enumerate().collect();
+                    let out = shard
+                        .write(move |s| Ok(put_many(s, job, new_edits, HashMap::new())))
+                        .unwrap();
+                    results.extend(out.into_iter().map(|(_, result)| match result {
+                        Ok(ok) => json!({"id": ok.id, "rev": ok.rev}),
+                        Err(e) => json!({"error": e.error, "reason": e.reason}),
+                    }));
+                }
+            }
+            let stored = shard
+                .read(|s| {
+                    let metas = ["a", "b", "c", "d", "e", "f"].map(|id| {
+                        s.get_meta(id)
+                            .unwrap()
+                            .map(|m| serde_json::to_string(&m).unwrap())
+                    });
+                    Ok((metas, s.by_seq()?, s.counts()))
+                })
+                .unwrap();
+            drop(shard);
+            crate::kv::forget_verified(&file);
+            let _ = std::fs::remove_dir_all(file.parent().unwrap());
+            (results, stored)
+        };
+        let single = state(false);
+        assert_eq!(state(true), single);
+        // The cases ran as meant: a's first revision is the one the batch
+        // names, and the replicated revision of `a` was not stored twice.
+        assert_eq!(single.0[0]["rev"], "1-967a00dff5e02add41819138abb3284d");
+        assert!(single.1 .0[0]
+            .as_ref()
+            .unwrap()
+            .contains(&format!("3-{}", hex(3))));
+    }
+
+    /// A bulk job journals every key its commit writes, as writing each key
+    /// on its own did: each document's metadata and body, each sequence it
+    /// adds or supersedes (one added earlier in the same job included), and
+    /// the settings the commit changes.
+    #[test]
+    fn batched_writes_are_journaled_like_single_ones() {
+        use crate::store::journal::{JournalKey, KeyBytes, Table, Taken};
+        let file = crate::store::tests::temp_file("bulk-journal");
+        let mut shard = crate::store::tests::open(&file);
+        let put = |shard: &mut crate::store::Shard, docs: &[Value], new_edits| {
+            let docs = docs
+                .iter()
+                .map(|doc| prepare(doc, doc_id(doc).unwrap(), new_edits).unwrap())
+                .enumerate()
+                .collect();
+            let results = shard
+                .write(move |s| Ok(put_many(s, docs, new_edits, HashMap::new())))
+                .unwrap();
+            results
+                .into_iter()
+                .map(|(_, result)| result.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let first = put(
+            &mut shard,
+            &[json!({"_id": "a"}), json!({"_id": "b"})],
+            true,
+        );
+        let seq_of = |shard: &mut crate::store::Shard, id: &'static str| {
+            shard
+                .read(move |s| Ok(s.get_meta(id)?.unwrap().seq))
+                .unwrap()
+        };
+        // The sequences the job supersedes, from before it.
+        let mut expected: std::collections::BTreeSet<JournalKey> = ["a", "b"]
+            .into_iter()
+            .map(|id| (Table::BySeq, seq_of(&mut shard, id).key_bytes()))
+            .collect();
+        let start = shard.seq();
+        shard.journal().start();
+
+        let edited = [
+            json!({"_id": "a", "_rev": first[0].rev, "n": 2}),
+            json!({"_id": "b", "_rev": first[1].rev, "_deleted": true}),
+            json!({"_id": "c"}),
+        ];
+        let mut written = put(&mut shard, &edited, true);
+        // "e" twice in one job: the second supersedes the first's sequence.
+        let (e1, e2) = (
+            "1-11111111111111111111111111111111",
+            "2-22222222222222222222222222222222",
+        );
+        let replicated = [
+            json!({"_id": "e", "_rev": e1}),
+            json!({"_id": "e", "_rev": e2,
+                   "_revisions": {"start": 2, "ids": [&e2[2..], &e1[2..]]}}),
+        ];
+        put(&mut shard, &replicated, false);
+        written.push(WriteOk {
+            ok: true,
+            id: "e".into(),
+            rev: e1.into(),
+        });
+        written.push(WriteOk {
+            ok: true,
+            id: "e".into(),
+            rev: e2.into(),
+        });
+
+        let end = shard.seq();
+        assert_eq!(end, start + 5);
+        for doc in &written {
+            expected.insert((Table::Meta, doc.id.as_str().key_bytes()));
+            expected.insert((
+                Table::Bodies,
+                (doc.id.as_str(), doc.rev.as_str()).key_bytes(),
+            ));
+        }
+        for seq in start + 1..=end {
+            expected.insert((Table::BySeq, seq.key_bytes()));
+        }
+        for name in ["seq", "doc_count", "doc_del_count"] {
+            expected.insert((Table::Settings, name.key_bytes()));
+        }
+        assert_eq!(shard.journal().take(), Taken::Batch(expected));
+
+        // One by_seq row per document, at its latest sequence.
+        let by_seq = shard.read(|s| Ok(s.by_seq()?)).unwrap();
+        let mut latest = Vec::new();
+        for id in ["a", "b", "c", "e"] {
+            latest.push((seq_of(&mut shard, id), id.to_string()));
+        }
+        latest.sort();
+        assert_eq!(by_seq, latest);
         drop(shard);
         crate::kv::forget_verified(&file);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
@@ -6625,6 +6905,100 @@ mod tests {
         assert_eq!(db.validation_functions().await.unwrap().len(), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A request's shards commit together: shard 1 commits while shard 0's
+    /// writer is held.
+    #[tokio::test]
+    async fn shards_of_one_request_commit_concurrently() {
+        let (db, root) = two_shard_db("concurrent");
+        let db = Arc::new(db);
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holding = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                db.shards[0]
+                    .alone(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = held.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started.await.unwrap();
+
+        let ids = [doc_id_for_shard(&db, 0), doc_id_for_shard(&db, 1)];
+        let request = tokio::spawn({
+            let db = Arc::clone(&db);
+            let docs = ids.iter().map(|id| json!({"_id": id})).collect::<Vec<_>>();
+            async move { db.put_docs(docs, true).await }
+        });
+        while db.shards[1].committed_seq() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(db.shards[0].committed_seq(), 0, "shard 0 is held");
+
+        release.send(()).unwrap();
+        holding.await.unwrap().unwrap();
+        let out = request.await.unwrap().unwrap();
+        for (result, id) in out.iter().zip(&ids) {
+            let result = result.json();
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["id"], id.as_str(), "{result}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every shard of a request answers before the request does: a failing
+    /// shard 0 fails the request with its own error, shard 1's documents
+    /// still commit, and the validator cache is dropped.
+    #[tokio::test]
+    async fn one_failing_shard_fails_the_request_after_both_answer() {
+        let (db, root) = two_shard_db("onefails");
+        let design_id = (0..10_000)
+            .map(|i| format!("_design/d{i}"))
+            .find(|id| db.shard_index(id) == 1)
+            .expect("design id on shard 1");
+        let failing_id = doc_id_for_shard(&db, 0);
+        let plain_id = doc_id_for_shard(&db, 1);
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        let generation = db.design_generation();
+
+        db.shards[0]
+            .call(|shard| {
+                shard.inject_commit_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = db
+            .put_docs(
+                vec![
+                    json!({"_id": failing_id}),
+                    json!({"_id": design_id, "validate_doc_update": "function(){}"}),
+                    json!({"_id": plain_id}),
+                ],
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 500, "{error:?}");
+        assert_eq!(
+            error.reason, "shard commit failed: injected commit failure",
+            "{error:?}"
+        );
+
+        let opts = DocOpts::default();
+        assert!(db.get_doc(&failing_id, &opts).await.is_err());
+        db.get_doc(&plain_id, &opts).await.unwrap();
+        db.get_doc(&design_id, &opts).await.unwrap();
+        assert_ne!(db.design_generation(), generation);
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -7794,10 +8168,10 @@ mod tests {
             .await
             .unwrap();
         let before = db.shard_seqs()[0].1;
-        // Bodies and sequence rows of the first two documents get through.
+        // The bodies and sequence rows get through; the metadata does not.
         db.shards[0]
             .call(|s| {
-                s.inject_write_failure(4);
+                s.inject_write_failure(2);
                 Ok(())
             })
             .await
@@ -8214,6 +8588,57 @@ mod tests {
         rev
     }
 
+    /// In a batch, a document whose metadata cannot be decoded, or fails its
+    /// checksum, fails alone, each time it appears; the rest are written.
+    #[tokio::test]
+    async fn an_unreadable_record_fails_only_its_document_in_a_batch() {
+        let (db, root) = single_shard_db("batch-corrupt").await;
+        let rev = put_then_corrupt_meta(&db, "bad").await;
+        db.shards[0]
+            .call(|s| {
+                s.put_unsealed(crate::kv::META, "crc", br#"{"tree":{},"seq":9}"#);
+                Ok(s.put_local("setup", b"1")?)
+            })
+            .await
+            .unwrap();
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": "x"}),
+                    json!({"_id": "bad", "_rev": rev}),
+                    json!({"_id": "crc"}),
+                    json!({"_id": "y"}),
+                    json!({"_id": "bad"}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let answers: Vec<Value> = written.iter().map(WriteResult::json).collect();
+        assert!(written[0].is_ok() && written[3].is_ok(), "{answers:?}");
+        let corrupt = "corrupt metadata for bad: key must be a string at line 1 column 2; its \
+                       revision tree cannot be validated, so the document cannot be changed: \
+                       purge it with POST /{db}/_purge to repair it";
+        for at in [1, 4] {
+            assert_eq!(
+                answers[at],
+                json!({"id": "bad", "error": "internal_server_error", "reason": corrupt}),
+                "{answers:?}"
+            );
+        }
+        assert_eq!(answers[2]["id"], "crc", "{answers:?}");
+        assert_eq!(answers[2]["error"], "internal_server_error", "{answers:?}");
+        assert!(
+            answers[2]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("Meta table: "),
+            "{answers:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn body_exists(db: &Db, id: &str, rev: &str) -> bool {
         let (id, rev) = (id.to_string(), rev.to_string());
         db.shards[0]
@@ -8431,6 +8856,183 @@ mod tests {
         let infos = db.purged_infos(&[0], None).await.unwrap().remove(0).1;
         assert_eq!(infos.len(), 2, "below the limit and confirmed: trimmed");
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Replay one golden case on a fresh database with `q` shards: each
+    /// request's responses, then the stored body of every revision named by
+    /// a request or a response, as text (`None` when not stored).
+    async fn replay_golden(case: &Value, q: u32) -> (Vec<Value>, Vec<Value>) {
+        let name = case["name"].as_str().unwrap();
+        let root = std::env::temp_dir().join(format!("douchdb-golden-{name}-{}", uuid()));
+        let db = Db::open_or_create(
+            &root,
+            name,
+            DbConfig {
+                q,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut responses = Vec::new();
+        let mut named: Vec<(String, String)> = Vec::new();
+        for request in case["requests"].as_array().unwrap() {
+            let docs = request["docs"].as_array().unwrap().clone();
+            for doc in &docs {
+                if let (Some(id), Some(rev)) = (doc["_id"].as_str(), doc["_rev"].as_str()) {
+                    named.push((id.to_string(), rev.to_string()));
+                }
+            }
+            let new_edits = request["new_edits"].as_bool().unwrap();
+            let out = db.put_docs(docs, new_edits).await.unwrap();
+            let out: Vec<Value> = out.iter().map(WriteResult::json).collect();
+            for result in &out {
+                if let (Some(id), Some(rev)) = (result["id"].as_str(), result["rev"].as_str()) {
+                    named.push((id.to_string(), rev.to_string()));
+                }
+            }
+            responses.push(Value::Array(out));
+        }
+        let mut stored = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, rev) in named {
+            if !seen.insert((id.clone(), rev.clone())) {
+                continue;
+            }
+            let shard = db.shard_index(&id);
+            let (doc, at) = (id.clone(), rev.clone());
+            let body = db.shards[shard]
+                .call(move |s| Ok(s.get_body(&doc, &at)?))
+                .await
+                .unwrap()
+                .map(|bytes| String::from_utf8(bytes).unwrap());
+            stored.push(json!({"id": id, "rev": rev, "body": body}));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        (responses, stored)
+    }
+
+    /// `_bulk_docs` answers and stores exactly what main did when the
+    /// fixture was captured: revision ids, responses, error precedence and
+    /// the stored body bytes, at q=1 and q=2.
+    #[tokio::test]
+    async fn bulk_write_matches_golden() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/golden/bulk_write.json")).unwrap();
+        assert_eq!(cases.len(), 10);
+        for case in &cases {
+            for q in [1, 2] {
+                let (responses, stored) = replay_golden(case, q).await;
+                let name = &case["name"];
+                assert_eq!(
+                    Value::Array(responses),
+                    case["responses"],
+                    "{name} responses, q={q}"
+                );
+                // As text, so the comparison is of the stored bytes.
+                assert_eq!(
+                    serde_json::to_string(&stored).unwrap(),
+                    serde_json::to_string(&case["stored_bodies"]).unwrap(),
+                    "{name} stored bodies, q={q}"
+                );
+            }
+        }
+    }
+
+    /// A batch large enough to be prepared on the blocking pool keeps each
+    /// result in its document's slot, a document that fails to prepare
+    /// included, and a document without `_id` is stored under the id its
+    /// result names.
+    #[tokio::test]
+    async fn large_batches_keep_their_order() {
+        let root = std::env::temp_dir().join(format!("douchdb-large-batch-{}", uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "large",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let count = PREPARE_INLINE_MAX + 2;
+        let mut docs: Vec<Value> = (0..count)
+            .map(|i| json!({"_id": format!("d{i:05}"), "n": i}))
+            .collect();
+        docs[7] = json!({"_id": "bad", "_rev": 5});
+        docs[8] = json!({"n": 8});
+        let blocking = BLOCKING_PREPARES.load(Ordering::SeqCst);
+        let out = db.put_docs(docs, true).await.unwrap();
+        assert!(BLOCKING_PREPARES.load(Ordering::SeqCst) > blocking);
+        assert_eq!(out.len(), count);
+        for (i, result) in out.iter().enumerate() {
+            let result = serde_json::to_value(result).unwrap();
+            match i {
+                7 => {
+                    assert_eq!(result["id"], "bad", "{result}");
+                    assert_eq!(result["reason"], "Invalid rev format", "{result}");
+                }
+                8 => {
+                    let id = result["id"].as_str().unwrap();
+                    let doc = db.get_doc(id, &DocOpts::default()).await.unwrap();
+                    assert_eq!(doc["n"], 8);
+                }
+                _ => assert_eq!(result["id"], format!("d{i:05}"), "{result}"),
+            }
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A write counts its shard group, the time spent in its jobs and its
+    /// commit, and the commit's two syncs (two-phase). The counters are
+    /// process-wide, so the test reruns itself alone in a child process:
+    /// no other test's commits land between the snapshots.
+    #[tokio::test]
+    async fn shard_metrics_count_groups_and_syncs() {
+        const CHILD: &str = "DOUCHDB_SHARD_METRICS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "db::tests::shard_metrics_count_groups_and_syncs",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (db, root) = single_shard_db("shard-metrics").await;
+        // The first commit grows the new file, and redb syncs a growth
+        // once more; the second is a plain two-phase commit.
+        db.put_docs(vec![json!({"_id": "a", "n": 1})], true)
+            .await
+            .unwrap();
+        let before = crate::metrics::snapshot()["shard"].clone();
+        db.put_docs(vec![json!({"_id": "b", "n": 1})], true)
+            .await
+            .unwrap();
+        let after = crate::metrics::snapshot()["shard"].clone();
+        let delta = |name: &str| after[name].as_u64().unwrap() - before[name].as_u64().unwrap();
+        assert!(delta("groups") >= 1, "{before} {after}");
+        assert_eq!(delta("syncs"), 2 * delta("groups"), "{before} {after}");
+        assert!(delta("jobs_us") > 0, "{before} {after}");
+        assert!(delta("commit_us") > 0, "{before} {after}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

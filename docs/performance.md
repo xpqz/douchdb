@@ -180,6 +180,127 @@ Caveats:
 - Concurrent single-document writes share commits poorly under the synced
   group commit; that is issue #90.
 
+### Bulk write path against the redb floor
+
+`scripts/bulk_bench.py` imports the airline fixture (150,959 documents)
+through `_bulk_docs` into a fresh single node, and interleaves the import with
+`examples/redb_floor`. The floor is a bare redb program that writes the same
+stored bytes, in the same tables and batches, with the same two-phase
+`Immediate` commits. The shard figures come from the `shard` counters of
+`/_node/_local/_metrics`.
+
+The bulk write path work moved per-document work off the shard actor. It also
+commits a request's shards concurrently, streams the revision hash into MD5,
+opens each table once per job, and starts the local and remote cluster writes
+together. It then trimmed what the actor does per document while staging a
+job:
+
+- one slot per distinct id, found by sorting, in place of three `String`-keyed
+  hash maps, with each document's metadata changed in place instead of cloned
+  in and out;
+- the new revision formatted once, before the job, and written into a new
+  document's tree directly;
+- revision ids rendered as hex without a `format!` per byte;
+- no pruning walk for a tree of roots only, which every new document has.
+
+Column definitions:
+
+- **jobs/insert** is the shard actors' job time (`shard.jobs_us`, syncs
+  excluded) divided by the floor's insert time (begin to last insert, syncs
+  excluded), both per document and from the same round. It is the median over
+  the rounds.
+- **Before** is `3210349`, measured before the job timer also counted
+  beginning the transaction, so its jobs/insert reads slightly low.
+- **Now** is `8dbade9`, the build with the staging trimmed. It ran in the
+  same rounds as `4d1f3d1` (the work before the staging was trimmed) and the
+  floor. The head was not re-measured. The later `2c03501` and `4f67e2b`
+  change only an edit over a revision at position `u64::MAX`, plus a
+  `checked_add` for the next position, in `prepare` (before the shard job,
+  off the actor) and in the shard's staging (one add per document, on the
+  actor).
+- **Now ÷ 4d1f3d1** is the median of the same-round ratios of job time.
+- **docs/s** is end to end, the floor's docs/s in parentheses.
+
+| q / batch / clients | Before jobs/insert | `4d1f3d1` jobs/insert | Now jobs/insert | Now ÷ 4d1f3d1 | Now docs/s | Now syncs/commit (douchdb / floor) | Now KB/commit (douchdb / floor) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q1 / 250 / 1 | 3.31 | 1.62 | **1.03** | 0.65 | 14,913 (18,275) | 2.02 / 2.02 | 882 / 897 |
+| q1 / 1,000 / 1 | 3.58 | 1.84 | **1.146** | 0.62 | 25,874 (40,660) | 2.09 / 2.09 | 2,597 / 2,651 |
+| q1 / 10,000 / 1 | 2.68 | 1.47 | **1.08** | 0.73 | 31,100 (53,910) | 2.81 / 2.81 | 41,591 / 41,189 |
+| q2 / 250 / 1 | 3.30 | 1.56 | **0.90** | 0.64 | 8,189 (8,750) | 2.02 / 2.02 | 475 / 482 |
+| q2 / 1,000 / 1 | 2.51 | 1.48 | **0.96** | 0.64 | 21,569 (27,244) | 2.08 / 2.08 | 1,311 / 1,336 |
+| q2 / 10,000 / 1 | 2.03 | 1.54 | **1.14** | 0.74 | 28,205 (53,099) | 2.75 / 2.75 | 16,936 / 16,567 |
+| q1 / 250 / 4 | 3.08 | 1.58 | 1.02 | 0.64 | 31,032 (17,969) | 2.07 / 2.02 | 2,210 / 897 |
+| q1 / 1,000 / 4 | 3.52 | 2.22 | 1.49 | 0.67 | 41,730 (40,557) | 2.29 / 2.09 | 10,029 / 2,651 |
+| q1 / 10,000 / 4 | 3.02 | 1.57 | 1.21 | 0.77 | 44,749 (53,580) | 4.60 / 2.81 | 132,846 / 41,189 |
+| q2 / 250 / 4 | 3.09 | 1.06 | 0.91 | 0.76 | 15,610 (10,484) | 2.04 / 2.02 | 832 / 482 |
+| q2 / 1,000 / 4 | 2.09 | 1.67 | 1.10 | 0.68 | 36,056 (36,964) | 2.23 / 2.08 | 3,700 / 1,336 |
+| q2 / 10,000 / 4 | — | 1.85 | 1.62 | 0.92 | 50,506 (48,684) | 4.40 / 2.75 | 64,409 / 16,567 |
+
+Conditions:
+
+- Release builds, `--n 1`, `--cache-mb 16` (the floor's cache is the same).
+- Apple M2 Pro, data on an external APFS disk.
+- Now: 5 interleaved rounds per one-client configuration and 3 per
+  four-client one, with the order of the two builds rotated each round.
+- The q=1 rows ran at load averages of 2–3 and their rounds agree closely
+  (q1/1,000/1: 1.12–1.16; one round in five, at 1.155, was over 1.15, and the
+  median, 1.146, passes). The q=2 rows ran at load averages of 10–37 and
+  single rounds vary widely (q2/10,000/1: 0.98–1.34). Read docs/s as
+  indicative only. The jobs/insert ratios come from the same round, and the
+  sync and byte counts are exact.
+
+Caveat on the floor: it is not a strict lower bound.
+`examples/redb_floor.rs` inserts the body, by_seq and meta rows of each
+document in turn, interleaving the three tables, and its insert span also
+times opening SETTINGS and the two settings inserts. douchdb writes table by
+table, and its settings writes fall in `commit_us`, not `jobs_us`. Ratios near
+or below 1 (the q=2 rows at 0.90 and 0.96) therefore partly reflect the floor,
+and q1/1,000/1 (median 1.146) is at the limit within measurement precision,
+not clearly under it. Aligning the floor and re-measuring is issue #95.
+
+End to end, with one client, douchdb runs at 0.53-0.94x the floor's docs/s
+(q1: 0.82, 0.64, 0.58; q2: 0.94, 0.79, 0.53 at 250, 1,000 and 10,000
+documents), up from roughly 0.42-0.69. The gap is request work the floor does
+not pay: HTTP, JSON parsing, and preparing each document (serialising its body
+and hashing its revision).
+
+What the numbers say:
+
+- **Job time.** With one client the shard actor's median job time is now
+  0.90–1.146× the floor's insert time, against a goal of 1.15×, which the
+  medians meet at every size and q against this floor (see the caveat above);
+  q=1 with 1,000 documents, at 1.146, is at the limit within measurement
+  precision. It
+  was 2.0–3.6× before the bulk write path work, and `4d1f3d1` measured
+  1.47–1.84× in the same rounds (1.35–1.72× in an earlier, more loaded run).
+  The trimmed staging alone cut job time by 26–38% against `4d1f3d1` in the
+  same rounds.
+  - A sampled profile of the shard actor at q=1, one client, splits the job
+    as follows. The inserts (bodies, by_seq, metadata) are 79–89% of it.
+    Staging, which includes building the tree, encoding the record and
+    pruning, is 8–16%, down from 26–41%. Reading the metadata is 2–6%.
+  - With four clients a group serves 2.2–3.4 requests and its job time is
+    0.91–1.62× the floor's; those rows are not judged against the goal.
+- **Syncs and bytes.**
+  - With one client, syncs per commit equal the floor's at every size and q.
+  - Bytes per commit are within 2.2% of the floor's: 1.5–2.0% under at 250
+    and 1,000 documents, 1.0–2.2% over at 10,000.
+  - The metadata records of a job are now written in the order their
+    documents arrive, as the floor writes them, instead of in hash map order.
+  - With four clients a group serves 2.2–3.4 requests (3.2 at 10,000 documents),
+    so its syncs and bytes per commit are not comparable with the floor's
+    single batch.
+- **Sorted inserts were measured and not kept.** They were measured on
+  `4d1f3d1`, before the staging was trimmed. Sorting each job's bodies by
+  `(id, rev)` and its metadata by id before inserting had these effects:
+  - It cut bytes per commit by 8–16% everywhere.
+  - It cut job time at 10,000 documents with one client, by 16% at q=1 and
+    32% at q=2 (paired medians).
+  - It made q=1, 10,000 documents, four clients 23% slower. That held in 10 of
+    13 paired rounds, including rounds with the build order alternated.
+  - The rule for keeping it was a gain of at least 10% at 10,000 documents and
+    no loss at 250 or 1,000; the four-client loss at 10,000 failed it.
+
 ## JavaScript sandbox throughput
 
 Design-document map/reduce/search-index work can run in four places: in-process

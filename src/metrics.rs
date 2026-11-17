@@ -404,6 +404,32 @@ pub fn record_fabric(kind: &str, value: u64) {
     }
 }
 
+/// Shard write groups, the microseconds spent running their jobs and
+/// committing them, and the syncs and bytes the shard files were written
+/// with: cumulative, for comparing the write path against bare redb.
+static SHARD_GROUPS: AtomicU64 = AtomicU64::new(0);
+static SHARD_JOBS_US: AtomicU64 = AtomicU64::new(0);
+static SHARD_COMMIT_US: AtomicU64 = AtomicU64::new(0);
+static SHARD_SYNCS: AtomicU64 = AtomicU64::new(0);
+static SHARD_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Count one shard write group: its jobs' time and its commit's.
+pub fn record_shard_group(jobs_us: u64, commit_us: u64) {
+    SHARD_GROUPS.fetch_add(1, Ordering::Relaxed);
+    SHARD_JOBS_US.fetch_add(jobs_us, Ordering::Relaxed);
+    SHARD_COMMIT_US.fetch_add(commit_us, Ordering::Relaxed);
+}
+
+/// Count one sync of a shard file.
+pub fn record_sync() {
+    SHARD_SYNCS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count bytes written to a shard file.
+pub fn record_write(bytes: u64) {
+    SHARD_BYTES_WRITTEN.fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// Count one corrupt stored record that a listing or scan skipped.
 pub fn record_corrupt_record_skipped() {
     state().corrupt_records_skipped += 1;
@@ -691,6 +717,13 @@ pub fn snapshot() -> Value {
         "views": state.views.json(),
         "js_sandbox_requests": crate::js::sandbox_requests(),
         "search": state.search.json(),
+        "shard": {
+            "groups": SHARD_GROUPS.load(Ordering::Relaxed),
+            "jobs_us": SHARD_JOBS_US.load(Ordering::Relaxed),
+            "commit_us": SHARD_COMMIT_US.load(Ordering::Relaxed),
+            "syncs": SHARD_SYNCS.load(Ordering::Relaxed),
+            "bytes_written": SHARD_BYTES_WRITTEN.load(Ordering::Relaxed),
+        },
         "integrity": {
             "corrupt_records_skipped": state.corrupt_records_skipped,
         },

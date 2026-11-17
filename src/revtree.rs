@@ -80,36 +80,49 @@ impl Serialize for RevTree {
 impl RevTree {
     /// Merge a root-to-leaf path, growing the tree where it already exists.
     pub fn merge_path(&mut self, path: &[Rev], deleted: bool) {
+        if let [leaf] = path {
+            return self.merge_root(leaf.to_string(), deleted);
+        }
         // A path may include ancestors that were already pruned from this
         // tree. Merging them back would turn a stemmed root into an extra
         // leaf, so start at the first revision the tree already knows and
         // ignore the older prefix.
-        let start = path
+        let revs: Vec<String> = path.iter().map(Rev::to_string).collect();
+        let start = revs
             .iter()
-            .position(|rev| self.edges.contains_key(&rev.to_string()))
+            .position(|rev| self.edges.contains_key(rev))
             .unwrap_or(0);
-        for i in start..path.len() {
-            let rev = path[i].to_string();
-            if self.edges.contains_key(&rev) {
+        for i in start..revs.len() {
+            let rev = &revs[i];
+            if self.edges.contains_key(rev) {
                 continue;
             }
-            let parent = if i == 0 {
-                None
-            } else {
-                Some(path[i - 1].to_string())
-            };
+            let parent = i.checked_sub(1).map(|p| revs[p].clone());
             if let Some(parent) = &parent {
                 self.leaves.remove(parent);
             }
+            if !self.has_child(rev) {
+                self.leaves.insert(rev.clone());
+            }
+            self.edges.insert(rev.clone(), parent);
+        }
+        if let Some(leaf) = revs.last() {
+            if deleted {
+                self.deleted.insert(leaf.clone());
+            }
+        }
+    }
+
+    /// [`RevTree::merge_path`] for a path of one revision, given as text.
+    pub fn merge_root(&mut self, rev: String, deleted: bool) {
+        if deleted {
+            self.deleted.insert(rev.clone());
+        }
+        if !self.edges.contains_key(&rev) {
             if !self.has_child(&rev) {
                 self.leaves.insert(rev.clone());
             }
-            self.edges.insert(rev, parent);
-        }
-        if let Some(leaf) = path.last() {
-            if deleted {
-                self.deleted.insert(leaf.to_string());
-            }
+            self.edges.insert(rev, None);
         }
     }
 
@@ -299,6 +312,13 @@ impl RevTree {
         if self.leaves.is_empty() {
             return Ok(());
         }
+        // Only roots: every revision is a leaf whose path is itself, so all
+        // are kept and no parent can be missing.
+        if self.edges.values().all(Option::is_none) {
+            self.deleted.retain(|rev| self.edges.contains_key(rev));
+            self.dangling.clear();
+            return Ok(());
+        }
         let mut keep: BTreeSet<String> = BTreeSet::new();
         for leaf in &self.leaves {
             let path = self.path(leaf)?;
@@ -372,6 +392,84 @@ mod tests {
         let before = tree.clone();
         assert_eq!(tree.prune(2), Err(CyclicTree));
         assert_eq!(tree, before);
+    }
+
+    /// A new document's tree, live or deleted, is its one revision as a
+    /// root, whatever an emptied tree held before.
+    #[test]
+    fn merge_root_builds_a_one_revision_tree() {
+        let stored = |json: &str| serde_json::from_str::<RevTree>(json).unwrap();
+        let rev = format!("1-{}", id(1));
+        for deleted in [false, true] {
+            let mut tree = RevTree::default();
+            tree.merge_path(&revs(&rev), deleted);
+            let tombstone = if deleted {
+                format!("\"{rev}\"")
+            } else {
+                String::new()
+            };
+            let expected = format!(r#"{{"edges":{{"{rev}":null}},"deleted":[{tombstone}]}}"#);
+            assert_eq!(tree, stored(&expected));
+        }
+        // Emptied by a purge, with a tombstone of an unknown revision left
+        // over and a dangling parent: the merge keeps both, as it always has.
+        let mut tree = stored(r#"{"edges":{"2-b":"1-a"},"deleted":["9-z"]}"#);
+        tree.purge_leaf("2-b");
+        tree.merge_path(&revs(&rev), false);
+        assert_eq!(tree.leaves(), vec![rev.clone()]);
+        assert!(tree.is_deleted("9-z"));
+        assert_eq!(tree.dangling, BTreeSet::from(["1-a".to_string()]));
+        // A known revision keeps its place; only the tombstone is added.
+        let mut tree = stored(&format!(
+            r#"{{"edges":{{"{rev}":null,"2-b":"{rev}"}},"deleted":[]}}"#
+        ));
+        tree.merge_root(rev.clone(), true);
+        assert_eq!(
+            tree,
+            stored(&format!(
+                r#"{{"edges":{{"{rev}":null,"2-b":"{rev}"}},"deleted":["{rev}"]}}"#
+            ))
+        );
+        // A replicated path into an empty tree takes the general merge.
+        let mut tree = RevTree::default();
+        tree.merge_path(&revs(&format!("1-{},2-{}", id(1), id(2))), true);
+        assert_eq!(
+            tree,
+            stored(&format!(
+                r#"{{"edges":{{"1-{a}":null,"2-{b}":"1-{a}"}},"deleted":["2-{b}"]}}"#,
+                a = id(1),
+                b = id(2)
+            ))
+        );
+    }
+
+    /// A tree of roots only, as every new document's is, prunes to itself
+    /// apart from what pruning always drops: tombstones of unknown revisions
+    /// and stale dangling parents.
+    #[test]
+    fn prune_keeps_a_tree_of_roots() {
+        let stored = |json: &str| serde_json::from_str::<RevTree>(json).unwrap();
+        let one = r#"{"edges":{"1-a":null},"deleted":["1-a"]}"#;
+        let mut tree = stored(one);
+        tree.prune(1).unwrap();
+        assert_eq!(tree, stored(one));
+
+        let mut tree = stored(r#"{"edges":{"1-a":null,"1-b":null},"deleted":["1-b","3-c"]}"#);
+        tree.prune(1).unwrap();
+        assert_eq!(
+            tree,
+            stored(r#"{"edges":{"1-a":null,"1-b":null},"deleted":["1-b"]}"#)
+        );
+
+        // Purging the only child of a missing parent leaves that parent in
+        // `dangling`; pruning clears it.
+        let mut tree = stored(r#"{"edges":{"2-b":"1-a"},"deleted":[]}"#);
+        tree.purge_leaf("2-b");
+        tree.merge_path(&revs(&format!("1-{}", id(1))), false);
+        tree.prune(1000).unwrap();
+        let mut fresh = RevTree::default();
+        fresh.merge_path(&revs(&format!("1-{}", id(1))), false);
+        assert_eq!(tree, fresh);
     }
 
     #[test]

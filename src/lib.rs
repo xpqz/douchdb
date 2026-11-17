@@ -27,6 +27,7 @@ pub(crate) mod kv;
 pub(crate) mod listener;
 pub(crate) mod metrics;
 pub(crate) mod params;
+pub(crate) mod prepare;
 pub(crate) mod replicate;
 pub(crate) mod rev;
 pub(crate) mod revtree;

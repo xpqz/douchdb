@@ -46,6 +46,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 /// Jobs one group commit takes at most.
@@ -567,6 +568,16 @@ fn failed(name: &ShardName, state: &ShardState) -> Option<ApiError> {
     }
 }
 
+/// A document's metadata record, with the state it replaces and the state it
+/// leaves.
+pub struct MetaWrite {
+    pub id: String,
+    pub bytes: Vec<u8>,
+    pub old: Option<MetaState>,
+    pub new: Option<MetaState>,
+    pub seq: u64,
+}
+
 /// One document's change, for the in-memory indexes once its group commits.
 struct DocChange {
     id: String,
@@ -634,6 +645,9 @@ pub struct Shard {
     /// Test seam: the row the next compaction drops from its copy.
     #[cfg(test)]
     drop_from_copy: Option<(Table, Vec<u8>)>,
+    /// Test seam: how many times a job or a commit has opened a table.
+    #[cfg(test)]
+    table_opens: AtomicU64,
 }
 
 impl Shard {
@@ -684,6 +698,8 @@ impl Shard {
             fail_write_after: None,
             #[cfg(test)]
             drop_from_copy: None,
+            #[cfg(test)]
+            table_opens: AtomicU64::new(0),
         })
     }
 
@@ -813,6 +829,11 @@ impl Shard {
     /// The shard's committed position.
     pub fn seq(&self) -> u64 {
         self.settings.seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn journal(&self) -> &journal::Journal {
+        &self.journal
     }
 
     /// Whether the write being made is the one `inject_write_failure` chose.
@@ -1017,6 +1038,8 @@ impl Shard {
         first: Box<dyn ShardJob>,
         mut more: impl FnMut() -> Option<Box<dyn ShardJob>>,
     ) -> (Vec<Reply>, Option<ApiError>) {
+        // Beginning the transaction counts as job time, as in the floor.
+        let jobs_started = Instant::now();
         let txn = match self.begin_group() {
             Ok(txn) => txn,
             Err(error) => {
@@ -1040,6 +1063,8 @@ impl Shard {
                 next = more();
             }
         }
+        let jobs_us = jobs_started.elapsed().as_micros() as u64;
+        let commit_started = Instant::now();
         let mut commit_failed = false;
         let error = match aborted {
             Some(error) => {
@@ -1058,6 +1083,7 @@ impl Shard {
                 )
             }),
         };
+        crate::metrics::record_shard_group(jobs_us, commit_started.elapsed().as_micros() as u64);
         // Before anyone hears back, so a retry meets the recovered file.
         if let Some(error) = &error {
             if commit_failed || self.poisoned() {
@@ -1197,7 +1223,9 @@ enum Txn {
 /// Run `$body` with `$table` bound to `$def` opened in the job's
 /// transaction, read-only or not.
 macro_rules! with_table {
-    ($txn:expr, $def:expr, |$table:ident| $body:expr) => {
+    ($txn:expr, $def:expr, |$table:ident| $body:expr) => {{
+        #[cfg(test)]
+        $txn.shard.table_opens.fetch_add(1, Ordering::Relaxed);
         match &$txn.txn {
             Txn::Write(txn) => {
                 let $table = txn.open_table($def)?;
@@ -1210,7 +1238,7 @@ macro_rules! with_table {
                 result
             }
         }
-    };
+    }};
 }
 
 /// A shard as one job sees it: the group's write transaction (or a read
@@ -1295,6 +1323,8 @@ impl<'s> ShardTxn<'s> {
             return Ok(());
         }
         {
+            #[cfg(test)]
+            shard.table_opens.fetch_add(1, Ordering::Relaxed);
             let mut settings = txn.open_table(SETTINGS)?;
             if staged.uuid != shard.settings.uuid {
                 settings.insert(UUID, kv::seal(staged.uuid.as_bytes()).as_slice())?;
@@ -1396,6 +1426,8 @@ impl<'s> ShardTxn<'s> {
         let injected = self.shard.injected_write_failure();
         #[cfg(not(test))]
         let injected = false;
+        #[cfg(test)]
+        self.shard.table_opens.fetch_add(1, Ordering::Relaxed);
         let result = if injected {
             Err(anyhow::anyhow!("injected write failure"))
         } else {
@@ -1422,11 +1454,32 @@ impl<'s> ShardTxn<'s> {
         value: &[u8],
     ) -> Result<()>
     where
+        K::SelfType<'k>: KeyBytes + Clone,
+    {
+        self.put_values(def, table, std::iter::once((key, value)))
+    }
+
+    /// Store each of `entries` in `def`, opened once, journaling every key.
+    /// No entries is no write.
+    fn put_values<'k, 'v, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
+        entries: impl Iterator<Item = (K::SelfType<'k>, &'v [u8])> + Clone,
+    ) -> Result<()>
+    where
         K::SelfType<'k>: KeyBytes,
     {
-        self.journaled.push((table, key.key_bytes()));
-        self.write(def, |table| {
-            table.insert(key, kv::seal(value).as_slice())?;
+        let journaled = self.journaled.len();
+        self.journaled
+            .extend(entries.clone().map(|(key, _)| (table, key.key_bytes())));
+        if self.journaled.len() == journaled {
+            return Ok(());
+        }
+        self.write(def, |t| {
+            for (key, value) in entries {
+                t.insert(key, kv::seal(value).as_slice())?;
+            }
             Ok(())
         })
     }
@@ -1438,11 +1491,32 @@ impl<'s> ShardTxn<'s> {
         key: K::SelfType<'k>,
     ) -> Result<()>
     where
+        K::SelfType<'k>: KeyBytes + Clone,
+    {
+        self.remove_values(def, table, std::iter::once(key))
+    }
+
+    /// Remove each of `keys` from `def`, opened once, journaling every key.
+    /// No keys is no write.
+    fn remove_values<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
+        keys: impl Iterator<Item = K::SelfType<'k>> + Clone,
+    ) -> Result<()>
+    where
         K::SelfType<'k>: KeyBytes,
     {
-        self.journaled.push((table, key.key_bytes()));
-        self.write(def, |table| {
-            table.remove(key)?;
+        let journaled = self.journaled.len();
+        self.journaled
+            .extend(keys.clone().map(|key| (table, key.key_bytes())));
+        if self.journaled.len() == journaled {
+            return Ok(());
+        }
+        self.write(def, |t| {
+            for key in keys {
+                t.remove(key)?;
+            }
             Ok(())
         })
     }
@@ -1524,6 +1598,21 @@ impl<'s> ShardTxn<'s> {
         }
     }
 
+    /// The metadata of each of `ids`, in order, read with one open of the
+    /// table. A record that cannot be read or decoded fails the whole read.
+    pub fn get_metas(&self, ids: &[&str]) -> Result<Vec<Option<DocMeta>>> {
+        with_table!(self, META, |t| ids
+            .iter()
+            .map(|id| match t.get(*id)? {
+                Some(stored) => Ok(Some(parse_meta(
+                    id,
+                    unsealed(Table::Meta, stored.value())?,
+                )?)),
+                None => Ok(None),
+            })
+            .collect())
+    }
+
     pub fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
         self.shard.body_reads.fetch_add(1, Ordering::Relaxed);
         self.get_value(BODIES, Table::Bodies, (docid, rev))
@@ -1548,6 +1637,23 @@ impl<'s> ShardTxn<'s> {
             new,
             seq: Some(seq),
         });
+        Ok(())
+    }
+
+    /// Write each of `metas`, as [`ShardTxn::put_meta`] does, with one open
+    /// of the table.
+    pub fn put_metas(&mut self, metas: Vec<MetaWrite>) -> Result<()> {
+        let entries = metas.iter().map(|m| (m.id.as_str(), m.bytes.as_slice()));
+        self.put_values(META, Table::Meta, entries)?;
+        self.changes.reserve(metas.len());
+        for meta in metas {
+            self.count(meta.old.as_ref(), meta.new.as_ref());
+            self.changes.push(DocChange {
+                id: meta.id,
+                new: meta.new,
+                seq: Some(meta.seq),
+            });
+        }
         Ok(())
     }
 
@@ -1578,8 +1684,10 @@ impl<'s> ShardTxn<'s> {
         }
     }
 
-    pub fn put_body(&mut self, docid: &str, rev: &str, body: &[u8]) -> Result<()> {
-        self.put_value(BODIES, Table::Bodies, (docid, rev), body)
+    /// Store each `(docid, rev, body)` with one open of the table.
+    pub fn put_bodies(&mut self, bodies: &[(&str, &str, &[u8])]) -> Result<()> {
+        let entries = bodies.iter().map(|&(id, rev, body)| ((id, rev), body));
+        self.put_values(BODIES, Table::Bodies, entries)
     }
 
     pub fn remove_body(&mut self, docid: &str, rev: &str) -> Result<()> {
@@ -1591,8 +1699,18 @@ impl<'s> ShardTxn<'s> {
         self.put_value(BY_SEQ, Table::BySeq, seq, docid.as_bytes())
     }
 
+    /// Record each `(seq, docid)` change with one open of the table.
+    pub fn put_seqs(&mut self, seqs: &[(u64, &str)]) -> Result<()> {
+        let entries = seqs.iter().map(|&(seq, id)| (seq, id.as_bytes()));
+        self.put_values(BY_SEQ, Table::BySeq, entries)
+    }
+
     pub fn remove_seq(&mut self, seq: u64) -> Result<()> {
         self.remove_value(BY_SEQ, Table::BySeq, seq)
+    }
+
+    pub fn remove_seqs(&mut self, seqs: &[u64]) -> Result<()> {
+        self.remove_values(BY_SEQ, Table::BySeq, seqs.iter().copied())
     }
 
     pub fn get_local(&self, id: &str) -> Result<Option<Vec<u8>>> {
@@ -1942,6 +2060,29 @@ impl<'s> ShardTxn<'s> {
         Some(kv::unseal(stored.value()).unwrap().to_vec())
     }
 
+    /// Every row of the by_seq table, in sequence order.
+    #[cfg(test)]
+    pub(crate) fn by_seq(&self) -> Result<Vec<(u64, String)>> {
+        let mut out = Vec::new();
+        self.scan(
+            BY_SEQ,
+            Table::BySeq,
+            (Unbounded, Unbounded),
+            false,
+            |seq, id| {
+                out.push((seq, String::from_utf8(id.to_vec())?));
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// How many tables this shard's jobs and commits have opened.
+    #[cfg(test)]
+    pub(crate) fn table_opens(&self) -> u64 {
+        self.shard.table_opens.load(Ordering::Relaxed)
+    }
+
     /// Make the group's commit fail, as a write error would.
     #[cfg(test)]
     pub(crate) fn inject_commit_failure(&mut self) {
@@ -1966,7 +2107,7 @@ impl<'s> ShardTxn<'s> {
         key: K::SelfType<'k>,
         value: &[u8],
     ) where
-        K::SelfType<'k>: KeyBytes,
+        K::SelfType<'k>: KeyBytes + Clone,
     {
         self.put_value(def, table, key, value).unwrap();
     }
@@ -2979,7 +3120,7 @@ pub(crate) mod tests {
         let old_seq = meta.seq;
         let seq = txn.next_seq();
         meta.seq = seq;
-        txn.put_body(id, &rev, body)?;
+        txn.put_bodies(&[(id, &rev, body)])?;
         txn.put_seq(seq, id)?;
         if old_seq != 0 {
             txn.remove_seq(old_seq)?;
@@ -3027,21 +3168,19 @@ pub(crate) mod tests {
             .write(move |txn| {
                 // The only leaf of "doc" has a '/' in its revision id.
                 put_doc_meta(txn, "doc", &tree(&[("1-x/y", None)]))?;
-                txn.put_body("doc", "1-x/y", b"{}")?;
+                txn.put_bodies(&[("doc", "1-x/y", b"{}")])?;
                 // "p" has a stale parent and a leaf, both with '/'.
                 put_doc_meta(
                     txn,
                     "p",
                     &tree(&[("1-p/q", None), ("2-r/s", Some("1-p/q"))]),
                 )?;
-                txn.put_body("p", "1-p/q", b"{}")?;
-                txn.put_body("p", "2-r/s", b"{}")?;
+                txn.put_bodies(&[("p", "1-p/q", b"{}"), ("p", "2-r/s", b"{}")])?;
                 // Under a joined key, a/1-b/c read as "a" with leaf "1-b/c"
                 // or as "a/1-b" with rev "c"; each is a leaf of its own.
                 put_doc_meta(txn, "a", &tree(&[("1-b/c", None)]))?;
                 put_doc_meta(txn, "a/1-b", &tree(&[("2-z", None)]))?;
-                txn.put_body("a", "1-b/c", b"{}")?;
-                txn.put_body("a/1-b", "2-z", b"{}")?;
+                txn.put_bodies(&[("a", "1-b/c", b"{}"), ("a/1-b", "2-z", b"{}")])?;
                 Ok(())
             })
             .unwrap();
@@ -3079,10 +3218,9 @@ pub(crate) mod tests {
             .write(move |txn| {
                 for id in ids {
                     put_doc_meta(txn, id, &doc_meta)?;
-                    txn.put_body(id, &old_rev, b"{}")?;
-                    txn.put_body(id, &new_rev, b"{}")?;
+                    txn.put_bodies(&[(id, &old_rev, b"{}"), (id, &new_rev, b"{}")])?;
                 }
-                txn.put_body("ghost/x", &old_rev, b"{}")?;
+                txn.put_bodies(&[("ghost/x", &old_rev, b"{}")])?;
                 Ok(())
             })
             .unwrap();

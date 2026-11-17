@@ -1045,7 +1045,7 @@ async fn spawn_quorum_writes(
         let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
         let slot = st.admission.acquire_detached().await;
         if node == ctx.cluster.me {
-            let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
+            let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
             let db = db.clone();
             let gate = gate.clone();
             pending.push(spawn_node_write(node, slots, async move {
@@ -1241,12 +1241,14 @@ async fn replicate_to_all(
     headers: &HeaderMap,
 ) -> Vec<NodeReply> {
     let ctx = &st.ctx;
-    let mut responses = Vec::new();
-    if let Some(group) = groups.remove(&ctx.cluster.me) {
+    // The coordinator's own copy is written while the remote copies are.
+    let mine = groups.remove(&ctx.cluster.me);
+    let local = async {
+        let group = mine?;
         let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
-        let subdocs: Vec<Value> = group.into_iter().map(|(_, doc)| (*doc).clone()).collect();
-        responses.push((ctx.cluster.me, slots, db.put_docs(subdocs, false).await));
-    }
+        let subdocs: Vec<Arc<Value>> = group.into_iter().map(|(_, doc)| doc).collect();
+        Some((ctx.cluster.me, slots, db.put_docs(subdocs, false).await))
+    };
     let remote = crate::cluster_http::in_one_round(futures::future::join_all(
         groups.into_iter().map(|(node, group)| {
             let slots: Vec<usize> = group.iter().map(|(slot, _)| *slot).collect();
@@ -1264,10 +1266,9 @@ async fn replicate_to_all(
                 )
             }
         }),
-    ))
-    .await;
-    responses.extend(remote);
-    responses
+    ));
+    let (local, remote) = tokio::join!(local, remote);
+    local.into_iter().chain(remote).collect()
 }
 
 /// Merge the replies of a replication write: the primary's verdict wins, and
@@ -3472,6 +3473,113 @@ mod tests {
             in_flight < 200,
             "{in_flight} replica writes are in flight to a peer that never answers"
         );
+    }
+
+    /// A replication write starts its remote call while the coordinator's own
+    /// copy is still blocked, and makes the same one call to the one peer.
+    /// The peer is a stub that reports each `_bulk_docs` body it receives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replicated_writes_start_remote_before_local_finishes() {
+        let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let app = axum::Router::new()
+            .fallback(
+                |axum::extract::State(arrived): axum::extract::State<
+                    tokio::sync::mpsc::UnboundedSender<Value>,
+                >,
+                 body: axum::body::Bytes| async move {
+                    let _ = arrived.send(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    axum::Json(json!([]))
+                },
+            )
+            .with_state(arrived);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let root = std::env::temp_dir().join(format!("douchdb-replicated-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 4);
+        Arc::get_mut(&mut st).expect("sole owner").ctx.cluster = crate::cluster::Cluster {
+            nodes: vec!["http://127.0.0.1:1".to_string(), peer],
+            me: 0,
+            n: 2,
+            secret: "test-secret".to_string(),
+        };
+        let db = st
+            .create_db("replicated", false, Some(1), Some(2))
+            .await
+            .unwrap();
+
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holding = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.shard_handle(0)
+                    .alone(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = held.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started.await.unwrap();
+
+        let stats = crate::cluster_http::PeerStats::new("/{db}/_bulk_docs".to_string(), false);
+        let request = tokio::spawn({
+            let st = st.clone();
+            let db = db.clone();
+            let stats = stats.clone();
+            crate::cluster_http::with_stats(stats, async move {
+                commit_docs(
+                    &st,
+                    &db,
+                    "replicated",
+                    vec![json!({"_id": "a", "_rev": "1-abc"})],
+                    false,
+                    0,
+                    &HeaderMap::new(),
+                )
+                .await
+            })
+        });
+        let body = arrivals.recv().await.expect("the peer is sent the write");
+        assert_eq!(body["new_edits"], false, "{body}");
+        assert_eq!(body["docs"][0]["_id"], "a", "{body}");
+        assert_eq!(
+            db.shard_handle(0).committed_seq(),
+            0,
+            "the local copy is held"
+        );
+
+        release.send(()).unwrap();
+        holding.await.unwrap().unwrap();
+        let (out, met) = request.await.unwrap().unwrap();
+        assert!(met);
+        assert!(out.iter().flatten().all(WriteResult::is_ok), "{out:?}");
+        let stored = db
+            .get_doc("a", &crate::db::DocOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(stored["_rev"], "1-abc");
+        let (calls, rounds, _) = stats.totals();
+        assert_eq!(
+            (calls, rounds),
+            (1, 1),
+            "one call to the one peer, in one round"
+        );
+        assert!(
+            arrivals.try_recv().is_err(),
+            "the peer is sent the write once"
+        );
+
+        server.abort();
+        drop(stats);
+        drop(db);
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn leaf(rev: &str, ids: &[&str]) -> Value {

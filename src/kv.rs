@@ -21,12 +21,13 @@ pub(crate) mod powercut;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use redb::backends::FileBackend;
 use redb::{
-    Builder, Database, DatabaseError, ReadableDatabase, StorageBackend, StorageError,
+    BackendError, Builder, Database, DatabaseError, ReadableDatabase, StorageBackend, StorageError,
     TableDefinition, TransactionError, WriteTransaction,
 };
 
@@ -133,7 +134,89 @@ fn lock(flag: &Mutex<bool>) -> MutexGuard<'_, bool> {
 /// one. An empty file is refused for the same reason (redb would initialise
 /// it as new).
 pub fn open(path: &Path, cache_bytes: usize) -> Result<Database> {
-    open_file(path, cache_bytes, |file| file)
+    open_file(path, cache_bytes, Metered)
+}
+
+/// redb's file backend, counting the syncs and bytes written for the
+/// shard metrics.
+#[derive(Debug)]
+struct Metered(FileBackend);
+
+impl StorageBackend for Metered {
+    fn len(&self) -> std::result::Result<u64, std::io::Error> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
+        self.0.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
+        crate::metrics::record_sync();
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
+        crate::metrics::record_write(data.len() as u64);
+        self.0.write(offset, data)
+    }
+
+    fn close(&self) -> std::result::Result<(), std::io::Error> {
+        self.0.close()
+    }
+
+    // The locks keep redb's refusal of a second open of the same file.
+    fn try_lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, BackendError> {
+        self.0.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, BackendError> {
+        self.0.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), BackendError> {
+        self.0.lock_range(start, end)
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), BackendError> {
+        self.0.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), BackendError> {
+        self.0.unlock_range(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, BackendError> {
+        self.0.query_lock_range(start, end)
+    }
 }
 
 /// Create a new redb file at `path`, failing if one is there already. A new

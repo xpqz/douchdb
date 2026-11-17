@@ -7,6 +7,19 @@ use md5::{Digest, Md5};
 use serde_json::Value;
 use std::fmt;
 
+/// Fields CouchDB strips before hashing a document body.
+pub const META_FIELDS: [&str; 9] = [
+    "_id",
+    "_rev",
+    "_revisions",
+    "_deleted",
+    "_attachments",
+    "_conflicts",
+    "_deleted_conflicts",
+    "_revs_info",
+    "_local_seq",
+];
+
 #[derive(Clone, Debug)]
 pub struct Rev {
     pub pos: u64,
@@ -31,7 +44,13 @@ impl Rev {
     /// emits it: 16-byte ids as lowercase hex, anything else verbatim.
     pub fn id_string(&self) -> String {
         if self.hex {
-            self.id.iter().map(|b| format!("{b:02x}")).collect()
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(self.id.len() * 2);
+            for &b in &self.id {
+                out.push(DIGITS[usize::from(b >> 4)] as char);
+                out.push(DIGITS[usize::from(b & 15)] as char);
+            }
+            out
         } else {
             String::from_utf8_lossy(&self.id).into_owned()
         }
@@ -77,12 +96,14 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Compute a new revision id, exactly as `couch_db:new_revid/1` does.
+/// The reference for [`new_revid_doc`]: build the term tree and hash it,
+/// exactly as `couch_db:new_revid/1` does.
 ///
 /// `body` must already have `_id`, `_rev`, `_revisions`, `_deleted`,
 /// `_attachments` and the other metadata fields removed, and must retain the
 /// key order it arrived in.
-pub fn new_revid(deleted: bool, parent: Option<&Rev>, body: &Value) -> [u8; 16] {
+#[cfg(test)]
+fn new_revid(deleted: bool, parent: Option<&Rev>, body: &Value) -> [u8; 16] {
     let old_start = parent.map(|r| r.pos).unwrap_or(0);
     let old_rev = match parent {
         Some(r) => Term::Binary(r.id.clone()),
@@ -99,6 +120,38 @@ pub fn new_revid(deleted: bool, parent: Option<&Rev>, body: &Value) -> [u8; 16] 
     ]);
 
     Md5::digest(term.encode()).into()
+}
+
+/// Like [`new_revid`], for the members of a whole document: every key that is
+/// not in [`META_FIELDS`] is the body, in order. The
+/// hash is fed without building the body or its term.
+pub fn new_revid_doc(
+    deleted: bool,
+    parent: Option<&Rev>,
+    doc: &serde_json::Map<String, Value>,
+) -> [u8; 16] {
+    let old_start = parent.map(|r| r.pos).unwrap_or(0);
+    let old_rev = match parent {
+        Some(r) => Term::Binary(r.id.clone()),
+        None => Term::Int(0),
+    };
+    // The version byte and the header of the five-element outer list.
+    let mut head = vec![131, 108, 0, 0, 0, 5];
+    for term in [
+        Term::Atom(if deleted { "true" } else { "false" }),
+        Term::Int(old_start as i64),
+        old_rev,
+    ] {
+        term.encode_into(&mut head);
+    }
+    let mut hasher = Md5::new();
+    etf::hash_revision(
+        &mut hasher,
+        &head,
+        doc.iter()
+            .filter(|(key, _)| !META_FIELDS.contains(&key.as_str())),
+    );
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -144,10 +197,11 @@ mod tests {
     fn revid_is_deterministic_and_order_sensitive() {
         let body = json!({"x": 1, "y": 2});
         let reordered = json!({"y": 2, "x": 1});
-        let a = new_revid(false, None, &body);
-        assert_eq!(a, new_revid(false, None, &body));
-        assert_ne!(a, new_revid(false, None, &reordered));
-        assert_ne!(a, new_revid(true, None, &body));
+        let (body, reordered) = (body.as_object().unwrap(), reordered.as_object().unwrap());
+        let a = new_revid_doc(false, None, body);
+        assert_eq!(a, new_revid_doc(false, None, body));
+        assert_ne!(a, new_revid_doc(false, None, reordered));
+        assert_ne!(a, new_revid_doc(true, None, body));
     }
 
     #[test]
@@ -155,8 +209,8 @@ mod tests {
         let body = json!({"x": 1});
         let parent = Rev::parse("1-aabbccddeeff00112233445566778899").unwrap();
         assert_ne!(
-            new_revid(false, Some(&parent), &body),
-            new_revid(false, None, &body)
+            new_revid_doc(false, Some(&parent), body.as_object().unwrap()),
+            new_revid_doc(false, None, body.as_object().unwrap())
         );
     }
 
@@ -176,7 +230,7 @@ mod tests {
             (json!({"a": [0, 255]}), "ebdd13a7ecf6387443aa094a0d18b4d6"),
         ];
         for (body, expected) in cases {
-            let got = hex16(new_revid(false, None, &body));
+            let got = hex16(new_revid_doc(false, None, body.as_object().unwrap()));
             assert_eq!(got, expected, "body {body}");
         }
     }
@@ -194,8 +248,64 @@ mod tests {
         ];
         for (raw, expected) in cases {
             let body = crate::json::from_slice(raw.as_bytes()).unwrap();
-            let got = hex16(new_revid(false, None, &body));
+            let got = hex16(new_revid_doc(false, None, body.as_object().unwrap()));
             assert_eq!(got, expected, "body {raw}");
+        }
+    }
+
+    #[test]
+    fn streaming_revid_matches_term_encoding() {
+        let mut wide = serde_json::Map::new();
+        for i in 0..300 {
+            wide.insert(format!("k{i}"), json!(i));
+        }
+        let mut deep = json!("leaf");
+        for i in 0..64 {
+            deep = if i % 2 == 0 {
+                json!([deep])
+            } else {
+                json!({"d": deep})
+            };
+        }
+        let texts = [
+            "{}",
+            r#"{"a":[1,2,3],"b":{"c":[[],{}],"d":[255,256,-1,300]},"e":[0,1.0,2]}"#,
+            r#"{"big":123456789012345678901234567890,"neg":-18446744073709551616,"u":18446744073709551615,"i":-9223372036854775808}"#,
+            r#"{"f":1.5,"e":1e400,"x":1.25e-7,"nz":-0,"nzf":-0.0,"z":0.0}"#,
+            r#"{"é":"ünï \u0000 日本","t":true,"f":false,"n":null,"":""}"#,
+            r#"{"_id":"x","_rev":"1-a","_deleted":true,"_attachments":{},"_revisions":1,"_conflicts":[],"_deleted_conflicts":[],"_revs_info":[],"_local_seq":3,"keep":1,"_other":2}"#,
+        ];
+        let mut docs: Vec<serde_json::Map<String, Value>> = texts
+            .iter()
+            .map(|t| {
+                serde_json::from_str::<Value>(t)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        docs.push(wide);
+        docs.push(
+            json!({"_id": "d", "deep": deep, "long": "x".repeat(20000), "bytes": vec![7; 70000]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let parent = Rev::parse("3-aabbccddeeff00112233445566778899").unwrap();
+        for doc in &docs {
+            let mut body = doc.clone();
+            body.retain(|k, _| !META_FIELDS.contains(&k.as_str()));
+            let body = Value::Object(body);
+            for deleted in [false, true] {
+                for parent in [None, Some(&parent)] {
+                    assert_eq!(
+                        new_revid_doc(deleted, parent, doc),
+                        new_revid(deleted, parent, &body),
+                        "{body}"
+                    );
+                }
+            }
         }
     }
 }
