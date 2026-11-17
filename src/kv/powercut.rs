@@ -7,6 +7,11 @@
 //! backend handed out before it, so whatever the dropped database does on its
 //! way out (a clean-shutdown write, a sync) cannot reach the durable image;
 //! [`PowerSwitch::backend`] hands out a live one to reopen over what survived.
+//!
+//! The disk also stands for the file's name: [`PowerSwitch::rename_over`]
+//! puts another disk's durable image under it, and until
+//! [`PowerSwitch::sync_directory`] a cut brings back the image the name held
+//! before, as a power cut does to a rename whose directory was not synced.
 
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -27,6 +32,13 @@ struct Disk {
     syncs_ignored: bool,
     /// `sync_data` calls that succeeded.
     syncs: usize,
+    /// What the name held durably before a rename over it whose directory
+    /// has not been synced since; a cut brings it back.
+    displaced: Option<Vec<u8>>,
+    /// Every later rename over the file fails with this.
+    renames_failing: Option<ErrorKind>,
+    /// Every later directory sync fails with this.
+    directory_syncs_failing: Option<ErrorKind>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +60,9 @@ enum Fault {
 
 impl Disk {
     fn cut(&mut self) {
+        if let Some(before) = self.displaced.take() {
+            self.durable = before;
+        }
         self.volatile = self.durable.clone();
         self.generation += 1;
         self.sync_fault = None;
@@ -165,13 +180,38 @@ impl PowerSwitch {
     }
 
     /// Put what `other` holds durably in place of this disk's contents, as
-    /// a rename over the file and a sync of its directory would: the
-    /// compaction swap of a shard on a test disk.
-    pub fn replace_with(&self, other: &PowerSwitch) {
+    /// a rename over the file does: the compaction swap of a shard on a test
+    /// disk. A cut undoes it until [`PowerSwitch::sync_directory`].
+    pub fn rename_over(&self, other: &PowerSwitch) -> Result<(), Error> {
         let image = other.disk.lock().unwrap().durable.clone();
         let mut disk = self.disk.lock().unwrap();
-        disk.volatile = image.clone();
-        disk.durable = image;
+        if let Some(kind) = disk.renames_failing {
+            return Err(Error::from(kind));
+        }
+        let before = std::mem::replace(&mut disk.durable, image.clone());
+        disk.displaced.get_or_insert(before);
+        disk.volatile = image;
+        Ok(())
+    }
+
+    /// Sync the file's directory: a rename over the file survives a cut.
+    pub fn sync_directory(&self) -> Result<(), Error> {
+        let mut disk = self.disk.lock().unwrap();
+        if let Some(kind) = disk.directory_syncs_failing {
+            return Err(Error::from(kind));
+        }
+        disk.displaced = None;
+        Ok(())
+    }
+
+    /// Make every later rename over the file fail with `error`.
+    pub fn fail_renames(&self, error: ErrorKind) {
+        self.disk.lock().unwrap().renames_failing = Some(error);
+    }
+
+    /// Make every later directory sync fail with `error`.
+    pub fn fail_directory_syncs(&self, error: ErrorKind) {
+        self.disk.lock().unwrap().directory_syncs_failing = Some(error);
     }
 
     /// A live backend over the disk as it now stands, to reopen after a cut.
