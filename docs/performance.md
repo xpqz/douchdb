@@ -211,25 +211,25 @@ Column definitions:
   the rounds.
 - **Before** is `3210349`, measured before the job timer also counted
   beginning the transaction, so its jobs/insert reads slightly low.
-- **Task 7** is `4d1f3d1` in its own run. **Now** is the head of the bulk
-  write path, measured in the same rounds as `4d1f3d1` and the floor.
+- **Now** is the head of the bulk write path. It ran in the same rounds as
+  `4d1f3d1` (the work before the staging was trimmed) and the floor.
 - **Now ÷ 4d1f3d1** is the median of the same-round ratios of job time.
 - **docs/s** is end to end, the floor's docs/s in parentheses.
 
-| q / batch / clients | Before jobs/insert | Task 7 jobs/insert | Now jobs/insert | Now ÷ 4d1f3d1 | Now docs/s | Now syncs/commit (douchdb / floor) | Now KB/commit (douchdb / floor) |
+| q / batch / clients | Before jobs/insert | `4d1f3d1` jobs/insert | Now jobs/insert | Now ÷ 4d1f3d1 | Now docs/s | Now syncs/commit (douchdb / floor) | Now KB/commit (douchdb / floor) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| q1 / 250 / 1 | 3.31 | 1.72 | **1.03** | 0.65 | 14,913 (18,275) | 2.02 / 2.02 | 882 / 897 |
-| q1 / 1,000 / 1 | 3.58 | 1.52 | **1.15** | 0.62 | 25,874 (40,660) | 2.09 / 2.09 | 2,597 / 2,651 |
-| q1 / 10,000 / 1 | 2.68 | 1.40 | **1.08** | 0.73 | 31,100 (53,910) | 2.81 / 2.81 | 41,591 / 41,189 |
-| q2 / 250 / 1 | 3.30 | 1.59 | **0.90** | 0.64 | 8,189 (8,750) | 2.02 / 2.02 | 475 / 482 |
-| q2 / 1,000 / 1 | 2.51 | 1.60 | **0.96** | 0.64 | 21,569 (27,244) | 2.08 / 2.08 | 1,311 / 1,336 |
-| q2 / 10,000 / 1 | 2.03 | 1.35 | **1.14** | 0.74 | 28,205 (53,099) | 2.75 / 2.75 | 16,936 / 16,567 |
-| q1 / 250 / 4 | 3.08 | 1.65 | 1.02 | 0.64 | 31,032 (17,969) | 2.07 / 2.02 | 2,210 / 897 |
-| q1 / 1,000 / 4 | 3.52 | 2.89 | 1.49 | 0.67 | 41,730 (40,557) | 2.29 / 2.09 | 10,029 / 2,651 |
-| q1 / 10,000 / 4 | 3.02 | 1.47 | 1.21 | 0.77 | 44,749 (53,580) | 4.60 / 2.81 | 132,846 / 41,189 |
-| q2 / 250 / 4 | 3.09 | 1.36 | 0.91 | 0.76 | 15,610 (10,484) | 2.04 / 2.02 | 832 / 482 |
-| q2 / 1,000 / 4 | 2.09 | 1.35 | 1.10 | 0.68 | 36,056 (36,964) | 2.23 / 2.08 | 3,700 / 1,336 |
-| q2 / 10,000 / 4 | — | 1.88 | 1.62 | 0.92 | 50,506 (48,684) | 4.40 / 2.75 | 64,409 / 16,567 |
+| q1 / 250 / 1 | 3.31 | 1.62 | **1.03** | 0.65 | 14,913 (18,275) | 2.02 / 2.02 | 882 / 897 |
+| q1 / 1,000 / 1 | 3.58 | 1.84 | **1.146** | 0.62 | 25,874 (40,660) | 2.09 / 2.09 | 2,597 / 2,651 |
+| q1 / 10,000 / 1 | 2.68 | 1.47 | **1.08** | 0.73 | 31,100 (53,910) | 2.81 / 2.81 | 41,591 / 41,189 |
+| q2 / 250 / 1 | 3.30 | 1.56 | **0.90** | 0.64 | 8,189 (8,750) | 2.02 / 2.02 | 475 / 482 |
+| q2 / 1,000 / 1 | 2.51 | 1.48 | **0.96** | 0.64 | 21,569 (27,244) | 2.08 / 2.08 | 1,311 / 1,336 |
+| q2 / 10,000 / 1 | 2.03 | 1.54 | **1.14** | 0.74 | 28,205 (53,099) | 2.75 / 2.75 | 16,936 / 16,567 |
+| q1 / 250 / 4 | 3.08 | 1.58 | 1.02 | 0.64 | 31,032 (17,969) | 2.07 / 2.02 | 2,210 / 897 |
+| q1 / 1,000 / 4 | 3.52 | 2.22 | 1.49 | 0.67 | 41,730 (40,557) | 2.29 / 2.09 | 10,029 / 2,651 |
+| q1 / 10,000 / 4 | 3.02 | 1.57 | 1.21 | 0.77 | 44,749 (53,580) | 4.60 / 2.81 | 132,846 / 41,189 |
+| q2 / 250 / 4 | 3.09 | 1.06 | 0.91 | 0.76 | 15,610 (10,484) | 2.04 / 2.02 | 832 / 482 |
+| q2 / 1,000 / 4 | 2.09 | 1.67 | 1.10 | 0.68 | 36,056 (36,964) | 2.23 / 2.08 | 3,700 / 1,336 |
+| q2 / 10,000 / 4 | — | 1.85 | 1.62 | 0.92 | 50,506 (48,684) | 4.40 / 2.75 | 64,409 / 16,567 |
 
 Conditions:
 
@@ -247,9 +247,11 @@ What the numbers say:
 
 - **Job time.** With one client the shard actor's job time is now 0.90–1.15×
   the floor's insert time, against a goal of 1.15×, which it meets at every
-  size and q; q=1 with 1,000 documents is at the limit. It was 2.0–3.6×
-  before the bulk write path work and 1.35–1.72× after Task 7. The trimmed
-  staging alone cut job time by 26–38% against `4d1f3d1` in the same rounds.
+  size and q; q=1 with 1,000 documents is just under the limit, at 1.146. It
+  was 2.0–3.6× before the bulk write path work, and `4d1f3d1` measured
+  1.47–1.84× in the same rounds (1.35–1.72× in an earlier, more loaded run).
+  The trimmed staging alone cut job time by 26–38% against `4d1f3d1` in the
+  same rounds.
   - A sampled profile of the shard actor at q=1, one client, splits the job
     as follows. The inserts (bodies, by_seq, metadata) are 79–89% of it.
     Staging, which includes building the tree, encoding the record and
