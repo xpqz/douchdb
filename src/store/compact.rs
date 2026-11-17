@@ -17,8 +17,9 @@
 //!    made exactly its leaf bodies, so a body that stopped being a leaf
 //!    goes even though its own key was never written.
 //! 5. On the actor, writes paused: the last round, a comparison of the new
-//!    file's settings with the shard's, and the swap through the gate
-//!    (close, drain, rename, directory sync, reopen).
+//!    file's settings and table lengths (bodies aside) with the shard's,
+//!    and the swap through the gate (close, drain, rename, directory sync,
+//!    reopen).
 //!
 //! A clear or a recovery invalidates the journal; the compaction then throws
 //! its file away and starts again. Until the rename the live file is
@@ -41,7 +42,7 @@ use std::sync::{Arc, PoisonError};
 
 /// Every table, in the order the copy walks them. Bodies are copied with
 /// their documents' metadata, not on their own.
-const TABLES: [Table; 9] = [
+pub(crate) const TABLES: [Table; 9] = [
     Table::Meta,
     Table::Bodies,
     Table::BySeq,
@@ -1421,6 +1422,37 @@ mod tests {
             drop(db);
             let _ = std::fs::remove_dir_all(&crashed);
         }
+    }
+
+    /// redb checks no page checksum on an ordinary read, so a damaged
+    /// branch page could hide part of a table from the copy. The swap
+    /// compares every table's length but the bodies', and a copy that came
+    /// up short is thrown away while the live file serves on.
+    #[tokio::test]
+    async fn a_copy_missing_a_row_is_not_swapped_in() {
+        let rig = Rig::new("compact-short");
+        rig.run(&setup()).await.unwrap();
+        let before = dump(&rig.handle).await;
+        let (table, key) = before
+            .keys()
+            .find(|(table, _)| *table == Table::BySeq)
+            .unwrap()
+            .clone();
+        rig.handle
+            .alone(move |shard| {
+                shard.drop_from_copy = Some((table, key));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = compact_shard(&rig.handle).await.unwrap_err();
+        assert!(format!("{error:#}").contains("BySeq"), "{error:#}");
+        assert_eq!(dump(&rig.handle).await, before, "the live file serves on");
+        assert!(!rig.file.with_extension("compact.redb").exists());
+
+        compact_shard(&rig.handle).await.unwrap();
+        assert_eq!(without_uuid(dump(&rig.handle).await), compacted(before));
+        rig.close();
     }
 
     /// A power cut once the new file is in place keeps it whole, with the

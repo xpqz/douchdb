@@ -265,6 +265,22 @@ fn bound<'k, T>(
     })
 }
 
+/// How many entries `table` holds in `txn`: the count redb keeps in the
+/// table's header, so no page is read.
+pub(crate) fn table_len(txn: &ReadTransaction, table: Table) -> Result<u64> {
+    Ok(match table {
+        Table::Meta => txn.open_table(META)?.len()?,
+        Table::BySeq => txn.open_table(BY_SEQ)?.len()?,
+        Table::Bodies => txn.open_table(BODIES)?.len()?,
+        Table::Local => txn.open_table(LOCAL)?.len()?,
+        Table::PurgeInfos => txn.open_table(PURGE_INFOS)?.len()?,
+        Table::PurgedRevs => txn.open_table(PURGED_REVS)?.len()?,
+        Table::PurgeUuids => txn.open_table(PURGE_UUIDS)?.len()?,
+        Table::Checkpoints => txn.open_table(CHECKPOINTS)?.len()?,
+        Table::Settings => txn.open_table(SETTINGS)?.len()?,
+    })
+}
+
 impl LeaseTxn<'_> {
     /// The value under `key` in `table`, unsealed and checked.
     pub fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -328,17 +344,7 @@ impl LeaseTxn<'_> {
 
     /// How many entries `table` holds.
     pub fn len(&self, table: Table) -> Result<u64> {
-        Ok(match table {
-            Table::Meta => self.txn.open_table(META)?.len()?,
-            Table::BySeq => self.txn.open_table(BY_SEQ)?.len()?,
-            Table::Bodies => self.txn.open_table(BODIES)?.len()?,
-            Table::Local => self.txn.open_table(LOCAL)?.len()?,
-            Table::PurgeInfos => self.txn.open_table(PURGE_INFOS)?.len()?,
-            Table::PurgedRevs => self.txn.open_table(PURGED_REVS)?.len()?,
-            Table::PurgeUuids => self.txn.open_table(PURGE_UUIDS)?.len()?,
-            Table::Checkpoints => self.txn.open_table(CHECKPOINTS)?.len()?,
-            Table::Settings => self.txn.open_table(SETTINGS)?.len()?,
-        })
+        table_len(&self.txn, table)
     }
 
     /// A missing table is an error, never an empty answer: every shard file

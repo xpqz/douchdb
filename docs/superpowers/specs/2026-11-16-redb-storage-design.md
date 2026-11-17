@@ -291,8 +291,9 @@ Online, as CouchDB's compactor does; the shard keeps serving throughout.
    are exactly its leaf bodies. Repeat until a round is small, as CouchDB's
    compactor retries until it has caught up.
 5. **Swap through the gate.** On the actor, with writes paused: apply the
-   remaining journal keys, compare the new file's settings with the shard's,
-   close it (recorded as verified by step 3), close and drain the gate,
+   remaining journal keys, compare the new file's settings, and the entry
+   count of every table but `bodies`, with the shard's (a mismatch fails the
+   compaction and keeps the live file), close it (recorded as verified by step 3), close and drain the gate,
    rename the new file over the live one, `fsync` the directory, reopen,
    open the gate, stop the journal. A failure at any step of the swap fails
    the shard closed; nothing is renamed back.

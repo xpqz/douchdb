@@ -631,6 +631,9 @@ pub struct Shard {
     /// Test seam: writes to let through before one fails.
     #[cfg(test)]
     fail_write_after: Option<usize>,
+    /// Test seam: the row the next compaction drops from its copy.
+    #[cfg(test)]
+    drop_from_copy: Option<(Table, Vec<u8>)>,
 }
 
 impl Shard {
@@ -679,6 +682,8 @@ impl Shard {
             fail_next_commit: false,
             #[cfg(test)]
             fail_write_after: None,
+            #[cfg(test)]
+            drop_from_copy: None,
         })
     }
 
@@ -1089,9 +1094,10 @@ impl Shard {
     }
 
     /// End a compaction, writes paused: catch the new file up with the
-    /// keys the journal still holds, compare its settings with the shard's,
-    /// close it (it was checked in full before the catch-up, off the
-    /// actor), rename it over the live file, reopen and stop the journal. `false` when the journal
+    /// keys the journal still holds, compare its settings and the length of
+    /// every table but the bodies with the shard's, close it (it was
+    /// checked in full before the catch-up, off the actor), rename it over
+    /// the live file, reopen and stop the journal. `false` when the journal
     /// was invalidated (the shard was cleared or reopened since it started):
     /// the compaction must start again. A failure before the swap leaves
     /// the live file as it is. A swap that fails (the rename, the directory
@@ -1116,6 +1122,28 @@ impl Shard {
             "the compacted file's settings {built:?} differ from the shard's {:?}",
             self.settings
         );
+        #[cfg(test)]
+        if let Some((table, key)) = self.drop_from_copy.take() {
+            compact::write(&target, vec![compact::Change::Set(table, key, None)])?;
+        }
+        // redb checks no page checksum on an ordinary read, so a damaged
+        // branch page could have hidden part of a table from the copy. Every
+        // table must hold as many entries in both files; only bodies drop.
+        let copy = target.begin_read()?;
+        self.gate.read_here(|live| {
+            for table in compact::TABLES {
+                if table == Table::Bodies {
+                    continue;
+                }
+                let (had, has) = (live.len(table)?, gate::table_len(&copy, table)?);
+                anyhow::ensure!(
+                    had == has,
+                    "the compacted file's {table:?} table holds {has} entries, the shard's {had}"
+                );
+            }
+            Ok(())
+        })?;
+        drop(copy);
         self.target.seal(target)?;
         // Nothing commits on the actor between the take and here; checked
         // again all the same, right before the swap.
