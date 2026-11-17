@@ -1666,8 +1666,8 @@ fn create_file(path: &Path) -> Result<Database, JsError> {
 type State = (IndexCursor, String);
 
 /// The view file at `path` and the state it records, created if there is
-/// none. A file that fails its integrity check, or whose recorded state fails
-/// its checksum, is deleted and replaced by an empty one, which the caller
+/// none. A file that fails its integrity check, is not recognised as a redb
+/// file, or whose recorded state fails its checksum, is deleted and replaced by an empty one, which the caller
 /// rebuilds from the shards: a view index is derived data. The caller holds
 /// the index's only handle, so nothing else has the file open.
 fn open_file(path: &Path) -> Result<(Database, State), JsError> {
@@ -1681,6 +1681,13 @@ fn open_file(path: &Path) -> Result<(Database, State), JsError> {
             Err(damage) => damage.to_string(),
         },
         Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(reason))) => reason,
+        // What redb reports for a file whose header it does not recognise
+        // (a damaged magic number).
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(error)))
+            if error.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            error.to_string()
+        }
         Err(error) => return Err(index_error(error)),
     };
     tracing::warn!(
@@ -5592,6 +5599,60 @@ mod tests {
         indexes().remove(&path);
         assert!(!crate::kv::is_verified(&path));
         drop(crate::kv::open(&path, VIEW_CACHE_BYTES).unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A view file whose magic number is damaged is not recognised as a
+    /// redb file at all (redb reports an `InvalidData` I/O error, not
+    /// corruption). That is damage too: it is deleted and rebuilt, and the
+    /// query answers from the rebuilt index.
+    #[tokio::test]
+    async fn a_view_file_with_a_damaged_magic_number_is_rebuilt() {
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        let root = std::env::temp_dir().join(format!("douchdb-viewmagic-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "viewmagic",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let docs = (0..20)
+            .map(|n| json!({"_id": format!("d{n:03}"), "n": n}))
+            .collect();
+        db.put_docs(docs, true).await.unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".into(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let before = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(before["total_rows"], 20, "{before}");
+
+        let path = index_path(&db, "_design/d", "v");
+        indexes().remove(&path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(b"junk");
+        std::fs::write(&path, bytes).unwrap();
+
+        let after = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "the rebuilt index answers differently");
+        assert_eq!(&std::fs::read(&path).unwrap()[..4], b"redb");
+        indexes().remove(&path);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
