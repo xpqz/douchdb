@@ -595,7 +595,7 @@ the bulk of the growth.
 * **Shard-map metadata and movement.** Each database has a persisted, cached
   mem3-style shard map, exposed at `/_node/_local/_dbs/{db}` and broadcast to
   peers. Maps carry monotonic versions; updates track metadata quorum and a
-  pending map file, and anti-entropy reconciles newer/older peers after a
+  pending map (in shard 0's settings table), and anti-entropy reconciles newer/older peers after a
   missed update. Routing and anti-entropy read the map; anti-entropy
   checkpoints live in each shard copy, so a new replica has none and backfills
   from 0 after a move. A
