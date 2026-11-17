@@ -549,13 +549,13 @@ impl Gate {
     /// A write transaction, for the shard's actor. Like [`Gate::begin_read`],
     /// it takes no lease: the actor is the only caller of [`Gate::reopen`],
     /// and holds none of its own transactions when it does.
-    pub(crate) fn begin_write(&self) -> Result<WriteTransaction> {
+    pub(crate) fn begin_write_txn(&self) -> Result<WriteTransaction> {
         let state = self.inner.lock();
         let db = state
             .db
             .as_ref()
             .ok_or_else(|| anyhow!("the shard file is closed"))?;
-        Ok(db.begin_write()?)
+        Ok(kv::begin_write(db)?)
     }
 
     /// A read transaction for the shard's actor, which reads the committed
@@ -629,7 +629,7 @@ mod tests {
     /// A database at `path` whose META table maps `key` to `value`.
     fn database(path: &Path, key: &str, value: &str) -> Database {
         let db = kv::open(path, CACHE).unwrap();
-        let txn = db.begin_write().unwrap();
+        let txn = kv::begin_write(&db).unwrap();
         txn.open_table(META)
             .unwrap()
             .insert(key, kv::seal(value.as_bytes()).as_slice())
@@ -768,7 +768,7 @@ mod tests {
         let writer = std::thread::spawn({
             let gate = gate.clone();
             move || {
-                let txn = gate.begin_write().unwrap();
+                let txn = gate.begin_write_txn().unwrap();
                 txn.open_table(META)
                     .unwrap()
                     .insert("a", kv::seal(b"2").as_slice())
@@ -798,7 +798,7 @@ mod tests {
         let scratch = Scratch::new("checksum");
         let path = scratch.file("shard-0000.redb");
         let db = database(&path, "good", "1");
-        let txn = db.begin_write().unwrap();
+        let txn = kv::begin_write(&db).unwrap();
         txn.open_table(META)
             .unwrap()
             .insert("bad", b"not sealed".as_slice())
@@ -832,7 +832,7 @@ mod tests {
         let scratch = Scratch::new("scan");
         let path = scratch.file("shard-0000.redb");
         let db = kv::open(&path, CACHE).unwrap();
-        let txn = db.begin_write().unwrap();
+        let txn = kv::begin_write(&db).unwrap();
         {
             let mut bodies = txn.open_table(kv::BODIES).unwrap();
             for (id, rev) in [("a", "1-x"), ("a", "2-y"), ("ab", "1-z"), ("b", "1-w")] {

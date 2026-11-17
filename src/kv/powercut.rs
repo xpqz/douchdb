@@ -19,10 +19,35 @@ struct Disk {
     generation: u64,
     /// Every later write and sync fails with this.
     failing: Option<ErrorKind>,
-    /// Every later sync fails with this; writes still succeed.
-    failing_syncs: Option<ErrorKind>,
+    /// What befalls a later sync, once `after` more syncs have succeeded.
+    sync_fault: Option<SyncFault>,
     /// `sync_data` succeeds without making anything durable.
     syncs_ignored: bool,
+    /// `sync_data` calls that succeeded.
+    syncs: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncFault {
+    after: usize,
+    kind: Fault,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    /// This sync and every later one fail with the error; writes still
+    /// succeed.
+    Fail(ErrorKind),
+    /// The power is cut at this sync, which fails.
+    Cut,
+}
+
+impl Disk {
+    fn cut(&mut self) {
+        self.volatile = self.durable.clone();
+        self.generation += 1;
+        self.sync_fault = None;
+    }
 }
 
 /// The backend redb writes through.
@@ -69,9 +94,7 @@ impl PowerSwitch {
     /// Discard every write since the last `sync_data`, and kill every backend
     /// handed out so far.
     pub fn cut(&self) {
-        let mut disk = self.disk.lock().unwrap();
-        disk.volatile = disk.durable.clone();
-        disk.generation += 1;
+        self.disk.lock().unwrap().cut();
     }
 
     /// Make every later write and sync fail with `error` (`StorageFull` for a
@@ -80,24 +103,42 @@ impl PowerSwitch {
         self.disk.lock().unwrap().failing = Some(error);
     }
 
-    /// Make every later `sync_data` fail with `error` while writes still
-    /// succeed: what was written stays in the volatile image, as in a page
-    /// cache, so a commit can report an error and yet be on the disk.
-    pub fn fail_syncs(&self, error: ErrorKind) {
-        self.disk.lock().unwrap().failing_syncs = Some(error);
+    /// Let `after` more `sync_data` calls succeed, then make every later one
+    /// fail with `error` while writes still succeed: what was written stays
+    /// in the volatile image, as in a page cache, so a commit can report an
+    /// error and yet be on the disk.
+    pub fn fail_syncs_after(&self, after: usize, error: ErrorKind) {
+        self.disk.lock().unwrap().sync_fault = Some(SyncFault {
+            after,
+            kind: Fault::Fail(error),
+        });
+    }
+
+    /// Let `after` more `sync_data` calls succeed, then cut the power at the
+    /// next one, which fails: a power cut part way through a commit.
+    pub fn cut_at_sync(&self, after: usize) {
+        self.disk.lock().unwrap().sync_fault = Some(SyncFault {
+            after,
+            kind: Fault::Cut,
+        });
     }
 
     /// Let writes and syncs succeed again: the disk has room once more.
     pub fn restore_writes(&self) {
         let mut disk = self.disk.lock().unwrap();
         disk.failing = None;
-        disk.failing_syncs = None;
+        disk.sync_fault = None;
     }
 
     /// Make every later `sync_data` a no-op that reports success: a build
     /// that forgot to sync.
     pub fn ignore_syncs(&self) {
         self.disk.lock().unwrap().syncs_ignored = true;
+    }
+
+    /// How many `sync_data` calls have succeeded so far.
+    pub fn syncs(&self) -> usize {
+        self.disk.lock().unwrap().syncs
     }
 
     /// A live backend over the disk as it now stands, to reopen after a cut.
@@ -134,9 +175,20 @@ impl redb::StorageBackend for PowerCut {
 
     fn sync_data(&self) -> Result<(), Error> {
         let mut disk = self.writable()?;
-        if let Some(kind) = disk.failing_syncs {
-            return Err(Error::from(kind));
+        if let Some(fault) = &mut disk.sync_fault {
+            if let Some(after) = fault.after.checked_sub(1) {
+                fault.after = after;
+            } else {
+                match fault.kind {
+                    Fault::Fail(kind) => return Err(Error::from(kind)),
+                    Fault::Cut => {
+                        disk.cut();
+                        return Err(Error::other("the power was cut"));
+                    }
+                }
+            }
         }
+        disk.syncs += 1;
         if !disk.syncs_ignored {
             disk.durable = disk.volatile.clone();
         }

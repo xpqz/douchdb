@@ -1320,7 +1320,7 @@ mod tests {
                 None => std::fs::remove_file(dir.join(file)).unwrap(),
                 Some(b"settings") => {
                     let db = crate::kv::open(&dir.join(file), 1 << 20).unwrap();
-                    let txn = db.begin_write().unwrap();
+                    let txn = crate::kv::begin_write(&db).unwrap();
                     txn.open_table(crate::kv::SETTINGS)
                         .unwrap()
                         .retain(|_, _| false)
@@ -1427,7 +1427,7 @@ mod tests {
             let dir = db_path(&root, "d");
             let file = shard_file(&dir, shard);
             let db = crate::kv::open(&file, 1 << 20).unwrap();
-            let txn = db.begin_write().unwrap();
+            let txn = crate::kv::begin_write(&db).unwrap();
             txn.open_table(crate::kv::SETTINGS)
                 .unwrap()
                 .insert(setting, bytes.as_slice())

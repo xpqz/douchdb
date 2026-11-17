@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- redb `= "4.6"`; every write transaction commits with `Durability::Immediate` (the default; never set `None`).
+- redb `= "4.6"`; every write transaction commits with `Durability::Immediate` (the default; never set `None`) and in two phases (`set_two_phase_commit(true)`), begun only through `kv::begin_write`, so damage to the newest commit is reported, never rolled back; cost: a second fsync per commit.
 - Every stored value carries a CRC32C appended on write and verified on every read; a mismatch is a corruption error (HTTP 500), never a miss.
 - Full integrity check on the **first open of each file in a process** (`Builder::set_check_integrity_on_open(true)`) and on **idle close** (`Database::check_integrity`, in the background, gate drained); a file that passed its close-time check opens without the check later in the same process. Never on every open.
 - `ConcurrencyMode::ExclusiveWriter` (default) on every file.

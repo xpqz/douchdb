@@ -2,7 +2,7 @@
 //! every stored value carries.
 //!
 //! redb checksums its pages but verifies them only in a full integrity check,
-//! so two things stand guard here (see "Corruption detection" in
+//! so three things stand guard here (see "Corruption detection" in
 //! `docs/superpowers/specs/2026-11-16-redb-storage-design.md`):
 //!
 //! - every value in every table is [`seal`]ed: a CRC32C of the value is
@@ -12,6 +12,9 @@
 //!   process and in [`close_verified`] when an idle database closes. A file
 //!   that passed its close-time check opens without the check later in the
 //!   same process, so reopening an idle database costs no full read.
+//! - every write transaction begins in [`begin_write`] and commits in two
+//!   phases, so that check reports damage to the newest commit instead of
+//!   rolling back to the commit before it.
 
 #[cfg(test)]
 pub(crate) mod powercut;
@@ -24,7 +27,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use redb::backends::FileBackend;
 use redb::{
     Builder, Database, DatabaseError, ReadableDatabase, StorageBackend, StorageError,
-    TableDefinition,
+    TableDefinition, TransactionError, WriteTransaction,
 };
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -254,6 +257,25 @@ pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     }
 }
 
+/// Begin a write transaction on `db` that commits in two phases, at redb's
+/// default durability (`Immediate`). Every write transaction goes through
+/// here: none calls `Database::begin_write` itself.
+///
+/// A one-phase commit writes its pages and the header naming them under a
+/// single sync, so redb takes a newest commit whose pages fail their
+/// checksums for one torn by a crash and silently rolls back to the commit
+/// before it, losing an acknowledged write. A two-phase commit syncs its
+/// pages before the header that makes them the newest commit, so damage to
+/// them can only be damage, and the open or integrity check reports it as
+/// `StorageError::Corrupted`. The cost is a second sync per commit.
+pub(crate) fn begin_write(
+    db: &Database,
+) -> std::result::Result<WriteTransaction, TransactionError> {
+    let mut txn = db.begin_write()?;
+    txn.set_two_phase_commit(true);
+    Ok(txn)
+}
+
 /// Whether the file at `path` would open without the full check.
 #[cfg(test)]
 pub(crate) fn is_verified(path: &Path) -> bool {
@@ -406,7 +428,7 @@ mod tests {
     /// Store `count` values of about 1 KiB, each holding [`MARKER`].
     fn fill(db: &Database, count: usize) {
         let value: Vec<u8> = MARKER.iter().copied().cycle().take(1024).collect();
-        let txn = db.begin_write().unwrap();
+        let txn = begin_write(db).unwrap();
         {
             let mut table = txn.open_table(META).unwrap();
             for i in 0..count {
@@ -419,7 +441,7 @@ mod tests {
     }
 
     fn put(db: &Database, key: &str, value: &[u8]) {
-        let txn = db.begin_write().unwrap();
+        let txn = begin_write(db).unwrap();
         txn.open_table(META)
             .unwrap()
             .insert(key, seal(value).as_slice())
@@ -439,14 +461,17 @@ mod tests {
         Some(unseal(guard.value()).unwrap().to_vec())
     }
 
-    /// Flip a byte inside every copy of [`MARKER`] in the file: value pages
-    /// of the committed tree, never the header.
-    fn damage(path: &Path) {
-        let mut bytes = std::fs::read(path).unwrap();
+    /// Written only by the newest commit of a test: the pages that hold it
+    /// are pages no earlier commit wrote.
+    const NEWEST: &[u8] = b"<<douchdb-kv-newest-commit>>";
+
+    /// Flip a byte inside every copy of `marker` in `bytes`: value pages of
+    /// the committed tree, never the header.
+    fn flip(bytes: &mut [u8], marker: &[u8]) {
         let hits: Vec<usize> = bytes
-            .windows(MARKER.len())
+            .windows(marker.len())
             .enumerate()
-            .filter(|(_, window)| *window == MARKER)
+            .filter(|(_, window)| *window == marker)
             .map(|(at, _)| at)
             .collect();
         assert!(!hits.is_empty(), "no value pages found");
@@ -454,7 +479,44 @@ mod tests {
         for at in hits {
             bytes[at + 3] ^= 0x55;
         }
+    }
+
+    /// Damage every copy of [`MARKER`] in the file.
+    fn damage(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        flip(&mut bytes, MARKER);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Commit an older value, then a newer one holding [`NEWEST`].
+    fn commit_older_then_newest(db: &Database) {
+        put(db, "older", b"1");
+        put(db, "newest", &NEWEST.repeat(64));
+    }
+
+    /// Close `db` as a crash right after its last commit would, with that
+    /// commit's pages then damaged: the file's bytes are taken while `db` is
+    /// open and written back once it has closed, so the commit redb makes
+    /// on a clean close is not on it.
+    fn crash_with_newest_damaged(db: Database, path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        drop(db);
+        flip(&mut bytes, NEWEST);
+        std::fs::write(path, bytes).unwrap();
+        forget_verified(path);
+    }
+
+    /// An open of `path` must fail as corrupted; one that succeeds serves
+    /// the older commit as if the newest had never been acknowledged.
+    fn assert_fails_closed(path: &Path) {
+        match open(path, CACHE) {
+            Err(error) => assert!(is_corrupted(&error), "{error:?}"),
+            Ok(db) => panic!(
+                "opened with its newest commit damaged: older = {:?}, newest = {:?}",
+                get(&db, "older"),
+                get(&db, "newest").map(|value| value.len())
+            ),
+        }
     }
 
     fn is_corrupted(error: &DatabaseError) -> bool {
@@ -497,6 +559,112 @@ mod tests {
         damage(&path);
         let error = open(&path, CACHE).expect_err("a damaged file opened");
         assert!(is_corrupted(&error), "{error:?}");
+    }
+
+    /// redb takes damage to a one-phase commit for a torn write and rolls
+    /// back to the commit before it, losing an acknowledged write without a
+    /// word. Every commit is two-phase, so the damage is reported instead.
+    #[test]
+    fn damage_to_the_newest_commit_is_corruption_not_rollback() {
+        let scratch = Scratch::new("newest");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        commit_older_then_newest(&db);
+        crash_with_newest_damaged(db, &path);
+        assert_fails_closed(&path);
+        assert_fails_closed(&path);
+    }
+
+    /// The same damage while the file is open: the close-time check reports
+    /// it and leaves the file unverified, and the next open fails closed
+    /// rather than serving the commit before it.
+    #[test]
+    fn the_close_time_check_reports_damage_to_the_newest_commit() {
+        use std::os::unix::fs::FileExt;
+        let scratch = Scratch::new("newest-close");
+        let path = scratch.file();
+        let db = open(&path, CACHE).unwrap();
+        commit_older_then_newest(&db);
+        let before = std::fs::read(&path).unwrap();
+        let mut after = before.clone();
+        flip(&mut after, NEWEST);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        for (at, (old, new)) in before.iter().zip(&after).enumerate() {
+            if old != new {
+                file.write_all_at(&[*new], at as u64).unwrap();
+            }
+        }
+        drop(file);
+        let error = close_verified(db, &path).expect_err("a damaged file verified");
+        assert!(is_corrupted(&error), "{error:?}");
+        assert!(!verified(&path));
+        assert_fails_closed(&path);
+    }
+
+    /// A two-phase commit syncs its pages, then the header that makes them
+    /// the newest commit. Power lost between the two leaves the pages on the
+    /// disk but the previous commit in force, and the commit unacknowledged.
+    #[test]
+    fn a_power_cut_between_the_two_syncs_keeps_the_old_state_unacknowledged() {
+        let (backend, switch) = PowerCut::new();
+        let db = open_with(backend, CACHE).unwrap();
+        put(&db, "older", b"1");
+        let before = switch.syncs();
+        put(&db, "control", b"2");
+        let per_commit = switch.syncs() - before;
+        assert!(per_commit >= 2, "a commit synced {per_commit} times");
+
+        switch.cut_at_sync(per_commit - 1);
+        let txn = begin_write(&db).unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert("newest", seal(&NEWEST.repeat(64)).as_slice())
+            .unwrap();
+        txn.commit()
+            .expect_err("a commit was acknowledged without its header on the disk");
+        drop(db);
+
+        let backend = switch.backend();
+        let mut image = vec![0; usize::try_from(backend.len().unwrap()).unwrap()];
+        backend.read(0, &mut image).unwrap();
+        assert!(
+            image.windows(NEWEST.len()).any(|window| window == NEWEST),
+            "the power was cut before the commit's pages were synced"
+        );
+        let db = open_with(backend, CACHE).unwrap();
+        assert_eq!(get(&db, "control").as_deref(), Some(&b"2"[..]));
+        assert_eq!(get(&db, "newest"), None);
+    }
+
+    /// Every write transaction commits in two phases only if it begins in
+    /// [`begin_write`]: nothing else in `src/` begins one.
+    #[test]
+    fn every_write_transaction_goes_through_kv_begin_write() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let own = root.join("kv.rs");
+        let mut dirs = vec![root];
+        let (mut scanned, mut found) = (0, Vec::new());
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                    scanned += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(".begin_write(") || line.contains(".try_begin_write(") {
+                            found.push(format!("{}:{}", path.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scanned > 10, "only {scanned} source files found");
+        assert!(
+            found.is_empty(),
+            "write transactions begun outside kv::begin_write: {found:#?}"
+        );
     }
 
     #[test]
@@ -754,7 +922,7 @@ mod tests {
         let (backend, switch) = PowerCut::new();
         let db = open_with(backend, CACHE).unwrap();
         put(&db, "base", b"1");
-        let txn = db.begin_write().unwrap();
+        let txn = begin_write(&db).unwrap();
         txn.open_table(META)
             .unwrap()
             .insert("pending", seal(b"2").as_slice())
@@ -792,7 +960,7 @@ mod tests {
         let db = open_with(backend, CACHE).unwrap();
         put(&db, "base", b"1");
         switch.fail_writes(ErrorKind::StorageFull);
-        let txn = db.begin_write().unwrap();
+        let txn = begin_write(&db).unwrap();
         txn.open_table(META)
             .unwrap()
             .insert("full", seal(b"2").as_slice())

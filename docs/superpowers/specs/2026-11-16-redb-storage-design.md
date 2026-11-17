@@ -166,6 +166,22 @@ term's MD5 as it reads it. So:
   therefore costs no full read. (Decision 2026-11-16: every-open checks
   would make each reopen of a large idle database, and every anti-entropy
   pass over cold ones, read the whole file.)
+- **Every write transaction commits in two phases**
+  (`WriteTransaction::set_two_phase_commit(true)`, through the one helper
+  `kv::begin_write`; nothing else begins a write transaction). With redb's
+  default one-phase commit, pages and the header naming them share one sync,
+  so redb cannot tell damage to the newest commit's pages from a commit torn
+  by a crash: the open or integrity check silently falls back to the commit
+  before it, and the server answers 200 without a document it acknowledged,
+  across restarts. A two-phase commit syncs its pages before the header that
+  makes them the newest commit, so redb reports damage to them as
+  `StorageError::Corrupted` ("Primary is corrupted despite 2-phase commit"):
+  a shard fails closed (500), a view file is deleted and rebuilt. Power lost
+  between the two syncs leaves the previous commit in force and the write
+  unacknowledged. Cost: a second sync per commit. **Residual:** redb records
+  whether the newest commit was two-phase in a bit of the header's god byte,
+  outside every checksum; damage that flips exactly that bit re-enables the
+  silent fallback for that file.
 - **Guarantee, stated narrowly:** a damaged *value* is detected when read. A
   damaged *tree page* (a branch page, which can misroute a lookup into a
   false "not found") is detected by the next integrity check: when its idle

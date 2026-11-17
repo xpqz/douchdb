@@ -1624,7 +1624,7 @@ fn decode_row(stored: &[u8]) -> Result<StoredRow, JsError> {
 
 /// Create a view file's tables, empty.
 fn init_tables(db: &Database) -> Result<(), JsError> {
-    let txn = db.begin_write().map_err(index_error)?;
+    let txn = crate::kv::begin_write(db).map_err(index_error)?;
     txn.open_table(ROWS).map_err(index_error)?;
     txn.open_table(META).map_err(index_error)?;
     txn.open_table(CURSOR).map_err(index_error)?;
@@ -1785,10 +1785,12 @@ impl ViewIndex {
         write: impl FnOnce(&WriteTransaction) -> Result<(), JsError>,
     ) -> Result<(), JsError> {
         let db = self.db()?;
-        let outcome = db.begin_write().map_err(index_error).and_then(|txn| {
-            write(&txn)?;
-            txn.commit().map_err(index_error)
-        });
+        let outcome = crate::kv::begin_write(db)
+            .map_err(index_error)
+            .and_then(|txn| {
+                write(&txn)?;
+                txn.commit().map_err(index_error)
+            });
         if outcome.is_err() {
             drop(self.db.take());
             self.cursor = IndexCursor::default();
@@ -3771,7 +3773,6 @@ mod tests {
     use super::*;
     use redb::StorageBackend;
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     fn reduce_value(
@@ -5192,55 +5193,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A power-cut backend that loses power at a chosen `sync_data`: once
-    /// `syncs` have succeeded, the next one cuts the power and fails.
-    struct CutAtSync {
-        inner: crate::kv::powercut::PowerCut,
-        switch: crate::kv::powercut::PowerSwitch,
-        syncs: Arc<AtomicUsize>,
-    }
-
-    impl std::fmt::Debug for CutAtSync {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("CutAtSync").finish_non_exhaustive()
-        }
-    }
-
-    impl StorageBackend for CutAtSync {
-        fn len(&self) -> Result<u64, std::io::Error> {
-            self.inner.len()
-        }
-
-        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
-            self.inner.read(offset, out)
-        }
-
-        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
-            self.inner.set_len(len)
-        }
-
-        fn sync_data(&self) -> Result<(), std::io::Error> {
-            let left =
-                self.syncs
-                    .try_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |left| {
-                        left.checked_sub(1)
-                    });
-            if left.is_err() {
-                self.switch.cut();
-                return Err(std::io::Error::other("the power was cut"));
-            }
-            self.inner.sync_data()
-        }
-
-        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
-            self.inner.write(offset, data)
-        }
-
-        fn close(&self) -> Result<(), std::io::Error> {
-            self.inner.close()
-        }
-    }
-
     /// An index over a fresh database on `backend`, as `create_file` makes one.
     fn index_over(backend: impl StorageBackend) -> ViewIndex {
         let db = crate::kv::open_with(backend, VIEW_CACHE_BYTES).unwrap();
@@ -5285,16 +5237,11 @@ mod tests {
         let mut cuts = 0;
         for syncs in 0.. {
             let (backend, switch) = crate::kv::powercut::PowerCut::new();
-            let budget = Arc::new(AtomicUsize::new(usize::MAX));
-            let mut index = index_over(CutAtSync {
-                inner: backend,
-                switch: switch.clone(),
-                syncs: Arc::clone(&budget),
-            });
+            let mut index = index_over(backend);
             index
                 .rebuild(vec![row("a", "a"), row("b", "b")], before.clone(), "map|")
                 .unwrap();
-            budget.store(syncs, AtomicOrdering::SeqCst);
+            switch.cut_at_sync(syncs);
             let mut by_doc = HashMap::new();
             by_doc.insert("a".to_string(), vec![row("a", "z")]);
             by_doc.insert("c".to_string(), vec![row("c", "c"), row("c", "d")]);
@@ -5371,7 +5318,7 @@ mod tests {
         {
             let mut index = handle.lock().await;
             let file = index.db.as_ref().unwrap();
-            let txn = file.begin_write().unwrap();
+            let txn = crate::kv::begin_write(file).unwrap();
             let mut damaged = crate::kv::seal(br#"{"key":1,"value":null}"#);
             damaged[0] ^= 0x20;
             txn.open_table(ROWS)
@@ -5472,6 +5419,92 @@ mod tests {
         assert!(!crate::kv::is_verified(&first));
         assert!(!crate::kv::is_verified(&second));
         assert_eq!(run(1).await["rows"][0]["key"], json!(2));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A view file whose newest commit is damaged is deleted and rebuilt,
+    /// never rolled back to the commit before it.
+    #[tokio::test]
+    async fn damage_to_the_newest_commit_is_corruption_not_rollback() {
+        // Other tests lower the registries' shared cap, and an idle index
+        // over it is evicted and closed in the background, whoever owns it.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        const OLDER: &str = "<<douchdb-view-older-commit>>";
+        const NEWEST: &str = "<<douchdb-view-newest-commit>>";
+        let root = std::env::temp_dir().join(format!("douchdb-viewnewest-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "viewnewest",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, doc.m); }".into(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let docs = |range: std::ops::Range<u32>, marker: &str| {
+            range
+                .map(|n| json!({"_id": format!("d{n:03}"), "n": n, "m": marker.repeat(8)}))
+                .collect()
+        };
+        db.put_docs(docs(0..100, OLDER), true).await.unwrap();
+        query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        db.put_docs(docs(100..200, NEWEST), true).await.unwrap();
+        let before = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(before["total_rows"], 200, "{before}");
+
+        // The file as a crash right after the newest update leaves it (a
+        // clean close commits again), then damaged where only it wrote.
+        let path = index_path(&db, "_design/d", "v");
+        let mut bytes = std::fs::read(&path).unwrap();
+        indexes().remove(&path);
+        let hits: Vec<usize> = bytes
+            .windows(NEWEST.len())
+            .enumerate()
+            .filter(|(_, window)| *window == NEWEST.as_bytes())
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!hits.is_empty(), "the newest update's rows were not found");
+        for at in hits {
+            bytes[at + 3] ^= 0x55;
+        }
+        std::fs::write(&path, bytes).unwrap();
+        crate::kv::forget_verified(&path);
+
+        let (file, state) = open_file(&path).unwrap();
+        drop(file);
+        assert_eq!(
+            state,
+            State::default(),
+            "the view file was rolled back, not rebuilt"
+        );
+        let rebuilt = std::fs::read(&path).unwrap();
+        assert!(
+            !rebuilt
+                .windows(OLDER.len())
+                .any(|window| window == OLDER.as_bytes()),
+            "the damaged file's older rows were kept"
+        );
+        let after = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "the rebuilt index answers differently");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5599,7 +5632,7 @@ mod tests {
                 let handle = index_handle(&path).await.unwrap();
                 let index = handle.lock().await;
                 let file = index.db.as_ref().unwrap();
-                let txn = file.begin_write().unwrap();
+                let txn = crate::kv::begin_write(file).unwrap();
                 let mut sealed = crate::kv::seal(br#"["x",1]"#);
                 sealed[0] ^= 0x20;
                 if damage == "design" {

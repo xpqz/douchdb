@@ -6517,7 +6517,7 @@ mod tests {
             drop(Db::open_or_create(&root, "meta", meta_config()).unwrap());
             let file = shard_file(&db_path(&root, "meta"), 0);
             let db = crate::kv::open(&file, 1 << 20).unwrap();
-            let txn = db.begin_write().unwrap();
+            let txn = crate::kv::begin_write(&db).unwrap();
             {
                 let mut table = txn.open_table(crate::kv::SETTINGS).unwrap();
                 match value {

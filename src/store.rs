@@ -391,7 +391,7 @@ struct Settings {
 /// transaction, so a read never finds a table missing and a file with a uuid
 /// always has the rest. A file that has them already is left alone.
 fn init_tables(db: &Database) -> Result<()> {
-    let txn = db.begin_write()?;
+    let txn = kv::begin_write(db)?;
     let fresh = {
         drop(txn.open_table(META)?);
         drop(txn.open_table(BY_SEQ)?);
@@ -433,7 +433,7 @@ pub fn create_file(path: &Path, cache_bytes: usize) -> Result<Database> {
 /// Store `rows` in the settings table of `db` in one transaction, committed
 /// durably (redb's default, `Immediate`), for a file no shard has open.
 pub fn put_settings(db: &Database, rows: &[(&str, Vec<u8>)]) -> Result<()> {
-    let txn = db.begin_write()?;
+    let txn = kv::begin_write(db)?;
     {
         let mut settings = txn.open_table(SETTINGS)?;
         for (name, value) in rows {
@@ -754,7 +754,7 @@ impl Shard {
 
     /// Whether the file's handle fails every write after an I/O error.
     fn poisoned(&self) -> bool {
-        match self.gate.begin_write() {
+        match self.gate.begin_write_txn() {
             Ok(txn) => {
                 drop(txn);
                 false
@@ -777,10 +777,10 @@ impl Shard {
     /// A write transaction for a group; a handle that an I/O error left
     /// failing every write (a read, or compaction, met it) is reopened first.
     fn begin_group(&mut self) -> Result<WriteTransaction> {
-        match self.gate.begin_write() {
+        match self.gate.begin_write_txn() {
             Err(error) if io_failure(&error) => {
                 self.recover(&format!("{error:#}"));
-                self.gate.begin_write()
+                self.gate.begin_write_txn()
             }
             begun => begun,
         }
@@ -1051,7 +1051,7 @@ impl Shard {
         // Documents whose corrupt metadata was already reported this sweep.
         let mut reported: BTreeSet<String> = BTreeSet::new();
         loop {
-            let txn = self.gate.begin_write()?;
+            let txn = self.gate.begin_write_txn()?;
             let keys: Vec<(String, String)> = {
                 let bodies = txn.open_table(BODIES)?;
                 let start = match &after {
@@ -2971,7 +2971,7 @@ pub(crate) mod tests {
             let file = temp_file("no-table");
             {
                 let db = kv::open(&file, CACHE).unwrap();
-                let txn = db.begin_write().unwrap();
+                let txn = kv::begin_write(&db).unwrap();
                 if damage == "bodies" {
                     txn.delete_table(BODIES).unwrap();
                 } else {
@@ -3004,6 +3004,58 @@ pub(crate) mod tests {
             drop(db);
             remove(&file);
         }
+    }
+
+    /// A shard whose newest commit is damaged fails to open, so every
+    /// request to it fails closed, rather than serving the commit before it
+    /// as if the newest had never been acknowledged.
+    #[test]
+    fn damage_to_the_newest_commit_is_corruption_not_rollback() {
+        const NEWEST: &str = "<<douchdb-shard-newest-commit>>";
+        let file = temp_file("newest");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| write_doc(txn, "older", false, b"{}", 1))
+            .unwrap();
+        let body = format!("{{\"m\":\"{}\"}}", NEWEST.repeat(64));
+        shard
+            .write(move |txn| write_doc(txn, "newest", false, body.as_bytes(), 2))
+            .unwrap();
+        // The file as a crash right after that commit leaves it (a clean
+        // close commits again), then damaged where only that commit wrote.
+        let mut bytes = std::fs::read(&file).unwrap();
+        drop(shard);
+        let hits: Vec<usize> = bytes
+            .windows(NEWEST.len())
+            .enumerate()
+            .filter(|(_, window)| *window == NEWEST.as_bytes())
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!hits.is_empty(), "the newest commit's body was not found");
+        for at in hits {
+            bytes[at + 3] ^= 0x55;
+        }
+        std::fs::write(&file, bytes).unwrap();
+        kv::forget_verified(&file);
+
+        for _ in 0..2 {
+            match Shard::open(&file, 1000, CACHE) {
+                Err(error) => assert!(
+                    error.chain().any(|cause| matches!(
+                        cause.downcast_ref::<redb::DatabaseError>(),
+                        Some(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                            _
+                        )))
+                    )),
+                    "{error:#}"
+                ),
+                Ok(mut shard) => panic!(
+                    "opened with its newest commit damaged: newest = {:?}",
+                    shard.read(|txn| Ok(txn.get_meta("newest")?)).unwrap()
+                ),
+            }
+        }
+        remove(&file);
     }
 
     /// The settings a fresh file is created with are its state: one that
@@ -4302,7 +4354,9 @@ mod recovery_tests {
         let mut commits = rig.committed.subscribe();
         commits.mark_unchanged();
 
-        rig.switch.fail_syncs(ErrorKind::Other);
+        // The commit's pages sync; the sync of the header that makes them
+        // the newest commit fails, after the header was written.
+        rig.switch.fail_syncs_after(1, ErrorKind::Other);
         let mut failing = tokio::spawn({
             let handle = Arc::clone(&rig.handle);
             async move { put(&handle, "landed", 2).await }
@@ -4453,7 +4507,7 @@ mod recovery_tests {
             .handle
             .alone(|shard| {
                 let commit = || -> Result<()> {
-                    let txn = shard.gate.begin_write()?;
+                    let txn = shard.gate.begin_write_txn()?;
                     txn.open_table(LOCAL)?
                         .insert("x", kv::seal(b"x").as_slice())?;
                     txn.commit()?;
@@ -4486,7 +4540,7 @@ mod recovery_tests {
             .unwrap();
         // A commit outside any group fails, and the handle with it.
         switch.fail_writes(ErrorKind::StorageFull);
-        let txn = shard.gate.begin_write().unwrap();
+        let txn = shard.gate.begin_write_txn().unwrap();
         txn.open_table(LOCAL)
             .unwrap()
             .insert("x", kv::seal(b"x").as_slice())
