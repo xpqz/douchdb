@@ -24,7 +24,8 @@ pub(crate) struct Prepared {
     pub members: Option<Map<String, Value>>,
     /// `new_edits=true`: the revision the edit writes over the parent the
     /// client's `_rev` names, or over no parent without `_rev`. `None` when
-    /// `_rev` is not a revision; the shard rejects the document.
+    /// `_rev` is not a revision or is at the last position; the shard rejects
+    /// the document.
     pub new_rev: Option<String>,
 }
 
@@ -72,19 +73,16 @@ pub(crate) fn prepare(doc: &Value, id: String, new_edits: bool) -> DbResult<Prep
             .collect()
     });
     let (rev, revisions, new_rev) = if new_edits {
-        let leaf = |parent: Option<&Rev>| Rev {
-            // Wrapping, as the shard's position arithmetic does in a release
-            // build: a `_rev` at the last position must not panic here.
-            pos: parent.map_or(0, |p| p.pos).wrapping_add(1),
-            id: new_revid_doc(deleted, parent, obj).to_vec(),
-            hex: true,
+        // No revision follows one at the last position; the shard rejects
+        // such an edit.
+        let leaf = |parent: Option<&Rev>| {
+            let pos = parent.map_or(0, |p| p.pos).checked_add(1)?;
+            let id = new_revid_doc(deleted, parent, obj).to_vec();
+            Some(Rev { pos, id, hex: true }.to_string())
         };
         let (rev, new_rev) = match rev.map(|raw| (raw, Rev::parse(raw))) {
-            None => (None, Some(leaf(None).to_string())),
-            Some((_, Some(parent))) => (
-                Some(parent.to_string()),
-                Some(leaf(Some(&parent)).to_string()),
-            ),
+            None => (None, leaf(None)),
+            Some((_, Some(parent))) => (Some(parent.to_string()), leaf(Some(&parent))),
             Some((raw, None)) => (Some(raw.clone()), None),
         };
         (rev, None, new_rev)
@@ -280,14 +278,9 @@ mod tests {
     #[test]
     fn prepared_rev_is_for_the_client_parent() {
         let parent = "2-aabbccddeeff00112233445566778899";
-        let hex = |hash: [u8; 16]| {
-            Rev {
-                pos: 0,
-                id: hash.to_vec(),
-                hex: true,
-            }
-            .id_string()
-        };
+        // Rendered independently of `Rev::id_string`, which formats the
+        // revision under test.
+        let hex = |hash: [u8; 16]| -> String { hash.iter().map(|b| format!("{b:02x}")).collect() };
         let doc = json!({"_id": "a", "_rev": parent, "z": 1, "a": [1, 2]});
         let want = new_revid_doc(false, Rev::parse(parent).as_ref(), doc.as_object().unwrap());
         assert_eq!(

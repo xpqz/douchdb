@@ -397,7 +397,7 @@ mod tests {
     /// A new document's tree, live or deleted, is its one revision as a
     /// root, whatever an emptied tree held before.
     #[test]
-    fn new_doc_fast_path_matches_merge_path() {
+    fn merge_root_builds_a_one_revision_tree() {
         let stored = |json: &str| serde_json::from_str::<RevTree>(json).unwrap();
         let rev = format!("1-{}", id(1));
         for deleted in [false, true] {

@@ -4111,6 +4111,8 @@ fn put_many(
                 results.push((i, Ok(value)));
             }
             Err(e) => {
+                // Staging changes a slot only after its last fallible step.
+                debug_assert_eq!(slot.origin.is_some(), was_staged, "failed document staged");
                 ops.truncate(mark);
                 results.push((i, Err(e)));
             }
@@ -4258,7 +4260,7 @@ impl Stage<'_, '_> {
             None => Vec::new(),
         };
         let parent = parent.as_deref().and_then(Rev::parse);
-        let pos = parent.as_ref().map_or(0, |p| p.pos).wrapping_add(1);
+        let pos = parent.as_ref().map_or(0, |p| p.pos).checked_add(1);
 
         // The prepared revision is for the client's parent. Without `_rev`
         // over a deleted winner the parent is the winner, and the revision is
@@ -4271,6 +4273,8 @@ impl Stage<'_, '_> {
                     None => body_members(&body)?,
                 };
                 let hash = new_revid_doc(deleted, parent.as_ref(), &members);
+                // No revision follows one at the last position.
+                let pos = pos.ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
                 let leaf = Rev {
                     pos,
                     id: hash.to_vec(),
@@ -4280,21 +4284,13 @@ impl Stage<'_, '_> {
             }
         };
 
-        // Past the last position the revision does not parse: the edit fails
-        // before anything is staged.
-        let path = if parent_path.is_empty() {
-            None
-        } else {
-            let leaf =
-                Rev::parse(&rev).ok_or_else(|| ApiError::bad_request("Invalid rev format"))?;
-            let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
-            path.push(leaf);
-            Some(path)
-        };
         let meta = slot.staging();
-        match path {
-            None => meta.tree.merge_root(rev.clone(), deleted),
-            Some(path) => meta.tree.merge_path(&path, deleted),
+        if parent_path.is_empty() {
+            meta.tree.merge_root(rev.clone(), deleted);
+        } else {
+            let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
+            path.extend(Rev::parse(&rev));
+            meta.tree.merge_path(&path, deleted);
         }
         let old_seq = meta.seq;
         let seq = self.next_seq();
