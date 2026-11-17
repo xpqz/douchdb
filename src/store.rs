@@ -1018,6 +1018,8 @@ impl Shard {
         first: Box<dyn ShardJob>,
         mut more: impl FnMut() -> Option<Box<dyn ShardJob>>,
     ) -> (Vec<Reply>, Option<ApiError>) {
+        // Beginning the transaction counts as job time, as in the floor.
+        let jobs_started = Instant::now();
         let txn = match self.begin_group() {
             Ok(txn) => txn,
             Err(error) => {
@@ -1028,7 +1030,6 @@ impl Shard {
         let mut txn = ShardTxn::new(self, Txn::Write(Box::new(txn)));
         let mut replies = Vec::new();
         let mut next = Some(first);
-        let jobs_started = Instant::now();
         let mut aborted = None;
         while let Some(job) = next.take() {
             txn.begin_job();

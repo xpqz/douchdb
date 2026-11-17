@@ -90,6 +90,14 @@ class Server:
         )
 
     def __enter__(self):
+        # `with` calls __exit__ only once __enter__ has returned.
+        try:
+            return self._wait_ready()
+        except BaseException:
+            self.__exit__()
+            raise
+
+    def _wait_ready(self):
         deadline = time.monotonic() + 60
         while True:
             if self.proc.poll() is not None:
@@ -212,7 +220,8 @@ def median(runs, key):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(
+        description="`_bulk_docs` against the bare redb floor (examples/redb_floor.rs).")
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", required=True, type=Path)
     parser.add_argument("--batches", default="250,1000,10000")
