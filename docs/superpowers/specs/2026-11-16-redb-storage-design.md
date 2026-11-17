@@ -262,8 +262,26 @@ on the next open. Policy:
    live-key rank) and settings from the committed tables, then reopens the
    gate.
 3. If reopening fails, the shard fails closed: every request to it returns
-   500 until the database is next opened. It is never left half-usable in the
-   cache.
+   500. It is never left half-usable in the cache. A request to a failed
+   shard also has its actor retry the reopen, at most once per backoff (1 s,
+   doubling per failed retry, capped at 60 s, reset on success). The retry
+   keeps the sequence the shard published, so a file that came back behind it
+   fails again and is never served; one that could not be opened (a full
+   disk, a passing I/O error) serves again once it opens. Each failed retry
+   is logged as an error, a return to service as a warning. A compaction
+   swap that fails is never retried: the file now under the shard's name may
+   not keep that name through a power cut, so the shard stays failed until
+   the database is next opened.
+4. A read that meets an I/O error (`Io` or `PreviousIo`, never a checksum
+   mismatch) leads to the same reopen when the handle fails writes. A read
+   through the gate asks the actor to check its handle once the lease is
+   back (at most one such check is queued per shard); a read job on the
+   actor that fails with a 500 is followed by the check before it answers.
+   So a shard that only serves reads recovers too.
+5. A database setting whose write failed and that cannot be read back
+   because shard 0 has failed is read back on shard 0's actor as soon as a
+   retry brings it back, before any later settings write, and installed in
+   memory if the write landed.
 
 ## Compaction
 

@@ -1092,9 +1092,13 @@ impl Db {
     /// error and be on the disk), so the setting is then read back from
     /// shard 0 once it has recovered, and installed if it is what was
     /// written; the caller still hears the error. Every other setting is as
-    /// it was: `writing` admits no other write. If it
-    /// cannot be read back, memory keeps what clients were last told until
-    /// the database reopens.
+    /// it was: `writing` admits no other write. If it cannot be read back
+    /// (shard 0 has failed), memory keeps what clients were last told, and
+    /// the read back is parked on shard 0's actor: it runs, and installs
+    /// the setting if the write landed, as soon as a retry brings the shard
+    /// back, before any later settings write, so installs keep the order of
+    /// the writes. The caller hears its error at once and `writing` is not
+    /// held meanwhile. A shard that never comes back never runs it.
     async fn store_setting(
         &self,
         writing: tokio::sync::OwnedMutexGuard<()>,
@@ -1114,6 +1118,7 @@ impl Db {
         // shard job even when the write succeeds and it is never sent. An
         // actor job, so it runs after the recovery.
         let read_back = self.shards[0].read(move |txn| Ok(txn.get_setting(name)?));
+        let later = self.shards[0].when_serving();
         let path = self.path.clone();
         tokio::spawn(async move {
             let _writing = writing;
@@ -1124,12 +1129,22 @@ impl Db {
             match read_back.await {
                 Ok(stored) if stored == attempted => install(),
                 Ok(_) => {}
-                Err(read) => tracing::warn!(
-                    db = %path.display(),
-                    setting = name,
-                    error = %read.reason,
-                    "the setting cannot be read back after a failed write; memory keeps the last acknowledged one"
-                ),
+                Err(read) => {
+                    tracing::warn!(
+                        db = %path.display(),
+                        setting = name,
+                        error = %read.reason,
+                        "the setting cannot be read back after a failed write; it is read back once the shard serves again"
+                    );
+                    later
+                        .run(move |txn| {
+                            if txn.get_setting(name)? == attempted {
+                                install();
+                            }
+                            Ok(())
+                        })
+                        .await;
+                }
             }
             Err(error)
         })
@@ -7048,19 +7063,19 @@ mod tests {
     }
 
     /// A failed settings write whose shard cannot recover leaves memory with
-    /// what clients were last told: nothing can be read back.
+    /// what clients were last told while nothing can be read back. Once a
+    /// retry brings the shard back, memory holds what the disk holds: here
+    /// the write, which landed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failed_settings_write_that_cannot_be_read_back_leaves_memory() {
+    async fn a_failed_settings_write_is_read_back_once_its_shard_serves_again() {
         let (db, root, switch) = db_on_test_disk("unread").await;
         let old = json!({"members": {"names": ["m"]}});
+        let landed = json!({"members": {"names": ["z"]}});
         let version = db.set_security(old.clone()).await.unwrap();
 
         // Every sync from the header's on fails, so the reopen fails too.
         switch.fail_syncs_after(1, std::io::ErrorKind::Other);
-        let error = db
-            .set_security(json!({"members": {"names": ["z"]}}))
-            .await
-            .unwrap_err();
+        let error = db.set_security(landed.clone()).await.unwrap_err();
         assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
         assert!(
             matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
@@ -7068,6 +7083,100 @@ mod tests {
             db.shards[0].state()
         );
         assert_eq!(db.security_versioned(), (version, old));
+
+        // The fault clears and a request has shard 0 retry.
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (version + 1, landed), "the write landed");
+        assert_eq!(db.security_versioned(), on_disk);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Shard 0 failed to recover after a settings write that never reached
+    /// the disk: once a retry brings it back, memory still holds what it
+    /// held, which is what the disk holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_settings_write_that_did_not_land_leaves_memory_once_its_shard_serves() {
+        let (db, root, switch) = db_on_test_disk("unlanded").await;
+        let old = json!({"members": {"names": ["m"]}});
+        let version = db.set_security(old.clone()).await.unwrap();
+
+        // A full disk: the write fails, and so does the reopen after it.
+        switch.fail_writes(std::io::ErrorKind::StorageFull);
+        assert!(db
+            .set_security(json!({"members": {"names": ["z"]}}))
+            .await
+            .is_err());
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (version, old));
+        assert_eq!(db.security_versioned(), on_disk);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two settings writes fail while shard 0 cannot recover: the first
+    /// landed, the second was refused. Once shard 0 serves again, memory
+    /// holds the one that landed, never the refused one, and a setting
+    /// written after that is not overwritten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parked_settings_read_backs_install_in_write_order() {
+        let (db, root, switch) = db_on_test_disk("parkedorder").await;
+        let old = json!({"members": {"names": ["m"]}});
+        let landed = json!({"members": {"names": ["x"]}});
+        let version = db.set_security(old.clone()).await.unwrap();
+
+        switch.fail_syncs_after(1, std::io::ErrorKind::Other);
+        assert!(db.set_security(landed.clone()).await.is_err());
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+        assert!(db
+            .set_security(json!({"members": {"names": ["y"]}}))
+            .await
+            .is_err());
+        assert_eq!(db.security_versioned(), (version, old));
+
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (version + 1, landed));
+        assert_eq!(db.security_versioned(), on_disk);
+
+        let later = json!({"members": {"names": ["w"]}});
+        let written = db.set_security(later.clone()).await.unwrap();
+        db.shards[0].barrier().await.unwrap().unwrap();
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (written, later));
+        assert_eq!(db.security_versioned(), on_disk);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use redb::backends::FileBackend;
 use redb::{
     BackendError, Builder, Database, DatabaseError, ReadableDatabase, StorageBackend, StorageError,
-    TableDefinition, TransactionError, WriteTransaction,
+    TableDefinition, TableError, TransactionError, WriteTransaction,
 };
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -361,6 +361,29 @@ fn close_recording(db: Database, path: &Path, checked: bool) -> Result<()> {
     let closed = db.close();
     *verified = checked && closed.is_ok();
     closed
+}
+
+/// Whether `error` is an I/O failure of the storage, after which redb fails
+/// every later write on that handle (`StorageError::PreviousIo`) until the
+/// file is reopened. redb's wrapping errors do not give their storage error
+/// as a source, so each is unwrapped here.
+pub(crate) fn io_failure(error: &anyhow::Error) -> bool {
+    let io = |error: &StorageError| matches!(error, StorageError::Io(_) | StorageError::PreviousIo);
+    error.chain().any(|cause| {
+        cause.downcast_ref::<StorageError>().is_some_and(io)
+            || matches!(
+                cause.downcast_ref::<TransactionError>(),
+                Some(TransactionError::Storage(storage)) if io(storage)
+            )
+            || matches!(
+                cause.downcast_ref::<TableError>(),
+                Some(TableError::Storage(storage)) if io(storage)
+            )
+            || matches!(
+                cause.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::Storage(storage)) if io(storage)
+            )
+    })
 }
 
 /// Begin a write transaction on `db` that commits in two phases, at redb's
