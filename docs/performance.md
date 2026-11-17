@@ -207,7 +207,7 @@ surface and deadline/memory limits.
   (0.1 s). The 10 GB spike in [PLAN.md](../PLAN.md#storage-spike) is the relevant
   compaction measurement, taken on the earlier storage engine. `_compact` now
   runs online in the background: a shard's writes pause only for the final
-  catch-up, the new file's integrity check and the swap. `compact_seconds`
+  catch-up and the swap. `compact_seconds`
   runs from the request until `compact_running` clears.
 
 ## Caveats

@@ -373,7 +373,8 @@ the bulk of the growth.
   does: it returns `202 Accepted` at once, copies each shard into a new file
   off the shard actor while it serves, catches up from a journal of the keys
   committed meanwhile, and swaps the file in with writes paused only for the
-  last catch-up, the new file's integrity check and the rename.
+  last catch-up and the rename; the new file's integrity check runs off the
+  actor before the catch-up.
 
 ## Progress
 

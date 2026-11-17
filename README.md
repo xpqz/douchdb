@@ -1041,9 +1041,9 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 - A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
 - `_compact` compacts online, as CouchDB does: it answers `202` at once,
   copies each shard into a new file (dropping non-leaf bodies) while the
-  shard keeps serving, catches up with the writes made meanwhile, and swaps
-  the new file in with writes paused only for the last catch-up, a full
-  check of the new file and the rename. It is node-local, like `_purge`;
+  shard keeps serving, checks the copy in full, catches up with the writes
+  made meanwhile, and swaps the new file in with writes paused only for the
+  last catch-up and the rename. It is node-local, like `_purge`;
   `--compact-concurrency` bounds concurrent compactions across databases;
   the rest wait their turn. The swap pauses that shard's writes and actor
   reads (reads on their own transactions carry on). `GET /db` reports

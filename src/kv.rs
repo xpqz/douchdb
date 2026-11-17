@@ -233,7 +233,42 @@ fn builder(cache_bytes: usize, check_integrity: bool) -> Builder {
 /// open, and the error is returned. Call it off the request path, with no
 /// transaction open: the check reads the whole file.
 pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
-    let outcome = db.check_integrity();
+    let checked = check(&mut db, path);
+    let closed = close_recording(db, path, checked.is_ok());
+    checked?;
+    closed
+}
+
+/// Proof that a database passed a full integrity check, which
+/// [`close_checked`] needs to record its file as verified. Only [`check`]
+/// makes one.
+pub struct Checked(PathBuf);
+
+/// Run the full integrity check on `db`, the file at `path`, now, while it
+/// stays open: a file still being written can be checked before its last
+/// commits, and closed with [`close_checked`] later. A file that fails (or
+/// had to be repaired) is an error.
+pub fn check(db: &mut Database, path: &Path) -> Result<Checked> {
+    match db.check_integrity()? {
+        true => Ok(Checked(path.to_path_buf())),
+        false => Err(StorageError::Corrupted(format!(
+            "{} failed its integrity check and was repaired",
+            path.display()
+        ))
+        .into()),
+    }
+}
+
+/// Close `db`, the file `checked` vouches for, and record it as verified
+/// if the close succeeds. Commits made after the check are trusted as any
+/// two-phase commit is, until the file's next close-time check.
+pub fn close_checked(db: Database, checked: Checked) -> Result<()> {
+    close_recording(db, &checked.0, true)
+}
+
+/// Close `db`, the file at `path`, and record whether it is verified:
+/// only if `checked` and the close succeeds.
+fn close_recording(db: Database, path: &Path, checked: bool) -> Result<()> {
     // Held from the release of the file until it is recorded: an open of
     // this path in between would be marked verified by the record below. A
     // close that fails leaves the file for its next open to recover, so it
@@ -241,20 +276,8 @@ pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     let flag = verified_flag(path);
     let mut verified = lock(&flag);
     let closed = db.close();
-    *verified = false;
-    match outcome {
-        Ok(true) => {
-            closed?;
-            *verified = true;
-            Ok(())
-        }
-        Ok(false) => Err(StorageError::Corrupted(format!(
-            "{} failed its integrity check and was repaired",
-            path.display()
-        ))
-        .into()),
-        Err(error) => Err(error),
-    }
+    *verified = checked && closed.is_ok();
+    closed
 }
 
 /// Begin a write transaction on `db` that commits in two phases, at redb's

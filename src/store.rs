@@ -1089,8 +1089,9 @@ impl Shard {
     }
 
     /// End a compaction, writes paused: catch the new file up with the
-    /// keys the journal still holds, check it and close it, rename it over
-    /// the live file, reopen and stop the journal. `false` when the journal
+    /// keys the journal still holds, compare its settings with the shard's,
+    /// close it (it was checked in full before the catch-up, off the
+    /// actor), rename it over the live file, reopen and stop the journal. `false` when the journal
     /// was invalidated (the shard was cleared or reopened since it started):
     /// the compaction must start again. A failure before the swap leaves
     /// the live file as it is. A swap that fails (the rename, the directory
@@ -1144,6 +1145,8 @@ impl Shard {
             compact::write(&target, changes)?;
             cursor = next;
         }
+        let mut target = target;
+        self.target.check(&mut target)?;
         let hook: compact::Hook = Arc::new(|_| {});
         anyhow::ensure!(self.finish_compaction(target, &hook)?, "restarted");
         Ok(())

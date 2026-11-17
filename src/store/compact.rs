@@ -8,14 +8,17 @@
 //!    drops the others), and every other table whole, the shard's sequence
 //!    and uuid included. Pages read different snapshots, which is safe: a
 //!    key that changes after its page was read is in the journal.
-//! 3. Catch-up rounds take the journal's keys and re-read each from a fresh
-//!    lease: present is an upsert, absent a delete. A document named by a
-//!    metadata or body key is reconciled as a whole: its metadata copied or
-//!    deleted, and its bodies in the new file made exactly its leaf bodies,
-//!    so a body that stopped being a leaf goes even though its own key was
-//!    never written.
-//! 4. On the actor, writes paused: the last round, a check of the new file,
-//!    and the swap through the gate (rename, directory sync, reopen).
+//! 3. Off the actor, the copied file is checked in full (`kv::check`), so
+//!    the shard keeps acknowledging writes meanwhile.
+//! 4. Catch-up rounds, until one is small, take the journal's keys and
+//!    re-read each from a fresh lease: present is an upsert, absent a
+//!    delete. A document named by a metadata or body key is reconciled as a
+//!    whole: its metadata copied or deleted, and its bodies in the new file
+//!    made exactly its leaf bodies, so a body that stopped being a leaf
+//!    goes even though its own key was never written.
+//! 5. On the actor, writes paused: the last round, a comparison of the new
+//!    file's settings with the shard's, and the swap through the gate
+//!    (close, drain, rename, directory sync, reopen).
 //!
 //! A clear or a recovery invalidates the journal; the compaction then throws
 //! its file away and starts again. Until the rename the live file is
@@ -59,10 +62,6 @@ const PAGE_ENTRIES: usize = 2;
 /// Bytes after which a page of the copy ends early.
 const PAGE_BYTES: usize = 4 << 20;
 
-/// Catch-up rounds off the actor at most: the last round, on the actor,
-/// takes whatever is left.
-const ROUNDS: usize = 8;
-
 /// Where a compaction has got to, for a hook to stop at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stage {
@@ -70,6 +69,8 @@ pub(crate) enum Stage {
     Start,
     /// A page of the copy is in the new file.
     Page,
+    /// Off the actor, the copied file's integrity check is about to run.
+    Check,
     /// A catch-up round off the actor is in the new file.
     Round,
     /// On the actor, writes paused, before the final round.
@@ -96,7 +97,9 @@ pub(crate) type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
 pub(crate) trait Target: Send + Sync {
     /// A new, empty shard file, replacing any leftover.
     fn create(&self) -> Result<Database>;
-    /// Check the finished file in full and close it.
+    /// Check the copied file in full, off the actor, before the catch-up.
+    fn check(&self, db: &mut Database) -> Result<()>;
+    /// Close the caught-up file, verified if [`Target::check`] passed.
     fn seal(&self, db: Database) -> Result<()>;
     /// Put the sealed file in place of the live one, durably. Called with
     /// the live file closed.
@@ -110,6 +113,8 @@ pub(crate) struct FileTarget {
     live: PathBuf,
     file: PathBuf,
     cache_bytes: usize,
+    /// The check the current file passed.
+    checked: std::sync::Mutex<Option<kv::Checked>>,
 }
 
 impl FileTarget {
@@ -118,6 +123,7 @@ impl FileTarget {
             live: live.to_path_buf(),
             file: live.with_extension("compact.redb"),
             cache_bytes,
+            checked: Default::default(),
         }
     }
 }
@@ -128,8 +134,20 @@ impl Target for FileTarget {
         super::create_file(&self.file, self.cache_bytes)
     }
 
+    fn check(&self, db: &mut Database) -> Result<()> {
+        let checked = kv::check(db, &self.file)?;
+        *self.checked.lock().unwrap_or_else(PoisonError::into_inner) = Some(checked);
+        Ok(())
+    }
+
     fn seal(&self, db: Database) -> Result<()> {
-        Ok(kv::close_verified(db, &self.file)?)
+        let checked = self
+            .checked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the compaction file was not checked"))?;
+        Ok(kv::close_checked(db, checked)?)
     }
 
     fn install(&self) -> Result<()> {
@@ -137,6 +155,7 @@ impl Target for FileTarget {
     }
 
     fn remove(&self) {
+        *self.checked.lock().unwrap_or_else(PoisonError::into_inner) = None;
         match std::fs::remove_file(&self.file) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => tracing::warn!(
                 file = %self.file.display(),
@@ -174,6 +193,11 @@ impl Target for DiskTarget {
         super::init_tables(&db)?;
         *self.next.lock().unwrap() = Some(switch);
         Ok(db)
+    }
+
+    fn check(&self, db: &mut Database) -> Result<()> {
+        anyhow::ensure!(db.check_integrity()?, "the compaction file was repaired");
+        Ok(())
     }
 
     fn seal(&self, db: Database) -> Result<()> {
@@ -423,9 +447,20 @@ pub async fn compact_shard(handle: &ShardHandle) -> Result<()> {
 /// [`compact_shard`], calling `hook` at each [`Stage`].
 pub(crate) async fn compact(handle: &ShardHandle, hook: Hook) -> Result<()> {
     let result = run(handle, &hook).await;
-    // Whatever happened, nothing records any longer and no file is left.
+    // Whatever happened, nothing records any longer.
     handle.journal.stop();
-    handle.target.remove();
+    if result.is_err() {
+        // The file goes on the actor, never from here: a shard whose actor
+        // is gone (its database deleted, and perhaps created again under
+        // the same name, with a compaction file of its own at this path)
+        // leaves it to the tombstone's removal or the start-up sweep.
+        let _ = handle
+            .alone(|shard| {
+                shard.target.remove();
+                Ok(())
+            })
+            .await;
+    }
     report(handle, None);
     result
 }
@@ -467,7 +502,22 @@ async fn run(handle: &ShardHandle, hook: &Hook) -> Result<()> {
             hook(Stage::Page);
         }
 
-        for _ in 0..ROUNDS {
+        // The full check, off the actor, so the shard keeps serving writes:
+        // what the catch-up writes after it is trusted as any two-phase
+        // commit is, until the file's next close-time check.
+        let mut target = Arc::into_inner(target)
+            .ok_or_else(|| anyhow::anyhow!("the compaction file is still in use"))?;
+        let (checker, check_hook) = (Arc::clone(&handle.target), Arc::clone(hook));
+        let target = tokio::task::spawn_blocking(move || {
+            check_hook(Stage::Check);
+            checker.check(&mut target).map(|()| target)
+        })
+        .await??;
+        let target = Arc::new(target);
+
+        // Until a round is small, as CouchDB's compactor retries until it
+        // has caught up; the last round runs on the actor.
+        loop {
             let Taken::Batch(keys) = handle.journal.take() else {
                 continue 'run;
             };
@@ -1138,5 +1188,157 @@ mod tests {
         assert_eq!(feed.await.unwrap(), expected);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The new file's full integrity check runs off the actor: the shard
+    /// acknowledges writes while it is held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_integrity_check_runs_while_the_shard_acknowledges_writes() {
+        let rig = Rig::new("compact-check");
+        rig.run(&setup()).await.unwrap();
+        let (hook, mut stops, _) = pauses(&[Stage::Check]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { compact(&handle, hook).await }
+        });
+        reached.await.expect("the check ran");
+        rig.run(&op(|txn| {
+            write_doc(txn, "during", false, b"{}", 50).map(drop)
+        }))
+        .await
+        .unwrap();
+        resume.send(()).unwrap();
+        compaction.await.unwrap().unwrap();
+        assert!(dump(&rig.handle)
+            .await
+            .contains_key(&(Table::Meta, key::text("during"))));
+        rig.close();
+    }
+
+    /// A compaction of a database that was deleted and created again under
+    /// the same name meanwhile fails, and leaves the new database's own
+    /// compaction file alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_compaction_never_touches_a_recreated_shards_file() {
+        let Rig { handle: old, file } = Rig::new("compact-stale");
+        let (old_rig, compacting) = (
+            Rig {
+                handle: Arc::clone(&old),
+                file: file.clone(),
+            },
+            file.with_extension("compact.redb"),
+        );
+        old_rig.run(&setup()).await.unwrap();
+        drop(old_rig);
+        let (hook, mut stops, _) = pauses(&[Stage::Page]);
+        let Pause { reached, resume } = stops.remove(0);
+        let stale = tokio::spawn({
+            let handle = Arc::clone(&old);
+            async move { compact(&handle, hook).await }
+        });
+        reached.await.unwrap();
+
+        old.close_deleted().await;
+        let dir = file.parent().unwrap().to_path_buf();
+        let tombstone = dir.with_extension("deleted");
+        std::fs::rename(&dir, &tombstone).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        crate::kv::forget_verified(&file);
+        drop(crate::store::create_file(&file, CACHE).unwrap());
+        let new = Rig {
+            handle: Arc::new(ShardHandle::spawn(&file, 1000, CACHE, Default::default()).unwrap()),
+            file: file.clone(),
+        };
+        new.run(&setup()).await.unwrap();
+        let (hook, mut stops, _) = pauses(&[Stage::Page]);
+        let fresh_stop = stops.remove(0);
+        let fresh = tokio::spawn({
+            let handle = Arc::clone(&new.handle);
+            async move { compact(&handle, hook).await }
+        });
+        fresh_stop.reached.await.unwrap();
+        assert!(compacting.exists());
+
+        resume.send(()).unwrap();
+        assert!(stale.await.unwrap().is_err(), "the stale compaction failed");
+        assert!(
+            compacting.exists(),
+            "the stale compaction removed the new one's file"
+        );
+        fresh_stop.resume.send(()).unwrap();
+        fresh.await.unwrap().unwrap();
+        drop(old);
+        let _ = std::fs::remove_dir_all(tombstone);
+        new.close();
+    }
+
+    /// A failed commit after the last round off the actor invalidates the
+    /// journal: the final round finds it so and the compaction starts again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalidated_journal_at_the_final_round_restarts_the_compaction() {
+        let rig = Rig::new("compact-final-invalid");
+        rig.run(&setup()).await.unwrap();
+        let (hook, mut stops, seen) = pauses(&[Stage::Round]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { compact(&handle, hook).await }
+        });
+        // Nothing was written during the copy: this round is the last.
+        reached.await.unwrap();
+        let failed = rig
+            .run(&op(|txn| {
+                write_doc(txn, "lost", false, b"{}", 60)?;
+                txn.inject_commit_failure();
+                Ok(())
+            }))
+            .await;
+        assert_eq!(failed.unwrap_err().status, 500);
+        resume.send(()).unwrap();
+        compaction.await.unwrap().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let swap = seen.iter().position(|stage| *stage == Stage::Swap).unwrap();
+        assert_eq!(seen[swap + 1], Stage::Start, "{seen:?}");
+        assert_eq!(seen.iter().filter(|s| **s == Stage::Start).count(), 2);
+        rig.close();
+    }
+
+    /// The swap closes the gate and waits for a reader holding a lease; the
+    /// reader finishes on the old file, and reads after it on the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swap_waits_for_a_reader_holding_a_lease() {
+        let rig = Rig::new("compact-lease");
+        rig.run(&setup()).await.unwrap();
+        let (hook, mut stops, _) = pauses(&[Stage::Swap]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { compact(&handle, hook).await }
+        });
+        reached.await.unwrap();
+        let (entered_tx, entered) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let gate = rig.handle.gate.clone();
+        let reader = tokio::spawn(async move {
+            gate.read(move |txn| {
+                entered_tx.send(()).unwrap();
+                held.recv().unwrap();
+                txn.len(Table::Meta)
+            })
+            .await
+        });
+        entered.await.unwrap();
+        resume.send(()).unwrap();
+        rig.handle.gate.closed().await;
+        assert!(
+            !compaction.is_finished(),
+            "the swap did not wait for the lease"
+        );
+        release.send(()).unwrap();
+        assert_eq!(reader.await.unwrap().unwrap(), 6);
+        compaction.await.unwrap().unwrap();
+        assert_eq!(body_keys(&dump(&rig.handle).await).len(), 6);
+        rig.close();
     }
 }
