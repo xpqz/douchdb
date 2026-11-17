@@ -163,9 +163,33 @@ term's MD5 as it reads it. So:
   A file that passed its close-time check is recorded as verified, so its
   next open in the same process skips the check; one that failed it is
   re-checked on its next open and fails closed. Reopening an idle database
-  therefore costs no full read. (Decision 2026-11-16: every-open checks
+  therefore costs no full read. Process exit closes shard and view files
+  cleanly but unchecked: the record dies with the process. (Decision 2026-11-16: every-open checks
   would make each reopen of a large idle database, and every anti-entropy
   pass over cold ones, read the whole file.)
+- **Every write transaction commits in two phases**
+  (`WriteTransaction::set_two_phase_commit(true)`, through the one helper
+  `kv::begin_write`; nothing else begins a write transaction). With redb's
+  default one-phase commit, pages and the header naming them share one sync,
+  so redb cannot tell damage to the newest commit's pages from a commit torn
+  by a crash: the open or integrity check silently falls back to the commit
+  before it, and the server answers 200 without a document it acknowledged,
+  across restarts. A two-phase commit syncs its pages before the header that
+  makes them the newest commit, so redb reports damage to them as
+  `StorageError::Corrupted` ("Primary is corrupted despite 2-phase commit"):
+  a shard fails closed (500), a view file is deleted and rebuilt. Power lost
+  between the two syncs leaves the previous commit in force and the write
+  unacknowledged. Cost: a second sync per commit. **Residual:** two bits of
+  the header's god byte sit outside every checksum: the primary-slot bit
+  (which commit slot is the newest) and the two-phase bit. Once the
+  two-phase bit is set, redb trusts the slot the primary-slot bit names
+  without comparing transaction ids, so flipping the primary-slot bit on a
+  file closed by a crash makes redb serve the older slot, which verifies,
+  silently. That single-bit path is new with two-phase commit: under
+  one-phase commit the transaction-id comparison would have caught the flip.
+  Clearing the two-phase bit brings back the one-phase fallback. So two-phase
+  commit narrows "any damage to the newest commit's pages silently rolls it
+  back" to "only a flip of one of these two header bits does".
 - **Guarantee, stated narrowly:** a damaged *value* is detected when read. A
   damaged *tree page* (a branch page, which can misroute a lookup into a
   false "not found") is detected by the next integrity check: when its idle
@@ -191,10 +215,13 @@ term's MD5 as it reads it. So:
   background.
 - **Recovery on start removes only staging and tombstone directories**
   (`.creating-*`, `.deleted-*`), then `fsync`s the parent. Nothing under a
-  published database name is ever removed by recovery.
+  published database name is ever removed by recovery, with one exception:
+  search-index temporary files (`.douchdb-search-meta.json.*.tmp` under
+  `_search_indexes/`) left by an interrupted metadata write are swept.
 - **A published database with a missing or unopenable shard fails closed:**
-  requests to it return 500, it stays listed, and every remaining file is left
-  untouched for inspection or repair. Damage is never mistaken for an
+  requests to it return 500, it stays listed, and no remaining file is
+  recreated or removed, nor is its data repaired (redb may still rebuild a
+  file's allocator state on open), so it is kept for inspection or repair. Damage is never mistaken for an
   interrupted create.
 - View and search index files are rebuildable from the shards, so losing a
   newly created one costs a rebuild, not data; they need no directory sync.

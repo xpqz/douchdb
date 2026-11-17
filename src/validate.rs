@@ -241,12 +241,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "validate",
             crate::db::DbConfig {
                 q,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(q),
                 partitioned: false,
             },
@@ -363,12 +364,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "validate",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },

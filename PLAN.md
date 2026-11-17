@@ -1,4 +1,4 @@
-# douchdb — CouchDB wire-compatible database in Rust on LevelDB
+# douchdb — CouchDB wire-compatible database in Rust on redb
 
 Status: implemented, living design and status. Target: a small, clustered,
 PouchDB-and-CouchDB compatible document store.
@@ -9,14 +9,14 @@ PouchDB-and-CouchDB compatible document store.
 |---|---|---|
 | Compatibility | CouchDB **wire** compatibility | Revision ids must be byte-identical to CouchDB's. This forces an Erlang External Term Format encoder and order-preserving JSON. See "The rev hash". |
 | Cluster membership | Static node list from config | No gossip, no membership protocol, no Raft. The default shard map is a pure function of (node list, q); explicit rebalance maps are versioned and reconciled by anti-entropy. Discovery probes peers for management but does not change placement. |
-| Storage | `rusty-leveldb` (pure Rust) | One implementation, no C++ toolchain, single static binary. Risk is concentrated here: its API is `&mut self` for *all* operations, including reads. |
+| Storage | `redb` (pure Rust, copy-on-write B-tree) | One implementation, no C++ toolchain, single static binary. ACID transactions with real `fsync`, MVCC readers beside the single writer, page checksums. Replaced an earlier vendored LSM engine that never called `fsync`. |
 | JavaScript isolation | QuickJS with no host capabilities | Design-document JS sees only the CouchDB helpers (`emit`, `sum`, `log`, `index`); there are no network or filesystem APIs. A pooled worker process with seccomp/Landlock, or a WASI/WASM engine, contains interpreter bugs. |
 | Not used | Raft, Mango, `_replicator`, `_users` | Where the code-size win comes from. Views and search use QuickJS rather than a general server-side JS platform. |
 
 ## Goal and non-goals
 
 **Goal:** a server that PouchDB can `replicate()` against in both directions and
-that CouchDB can replicate to and from, storing data in LevelDB, running as a
+that CouchDB can replicate to and from, storing data in redb, running as a
 Q-shard × N-replica cluster.
 
 **Non-goals, deliberately:** attachments, Mango, `_replicator` database,
@@ -39,7 +39,7 @@ simultaneously:
 4. the backup/restore mechanism.
 
 One implementation, four features. Any shortcut that writes "directly to
-LevelDB" forks into a second implementation later.
+the storage engine" forks into a second implementation later.
 
 Corollary: **single-node is the cluster with Q=1, N=1.** No separate code path.
 
@@ -56,16 +56,16 @@ Corollary: **single-node is the cluster with Q=1, N=1.** No separate code path.
       │  fabric        │  call local shard actor, or HTTP-proxy to a replica
       └───────┬────────┘
       ┌───────▼────────┐
-      │  shard actor   │  one task per shard, owns the DB (mandatory: the
-      │                │  LevelDB API is &mut self even for reads),
-      │                │  group-commits into one WriteBatch
+      │  shard actor   │  one task per shard, the only writer; group-commits
+      │                │  into one redb write transaction. Readers use their
+      │                │  own read transactions off the actor
       └───────┬────────┘
       ┌───────▼────────┐
-      │    LevelDB     │  one DB per (database, shard)
+      │      redb      │  one file per (database, shard)
       └────────────────┘
 ```
 
-Crates: `axum`, `tokio`, `serde_json` (**with `preserve_order`**), `rusty-leveldb`,
+Crates: `axum`, `tokio`, `serde_json` (**with `preserve_order`**), `redb`, `crc32c`,
 `reqwest`, `md-5`, `tracing`, `rquickjs`, `tantivy`, `icu_collator`,
 `wasmi`/`wasmi_wasi` (plus optional `wasmtime`/`wasmtime-wasi`), and Linux-only
 `seccompiler`/`landlock`.
@@ -78,55 +78,66 @@ QuickJS WASI module under `wasmi` (default) or an optional Wasmtime Cranelift
 JIT, with linear-memory and output limits. None of these exposes network or
 filesystem APIs to JavaScript.
 
-Because the LevelDB handle is `&mut` for reads as well as writes, the shard
-actor is not an optimisation — it is the only way to share a shard. Reads and
-writes both funnel through its mailbox. Snapshots are taken inside the actor;
-a read that needs a consistent multi-key view does it in one message.
+The shard actor is the single writer: it drains its mailbox and commits a group
+of writes as one transaction. Reads that need nothing from the actor's
+in-memory indexes (documents, `_bulk_get`, `_revs_diff`, view and anti-entropy
+fetches) open a redb read transaction, a snapshot, on the caller's task and run
+concurrently with the writer. Readers hold the file only through a lease from a
+per-shard gate, so the actor can close the gate, drain the leases and reopen the
+file (failed-commit recovery).
 
-**One DB per (database, shard)**, not one big DB with key prefixes:
-drop-database is `rm -rf`, shard migration is a directory copy, and compaction
-stalls stay isolated to one database. Document the operational ceiling (~hundreds
-of databases, not thousands).
+**One file per (database, shard)**, not one big database: drop-database is a
+rename plus a background delete, shard migration is a file copy, and redb's
+exclusive file lock keeps a second process out. Document the operational
+ceiling (~hundreds of databases, not thousands); the page cache is per file
+(`--cache-mb`, default 16 per shard file).
 
 ## Storage layout
 
-Keys are chosen so LevelDB's own sort order *is* the index.
+Each shard file holds typed redb tables, so the sort order of a table's key is
+the index. Every stored value is followed by a CRC32C that is checked on every
+read.
 
-| Key | Value | Purpose |
+| Table | Key → value | Purpose |
 |---|---|---|
-| `m/<docid>` | revtree + winner + deleted flag + update seq | doc metadata; sorted = `_all_docs` order |
-| `d/<docid>/<rev>` | JSON body (without `_id`/`_rev`) | one body per revision |
-| `s/<u64 BE seq>/<docid>` | 1 byte | by-seq index for `_changes` |
-| `l/<localid>` | JSON | `_local` docs, replication checkpoints |
-| `z/doc_count`, `z/doc_deleted_count` | u64 BE | live/deleted counters for `GET /db` and `_all_docs` totals |
-| `x/...` | — | reserved |
+| `meta` | doc id → revtree + winner + deleted flag + update seq | doc metadata; sorted = `_all_docs` order |
+| `by_seq` | u64 seq → doc id | by-seq index for `_changes` (the shard's own sequence) |
+| `bodies` | (doc id, rev) → JSON body (without `_id`/`_rev`) | one body per revision |
+| `local` | local id → JSON | `_local` docs |
+| `checkpoints` | peer/shard → checkpoint | anti-entropy checkpoints |
+| `purge_infos`, `purged_revs`, `purge_uuids` | | `_purge` records |
+| `settings` | name → value | doc counters, sequence, shard uuid; in shard 0 also the shard map, security object, `q` and `n` |
 
 Doc ids are raw UTF-8 bytes, which sorts identically to CouchDB's binary
 ordering, so `_all_docs` pagination and `startkey`/`endkey` match with no
-collation layer. `_local` lives in its own prefix and is excluded from
-`_all_docs`, as in CouchDB.
+collation layer. `_local` lives in its own table and is excluded from
+`_all_docs`, as in CouchDB. Counters are updated in the same write transaction
+as the document, so they cannot drift.
 
 Each database directory also contains:
 
 | Path | Purpose |
 |---|---|
-| `db.json` | database uuid, shard count and partitioned flag |
-| `shard-map.json`, `pending-shard-map.json` | versioned placement metadata |
-| `shard-0000`, `shard-0001`, ... | one LevelDB per shard |
-| `_view_indexes/` | persistent map/reduce indexes, one directory per view |
+| `shard-0000.redb`, `shard-0001.redb`, ... | one redb file per shard; shard 0 also holds the database metadata (shard map, pending shard map, security, `q`, `n`) |
+| `_view_indexes/` | persistent map/reduce indexes, one redb file per view |
 | `_search_indexes/` | Tantivy indexes plus a JSON sidecar of indexed values |
+
+A database is created in a `.creating-<uuid>` staging directory and published by
+one rename; it is deleted by renaming it to `.deleted-<uuid>`. Recovery on start
+removes only those two kinds of directory.
 
 View and search indexes are derived data: they can be deleted and rebuilt from
 documents and design documents. `_view_cleanup` and `_search_cleanup` remove
 them.
 
-**Write path.** Sequence numbers are allocated in memory and persisted *in the
-same WriteBatch* as the document, so a crash can never leave a gap or a document
-without a seq. The actor drains its mailbox and commits everything as one
-`WriteBatch` with `sync=true`. rusty-leveldb's sync flag flushes its
-`BufWriter` to the OS but does not call `fsync`, so this gives process-crash
-durability, not power-loss durability. Group commit still turns many small
-writes into one flushed batch and is ~60 lines.
+**Write path.** The actor drains its mailbox and commits everything as one redb
+write transaction. Each shard assigns its own sequence inside that transaction,
+so a shard's `_changes` feed is exactly its committed snapshot and there is no
+reserved/committed watermark. Every transaction commits in two phases (pages
+synced, then the header that names them), so a write is acknowledged only once
+it is on disk and damage to the newest commit is reported as corruption rather
+than silently falling back to the previous one. Group commit still turns many
+small writes into one pair of syncs. See `docs/durability.md`.
 
 ## The rev hash
 
@@ -329,10 +340,10 @@ the bulk of the growth.
 
 1. **Rev hash divergence.** Silent until it manifests as phantom conflicts.
    Differential testing from day one, gated in milestone 0.
-2. **`rusty-leveldb` semantics under load.** `&mut self` on every operation
-   serialises all access per shard — that is the design, but compaction stalls
-   and write amplification are unproven. Spike: 10 GB, group-commit throughput,
-   p99 latency during compaction.
+2. **Storage engine under load.** One writer per shard serialises writes by
+   design; redb's `fsync` per commit costs throughput that group commit has to
+   amortise. Spike: 10 GB, group-commit throughput, p99 latency during
+   `_compact`.
 3. ~~**Attachment bloat.**~~ No longer applicable: attachments are not stored.
 4. **Wire-compat surface creep.** Every quirk discovered (`ETag` format,
    `_changes` line framing, `open_revs` shape) is small but there are many.
@@ -357,18 +368,11 @@ the bulk of the growth.
 * **Non-Linux process sandboxing.** Resolved by guidance: process syscall/
   filesystem confinement is Linux-only; use the portable `--js-sandbox wasm`
   engine on other hosts that need a hard boundary.
-* **Storage-cache teardown.** `rusty-leveldb` 4.0.2 is vendored with the
-  UB-free circular LRU from upstream PR #69 plus our own fixes (duplicate-key
-  eviction, propagated table errors, footer and filter-block checks, bloom off,
-  the neighbouring-tombstone deletion fix) after a recursive cache-drop stack
-  overflow on Linux ARM64 bulk imports. Each patch has its own upstreamed? gate
-  in `vendor/rusty-leveldb/PATCHES.md`; PR #69 alone does not retire the fork.
-  This is a temporary vendored dependency: the decision and removal checklist
-  are in `docs/storage-dependency.md`, tracked by issue #105.
 * **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
-  ~27 s. More shards or an observable `compact_running` flag plus off-path
-  scheduling remain options; `_compact` maps to `compact_range` and returns
-  `202 Accepted`.
+  ~27 s on the earlier engine. `_compact` is now an interim sweep that deletes
+  non-leaf bodies in batches on the shard actor (the file does not shrink; redb
+  reuses the freed pages) and returns `202 Accepted`. Online copy-and-swap
+  compaction, as CouchDB does, is the planned next phase.
 
 ## Progress
 
@@ -382,14 +386,13 @@ the bulk of the growth.
   Verified manually: PouchDB ⇄ douchdb round-trips docs, deletions and
   and CouchDB's own `_replicate` pushes and pulls in both directions with
   identical revision ids.
-* **Group commit.** The shard actor drains up to 64 queued jobs, merges their
-  `Tx`es into one `WriteBatch`, and acknowledges after the batch is flushed to
-  the OS. rusty-leveldb does not fsync by default, so acknowledged writes are
-  not power-loss durable; comparisons must state this. The explicit positioning
-  and operational guidance are in `docs/durability.md`. A write overlay makes
-  later jobs in the same group read their predecessors. A SIGKILL/restart
-  conformance test confirms acknowledged documents and changes survive a
-  process crash; power loss remains explicitly out of scope.
+* **Group commit.** The shard actor drains up to 64 queued jobs and runs them in
+  one redb write transaction, committed in two phases with `fsync`; later jobs in
+  the group see earlier jobs' writes through the transaction. A job's writes are
+  acknowledged only after the commit is durable. The guarantee, its residual
+  and operational guidance are in `docs/durability.md`. A SIGKILL/restart
+  conformance test and a power-cut storage backend (`kv::powercut`) confirm
+  acknowledged documents and changes survive.
 * **Cluster routing green.** Shard map, rendezvous placement and per-document
   proxying cover CRUD, `_bulk_docs`, `_bulk_get`, `_revs_diff` and `POST /db`
   (generated ids are routed after parsing). `_all_docs` fans out to every node,
@@ -490,11 +493,10 @@ the bulk of the growth.
   the embedded WASI runner, a GitHub Actions workflow runs
   fmt/clippy/tests/both wasm backends/container build, search rebuilds are
   serialized per index and run on the blocking pool, and `_compact` has a
-  configurable node-wide concurrency bound, a visible `compact_running` flag,
-  and runs the blocking LevelDB call through `block_in_place` so it does not
-  pin a Tokio worker. Non-Linux process RSS and thread metrics are explicitly
-  `null` until a platform collector is added. Durability is explicitly
-  positioned as non-primary in `docs/durability.md`. Observability handlers
+  configurable node-wide concurrency bound and a visible `compact_running`
+  flag. (Compaction is now an interim sweep that holds each shard's actor for
+  its whole run; see "Compaction placement".) Non-Linux process RSS and
+  thread metrics are explicitly `null` until a platform collector is added. Observability handlers
   moved out of `api.rs` into `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies
   token users and roles; `_security` uses CouchDB's `admins`/`members` names and
@@ -552,7 +554,7 @@ the bulk of the growth.
   resume boundaries and duplicate-free pagination across interleaved shards.
   A lazy per-shard sequence index caches
   winning revisions and conflict leaves, so steady-state feeds do not scan the
-  LevelDB sequence table or decode metadata. Normal changes responses are
+  sequence table or decode metadata. Normal changes responses are
   streamed by merging shard pages and serializing bounded chunks, with
   `include_docs` bodies embedded verbatim rather than parsed and rebuilt. Full `_changes` feeds
   also query peers concurrently; limited
@@ -608,7 +610,7 @@ the bulk of the growth.
 * **Live-document index for `_all_docs`.** Each shard lazily builds an in-memory
   sorted map of live ids to winning revisions on the first ascending range
   query, then maintains it on writes. This removes metadata decodes and makes
-  `startkey` offsets a range count without adding an extra LevelDB write per
+  `startkey` offsets a range count without adding an extra storage write per
   ingested document. Descending ranges still use the metadata scan.
 * **Storage spike green.** A 10 GB run on one shard (worst-case `&mut self`
   serialisation) is recorded below.
@@ -627,7 +629,9 @@ the bulk of the growth.
 `scripts/storage_spike.py` writes incompressible 1 MB documents through the HTTP
 API, keeps concurrent writers running (group commit), probes read latency, then
 compacts the shard and kills the server with `SIGKILL` to check process-crash
-durability. This does not cover power loss: rusty-leveldb does not fsync.
+durability. It does not test power loss (the `kv::powercut` tests do).
+The run below is historical: it was measured on the earlier LSM-based
+engine, before `fsync` per commit and the interim `_compact`.
 Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
 
 | Metric | Result |
@@ -641,10 +645,10 @@ Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
 | Probe latency during compaction | 26.9 s (blocked for the whole compaction) |
 | Docs after kill -9 + restart | 10,001 of 10,001 |
 
-The interesting number is the last one: `compact_range` owns the shard actor
+The interesting number is the last one: the old engine's range compaction owned the shard actor
 for its whole duration, so every request behind it waits. At 10 GB that is a
 27-second p99 for that shard. The write path itself is acceptable (80 MB/s,
-~0.5 s p99) with one 22-second outlier where LevelDB compaction stalled the
+~0.5 s p99) with one 22-second outlier where compaction stalled the
 writer. Keeping `_compact` synchronous is no longer defensible for large
 databases; the options are a background job that still takes the shard lock
 (same stall, but observable via `compact_running`) or sharding compaction work

@@ -1,7 +1,7 @@
 # douchdb
 
 A small CouchDB **wire-compatible** document database in Rust, stored on
-LevelDB, runnable as a Q-shard × N-replica cluster.
+[redb](https://github.com/cberner/redb), runnable as a Q-shard × N-replica cluster.
 
 The goal is not to reimplement all of CouchDB. It is a server that PouchDB and
 CouchDB can replicate against in both directions, with CouchDB-compatible
@@ -471,7 +471,7 @@ Every flag that takes a value also accepts `--flag=VALUE`. A value that is exact
 | Flag | Default | Meaning |
 |---|---|---|
 | `--listen` | `127.0.0.1:5984` | HTTP listen address |
-| `--data` | `data` | Data directory (one LevelDB per database/shard) |
+| `--data` | `data` | Data directory (one redb file per shard, in a directory per database) |
 | `--q` | `2` | Default shards per database, fixed at creation (CouchDB's default) |
 | `--n` | `3` | Default copies of each shard, clamped to the node count (CouchDB's default) |
 | `--revs-limit` | `1000` | Revision history kept per document |
@@ -987,8 +987,9 @@ python3 scripts/storage_spike.py --target-gb 10
 ```
 
 It reports throughput, write/read latencies, compaction latency and
-amplification, and checks process-crash durability across `kill -9`. It does
-not test power-loss durability: rusty-leveldb does not fsync.
+amplification, and checks that acknowledged writes survive `kill -9`. It does
+not test power loss; the `kv::powercut` unit tests do (a storage backend that
+discards everything not yet synced).
 
 Storage corruption and fail-closed checks run against a release build:
 
@@ -997,9 +998,11 @@ cargo build --release
 python3 scripts/storage_faults.py --bin target/release/douchdb
 ```
 
-It covers a clean SIGKILL, kill during compaction, truncated tables, bit
-flips, a removed table and a truncated manifest. Each scenario must preserve
-all acknowledged documents or refuse to serve them.
+It covers repeated SIGKILL mid-write (every acknowledged write must come
+back), then deliberate damage: a truncated shard file, bit flips in a value
+page and in a branch page (while the server is stopped and while it runs), a
+removed shard file, and a damaged view index. Damaged shards must fail closed
+(500) with the rest of the server unaffected; a damaged view index is rebuilt.
 
 A document whose metadata record is corrupt cannot be read or overwritten
 (the error says so), and listings skip it. To repair it, purge it:
@@ -1024,27 +1027,24 @@ follows CouchDB's duplicate-key rule — the last value wins and the key keeps
 the position of its last occurrence — so revision ids match. The JSON object
 key `$serde_json::private::Number` is reserved by the parser and rejected.
 
-The `rusty-leveldb` dependency is temporarily vendored with a heap-sentinel
-LRU list and duplicate-key eviction fix; see
-`vendor/rusty-leveldb/PATCHES.md`. This addresses the cache corruption and
-stack overflow seen during large ARM64 imports. The decision, risks and
-removal checklist are tracked in
-[docs/storage-dependency.md](docs/storage-dependency.md) and issue #105.
-
-**Durability:** DouchDB is not a power-loss-durable primary store. Writes survive
-process crashes but not necessarily power loss, because the storage layer does
-not fsync. See [docs/durability.md](docs/durability.md). The per-document,
+**Durability:** every acknowledged write is durable. Each commit is a redb
+two-phase commit that fsyncs before the write is acknowledged, as CouchDB syncs
+every commit. Every stored value carries a checksum, so a damaged value fails
+closed on read; a damaged tree page is caught by the next integrity check
+(first open after a restart, or when an idle database closes), which is weaker
+than CouchDB. See [docs/durability.md](docs/durability.md). The per-document,
 quorum, `_changes`, view and replication guarantees, non-guarantees and their
 test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
-- `_compact` still blocks the owning shard actor, but runs through
-  `block_in_place` so it does not pin a Tokio worker; at 10 GB the shard stall is
-  ~27 s (measured in [PLAN.md](PLAN.md)). `--compact-concurrency` bounds
-  concurrent compactions across databases, and `GET /db` reports
-  `compact_running`.
+- `_compact` is an interim sweep that deletes non-leaf bodies. It runs as one
+  job holding each shard's actor for its whole run, so that shard's writes and
+  actor reads queue behind it (reads on their own transactions carry on); the
+  file does not shrink, as redb reuses the freed pages. Online compaction is
+  the next phase. `--compact-concurrency` bounds concurrent compactions across
+  databases, and `GET /db` reports `compact_running`.
 - No Mango or lists/shows. Attachments are not supported.
 
 ## License

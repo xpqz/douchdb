@@ -298,7 +298,7 @@ correct keys, a range window and a cluster-wide offset.
 ### Shard-map metadata and movement (#47)
 
 Each database now carries a mem3-style shard map: one ordered replica list per
-shard, persisted as `shard-map.json` and cached in memory. It defaults to the
+shard, stored in the settings table of the database's shard 0 and cached in memory. It defaults to the
 balanced mem3-style placement (#77), and all routing, anti-entropy filters and owner filters
 read it.
 
@@ -464,7 +464,7 @@ anything the scanner cannot handle falls back to a full document parse.
 | `style=all_docs` | 224 req/s | 239 req/s | 4.10 ms | 4.06 ms |
 | Native map cold build | 38.2 ms | 35.2 ms | — | — |
 
-`include_docs` remains dominated by reading document bodies from LevelDB.
+`include_docs` remains dominated by reading document bodies from the shard file.
 The benchmark now warms each full-feed mode on every coordinator before
 measuring steady state.
 
@@ -552,7 +552,7 @@ work. Three changes target it:
 - Shard masks are disjoint, so the cluster feed no longer builds a HashSet or
   runs a dedup/sequence-score pass for every row.
 - The live-document index supplies the winning revision for ordinary live
-  documents, avoiding a LevelDB metadata read and revision-tree decode per
+  documents, avoiding a stored metadata read and revision-tree decode per
   row. Tombstones and `style=all_docs` still use the full metadata path.
 - Cluster sequence tokens wrap a compact `v1:<node seqs>` body instead of
   base64(JSON) of a map encoded per row; they are then written in CouchDB's
@@ -568,7 +568,7 @@ Before/after on the 6,000-document cluster benchmark:
 | `_changes?include_docs` | — | 10.6 req/s | — | 93.9 ms |
 
 `style=all_docs` is close to the default path. `include_docs` remains the
-slowest mode because every row reads and parses a document body from LevelDB.
+slowest mode because every row reads and parses a document body from the shard file.
 
 ### Raw changes serialization (#61)
 
@@ -591,14 +591,14 @@ Before/after against the previous `_changes` path:
 | `style=all_docs&include_docs` | 10.1 req/s | 24.9 req/s | 96.4 ms | 39.3 ms |
 
 `style=all_docs` still decodes revision trees to find all leaf revisions;
-`include_docs` is now dominated by reading bodies from LevelDB.
+`include_docs` is now dominated by reading bodies from the shard file.
 
 ### In-memory sequence index (#62)
 
 Each shard now builds a lazy sequence index of `seq -> (id, winning rev,
 deleted, other leaves)` on the first changes request and maintains it on every
 write. Non-conflict documents store no extra leaf entries. The index removes
-the per-request LevelDB scan of `s/` keys, the metadata decode for winning
+the per-request scan of `s/` keys, the metadata decode for winning
 revisions, and the revision-tree walk for `style=all_docs`.
 
 The first feed after a restart still builds the index. The benchmark warms one
@@ -613,7 +613,7 @@ request per coordinator before measuring steady state.
 | `style=all_docs&include_docs` | 24.9 req/s | 54.9 req/s | 39.3 ms | 17.9 ms |
 
 `include_docs` is now dominated by reading the requested document bodies from
-LevelDB; every other changes mode is mostly JSON serialization and transfer.
+the shard file; every other changes mode is mostly JSON serialization and transfer.
 
 ### Partitioned databases (#55)
 
@@ -707,8 +707,8 @@ local path.
 
 Shard maps now carry a monotonic `version`. External updates increment it,
 peers reject older versions, and the PUT response includes `"pending": true`
-when fewer than a metadata quorum acknowledged. The coordinator persists a
-`pending-shard-map.json`, and anti-entropy reconciles versions with peers:
+when fewer than a metadata quorum acknowledged. The coordinator stores the
+map as pending in shard 0's settings, and anti-entropy reconciles versions with peers:
 newer maps are pulled, older peers are pushed, and the pending marker clears
 once a metadata quorum acknowledges. A test takes two of three nodes down,
 observes a pending version-3 update, restarts one peer, and verifies the map

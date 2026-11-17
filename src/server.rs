@@ -184,6 +184,7 @@ fn build_state(
         view_memory_mb: args.view_memory_mb,
         default_admin_only,
         max_open_dbs: args.max_open_dbs,
+        cache_bytes: args.cache_mb << 20,
         local_feed_recheck: crate::state::LOCAL_FEED_RECHECK,
     };
     Ok(Arc::new(AppState {
@@ -397,6 +398,9 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
         );
     }
     std::fs::create_dir_all(&args.data)?;
+    // Finish the creates and deletes a crash interrupted before serving.
+    let data = args.data.clone();
+    tokio::task::spawn_blocking(move || crate::state::recover_root(&data)).await??;
 
     let advertise = advertise_url(args);
     let auth = build_auth(args)?;
@@ -422,7 +426,7 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
         for task in tasks {
             let _ = task.await;
         }
-        close_databases(&state).await;
+        state.close_for_exit().await;
         Ok(())
     };
     tokio::select! {
@@ -435,15 +439,4 @@ async fn serve(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
             SHUTDOWN_DEADLINE.as_secs()
         )),
     }
-}
-
-/// Drop every open database off the async threads. Each one joins its shard
-/// actors, which finish their queued writes first, so a restart finds every
-/// acknowledged write.
-async fn close_databases(state: &AppState) {
-    let open = std::mem::take(&mut *state.dbs.write().await);
-    if open.is_empty() {
-        return;
-    }
-    let _ = tokio::task::spawn_blocking(move || drop(open)).await;
 }

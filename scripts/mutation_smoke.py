@@ -71,7 +71,16 @@ MUTATIONS = [
 
 BUILD_TIMEOUT = 900
 TEST_TIMEOUT = 600
-IGNORED = shutil.ignore_patterns("target", ".git", ".skis", ".claude", "node_modules", "data", "store")
+ANYWHERE = shutil.ignore_patterns("target", ".git", ".skis", ".claude", "node_modules")
+# Data directories at the top of a checkout only: `src/store/` is source.
+TOP_LEVEL_ONLY = {"data", "store"}
+
+
+def IGNORED(directory: str, names: list[str]) -> set[str]:
+    ignored = set(ANYWHERE(directory, names))
+    if Path(directory) == ROOT:
+        ignored |= TOP_LEVEL_ONLY & set(names)
+    return ignored
 
 
 def run(command: list[str], cwd: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess | None:

@@ -805,15 +805,16 @@ mod tests {
 
     /// A version bump that leaves every replica list alone must keep the
     /// checkpoint: the filter has not changed, so re-pulling from zero is waste.
-    #[test]
-    fn version_only_shard_map_bump_keeps_the_checkpoint_id() {
+    #[tokio::test]
+    async fn version_only_shard_map_bump_keeps_the_checkpoint_id() {
         let root = std::env::temp_dir().join(format!("douchdb-ckid-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "ck",
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::balanced(2, 2, 1),
                 partitioned: false,
             },
@@ -822,14 +823,14 @@ mod tests {
         let before = checkpoint_id(&db, "http://peer");
         let mut bumped = db.shard_map();
         bumped.version += 1;
-        assert!(db.set_shard_map(bumped).expect("set map"));
+        assert!(db.set_shard_map(bumped).await.expect("set map"));
         assert_eq!(db.shard_map().version, 1);
         assert_eq!(before, checkpoint_id(&db, "http://peer"));
 
         let mut moved = db.shard_map();
         moved.version += 1;
         moved.replicas = vec![vec![1], vec![0]];
-        assert!(db.set_shard_map(moved).expect("set map"));
+        assert!(db.set_shard_map(moved).await.expect("set map"));
         assert_ne!(before, checkpoint_id(&db, "http://peer"));
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -844,12 +845,13 @@ mod tests {
             Json(json!({"results": [], "last_seq": stub_seq(0)}))
         }
         let root = std::env::temp_dir().join(format!("douchdb-stop-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "ae",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -899,12 +901,13 @@ mod tests {
     #[tokio::test]
     async fn partial_bulk_get_does_not_advance_the_checkpoint() {
         let root = std::env::temp_dir().join(format!("douchdb-ae-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "ae",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -1013,12 +1016,13 @@ mod tests {
         }
 
         let root = std::env::temp_dir().join(format!("douchdb-auth-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "ae",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -1173,12 +1177,13 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "ae",
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },

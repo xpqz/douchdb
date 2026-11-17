@@ -11,7 +11,7 @@ partitioned or global design documents.
 curl -X PUT 'http://localhost:5984/sensors?partitioned=true'
 ```
 
-The flag is stored in the database's `db.json`. A normal `GET /sensors` then
+The flag is stored with the database's settings in its shard 0. A normal `GET /sensors` then
 reports it:
 
 ```json

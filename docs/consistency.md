@@ -152,13 +152,46 @@ where behaviour is best-effort, it says so.
 - Static membership: nodes and placement are configuration, not a consensus
   protocol. There is no online membership change.
 
+## Databases
+
+- A database is a directory under the data root holding its shard files
+  (`shard-NNNN.redb`). Its own settings (shard count, shard map, security
+  object, a pending shard map) are rows in shard 0's settings table.
+- A create builds the database in a `.creating-<uuid>` directory, commits
+  shard 0's settings last, syncs it and renames it to the database's name,
+  then syncs the data root; it is acknowledged only after that. A delete
+  renames the directory to `.deleted-<uuid>` and syncs the root before it is
+  acknowledged; the files are removed in the background. A crash leaves at
+  most one of those directories, which the next start removes. Nothing under
+  a database's own name is removed on start, except search-index temporary
+  files (`.douchdb-search-meta.json.*.tmp` under `_search_indexes/`) that an
+  interrupted metadata write left behind.
+- A database with a missing or damaged shard file fails closed: it stays
+  listed, requests to it answer 500, and its files are not recreated or
+  removed, nor is their data repaired (redb's first open of a file that was
+  not closed cleanly may commit a rebuild of its allocator state).
+- A directory counts as a database when it holds at least one shard file, so
+  a directory that only has a legal name (`lost+found` at a volume root) is
+  ignored. The residual case: a database that lost *every* shard file is no
+  longer listed and answers 404, and creating its name answers 412, because
+  the leftover directory is not empty and a new database cannot be renamed
+  over it. Remove or restore the directory by hand.
+
 ## Durability
 
-- Acknowledged writes survive a process crash (`kill -9`) because they reach
-  the operating-system page cache.
-- They do **not** survive power loss: the storage layer does not fsync. See
-  [durability.md](durability.md).
-- DouchDB is not a primary power-loss-durable store.
+- Every acknowledged write is durable: each commit is a redb two-phase commit
+  that syncs before the write is acknowledged, so it survives a process crash,
+  a kernel crash and power loss. See [durability.md](durability.md).
+- Every stored value carries a CRC32C checked on every read; a damaged value is
+  a 500, never a miss. A damaged *tree page* (a branch page, which could
+  misroute a lookup into a false "not found") is detected only by the next
+  integrity check: when the idle database closes, or on the first open after a
+  restart. That is weaker than CouchDB, which checksums tree nodes as it reads
+  them.
+- Residual: two bits of redb's file header (which commit slot is newest, and
+  the two-phase flag) are outside every checksum. Flipping the first on a file
+  closed by a crash makes redb serve the previous commit without detection.
+- A view index that is damaged is deleted and rebuilt from the shards.
 
 ## Explicit non-guarantees
 
@@ -214,5 +247,5 @@ where behaviour is best-effort, it says so.
 - Mutation testing of critical paths is tracked in #121.
 - Cluster-version-vector `pending` is reported as zero; only the single-node
   feed has an exact pending count.
-- Corrupt filter/footer handling is tested; arbitrary metadata corruption that
-  leaves a readable but incomplete index remains a storage-engine risk.
+- Tree-page damage to a file that stays open is only found by the next
+  integrity check (see Durability above).

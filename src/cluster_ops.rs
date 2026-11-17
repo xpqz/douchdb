@@ -4,7 +4,7 @@
 use crate::cluster::ShardMap;
 use crate::cluster_http::{internal_request, send_peer, ClusterCtx};
 use crate::db::{ApiError, Db, DbResult};
-use crate::store::ShardState;
+use crate::store::ShardSummary;
 use axum::http::{header, HeaderMap, StatusCode};
 use futures::future::join_all;
 use serde_json::{json, Value};
@@ -25,7 +25,7 @@ pub(crate) async fn set_security_everywhere(
     value: Value,
     headers: &HeaderMap,
 ) -> DbResult<bool> {
-    let version = db.set_security(value.clone())?;
+    let version = db.set_security(value.clone()).await?;
     if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
         return Ok(true);
     }
@@ -119,7 +119,7 @@ pub(crate) async fn apply_shard_map(
     }
     let internal = ctx.cluster.is_internal(headers);
     if internal {
-        if !db.set_shard_map(map.clone())? {
+        if !db.set_shard_map(map.clone()).await? {
             return Err(shard_map_rejected());
         }
     } else {
@@ -140,10 +140,10 @@ pub(crate) async fn apply_shard_map(
                 error.reason
             );
         }
-        map = db.set_next_shard_map(map)?;
+        map = db.set_next_shard_map(map).await?;
     }
     if internal {
-        db.clear_pending_shard_map()?;
+        db.clear_pending_shard_map().await?;
         return Ok((map, false));
     }
 
@@ -195,9 +195,9 @@ pub(crate) async fn apply_shard_map(
     let quorum = ctx.cluster.nodes.len().max(1) / 2 + 1;
     let pending = acknowledgements < quorum;
     if pending {
-        db.set_pending_shard_map(&map)?;
+        db.set_pending_shard_map(&map).await?;
     } else {
-        db.clear_pending_shard_map()?;
+        db.clear_pending_shard_map().await?;
     }
     crate::telemetry::record_shard_map_update(pending);
     Ok((map, pending))
@@ -209,7 +209,7 @@ async fn fetch_shard_states(
     node: usize,
     headers: &HeaderMap,
     with_digest: bool,
-) -> Option<Vec<ShardState>> {
+) -> Option<Vec<ShardSummary>> {
     if node == ctx.cluster.me {
         return db.shard_states(with_digest).await.ok();
     }
@@ -228,7 +228,7 @@ async fn fetch_shard_states(
     let value = send_peer(request).await.ok()?.json::<Value>().await.ok()?;
     let mut out = Vec::new();
     for row in value["shards"].as_array()? {
-        out.push(ShardState {
+        out.push(ShardSummary {
             docs: row.get("docs").and_then(Value::as_u64).unwrap_or(0),
             deleted: row.get("deleted").and_then(Value::as_u64).unwrap_or(0),
             seq: row.get("seq").and_then(Value::as_u64).unwrap_or(0),
@@ -258,7 +258,7 @@ async fn fetch_states(
     nodes: &[usize],
     headers: &HeaderMap,
     with_digest: bool,
-) -> Vec<Option<Vec<ShardState>>> {
+) -> Vec<Option<Vec<ShardSummary>>> {
     let fetched = crate::cluster_http::in_one_round(futures::future::join_all(
         nodes
             .iter()
@@ -311,21 +311,21 @@ fn remaining(deadline: std::time::Instant) -> std::time::Duration {
     deadline.saturating_duration_since(std::time::Instant::now())
 }
 
-fn same_shard_content(left: &ShardState, right: &ShardState) -> bool {
+fn same_shard_content(left: &ShardSummary, right: &ShardSummary) -> bool {
     left.docs == right.docs && left.deleted == right.deleted && left.digest == right.digest
 }
 
 /// Per-shard source digest, or `None` while old replicas disagree, are
 /// unreachable, or did not produce a digest.
 fn source_required(
-    states: &[Option<Vec<ShardState>>],
+    states: &[Option<Vec<ShardSummary>>],
     old_map: &ShardMap,
     q: u32,
     require_digest: bool,
-) -> Option<Vec<ShardState>> {
+) -> Option<Vec<ShardSummary>> {
     let mut required = Vec::with_capacity(q as usize);
     for shard in 0..q {
-        let mut chosen: Option<&ShardState> = None;
+        let mut chosen: Option<&ShardSummary> = None;
         for node in old_map.replicas_of(shard) {
             // Every old owner must answer; otherwise a replica that is merely
             // unreachable could be dropped while it still holds newer writes.
@@ -358,7 +358,7 @@ async fn stable_source_states(
     headers: &HeaderMap,
     grace: std::time::Duration,
     shutdown: &CancellationToken,
-) -> DbResult<Vec<ShardState>> {
+) -> DbResult<Vec<ShardSummary>> {
     let deadline = std::time::Instant::now() + grace;
     let owners = owners_of(&[old_map]);
     let mut delay = Backoff::new(100, 1_000);
@@ -648,7 +648,7 @@ async fn activate_map_everywhere(
     headers: &HeaderMap,
 ) -> DbResult<ShardMap> {
     let old = db.shard_map();
-    let map = &db.set_next_shard_map(target.clone())?;
+    let map = &db.set_next_shard_map(target.clone()).await?;
     let peers: Vec<String> = ctx.cluster.peers().cloned().collect();
     let mut failures = Vec::new();
     for peer in &peers {
@@ -674,6 +674,7 @@ async fn activate_map_everywhere(
     // the target map also accept the old placement again.
     let rollback = db
         .set_next_shard_map(old)
+        .await
         .unwrap_or_else(|_| db.shard_map());
     for peer in &peers {
         let request = internal_request(
@@ -854,12 +855,13 @@ mod tests {
             replicas: vec![vec![0], vec![0]],
             version: 1,
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "activate",
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active.clone(),
                 partitioned: false,
             },
@@ -876,7 +878,7 @@ mod tests {
             replicas: vec![vec![0, 1], vec![0, 1]],
             ..active.clone()
         };
-        let current = db.set_next_shard_map(interloper).unwrap();
+        let current = db.set_next_shard_map(interloper).await.unwrap();
         assert_eq!(current.version, 2);
 
         let ctx = ClusterCtx {
@@ -918,12 +920,13 @@ mod tests {
             ..old_map.clone()
         };
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "stop",
                 DbConfig {
                     q: 2,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: old_map.clone(),
                     partitioned: false,
                 },

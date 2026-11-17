@@ -422,10 +422,55 @@ impl KindStats {
     }
 }
 
+/// File name of an index's metadata, written with `db::write_atomic`.
+const META_FILE: &str = "douchdb-search-meta.json";
+
+/// Remove the temporary files a crash left behind while writing an index's
+/// metadata (`.douchdb-search-meta.json.<pid>.<n>.tmp`), in every search
+/// index of the database at `db_path`, whatever process wrote them. Run
+/// only where no metadata write can be in flight: at start-up, before the
+/// node serves (`state::recover_root`). Blocking.
+pub(crate) fn remove_stale_temps(db_path: &Path) {
+    let Ok(indexes) = std::fs::read_dir(db_path.join("_search_indexes")) else {
+        return;
+    };
+    let prefix = format!(".{META_FILE}.");
+    for index in indexes.flatten() {
+        let Ok(files) = std::fs::read_dir(index.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let Some((pid, counter)) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .and_then(|rest| rest.split_once('.'))
+            else {
+                continue;
+            };
+            let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+            if !numeric(pid) || !numeric(counter) {
+                continue;
+            }
+            if file.file_type().is_ok_and(|kind| kind.is_file()) {
+                match std::fs::remove_file(file.path()) {
+                    Ok(()) => {
+                        tracing::info!(file = %file.path().display(), "removed stale temporary file")
+                    }
+                    Err(error) => {
+                        tracing::warn!(file = %file.path().display(), %error, "cannot remove stale temporary file")
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn write_meta(path: &Path, meta: &SearchMeta) -> DbResult<()> {
     let bytes = serde_json::to_vec(meta)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))?;
-    crate::db::write_atomic(&path.join("douchdb-search-meta.json"), &bytes)
+    crate::db::write_atomic(&path.join(META_FILE), &bytes)
         .map_err(|error| ApiError::new(500, "search_index_error", error.to_string()))
 }
 
@@ -837,8 +882,7 @@ async fn update_index(
 
 /// An index's files, written without fsync. A search index is derived from
 /// the database: one a crash damages fails its checksums when it is next
-/// opened and is rebuilt, so a commit does not wait for the disk. (The
-/// database's own storage does not sync either.)
+/// opened and is rebuilt, so a commit does not wait for the disk.
 #[derive(Clone, Debug)]
 struct UnsyncedDirectory {
     inner: MmapDirectory,
@@ -1901,16 +1945,62 @@ mod tests {
 
     /// Every index ever searched used to stay open, with all its stored
     /// documents, until the database was deleted.
+    /// Start-up recovery removes the temporary metadata files a crashed
+    /// process left in the search indexes, whatever pid they carry (in a
+    /// container the server is pid 1 every time), and nothing else.
+    #[test]
+    fn recovery_removes_stale_search_meta_temporary_files() {
+        let root = std::env::temp_dir().join(format!("douchdb-searchtmp-{}", crate::util::uuid()));
+        let config = || crate::db::DbConfig {
+            q: 1,
+            revs_limit: 1000,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+            shard_map: crate::cluster::ShardMap::single(1),
+            partitioned: false,
+        };
+        drop(Db::open_or_create(&root, "tmp", config()).unwrap());
+        let index = crate::db::db_path(&root, "tmp")
+            .join("_search_indexes")
+            .join("abc");
+        std::fs::create_dir_all(&index).unwrap();
+        let stale = [
+            format!(".{META_FILE}.{}.7.tmp", std::process::id().wrapping_add(1)),
+            format!(".{META_FILE}.{}.0.tmp", std::process::id()),
+            format!(".{META_FILE}.1.3.tmp"),
+        ];
+        let keep = [
+            META_FILE,
+            ".douchdb-search-meta.json.x.2.tmp",
+            ".douchdb-search-meta.json.1.tmp",
+            ".other.json.1.2.tmp",
+        ];
+        for name in &stale {
+            std::fs::write(index.join(name), b"partial").unwrap();
+        }
+        for name in keep {
+            std::fs::write(index.join(name), b"keep").unwrap();
+        }
+        crate::state::recover_root(&root).unwrap();
+        for name in &stale {
+            assert!(!index.join(name).exists(), "{name} stayed");
+        }
+        for name in keep {
+            assert!(index.join(name).exists(), "{name} was removed");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn open_search_indexes_stay_within_the_cap() {
         let _cap = crate::index_cache::CapGuard::new(8).await;
         let root = std::env::temp_dir().join(format!("douchdb-search-cap-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchcap",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -1948,14 +2038,18 @@ mod tests {
     /// that is using its indexes, and must leave no gate behind.
     #[tokio::test]
     async fn forget_db_waits_for_a_search_in_flight() {
+        // Other tests lower the registries' shared cap, and an idle index or
+        // gate over it is evicted, whoever owns it. Run with them excluded.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root =
             std::env::temp_dir().join(format!("douchdb-search-forget-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchforget",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -2029,12 +2123,13 @@ mod tests {
         let config = || crate::db::DbConfig {
             q: 1,
             revs_limit: 1000,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: crate::cluster::ShardMap::single(1),
             partitioned: false,
         };
         let ddoc = json!({"_id": "_design/s", "indexes": {"idx": {
             "index": "function(doc){ if (doc.name) index('name', doc.name); }"}}});
-        let db = Arc::new(Db::open(&root, "searchcancel", config()).unwrap());
+        let db = Arc::new(Db::open_or_create(&root, "searchcancel", config()).unwrap());
         db.put_docs(
             vec![json!({"_id": "a", "name": "apple"}), ddoc.clone()],
             true,
@@ -2079,7 +2174,7 @@ mod tests {
         // A database recreated under the name has a fresh gate and serves.
         drop(db);
         std::fs::remove_dir_all(&root).unwrap();
-        let db = Db::open(&root, "searchcancel", config()).unwrap();
+        let db = Db::open_or_create(&root, "searchcancel", config()).unwrap();
         db.put_docs(vec![json!({"_id": "b", "name": "apple"}), ddoc], true)
             .await
             .unwrap();
@@ -2221,12 +2316,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchpending",
             crate::db::DbConfig {
                 q: 3,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(3),
                 partitioned: false,
             },
@@ -2272,12 +2368,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchrandom",
             crate::db::DbConfig {
                 q: 3,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(3),
                 partitioned: false,
             },
@@ -2380,12 +2477,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchpassed",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -2425,12 +2523,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchdeadline",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },
@@ -2466,12 +2565,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchupdate",
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },
@@ -2591,12 +2691,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchcursor",
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },
@@ -2661,12 +2762,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchrace",
             crate::db::DbConfig {
                 q: 2,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(2),
                 partitioned: false,
             },
@@ -2722,12 +2824,13 @@ mod tests {
             std::process::id(),
             crate::util::uuid()
         ));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "searchdamaged",
             crate::db::DbConfig {
                 q: 1,
                 revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: crate::cluster::ShardMap::single(1),
                 partitioned: false,
             },

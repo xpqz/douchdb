@@ -1,4 +1,4 @@
-//! douchdb: a CouchDB wire-compatible database on LevelDB.
+//! douchdb: a CouchDB wire-compatible database on redb.
 
 pub(crate) mod admission;
 pub(crate) mod api;
@@ -14,6 +14,8 @@ pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod etf;
 pub(crate) mod fabric;
+#[doc(hidden)]
+pub mod gate;
 pub(crate) mod health;
 pub(crate) mod hll;
 pub(crate) mod index_cache;
@@ -21,6 +23,7 @@ pub(crate) mod js;
 #[cfg(feature = "wasmtime")]
 pub(crate) mod js_wasmtime;
 pub(crate) mod json;
+pub(crate) mod kv;
 pub(crate) mod listener;
 pub(crate) mod metrics;
 pub(crate) mod params;

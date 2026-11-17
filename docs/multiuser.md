@@ -109,8 +109,8 @@ where they are a member or admin. `GET /_dbs_info`, `_db_updates`, `_membership`
 `/_node/...`, cluster/replication management, detailed health and metrics remain
 server-admin operations.
 
-The security object is stored with a version in `security-versioned.json` beside
-the database. A change is
+The security object is stored with a version in the settings table of the
+database's shard 0. A change is
 stored locally at the next version and pushed to every configured peer; it
 returns 200 once a majority holds it and 202 otherwise. Peers reject older
 versions, equal versions settle on the same winner everywhere, and the

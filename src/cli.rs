@@ -45,6 +45,8 @@ pub struct Args {
     pub js_worker_startup_ms: u64,
     pub max_open_indexes: usize,
     pub max_open_dbs: usize,
+    /// Page cache per shard file, in MiB (`--cache-mb`).
+    pub cache_mb: usize,
     pub cluster_secret: String,
     pub otel_endpoint: Option<String>,
 }
@@ -65,7 +67,7 @@ const HELP: &str = "douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs
                      \x20       [--cors-exposed-headers HEADER,HEADER] [--cors-max-age SECS]\n\
                      \x20       [--view-timeout-ms N]\n\
                      \x20       [--view-memory-mb N] [--max-request-mb N]\n\
-                     \x20       [--max-open-indexes N] [--max-open-dbs N]\n\
+                     \x20       [--max-open-indexes N] [--max-open-dbs N] [--cache-mb N]\n\
                      \x20       [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]\n\
                      \x20       [--rebalance-freeze-ms N] [--js-worker-startup-ms N]\n\
                      \x20       [--cluster-secret SECRET]   (or DOUCHDB_CLUSTER_SECRET)\n\
@@ -287,6 +289,7 @@ static FLAGS: &[Flag] = &[
     numeric!("--js-worker-startup-ms", js_worker_startup_ms, 1, u64::MAX),
     numeric!("--max-open-indexes", max_open_indexes, 1, u32::MAX.into()),
     numeric!("--max-open-dbs", max_open_dbs, 1, u32::MAX.into()),
+    numeric!("--cache-mb", cache_mb, 1, u32::MAX.into()),
     valued!("--cluster-secret", |args, raw| {
         args.cluster_secret = raw;
         Ok(())
@@ -459,6 +462,7 @@ pub fn parse_from(
         js_worker_startup_ms: crate::js::DEFAULT_WORKER_STARTUP_MS,
         max_open_indexes: crate::index_cache::DEFAULT_MAX_OPEN,
         max_open_dbs: crate::state::DEFAULT_MAX_OPEN_DBS,
+        cache_mb: crate::state::DEFAULT_CACHE_MB,
         cluster_secret: environment(&env, "DOUCHDB_CLUSTER_SECRET")?.unwrap_or_default(),
         otel_endpoint: environment(&env, "OTEL_EXPORTER_OTLP_ENDPOINT")?,
     };
@@ -545,6 +549,7 @@ mod tests {
         "--max-request-mb",
         "--max-open-indexes",
         "--max-open-dbs",
+        "--cache-mb",
         "--cors-max-age",
     ];
 
@@ -573,6 +578,14 @@ mod tests {
         let args = parse(&[]).unwrap().unwrap();
         assert_eq!((args.q, args.n, args.me), (2, 3, 0));
         assert_eq!(args.listen, "127.0.0.1:5984");
+    }
+
+    #[test]
+    fn cache_mb_defaults_to_16_and_parses() {
+        assert_eq!(parse(&[]).unwrap().unwrap().cache_mb, 16);
+        let args = parse(&["--cache-mb", "64"]).unwrap().unwrap();
+        assert_eq!(args.cache_mb, 64);
+        assert!(error(&["--cache-mb", "0"]).contains("--cache-mb"));
     }
 
     #[test]
@@ -684,6 +697,7 @@ mod tests {
             "--max-request-mb",
             "--max-open-indexes",
             "--max-open-dbs",
+            "--cache-mb",
         ] {
             assert!(error(&[flag, "0"]).contains(flag), "{flag} 0");
         }

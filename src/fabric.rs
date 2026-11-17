@@ -170,12 +170,11 @@ pub(crate) struct MetadataSyncReply {
 
 /// The shard map anti-entropy spreads for `db`: the pending one if it is at
 /// least as new as the stored one, else the stored one.
-fn desired_shard_map(db: &Db) -> DbResult<crate::cluster::ShardMap> {
+fn desired_shard_map(db: &Db) -> crate::cluster::ShardMap {
     let local = db.shard_map();
-    Ok(db
-        .pending_shard_map()?
+    db.pending_shard_map()
         .filter(|pending| pending.version >= local.version)
-        .unwrap_or(local))
+        .unwrap_or(local)
 }
 
 /// The receiver's side of the exchange: compare `summary` with what the local
@@ -260,13 +259,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             continue;
         };
         let (version, security) = db.security_versioned();
-        let desired = match desired_shard_map(&db) {
-            Ok(desired) => desired,
-            Err(error) => {
-                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
-                continue;
-            }
-        };
+        let desired = desired_shard_map(&db);
         sent.summary.insert(
             name.clone(),
             DbSummary {
@@ -311,13 +304,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             .map(|(peer, reply)| (peer, reply))
             .collect();
 
-        let mut desired = match desired_shard_map(&db) {
-            Ok(desired) => desired,
-            Err(error) => {
-                tracing::warn!(db = %db.name, error = %error.reason, "cannot read the pending shard map");
-                continue;
-            }
-        };
+        let mut desired = desired_shard_map(&db);
         for (_, reply) in &holders {
             let Some(map) = reply
                 .differs
@@ -327,16 +314,14 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
                 continue;
             };
             if adoptable_peer_map(map, desired.version, ctx.cluster.nodes.len())
-                && db.set_shard_map(map.clone()).unwrap_or(false)
+                && db.set_shard_map(map.clone()).await.unwrap_or(false)
             {
                 if db
                     .pending_shard_map()
-                    .ok()
-                    .flatten()
                     .is_some_and(|pending| pending.version <= map.version)
                 {
                     // The adopted map supersedes (or beat the tiebreak against) ours.
-                    if let Err(error) = db.clear_pending_shard_map() {
+                    if let Err(error) = db.clear_pending_shard_map().await {
                         tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
                     }
                 }
@@ -365,7 +350,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
                     .shard_map = Some(desired.clone());
             }
         }
-        if !matches!(db.pending_shard_map(), Ok(None)) {
+        if db.pending_shard_map().is_some() {
             pending.insert(name.clone(), current);
         }
 
@@ -381,6 +366,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             if security_supersedes(entry.version, &entry.security, version, &security)
                 && db
                     .set_security_versioned(entry.version, entry.security.clone())
+                    .await
                     .unwrap_or(false)
             {
                 version = entry.version;
@@ -450,7 +436,7 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
         let Ok(db) = state.db_cold(name).await else {
             continue;
         };
-        if let Err(error) = db.clear_pending_shard_map() {
+        if let Err(error) = db.clear_pending_shard_map().await {
             tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
         }
         drop(db);

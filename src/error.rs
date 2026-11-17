@@ -68,10 +68,10 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// A stored record that was read from LevelDB successfully but cannot be
-/// decoded. This is the only error a listing may skip: it names one document.
-/// An error from LevelDB itself (I/O, checksum) is a plain `anyhow::Error`
-/// and always fails the request. Point reads and writes treat both the same.
+/// A stored record that was read successfully (its checksum holds) but cannot
+/// be decoded. This is the only error a listing may skip: it names one
+/// document. A storage error (I/O, a checksum mismatch) is a plain
+/// `anyhow::Error` and always fails the request. Point reads and writes treat both the same.
 #[derive(Debug)]
 pub struct CorruptRecord {
     pub id: String,

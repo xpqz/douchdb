@@ -1,47 +1,84 @@
-//! LevelDB access and the key codec.
+//! Shard storage: one redb file per (database, shard), written only by the
+//! shard's actor.
 //!
-//! One LevelDB database per (database, shard). Every key is chosen so that
-//! LevelDB's sort order is the index we need.
+//! The actor runs write jobs in groups. Every job of a group works in the
+//! group's one redb write transaction ([`ShardTxn`]), so a later job sees an
+//! earlier job's writes, and the group commits once, synced
+//! (`Durability::Immediate`, redb's default), before any of its callers hears
+//! back. Read jobs that need the in-memory indexes run on the actor between
+//! groups, on a read transaction; every other read runs off the actor, on a
+//! read transaction of its own leased from the shard's [`Gate`]
+//! ([`ShardHandle::lease`]), alongside the groups.
+//!
+//! The in-memory indexes (each document's latest sequence, the live ids and
+//! their ranks) describe the committed state only: a group's changes reach
+//! them after its commit has succeeded, so a reader on the actor sees exactly
+//! what is on disk.
+//!
+//! After an I/O error redb fails every later write on that handle. A shard
+//! whose commit failed, or whose handle an I/O error left failing, reopens
+//! its file through the gate and reloads its state from what is committed
+//! ([`Shard::recover`]); if the file cannot be reopened the shard fails
+//! closed ([`ShardState::Failed`]).
+
+#[cfg(test)]
+mod model_test;
 
 use crate::error::ApiError;
+use crate::gate::{self, Gate, LeaseTxn};
+use crate::kv::{
+    self, Table, BODIES, BY_SEQ, CHECKPOINTS, LOCAL, META, PURGED_REVS, PURGE_INFOS, PURGE_UUIDS,
+    SETTINGS,
+};
 use crate::revtree::RevTree;
 use anyhow::Result;
-use rusty_leveldb::{LdbIterator, Options, WriteBatch, DB};
+use redb::{
+    Database, Key, ReadTransaction, ReadableDatabase, ReadableTable, StorageError, TableDefinition,
+    TransactionError, WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
-use std::path::Path;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-/// Body keys examined per round of the compaction sweep.
+/// Body records examined per transaction of the compaction sweep.
 #[cfg(not(test))]
 const BODY_SWEEP_BATCH: usize = 1000;
 #[cfg(test)]
 const BODY_SWEEP_BATCH: usize = 3;
 
-/// Sequence of the newest purge info, big-endian like the other `z/`
-/// counters. Every purge info takes the next number, so it is also a count.
-const PURGE_SEQ_KEY: &[u8] = b"z/purge_seq";
+/// Jobs one group commit takes at most.
+const GROUP_JOBS: usize = 64;
 
 /// Default for how many purge infos a shard keeps (CouchDB's
 /// `purged_infos_limit`); `_purged_infos_limit` changes it per shard.
 const DEFAULT_PURGED_INFOS_LIMIT: u64 = 1000;
-const PURGED_INFOS_LIMIT_KEY: &[u8] = b"z/purged_infos_limit";
 
-/// This copy's uuid (see [`Shard::uuid`]).
-const UUID_KEY: &[u8] = b"z/uuid";
-
-/// Checkpoint ids under this prefix describe this shard copy's own contents
+/// Checkpoint ids starting with this describe this shard copy's own contents
 /// (anti-entropy per shard), so clearing the shard drops them.
-pub const SHARD_CHECKPOINT_PREFIX: &[u8] = b"ck/ae3";
+const SHARD_CHECKPOINT_PREFIX: &str = "ae3";
 
-/// `pc/<node>`: the purge sequence replica `node` has confirmed reading.
-fn purge_checkpoint_key(node: usize) -> Vec<u8> {
-    key(b"pc/", &node.to_string())
+// Names in the settings table.
+/// This copy's identity (see [`ShardTxn::uuid`]).
+const UUID: &str = "uuid";
+/// The shard's sequence: the last one a committed change took.
+const SEQ: &str = "seq";
+/// Documents whose winning revision is live.
+const DOC_COUNT: &str = "doc_count";
+/// Documents whose winning revision is deleted.
+const DELETED_COUNT: &str = "doc_del_count";
+const REVS_LIMIT: &str = "revs_limit";
+const PURGED_INFOS_LIMIT: &str = "purged_infos_limit";
+/// `purge_checkpoint/<node>`: the purge sequence replica `node` has
+/// confirmed reading.
+const PURGE_CHECKPOINT: &str = "purge_checkpoint/";
+
+fn purge_checkpoint_name(node: usize) -> String {
+    format!("{PURGE_CHECKPOINT}{node}")
 }
 
 /// One purge request for one document: what CouchDB stores as a purge info
@@ -53,73 +90,55 @@ pub struct PurgeInfo {
     pub revs: Vec<String>,
 }
 
-/// `p/<seq>`: the purge info with that sequence.
-fn purge_key(seq: u64) -> Vec<u8> {
-    let mut out = b"p/".to_vec();
-    out.extend_from_slice(&seq.to_be_bytes());
-    out
-}
-
-/// `pu/<uuid>`: the sequence of the purge info with that uuid.
-fn purge_uuid_key(uuid: &str) -> Vec<u8> {
-    key(b"pu/", uuid)
-}
-
-/// `pr/<docid>/<rev>`: the sequence of the purge info that lists the revision.
-fn purged_rev_key(docid: &str, rev: &str) -> Vec<u8> {
-    key(b"pr/", &format!("{docid}/{rev}"))
-}
-
-pub fn meta_key(docid: &str) -> Vec<u8> {
-    key(b"m/", docid)
-}
-
-pub fn body_key(docid: &str, rev: &str) -> Vec<u8> {
-    key(b"d/", &format!("{docid}/{rev}"))
-}
-
-/// Big-endian so byte order is numeric order.
-pub fn seq_key(seq: u64) -> Vec<u8> {
-    let mut out = b"s/".to_vec();
-    out.extend_from_slice(&seq.to_be_bytes());
-    out
-}
-
-pub fn local_key(id: &str) -> Vec<u8> {
-    key(b"l/", id)
-}
-
-/// `ck/<id>`: a node-local anti-entropy checkpoint. Not a `_local` document:
-/// it is never listed, shared or moved with a shard.
-pub fn checkpoint_key(id: &str) -> Vec<u8> {
-    key(b"ck/", id)
-}
-
-fn key(prefix: &[u8], rest: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + rest.len());
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(rest.as_bytes());
-    out
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LiveDoc {
     pub rev: String,
 }
 
 /// Counts plus an optional content digest for rebalance verification.
 #[derive(Clone, Debug, Default)]
-pub struct ShardState {
+pub struct ShardSummary {
     pub docs: u64,
     pub deleted: u64,
     pub seq: u64,
     pub digest: Option<String>,
+}
+
+/// Whether a shard serves requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShardState {
+    Serving,
+    /// Its file could not be reopened after a failed commit (see
+    /// [`Shard::recover`]): every request to the shard answers 500 with this
+    /// reason until the database is next opened.
+    Failed(String),
+    /// Its database was deleted: every request answers `not_found`, as
+    /// CouchDB answers for a database that is gone.
+    Deleted,
+}
+
+/// Opens the shard's file: once when the shard starts and again whenever
+/// it recovers.
+type Opener = Box<dyn FnMut() -> Result<Database> + Send>;
+
+/// Whether `error` is an I/O failure of the storage, after which redb fails
+/// every later write on that handle (`StorageError::PreviousIo`) until the
+/// file is reopened.
+fn io_failure(error: &anyhow::Error) -> bool {
+    let io = |error: &StorageError| matches!(error, StorageError::Io(_) | StorageError::PreviousIo);
+    error.chain().any(|cause| {
+        cause.downcast_ref::<StorageError>().is_some_and(io)
+            || matches!(
+                cause.downcast_ref::<TransactionError>(),
+                Some(TransactionError::Storage(storage)) if io(storage)
+            )
+    })
 }
 
 /// Each document's latest sequence, indexed both ways: by id to update it
@@ -138,7 +157,7 @@ pub struct LatestChanges {
 const SEQ_BUCKET_BITS: u32 = 8;
 
 /// Where one partition's ids sit among the shard's live ids, kept current on
-/// every write so a partition's count and offsets are not recounted by
+/// every commit so a partition's count and offsets are not recounted by
 /// walking the partition.
 struct PartitionRank {
     /// The partition's key range: `[first, last)`, as `name:` to `name;`.
@@ -266,205 +285,15 @@ impl Fenwick {
     }
 }
 
-/// A batch of changes plus the sequence counter, committed atomically.
-///
-/// Staged as plain operations rather than a `WriteBatch` so the shard actor can
-/// merge several request batches into one OS flush.
-#[derive(Default)]
-pub struct Tx {
-    ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    /// Metadata writes whose before and after states the caller already
-    /// knows, by index into `ops`. `commit` would otherwise read and decode
-    /// both records to learn them.
-    known: std::collections::HashMap<usize, MetaChange>,
-}
-
-impl Tx {
-    pub fn new() -> Tx {
-        Tx::default()
-    }
-
-    pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.ops.push((key.to_vec(), Some(value.to_vec())));
-    }
-
-    pub fn put_json<T: Serialize>(&mut self, key: &[u8], value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec(value)?;
-        self.ops.push((key.to_vec(), Some(bytes)));
-        Ok(())
-    }
-
-    pub fn delete(&mut self, key: &[u8]) {
-        self.ops.push((key.to_vec(), None));
-    }
-
-    /// Delete a metadata record that cannot be decoded. Its old state is
-    /// unknown, so the commit leaves the counters alone; the caller recounts.
-    fn delete_corrupt_meta(&mut self, key: &[u8]) {
-        self.known.insert(self.ops.len(), (None, None, None));
-        self.delete(key);
-    }
-
-    /// Write a document's metadata record, saying what the document's state
-    /// was in the shard before (`old`) and is after the write (`new`), so the
-    /// commit need not decode either, and the sequence it carries (`seq`).
-    /// `old` must be the state of the record the shard holds when the
-    /// transaction commits.
-    pub fn put_meta(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        old: Option<MetaState>,
-        new: Option<MetaState>,
-        seq: u64,
-    ) {
-        self.known.insert(self.ops.len(), (old, new, Some(seq)));
-        self.put(key, value);
-    }
-}
-
-/// The first key that sorts after every key beginning with `prefix`.
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    while let Some(last) = out.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return Some(out);
-        }
-        out.pop();
-    }
-    None
-}
-
-/// Position an iterator on the last key under `prefix`, if any.
-fn seek_last(iter: &mut rusty_leveldb::DBIterator, prefix: &[u8]) -> Result<()> {
-    if let Some(successor) = prefix_successor(prefix) {
-        iter.seek(&successor);
-        if iter.valid() {
-            if iter.prev() {
-                if let Some((key, _)) = iter.current() {
-                    if key.starts_with(prefix) {
-                        return Ok(());
-                    }
-                }
-            }
-            return Ok(());
-        }
-    }
-
-    // No key at or after the successor, so walk the prefix to find its last
-    // key. This only happens for a descending scan with no upper bound, and it
-    // visits keys without decoding values.
-    iter.seek(prefix);
-    if !iter.valid() {
-        return Ok(());
-    }
-    let mut last = match iter.current() {
-        Some((key, _)) => key.to_vec(),
-        None => return Ok(()),
-    };
-    while iter.advance() {
-        match iter.current() {
-            Some((key, _)) if key.starts_with(prefix) => last = key.to_vec(),
-            _ => break,
-        }
-    }
-    iter.seek(&last);
-    Ok(())
-}
-
-struct JobMark {
-    pending: usize,
-    docs: u64,
-    deleted: u64,
-}
-
-/// Invariant: a `Shard` lives and dies on its actor thread (see
-/// `ShardHandle::spawn`) and must never leave it. rusty-leveldb's `DB` holds
-/// `Rc`s internally and is only `Send` through an upstream `unsafe impl`, so
-/// moving it between threads after use, or sharing it, is unsound.
-pub struct Shard {
-    db: DB,
-    name: ShardName,
-    /// The last sequence this shard handed out. It only moves forward, even
-    /// past writes that were never persisted, so a reader that saw a staged
-    /// row can never meet its sequence again on another document.
-    seq: u64,
-    /// The `z/seq` value of the last batch written to disk: the position up
-    /// to which this shard's changes are committed.
-    persisted_seq: u64,
-    /// Identity of this copy of the shard: created with it, replaced when it
-    /// is cleared, so a position is never applied to another copy.
-    uuid: String,
-    /// `uuid`, shared with the shard's handle once it has one.
-    shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
-    revs_limit: u64,
-    purged_infos_limit: u64,
-    /// Number of live documents, maintained on every metadata write so `GET
-    /// /db` and `_all_docs` totals do not scan the whole `m/` namespace.
-    docs: u64,
-    /// Number of documents whose winning revision is deleted.
-    deleted: u64,
-    /// Live document id -> winning revision, built lazily on the first
-    /// `_all_docs` range query and then maintained in memory. Keeping this out
-    /// of LevelDB avoids an extra write per ingested document.
-    live: Option<BTreeMap<String, LiveDoc>>,
-    /// The last `live_rank` answer: how many live ids sort before this key.
-    /// Paging `_all_docs` by `startkey` asks for nearby keys, so the next rank
-    /// is found by counting only the ids between the two keys. Kept in step
-    /// with `live` on every write and dropped whenever `live` is.
-    rank_cursor: Option<(String, usize)>,
-    /// Index entries this shard has walked to answer reads: change rows read
-    /// from the sequence index and ids counted to rank a key. Shared with the
-    /// shard's handle, so a request's cost can be judged by how many entries
-    /// it visited rather than by how long it took.
-    scanned: Arc<AtomicU64>,
-    /// Document bodies this shard has read from storage, shared with the
-    /// shard's handle like `scanned`.
-    body_reads: Arc<AtomicU64>,
-    /// Ranks of the partitions `_all_docs` was recently asked about. Dropped
-    /// whenever `live` is.
-    partition_ranks: Vec<PartitionRank>,
-    /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
-    /// returns one row per document at its latest change, not one row per
-    /// historical sequence entry.
-    latest: Option<LatestChanges>,
-    /// Uncommitted operations, in order, plus the same view as a key overlay so
-    /// jobs later in the same group observe earlier writes.
-    pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Test seam: make the next `flush_pending` fail as a LevelDB write error
-    /// would, after the queued operations have been drained.
-    #[cfg(test)]
-    fail_next_flush: bool,
-    /// Set when a flush failed and the shard was reset to its on-disk state.
-    /// A flush can run inside a job (`flush`, `compact`), where the error
-    /// reaches only that job's caller; the group commit still has to fail
-    /// every other job whose queued writes were discarded with it.
-    flush_failure: Option<String>,
-}
-
 /// What a document's metadata says about it: the winning revision, whether it
 /// is live.
 pub(crate) type MetaState = (String, bool);
-
-/// A metadata record's state before and after a commit, and the sequence the
-/// new record carries (`None` when the record goes away).
-type MetaChange = (Option<MetaState>, Option<MetaState>, Option<u64>);
 
 pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
         (winner, live)
     })
-}
-
-fn db_get_checked(db: &mut DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let snapshot = db.get_snapshot();
-    let value = db
-        .get_at(&snapshot, key)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    Ok(value.map(|bytes| bytes.to_vec()))
 }
 
 /// Which database and shard a shard actor serves, for log lines.
@@ -475,15 +304,14 @@ pub struct ShardName {
 }
 
 impl ShardName {
-    fn of(dir: &Path) -> ShardName {
-        let name = |path: Option<&Path>| {
-            path.and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
+    fn of(file: &Path) -> ShardName {
+        let name = |part: Option<&std::ffi::OsStr>| {
+            part.map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
         ShardName {
-            db: name(dir.parent()),
-            shard: name(Some(dir)),
+            db: name(file.parent().and_then(Path::file_name)),
+            shard: name(file.file_stem()),
         }
     }
 
@@ -498,9 +326,7 @@ impl ShardName {
         );
         crate::telemetry::record_corrupt_record_skipped();
     }
-}
 
-impl ShardName {
     /// Log and count a corrupt record that compaction leaves in place.
     fn report_compaction_skip(&self, id: &str, error: &dyn std::fmt::Display) {
         tracing::warn!(
@@ -526,329 +352,560 @@ pub(crate) fn meta_parses() -> usize {
     META_PARSES.with(std::cell::Cell::get)
 }
 
-/// The document id in a `m/<id>` metadata key. A key too short to hold the
-/// prefix is corruption, not a reason to panic.
-fn doc_id_from_meta_key(key: &[u8]) -> Result<&str> {
-    let id = key
-        .get(2..)
-        .ok_or_else(|| anyhow::anyhow!("corrupt metadata key of {} bytes", key.len()))?;
-    std::str::from_utf8(id).map_err(|error| anyhow::anyhow!("doc id is not UTF-8: {error}"))
-}
-
 /// Decode a stored metadata record. A record that does not parse is
 /// corruption: point reads and writes fail on it, and listings skip it
 /// through `ShardName::report_corrupt`.
-fn parse_meta(
-    key: &[u8],
-    value: &[u8],
-) -> std::result::Result<(String, DocMeta), crate::error::CorruptRecord> {
+fn parse_meta(id: &str, value: &[u8]) -> std::result::Result<DocMeta, crate::error::CorruptRecord> {
     #[cfg(test)]
     META_PARSES.with(|count| count.set(count.get() + 1));
-    let id = key
-        .get(2..)
-        .and_then(|id| std::str::from_utf8(id).ok())
-        .ok_or_else(|| crate::error::CorruptRecord {
-            id: String::from_utf8_lossy(key.get(2..).unwrap_or_default()).into_owned(),
-            reason: "key is not UTF-8".to_string(),
-        })?;
-    let meta = serde_json::from_slice(value).map_err(|error| crate::error::CorruptRecord {
+    serde_json::from_slice(value).map_err(|error| crate::error::CorruptRecord {
         id: id.to_string(),
         reason: error.to_string(),
-    })?;
-    Ok((id.to_string(), meta))
+    })
 }
 
-fn read_counter(db: &mut DB, key: &[u8]) -> Result<Option<u64>> {
-    Ok(db_get_checked(db, key)?
-        .filter(|bytes| bytes.len() == 8)
-        .map(|bytes| u64::from_be_bytes(bytes[..].try_into().unwrap())))
+/// The value inside a stored one. A checksum mismatch is an error that fails
+/// the request (never a miss, and never a record a listing skips).
+fn unsealed(table: Table, stored: &[u8]) -> Result<&[u8]> {
+    kv::unseal(stored).map_err(|corrupt| anyhow::anyhow!("{table:?} table: {corrupt}"))
+}
+
+fn decode_u64(table: Table, value: &[u8]) -> Result<u64> {
+    <[u8; 8]>::try_from(value)
+        .map(u64::from_be_bytes)
+        .map_err(|_| anyhow::anyhow!("{table:?} table: a number of {} bytes", value.len()))
+}
+
+/// The shard's scalar state, as stored in its settings table.
+#[derive(Clone, Debug, PartialEq)]
+struct Settings {
+    uuid: String,
+    seq: u64,
+    docs: u64,
+    deleted: u64,
+    revs_limit: u64,
+    purged_infos_limit: u64,
+}
+
+/// Give a new file every table, a uuid, its sequence and counters in one
+/// transaction, so a read never finds a table missing and a file with a uuid
+/// always has the rest. A file that has them already is left alone.
+fn init_tables(db: &Database) -> Result<()> {
+    let txn = kv::begin_write(db)?;
+    let fresh = {
+        drop(txn.open_table(META)?);
+        drop(txn.open_table(BY_SEQ)?);
+        drop(txn.open_table(BODIES)?);
+        drop(txn.open_table(LOCAL)?);
+        drop(txn.open_table(PURGE_INFOS)?);
+        drop(txn.open_table(PURGED_REVS)?);
+        drop(txn.open_table(PURGE_UUIDS)?);
+        drop(txn.open_table(CHECKPOINTS)?);
+        let mut settings = txn.open_table(SETTINGS)?;
+        // Only a new file has no settings at all; one that lost some is
+        // damaged, and fails in `load_settings` rather than starting over.
+        if settings.first()?.is_none() {
+            settings.insert(UUID, kv::seal(crate::util::uuid().as_bytes()).as_slice())?;
+            for counter in [SEQ, DOC_COUNT, DELETED_COUNT] {
+                settings.insert(counter, kv::seal(&0u64.to_be_bytes()).as_slice())?;
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if fresh {
+        txn.commit()?;
+    } else {
+        txn.abort()?;
+    }
+    Ok(())
+}
+
+/// Create the shard file at `path` with every table and its settings, and
+/// return it open. Fails if a file is there already.
+pub fn create_file(path: &Path, cache_bytes: usize) -> Result<Database> {
+    let db = kv::create(path, cache_bytes)?;
+    init_tables(&db)?;
+    Ok(db)
+}
+
+/// Store `rows` in the settings table of `db` in one transaction, committed
+/// durably (redb's default, `Immediate`), for a file no shard has open.
+pub fn put_settings(db: &Database, rows: &[(&str, Vec<u8>)]) -> Result<()> {
+    let txn = kv::begin_write(db)?;
+    {
+        let mut settings = txn.open_table(SETTINGS)?;
+        for (name, value) in rows {
+            settings.insert(*name, kv::seal(value).as_slice())?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// The committed settings whose names start with `prefix`, checked against
+/// their checksums.
+fn settings_in(txn: &ReadTransaction, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let table = txn.open_table(SETTINGS)?;
+    let mut rows = Vec::new();
+    for entry in table.range(prefix..)? {
+        let (name, stored) = entry?;
+        let name = name.value();
+        if !name.starts_with(prefix) {
+            break;
+        }
+        rows.push((
+            name.to_string(),
+            unsealed(Table::Settings, stored.value())?.to_vec(),
+        ));
+    }
+    Ok(rows)
+}
+
+/// [`settings_in`] the file `db`, for one no shard has open.
+pub fn read_settings(db: &dyn ReadableDatabase, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    settings_in(&db.begin_read()?, prefix)
+}
+
+/// Fail where opening the shard file `db` would: [`check_shard`] for a
+/// file no shard has open, so a peek finds every damage an open would.
+pub fn check_file(db: &dyn ReadableDatabase, file: &Path) -> Result<()> {
+    // The default revs limit only fills in an absent setting: any will do.
+    check_shard(db, &ShardName::of(file), 1).map(drop)
+}
+
+/// What opening a shard reads, and the one check of it: every table there,
+/// and the settings it was created with, each matching its checksum and
+/// parsing. A file that lost or damaged any of them fails, never taken for
+/// a new one and filled in again (that would give it a new uuid and zeroed
+/// counters). Both the open and [`check_file`] go through here.
+fn check_shard(
+    db: &dyn ReadableDatabase,
+    name: &ShardName,
+    default_revs_limit: u64,
+) -> Result<Settings> {
+    let txn = db.begin_read()?;
+    let missing = |table: &'static str| {
+        move |error: redb::TableError| {
+            anyhow::anyhow!(
+                "corrupt shard {}/{}: no {table} table: {error}",
+                name.db,
+                name.shard
+            )
+        }
+    };
+    drop(txn.open_table(META).map_err(missing("meta"))?);
+    drop(txn.open_table(BY_SEQ).map_err(missing("by_seq"))?);
+    drop(txn.open_table(BODIES).map_err(missing("bodies"))?);
+    drop(txn.open_table(LOCAL).map_err(missing("local"))?);
+    drop(
+        txn.open_table(PURGE_INFOS)
+            .map_err(missing("purge_infos"))?,
+    );
+    drop(
+        txn.open_table(PURGED_REVS)
+            .map_err(missing("purged_revs"))?,
+    );
+    drop(
+        txn.open_table(PURGE_UUIDS)
+            .map_err(missing("purge_uuids"))?,
+    );
+    drop(
+        txn.open_table(CHECKPOINTS)
+            .map_err(missing("checkpoints"))?,
+    );
+    drop(txn.open_table(SETTINGS).map_err(missing("settings"))?);
+    load_settings(&txn, name, default_revs_limit)
+}
+
+/// The settings committed in `db`; a shard without a `revs_limit` of its
+/// own has `default_revs_limit`.
+fn load_settings(
+    txn: &ReadTransaction,
+    name: &ShardName,
+    default_revs_limit: u64,
+) -> Result<Settings> {
+    let table = txn.open_table(SETTINGS)?;
+    let get = |setting: &str| -> Result<Option<Vec<u8>>> {
+        match table.get(setting)? {
+            Some(stored) => Ok(Some(unsealed(Table::Settings, stored.value())?.to_vec())),
+            None => Ok(None),
+        }
+    };
+    let required = |setting: &str| -> Result<Vec<u8>> {
+        get(setting)?.ok_or_else(|| {
+            anyhow::anyhow!("corrupt shard {}/{}: no {setting}", name.db, name.shard)
+        })
+    };
+    let number = |bytes: Vec<u8>| decode_u64(Table::Settings, &bytes);
+    Ok(Settings {
+        uuid: String::from_utf8(required(UUID)?)
+            .map_err(|_| anyhow::anyhow!("Settings table: the uuid is not UTF-8"))?,
+        seq: number(required(SEQ)?)?,
+        docs: number(required(DOC_COUNT)?)?,
+        deleted: number(required(DELETED_COUNT)?)?,
+        revs_limit: get(REVS_LIMIT)?
+            .map(number)
+            .transpose()?
+            .unwrap_or(default_revs_limit),
+        purged_infos_limit: get(PURGED_INFOS_LIMIT)?
+            .map(number)
+            .transpose()?
+            .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT),
+    })
+}
+
+/// The answer to every request to the shard `name` while it is `state`
+/// [`ShardState::Failed`].
+fn failed(name: &ShardName, state: &ShardState) -> Option<ApiError> {
+    match state {
+        ShardState::Serving => None,
+        ShardState::Failed(reason) => Some(ApiError::new(
+            500,
+            "internal_server_error",
+            format!("shard {}/{} has failed: {reason}", name.db, name.shard),
+        )),
+        ShardState::Deleted => Some(ApiError::db_not_found()),
+    }
+}
+
+/// One document's change, for the in-memory indexes once its group commits.
+struct DocChange {
+    id: String,
+    /// The document's state after the change; `None` when its record went.
+    new: Option<MetaState>,
+    /// The sequence its record carries; `None` when the record went.
+    seq: Option<u64>,
+}
+
+/// One shard's file and what the actor keeps in memory about it. It lives on
+/// the actor thread; jobs reach it through a [`ShardTxn`].
+pub struct Shard {
+    /// The file, shared with the readers that lease it off the actor.
+    gate: Gate,
+    /// Opens the file again when the shard recovers.
+    open: Opener,
+    /// Shared with the shard's handle, which answers for a failed shard
+    /// without a round trip.
+    state: Arc<std::sync::RwLock<ShardState>>,
+    /// The file, for the integrity check when the shard closes; `None` for a
+    /// test backend.
+    path: Option<PathBuf>,
+    name: ShardName,
+    /// As of the last commit.
+    settings: Settings,
+    /// The `revs_limit` of a shard that has none set.
+    default_revs_limit: u64,
+    /// `settings.uuid`, shared with the shard's handle once it has one.
+    shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
+    /// Live document id -> winning revision, built lazily on the first
+    /// `_all_docs` range query and then maintained in memory.
+    live: Option<BTreeMap<String, LiveDoc>>,
+    /// The last `live_rank` answer: how many live ids sort before this key.
+    /// Paging `_all_docs` by `startkey` asks for nearby keys, so the next rank
+    /// is found by counting only the ids between the two keys. Kept in step
+    /// with `live` on every commit and dropped whenever `live` is.
+    rank_cursor: Option<(String, usize)>,
+    /// Index entries this shard has walked to answer reads: change rows read
+    /// from the sequence index and ids counted to rank a key. Shared with the
+    /// shard's handle, so a request's cost can be judged by how many entries
+    /// it visited rather than by how long it took.
+    scanned: Arc<AtomicU64>,
+    /// Document bodies this shard has read from storage, shared with the
+    /// shard's handle like `scanned`.
+    body_reads: Arc<AtomicU64>,
+    /// Ranks of the partitions `_all_docs` was recently asked about. Dropped
+    /// whenever `live` is.
+    partition_ranks: Vec<PartitionRank>,
+    /// Document id -> latest sequence, built lazily for `_changes`. CouchDB
+    /// returns one row per document at its latest change, not one row per
+    /// historical sequence entry.
+    latest: Option<LatestChanges>,
+    /// Test seam: make the next group that has something to commit fail
+    /// instead of committing.
+    #[cfg(test)]
+    fail_next_commit: bool,
+    /// Test seam: writes to let through before one fails.
+    #[cfg(test)]
+    fail_write_after: Option<usize>,
 }
 
 impl Shard {
-    pub fn open(dir: impl AsRef<Path>, revs_limit: u64) -> Result<Shard> {
-        let path = dir.as_ref();
-        let had_tables = std::fs::read_dir(path)
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    matches!(
-                        entry.path().extension().and_then(|ext| ext.to_str()),
-                        Some("ldb" | "sst")
-                    )
-                })
-            })
-            .unwrap_or(false);
-        let opts = Options {
-            create_if_missing: true,
-            paranoid_checks: true,
-            // Bloom filters are not checksummed. A corrupt filter can turn a
-            // present key into a false "not found"; without one, the
-            // checksummed data block is always read.
-            filter_policy: Rc::new(Box::new(rusty_leveldb::NoFilterPolicy::new())),
-            ..Options::default()
-        };
-        let mut db = DB::open(path, opts)?;
-        // A shard that has only seen `_local` writes, or was cleared, legitimately
-        // has sequence 0; what marks corruption is the key being absent.
-        let stored_seq = read_counter(&mut db, b"z/seq")?;
-        let seq = stored_seq.unwrap_or(0);
-        if had_tables && stored_seq.is_none() {
-            anyhow::bail!(
-                "corrupt shard {}: table files are present but no sequence state",
-                path.display()
-            );
-        }
-        let stored_uuid = db_get_checked(&mut db, UUID_KEY)?
-            .map(|bytes| {
-                String::from_utf8(bytes).map_err(|_| {
-                    anyhow::anyhow!("corrupt shard {}: unreadable uuid", path.display())
-                })
-            })
-            .transpose()?;
-        // A fresh shard records its sequence alongside its uuid, so that once
-        // compaction moves these keys into table files the probe above still
-        // finds sequence state.
-        let uuid = match (stored_uuid, stored_seq) {
-            (Some(uuid), Some(_)) => uuid,
-            (stored_uuid, _) => {
-                let uuid = stored_uuid.unwrap_or_else(crate::util::uuid);
-                let mut batch = WriteBatch::default();
-                batch.put(UUID_KEY, uuid.as_bytes());
-                batch.put(b"z/seq", &seq.to_be_bytes());
-                db.write(batch, true)?;
-                uuid
-            }
-        };
-        let revs_limit = db_get_checked(&mut db, b"z/revs_limit")?
-            .filter(|b| b.len() == 8)
-            .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
-            .unwrap_or(revs_limit);
-
-        let purged_infos_limit = db_get_checked(&mut db, PURGED_INFOS_LIMIT_KEY)?
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map(u64::from_be_bytes)
-            .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT);
-
-        // A shard without counters (a new one, or one whose counters were
-        // lost) counts its metadata once on open; every metadata write then
-        // keeps them in sync.
-        let stored = read_counter(&mut db, b"z/doc_count")?
-            .zip(read_counter(&mut db, b"z/doc_deleted_count")?);
-        let (docs, deleted) = match stored {
-            Some(pair) => pair,
-            None => {
-                let mut docs = 0u64;
-                let mut deleted = 0u64;
-                let mut iter = db.new_iter()?;
-                iter.seek(b"m/");
-                while let Some((key, value)) = iter.current() {
-                    if !key.starts_with(b"m/") {
-                        break;
-                    }
-                    let (_, meta) = parse_meta(&key, &value)?;
-                    match meta_state(&meta) {
-                        Some((_, true)) => docs += 1,
-                        Some((_, false)) => deleted += 1,
-                        None => {}
-                    }
-                    if !iter.advance() {
-                        break;
-                    }
-                }
-                db.put(b"z/doc_count", &docs.to_be_bytes())?;
-                db.put(b"z/doc_deleted_count", &deleted.to_be_bytes())?;
-                db.flush()?;
-                (docs, deleted)
-            }
-        };
-
-        Ok(Shard {
-            db,
-            name: ShardName::of(path),
-            seq,
-            persisted_seq: seq,
-            shared_uuid: None,
-            uuid,
+    /// Open the existing shard file at `path` (see [`create_file`]).
+    pub fn open(path: &Path, revs_limit: u64, cache_bytes: usize) -> Result<Shard> {
+        let file = path.to_path_buf();
+        Shard::over(
+            Box::new(move || Ok(kv::open(&file, cache_bytes)?)),
+            Some(path.to_path_buf()),
+            ShardName::of(path),
             revs_limit,
-            purged_infos_limit,
-            docs,
-            deleted,
+        )
+    }
+
+    /// A shard over the database `open` opens. A new file gets every table,
+    /// a uuid, its sequence and counters in one transaction, so a read never
+    /// finds a table missing and a file with a uuid always has the rest.
+    fn over(
+        mut open: Opener,
+        path: Option<PathBuf>,
+        name: ShardName,
+        revs_limit: u64,
+    ) -> Result<Shard> {
+        let db = open()?;
+        let settings = check_shard(&db, &name, revs_limit)?;
+        Ok(Shard {
+            gate: Gate::new(db),
+            open,
+            state: Arc::new(std::sync::RwLock::new(ShardState::Serving)),
+            path,
+            name,
+            settings,
+            default_revs_limit: revs_limit,
+            shared_uuid: None,
             live: None,
             rank_cursor: None,
             scanned: Arc::new(AtomicU64::new(0)),
             body_reads: Arc::new(AtomicU64::new(0)),
             partition_ranks: Vec::new(),
             latest: None,
-            pending: Vec::new(),
-            overlay: std::collections::HashMap::new(),
             #[cfg(test)]
-            fail_next_flush: false,
-            flush_failure: None,
+            fail_next_commit: false,
+            #[cfg(test)]
+            fail_write_after: None,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_flush_failure(&mut self) {
-        self.fail_next_flush = true;
-    }
-
-    /// Write a record straight to disk, bypassing the overlay, counters and
-    /// indexes, so tests can plant corrupt or missing data.
-    #[cfg(test)]
-    pub(crate) fn put_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.db.put(key, value).unwrap();
-        self.db.flush().unwrap();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn delete_raw(&mut self, key: &[u8]) {
-        self.db.delete(key).unwrap();
-        self.db.flush().unwrap();
-    }
-
-    /// Take the next sequence of this shard for a write. Sequences are
-    /// shard-local, as in CouchDB: each shard counts its own changes.
-    pub fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
-    }
-
-    /// The position up to which this shard's changes are on disk.
-    pub fn persisted_seq(&self) -> u64 {
-        self.persisted_seq
-    }
-
-    /// This copy's identity.
-    pub fn uuid(&self) -> &str {
-        &self.uuid
-    }
-
-    /// Live and deleted document counts for this shard.
-    pub fn counts(&self) -> (u64, u64) {
-        (self.docs, self.deleted)
-    }
-
-    /// Content digest over document ids, winning revisions, deleted flags,
-    /// conflict leaves and attachment metadata. It deliberately excludes
-    /// per-replica sequence numbers, which differ between replicas. Two
-    /// replicas with identical replicated content produce the same digest.
-    pub fn fingerprint(&mut self) -> Result<String> {
-        let mut hasher = Sha256::new();
-        let mut iter = self.db.new_iter()?;
-        iter.seek(b"m/");
-        let mut documents = 0u64;
-        while let Some((key, value)) = iter.current() {
-            let key = key.as_ref();
-            if !key.starts_with(b"m/") {
-                break;
-            }
-            let id = doc_id_from_meta_key(key)?;
-            let meta: DocMeta = serde_json::from_slice(value.as_ref())?;
-            hasher.update(b"doc");
-            hasher.update(id.as_bytes());
-            match meta_state(&meta) {
-                Some((winner, live)) => {
-                    hasher.update(winner.as_bytes());
-                    hasher.update([live as u8]);
-                }
-                None => hasher.update(b"no-winner"),
-            }
-            let mut leaves = meta.tree.leaves();
-            leaves.sort();
-            for leaf in leaves {
-                hasher.update(b"leaf");
-                hasher.update(leaf.as_bytes());
-                hasher.update([meta.tree.is_deleted(&leaf) as u8]);
-            }
-            documents += 1;
-            if !iter.advance() {
-                break;
-            }
-        }
-        hasher.update(documents.to_be_bytes());
-        Ok(crate::util::hex(&hasher.finalize()))
-    }
-
-    pub fn state(&mut self, with_digest: bool) -> Result<ShardState> {
-        let (docs, deleted) = self.counts();
-        Ok(ShardState {
-            docs,
-            deleted,
-            seq: self.seq,
-            digest: if with_digest {
-                Some(self.fingerprint()?)
-            } else {
-                None
-            },
-        })
-    }
-
-    /// Live document count for one partition.
-    pub fn partition_live_count(&mut self, partition: &str) -> Result<u64> {
-        Ok(self.partition_rank(partition)?.1 as u64)
-    }
-
-    /// How many live ids of `partition` come before `start` in the query's
-    /// direction: the offset of a partitioned `_all_docs` reply. `start` is
-    /// ranked from the previous rank, so paging by `startkey` costs the
-    /// distance moved, not the partition's size.
-    pub fn partition_offset(
-        &mut self,
-        partition: &str,
-        start: &str,
-        descending: bool,
-    ) -> Result<usize> {
-        let (below, count) = self.partition_rank(partition)?;
-        let rank = self.live_rank(start)?;
-        let on_start = usize::from(
-            self.live
-                .as_ref()
-                .is_some_and(|live| live.contains_key(start)),
+    /// Recover from a failed commit, or from an I/O error that left the
+    /// handle failing every write: reopen the file through the gate (close
+    /// it, wait for every lease, drop the handle, open the file again, which
+    /// runs redb's recovery and the integrity check), reload the settings
+    /// from what is committed, and drop the in-memory indexes, which rebuild
+    /// from the committed tables on next use. The gate opens only once the
+    /// settings have loaded, so no read sees the file half recovered. If the
+    /// file cannot be opened, or it lost a change that was acknowledged
+    /// (its sequence is behind the one published), the shard fails closed:
+    /// [`ShardState::Failed`] until the database is next opened.
+    ///
+    /// Runs on the actor, between groups. Every recovery comes through here,
+    /// so whatever must learn that the file was reopened (a running
+    /// compaction's journal) is told here.
+    fn recover(&mut self, cause: &str) {
+        tracing::warn!(
+            db = %self.name.db,
+            shard = %self.name.shard,
+            cause,
+            "reopening the shard file"
         );
-        Ok(if descending {
-            // Ids after `start`: all but those up to and including it.
-            let through = (rank + on_start).saturating_sub(below).min(count);
-            count - through
-        } else {
-            rank.saturating_sub(below).min(count)
-        })
-    }
-
-    /// `(live ids below the partition, live ids in it)`, found once by
-    /// walking the partition and then kept current by writes.
-    fn partition_rank(&mut self, partition: &str) -> Result<(usize, usize)> {
-        let first = format!("{partition}:");
-        if let Some(known) = self
-            .partition_ranks
-            .iter()
-            .find(|known| known.first == first)
-        {
-            return Ok((known.below, known.count));
-        }
-        let last = format!("{partition};");
-        let below = self.live_rank(&first)?;
-        let live = self.live_docs()?;
-        let count = live
-            .range::<str, _>((
-                Bound::Included(first.as_str()),
-                Bound::Excluded(last.as_str()),
-            ))
-            .count();
-        self.add_scanned(count);
-        if self.partition_ranks.len() >= PARTITION_RANKS {
-            self.partition_ranks.remove(0);
-        }
-        self.partition_ranks.push(PartitionRank {
-            first,
-            last,
-            below,
-            count,
+        let Shard {
+            gate,
+            open,
+            name,
+            settings,
+            default_revs_limit,
+            ..
+        } = self;
+        let mut loaded = None;
+        let reopened = gate.reopen(|| {
+            let db = open()?;
+            let found = check_shard(&db, name, *default_revs_limit)?;
+            // A commit that reported an error may still have landed, so the
+            // file may be ahead of what was published; never behind it.
+            anyhow::ensure!(
+                found.seq >= settings.seq,
+                "the file's sequence {} is behind the committed {}",
+                found.seq,
+                settings.seq
+            );
+            loaded = Some(found);
+            Ok(db)
         });
-        Ok((below, count))
+        self.release_indexes();
+        match (reopened, loaded) {
+            (Ok(()), Some(found)) => {
+                if found.uuid != self.settings.uuid {
+                    if let Some(shared) = &self.shared_uuid {
+                        *shared.write().unwrap_or_else(|poison| poison.into_inner()) =
+                            found.uuid.clone();
+                    }
+                }
+                self.settings = found;
+            }
+            (reopened, _) => {
+                let reason = match reopened {
+                    Err(error) => format!("{error:#}"),
+                    Ok(()) => "the shard file reopened without its settings".to_string(),
+                };
+                tracing::error!(
+                    db = %self.name.db,
+                    shard = %self.name.shard,
+                    error = %reason,
+                    "the shard file could not be reopened; the shard fails closed"
+                );
+                // Never served again: the gate is shut, or shut here.
+                drop(self.gate.shut());
+                *self
+                    .state
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner()) = ShardState::Failed(reason);
+            }
+        }
     }
 
-    /// Record `entries` index entries walked by a read.
-    pub fn add_scanned(&self, entries: usize) {
-        self.scanned.fetch_add(entries as u64, Ordering::Relaxed);
+    /// Whether the file's handle fails every write after an I/O error.
+    fn poisoned(&self) -> bool {
+        match self.gate.begin_write_txn() {
+            Ok(txn) => {
+                drop(txn);
+                false
+            }
+            Err(error) => io_failure(&error),
+        }
+    }
+
+    /// The answer to every request while the shard has failed.
+    fn failure(&self) -> Option<ApiError> {
+        failed(
+            &self.name,
+            &self
+                .state
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    /// A write transaction for a group; a handle that an I/O error left
+    /// failing every write (a read, or compaction, met it) is reopened first.
+    fn begin_group(&mut self) -> Result<WriteTransaction> {
+        match self.gate.begin_write_txn() {
+            Err(error) if io_failure(&error) => {
+                self.recover(&format!("{error:#}"));
+                self.gate.begin_write_txn()
+            }
+            begun => begun,
+        }
+    }
+
+    /// The shard's committed position.
+    pub fn seq(&self) -> u64 {
+        self.settings.seq
+    }
+
+    /// Whether the write being made is the one `inject_write_failure` chose.
+    #[cfg(test)]
+    fn injected_write_failure(&mut self) -> bool {
+        match self.fail_write_after {
+            Some(0) => {
+                self.fail_write_after = None;
+                true
+            }
+            Some(after) => {
+                self.fail_write_after = Some(after - 1);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// A shard over a new test disk, whose first open makes the file as
+    /// `create_file` makes one. Recoveries reopen what the disk then holds.
+    #[cfg(test)]
+    pub(crate) fn create_over_backend(
+        switch: &kv::powercut::PowerSwitch,
+        revs_limit: u64,
+    ) -> Result<Shard> {
+        let switch = switch.clone();
+        let mut first = true;
+        Shard::over_test_opener(
+            Box::new(move || {
+                let db = kv::open_with(switch.backend(), 1 << 20)?;
+                if std::mem::take(&mut first) {
+                    init_tables(&db)?;
+                }
+                Ok(db)
+            }),
+            revs_limit,
+        )
+    }
+
+    /// A shard over a test disk that already holds one, reopened over what
+    /// the disk then holds, as `open` reopens a file: nothing is created.
+    #[cfg(test)]
+    pub(crate) fn over_backend(
+        switch: &kv::powercut::PowerSwitch,
+        revs_limit: u64,
+    ) -> Result<Shard> {
+        let switch = switch.clone();
+        Shard::over_test_opener(
+            Box::new(move || Ok(kv::open_with(switch.backend(), 1 << 20)?)),
+            revs_limit,
+        )
+    }
+
+    /// A shard over the test databases `open` opens.
+    #[cfg(test)]
+    fn over_test_opener(open: Opener, revs_limit: u64) -> Result<Shard> {
+        let name = ShardName {
+            db: "test".to_string(),
+            shard: "shard-0000".to_string(),
+        };
+        Shard::over(open, None, name, revs_limit)
+    }
+
+    /// Run `f` as a group of its own and answer.
+    #[cfg(test)]
+    pub(crate) fn write<R, F>(&mut self, f: F) -> std::result::Result<R, ApiError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        let (job, mut answer) = call_job(f);
+        let (replies, error) = self.run_group(job, || None);
+        for reply in replies {
+            reply(error.as_ref());
+        }
+        answer.try_recv().expect("the job answered")
+    }
+
+    /// Run `f` as a read job and answer.
+    #[cfg(test)]
+    pub(crate) fn read<R, F>(&mut self, f: F) -> std::result::Result<R, ApiError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        let (job, mut answer) = call_job(f);
+        if let Some(reply) = self.run_read(job) {
+            reply(None);
+        }
+        answer.try_recv().expect("the job answered")
+    }
+
+    /// Close the file. One opened from a path is closed after a full
+    /// integrity check, so its next open in this process can skip one; a
+    /// failure is logged and leaves the file to be checked on its next open.
+    fn close(self) {
+        let Shard {
+            gate, path, name, ..
+        } = self;
+        // Waits for the readers' leases to come back.
+        let (Some(db), Some(path)) = (gate.shut(), path) else {
+            return;
+        };
+        if let Err(error) = kv::close_verified(db, &path) {
+            tracing::error!(
+                db = %name.db,
+                shard = %name.shard,
+                error = %error,
+                "shard file failed its integrity check on close"
+            );
+        }
+    }
+
+    /// Close the file of a deleted database without checking it: it will
+    /// never be opened again, so there is nothing to record.
+    fn discard(self) {
+        drop(self.gate.shut());
     }
 
     /// Share the handle's counters as this shard's scanned-entries and
@@ -858,57 +915,792 @@ impl Shard {
         self.body_reads = body_reads;
     }
 
-    /// Live and deleted document counts for one partition. The partition
-    /// prefix keeps the scan inside that partition's key range.
-    pub fn partition_counts(&mut self, partition: &str) -> Result<(u64, u64)> {
-        let prefix = format!("m/{partition}:");
-        let mut docs = 0u64;
-        let mut deleted = 0u64;
-        let name = self.name.clone();
-        self.scan_range_while(prefix.as_bytes(), None, false, |key, value| {
-            match parse_meta(key, value) {
-                Ok((_, meta)) => {
-                    if let Some((_, live)) = meta_state(&meta) {
-                        if live {
-                            docs += 1;
-                        } else {
-                            deleted += 1;
-                        }
+    /// Drop the lazily built indexes (live ids, latest sequences, the rank
+    /// cursor and the partition ranks). They are rebuilt from the shard's
+    /// committed records on next use, so an idle shard holds none of them.
+    pub fn release_indexes(&mut self) {
+        self.live = None;
+        self.rank_cursor = None;
+        self.partition_ranks.clear();
+        self.latest = None;
+    }
+
+    /// Visit every committed metadata record. A record that does not decode
+    /// is reported and skipped; a checksum mismatch fails the walk.
+    fn committed_metas(&self, mut visit: impl FnMut(&str, DocMeta)) -> Result<()> {
+        let txn = self.gate.begin_read()?;
+        let table = txn.open_table(META)?;
+        for entry in table.iter()? {
+            let (id, stored) = entry?;
+            let id = id.value();
+            match parse_meta(id, unsealed(Table::Meta, stored.value())?) {
+                Ok(meta) => visit(id, meta),
+                Err(corrupt) => self.name.report_corrupt(&corrupt.id, &corrupt),
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring the in-memory indexes up to a committed change.
+    fn apply(&mut self, change: DocChange) {
+        let DocChange { id, new, seq } = change;
+        if let Some(latest) = self.latest.as_mut() {
+            match seq {
+                Some(seq) => latest.insert(id.clone(), seq),
+                None => latest.remove(&id),
+            }
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let (was_live, is_live) = match new {
+            Some((rev, true)) => (live.insert(id.clone(), LiveDoc { rev }).is_some(), true),
+            _ => (live.remove(&id).is_some(), false),
+        };
+        if was_live == is_live {
+            return;
+        }
+        let step = |n: &mut usize| *n = if is_live { *n + 1 } else { n.saturating_sub(1) };
+        for known in &mut self.partition_ranks {
+            if id < known.first {
+                step(&mut known.below);
+            } else if id < known.last {
+                step(&mut known.count);
+            }
+        }
+        if let Some((from, rank)) = self.rank_cursor.as_mut() {
+            if id < *from {
+                step(rank);
+            }
+        }
+    }
+
+    /// Run a group: `first`, then whatever `more` hands over, up to
+    /// [`GROUP_JOBS`], in one write transaction, committed once. Returns each
+    /// job's reply and the group's error, if it failed: a job that panicked
+    /// or failed after writing aborts the group, as does a failed commit.
+    /// Nothing in memory changes unless the commit succeeds.
+    fn run_group(
+        &mut self,
+        first: Box<dyn ShardJob>,
+        mut more: impl FnMut() -> Option<Box<dyn ShardJob>>,
+    ) -> (Vec<Reply>, Option<ApiError>) {
+        let txn = match self.begin_group() {
+            Ok(txn) => txn,
+            Err(error) => {
+                first.fail(ApiError::internal(error));
+                return (Vec::new(), None);
+            }
+        };
+        let mut txn = ShardTxn::new(self, Txn::Write(Box::new(txn)));
+        let mut replies = Vec::new();
+        let mut next = Some(first);
+        let mut aborted = None;
+        while let Some(job) = next.take() {
+            txn.begin_job();
+            let (reply, abort) = job.run(&mut txn);
+            replies.push(reply);
+            if abort.is_some() {
+                aborted = abort;
+                break;
+            }
+            if replies.len() < GROUP_JOBS {
+                next = more();
+            }
+        }
+        let mut commit_failed = false;
+        let error = match aborted {
+            Some(error) => {
+                // Dropping the transaction aborts it. A panicking job may
+                // have left an index half built.
+                drop(txn);
+                self.release_indexes();
+                Some(error)
+            }
+            None => txn.commit().err().map(|error| {
+                commit_failed = true;
+                ApiError::new(
+                    500,
+                    "internal_server_error",
+                    format!("shard commit failed: {error:#}"),
+                )
+            }),
+        };
+        // Before anyone hears back, so a retry meets the recovered file.
+        if let Some(error) = &error {
+            if commit_failed || self.poisoned() {
+                self.recover(&error.reason);
+            }
+        }
+        (replies, error)
+    }
+
+    /// Run a read job on a read transaction of the committed state.
+    fn run_read(&mut self, job: Box<dyn ShardJob>) -> Option<Reply> {
+        let txn = match self.gate.begin_read() {
+            Ok(txn) => txn,
+            Err(error) => {
+                job.fail(ApiError::internal(error));
+                return None;
+            }
+        };
+        let mut txn = ShardTxn::new(self, Txn::Read(txn));
+        txn.begin_job();
+        let (reply, abort) = job.run(&mut txn);
+        drop(txn);
+        if abort.is_some() {
+            self.release_indexes();
+        }
+        Some(reply)
+    }
+
+    /// Delete every revision body that is not a leaf of its document's tree:
+    /// superseded revisions, revisions stemmed by `revs_limit` and orphans.
+    /// CouchDB keeps them readable until compaction and then drops them;
+    /// leaves (conflicts and tombstones included) always stay.
+    ///
+    /// Runs on the actor as one job run alone, holding it for the whole
+    /// sweep: the shard's writes and actor reads queue behind it until it
+    /// ends (reads on leases carry on). It commits one write transaction
+    /// per [`BODY_SWEEP_BATCH`] bodies, so memory stays bounded. The file
+    /// does not shrink: redb reuses the freed pages. Online compaction is
+    /// the next phase.
+    pub fn compact(&mut self) -> Result<()> {
+        let mut after: Option<(String, String)> = None;
+        // Documents whose corrupt metadata was already reported this sweep.
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let txn = self.gate.begin_write_txn()?;
+            let keys: Vec<(String, String)> = {
+                let bodies = txn.open_table(BODIES)?;
+                let start = match &after {
+                    Some((id, rev)) => Bound::Excluded((id.as_str(), rev.as_str())),
+                    None => Bound::Unbounded,
+                };
+                bodies
+                    .range::<(&str, &str)>((start, Unbounded))?
+                    .take(BODY_SWEEP_BATCH)
+                    .map(|entry| {
+                        let (key, _) = entry?;
+                        let (id, rev) = key.value();
+                        Ok((id.to_string(), rev.to_string()))
+                    })
+                    .collect::<Result<_>>()?
+            };
+            let Some(last) = keys.last().cloned() else {
+                txn.abort()?;
+                return Ok(());
+            };
+            let mut stale = Vec::new();
+            {
+                let metas = txn.open_table(META)?;
+                // Leaf sets by document id, for this batch only; `None` for
+                // a document without a record (its bodies are orphans).
+                let mut leaves: BTreeMap<&str, Option<BTreeSet<String>>> = BTreeMap::new();
+                for (id, rev) in &keys {
+                    if !leaves.contains_key(id.as_str()) {
+                        let found = match metas.get(id.as_str())? {
+                            None => Some(None),
+                            Some(stored) => {
+                                match parse_meta(id, unsealed(Table::Meta, stored.value())?) {
+                                    Ok(meta) => {
+                                        Some(Some(meta.tree.leaves().into_iter().collect()))
+                                    }
+                                    // A record that cannot be decoded cannot
+                                    // say which bodies are stale: keep them
+                                    // all, report it once and carry on.
+                                    Err(corrupt) => {
+                                        if reported.insert(id.clone()) {
+                                            self.name.report_compaction_skip(id, &corrupt);
+                                        }
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        let Some(found) = found else { continue };
+                        leaves.insert(id, found);
+                    }
+                    let is_leaf = leaves
+                        .get(id.as_str())
+                        .and_then(Option::as_ref)
+                        .is_some_and(|set| set.contains(rev));
+                    if !is_leaf {
+                        stale.push((id.as_str(), rev.as_str()));
                     }
                 }
+            }
+            if stale.is_empty() {
+                txn.abort()?;
+            } else {
+                {
+                    let mut bodies = txn.open_table(BODIES)?;
+                    for key in stale {
+                        bodies.remove(key)?;
+                    }
+                }
+                txn.commit()?;
+            }
+            after = Some(last);
+        }
+    }
+}
+
+/// The transaction a job works in.
+enum Txn {
+    /// A group's: the job may write.
+    Write(Box<WriteTransaction>),
+    /// A read job's, of the committed state.
+    Read(ReadTransaction),
+}
+
+/// Run `$body` with `$table` bound to `$def` opened in the job's
+/// transaction, read-only or not.
+macro_rules! with_table {
+    ($txn:expr, $def:expr, |$table:ident| $body:expr) => {
+        match &$txn.txn {
+            Txn::Write(txn) => {
+                let $table = txn.open_table($def)?;
+                let result = $body;
+                result
+            }
+            Txn::Read(txn) => {
+                let $table = txn.open_table($def)?;
+                let result = $body;
+                result
+            }
+        }
+    };
+}
+
+/// A shard as one job sees it: the group's write transaction (or a read
+/// job's read transaction) plus the shard's in-memory state.
+///
+/// A write job reads and decodes every record it will change before its
+/// first write. A job that fails after writing, or panics, aborts its whole
+/// group; one that fails before writing fails alone.
+pub struct ShardTxn<'s> {
+    shard: &'s mut Shard,
+    txn: Txn,
+    /// The group's view of the settings, written with the group's commit.
+    staged: Settings,
+    /// Document changes for the in-memory indexes, applied after the commit.
+    changes: Vec<DocChange>,
+    /// The group cleared the shard or removed a corrupt record: the indexes
+    /// are dropped after the commit and rebuilt on next use.
+    reset_indexes: bool,
+    /// The settings as the current job found them, restored if it fails
+    /// before writing.
+    job_start: Settings,
+    job_wrote: bool,
+    group_wrote: bool,
+    /// The first write of the group that failed. Whatever the job that made
+    /// it returns, the group fails: it may hold part of that job's writes.
+    write_failed: Option<String>,
+}
+
+impl<'s> ShardTxn<'s> {
+    fn new(shard: &'s mut Shard, txn: Txn) -> ShardTxn<'s> {
+        let staged = shard.settings.clone();
+        ShardTxn {
+            job_start: staged.clone(),
+            staged,
+            shard,
+            txn,
+            changes: Vec::new(),
+            reset_indexes: false,
+            job_wrote: false,
+            group_wrote: false,
+            write_failed: None,
+        }
+    }
+
+    fn begin_job(&mut self) {
+        self.job_start = self.staged.clone();
+        self.job_wrote = false;
+    }
+
+    /// Forget what a job that failed before writing did to the settings
+    /// (a sequence it took).
+    fn undo_job(&mut self) {
+        self.staged = self.job_start.clone();
+    }
+
+    /// Commit the group, write its settings first, and bring the in-memory
+    /// state up to it. A group that changed nothing is not committed.
+    fn commit(self) -> Result<()> {
+        let ShardTxn {
+            shard,
+            txn,
+            staged,
+            changes,
+            reset_indexes,
+            group_wrote,
+            ..
+        } = self;
+        let Txn::Write(txn) = txn else {
+            return Ok(());
+        };
+        if !group_wrote && staged == shard.settings {
+            // Dropping it aborts it: no sync for a group of reads.
+            return Ok(());
+        }
+        {
+            let mut settings = txn.open_table(SETTINGS)?;
+            if staged.uuid != shard.settings.uuid {
+                settings.insert(UUID, kv::seal(staged.uuid.as_bytes()).as_slice())?;
+            }
+            for (name, new, old) in [
+                (SEQ, staged.seq, shard.settings.seq),
+                (DOC_COUNT, staged.docs, shard.settings.docs),
+                (DELETED_COUNT, staged.deleted, shard.settings.deleted),
+            ] {
+                if new != old {
+                    settings.insert(name, kv::seal(&new.to_be_bytes()).as_slice())?;
+                }
+            }
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut shard.fail_next_commit) {
+            anyhow::bail!("injected commit failure");
+        }
+        txn.commit()?;
+        if staged.uuid != shard.settings.uuid {
+            if let Some(shared) = &shard.shared_uuid {
+                *shared.write().unwrap_or_else(|poison| poison.into_inner()) = staged.uuid.clone();
+            }
+        }
+        shard.settings = staged;
+        if reset_indexes {
+            shard.release_indexes();
+        } else {
+            for change in changes {
+                shard.apply(change);
+            }
+        }
+        Ok(())
+    }
+
+    /// The value under `key` in `def`, checked against its checksum.
+    fn get_value<'k, K: Key + 'static>(
+        &self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
+        key: K::SelfType<'k>,
+    ) -> Result<Option<Vec<u8>>> {
+        with_table!(self, def, |t| match t.get(key)? {
+            Some(stored) => Ok(Some(unsealed(table, stored.value())?.to_vec())),
+            None => Ok(None),
+        })
+    }
+
+    /// Visit the entries of `def` between `from` and `to`, in key order or
+    /// reversed, until `visit` returns `false`.
+    fn scan<'k, K: Key + 'static>(
+        &self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
+        (from, to): (Bound<K::SelfType<'k>>, Bound<K::SelfType<'k>>),
+        reverse: bool,
+        mut visit: impl for<'v> FnMut(K::SelfType<'v>, &'v [u8]) -> Result<bool>,
+    ) -> Result<()> {
+        with_table!(self, def, |t| {
+            let entries = t.range((from, to))?;
+            let entries: Box<dyn Iterator<Item = _>> = if reverse {
+                Box::new(entries.rev())
+            } else {
+                Box::new(entries)
+            };
+            for entry in entries {
+                let (key, stored) = entry?;
+                if !visit(key.value(), unsealed(table, stored.value())?)? {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Run `body` on `def` opened for writing, marking the job as one that
+    /// has written. A read job cannot write. A write that fails is recorded,
+    /// so the group fails even if the job carries on as if it had not.
+    fn write<K: Key + 'static, R>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        body: impl FnOnce(&mut redb::Table<'_, K, &'static [u8]>) -> Result<R>,
+    ) -> Result<R> {
+        let Txn::Write(txn) = &self.txn else {
+            anyhow::bail!("a read-only shard job tried to write");
+        };
+        self.job_wrote = true;
+        self.group_wrote = true;
+        #[cfg(test)]
+        let injected = self.shard.injected_write_failure();
+        #[cfg(not(test))]
+        let injected = false;
+        let result = if injected {
+            Err(anyhow::anyhow!("injected write failure"))
+        } else {
+            txn.open_table(def)
+                .map_err(anyhow::Error::from)
+                .and_then(|mut table| body(&mut table))
+        };
+        if let Err(error) = &result {
+            self.note_failed_write(error);
+        }
+        result
+    }
+
+    fn note_failed_write(&mut self, error: &anyhow::Error) {
+        self.write_failed
+            .get_or_insert_with(|| format!("{error:#}"));
+    }
+
+    fn put_value<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        key: K::SelfType<'k>,
+        value: &[u8],
+    ) -> Result<()> {
+        self.write(def, |table| {
+            table.insert(key, kv::seal(value).as_slice())?;
+            Ok(())
+        })
+    }
+
+    fn remove_value<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        key: K::SelfType<'k>,
+    ) -> Result<()> {
+        self.write(def, |table| {
+            table.remove(key)?;
+            Ok(())
+        })
+    }
+
+    /// Take the next sequence of this shard for a write. Sequences are
+    /// shard-local, as in CouchDB: each shard counts its own changes. A
+    /// sequence is committed with the group that took it, so one taken by a
+    /// group that failed is taken again.
+    pub fn next_seq(&mut self) -> u64 {
+        self.staged.seq += 1;
+        self.staged.seq
+    }
+
+    /// This copy's identity: created with the file, replaced when the shard
+    /// is cleared, so a position is never applied to another copy.
+    #[cfg(test)]
+    pub fn uuid(&self) -> &str {
+        &self.staged.uuid
+    }
+
+    /// Live and deleted document counts for this shard.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.staged.docs, self.staged.deleted)
+    }
+
+    pub fn revs_limit(&self) -> u64 {
+        self.staged.revs_limit
+    }
+
+    pub fn purged_infos_limit(&self) -> u64 {
+        self.staged.purged_infos_limit
+    }
+
+    /// Store `value` under the setting `name`, with this group's commit.
+    pub fn put_setting(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        self.put_value(SETTINGS, name, value)
+    }
+
+    /// Remove the setting `name`, with this group's commit.
+    pub fn remove_setting(&mut self, name: &str) -> Result<()> {
+        self.remove_value(SETTINGS, name)
+    }
+
+    pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {
+        let limit = limit.max(1);
+        self.put_value(SETTINGS, REVS_LIMIT, &limit.to_be_bytes())?;
+        self.staged.revs_limit = limit;
+        Ok(())
+    }
+
+    pub fn set_purged_infos_limit(&mut self, limit: u64) -> Result<()> {
+        let limit = limit.max(1);
+        self.put_value(SETTINGS, PURGED_INFOS_LIMIT, &limit.to_be_bytes())?;
+        self.staged.purged_infos_limit = limit;
+        Ok(())
+    }
+
+    /// Where this shard lives, for logging skipped records.
+    pub fn name(&self) -> &ShardName {
+        &self.shard.name
+    }
+
+    /// Record `entries` index entries walked by a read.
+    pub fn add_scanned(&self, entries: usize) {
+        self.shard
+            .scanned
+            .fetch_add(entries as u64, Ordering::Relaxed);
+    }
+
+    pub fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>> {
+        match self.get_value(META, Table::Meta, docid)? {
+            Some(bytes) => Ok(Some(parse_meta(docid, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        self.shard.body_reads.fetch_add(1, Ordering::Relaxed);
+        self.get_value(BODIES, Table::Bodies, (docid, rev))
+    }
+
+    /// Write a document's metadata record, saying what the document's state
+    /// was before (`old`, which must be the state of the record this
+    /// transaction holds now) and is after (`new`), and the sequence it
+    /// carries. The counters follow, and the in-memory indexes after commit.
+    pub fn put_meta(
+        &mut self,
+        docid: &str,
+        bytes: &[u8],
+        old: Option<MetaState>,
+        new: Option<MetaState>,
+        seq: u64,
+    ) -> Result<()> {
+        self.put_value(META, docid, bytes)?;
+        self.count(old.as_ref(), new.as_ref());
+        self.changes.push(DocChange {
+            id: docid.to_string(),
+            new,
+            seq: Some(seq),
+        });
+        Ok(())
+    }
+
+    /// Remove a document's metadata record, whose state was `old`.
+    pub fn remove_meta(&mut self, docid: &str, old: Option<MetaState>) -> Result<()> {
+        self.remove_value(META, docid)?;
+        self.count(old.as_ref(), None);
+        self.changes.push(DocChange {
+            id: docid.to_string(),
+            new: None,
+            seq: None,
+        });
+        Ok(())
+    }
+
+    /// Move the counters from a document's old state to its new one.
+    fn count(&mut self, old: Option<&MetaState>, new: Option<&MetaState>) {
+        let staged = &mut self.staged;
+        match old.map(|(_, live)| *live) {
+            Some(true) => staged.docs = staged.docs.saturating_sub(1),
+            Some(false) => staged.deleted = staged.deleted.saturating_sub(1),
+            None => {}
+        }
+        match new.map(|(_, live)| *live) {
+            Some(true) => staged.docs += 1,
+            Some(false) => staged.deleted += 1,
+            None => {}
+        }
+    }
+
+    pub fn put_body(&mut self, docid: &str, rev: &str, body: &[u8]) -> Result<()> {
+        self.put_value(BODIES, (docid, rev), body)
+    }
+
+    pub fn remove_body(&mut self, docid: &str, rev: &str) -> Result<()> {
+        self.remove_value(BODIES, (docid, rev))
+    }
+
+    /// Record that `docid` changed at `seq`.
+    pub fn put_seq(&mut self, seq: u64, docid: &str) -> Result<()> {
+        self.put_value(BY_SEQ, seq, docid.as_bytes())
+    }
+
+    pub fn remove_seq(&mut self, seq: u64) -> Result<()> {
+        self.remove_value(BY_SEQ, seq)
+    }
+
+    pub fn get_local(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_value(LOCAL, Table::Local, id)
+    }
+
+    pub fn put_local(&mut self, id: &str, doc: &[u8]) -> Result<()> {
+        self.put_value(LOCAL, id, doc)
+    }
+
+    pub fn remove_local(&mut self, id: &str) -> Result<()> {
+        self.remove_value(LOCAL, id)
+    }
+
+    /// Every local document of this shard, in id order.
+    pub fn locals(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.scan(
+            LOCAL,
+            Table::Local,
+            (Unbounded, Unbounded),
+            false,
+            |id, doc| {
+                out.push((id.to_string(), doc.to_vec()));
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// A node-local anti-entropy checkpoint. Not a `_local` document: it is
+    /// never listed, shared or moved with a shard.
+    pub fn get_checkpoint(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_value(CHECKPOINTS, Table::Checkpoints, id)
+    }
+
+    pub fn put_checkpoint(&mut self, id: &str, value: &[u8]) -> Result<()> {
+        self.put_value(CHECKPOINTS, id, value)
+    }
+
+    pub fn remove_checkpoint(&mut self, id: &str) -> Result<()> {
+        self.remove_value(CHECKPOINTS, id)
+    }
+
+    /// The checkpoints whose ids start with `prefix`, in id order.
+    pub fn checkpoints(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        let from = (Included(prefix), Unbounded);
+        self.scan(CHECKPOINTS, Table::Checkpoints, from, false, |id, value| {
+            if !id.starts_with(prefix) {
+                return Ok(false);
+            }
+            out.push((id.to_string(), value.to_vec()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Content digest over document ids, winning revisions, deleted flags
+    /// and conflict leaves. It deliberately excludes per-replica sequence
+    /// numbers, which differ between replicas. Two replicas with identical
+    /// replicated content produce the same digest.
+    pub fn fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        let mut documents = 0u64;
+        self.scan(
+            META,
+            Table::Meta,
+            (Unbounded, Unbounded),
+            false,
+            |id, stored| {
+                let meta = parse_meta(id, stored)?;
+                hasher.update(b"doc");
+                hasher.update(id.as_bytes());
+                match meta_state(&meta) {
+                    Some((winner, live)) => {
+                        hasher.update(winner.as_bytes());
+                        hasher.update([live as u8]);
+                    }
+                    None => hasher.update(b"no-winner"),
+                }
+                let mut leaves = meta.tree.leaves();
+                leaves.sort();
+                for leaf in leaves {
+                    hasher.update(b"leaf");
+                    hasher.update(leaf.as_bytes());
+                    hasher.update([meta.tree.is_deleted(&leaf) as u8]);
+                }
+                documents += 1;
+                Ok(true)
+            },
+        )?;
+        hasher.update(documents.to_be_bytes());
+        Ok(crate::util::hex(&hasher.finalize()))
+    }
+
+    pub fn summary(&self, with_digest: bool) -> Result<ShardSummary> {
+        let (docs, deleted) = self.counts();
+        Ok(ShardSummary {
+            docs,
+            deleted,
+            seq: self.staged.seq,
+            digest: if with_digest {
+                Some(self.fingerprint()?)
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Visit the metadata records whose ids lie in `[first, last)`, skipping
+    /// (and reporting) any that do not decode.
+    fn metas_in(
+        &self,
+        first: &str,
+        last: &str,
+        mut visit: impl FnMut(&str, DocMeta),
+    ) -> Result<()> {
+        let name = self.shard.name.clone();
+        let range = (Included(first), Excluded(last));
+        self.scan(META, Table::Meta, range, false, |id, stored| {
+            match parse_meta(id, stored) {
+                Ok(meta) => visit(id, meta),
                 Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
             }
-            true
+            Ok(true)
+        })
+    }
+
+    /// Live and deleted document counts for one partition. The scan stays
+    /// inside the partition's id range.
+    pub fn partition_counts(&self, partition: &str) -> Result<(u64, u64)> {
+        let (mut docs, mut deleted) = (0u64, 0u64);
+        let (first, last) = (format!("{partition}:"), format!("{partition};"));
+        self.metas_in(&first, &last, |_, meta| match meta_state(&meta) {
+            Some((_, true)) => docs += 1,
+            Some((_, false)) => deleted += 1,
+            None => {}
         })?;
         Ok((docs, deleted))
     }
 
-    /// Sorted live document ids and their winning revisions. The index is
-    /// built on first use and maintained in memory from then on.
-    pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {
-        if self.live.is_none() {
-            let mut live = BTreeMap::new();
-            let name = self.name.clone();
-            // `scan_range_while` merges the uncommitted overlay, so a read in
-            // the same group commit sees writes queued before it. A record
-            // that does not decode is left out of the index; LevelDB errors
-            // still fail the scan.
-            self.scan_range_while(b"m/", None, false, |key, value| {
-                match parse_meta(key, value) {
-                    Ok((id, meta)) => {
-                        if let Some((rev, true)) = meta_state(&meta) {
-                            live.insert(id, LiveDoc { rev });
-                        }
-                    }
-                    Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
+    /// The ids of the design documents (deleted ones included), and those
+    /// among them whose metadata is corrupt. A corrupt one's
+    /// `validate_doc_update` cannot be loaded, so callers must fail instead of
+    /// skipping it. A range scan of the `_design/` ids: it neither builds nor
+    /// needs the id-to-sequence index.
+    pub fn design_docs(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let name = self.shard.name.clone();
+        let mut ids = Vec::new();
+        let mut corrupt_design = Vec::new();
+        // '0' follows '/', so this is every id starting with "_design/".
+        let range = (Included("_design/"), Excluded("_design0"));
+        self.scan(META, Table::Meta, range, false, |id, stored| {
+            match parse_meta(id, stored) {
+                Ok(_) => ids.push(id.to_string()),
+                Err(corrupt) => {
+                    name.report_corrupt(&corrupt.id, &corrupt);
+                    corrupt_design.push(corrupt.id);
                 }
-                true
+            }
+            Ok(true)
+        })?;
+        Ok((ids, corrupt_design))
+    }
+
+    /// Sorted live document ids and their winning revisions, as committed.
+    /// The index is built on first use and maintained after each commit.
+    pub fn live_docs(&mut self) -> Result<&BTreeMap<String, LiveDoc>> {
+        if self.shard.live.is_none() {
+            let mut live = BTreeMap::new();
+            self.shard.committed_metas(|id, meta| {
+                if let Some((rev, true)) = meta_state(&meta) {
+                    live.insert(id.to_string(), LiveDoc { rev });
+                }
             })?;
-            self.live = Some(live);
-            self.rank_cursor = None;
-            self.partition_ranks.clear();
+            self.shard.live = Some(live);
+            self.shard.rank_cursor = None;
+            self.shard.partition_ranks.clear();
         }
-        Ok(self.live.as_ref().expect("live index initialized"))
+        Ok(self.shard.live.get_or_insert_with(BTreeMap::new))
     }
 
     /// How many live documents have an id in `[first, last)`.
@@ -927,7 +1719,8 @@ impl Shard {
     pub fn live_rank(&mut self, key: &str) -> Result<usize> {
         use std::ops::Bound::{Excluded, Unbounded};
         self.live_docs()?;
-        let (Some(live), cursor) = (self.live.as_ref(), self.rank_cursor.take()) else {
+        let shard = &mut *self.shard;
+        let (Some(live), cursor) = (shard.live.as_ref(), shard.rank_cursor.take()) else {
             return Ok(0);
         };
         let (rank, walked) = match &cursor {
@@ -955,72 +1748,88 @@ impl Shard {
                 (walked, walked)
             }
         };
-        self.scanned.fetch_add(walked as u64, Ordering::Relaxed);
-        self.rank_cursor = Some((key.to_string(), rank));
+        shard.scanned.fetch_add(walked as u64, Ordering::Relaxed);
+        shard.rank_cursor = Some((key.to_string(), rank));
         Ok(rank)
     }
 
-    /// Each document's latest sequence, built lazily from metadata. Used by
-    /// `_changes`, which returns one row per document.
-    pub fn latest_changes(&mut self) -> Result<&LatestChanges> {
-        if self.latest.is_none() {
-            let mut latest = LatestChanges::default();
-            let name = self.name.clone();
-            self.scan_range_while(b"m/", None, false, |key, value| {
-                match parse_meta(key, value) {
-                    Ok((id, meta)) => latest.insert(id, meta.seq),
-                    Err(corrupt) => name.report_corrupt(&corrupt.id, &corrupt),
-                }
-                true
-            })?;
-            self.latest = Some(latest);
+    /// Live document count for one partition.
+    pub fn partition_live_count(&mut self, partition: &str) -> Result<u64> {
+        Ok(self.partition_rank(partition)?.1 as u64)
+    }
+
+    /// How many live ids of `partition` come before `start` in the query's
+    /// direction: the offset of a partitioned `_all_docs` reply. `start` is
+    /// ranked from the previous rank, so paging by `startkey` costs the
+    /// distance moved, not the partition's size.
+    pub fn partition_offset(
+        &mut self,
+        partition: &str,
+        start: &str,
+        descending: bool,
+    ) -> Result<usize> {
+        let (below, count) = self.partition_rank(partition)?;
+        let rank = self.live_rank(start)?;
+        let on_start = usize::from(
+            self.shard
+                .live
+                .as_ref()
+                .is_some_and(|live| live.contains_key(start)),
+        );
+        Ok(if descending {
+            // Ids after `start`: all but those up to and including it.
+            let through = (rank + on_start).saturating_sub(below).min(count);
+            count - through
+        } else {
+            rank.saturating_sub(below).min(count)
+        })
+    }
+
+    /// `(live ids below the partition, live ids in it)`, found once by
+    /// walking the partition and then kept current by commits.
+    fn partition_rank(&mut self, partition: &str) -> Result<(usize, usize)> {
+        let first = format!("{partition}:");
+        if let Some(known) = self
+            .shard
+            .partition_ranks
+            .iter()
+            .find(|known| known.first == first)
+        {
+            return Ok((known.below, known.count));
         }
-        Ok(self.latest.as_ref().expect("latest changes initialized"))
+        let last = format!("{partition};");
+        let below = self.live_rank(&first)?;
+        let count = self
+            .live_docs()?
+            .range::<str, _>((
+                Bound::Included(first.as_str()),
+                Bound::Excluded(last.as_str()),
+            ))
+            .count();
+        self.add_scanned(count);
+        let ranks = &mut self.shard.partition_ranks;
+        if ranks.len() >= PARTITION_RANKS {
+            ranks.remove(0);
+        }
+        ranks.push(PartitionRank {
+            first,
+            last,
+            below,
+            count,
+        });
+        Ok((below, count))
     }
 
-    /// The ids of the design documents (deleted ones included), and those
-    /// among them whose metadata is corrupt. A corrupt one's
-    /// `validate_doc_update` cannot be loaded, so callers must fail instead of
-    /// skipping it. A range scan of the `_design/` keys: it neither builds nor
-    /// needs the id-to-sequence index.
-    pub fn design_docs(&mut self) -> Result<(Vec<String>, Vec<String>)> {
-        let name = self.name.clone();
-        let mut ids = Vec::new();
-        let mut corrupt_design = Vec::new();
-        self.scan_range_while(b"m/_design/", None, false, |key, value| {
-            match parse_meta(key, value) {
-                Ok((id, _)) => ids.push(id),
-                Err(corrupt) => {
-                    name.report_corrupt(&corrupt.id, &corrupt);
-                    corrupt_design.push(corrupt.id);
-                }
-            }
-            true
-        })?;
-        Ok((ids, corrupt_design))
-    }
-
-    #[cfg(test)]
-    pub fn latest_built(&self) -> bool {
-        self.latest.is_some()
-    }
-
-    /// Drop the lazily built indexes (live ids, latest sequences, the rank
-    /// cursor and the partition ranks). They are rebuilt from the shard's
-    /// records on next use, so an idle shard holds none of them.
-    pub fn release_indexes(&mut self) {
-        self.live = None;
-        self.rank_cursor = None;
-        self.partition_ranks.clear();
-        self.latest = None;
-    }
-
-    /// Entries held by the live and latest-changes indexes, for judging their
-    /// memory by count.
-    #[cfg(test)]
-    pub fn index_entries(&self) -> usize {
-        self.live.as_ref().map_or(0, BTreeMap::len)
-            + self.latest.as_ref().map_or(0, LatestChanges::len)
+    /// Each document's latest committed sequence, built lazily from
+    /// metadata. Used by `_changes`, which returns one row per document.
+    pub fn latest_changes(&mut self) -> Result<&LatestChanges> {
+        if self.shard.latest.is_none() {
+            let mut latest = LatestChanges::default();
+            self.shard
+                .committed_metas(|id, meta| latest.insert(id.to_string(), meta.seq))?;
+            self.shard.latest = Some(latest);
+        }
+        Ok(self.shard.latest.get_or_insert_with(LatestChanges::default))
     }
 
     pub fn pending_changes(&mut self, after: u64, descending: bool) -> Result<usize> {
@@ -1032,118 +1841,88 @@ impl Shard {
         })
     }
 
-    pub fn revs_limit(&self) -> u64 {
-        self.revs_limit
+    /// See [`Shard::release_indexes`].
+    pub fn release_indexes(&mut self) {
+        self.shard.release_indexes();
     }
 
-    pub fn purged_infos_limit(&self) -> u64 {
-        self.purged_infos_limit
+    #[cfg(test)]
+    pub fn latest_built(&self) -> bool {
+        self.shard.latest.is_some()
     }
 
-    pub fn set_purged_infos_limit(&mut self, limit: u64) -> Result<()> {
-        self.purged_infos_limit = limit.max(1);
-        self.db.put(
-            PURGED_INFOS_LIMIT_KEY,
-            &self.purged_infos_limit.to_be_bytes(),
-        )?;
-        Ok(())
+    /// Entries held by the live and latest-changes indexes, for judging their
+    /// memory by count.
+    #[cfg(test)]
+    pub fn index_entries(&self) -> usize {
+        self.shard.live.as_ref().map_or(0, BTreeMap::len)
+            + self.shard.latest.as_ref().map_or(0, LatestChanges::len)
     }
 
-    pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {
-        self.revs_limit = limit.max(1);
-        self.db
-            .put(b"z/revs_limit", &self.revs_limit.to_be_bytes())?;
-        Ok(())
+    /// The `_local` document `id` as last committed, whatever this
+    /// transaction has written since.
+    #[cfg(test)]
+    pub(crate) fn committed_local(&self, id: &str) -> Option<Vec<u8>> {
+        let txn = self.shard.gate.begin_read().unwrap();
+        let table = txn.open_table(LOCAL).unwrap();
+        let stored = table.get(id).unwrap()?;
+        Some(kv::unseal(stored.value()).unwrap().to_vec())
     }
 
-    /// Read a key, merging the uncommitted overlay. LevelDB I/O and checksum
-    /// errors surface as errors instead of turning into `None`, so corruption
-    /// is a 500, never a silent 404. Every read goes through here.
-    pub fn get_checked(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.overlay.get(key) {
-            return Ok(value.clone());
-        }
-        let snapshot = self.db.get_snapshot();
-        let value = self
-            .db
-            .get_at(&snapshot, key)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        Ok(value.map(|bytes| bytes.to_vec()))
+    /// Make the group's commit fail, as a write error would.
+    #[cfg(test)]
+    pub(crate) fn inject_commit_failure(&mut self) {
+        self.shard.fail_next_commit = true;
+    }
+
+    /// Make the write after the next `after` writes fail, as an I/O error
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn inject_write_failure(&mut self, after: usize) {
+        self.shard.fail_write_after = Some(after);
+    }
+
+    /// Store `value` under `key` in `def` exactly as given (sealed, so its
+    /// checksum holds), bypassing the counters and indexes, so tests can
+    /// plant records that do not decode.
+    #[cfg(test)]
+    pub(crate) fn put_raw<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        key: K::SelfType<'k>,
+        value: &[u8],
+    ) {
+        self.put_value(def, key, value).unwrap();
+    }
+
+    /// Store `value` under `key` in `def` without its seal, as damage on
+    /// disk would leave it: reading it fails its checksum.
+    #[cfg(test)]
+    pub(crate) fn put_unsealed<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        key: K::SelfType<'k>,
+        value: &[u8],
+    ) {
+        let Txn::Write(raw) = &self.txn else {
+            unreachable!("a write job runs on a write transaction")
+        };
+        raw.open_table(def).unwrap().insert(key, value).unwrap();
     }
 
     /// Sequence of the newest purge info of this shard: how many have been
-    /// recorded.
-    pub fn purge_seq(&mut self) -> Result<u64> {
-        Ok(self
-            .get_checked(PURGE_SEQ_KEY)?
-            .filter(|bytes| bytes.len() == 8)
-            .map(|bytes| {
-                bytes
-                    .iter()
-                    .fold(0, |acc, byte| (acc << 8) | u64::from(*byte))
-            })
-            .unwrap_or(0))
-    }
-
-    /// Record `info` in `tx` under the next purge sequence, and drop the
-    /// infos that are past the shard's `purged_infos_limit` and that every
-    /// replica in `peers` has confirmed (CouchDB never trims past the lowest
-    /// purge checkpoint of a peer). A peer that never reported holds trimming
-    /// back. One call per `tx`.
-    pub fn record_purge(&mut self, tx: &mut Tx, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
-        let seq = self.purge_seq()?.saturating_add(1);
-        let seq_bytes = seq.to_be_bytes();
-        tx.put_json(&purge_key(seq), info)?;
-        tx.put(&purge_uuid_key(&info.uuid), &seq_bytes);
-        for rev in &info.revs {
-            tx.put(&purged_rev_key(&info.id, rev), &seq_bytes);
-        }
-        tx.put(PURGE_SEQ_KEY, &seq_bytes);
-        let mut floor = seq.saturating_sub(self.purged_infos_limit);
-        for peer in peers {
-            floor = floor.min(self.purge_checkpoint(*peer)?);
-        }
-        let mut old = Vec::new();
-        let mut corrupt = false;
-        self.scan_range_while(b"p/", None, false, |key, value| {
-            let Some(old_seq) = key.get(2..).and_then(|b| <[u8; 8]>::try_from(b).ok()) else {
-                corrupt = true;
-                return false;
-            };
-            let old_seq = u64::from_be_bytes(old_seq);
-            if old_seq > floor {
-                return false;
-            }
-            match serde_json::from_slice::<PurgeInfo>(value) {
-                Ok(gone) => old.push((old_seq, gone)),
-                Err(_) => corrupt = true,
-            }
-            !corrupt
-        })?;
-        if corrupt {
-            anyhow::bail!("an unreadable purge info");
-        }
-        for (old_seq, gone) in old {
-            tx.delete(&purge_key(old_seq));
-            tx.delete(&purge_uuid_key(&gone.uuid));
-            for rev in &gone.revs {
-                // A later info may list the same revision again.
-                let key = purged_rev_key(&gone.id, rev);
-                if self.get_checked(&key)?.as_deref() == Some(old_seq.to_be_bytes().as_slice()) {
-                    tx.delete(&key);
-                }
-            }
-        }
-        Ok(())
+    /// recorded. Trimming never removes the newest one.
+    pub fn purge_seq(&self) -> Result<u64> {
+        with_table!(self, PURGE_INFOS, |t| Ok(t
+            .last()?
+            .map_or(0, |(seq, _)| seq.value())))
     }
 
     /// The purge sequence replica `node` last confirmed reading from this
     /// shard; 0 when it never reported.
-    fn purge_checkpoint(&mut self, node: usize) -> Result<u64> {
-        Ok(self
-            .get_checked(&purge_checkpoint_key(node))?
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map_or(0, u64::from_be_bytes))
+    fn purge_checkpoint(&self, node: usize) -> Result<u64> {
+        self.get_value(SETTINGS, Table::Settings, &purge_checkpoint_name(node))?
+            .map_or(Ok(0), |bytes| decode_u64(Table::Settings, &bytes))
     }
 
     /// Remember that replica `node` has confirmed purge infos up to `seq`.
@@ -1151,633 +1930,491 @@ impl Shard {
         if self.purge_checkpoint(node)? == seq {
             return Ok(());
         }
-        let mut tx = Tx::new();
-        tx.put(&purge_checkpoint_key(node), &seq.to_be_bytes());
-        self.commit(tx)
+        self.put_value(SETTINGS, &purge_checkpoint_name(node), &seq.to_be_bytes())
+    }
+
+    /// The purge infos at sequences `from..=through`, in order.
+    fn purge_infos(&self, from: u64, through: u64) -> Result<Vec<(u64, PurgeInfo)>> {
+        let mut infos = Vec::new();
+        let range = (Included(from), Included(through));
+        self.scan(
+            PURGE_INFOS,
+            Table::PurgeInfos,
+            range,
+            false,
+            |seq, value| {
+                let info = serde_json::from_slice(value)
+                    .map_err(|error| anyhow::anyhow!("an unreadable purge info: {error}"))?;
+                infos.push((seq, info));
+                Ok(true)
+            },
+        )?;
+        Ok(infos)
+    }
+
+    /// Record `info` under the next purge sequence, and drop the infos that
+    /// are past the shard's `purged_infos_limit` and that every replica in
+    /// `peers` has confirmed (CouchDB never trims past the lowest purge
+    /// checkpoint of a peer). A peer that never reported holds trimming back.
+    pub fn record_purge(&mut self, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
+        let seq = self.purge_seq()?.saturating_add(1);
+        let mut floor = seq.saturating_sub(self.staged.purged_infos_limit);
+        for peer in peers {
+            floor = floor.min(self.purge_checkpoint(*peer)?);
+        }
+        let old = if floor == 0 {
+            Vec::new()
+        } else {
+            self.purge_infos(1, floor)?
+        };
+        // A later info may list the same revision again: only the entries
+        // that still name a trimmed info go.
+        let mut stale_revs = Vec::new();
+        for (old_seq, gone) in &old {
+            for rev in &gone.revs {
+                let named = self.get_value(
+                    PURGED_REVS,
+                    Table::PurgedRevs,
+                    (gone.id.as_str(), rev.as_str()),
+                )?;
+                if named.as_deref() == Some(old_seq.to_be_bytes().as_slice()) {
+                    stale_revs.push((gone.id.clone(), rev.clone()));
+                }
+            }
+        }
+
+        for (old_seq, gone) in &old {
+            self.remove_value(PURGE_INFOS, *old_seq)?;
+            self.remove_value(PURGE_UUIDS, gone.uuid.as_str())?;
+        }
+        for (id, rev) in &stale_revs {
+            self.remove_value(PURGED_REVS, (id.as_str(), rev.as_str()))?;
+        }
+        let seq_bytes = seq.to_be_bytes();
+        self.put_value(PURGE_INFOS, seq, &serde_json::to_vec(info)?)?;
+        self.put_value(PURGE_UUIDS, info.uuid.as_str(), &seq_bytes)?;
+        for rev in &info.revs {
+            self.put_value(PURGED_REVS, (info.id.as_str(), rev.as_str()), &seq_bytes)?;
+        }
+        Ok(())
     }
 
     /// The purge infos after sequence `since`, with the shard's purge sequence
-    /// read at the same point.
-    pub fn purged_since(&mut self, since: u64) -> Result<(u64, Vec<PurgeInfo>)> {
+    /// read in the same transaction.
+    pub fn purged_since(&self, since: u64) -> Result<(u64, Vec<PurgeInfo>)> {
         let seq = self.purge_seq()?;
-        let mut infos = Vec::new();
-        let mut corrupt = false;
-        self.scan_range_while(
-            b"p/",
-            Some(&purge_key(since.saturating_add(1))),
-            false,
-            |_, value| match serde_json::from_slice(value) {
-                Ok(info) => {
-                    infos.push(info);
-                    true
-                }
-                Err(_) => {
-                    corrupt = true;
-                    false
-                }
-            },
-        )?;
-        if corrupt {
-            anyhow::bail!("an unreadable purge info");
-        }
-        Ok((seq, infos))
+        let infos = match since.checked_add(1) {
+            Some(from) if from <= seq => self.purge_infos(from, seq)?,
+            _ => Vec::new(),
+        };
+        Ok((seq, infos.into_iter().map(|(_, info)| info).collect()))
     }
 
     /// Whether the purge info `uuid` was already recorded here.
-    pub fn has_purge(&mut self, uuid: &str) -> Result<bool> {
-        Ok(self.get_checked(&purge_uuid_key(uuid))?.is_some())
+    pub fn has_purge(&self, uuid: &str) -> Result<bool> {
+        Ok(self
+            .get_value(PURGE_UUIDS, Table::PurgeUuids, uuid)?
+            .is_some())
     }
 
+    /// Remove a document whose metadata record cannot be decoded: the record,
+    /// its sequence entries and its revision bodies, recorded as the purge
+    /// `info`. The counters are recounted, since the record's old state is
+    /// unknown.
+    pub fn purge_corrupt(&mut self, id: &str, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
+        let mut revs = Vec::new();
+        // Every body of `id` and nothing else: ids sort before their
+        // extensions, and "\0" is the least extension.
+        let after_id = format!("{id}\0");
+        let range = (Included((id, "")), Excluded((after_id.as_str(), "")));
+        self.scan(BODIES, Table::Bodies, range, false, |(_, rev), _| {
+            revs.push(rev.to_string());
+            Ok(true)
+        })?;
+        let mut seqs = Vec::new();
+        self.scan(
+            BY_SEQ,
+            Table::BySeq,
+            (Unbounded, Unbounded),
+            false,
+            |seq, owner| {
+                if owner == id.as_bytes() {
+                    seqs.push(seq);
+                }
+                Ok(true)
+            },
+        )?;
+        self.record_purge(info, peers)?;
+        for rev in &revs {
+            self.remove_body(id, rev)?;
+        }
+        for seq in seqs {
+            self.remove_seq(seq)?;
+        }
+        self.remove_value(META, id)?;
+
+        let (mut docs, mut deleted) = (0u64, 0u64);
+        self.scan(
+            META,
+            Table::Meta,
+            (Unbounded, Unbounded),
+            false,
+            |id, stored| {
+                if let Ok(meta) = parse_meta(id, stored) {
+                    match meta_state(&meta) {
+                        Some((_, true)) => docs += 1,
+                        Some((_, false)) => deleted += 1,
+                        None => {}
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        self.staged.docs = docs;
+        self.staged.deleted = deleted;
+        self.reset_indexes = true;
+        Ok(())
+    }
+
+    /// Drop all document data from this local shard, keeping its sequence,
+    /// its revs and purged-infos limits and the node-local checkpoints. Used
+    /// after a shard has moved elsewhere and anti-entropy has seeded the new
+    /// replicas. What is left is a new copy: it gets a new uuid, and the
+    /// anti-entropy checkpoints that described the old copy's contents go
+    /// with it.
+    pub fn clear(&mut self) -> Result<()> {
+        self.write(SETTINGS, |settings| {
+            settings.retain(|name, _| !name.starts_with(PURGE_CHECKPOINT))?;
+            Ok(())
+        })?;
+        let Txn::Write(txn) = &self.txn else {
+            anyhow::bail!("a read-only shard job tried to write");
+        };
+        if let Err(error) = Self::clear_tables(txn) {
+            self.note_failed_write(&error);
+            return Err(error);
+        }
+        self.staged.uuid = crate::util::uuid();
+        self.staged.docs = 0;
+        self.staged.deleted = 0;
+        self.reset_indexes = true;
+        Ok(())
+    }
+
+    /// Empty every table of a shard's contents, keeping the node-local
+    /// checkpoints.
+    fn clear_tables(txn: &WriteTransaction) -> Result<()> {
+        // Deleted and created again empty, so read transactions still find
+        // every table.
+        txn.delete_table(META)?;
+        drop(txn.open_table(META)?);
+        txn.delete_table(BY_SEQ)?;
+        drop(txn.open_table(BY_SEQ)?);
+        txn.delete_table(BODIES)?;
+        drop(txn.open_table(BODIES)?);
+        txn.delete_table(LOCAL)?;
+        drop(txn.open_table(LOCAL)?);
+        txn.delete_table(PURGE_INFOS)?;
+        drop(txn.open_table(PURGE_INFOS)?);
+        txn.delete_table(PURGED_REVS)?;
+        drop(txn.open_table(PURGED_REVS)?);
+        txn.delete_table(PURGE_UUIDS)?;
+        drop(txn.open_table(PURGE_UUIDS)?);
+        txn.open_table(CHECKPOINTS)?
+            .retain(|id, _| !id.starts_with(SHARD_CHECKPOINT_PREFIX))?;
+        Ok(())
+    }
+}
+
+/// What reading a document needs, on the actor (a job's [`ShardTxn`]) or
+/// off it (a [`ShardView`] on a lease).
+pub trait DocRead {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>>;
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>>;
+    fn revs_limit(&self) -> Result<u64>;
+    /// Where this shard lives, for logging skipped records.
+    fn name(&self) -> &ShardName;
+}
+
+impl DocRead for ShardTxn<'_> {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>> {
+        ShardTxn::get_meta(self, docid)
+    }
+
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        ShardTxn::get_body(self, docid, rev)
+    }
+
+    fn revs_limit(&self) -> Result<u64> {
+        Ok(ShardTxn::revs_limit(self))
+    }
+
+    fn name(&self) -> &ShardName {
+        ShardTxn::name(self)
+    }
+}
+
+/// What a read off the actor knows of its shard besides the file.
+struct ReadContext {
+    name: ShardName,
+    /// Shared with the shard and its handle (see [`Shard`]).
+    body_reads: Arc<AtomicU64>,
+    default_revs_limit: u64,
+}
+
+/// A shard as a read off the actor sees it: the committed state as of its
+/// lease's transaction. It has none of the actor's in-memory indexes, so
+/// reads that need them (`_changes` `pending`, `_all_docs` `offset` and
+/// `total_rows`, partition counts) stay actor jobs.
+pub struct ShardView<'a, 'l> {
+    txn: &'a LeaseTxn<'l>,
+    shard: &'a ReadContext,
+}
+
+impl DocRead for ShardView<'_, '_> {
+    fn get_meta(&self, docid: &str) -> Result<Option<DocMeta>> {
+        match self.txn.get(Table::Meta, &gate::key::text(docid))? {
+            Some(bytes) => Ok(Some(parse_meta(docid, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_body(&self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
+        self.shard.body_reads.fetch_add(1, Ordering::Relaxed);
+        self.txn.get(Table::Bodies, &gate::key::pair(docid, rev))
+    }
+
+    fn revs_limit(&self) -> Result<u64> {
+        match self
+            .txn
+            .get(Table::Settings, &gate::key::text(REVS_LIMIT))?
+        {
+            Some(bytes) => decode_u64(Table::Settings, &bytes),
+            None => Ok(self.shard.default_revs_limit),
+        }
+    }
+
+    fn name(&self) -> &ShardName {
+        &self.shard.name
+    }
+}
+
+impl ShardView<'_, '_> {
     /// The revisions of `id` that a recorded purge info lists.
-    pub fn purged_revs(&mut self, id: &str, revs: &[String]) -> Result<Vec<String>> {
+    pub fn purged_revs(&self, id: &str, revs: &[String]) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for rev in revs {
-            if self.get_checked(&purged_rev_key(id, rev))?.is_some() {
+            if self
+                .txn
+                .get(Table::PurgedRevs, &gate::key::pair(id, rev))?
+                .is_some()
+            {
                 out.push(rev.clone());
             }
         }
         Ok(out)
     }
 
-    /// Remove a document whose metadata record cannot be decoded: the record,
-    /// its sequence entry and its revision bodies, and recount the document
-    /// counters, which the record's old state can no longer correct. The
-    /// purge is recorded as `info`. Bodies of a revision that itself contains
-    /// a `/` cannot be told from another document's here; compaction removes
-    /// them as orphans.
-    pub fn purge_corrupt(&mut self, id: &str, info: &PurgeInfo, peers: &[usize]) -> Result<()> {
-        let mut tx = Tx::new();
-        let body_prefix = format!("d/{id}/");
-        let mut keys = Vec::new();
-        self.scan_range_while(body_prefix.as_bytes(), None, false, |key, _| {
-            if key
-                .get(body_prefix.len()..)
-                .is_some_and(|rev| !rev.contains(&b'/'))
-            {
-                keys.push(key.to_vec());
-            }
-            true
-        })?;
-        self.scan_range_while(b"s/", None, false, |key, value| {
-            if value == id.as_bytes() {
-                keys.push(key.to_vec());
-            }
-            true
-        })?;
-        for key in keys {
-            tx.delete(&key);
-        }
-        tx.delete_corrupt_meta(&meta_key(id));
-        self.record_purge(&mut tx, info, peers)?;
-        self.commit(tx)?;
-
-        let (mut docs, mut deleted) = (0u64, 0u64);
-        self.scan_range_while(b"m/", None, false, |key, value| {
-            if let Ok((_, meta)) = parse_meta(key, value) {
-                match meta_state(&meta) {
-                    Some((_, true)) => docs += 1,
-                    Some((_, false)) => deleted += 1,
-                    None => {}
-                }
-            }
-            true
-        })?;
-        if (docs, deleted) != (self.docs, self.deleted) {
-            self.docs = docs;
-            self.deleted = deleted;
-            for (key, value) in [
-                (b"z/doc_count".as_slice(), docs),
-                (b"z/doc_deleted_count".as_slice(), deleted),
-            ] {
-                let value = value.to_be_bytes().to_vec();
-                self.overlay.insert(key.to_vec(), Some(value.clone()));
-                self.pending.push((key.to_vec(), Some(value)));
-            }
-        }
-        self.release_indexes();
-        Ok(())
-    }
-
-    pub fn get_meta(&mut self, docid: &str) -> Result<Option<DocMeta>> {
-        let Some(bytes) = self.get_checked(&meta_key(docid))? else {
-            return Ok(None);
-        };
-        let (_, meta) = parse_meta(&meta_key(docid), &bytes)?;
-        Ok(Some(meta))
-    }
-
-    /// Where this shard lives, for logging skipped records.
-    pub fn name(&self) -> &ShardName {
-        &self.name
-    }
-
-    pub fn get_body(&mut self, docid: &str, rev: &str) -> Result<Option<Vec<u8>>> {
-        self.body_reads.fetch_add(1, Ordering::Relaxed);
-        self.get_checked(&body_key(docid, rev))
-    }
-
-    /// Every key/value pair under `prefix`, starting at `start`. For small
-    /// key ranges; large ones use `scan_range_while` so they can stop early.
-    pub fn scan_from(&mut self, prefix: &[u8], start: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /// Up to `limit` live documents (id and winning revision) whose ids
+    /// `keep` accepts, in id order, after `after` when it is given, read from
+    /// the metadata records. A record that does not decode is reported and
+    /// skipped; a checksum mismatch fails the read.
+    pub fn live_docs_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
-        self.scan_range_while(prefix, Some(start), false, |key, value| {
-            out.push((key.to_vec(), value.to_vec()));
-            true
-        })?;
-        Ok(out)
-    }
-
-    /// Visit key/value pairs under `prefix` in LevelDB order, merging the
-    /// uncommitted overlay. `start` is an inclusive lower bound when scanning
-    /// forward and an inclusive upper bound when scanning in reverse. Returning
-    /// `false` from the visitor stops the scan early; this is what keeps
-    /// `_all_docs?limit=100` from reading every document metadata record.
-    pub fn scan_range_while<F>(
-        &mut self,
-        prefix: &[u8],
-        start: Option<&[u8]>,
-        reverse: bool,
-        mut visit: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&[u8], &[u8]) -> bool,
-    {
-        // Overlay entries are few (one group commit's worth), so collecting and
-        // merging them in memory stays cheap.
-        let overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = self
-            .overlay
-            .iter()
-            .filter(|(key, _)| {
-                key.starts_with(prefix)
-                    && match start {
-                        Some(bound) if reverse => key.as_slice() <= bound,
-                        Some(bound) => key.as_slice() >= bound,
-                        None => true,
-                    }
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-
-        let mut iter = self.db.new_iter()?;
-        if reverse {
-            match start {
-                Some(upper) => {
-                    iter.seek(upper);
-                    if iter.valid() {
-                        let past = iter
-                            .current()
-                            .map(|(key, _)| key.as_ref() > upper)
-                            .unwrap_or(false);
-                        if past {
-                            iter.prev();
-                        }
-                    } else {
-                        seek_last(&mut iter, prefix)?;
-                    }
-                }
-                None => seek_last(&mut iter, prefix)?,
-            }
-        } else {
-            match start {
-                Some(lower) => iter.seek(lower),
-                None => iter.seek(prefix),
-            }
+        if limit == 0 {
+            return Ok(out);
         }
-
-        // Merge the disk and overlay streams in scan order. An overlay entry
-        // shadows a disk entry with the same key, and a `None` value deletes it.
-        let mut overlay: Vec<_> = overlay.into_iter().collect();
-        if reverse {
-            overlay.reverse();
-        }
-        let mut overlay = overlay.into_iter().peekable();
-        loop {
-            let disk = if iter.valid() {
-                iter.current()
-                    .map(|(key, value)| (key.to_vec(), value.to_vec()))
-            } else {
-                None
-            };
-            let disk = disk.filter(|(key, _)| key.starts_with(prefix));
-            let take_disk = match (&disk, overlay.peek()) {
-                (Some((disk_key, _)), Some((overlay_key, _))) if reverse => {
-                    disk_key.as_slice() >= overlay_key.as_slice()
-                }
-                (Some((disk_key, _)), Some((overlay_key, _))) => {
-                    disk_key.as_slice() <= overlay_key.as_slice()
-                }
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => break,
-            };
-            let next = if take_disk {
-                let Some((key, value)) = disk else { break };
-                if reverse {
-                    iter.prev();
-                } else {
-                    iter.advance();
-                }
-                match overlay.next_if(|(overlay_key, _)| *overlay_key == key) {
-                    Some((_, overlay_value)) => (key, overlay_value),
-                    None => (key, Some(value)),
-                }
-            } else {
-                match overlay.next() {
-                    Some(entry) => entry,
-                    None => break,
-                }
-            };
-            if let (key, Some(value)) = next {
-                if !visit(&key, &value) {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Commit, recording the shard's sequence (`next_seq`) with the batch.
-    ///
-    /// The operations are queued rather than written: the shard actor merges
-    /// everything queued while it drains its mailbox into one synced batch.
-    pub fn commit(&mut self, mut tx: Tx) -> Result<()> {
-        // Read every old record before changing anything, so a read or decode
-        // error leaves the shard exactly as it was. Earlier operations in this
-        // same transaction count as the old value, so batched updates to one
-        // document still produce one final delta.
-        let mut written: std::collections::HashMap<&[u8], &Option<Vec<u8>>> =
-            std::collections::HashMap::new();
-        let mut states = Vec::with_capacity(tx.ops.len() + 1);
-        for (index, (key, value)) in tx.ops.iter().enumerate() {
-            if let Some(known) = tx.known.remove(&index) {
-                states.push(Some(known));
-            } else if key.starts_with(b"m/") {
-                let old = match written.get(key.as_slice()) {
-                    Some(earlier) => (*earlier).clone(),
-                    None => self.get_checked(key)?,
-                };
-                let old = match old {
-                    Some(bytes) => Some(parse_meta(key, &bytes)?.1),
-                    None => None,
-                };
-                let new = match value {
-                    Some(bytes) => Some(parse_meta(key, bytes)?.1),
-                    None => None,
-                };
-                states.push(Some((
-                    old.as_ref().and_then(meta_state),
-                    new.as_ref().and_then(meta_state),
-                    new.as_ref().map(|meta| meta.seq),
-                )));
-            } else {
-                states.push(None);
-            }
-            written.insert(key.as_slice(), value);
-        }
-        drop(written);
-
-        tx.ops
-            .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
-        states.push(None);
-
-        let mut docs = self.docs as i64;
-        let mut deleted = self.deleted as i64;
-        for ((key, value), state) in tx.ops.into_iter().zip(states) {
-            if let Some((old_state, new_state, new_seq)) = state {
-                if let (Some(latest), Ok(id)) = (self.latest.as_mut(), doc_id_from_meta_key(&key)) {
-                    match new_seq {
-                        Some(seq) => latest.insert(id.to_string(), seq),
-                        None => latest.remove(id),
-                    }
-                }
-                match old_state.as_ref().map(|(_, live)| *live) {
-                    Some(true) => docs -= 1,
-                    Some(false) => deleted -= 1,
-                    None => {}
-                }
-                match new_state.as_ref().map(|(_, live)| *live) {
-                    Some(true) => docs += 1,
-                    Some(false) => deleted += 1,
-                    None => {}
-                }
-                if let Some(live) = self.live.as_mut() {
-                    if let Ok(id) = doc_id_from_meta_key(&key) {
-                        let (was_live, is_live) = match new_state {
-                            Some((rev, true)) => {
-                                let old = live.insert(id.to_string(), LiveDoc { rev });
-                                (old.is_some(), true)
-                            }
-                            _ => (live.remove(id).is_some(), false),
-                        };
-                        if was_live != is_live {
-                            for known in &mut self.partition_ranks {
-                                let step = |n: &mut usize| {
-                                    *n = if is_live { *n + 1 } else { n.saturating_sub(1) }
-                                };
-                                if id < known.first.as_str() {
-                                    step(&mut known.below);
-                                } else if id < known.last.as_str() {
-                                    step(&mut known.count);
-                                }
-                            }
-                        }
-                        if let Some((from, rank)) = self.rank_cursor.as_mut() {
-                            if id < from.as_str() && was_live != is_live {
-                                if is_live {
-                                    *rank += 1;
-                                } else {
-                                    *rank = rank.saturating_sub(1);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            self.overlay.insert(key.clone(), value.clone());
-            self.pending.push((key, value));
-        }
-
-        if docs != self.docs as i64 || deleted != self.deleted as i64 {
-            self.docs = docs.max(0) as u64;
-            self.deleted = deleted.max(0) as u64;
-            for (key, value) in [
-                (b"z/doc_count".as_slice(), self.docs),
-                (b"z/doc_deleted_count".as_slice(), self.deleted),
-            ] {
-                let value = value.to_be_bytes().to_vec();
-                self.overlay.insert(key.to_vec(), Some(value.clone()));
-                self.pending.push((key.to_vec(), Some(value)));
-            }
-        }
-        Ok(())
-    }
-
-    /// Position to restore if the job that starts here panics.
-    fn job_mark(&self) -> JobMark {
-        JobMark {
-            pending: self.pending.len(),
-            docs: self.docs,
-            deleted: self.deleted,
-        }
-    }
-
-    /// Undo whatever a panicked job staged. Operations queued by earlier jobs
-    /// in the same group commit are kept (their callers have not been told
-    /// anything yet); everything the panicked job queued is dropped, the
-    /// overlay is rebuilt from what remains, and the counters are restored.
-    /// The lazily built in-memory indexes may have been updated halfway, so
-    /// they are dropped and rebuild from disk plus the overlay on next use.
-    /// The sequence is not rewound: the job's sequences become a gap, and
-    /// the high mark is queued again so it is persisted with the group.
-    fn rollback_to(&mut self, mark: JobMark) {
-        self.pending.truncate(mark.pending);
-        self.pending
-            .push((b"z/seq".to_vec(), Some(self.seq.to_be_bytes().to_vec())));
-        self.overlay.clear();
-        for (key, value) in &self.pending {
-            self.overlay.insert(key.clone(), value.clone());
-        }
-        self.docs = mark.docs;
-        self.deleted = mark.deleted;
-        self.release_indexes();
-    }
-
-    /// Write every queued operation as one synced `WriteBatch`.
-    pub fn flush_pending(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let mut batch = WriteBatch::default();
-        let mut written_seq = None;
-        for (key, value) in self.pending.drain(..) {
-            if key == b"z/seq" {
-                written_seq = value
-                    .as_deref()
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                    .map(u64::from_be_bytes);
-            }
-            match value {
-                Some(value) => batch.put(&key, &value),
-                None => batch.delete(&key),
-            }
-        }
-        #[cfg(test)]
-        let injected = std::mem::take(&mut self.fail_next_flush);
-        #[cfg(not(test))]
-        let injected = false;
-        let written = if injected {
-            Err(anyhow::anyhow!("injected write failure"))
-        } else {
-            self.db
-                .write(batch, true)
-                .map_err(|error| anyhow::anyhow!("{error}"))
+        let from = match after {
+            Some(after) => Excluded(gate::key::text(after)),
+            None => Unbounded,
         };
-        if let Err(error) = written {
-            // The queued operations are gone, so nothing in memory may still
-            // reflect them.
-            let message = match self.restore_from_disk() {
-                Ok(()) => error.to_string(),
-                Err(restore) => format!("{error}; could not restore shard state: {restore}"),
-            };
-            self.flush_failure = Some(message.clone());
-            anyhow::bail!(message);
-        }
-        self.overlay.clear();
-        if let Some(seq) = written_seq {
-            self.persisted_seq = self.persisted_seq.max(seq);
-        }
-        Ok(())
-    }
-
-    /// Error from a flush that failed since the last call, if any.
-    fn take_flush_failure(&mut self) -> Option<String> {
-        self.flush_failure.take()
-    }
-
-    /// Reset the in-memory state to what is on disk after a failed write: the
-    /// overlay and counters described operations that never happened, and the
-    /// lazily built indexes were updated alongside them.
-    ///
-    /// The sequence is not rewound: a reader may already have seen the lost
-    /// rows' sequences, so they become a gap rather than being handed out
-    /// again. The next commit persists the high mark.
-    fn restore_from_disk(&mut self) -> Result<()> {
-        self.pending.clear();
-        self.overlay.clear();
-        self.release_indexes();
-        self.persisted_seq = read_counter(&mut self.db, b"z/seq")?.unwrap_or(0);
-        self.seq = self.seq.max(self.persisted_seq);
-        self.docs = read_counter(&mut self.db, b"z/doc_count")?.unwrap_or(0);
-        self.deleted = read_counter(&mut self.db, b"z/doc_deleted_count")?.unwrap_or(0);
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<()> {
-        self.flush_pending()?;
-        self.db.flush()?;
-        Ok(())
-    }
-
-    /// Drop all document data from this local shard, preserving only the
-    /// shard's revs-limit setting. Used after a shard has moved elsewhere and
-    /// anti-entropy has seeded the new replicas. What is left is a new copy:
-    /// it gets a new uuid, and the anti-entropy checkpoints that described
-    /// the old copy's contents go with it.
-    pub fn clear(&mut self) -> Result<()> {
-        let mut keys = Vec::new();
-        {
-            let mut iter = self.db.new_iter()?;
-            iter.reset();
-            iter.advance();
-            while let Some((key, _)) = iter.current() {
-                if key.as_ref() != b"z/revs_limit"
-                    && key.as_ref() != PURGED_INFOS_LIMIT_KEY
-                    && (!key.starts_with(b"ck/") || key.starts_with(SHARD_CHECKPOINT_PREFIX))
-                {
-                    keys.push(key.to_vec());
+        self.txn
+            .scan(Table::Meta, (from, Unbounded), false, |id, stored| {
+                let id = gate::key::split_text(id)?;
+                if !keep(id) {
+                    return Ok(true);
                 }
-                if !iter.advance() {
-                    break;
+                match parse_meta(id, stored) {
+                    Ok(meta) => {
+                        if let Some((rev, true)) = meta_state(&meta) {
+                            out.push((id.to_string(), rev));
+                        }
+                    }
+                    Err(corrupt) => self.shard.name.report_corrupt(&corrupt.id, &corrupt),
                 }
-            }
-        }
-        let mut batch = WriteBatch::default();
-        for key in keys {
-            batch.delete(&key);
-        }
-        // Keep the sequence (so numbers never go backwards and `open` still
-        // finds sequence state next to the table files) and persist the
-        // emptied counters.
-        let uuid = crate::util::uuid();
-        batch.put(b"z/seq", &self.seq.to_be_bytes());
-        batch.put(UUID_KEY, uuid.as_bytes());
-        batch.put(b"z/doc_count", &0u64.to_be_bytes());
-        batch.put(b"z/doc_deleted_count", &0u64.to_be_bytes());
-        self.db.write(batch, true)?;
-        self.persisted_seq = self.seq;
-        if let Some(shared) = &self.shared_uuid {
-            *shared.write().unwrap_or_else(|poison| poison.into_inner()) = uuid.clone();
-        }
-        self.uuid = uuid;
-        self.docs = 0;
-        self.deleted = 0;
-        self.release_indexes();
-        self.pending.clear();
-        self.overlay.clear();
-        self.db
-            .put(b"z/revs_limit", &self.revs_limit.to_be_bytes())?;
-        self.db.put(
-            PURGED_INFOS_LIMIT_KEY,
-            &self.purged_infos_limit.to_be_bytes(),
-        )?;
-        self.db.flush()?;
-        Ok(())
-    }
-
-    /// Delete every revision body that is not a leaf of its document's tree:
-    /// superseded revisions, revisions stemmed by `revs_limit` and orphans.
-    /// CouchDB keeps them readable until compaction and then drops them;
-    /// leaves (conflicts and tombstones included) always stay.
-    fn drop_stale_bodies(&mut self) -> Result<()> {
-        // Memory stays bounded: each round reads at most BODY_SWEEP_BATCH body
-        // keys, deletes the stale ones and resumes after the last key seen.
-        let mut start = b"d/".to_vec();
-        // Documents whose corrupt metadata was already reported this sweep.
-        let mut reported: BTreeSet<String> = BTreeSet::new();
-        let name = self.name.clone();
-        loop {
-            let mut keys = Vec::new();
-            self.scan_range_while(b"d/", Some(&start), false, |key, _| {
-                keys.push(key.to_vec());
-                keys.len() < BODY_SWEEP_BATCH
+                Ok(out.len() < limit)
             })?;
-            let Some(last) = keys.last() else {
-                return Ok(());
-            };
-            start = last.clone();
-            start.push(0);
-
-            // Leaf sets by document id, for this batch only.
-            let mut leaves: std::collections::HashMap<String, Option<BTreeSet<String>>> =
-                std::collections::HashMap::new();
-            let mut tx = Tx::new();
-            for key in &keys {
-                let Some(rest) = key.get(2..).and_then(|rest| std::str::from_utf8(rest).ok())
-                else {
-                    continue;
-                };
-                // Both the document id and the revision may contain '/', so
-                // d/{id}/{rev} is ambiguous. Keep the body if any split makes
-                // it a leaf; delete it only when none does.
-                let mut is_leaf = false;
-                for (at, _) in rest.match_indices('/') {
-                    let (id, rev) = (&rest[..at], &rest[at + 1..]);
-                    if !leaves.contains_key(id) {
-                        // A record that cannot be decoded cannot say which
-                        // bodies are stale: keep them all, report it once and
-                        // carry on with the rest of the shard.
-                        let found = match self.get_meta(id) {
-                            Ok(meta) => meta.map(|meta| meta.tree.leaves().into_iter().collect()),
-                            Err(error) => {
-                                let corrupt = error.downcast::<crate::error::CorruptRecord>()?;
-                                if reported.insert(id.to_string()) {
-                                    name.report_compaction_skip(id, &corrupt);
-                                }
-                                is_leaf = true;
-                                break;
-                            }
-                        };
-                        leaves.insert(id.to_string(), found);
-                    }
-                    if leaves
-                        .get(id)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|set| set.contains(rev))
-                    {
-                        is_leaf = true;
-                        break;
-                    }
-                }
-                if !is_leaf {
-                    tx.delete(key);
-                }
-            }
-            self.commit(tx)?;
-            self.flush_pending()?;
-        }
-    }
-
-    pub fn compact(&mut self) -> Result<()> {
-        self.flush_pending()?;
-        self.drop_stale_bodies()?;
-        // Compaction is a long, blocking LevelDB call (tens of seconds on a
-        // large shard). It runs on this shard's dedicated actor thread, so it
-        // never ties up a Tokio worker.
-        self.db.compact_range(&[], &[])?;
-        self.db.flush()?;
-        Ok(())
+        Ok(out)
     }
 }
 
-type Ack = Box<dyn FnOnce(Option<String>) + Send>;
-type Job = Box<dyn FnOnce(&mut Shard) -> Ack + Send>;
+/// A job's reply, sent once its group has committed or failed (`Some`).
+type Reply = Box<dyn FnOnce(Option<&ApiError>) + Send>;
 
-/// Every shard is owned by exactly one dedicated OS thread: rusty-leveldb
-/// takes `&mut self` even for reads, so serialised access is not a choice, and
+/// A job for the shard actor.
+trait ShardJob: Send {
+    /// Run in `txn`. Returns the reply to send once the group is decided, and
+    /// the error that aborts the group, if this job does.
+    fn run(self: Box<Self>, txn: &mut ShardTxn<'_>) -> (Reply, Option<ApiError>);
+    /// Answer without running: no transaction could be opened.
+    fn fail(self: Box<Self>, error: ApiError);
+}
+
+/// A caller's job and where its answer goes.
+struct Call<F, R> {
+    f: F,
+    reply: oneshot::Sender<std::result::Result<R, ApiError>>,
+}
+
+/// What a panic in a job turns into.
+fn panicked(payload: Box<dyn std::any::Any + Send>) -> ApiError {
+    let reason = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    ApiError::new(
+        500,
+        "internal_server_error",
+        format!("shard job panicked: {reason}"),
+    )
+}
+
+impl<F, R> ShardJob for Call<F, R>
+where
+    F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send,
+    R: Send + 'static,
+{
+    fn run(self: Box<Self>, txn: &mut ShardTxn<'_>) -> (Reply, Option<ApiError>) {
+        let Call { f, reply } = *self;
+        // A panic must fail only this job's group, never kill the shard
+        // actor (every later call would then answer "shard task is gone").
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(txn)));
+        let (result, abort) = match outcome {
+            Ok(Ok(_)) if txn.write_failed.is_some() => {
+                // The job carried on past a failed write; part of its writes
+                // may be in the transaction.
+                let reason = txn.write_failed.clone().unwrap_or_default();
+                let error = ApiError::new(
+                    500,
+                    "internal_server_error",
+                    format!("a shard write failed: {reason}"),
+                );
+                let abort = ApiError::new(500, error.error, error.reason.clone());
+                (Err(error), Some(abort))
+            }
+            Ok(Ok(value)) => (Ok(value), None),
+            Ok(Err(error)) if txn.job_wrote => {
+                let abort = ApiError::new(
+                    500,
+                    "internal_server_error",
+                    format!("a job in the same group commit failed: {}", error.reason),
+                );
+                (Err(error), Some(abort))
+            }
+            Ok(Err(error)) => {
+                txn.undo_job();
+                (Err(error), None)
+            }
+            Err(payload) => {
+                let error = panicked(payload);
+                let abort = ApiError::new(error.status, error.error, error.reason.clone());
+                (Err(error), Some(abort))
+            }
+        };
+        let reply: Reply = Box::new(move |group| {
+            // A job's own error is its answer; a job that succeeded fails
+            // with its group.
+            let result = match (result, group) {
+                (Ok(_), Some(group)) => Err(ApiError::new(
+                    group.status,
+                    group.error,
+                    group.reason.clone(),
+                )),
+                (result, _) => result,
+            };
+            let _ = reply.send(result);
+        });
+        (reply, abort)
+    }
+
+    fn fail(self: Box<Self>, error: ApiError) {
+        let _ = self.reply.send(Err(error));
+    }
+}
+
+/// A job and the receiver of its answer.
+fn call_job<R, F>(
+    f: F,
+) -> (
+    Box<dyn ShardJob>,
+    oneshot::Receiver<std::result::Result<R, ApiError>>,
+)
+where
+    R: Send + 'static,
+    F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
+{
+    let (reply, answer) = oneshot::channel();
+    (Box::new(Call { f, reply }), answer)
+}
+
+/// What the shard actor is asked to do.
+enum Message {
+    /// A job that may write: it joins a group.
+    Write(Box<dyn ShardJob>),
+    /// A job that only reads, on the committed state.
+    Read(Box<dyn ShardJob>),
+    /// A job that has the shard to itself between groups and opens its own
+    /// transactions; handed the error instead when the shard has failed.
+    Alone(AloneJob),
+    /// Stop: the database is deleted. The file is closed unchecked, and the
+    /// sender hears once it is.
+    Close(oneshot::Sender<()>),
+}
+
+/// A job run alone: handed the shard, or the error to answer with.
+type AloneJob = Box<dyn FnOnce(std::result::Result<&mut Shard, ApiError>) + Send>;
+
+impl Message {
+    /// Answer with `error` without running.
+    fn fail(self, error: ApiError) {
+        match self {
+            Message::Write(job) | Message::Read(job) => job.fail(error),
+            Message::Alone(job) => job(Err(error)),
+            Message::Close(done) => drop(done),
+        }
+    }
+}
+
+/// Every shard is owned by exactly one dedicated OS thread, its only writer:
 /// its calls are synchronous file I/O that must not run on Tokio workers.
 /// Dropping the handle closes the queue, lets the thread finish the queued
-/// jobs, flush and close the database, and waits for it, so the LevelDB lock
-/// is released before `drop` returns.
+/// jobs, and waits for it to close the file (after a full integrity check,
+/// unless `skip_close_check` was called), so redb's file lock is released
+/// before `drop` returns.
 pub struct ShardHandle {
-    tx: Option<mpsc::Sender<Job>>,
+    tx: Option<mpsc::Sender<Message>>,
+    /// Set by `discard` and `skip_close_check`: the actor closes the file
+    /// without the close-time check and records nothing.
+    discard: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The shard's committed position: its sequence as of the last batch
-    /// flushed to disk.
+    /// The shard's committed position: its sequence as of the last commit.
     seq_tracker: Arc<AtomicU64>,
     /// The shard copy's uuid, which `clear` replaces.
     uuid: Arc<std::sync::RwLock<String>>,
-    /// Jobs submitted to this shard's actor since it opened. Each one is a
-    /// cross-thread hop, so the count is the shard round-trip cost of a request.
+    /// Shared with the shard.
+    state: Arc<std::sync::RwLock<ShardState>>,
+    /// The file, for reads off the actor.
+    gate: Gate,
+    read_context: Arc<ReadContext>,
+    /// Shard round trips since it opened: jobs submitted to its actor and
+    /// reads on leases. Each one is a cross-thread hop, so the count is the
+    /// shard round-trip cost of a request.
     jobs: AtomicU64,
     /// Index entries the shard has walked, shared with the shard.
     scanned: Arc<AtomicU64>,
@@ -1786,22 +2423,52 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
-    /// `committed` is pinged after every batch that advanced this shard's
-    /// committed sequence and has been flushed, so a feed can wait for a
-    /// commit instead of polling.
+    /// Open the shard file at `path` on a new actor thread. `committed` is
+    /// pinged after every commit that advanced this shard's sequence, so a
+    /// feed can wait for a commit instead of polling.
     pub fn spawn(
-        dir: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         revs_limit: u64,
+        cache_bytes: usize,
         committed: Arc<tokio::sync::watch::Sender<()>>,
     ) -> Result<ShardHandle> {
-        let dir = dir.as_ref().to_path_buf();
+        let path = path.as_ref().to_path_buf();
         let name = format!(
             "shard-{}",
-            dir.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            path.file_stem().and_then(|n| n.to_str()).unwrap_or("?")
         );
+        ShardHandle::spawn_with(name, committed, move || {
+            Shard::open(&path, revs_limit, cache_bytes)
+        })
+    }
+
+    /// A shard over a test disk that already holds one, on a new actor
+    /// thread.
+    #[cfg(test)]
+    pub(crate) fn over_backend(switch: &kv::powercut::PowerSwitch) -> Result<ShardHandle> {
+        let switch = switch.clone();
+        ShardHandle::spawn_with("shard-test".to_string(), Default::default(), move || {
+            Shard::over_backend(&switch, 1000)
+        })
+    }
+
+    /// Run a shard that `open` opens on a new actor thread named `name`.
+    fn spawn_with(
+        name: String,
+        committed: Arc<tokio::sync::watch::Sender<()>>,
+        open: impl FnOnce() -> Result<Shard> + Send + 'static,
+    ) -> Result<ShardHandle> {
         let seq_tracker = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = mpsc::channel::<Job>(256);
-        type Ready = (u64, Arc<std::sync::RwLock<String>>);
+        let discard = Arc::new(AtomicBool::new(false));
+        let discarded = discard.clone();
+        let (tx, mut rx) = mpsc::channel::<Message>(256);
+        type Ready = (
+            u64,
+            Arc<std::sync::RwLock<String>>,
+            Arc<std::sync::RwLock<ShardState>>,
+            Gate,
+            ReadContext,
+        );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
         let scanned = Arc::new(AtomicU64::new(0));
@@ -1809,8 +2476,8 @@ impl ShardHandle {
         let body_reads = Arc::new(AtomicU64::new(0));
         let shard_body_reads = body_reads.clone();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
-            // Open on this thread so the database never crosses threads.
-            let mut shard = match Shard::open(&dir, revs_limit) {
+            // Opened on this thread, so the file never crosses threads.
+            let mut shard = match open() {
                 Ok(shard) => shard,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -1818,47 +2485,103 @@ impl ShardHandle {
                 }
             };
             shard.set_counters(shard_scanned, shard_body_reads);
-            let uuid = Arc::new(std::sync::RwLock::new(shard.uuid().to_string()));
+            let uuid = Arc::new(std::sync::RwLock::new(shard.settings.uuid.clone()));
             shard.shared_uuid = Some(uuid.clone());
-            if ready_tx.send(Ok((shard.persisted_seq(), uuid))).is_err() {
+            let context = ReadContext {
+                name: shard.name.clone(),
+                body_reads: Arc::clone(&shard.body_reads),
+                default_revs_limit: shard.default_revs_limit,
+            };
+            let ready = (
+                shard.seq(),
+                uuid,
+                Arc::clone(&shard.state),
+                shard.gate.clone(),
+                context,
+            );
+            if ready_tx.send(Ok(ready)).is_err() {
                 return;
             }
-            // Group commit: run a job, then everything already queued, and
-            // acknowledge only after the merged batch has been flushed to the
-            // OS. rusty-leveldb does not fsync, so this is not power-loss
-            // durable.
-            while let Some(job) = rx.blocking_recv() {
-                let before = tracker.load(Ordering::SeqCst);
-                let mut acks = vec![job(&mut shard)];
-                for _ in 1..64 {
-                    match rx.try_recv() {
-                        Ok(job) => acks.push(job(&mut shard)),
-                        Err(_) => break,
+            let mut next = None;
+            let mut deleted = None;
+            loop {
+                let message = match next.take() {
+                    Some(message) => message,
+                    None => match rx.blocking_recv() {
+                        Some(message) => message,
+                        None => break,
+                    },
+                };
+                if let Some(error) = shard.failure() {
+                    if !matches!(message, Message::Close(_)) {
+                        message.fail(error);
+                        continue;
                     }
                 }
-                let _ = shard.flush_pending();
-                let flush_error = shard.take_flush_failure();
-                // Published before any caller hears back, so a write that
-                // was acknowledged is inside the committed position.
-                tracker.fetch_max(shard.persisted_seq(), Ordering::SeqCst);
-                if tracker.load(Ordering::SeqCst) > before {
-                    committed.send_replace(());
-                }
-                for ack in acks {
-                    ack(flush_error.clone());
+                match message {
+                    Message::Close(done) => {
+                        deleted = Some(done);
+                        break;
+                    }
+                    // Group commit: run a job, then every write job already
+                    // queued, commit once (synced), and only then answer. A
+                    // queued read ends the group and runs after its commit.
+                    // A failed commit is recovered from before the answers.
+                    Message::Write(job) => {
+                        let (replies, error) = shard.run_group(job, || match rx.try_recv() {
+                            Ok(Message::Write(job)) => Some(job),
+                            Ok(other) => {
+                                next = Some(other);
+                                None
+                            }
+                            Err(_) => None,
+                        });
+                        // Published before any caller hears back, so a write
+                        // that was acknowledged is inside the committed
+                        // position.
+                        if tracker.swap(shard.seq(), Ordering::SeqCst) != shard.seq() {
+                            committed.send_replace(());
+                        }
+                        for reply in replies {
+                            reply(error.as_ref());
+                        }
+                    }
+                    Message::Read(job) => {
+                        if let Some(reply) = shard.run_read(job) {
+                            reply(None);
+                        }
+                    }
+                    Message::Alone(job) => {
+                        job(Ok(&mut shard));
+                        // Its own commits (compaction's) may have failed.
+                        if shard.poisoned() {
+                            shard.recover("an I/O error in a job run alone");
+                        }
+                    }
                 }
             }
-            let _ = shard.flush_pending();
+            match deleted {
+                Some(done) => {
+                    shard.discard();
+                    let _ = done.send(());
+                }
+                None if discarded.load(Ordering::SeqCst) => shard.discard(),
+                None => shard.close(),
+            }
         })?;
-        let (initial_seq, uuid) = ready_rx
+        let (initial_seq, uuid, state, gate, read_context) = ready_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
         Ok(ShardHandle {
             tx: Some(tx),
+            discard,
             thread: Some(thread),
             seq_tracker,
             uuid,
+            state,
+            gate,
+            read_context: Arc::new(read_context),
             jobs: AtomicU64::new(0),
             scanned,
             body_reads,
@@ -1875,7 +2598,7 @@ impl ShardHandle {
         self.body_reads.load(Ordering::Relaxed)
     }
 
-    /// Jobs submitted to this shard's actor so far.
+    /// Shard round trips so far: actor jobs and lease reads.
     pub fn jobs(&self) -> u64 {
         self.jobs.load(Ordering::Relaxed)
     }
@@ -1893,52 +2616,152 @@ impl ShardHandle {
             .clone()
     }
 
-    /// Run a job on the shard task, which owns the database handle.
-    pub async fn call<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
+    /// Whether the shard serves requests.
+    pub fn state(&self) -> ShardState {
+        self.state
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The answer to every request while the shard has failed.
+    fn failure(&self) -> Option<ApiError> {
+        failed(&self.read_context.name, &self.state())
+    }
+
+    /// Jobs waiting in this shard's queue, for tests that line jobs up into
+    /// one group.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.tx
+            .as_ref()
+            .map_or(0, |tx| tx.max_capacity() - tx.capacity())
+    }
+
+    /// Queue `message` and wait for its `answer`. The future borrows
+    /// nothing from the handle, so it can be moved into a task of its own.
+    fn send<R: Send + 'static>(
+        &self,
+        message: Message,
+        answer: oneshot::Receiver<std::result::Result<R, ApiError>>,
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static {
+        self.jobs.fetch_add(1, Ordering::Relaxed);
+        let queue = match self.failure() {
+            Some(error) => Err(error),
+            None => self
+                .tx
+                .clone()
+                .ok_or_else(|| ApiError::new(500, "internal_server_error", "shard task is gone")),
+        };
+        async move {
+            queue?
+                .send(message)
+                .await
+                .map_err(|_| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
+            answer.await.map_err(|_| {
+                ApiError::new(500, "internal_server_error", "shard task dropped reply")
+            })?
+        }
+    }
+
+    /// Run a job that may write, in the next group commit; it answers once
+    /// the group has committed.
+    pub fn call<R, F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        let (job, answer) = call_job(f);
+        self.send(Message::Write(job), answer)
+    }
+
+    /// Run a job that only reads, on the committed state.
+    pub fn read<R, F>(
+        &self,
+        f: F,
+    ) -> impl std::future::Future<Output = std::result::Result<R, ApiError>> + Send + 'static
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        let (job, answer) = call_job(f);
+        self.send(Message::Read(job), answer)
+    }
+
+    /// Close the shard without the close-time integrity check, for a
+    /// database whose open failed: the file is left as it is and its
+    /// verification as the open left it (consumed, never recorded), so a
+    /// damaged database costs no full read of its healthy shards per
+    /// request. Waits until the file is closed.
+    pub fn discard(self) {
+        self.skip_close_check();
+        drop(self);
+    }
+
+    /// Close the file without the close-time integrity check once the last
+    /// handle goes, for a process that is exiting: the check reads the
+    /// whole file, and what it records dies with the process.
+    pub fn skip_close_check(&self) {
+        self.discard.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop the shard because its database is deleted, and wait until its
+    /// file is closed. From then on every request answers `not_found`, also
+    /// through handles cloned before, and the file is never closed again, so
+    /// nothing can record it as verified after the database is gone.
+    pub async fn close_deleted(&self) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = ShardState::Deleted;
+        let (done, closed) = oneshot::channel();
+        if let Some(tx) = &self.tx {
+            if tx.send(Message::Close(done)).await.is_ok() {
+                // A dropped sender means the actor is gone, file closed.
+                let _ = closed.await;
+            }
+        }
+    }
+
+    /// Run `f` off the actor, on a read transaction of its own leased from
+    /// the shard's gate, alongside the actor's write groups: for reads that
+    /// need none of the actor's in-memory indexes. It sees the committed
+    /// state as of its start. A streamed read takes one lease per page.
+    pub async fn lease<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&ShardView<'_, '_>) -> std::result::Result<R, ApiError> + Send + 'static,
+    {
+        self.jobs.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        let shard = Arc::clone(&self.read_context);
+        self.gate
+            .read(move |txn| Ok(f(&ShardView { txn, shard: &shard })))
+            .await
+            .map_err(ApiError::from)?
+    }
+
+    /// Run a job that has the shard to itself between groups, such as
+    /// compaction, which commits as it goes.
+    pub async fn alone<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
     where
         R: Send + 'static,
         F: FnOnce(&mut Shard) -> std::result::Result<R, ApiError> + Send + 'static,
     {
-        self.jobs.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let job: Job = Box::new(move |shard| {
-            // A panic must fail only this job's caller, never kill the shard
-            // actor (every later call would then answer "shard task is gone").
-            let mark = shard.job_mark();
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard))) {
-                Ok(result) => result,
-                Err(payload) => {
-                    shard.rollback_to(mark);
-                    let reason = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    Err(ApiError::new(
-                        500,
-                        "internal_server_error",
-                        format!("shard job panicked: {reason}"),
-                    ))
-                }
-            };
-            Box::new(move |flush_error: Option<String>| {
-                let result = match flush_error {
-                    Some(message) => Err(ApiError::new(500, "internal_server_error", message)),
-                    None => result,
-                };
-                let _ = reply_tx.send(result);
-            })
+        let (reply, answer) = oneshot::channel();
+        let job = Box::new(move |shard: std::result::Result<&mut Shard, ApiError>| {
+            let result = shard.and_then(|shard| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard)))
+                    .unwrap_or_else(|payload| Err(panicked(payload)))
+            });
+            let _ = reply.send(result);
         });
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
-        tx.send(job)
-            .await
-            .map_err(|_| ApiError::new(500, "internal_server_error", "shard task is gone"))?;
-        reply_rx
-            .await
-            .map_err(|_| ApiError::new(500, "internal_server_error", "shard task dropped reply"))?
+        self.send(Message::Alone(job), answer).await
     }
 }
 
@@ -1956,210 +2779,30 @@ impl Drop for ShardHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::kv::powercut::PowerCut;
     use crate::rev::Rev;
 
-    #[test]
-    fn docids_sort_like_couchdb() {
-        assert!(meta_key("a") < meta_key("b"));
-        assert!(meta_key("Z") < meta_key("a"));
-        assert!(meta_key("a") < meta_key("aa"));
-        assert!(meta_key("_design/x") < meta_key("a"));
+    pub(crate) const CACHE: usize = 1 << 20;
+
+    /// A new shard file in a fresh directory of its own.
+    pub(crate) fn temp_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shard-0000.redb");
+        drop(create_file(&file, CACHE).unwrap());
+        file
     }
 
-    #[test]
-    fn a_short_metadata_key_is_an_error_not_a_panic() {
-        assert_eq!(doc_id_from_meta_key(&meta_key("abc")).unwrap(), "abc");
-        assert_eq!(doc_id_from_meta_key(b"m/").unwrap(), "");
-        assert!(doc_id_from_meta_key(b"m").is_err());
-        assert!(doc_id_from_meta_key(b"").is_err());
-        assert!(doc_id_from_meta_key(b"m/\xff").is_err());
+    fn remove(file: &Path) {
+        kv::forget_verified(file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
-    #[test]
-    fn seq_keys_sort_numerically() {
-        assert!(seq_key(2) < seq_key(10));
-        assert!(seq_key(255) < seq_key(256));
-        assert_eq!(seq_key(42)[2..10], 42u64.to_be_bytes());
+    pub(crate) fn open(file: &Path) -> Shard {
+        Shard::open(file, 1000, CACHE).unwrap()
     }
-
-    #[test]
-    fn prefixes_are_disjoint() {
-        assert!(local_key("x") < meta_key("x"));
-        assert!(meta_key("x") < seq_key(0));
-    }
-
-    #[test]
-    fn body_keys_are_per_revision_not_per_position() {
-        let a = Rev::parse("2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let b = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        assert_ne!(body_key("d", &a.to_string()), body_key("d", &b.to_string()));
-    }
-}
-
-#[cfg(test)]
-mod panic_tests {
-    use super::*;
-
-    fn handle() -> ShardHandle {
-        let dir = std::env::temp_dir().join(format!("douchdb-panic-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        ShardHandle::spawn(&dir, 1000, Default::default()).unwrap()
-    }
-
-    fn put(key: &'static [u8]) -> impl FnOnce(&mut Shard) -> std::result::Result<(), ApiError> {
-        move |shard| {
-            let mut tx = Tx::new();
-            tx.put(key, b"v");
-            shard.commit(tx).map_err(ApiError::from)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_panicking_job_fails_only_its_caller() {
-        let handle = handle();
-        let result: std::result::Result<(), ApiError> =
-            handle.call(|_| panic!("boom in job")).await;
-        let error = result.unwrap_err();
-        assert_eq!(error.status, 500);
-        assert!(error.reason.contains("boom in job"), "{}", error.reason);
-        handle.call(|_| Ok(())).await.unwrap();
-    }
-
-    /// A sequence a panicked or failed job took is a gap: it is never handed
-    /// out again, and the committed position moves past it once persisted.
-    #[tokio::test]
-    async fn a_sequence_taken_by_a_failed_job_is_never_reused() {
-        let handle = handle();
-        let result: std::result::Result<(), ApiError> = handle
-            .call(|shard| {
-                shard.next_seq();
-                panic!("after taking a sequence");
-            })
-            .await;
-        assert!(result.is_err());
-        let result: std::result::Result<(), ApiError> = handle
-            .call(|shard| {
-                shard.next_seq();
-                Err(ApiError::bad_request("failed after taking a sequence"))
-            })
-            .await;
-        assert!(result.is_err());
-        let next = handle
-            .call(|shard| {
-                let seq = shard.next_seq();
-                let mut tx = Tx::new();
-                tx.put(b"k/after", b"v");
-                shard.commit(tx)?;
-                Ok(seq)
-            })
-            .await
-            .unwrap();
-        assert_eq!(next, 3);
-        assert_eq!(handle.committed_seq(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_failed_group_flush_fails_the_caller_and_leaves_no_trace() {
-        let handle = handle();
-        handle.call(put(b"k/one")).await.unwrap();
-        handle
-            .call(|shard| {
-                shard.inject_flush_failure();
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(handle.call(put(b"k/two")).await.is_err());
-        let seen = handle
-            .call(|shard| Ok((shard.get_checked(b"k/one")?, shard.get_checked(b"k/two")?)))
-            .await
-            .unwrap();
-        assert_eq!(seen, (Some(b"v".to_vec()), None));
-        handle.call(put(b"k/three")).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn jobs_run_on_a_dedicated_thread_not_a_tokio_worker() {
-        let handle = handle();
-        let (in_runtime, name) = handle
-            .call(|_| {
-                Ok((
-                    tokio::runtime::Handle::try_current().is_ok(),
-                    std::thread::current().name().map(str::to_string),
-                ))
-            })
-            .await
-            .unwrap();
-        assert!(!in_runtime, "shard job ran inside a Tokio runtime");
-        assert!(
-            name.as_deref().is_some_and(|n| n.starts_with("shard-")),
-            "unexpected thread name {name:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_works_from_the_actor_outside_a_multi_thread_runtime() {
-        let handle = handle();
-        handle.call(put(b"x/a")).await.unwrap();
-        handle
-            .call(|shard| shard.compact().map_err(ApiError::from))
-            .await
-            .unwrap();
-        let value = handle
-            .call(|shard| Ok(shard.get_checked(b"x/a")?))
-            .await
-            .unwrap();
-        assert_eq!(value.as_deref(), Some(b"v".as_slice()));
-    }
-
-    #[tokio::test]
-    async fn dropping_the_handle_releases_the_database_lock() {
-        let dir = std::env::temp_dir().join(format!("douchdb-drop-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let handle = ShardHandle::spawn(&dir, 1000, Default::default()).unwrap();
-        handle.call(put(b"x/kept")).await.unwrap();
-        drop(handle);
-        // No waiting: the LevelDB LOCK must already be released.
-        let mut reopened = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(
-            reopened.get_checked(b"x/kept").unwrap().as_deref(),
-            Some(b"v".as_slice())
-        );
-        drop(reopened);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn data_written_before_a_panic_survives_and_the_partial_job_is_discarded() {
-        let handle = handle();
-        handle.call(put(b"x/before")).await.unwrap();
-        let result: std::result::Result<(), ApiError> = handle
-            .call(|shard| {
-                put(b"x/partial")(shard)?;
-                panic!("after partial write");
-            })
-            .await;
-        assert!(result.is_err());
-        let (before, partial) = handle
-            .call(|shard| {
-                Ok((
-                    shard.get_checked(b"x/before")?,
-                    shard.get_checked(b"x/partial")?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(before.as_deref(), Some(b"v".as_slice()));
-        assert_eq!(partial, None);
-    }
-}
-
-#[cfg(test)]
-mod scan_tests {
-    use super::*;
-    use crate::rev::Rev;
 
     fn meta(deleted: bool, seq: u64) -> DocMeta {
         let rev = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
@@ -2168,65 +2811,136 @@ mod scan_tests {
         DocMeta { tree, seq }
     }
 
+    /// Write `meta` as `id`'s record, reading the record it replaces first.
+    pub(crate) fn put_doc_meta(
+        txn: &mut ShardTxn<'_>,
+        id: &str,
+        meta: &DocMeta,
+    ) -> std::result::Result<(), ApiError> {
+        let old = txn.get_meta(id)?.as_ref().and_then(meta_state);
+        let bytes = serde_json::to_vec(meta).unwrap();
+        txn.put_meta(id, &bytes, old, meta_state(meta), meta.seq)?;
+        Ok(())
+    }
+
+    /// Write a new revision of `id` on top of its winner (or create it),
+    /// with its body, sequence entry and metadata, as a document write does:
+    /// everything is read before the first write. The new revision.
+    pub(crate) fn write_doc(
+        txn: &mut ShardTxn<'_>,
+        id: &str,
+        deleted: bool,
+        body: &[u8],
+        n: u64,
+    ) -> std::result::Result<String, ApiError> {
+        let stored = txn.get_meta(id)?;
+        let old = stored.as_ref().and_then(meta_state);
+        let mut meta = stored.unwrap_or_default();
+        let mut path: Vec<Rev> = match meta.tree.winner() {
+            Some(winner) => meta
+                .tree
+                .path(&winner)
+                .unwrap()
+                .iter()
+                .filter_map(|rev| Rev::parse(rev))
+                .collect(),
+            None => Vec::new(),
+        };
+        let pos = path.last().map_or(0, |rev| rev.pos) + 1;
+        let rev = format!("{pos}-{n:032x}");
+        path.push(Rev::parse(&rev).unwrap());
+        meta.tree.merge_path(&path, deleted);
+        let old_seq = meta.seq;
+        let seq = txn.next_seq();
+        meta.seq = seq;
+        txn.put_body(id, &rev, body)?;
+        txn.put_seq(seq, id)?;
+        if old_seq != 0 {
+            txn.remove_seq(old_seq)?;
+        }
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        txn.put_meta(id, &bytes, old, meta_state(&meta), seq)?;
+        Ok(rev)
+    }
+
+    fn live_ids(shard: &mut Shard) -> Vec<String> {
+        shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap()
+    }
+
+    fn counts(shard: &mut Shard) -> (u64, u64) {
+        shard.read(|txn| Ok(txn.counts())).unwrap()
+    }
+
+    fn body_keys(shard: &mut Shard) -> Vec<(String, String)> {
+        shard
+            .read(|txn| {
+                let mut keys = Vec::new();
+                let all = (Unbounded, Unbounded);
+                txn.scan(BODIES, Table::Bodies, all, false, |(id, rev), _| {
+                    keys.push((id.to_string(), rev.to_string()));
+                    Ok(true)
+                })?;
+                Ok(keys)
+            })
+            .unwrap()
+    }
+
     #[test]
     fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
-        let dir = temp_shard_dir("sweep-slash");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let file = temp_file("sweep-slash");
+        let mut shard = open(&file);
         let tree = |edges: &[(&str, Option<&str>)]| {
             let edges: BTreeMap<&str, Option<&str>> = edges.iter().copied().collect();
             let tree: RevTree =
                 serde_json::from_value(serde_json::json!({"edges": edges, "deleted": []})).unwrap();
             DocMeta { tree, seq: 1 }
         };
-        let mut tx = Tx::new();
-        // The only leaf of "doc" has a '/' in its revision id.
-        tx.put_json(&meta_key("doc"), &tree(&[("1-x/y", None)]))
+        shard
+            .write(move |txn| {
+                // The only leaf of "doc" has a '/' in its revision id.
+                put_doc_meta(txn, "doc", &tree(&[("1-x/y", None)]))?;
+                txn.put_body("doc", "1-x/y", b"{}")?;
+                // "p" has a stale parent and a leaf, both with '/'.
+                put_doc_meta(
+                    txn,
+                    "p",
+                    &tree(&[("1-p/q", None), ("2-r/s", Some("1-p/q"))]),
+                )?;
+                txn.put_body("p", "1-p/q", b"{}")?;
+                txn.put_body("p", "2-r/s", b"{}")?;
+                // Under a joined key, a/1-b/c read as "a" with leaf "1-b/c"
+                // or as "a/1-b" with rev "c"; each is a leaf of its own.
+                put_doc_meta(txn, "a", &tree(&[("1-b/c", None)]))?;
+                put_doc_meta(txn, "a/1-b", &tree(&[("2-z", None)]))?;
+                txn.put_body("a", "1-b/c", b"{}")?;
+                txn.put_body("a/1-b", "2-z", b"{}")?;
+                Ok(())
+            })
             .unwrap();
-        tx.put(&body_key("doc", "1-x/y"), b"{}");
-        // "p" has a stale parent and a leaf, both with '/'.
-        tx.put_json(
-            &meta_key("p"),
-            &tree(&[("1-p/q", None), ("2-r/s", Some("1-p/q"))]),
-        )
-        .unwrap();
-        tx.put(&body_key("p", "1-p/q"), b"{}");
-        tx.put(&body_key("p", "2-r/s"), b"{}");
-        // d/a/1-b/c is "a" with leaf "1-b/c" or "a/1-b" with rev "c": it
-        // stays because one reading makes it a leaf.
-        tx.put_json(&meta_key("a"), &tree(&[("1-b/c", None)]))
-            .unwrap();
-        tx.put_json(&meta_key("a/1-b"), &tree(&[("2-z", None)]))
-            .unwrap();
-        tx.put(&body_key("a", "1-b/c"), b"{}");
-        tx.put(&body_key("a/1-b", "2-z"), b"{}");
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
 
         shard.compact().unwrap();
 
-        let mut left = Vec::new();
-        shard
-            .scan_range_while(b"d/", None, false, |key, _| {
-                left.push(key.to_vec());
-                true
-            })
-            .unwrap();
-        let mut expected = vec![
-            body_key("doc", "1-x/y"),
-            body_key("p", "2-r/s"),
-            body_key("a", "1-b/c"),
-            body_key("a/1-b", "2-z"),
-        ];
+        let mut expected: Vec<(String, String)> = [
+            ("doc", "1-x/y"),
+            ("p", "2-r/s"),
+            ("a", "1-b/c"),
+            ("a/1-b", "2-z"),
+        ]
+        .iter()
+        .map(|(id, rev)| (id.to_string(), rev.to_string()))
+        .collect();
         expected.sort();
-        assert_eq!(left, expected);
+        assert_eq!(body_keys(&mut shard), expected);
         drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn compaction_sweeps_stale_bodies_in_several_batches() {
-        let dir = temp_shard_dir("sweep");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let file = temp_file("sweep");
+        let mut shard = open(&file);
         let old = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let new = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let mut tree = RevTree::default();
@@ -2234,336 +2948,464 @@ mod scan_tests {
         let doc_meta = DocMeta { tree, seq: 1 };
         // Ids with '/' sort between and around each other's keys.
         let ids = ["a", "a/b", "a/b/c", "a0", "b", "b/", "c", "d/e", "e", "f"];
-        let mut tx = Tx::new();
-        for id in ids {
-            tx.put_json(&meta_key(id), &doc_meta).unwrap();
-            tx.put(&body_key(id, &old.to_string()), b"{}");
-            tx.put(&body_key(id, &new.to_string()), b"{}");
-        }
-        tx.put(&body_key("ghost/x", &old.to_string()), b"{}");
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
+        let (old_rev, new_rev) = (old.to_string(), new.to_string());
+        shard
+            .write(move |txn| {
+                for id in ids {
+                    put_doc_meta(txn, id, &doc_meta)?;
+                    txn.put_body(id, &old_rev, b"{}")?;
+                    txn.put_body(id, &new_rev, b"{}")?;
+                }
+                txn.put_body("ghost/x", &old_rev, b"{}")?;
+                Ok(())
+            })
+            .unwrap();
 
         shard.compact().unwrap();
 
-        let mut left = Vec::new();
-        shard
-            .scan_range_while(b"d/", None, false, |key, _| {
-                left.push(key.to_vec());
-                true
-            })
-            .unwrap();
-        let mut expected: Vec<Vec<u8>> = ids
+        let mut expected: Vec<(String, String)> = ids
             .iter()
-            .map(|id| body_key(id, &new.to_string()))
+            .map(|id| (id.to_string(), new.to_string()))
             .collect();
         expected.sort();
-        assert_eq!(left, expected, "only leaf bodies survive");
+        assert_eq!(body_keys(&mut shard), expected, "only leaf bodies survive");
         drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn counters_track_live_and_deleted_documents_across_reopen() {
-        let dir = std::env::temp_dir().join(format!("douchdb-counts-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.counts(), (0, 0));
+        let file = temp_file("counts");
+        let mut shard = open(&file);
+        assert_eq!(counts(&mut shard), (0, 0));
 
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
-        tx.put_json(&meta_key("c"), &meta(true, 3)).unwrap();
-        shard.commit(tx).unwrap();
-        assert_eq!(shard.counts(), (2, 1));
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(false, 1))?;
+                put_doc_meta(txn, "b", &meta(false, 2))?;
+                put_doc_meta(txn, "c", &meta(true, 3))
+            })
+            .unwrap();
+        assert_eq!(counts(&mut shard), (2, 1));
 
         // Turn a live doc into a deleted one, and purge another entirely.
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(true, 4)).unwrap();
-        tx.delete(&meta_key("b"));
-        shard.commit(tx).unwrap();
-        assert_eq!(shard.counts(), (0, 2));
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(true, 4))?;
+                let old = txn.get_meta("b")?.as_ref().and_then(meta_state);
+                Ok(txn.remove_meta("b", old)?)
+            })
+            .unwrap();
+        assert_eq!(counts(&mut shard), (0, 2));
 
-        shard.flush_pending().unwrap();
         drop(shard);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.counts(), (0, 2), "counters survive reopen");
+        let mut shard = open(&file);
+        assert_eq!(counts(&mut shard), (0, 2), "counters survive reopen");
+        drop(shard);
+        remove(&file);
+    }
 
-        // A shard whose counters are missing: open must recount them from the
-        // metadata.
-        shard.db.delete(b"z/doc_count").unwrap();
-        shard.db.delete(b"z/doc_deleted_count").unwrap();
-        shard.db.flush().unwrap();
+    /// A shard file that lost a table, or every setting, is damaged: it
+    /// used to be filled in again on open (a new uuid, zeroed counters),
+    /// now the open fails and the file is left as it is.
+    #[test]
+    fn a_shard_missing_a_table_or_its_settings_fails_to_open() {
+        for damage in ["bodies", "settings"] {
+            let file = temp_file("no-table");
+            {
+                let db = kv::open(&file, CACHE).unwrap();
+                let txn = kv::begin_write(&db).unwrap();
+                if damage == "bodies" {
+                    txn.delete_table(BODIES).unwrap();
+                } else {
+                    txn.open_table(SETTINGS)
+                        .unwrap()
+                        .retain(|_, _| false)
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            let error = Shard::open(&file, 1000, CACHE)
+                .err()
+                .expect("must refuse to open");
+            assert!(
+                error.to_string().contains("corrupt shard"),
+                "{damage}: {error}"
+            );
+            let db = kv::open(&file, CACHE).unwrap();
+            let txn = db.begin_read().unwrap();
+            if damage == "bodies" {
+                assert!(txn.open_table(BODIES).is_err(), "the table was recreated");
+            } else {
+                let settings = txn.open_table(SETTINGS).unwrap();
+                assert!(
+                    settings.first().unwrap().is_none(),
+                    "settings were refilled"
+                );
+            }
+            drop(txn);
+            drop(db);
+            remove(&file);
+        }
+    }
+
+    /// A shard whose newest commit is damaged fails to open, so every
+    /// request to it fails closed, rather than serving the commit before it
+    /// as if the newest had never been acknowledged.
+    #[test]
+    fn damage_to_the_newest_commit_is_corruption_not_rollback() {
+        const NEWEST: &str = "<<douchdb-shard-newest-commit>>";
+        let file = temp_file("newest");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| write_doc(txn, "older", false, b"{}", 1))
+            .unwrap();
+        let body = format!("{{\"m\":\"{}\"}}", NEWEST.repeat(64));
+        shard
+            .write(move |txn| write_doc(txn, "newest", false, body.as_bytes(), 2))
+            .unwrap();
+        // The file as a crash right after that commit leaves it (a clean
+        // close commits again), then damaged where only that commit wrote.
+        let mut bytes = std::fs::read(&file).unwrap();
         drop(shard);
-        let shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.counts(), (0, 2), "missing counters are backfilled");
-        let _ = std::fs::remove_dir_all(&dir);
+        let hits: Vec<usize> = bytes
+            .windows(NEWEST.len())
+            .enumerate()
+            .filter(|(_, window)| *window == NEWEST.as_bytes())
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!hits.is_empty(), "the newest commit's body was not found");
+        for at in hits {
+            bytes[at + 3] ^= 0x55;
+        }
+        std::fs::write(&file, bytes).unwrap();
+        kv::forget_verified(&file);
+
+        for _ in 0..2 {
+            match Shard::open(&file, 1000, CACHE) {
+                Err(error) => assert!(
+                    error.chain().any(|cause| matches!(
+                        cause.downcast_ref::<redb::DatabaseError>(),
+                        Some(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                            _
+                        )))
+                    )),
+                    "{error:#}"
+                ),
+                Ok(mut shard) => panic!(
+                    "opened with its newest commit damaged: newest = {:?}",
+                    shard.read(|txn| Ok(txn.get_meta("newest")?)).unwrap()
+                ),
+            }
+        }
+        remove(&file);
+    }
+
+    /// The settings a fresh file is created with are its state: one that
+    /// lost any of them is damaged, not new, and must not open as if empty.
+    #[test]
+    fn a_shard_missing_a_setting_fails_to_open() {
+        for setting in [UUID, SEQ, DOC_COUNT, DELETED_COUNT] {
+            let file = temp_file("no-setting");
+            let mut shard = open(&file);
+            shard
+                .write(move |txn| Ok(txn.remove_value(SETTINGS, setting)?))
+                .unwrap();
+            drop(shard);
+            let error = Shard::open(&file, 1000, CACHE)
+                .err()
+                .expect("must refuse to open");
+            assert!(error.to_string().contains("corrupt shard"), "{error}");
+            remove(&file);
+        }
     }
 
     #[test]
-    fn failed_flush_restores_the_state_on_disk() {
-        let dir = temp_shard_dir("flush-fail");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, shard.next_seq()))
+    fn a_failed_commit_leaves_the_state_on_disk() {
+        let file = temp_file("commit-fail");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "a", &meta(false, seq))
+            })
             .unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        // Build the lazy indexes so the failure has to repair them too.
+        // Build the lazy indexes so the failure has to leave them alone too.
         assert_eq!(live_ids(&mut shard), vec!["a"]);
-        assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
+        let seq_of = |shard: &mut Shard, id: &'static str| {
+            shard
+                .read(move |txn| Ok(txn.latest_changes()?.seq_of(id)))
+                .unwrap()
+        };
+        assert_eq!(seq_of(&mut shard, "a"), Some(1));
 
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("b"), &meta(false, shard.next_seq()))
+        let failed = shard.write(|txn| {
+            txn.inject_commit_failure();
+            let seq = txn.next_seq();
+            put_doc_meta(txn, "b", &meta(false, seq))
+        });
+        assert!(failed.is_err());
+
+        assert!(shard.read(|txn| Ok(txn.get_meta("b")?)).unwrap().is_none());
+        assert_eq!(counts(&mut shard), (1, 0));
+        // Nothing of the failed group is committed, its sequence included.
+        assert_eq!(shard.seq(), 1);
+        assert_eq!(live_ids(&mut shard), vec!["a"]);
+        assert_eq!(seq_of(&mut shard, "b"), None);
+
+        let seq = shard
+            .write(|txn| {
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "c", &meta(false, seq))?;
+                Ok(seq)
+            })
             .unwrap();
-        shard.commit(tx).unwrap();
-        shard.inject_flush_failure();
-        assert!(shard.flush_pending().is_err());
-
-        assert!(
-            shard.get_checked(&meta_key("b")).unwrap().is_none(),
-            "unwritten doc visible"
-        );
-        assert_eq!(shard.counts(), (1, 0));
-        // The lost write's sequence is a gap, never handed out again.
-        assert_eq!(shard.seq, 2);
-        assert_eq!(shard.persisted_seq(), 1);
-        assert_eq!(live_ids(&mut shard), vec!["a"]);
-        assert_eq!(shard.latest_changes().unwrap().seq_of("b"), None);
-
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("c"), &meta(false, 3)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
+        assert_eq!(seq, 2);
         drop(shard);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut shard = open(&file);
         assert_eq!(live_ids(&mut shard), vec!["a", "c"]);
-        assert_eq!(shard.counts(), (2, 0));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn temp_shard_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    fn has_tables(dir: &std::path::Path) -> bool {
-        std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
-            matches!(
-                entry.path().extension().and_then(|ext| ext.to_str()),
-                Some("ldb" | "sst")
-            )
-        })
+        assert_eq!(counts(&mut shard), (2, 0));
+        drop(shard);
+        remove(&file);
     }
 
     #[test]
     fn shard_uuid_survives_reopen() {
-        let dir = temp_shard_dir("uuid-reopen");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let uuid = shard.uuid().to_string();
+        let file = temp_file("uuid-reopen");
+        let mut shard = open(&file);
+        let uuid = shard.read(|txn| Ok(txn.uuid().to_string())).unwrap();
         assert_eq!(uuid.len(), 32, "{uuid}");
-        let mut tx = Tx::new();
-        let seq = shard.next_seq();
-        tx.put_json(&meta_key("a"), &meta(false, seq)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
+        shard
+            .write(|txn| {
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "a", &meta(false, seq))
+            })
+            .unwrap();
         drop(shard);
 
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.uuid(), uuid);
-        assert_eq!(shard.next_seq(), 2, "the sequence continues after reopen");
+        let mut shard = open(&file);
+        assert_eq!(shard.read(|txn| Ok(txn.uuid().to_string())).unwrap(), uuid);
+        let next = shard.write(|txn| Ok(txn.next_seq())).unwrap();
+        assert_eq!(next, 2, "the sequence continues after reopen");
         // A cleared shard is a new copy: positions in the old one mean
         // nothing in it.
-        shard.clear().unwrap();
-        assert_ne!(shard.uuid(), uuid);
-        let cleared = shard.uuid().to_string();
+        shard.write(|txn| Ok(txn.clear()?)).unwrap();
+        let cleared = shard.read(|txn| Ok(txn.uuid().to_string())).unwrap();
+        assert_ne!(cleared, uuid);
         drop(shard);
-        let shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.uuid(), cleared);
+        let mut shard = open(&file);
+        assert_eq!(
+            shard.read(|txn| Ok(txn.uuid().to_string())).unwrap(),
+            cleared
+        );
         drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn cleared_shard_reopens_and_keeps_its_sequence() {
-        let dir = temp_shard_dir("clear-reopen");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        shard.seq = 7;
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        shard.db.compact_range(&[], &[]).unwrap();
-        assert!(has_tables(&dir));
-        shard.clear().unwrap();
-        assert_eq!(shard.counts(), (0, 0));
+        let file = temp_file("clear-reopen");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                for _ in 0..5 {
+                    txn.next_seq();
+                }
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "a", &meta(false, seq))?;
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "b", &meta(true, seq))?;
+                txn.put_local("l", b"{}")?;
+                txn.put_checkpoint("ae3:peer", b"{}")?;
+                txn.put_checkpoint("node-local", b"{}")?;
+                txn.set_revs_limit(7)?;
+                Ok(())
+            })
+            .unwrap();
+        shard.write(|txn| Ok(txn.clear()?)).unwrap();
+        assert_eq!(counts(&mut shard), (0, 0));
         drop(shard);
 
-        let shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.seq, 7, "sequence numbers never go backwards");
-        assert_eq!(shard.counts(), (0, 0));
+        let mut shard = open(&file);
+        assert_eq!(shard.seq(), 7, "sequence numbers never go backwards");
+        assert_eq!(counts(&mut shard), (0, 0));
+        let left = shard
+            .read(|txn| {
+                Ok((
+                    txn.get_meta("a")?.is_none(),
+                    txn.get_local("l")?,
+                    txn.checkpoints("")?,
+                    txn.revs_limit(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            left,
+            (
+                true,
+                None,
+                vec![("node-local".to_string(), b"{}".to_vec())],
+                7
+            ),
+            "the copy's contents go; node-local checkpoints and limits stay"
+        );
         drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn shard_with_tables_but_no_sequence_key_is_corrupt() {
-        let dir = temp_shard_dir("no-seq");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        shard.db.compact_range(&[], &[]).unwrap();
-        shard.db.delete(b"z/seq").unwrap();
-        shard.db.flush().unwrap();
-        drop(shard);
-        assert!(has_tables(&dir));
-        let error = Shard::open(&dir, 1000).err().expect("must refuse to open");
-        assert!(error.to_string().contains("corrupt shard"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fresh_shard_reopens_after_compaction() {
-        let dir = temp_shard_dir("fresh-compact");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let uuid = shard.uuid().to_string();
-        shard.db.compact_range(&[], &[]).unwrap();
-        drop(shard);
-        assert!(has_tables(&dir));
-        let shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.seq, 0);
-        assert_eq!(shard.uuid(), uuid);
-        drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn local_only_shard_reopens() {
-        let dir = temp_shard_dir("local-only");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put(&local_key("x"), b"{}");
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        shard.db.compact_range(&[], &[]).unwrap();
+        let file = temp_file("local-only");
+        let mut shard = open(&file);
+        shard.write(|txn| Ok(txn.put_local("x", b"{}")?)).unwrap();
         drop(shard);
-        assert!(has_tables(&dir));
-        let shard = Shard::open(&dir, 1000).unwrap();
-        assert_eq!(shard.seq, 0);
+        let mut shard = open(&file);
+        assert_eq!(shard.seq(), 0);
+        assert_eq!(
+            shard
+                .read(|txn| Ok(txn.get_local("x")?))
+                .unwrap()
+                .as_deref(),
+            Some(&b"{}"[..])
+        );
         drop(shard);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn corrupt_metadata_is_skipped_by_scans_and_fails_closed_elsewhere() {
-        let dir = temp_shard_dir("corrupt-meta");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, shard.next_seq()))
+        let file = temp_file("corrupt-meta");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "a", &meta(false, seq))?;
+                txn.put_raw(META, "p:bad", b"{not json");
+                Ok(())
+            })
             .unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        shard.put_raw(&meta_key("p:bad"), b"{not json");
 
         // Scans that serve many documents skip the record and count it.
         let before = crate::metrics::corrupt_records_skipped();
         assert_eq!(live_ids(&mut shard), ["a"]);
-        assert_eq!(shard.latest_changes().unwrap().through(u64::MAX).count(), 1);
-        assert_eq!(shard.partition_counts("p").unwrap(), (0, 0));
+        let rows = shard
+            .read(|txn| Ok(txn.latest_changes()?.through(u64::MAX).count()))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let partition = shard.read(|txn| Ok(txn.partition_counts("p")?)).unwrap();
+        assert_eq!(partition, (0, 0));
         assert!(crate::metrics::corrupt_records_skipped() >= before + 3);
-        // The anti-entropy fingerprint must not paper over it.
-        assert!(shard.fingerprint().is_err());
-
-        // Overwriting a record that cannot be parsed would make the counters
-        // guess what it used to be.
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("p:bad"), &meta(false, 2)).unwrap();
-        assert!(shard.commit(tx).is_err());
-        assert_eq!(shard.counts(), (1, 0));
-        assert_eq!(shard.seq, 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        // The anti-entropy fingerprint must not paper over it, and a point
+        // read fails rather than answering "missing".
+        assert!(shard.read(|txn| Ok(txn.fingerprint()?)).is_err());
+        let read = shard.read(|txn| Ok(txn.get_meta("p:bad")?));
+        assert!(read.is_err_and(|error| error.corrupt));
+        drop(shard);
+        remove(&file);
     }
 
+    /// A value whose checksum fails is an error everywhere, listings
+    /// included: it is never skipped as a corrupt record nor read as absent.
     #[test]
-    fn counter_backfill_fails_on_corrupt_metadata() {
-        let dir = temp_shard_dir("corrupt-backfill");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        shard.put_raw(&meta_key("p:bad"), b"{not json");
-        shard.delete_raw(b"z/doc_count");
-        shard.delete_raw(b"z/doc_deleted_count");
+    fn a_value_failing_its_checksum_fails_reads_and_listings() {
+        let file = temp_file("checksum");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                let seq = txn.next_seq();
+                put_doc_meta(txn, "a", &meta(false, seq))?;
+                // Written without a seal: its last four bytes are no CRC.
+                let Txn::Write(raw) = &txn.txn else {
+                    unreachable!()
+                };
+                raw.open_table(META)
+                    .unwrap()
+                    .insert("bad", br#"{"tree":{},"seq":9}"#.as_slice())
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let point = shard.read(|txn| Ok(txn.get_meta("bad")?)).unwrap_err();
+        assert!(
+            !point.corrupt,
+            "a checksum failure is not a skippable record"
+        );
+        assert!(point.reason.contains("checksum"), "{}", point.reason);
+        assert!(shard.read(|txn| Ok(txn.live_docs()?.len())).is_err());
+        assert!(shard
+            .read(|txn| Ok(txn.latest_changes()?.through(u64::MAX).count()))
+            .is_err());
         drop(shard);
-        assert!(Shard::open(&dir, 1000).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        remove(&file);
     }
 
     #[test]
     fn compaction_skips_a_corrupt_metadata_record_and_keeps_its_bodies() {
-        let dir = temp_shard_dir("corrupt-compact");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let file = temp_file("corrupt-compact");
+        let mut shard = open(&file);
         // A stale-looking body next to an unreadable metadata record: the
         // sweep cannot know it is stale, so it must keep it and carry on.
-        shard.put_raw(&meta_key("bad"), b"{not json");
-        shard.put_raw(&body_key("bad", "1-aaa"), b"{}");
+        shard
+            .write(|txn| {
+                txn.put_raw(META, "bad", b"{not json");
+                txn.put_raw(BODIES, ("bad", "1-aaa"), b"{}");
+                Ok(())
+            })
+            .unwrap();
         shard.compact().unwrap();
-        assert!(shard.get_body("bad", "1-aaa").unwrap().is_some());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn live_ids(shard: &mut Shard) -> Vec<String> {
-        shard.live_docs().unwrap().keys().cloned().collect()
+        let kept = shard.read(|txn| Ok(txn.get_body("bad", "1-aaa")?)).unwrap();
+        assert!(kept.is_some());
+        drop(shard);
+        remove(&file);
     }
 
     #[test]
     fn live_index_tracks_documents_and_rebuilds_on_open() {
-        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        tx.put_json(&meta_key("b"), &meta(true, 2)).unwrap();
-        shard.commit(tx).unwrap();
+        let file = temp_file("live");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(false, 1))?;
+                put_doc_meta(txn, "b", &meta(true, 2))
+            })
+            .unwrap();
         assert_eq!(live_ids(&mut shard), ["a"]);
 
         // Once built, the index follows deletions and new writes.
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(true, 3)).unwrap();
-        tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
-        shard.commit(tx).unwrap();
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(true, 3))?;
+                put_doc_meta(txn, "c", &meta(false, 4))
+            })
+            .unwrap();
         assert_eq!(live_ids(&mut shard), ["c"]);
-        shard.flush_pending().unwrap();
         drop(shard);
 
         // A fresh process rebuilds the index from metadata on first use.
-        let mut shard = Shard::open(&dir, 1000).unwrap();
+        let mut shard = open(&file);
         assert_eq!(live_ids(&mut shard), ["c"]);
-        assert_eq!(shard.counts(), (1, 2));
+        assert_eq!(counts(&mut shard), (1, 2));
 
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("d"), &meta(false, 5)).unwrap();
-        shard.commit(tx).unwrap();
+        shard
+            .write(|txn| put_doc_meta(txn, "d", &meta(false, 5)))
+            .unwrap();
         assert_eq!(live_ids(&mut shard), ["c", "d"]);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(shard);
+        remove(&file);
     }
 
     #[test]
     fn live_rank_follows_the_cursor_through_writes() {
-        let dir = temp_shard_dir("live-rank");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut seq = 0;
-        let mut tx = Tx::new();
-        for id in ["b", "d", "f", "h", "j"] {
-            seq += 1;
-            tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
-        }
-        shard.commit(tx).unwrap();
+        let file = temp_file("live-rank");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                for (seq, id) in (1..).zip(["b", "d", "f", "h", "j"]) {
+                    put_doc_meta(txn, id, &meta(false, seq))?;
+                }
+                Ok(())
+            })
+            .unwrap();
         let probes = ["a", "d", "e", "j", "z", "c", "f", "a", "h"];
         let check = |shard: &mut Shard| {
             for probe in probes {
@@ -2571,52 +3413,69 @@ mod scan_tests {
                     .iter()
                     .filter(|id| id.as_str() < probe)
                     .count();
-                assert_eq!(shard.live_rank(probe).unwrap(), expected, "rank of {probe}");
+                let rank = shard.read(move |txn| Ok(txn.live_rank(probe)?)).unwrap();
+                assert_eq!(rank, expected, "rank of {probe}");
             }
         };
         check(&mut shard);
         // Writes below, at and above the cursor key: insert, delete, update.
-        for (id, deleted) in [
+        for (seq, (id, deleted)) in (6..).zip([
             ("a", false),
             ("d", true),
             ("e", false),
             ("z", false),
             ("j", true),
-        ] {
-            shard.live_rank("f").unwrap();
-            seq += 1;
-            let mut tx = Tx::new();
-            tx.put_json(&meta_key(id), &meta(deleted, seq)).unwrap();
-            shard.commit(tx).unwrap();
+        ]) {
+            shard.read(|txn| Ok(txn.live_rank("f")?)).unwrap();
+            shard
+                .write(move |txn| put_doc_meta(txn, id, &meta(deleted, seq)))
+                .unwrap();
             check(&mut shard);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(shard);
+        remove(&file);
     }
 
     #[test]
     fn commit_keeps_the_latest_index_current() {
-        let dir = temp_shard_dir("latest-commit");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 1)).unwrap();
-        tx.put_json(&meta_key("b"), &meta(false, 2)).unwrap();
-        shard.commit(tx).unwrap();
-        assert_eq!(shard.latest_changes().unwrap().seq_of("a"), Some(1));
+        let file = temp_file("latest-commit");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(false, 1))?;
+                put_doc_meta(txn, "b", &meta(false, 2))
+            })
+            .unwrap();
+        let seq_a = shard
+            .read(|txn| Ok(txn.latest_changes()?.seq_of("a")))
+            .unwrap();
+        assert_eq!(seq_a, Some(1));
 
         // An update, a new document and a purge, committed with the index
         // built: it follows them without a rebuild.
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("a"), &meta(false, 3)).unwrap();
-        tx.put_json(&meta_key("c"), &meta(false, 4)).unwrap();
-        tx.delete(&meta_key("b"));
-        shard.commit(tx).unwrap();
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "a", &meta(false, 3))?;
+                put_doc_meta(txn, "c", &meta(false, 4))?;
+                let old = txn.get_meta("b")?.as_ref().and_then(meta_state);
+                Ok(txn.remove_meta("b", old)?)
+            })
+            .unwrap();
         assert!(shard.latest.is_some(), "the index was dropped, not updated");
-        let latest = shard.latest_changes().unwrap();
-        assert_eq!(latest.seq_of("a"), Some(3));
-        assert_eq!(latest.seq_of("b"), None);
-        assert_eq!(latest.through(u64::MAX).count(), 2);
-        assert_eq!(latest.count_after(3), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let seen = shard
+            .read(|txn| {
+                let latest = txn.latest_changes()?;
+                Ok((
+                    latest.seq_of("a"),
+                    latest.seq_of("b"),
+                    latest.through(u64::MAX).count(),
+                    latest.count_after(3),
+                ))
+            })
+            .unwrap();
+        assert_eq!(seen, (Some(3), None, 2, 1));
+        drop(shard);
+        remove(&file);
     }
 
     /// An idle shard holds no live or latest-changes entries, and the next
@@ -2624,155 +3483,83 @@ mod scan_tests {
     /// order come out as they did, and a write made while released shows.
     #[test]
     fn released_indexes_are_empty_and_rebuild_on_next_use() {
-        let dir = temp_shard_dir("release-indexes");
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let mut tx = Tx::new();
-        for (seq, id) in [(1, "a"), (2, "p:1"), (3, "p:2"), (4, "q:1"), (5, "z")] {
-            tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
-        }
-        tx.put_json(&meta_key("p:3"), &meta(true, 6)).unwrap();
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
+        let file = temp_file("release-indexes");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                for (seq, id) in [(1, "a"), (2, "p:1"), (3, "p:2"), (4, "q:1"), (5, "z")] {
+                    put_doc_meta(txn, id, &meta(false, seq))?;
+                }
+                put_doc_meta(txn, "p:3", &meta(true, 6))
+            })
+            .unwrap();
 
-        let observe = |shard: &mut Shard| {
-            let changes: Vec<(u64, String)> = shard
-                .latest_changes()
+        type Observed = (
+            Vec<String>,
+            usize,
+            (u64, u64),
+            usize,
+            usize,
+            usize,
+            Vec<(u64, String)>,
+        );
+        let observe = |shard: &mut Shard| -> Observed {
+            shard
+                .read(|txn| {
+                    let changes: Vec<(u64, String)> = txn
+                        .latest_changes()?
+                        .after(1)
+                        .map(|(seq, id)| (seq, id.to_string()))
+                        .collect();
+                    Ok((
+                        txn.live_docs()?.keys().cloned().collect(),
+                        txn.live_rank("q:")?,
+                        txn.partition_counts("p")?,
+                        txn.partition_offset("p", "p:2", true)?,
+                        txn.pending_changes(3, false)?,
+                        txn.pending_changes(3, true)?,
+                        changes,
+                    ))
+                })
                 .unwrap()
-                .after(1)
-                .map(|(seq, id)| (seq, id.to_string()))
-                .collect();
-            (
-                live_ids(shard),
-                shard.live_rank("q:").unwrap(),
-                shard.partition_counts("p").unwrap(),
-                shard.partition_offset("p", "p:2", true).unwrap(),
-                shard.pending_changes(3, false).unwrap(),
-                shard.pending_changes(3, true).unwrap(),
-                changes,
-            )
         };
+        let entries = |shard: &mut Shard| shard.read(|txn| Ok(txn.index_entries())).unwrap();
         let before = observe(&mut shard);
         assert_eq!(before.1, 3);
-        assert_eq!(shard.index_entries(), 5 + 6, "live plus latest");
+        assert_eq!(entries(&mut shard), 5 + 6, "live plus latest");
 
         shard.release_indexes();
-        assert_eq!(shard.index_entries(), 0);
+        assert_eq!(entries(&mut shard), 0);
         assert!(shard.rank_cursor.is_none() && shard.partition_ranks.is_empty());
         assert_eq!(observe(&mut shard), before, "rebuilt answers differ");
-        assert_eq!(shard.index_entries(), 5 + 6);
+        assert_eq!(entries(&mut shard), 5 + 6);
 
         // A write between the release and the rebuild is not lost.
         shard.release_indexes();
-        let mut tx = Tx::new();
-        tx.put_json(&meta_key("p:0"), &meta(false, 7)).unwrap();
-        tx.put_json(&meta_key("z"), &meta(true, 8)).unwrap();
-        shard.commit(tx).unwrap();
-        assert_eq!(shard.index_entries(), 0, "a write rebuilt the indexes");
+        shard
+            .write(|txn| {
+                put_doc_meta(txn, "p:0", &meta(false, 7))?;
+                put_doc_meta(txn, "z", &meta(true, 8))
+            })
+            .unwrap();
+        assert_eq!(entries(&mut shard), 0, "a write rebuilt the indexes");
         assert_eq!(live_ids(&mut shard), ["a", "p:0", "p:1", "p:2", "q:1"]);
-        assert_eq!(shard.partition_counts("p").unwrap(), (3, 1));
-        assert_eq!(shard.live_rank("q:").unwrap(), 4);
-        let latest = shard.latest_changes().unwrap();
-        assert_eq!(latest.seq_of("p:0"), Some(7));
-        assert_eq!(latest.seq_of("z"), Some(8));
-        assert_eq!(latest.through(u64::MAX).count(), 7);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scan_range_merges_overlay_and_stops_early_in_both_directions() {
-        let dir = std::env::temp_dir().join(format!("douchdb-range-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        // a, c and e are flushed to disk; b and d stay in the overlay, so
-        // every scan below has to interleave the two sources.
-        let mut tx = Tx::new();
-        for id in ["a", "c", "e"] {
-            tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
-        }
-        shard.commit(tx).unwrap();
-        shard.flush_pending().unwrap();
-        let mut tx = Tx::new();
-        for id in ["b", "d"] {
-            tx.put_json(&meta_key(id), &meta(false, 1)).unwrap();
-        }
-        shard.commit(tx).unwrap();
-
-        let mut forward = Vec::new();
-        shard
-            .scan_range_while(b"m/", Some(&meta_key("c")), false, |key, _| {
-                forward.push(String::from_utf8(key[2..].to_vec()).unwrap());
-                forward.len() < 2
+        let partition = shard.read(|txn| Ok(txn.partition_counts("p")?)).unwrap();
+        assert_eq!(partition, (3, 1));
+        assert_eq!(shard.read(|txn| Ok(txn.live_rank("q:")?)).unwrap(), 4);
+        let latest = shard
+            .read(|txn| {
+                let latest = txn.latest_changes()?;
+                Ok((
+                    latest.seq_of("p:0"),
+                    latest.seq_of("z"),
+                    latest.through(u64::MAX).count(),
+                ))
             })
             .unwrap();
-        assert_eq!(forward, ["c", "d"]);
-
-        let mut reverse = Vec::new();
-        shard
-            .scan_range_while(b"m/", Some(&meta_key("d")), true, |key, _| {
-                reverse.push(String::from_utf8(key[2..].to_vec()).unwrap());
-                reverse.len() < 2
-            })
-            .unwrap();
-        assert_eq!(reverse, ["d", "c"]);
-
-        // Starting exactly on a flushed key must include it.
-        let mut from_disk = Vec::new();
-        shard
-            .scan_range_while(b"m/", Some(&meta_key("c")), true, |key, _| {
-                from_disk.push(String::from_utf8(key[2..].to_vec()).unwrap());
-                from_disk.len() < 2
-            })
-            .unwrap();
-        assert_eq!(from_disk, ["c", "b"]);
-
-        let mut all_reverse = Vec::new();
-        shard
-            .scan_range_while(b"m/", None, true, |key, _| {
-                all_reverse.push(String::from_utf8(key[2..].to_vec()).unwrap());
-                true
-            })
-            .unwrap();
-        assert_eq!(all_reverse, ["e", "d", "c", "b", "a"]);
-
-        let mut all_forward = Vec::new();
-        shard
-            .scan_range_while(b"m/", None, false, |key, _| {
-                all_forward.push(String::from_utf8(key[2..].to_vec()).unwrap());
-                true
-            })
-            .unwrap();
-        assert_eq!(all_forward, ["a", "b", "c", "d", "e"]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scan_from_exact_key_includes_it() {
-        let dir = std::env::temp_dir().join(format!("douchdb-scan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        for seq in 1..=5u64 {
-            let mut tx = Tx::new();
-            tx.put(&seq_key(seq), format!("doc{seq}").as_bytes());
-            shard.commit(tx).unwrap();
-            // Sequences 1-3 on disk, 4-5 still in the overlay.
-            if seq == 3 {
-                shard.flush_pending().unwrap();
-            }
-        }
-        let all = shard.scan_from(b"s/", &seq_key(1)).unwrap();
-        assert_eq!(all.len(), 5, "scan from seq 1 must include seq 1");
-        let after = shard.scan_from(b"s/", &seq_key(2)).unwrap();
-        assert_eq!(after.len(), 4, "scan from seq 2 must skip seq 1");
-        let from_disk = shard.scan_from(b"s/", &seq_key(3)).unwrap();
-        assert_eq!(
-            from_disk.len(),
-            3,
-            "scan from seq 3 must include the flushed key"
-        );
-        let tail = shard.scan_from(b"s/", &seq_key(4)).unwrap();
-        assert_eq!(tail.len(), 2, "scan from seq 4 must include 4 and 5");
-        assert_eq!(shard.scan_from(b"s/", &seq_key(9)).unwrap().len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(latest, (Some(7), Some(8), 7));
+        drop(shard);
+        remove(&file);
     }
 
     #[test]
@@ -2845,47 +3632,1120 @@ mod scan_tests {
         assert_eq!(latest.seq_of("a"), Some(4));
     }
 
-    /// Updates delete the previous sequence entry. Once memtables have rolled
-    /// over, a newer table can hold a sequence tombstone right after a
-    /// metadata key range that does not contain a given document; that must
-    /// not make the document disappear from point reads.
-    #[test]
-    fn point_reads_survive_updates_across_memtable_rollovers() {
-        let dir = std::env::temp_dir().join(format!("douchdb-rollover-{}", crate::util::uuid()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut shard = Shard::open(&dir, 1000).unwrap();
-        let ids: Vec<String> = (0..40).map(|n| format!("doc{n:02}")).collect();
-        let mut seqs = vec![0u64; ids.len()];
-        let mut seq = 0u64;
+    /// A deterministic pseudo-random sequence (xorshift64).
+    pub(crate) struct Rng(pub(crate) u64);
 
-        for round in 0..8usize {
-            let mut tx = Tx::new();
-            for (n, id) in ids.iter().enumerate() {
-                // Round 0 creates everything; later rounds update a rotating
-                // subset of the low ids, so newer tables cover the range of
-                // the untouched high ids without containing them.
-                if round > 0 && (n >= 20 || (n + round) % 3 != 0) {
-                    continue;
-                }
-                seq += 1;
-                if seqs[n] != 0 {
-                    tx.delete(&seq_key(seqs[n]));
-                }
-                tx.put_json(&meta_key(id), &meta(false, seq)).unwrap();
-                tx.put(&seq_key(seq), id.as_bytes());
-                seqs[n] = seq;
+    impl Rng {
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A number below `n`.
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Every acknowledged write is on disk when the power goes, however the
+    /// writes were grouped and wherever the cut falls; a group in flight at
+    /// the cut is wholly there or wholly gone.
+    #[tokio::test]
+    async fn acknowledged_writes_survive_a_power_cut() {
+        let (_, switch) = PowerCut::new();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // Every acknowledged write: local id -> value.
+        let mut acknowledged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        // The shard file, made once; each round reopens it.
+        drop(Shard::create_over_backend(&switch, 1000).unwrap());
+        for round in 0..12u64 {
+            let handle = Arc::new(ShardHandle::over_backend(&switch).unwrap());
+            let writes = 20 + rng.below(40);
+            let cut_after = rng.below(writes);
+            let mut tasks = Vec::new();
+            for i in 0..writes {
+                let handle = handle.clone();
+                // Each write is a group's worth: a document and two locals,
+                // so a torn group would show as a part of one.
+                let ids: Vec<String> = (0..3).map(|k| format!("r{round}-w{i}-{k}")).collect();
+                groups.push(ids.clone());
+                let value = format!("{round}/{i}").into_bytes();
+                tasks.push(tokio::spawn(async move {
+                    let stored = value.clone();
+                    let result = handle
+                        .call(move |txn| {
+                            write_doc(txn, &ids[0], false, &stored, round * 1000 + i)?;
+                            txn.put_local(&ids[1], &stored)?;
+                            txn.put_local(&ids[2], &stored)?;
+                            Ok(ids)
+                        })
+                        .await;
+                    (result, value)
+                }));
             }
-            shard.commit(tx).unwrap();
-            shard.flush_pending().unwrap();
-            // Roll the memtable over into a table without compacting the
-            // existing ones (the range lies beyond every key in the shard).
-            shard.db.compact_range(b"\xfe", b"\xff").unwrap();
-        }
+            let mut done = 0;
+            for task in tasks {
+                let (result, value) = task.await.unwrap();
+                if let Ok(ids) = result {
+                    for id in ids {
+                        acknowledged.insert(id, value.clone());
+                    }
+                }
+                done += 1;
+                if done == cut_after {
+                    switch.cut();
+                }
+            }
+            if cut_after == 0 {
+                switch.cut();
+            }
+            drop(handle);
 
-        for (n, id) in ids.iter().enumerate() {
-            let found = shard.get_meta(id).unwrap();
-            assert_eq!(found.map(|m| m.seq), Some(seqs[n]), "{id}");
+            let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+            let (docs, locals) = shard
+                .read(|txn| {
+                    let docs: BTreeSet<String> = txn.live_docs()?.keys().cloned().collect();
+                    let locals: BTreeMap<String, Vec<u8>> = txn.locals()?.into_iter().collect();
+                    Ok((docs, locals))
+                })
+                .unwrap();
+            for (id, value) in &acknowledged {
+                let present = docs.contains(id) || locals.get(id) == Some(value);
+                assert!(present, "acknowledged write {id} lost in round {round}");
+            }
+            for ids in &groups {
+                let parts = usize::from(docs.contains(&ids[0]))
+                    + usize::from(locals.contains_key(&ids[1]))
+                    + usize::from(locals.contains_key(&ids[2]));
+                assert!(parts == 0 || parts == 3, "a torn group: {ids:?}");
+            }
+            assert_eq!(
+                shard.read(|txn| Ok(txn.counts())).unwrap().0,
+                docs.len() as u64,
+                "counters agree with the documents"
+            );
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!acknowledged.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::tests::{open, temp_file, write_doc};
+    use super::*;
+
+    type TestJob = Box<dyn FnOnce(&mut ShardTxn<'_>) -> std::result::Result<(), ApiError> + Send>;
+
+    fn handle(tag: &str) -> (Arc<ShardHandle>, PathBuf) {
+        let file = temp_file(tag);
+        let handle = ShardHandle::spawn(&file, 1000, tests::CACHE, Default::default()).unwrap();
+        (Arc::new(handle), file)
+    }
+
+    fn cleanup(handle: Arc<ShardHandle>, file: PathBuf) {
+        drop(handle);
+        kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Run `jobs` in one group, behind a first job that holds the actor until
+    /// every one of them is queued. The first job's answer, then theirs.
+    async fn grouped(
+        handle: &Arc<ShardHandle>,
+        jobs: Vec<TestJob>,
+    ) -> (
+        std::result::Result<(), ApiError>,
+        Vec<std::result::Result<(), ApiError>>,
+    ) {
+        let (started, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .call(move |_| {
+                        let _ = started.send(());
+                        held.recv().map_err(ApiError::internal)
+                    })
+                    .await
+            }
+        });
+        running.await.unwrap();
+        let count = jobs.len();
+        let tasks: Vec<_> = jobs
+            .into_iter()
+            .map(|job| {
+                let handle = handle.clone();
+                tokio::spawn(async move { handle.call(job).await })
+            })
+            .collect();
+        while handle.queued() < count {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        let first = first.await.unwrap();
+        let mut answers = Vec::new();
+        for task in tasks {
+            answers.push(task.await.unwrap());
+        }
+        (first, answers)
+    }
+
+    fn local(id: &'static str) -> TestJob {
+        Box::new(move |txn| Ok(txn.put_local(id, id.as_bytes())?))
+    }
+
+    async fn locals(handle: &ShardHandle) -> Vec<String> {
+        handle
+            .read(|txn| Ok(txn.locals()?.into_iter().map(|(id, _)| id).collect()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_group_commits_atomically_and_later_jobs_see_earlier_writes() {
+        let (handle, file) = handle("group-atomic");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let (first, answers) = grouped(
+            &handle,
+            vec![
+                Box::new(|txn| {
+                    write_doc(txn, "a", false, b"{}", 1)?;
+                    Ok(txn.put_local("one", b"1")?)
+                }),
+                Box::new(move |txn| {
+                    // The earlier job's writes, through the open transaction,
+                    // none of them committed yet.
+                    let mut seen = record.lock().unwrap();
+                    seen.push(format!("{:?}", txn.get_local("one")?));
+                    seen.push(format!("{:?}", txn.committed_local("one")));
+                    seen.push(format!("{:?}", txn.get_meta("a")?.map(|meta| meta.seq)));
+                    seen.push(format!("{}", txn.counts().0));
+                    write_doc(txn, "b", false, b"{}", 2)?;
+                    Ok(txn.put_local("two", b"2")?)
+                }),
+            ],
+        )
+        .await;
+        first.unwrap();
+        for answer in answers {
+            answer.unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["Some([49])", "None", "Some(1)", "1"],
+            "a later job sees the earlier job's uncommitted writes"
+        );
+        assert_eq!(
+            handle.committed_seq(),
+            2,
+            "sequences run on through the group"
+        );
+        assert_eq!(locals(&handle).await, ["one", "two"]);
+        let (docs, rows) = handle
+            .read(|txn| {
+                let rows: Vec<(u64, String)> = txn
+                    .latest_changes()?
+                    .after(0)
+                    .map(|(seq, id)| (seq, id.to_string()))
+                    .collect();
+                Ok((txn.counts(), rows))
+            })
+            .await
+            .unwrap();
+        assert_eq!(docs, (2, 0));
+        assert_eq!(rows, [(1, "a".to_string()), (2, "b".to_string())]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_fails_its_whole_group_and_writes_nothing() {
+        let (handle, file) = handle("group-panic");
+        handle
+            .call(|txn| Ok(txn.put_local("before", b"")?))
+            .await
+            .unwrap();
+        let (first, answers) = grouped(
+            &handle,
+            vec![
+                local("a"),
+                Box::new(|txn| {
+                    write_doc(txn, "doc", false, b"{}", 1)?;
+                    txn.put_local("b", b"")?;
+                    panic!("boom in a grouped job");
+                }),
+                // Queued behind the panic: it runs in the next group.
+                local("c"),
+            ],
+        )
+        .await;
+        for (who, answer) in [
+            ("first", &first),
+            ("a", &answers[0]),
+            ("panicker", &answers[1]),
+        ] {
+            let error = answer.as_ref().unwrap_err();
+            assert_eq!(error.status, 500, "{who}");
+            assert!(
+                error.reason.contains("boom in a grouped job"),
+                "{who}: {}",
+                error.reason
+            );
+        }
+        answers[2].as_ref().unwrap();
+        assert_eq!(locals(&handle).await, ["before", "c"]);
+        assert_eq!(
+            handle.committed_seq(),
+            0,
+            "the group's sequence is not committed"
+        );
+        let state = handle
+            .read(|txn| Ok((txn.counts(), txn.get_meta("doc")?.is_none())))
+            .await
+            .unwrap();
+        assert_eq!(state, ((0, 0), true));
+        // The shard serves on.
+        handle
+            .call(|txn| Ok(txn.put_local("after", b"")?))
+            .await
+            .unwrap();
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_job_error_before_writing_fails_only_that_job() {
+        let (handle, file) = handle("group-early-error");
+        let (first, answers) = grouped(
+            &handle,
+            vec![
+                Box::new(|txn| {
+                    write_doc(txn, "a", false, b"{}", 1)?;
+                    Ok(())
+                }),
+                Box::new(|txn| {
+                    // Validation fails after taking a sequence, before any
+                    // write: the sequence goes back.
+                    txn.next_seq();
+                    txn.get_meta("a")?;
+                    Err(ApiError::conflict())
+                }),
+                Box::new(|txn| {
+                    write_doc(txn, "b", false, b"{}", 2)?;
+                    Ok(())
+                }),
+            ],
+        )
+        .await;
+        first.unwrap();
+        answers[0].as_ref().unwrap();
+        assert_eq!(answers[1].as_ref().unwrap_err().status, 409);
+        answers[2].as_ref().unwrap();
+        let seqs = handle
+            .read(|txn| {
+                Ok((
+                    txn.get_meta("a")?.map(|meta| meta.seq),
+                    txn.get_meta("b")?.map(|meta| meta.seq),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(seqs, (Some(1), Some(2)), "no gap where the failed job was");
+        assert_eq!(handle.committed_seq(), 2);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_job_error_after_writing_fails_the_whole_group() {
+        let (handle, file) = handle("group-late-error");
+        let (first, answers) = grouped(
+            &handle,
+            vec![
+                local("a"),
+                Box::new(|txn| {
+                    write_doc(txn, "doc", false, b"{}", 1)?;
+                    txn.put_local("b", b"")?;
+                    Err(ApiError::bad_request("failed after writing"))
+                }),
+                local("c"),
+            ],
+        )
+        .await;
+        let failing = answers[1].as_ref().unwrap_err();
+        assert_eq!(failing.status, 400, "the failing job gets its own error");
+        for (who, answer) in [("first", &first), ("a", &answers[0])] {
+            let error = answer.as_ref().unwrap_err();
+            assert_eq!(error.status, 500, "{who}");
+            assert!(
+                error.reason.contains("failed after writing"),
+                "{who}: {}",
+                error.reason
+            );
+        }
+        answers[2].as_ref().unwrap();
+        assert_eq!(locals(&handle).await, ["c"]);
+        assert_eq!(handle.committed_seq(), 0);
+        let doc = handle.read(|txn| Ok(txn.get_meta("doc")?)).await.unwrap();
+        assert!(doc.is_none());
+        cleanup(handle, file);
+    }
+
+    /// A job that carries on past a failed write (as a batch write that turns
+    /// a storage error into per-document results would) still fails its
+    /// group: part of its writes may be in the transaction.
+    #[tokio::test]
+    async fn a_job_that_carries_on_past_a_failed_write_fails_the_whole_group() {
+        let (handle, file) = handle("group-swallowed-write");
+        let (first, answers) = grouped(
+            &handle,
+            vec![
+                local("a"),
+                Box::new(|txn| {
+                    txn.inject_write_failure(1);
+                    txn.put_local("b", b"")?;
+                    let swallowed = txn.put_local("c", b"");
+                    assert!(swallowed.is_err(), "the injected write failure");
+                    Ok(())
+                }),
+                local("d"),
+            ],
+        )
+        .await;
+        for (who, answer) in [
+            ("first", &first),
+            ("a", &answers[0]),
+            ("carrier", &answers[1]),
+        ] {
+            let error = answer.as_ref().unwrap_err();
+            assert_eq!(error.status, 500, "{who}");
+            assert!(
+                error.reason.contains("injected write failure"),
+                "{who}: {}",
+                error.reason
+            );
+        }
+        answers[2].as_ref().unwrap();
+        assert_eq!(locals(&handle).await, ["d"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_fails_only_its_caller() {
+        let (handle, file) = handle("panic");
+        let result: std::result::Result<(), ApiError> =
+            handle.call(|_| panic!("boom in job")).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.status, 500);
+        assert!(error.reason.contains("boom in job"), "{}", error.reason);
+        handle.call(|_| Ok(())).await.unwrap();
+        let read: std::result::Result<(), ApiError> = handle.read(|_| panic!("boom in read")).await;
+        assert!(read.unwrap_err().reason.contains("boom in read"));
+        handle.read(|_| Ok(())).await.unwrap();
+        cleanup(handle, file);
+    }
+
+    /// Nothing of a failed job is committed, its sequence included: the
+    /// next write takes the same number, which no reader ever saw.
+    #[tokio::test]
+    async fn a_failed_job_leaves_no_sequence_behind() {
+        let (handle, file) = handle("seq-failed");
+        let result: std::result::Result<(), ApiError> = handle
+            .call(|txn| {
+                txn.next_seq();
+                panic!("after taking a sequence");
+            })
+            .await;
+        assert!(result.is_err());
+        let result: std::result::Result<(), ApiError> = handle
+            .call(|txn| {
+                txn.next_seq();
+                Err(ApiError::bad_request("failed after taking a sequence"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(handle.committed_seq(), 0);
+        let next = handle
+            .call(|txn| write_doc(txn, "after", false, b"{}", 1).map(|_| txn.staged.seq))
+            .await
+            .unwrap();
+        assert_eq!(next, 1);
+        assert_eq!(handle.committed_seq(), 1);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_fails_the_caller_and_leaves_no_trace() {
+        let (handle, file) = handle("commit-fail");
+        handle
+            .call(|txn| Ok(txn.put_local("one", b"v")?))
+            .await
+            .unwrap();
+        handle
+            .call(|txn| {
+                txn.inject_commit_failure();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(handle
+            .call(|txn| Ok(txn.put_local("two", b"v")?))
+            .await
+            .is_err());
+        assert_eq!(locals(&handle).await, ["one"]);
+        handle
+            .call(|txn| Ok(txn.put_local("three", b"v")?))
+            .await
+            .unwrap();
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn jobs_run_on_a_dedicated_thread_not_a_tokio_worker() {
+        let (handle, file) = handle("thread");
+        let (in_runtime, name) = handle
+            .call(|_| {
+                Ok((
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    std::thread::current().name().map(str::to_string),
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(!in_runtime, "shard job ran inside a Tokio runtime");
+        assert!(
+            name.as_deref().is_some_and(|n| n.starts_with("shard-")),
+            "unexpected thread name {name:?}"
+        );
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn compact_works_from_the_actor_outside_a_multi_thread_runtime() {
+        let (handle, file) = handle("compact");
+        handle
+            .call(|txn| write_doc(txn, "a", false, b"{}", 1))
+            .await
+            .unwrap();
+        handle
+            .alone(|shard| shard.compact().map_err(ApiError::from))
+            .await
+            .unwrap();
+        let rev = format!("1-{:032x}", 1);
+        let body = handle
+            .read(move |txn| Ok(txn.get_body("a", &rev)?))
+            .await
+            .unwrap();
+        assert_eq!(body.as_deref(), Some(b"{}".as_slice()));
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_releases_the_file() {
+        let (handle, file) = handle("drop");
+        handle
+            .call(|txn| Ok(txn.put_local("kept", b"v")?))
+            .await
+            .unwrap();
+        let handle = Arc::into_inner(handle).unwrap();
+        drop(handle);
+        // No waiting: redb's lock on the file must already be released.
+        let mut reopened = open(&file);
+        let kept = reopened.read(|txn| Ok(txn.get_local("kept")?)).unwrap();
+        assert_eq!(kept.as_deref(), Some(b"v".as_slice()));
+        drop(reopened);
+        kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A handle closed normally is checked and recorded verified; one
+    /// discarded (a database whose open failed) is closed unchecked and
+    /// records nothing.
+    #[tokio::test]
+    async fn a_discarded_handle_closes_its_file_unchecked() {
+        let (handle, file) = handle("discard");
+        let handle = Arc::into_inner(handle).unwrap();
+        handle.discard();
+        assert!(!kv::is_verified(&file), "a discarded shard was verified");
+        let reopened = ShardHandle::spawn(&file, 1000, tests::CACHE, Default::default()).unwrap();
+        drop(reopened);
+        assert!(kv::is_verified(&file), "a normal close was not verified");
+        kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn data_written_before_a_panic_survives_and_the_partial_job_is_discarded() {
+        let (handle, file) = handle("partial");
+        handle
+            .call(|txn| Ok(txn.put_local("before", b"v")?))
+            .await
+            .unwrap();
+        let result: std::result::Result<(), ApiError> = handle
+            .call(|txn| {
+                txn.put_local("partial", b"v")?;
+                panic!("after partial write");
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(locals(&handle).await, ["before"]);
+        cleanup(handle, file);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::tests::{write_doc, CACHE};
+    use super::*;
+    use crate::kv::powercut::{PowerCut, PowerSwitch};
+    use std::io::ErrorKind;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{mpsc::UnboundedReceiver, watch};
+
+    /// A shard on its own actor over a test disk. Every open after the
+    /// first (a recovery) reports on `opening` whether `held` was set, then
+    /// waits for `go`.
+    struct Rig {
+        switch: PowerSwitch,
+        handle: Arc<ShardHandle>,
+        held: Arc<AtomicBool>,
+        opening: UnboundedReceiver<bool>,
+        go: std::sync::mpsc::Sender<()>,
+        committed: Arc<watch::Sender<()>>,
+    }
+
+    fn rig() -> Rig {
+        let (_, switch) = PowerCut::new();
+        let held = Arc::new(AtomicBool::new(false));
+        let (opening_tx, opening) = tokio::sync::mpsc::unbounded_channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let committed: Arc<watch::Sender<()>> = Default::default();
+        let disk = switch.clone();
+        let lease_held = Arc::clone(&held);
+        let mut first = true;
+        let open: Opener = Box::new(move || {
+            let creating = std::mem::take(&mut first);
+            if !creating {
+                let _ = opening_tx.send(lease_held.load(Ordering::SeqCst));
+                go_rx.recv()?;
+            }
+            let db = kv::open_with(disk.backend(), CACHE)?;
+            // Only the first open makes the file, as `create_file` would; a
+            // recovery reopens what the disk holds.
+            if creating {
+                init_tables(&db)?;
+            }
+            Ok(db)
+        });
+        let handle = ShardHandle::spawn_with(
+            "shard-recovery".to_string(),
+            Arc::clone(&committed),
+            move || Shard::over_test_opener(open, 1000),
+        )
+        .unwrap();
+        Rig {
+            switch,
+            handle: Arc::new(handle),
+            held,
+            opening,
+            go,
+            committed,
+        }
+    }
+
+    /// Write a new document `id`; its sequence.
+    async fn put(handle: &ShardHandle, id: &str, n: u64) -> std::result::Result<u64, ApiError> {
+        let id = id.to_string();
+        handle
+            .call(move |txn| {
+                write_doc(txn, &id, false, b"{}", n)?;
+                Ok(txn.staged.seq)
+            })
+            .await
+    }
+
+    /// A write on a full disk, started.
+    fn put_on_full_disk(
+        rig: &Rig,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<std::result::Result<u64, ApiError>> {
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let handle = Arc::clone(&rig.handle);
+        tokio::spawn(async move { put(&handle, id, 99).await })
+    }
+
+    /// Wait until the shard reopens its file, failing if `write` is answered
+    /// first: the answer to a failed commit comes after the recovery.
+    async fn reopening<T: std::fmt::Debug>(
+        rig: &mut Rig,
+        write: &mut tokio::task::JoinHandle<std::result::Result<T, ApiError>>,
+    ) -> bool {
+        tokio::select! {
+            held = rig.opening.recv() => held.unwrap(),
+            answer = write => panic!("answered without reopening the file: {answer:?}"),
+        }
+    }
+
+    /// The sequence index in a lease of its own: (sequence, id) pairs.
+    async fn by_seq(handle: &ShardHandle) -> Vec<(u64, String)> {
+        handle
+            .lease(|s| {
+                let mut rows = Vec::new();
+                s.txn.scan(Table::BySeq, .., false, |key, id| {
+                    rows.push((gate::key::split_seq(key)?, String::from_utf8(id.to_vec())?));
+                    Ok(true)
+                })?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+    }
+
+    fn rows(ids: &[(u64, &str)]) -> Vec<(u64, String)> {
+        ids.iter().map(|(seq, id)| (*seq, id.to_string())).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_commit_reopens_the_shard_and_keeps_acknowledged_writes() {
+        let mut rig = rig();
+        assert_eq!(put(&rig.handle, "a", 1).await.unwrap(), 1);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing
+            .await
+            .unwrap()
+            .expect_err("a write to a full disk was acknowledged");
+        assert_eq!(error.status, 500, "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.committed_seq(), 2);
+        assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
+        assert_eq!(
+            by_seq(&rig.handle).await,
+            rows(&[(1, "a"), (2, "b"), (3, "c")])
+        );
+        let counts = rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+        assert_eq!(counts, (3, 0));
+
+        // And on disk.
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a", "b", "c"]);
+        assert_eq!(shard.seq(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shard_that_cannot_reopen_fails_closed() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        // A job queued behind the recovery.
+        let queued = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.read(|txn| Ok(txn.counts())).await }
+        });
+        while rig.handle.queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+        // The disk is still full, so the file cannot be opened.
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        let error = queued.await.unwrap().unwrap_err();
+        assert!(error.reason.contains("has failed"), "{error:?}");
+        assert!(
+            matches!(rig.handle.state(), ShardState::Failed(_)),
+            "{:?}",
+            rig.handle.state()
+        );
+
+        // Room on the disk again does not bring it back: every request
+        // fails until the database is next opened.
+        rig.switch.restore_writes();
+        fn failed<T: std::fmt::Debug>(result: std::result::Result<T, ApiError>) {
+            let error = result.expect_err("a failed shard answered");
+            assert_eq!(error.status, 500, "{error:?}");
+        }
+        failed(put(&rig.handle, "b", 2).await);
+        failed(rig.handle.read(|txn| Ok(txn.counts())).await);
+        failed(rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await);
+        failed(rig.handle.alone(|shard| Ok(shard.seq())).await);
+        assert_eq!(rig.handle.committed_seq(), 1);
+
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a"]);
+    }
+
+    /// A commit can report an error and still be on the disk (here, its
+    /// writes reached the disk and only the sync failed). The recovered
+    /// shard serves exactly what the file holds: the landed write, its
+    /// sequence and counters, and the published position advanced to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_commit_that_landed_is_served_after_recovery() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        let mut commits = rig.committed.subscribe();
+        commits.mark_unchanged();
+
+        // The commit's pages sync; the sync of the header that makes them
+        // the newest commit fails, after the header was written.
+        rig.switch.fail_syncs_after(1, ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "landed", 2).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(
+            rig.handle.committed_seq(),
+            2,
+            "the landed commit is published"
+        );
+        assert!(commits.has_changed().unwrap(), "feeds were not woken");
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a"), (2, "landed")]));
+        let (counts, latest) = rig
+            .handle
+            .read(|txn| {
+                let latest: Vec<(u64, String)> = txn
+                    .latest_changes()?
+                    .after(0)
+                    .map(|(seq, id)| (seq, id.to_string()))
+                    .collect();
+                Ok((txn.counts(), latest))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (2, 0));
+        assert_eq!(latest, rows(&[(1, "a"), (2, "landed")]));
+        assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
+        assert_eq!(rig.handle.committed_seq(), 3);
+    }
+
+    /// A commit whose first sync, of its pages, fails never lands: the
+    /// header that would make it the newest commit is not written. The
+    /// recovered shard serves the commit before it, and so does the disk
+    /// after a power cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_whose_page_sync_fails_is_not_served_after_recovery() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_syncs_after(0, ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "lost", 2).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.committed_seq(), 1);
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a")]));
+        let lost = rig
+            .handle
+            .lease(|s| Ok(s.get_meta("lost")?.is_some()))
+            .await
+            .unwrap();
+        assert!(!lost, "the failed commit is served");
+        let counts = rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+        assert_eq!(counts, (1, 0));
+        assert_eq!(put(&rig.handle, "c", 2).await.unwrap(), 2);
+
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        switch.cut();
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a", "c"]);
+        assert_eq!(shard.seq(), 2);
+    }
+
+    /// The published position never goes back: a file that comes back
+    /// without changes that were acknowledged (here, a disk that ignored
+    /// syncs and then lost power) fails the shard instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reopened_file_missing_acknowledged_changes_fails_closed() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        rig.switch.ignore_syncs();
+        put(&rig.handle, "b", 2).await.unwrap();
+        rig.switch.cut();
+
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "c", 3).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        match rig.handle.state() {
+            ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
+            state => panic!("served a file that lost acknowledged changes: {state:?}"),
+        }
+        assert_eq!(rig.handle.committed_seq(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_waits_for_a_reader_holding_a_lease() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            let held = Arc::clone(&rig.held);
+            async move {
+                handle
+                    .lease(move |s| {
+                        held.store(true, Ordering::SeqCst);
+                        let found = s.get_meta("a")?.is_some();
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        held.store(false, Ordering::SeqCst);
+                        Ok(found)
+                    })
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        let mut failing = put_on_full_disk(&rig, "lost");
+        // The recovery has closed the gate and waits for the lease.
+        rig.handle.gate.closed().await;
+        release_tx.send(()).unwrap();
+        assert!(
+            !reopening(&mut rig, &mut failing).await,
+            "reopened while a lease was out"
+        );
+        assert!(reader.await.unwrap().unwrap());
+
+        // A read asked for during the reopen waits, then runs on the new file.
+        let waiting = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await }
+        });
+        rig.handle.gate.waiting_reads(1).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        assert!(waiting.await.unwrap().unwrap());
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_io_error_inside_a_group_reopens_the_shard() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        // Too big for the page cache: its pages reach the disk, and fail,
+        // before the group gets to commit.
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move {
+                handle
+                    .call(|txn| write_doc(txn, "big", false, &vec![b'x'; 8 << 20], 2))
+                    .await
+            }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert_eq!(error.status, 500, "{error:?}");
+        assert!(
+            !error.reason.starts_with("shard commit failed"),
+            "the write did not fail before the commit: {error:?}"
+        );
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a"), (2, "b")]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_left_failing_by_a_job_run_alone_is_reopened() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let failed = rig
+            .handle
+            .alone(|shard| {
+                let commit = || -> Result<()> {
+                    let txn = shard.gate.begin_write_txn()?;
+                    txn.open_table(LOCAL)?
+                        .insert("x", kv::seal(b"x").as_slice())?;
+                    txn.commit()?;
+                    Ok(())
+                };
+                commit().map_err(ApiError::from)
+            })
+            .await;
+        assert!(failed.is_err());
+        // The job has answered; the actor reopens the file before the next
+        // job, a read, which would otherwise meet the failing handle.
+        let mut next = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.read(|txn| Ok(txn.counts())).await }
+        });
+        reopening(&mut rig, &mut next).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(next.await.unwrap().unwrap(), (1, 0));
+        assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+    }
+
+    /// A test disk that lost its settings is reopened as the damaged file
+    /// it is, not initialised again as a new shard: only the first open of a
+    /// test disk creates its tables.
+    #[test]
+    fn a_test_disk_that_lost_its_settings_does_not_reopen_as_new() {
+        let (_, switch) = PowerCut::new();
+        let shard = Shard::create_over_backend(&switch, 1000).unwrap();
+        let txn = shard.gate.begin_write_txn().unwrap();
+        txn.open_table(SETTINGS)
+            .unwrap()
+            .retain(|_, _| false)
+            .unwrap();
+        txn.commit().unwrap();
+        drop(shard);
+        assert!(
+            Shard::over_backend(&switch, 1000).is_err(),
+            "a shard file without settings opened"
+        );
+    }
+
+    #[test]
+    fn a_handle_left_failing_is_reopened_before_the_next_group() {
+        let (_, switch) = PowerCut::new();
+        let mut shard = Shard::create_over_backend(&switch, 1000).unwrap();
+        shard
+            .write(|txn| write_doc(txn, "a", false, b"{}", 1))
+            .unwrap();
+        // A commit outside any group fails, and the handle with it.
+        switch.fail_writes(ErrorKind::StorageFull);
+        let txn = shard.gate.begin_write_txn().unwrap();
+        txn.open_table(LOCAL)
+            .unwrap()
+            .insert("x", kv::seal(b"x").as_slice())
+            .unwrap();
+        assert!(txn.commit().is_err());
+        switch.restore_writes();
+        assert!(shard.poisoned());
+
+        shard
+            .write(|txn| write_doc(txn, "b", false, b"{}", 2))
+            .unwrap();
+        assert!(!shard.poisoned());
+        assert_eq!(shard.seq(), 2);
+        assert_eq!(*shard.state.read().unwrap(), ShardState::Serving);
+    }
+
+    /// A continuous feed reading the sequence index a page (one lease) at a
+    /// time up to the published committed position, open across a recovery:
+    /// it does not hold up the reopen, and gets every acknowledged change
+    /// once, in order, and nothing of the failed group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_continuous_feed_survives_recovery_without_skipping() {
+        let mut rig = rig();
+        for n in 1..=5 {
+            put(&rig.handle, &format!("d{n}"), n).await.unwrap();
+        }
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let feed = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            let mut commits = rig.committed.subscribe();
+            let mut hold = Some((entered_tx, release_rx));
+            async move {
+                let mut seen: Vec<(u64, String)> = Vec::new();
+                let (mut cursor, mut published) = (0, 0);
+                while seen.len() < 10 {
+                    let bound = handle.committed_seq();
+                    assert!(bound >= published, "the committed position went back");
+                    published = bound;
+                    if cursor == bound {
+                        commits.changed().await.unwrap();
+                        continue;
+                    }
+                    // The page after d4 keeps its lease until released.
+                    let held = if cursor == 4 { hold.take() } else { None };
+                    let page = handle
+                        .lease(move |s| {
+                            let mut page = Vec::new();
+                            let range = gate::key::seq(cursor + 1)..=gate::key::seq(bound);
+                            s.txn.scan(Table::BySeq, range, false, |key, id| {
+                                let id = String::from_utf8(id.to_vec())?;
+                                page.push((gate::key::split_seq(key)?, id));
+                                Ok(page.len() < 2)
+                            })?;
+                            if let Some((entered, release)) = held {
+                                entered.send(()).unwrap();
+                                release.recv().unwrap();
+                            }
+                            Ok(page)
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!page.is_empty(), "nothing after {cursor} up to {bound}");
+                    for (seq, id) in page {
+                        assert!(
+                            seq > cursor && seq <= bound,
+                            "{seq} outside ({cursor}, {bound}]"
+                        );
+                        cursor = seq;
+                        seen.push((seq, id));
+                    }
+                }
+                seen
+            }
+        });
+        entered_rx.await.unwrap();
+
+        // The commit fails while the feed holds a page's lease; the reopen
+        // waits for that page only, not for the feed.
+        let mut failing = put_on_full_disk(&rig, "lost");
+        rig.handle.gate.closed().await;
+        release_tx.send(()).unwrap();
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        assert_eq!(failing.await.unwrap().unwrap_err().status, 500);
+        assert!(!feed.is_finished());
+
+        for n in 6..=10 {
+            assert_eq!(put(&rig.handle, &format!("d{n}"), n).await.unwrap(), n);
+        }
+        let expected: Vec<(u64, String)> = (1..=10).map(|n| (n, format!("d{n}"))).collect();
+        assert_eq!(feed.await.unwrap(), expected);
     }
 }

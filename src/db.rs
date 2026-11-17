@@ -1,17 +1,15 @@
 //! Database and document semantics: revisions, conflicts, changes feeds.
 //!
-//! All writes for one request are staged as an ordered list of (key, value)
-//! operations and applied as a single LevelDB `WriteBatch`, so a `_bulk_docs`
-//! of a thousand documents costs one OS flush, not a thousand. rusty-leveldb
-//! does not fsync, so this is process-crash durability, not power-loss
-//! durability.
+//! All writes for one request are staged, validated, and then written into
+//! the shard's group commit (one synced redb transaction for every request
+//! queued together), so a `_bulk_docs` of a thousand documents costs one
+//! `fsync`, not a thousand, and is acknowledged only once it is durable.
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
 use crate::rev::{new_revid, Rev};
 use crate::store::{
-    body_key, checkpoint_key, local_key, meta_key, meta_state, seq_key, DocMeta, LiveDoc,
-    MetaState, PurgeInfo, Shard, ShardHandle, Tx,
+    meta_state, DocMeta, DocRead, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn,
 };
 use crate::util::{hex, uuid};
 use md5::{Digest, Md5};
@@ -35,16 +33,169 @@ pub const META_FIELDS: [&str; 9] = [
     "_local_seq",
 ];
 
+/// Names of the database's own settings, kept in the settings table of
+/// shard 0 beside that shard's own.
+const DB_SETTINGS: &str = "db/";
+/// [`DbRecord`].
+const INFO_SETTING: &str = "db/info";
+/// The active [`ShardMap`].
+const SHARD_MAP_SETTING: &str = "db/shard_map";
+/// `{"version": .., "security": ..}`.
+const SECURITY_SETTING: &str = "db/security";
+/// A [`ShardMap`] this node has not had acknowledged; absent when none is.
+const PENDING_SHARD_MAP_SETTING: &str = "db/pending_shard_map";
+
+/// Page cache for reading a closed database's settings: a few pages.
+const PEEK_CACHE: usize = 1 << 20;
+
+/// What a database is, fixed when it is created.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct DbFile {
+struct DbRecord {
     q: u32,
     uuid: String,
     instance_start_time: String,
     partitioned: bool,
 }
 
-/// Staged operations for one atomic commit.
-type Ops = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+/// What a new database is created with.
+pub struct DbSettings {
+    pub q: u32,
+    pub partitioned: bool,
+    pub shard_map: ShardMap,
+}
+
+impl DbSettings {
+    /// The settings `config` asks for. A configured placement for another
+    /// shard count is replaced by one that keeps every shard here.
+    pub fn of(config: &DbConfig) -> DbSettings {
+        let q = config.q.max(1);
+        DbSettings {
+            q,
+            partitioned: config.partitioned,
+            shard_map: placement_for(config, q),
+        }
+    }
+
+    /// The rows shard 0 of a new database is given, committed last when it
+    /// is created: what it is, where its shards live, and an empty security
+    /// object. Every one is required when the database opens.
+    pub(crate) fn rows(&self) -> DbResult<Vec<(&'static str, Vec<u8>)>> {
+        let info = DbRecord {
+            q: self.q,
+            uuid: uuid(),
+            instance_start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+                .to_string(),
+            partitioned: self.partitioned,
+        };
+        Ok(vec![
+            (INFO_SETTING, to_json(&info)?),
+            (SHARD_MAP_SETTING, to_json(&self.shard_map)?),
+            (SECURITY_SETTING, security_json(0, &json!({}))?),
+        ])
+    }
+}
+
+/// The configured placement of a database with `q` shards: the one
+/// `config` carries when it is for `q` shards, else every shard here.
+fn placement_for(config: &DbConfig, q: u32) -> ShardMap {
+    if config.shard_map.q == q {
+        config.shard_map.clone()
+    } else {
+        ShardMap::single(q)
+    }
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> DbResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn security_json(version: u64, security: &Value) -> DbResult<Vec<u8>> {
+    to_json(&json!({"version": version, "security": security}))
+}
+
+/// A database's settings as shard 0 stores them.
+struct Stored {
+    info: DbRecord,
+    shard_map: ShardMap,
+    security: (u64, Value),
+    pending_shard_map: Option<ShardMap>,
+}
+
+impl Stored {
+    /// Parse the `db/` settings of the database at `path`. Every one but the
+    /// pending map is required: a database is created with all of them, so
+    /// one missing or unreadable is damage and an error, never a default
+    /// (an empty security object would make the database public).
+    fn parse(path: &Path, rows: Vec<(String, Vec<u8>)>) -> DbResult<Stored> {
+        let mut rows: HashMap<String, Vec<u8>> = rows.into_iter().collect();
+        let mut take = |name: &str| rows.remove(name);
+        fn parse<T: serde::de::DeserializeOwned>(
+            path: &Path,
+            name: &str,
+            bytes: Option<Vec<u8>>,
+        ) -> DbResult<T> {
+            let bytes = bytes.ok_or_else(|| setting_error(path, name, "missing"))?;
+            serde_json::from_slice(&bytes).map_err(|error| setting_error(path, name, error))
+        }
+        let info: DbRecord = parse(path, INFO_SETTING, take(INFO_SETTING))?;
+        if info.q == 0 {
+            return Err(setting_error(path, INFO_SETTING, "no shards"));
+        }
+        let shard_map: ShardMap = parse(path, SHARD_MAP_SETTING, take(SHARD_MAP_SETTING))?;
+        if !shard_map.is_valid(info.q, shard_map.node_count) {
+            return Err(setting_error(
+                path,
+                SHARD_MAP_SETTING,
+                "not a valid shard map",
+            ));
+        }
+        let stored: Value = parse(path, SECURITY_SETTING, take(SECURITY_SETTING))?;
+        let security = match (
+            stored.get("version").and_then(Value::as_u64),
+            stored.get("security"),
+        ) {
+            (Some(version), Some(security)) => (version, security.clone()),
+            _ => {
+                return Err(setting_error(
+                    path,
+                    SECURITY_SETTING,
+                    "expected an object with `version` and `security`",
+                ))
+            }
+        };
+        let pending_shard_map = match take(PENDING_SHARD_MAP_SETTING) {
+            Some(bytes) => Some(parse(path, PENDING_SHARD_MAP_SETTING, Some(bytes))?),
+            None => None,
+        };
+        Ok(Stored {
+            info,
+            shard_map,
+            security,
+            pending_shard_map,
+        })
+    }
+}
+
+/// One staged write of a document batch, applied once the whole batch is
+/// staged.
+enum Op {
+    /// A revision's body.
+    Body {
+        id: String,
+        rev: String,
+        body: Vec<u8>,
+    },
+    /// The document's change at this sequence.
+    Seq { seq: u64, id: String },
+    /// The document's previous change, superseded.
+    Unseq(u64),
+}
+
+/// Staged writes for one atomic commit.
+type Ops = Vec<Op>;
 
 /// Shard slot for a document id. Kept free so cluster code can map a view row
 /// back to its owning shard without an open database handle.
@@ -164,14 +315,21 @@ pub fn validate_partition(partition: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// Log a metadata file that cannot be used and return the 500 for it. The
-/// client sees the file name only; the log carries the full path.
-fn metadata_error(path: &Path, error: impl std::fmt::Display) -> ApiError {
-    tracing::error!(file = %path.display(), %error, "database metadata is unusable");
+/// Log a database setting that cannot be used and return the 500 for it.
+/// The client sees the setting's name only; the log carries the path.
+fn setting_error(path: &Path, setting: &str, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(db = %path.display(), setting, %error, "database setting is unusable");
+    ApiError::new(500, "internal_server_error", format!("{setting}: {error}"))
+}
+
+/// Log a shard file that cannot be opened or read and return the 500 for
+/// it: the database fails closed, and the file is left as it is.
+fn shard_error(file: &Path, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(file = %file.display(), %error, "shard file is unusable");
     ApiError::new(
         500,
         "internal_server_error",
-        format!("{}: {error}", file_name(path)),
+        format!("{}: {error}", file_name(file)),
     )
 }
 
@@ -181,131 +339,16 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Read and parse one metadata file. `None` means it does not exist; one that
-/// cannot be read or parsed is a 500, never a default.
-fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> DbResult<Option<T>> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| metadata_error(path, error)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(metadata_error(path, error)),
-    }
-}
+/// Numbers the temporary files of this process.
+static TEMPS: AtomicU64 = AtomicU64::new(0);
 
-fn clear_error(path: &Path, error: &dyn std::fmt::Display) -> ApiError {
-    ApiError::new(
-        500,
-        "internal_server_error",
-        format!("{}: {error}", file_name(path)),
-    )
-}
-
-/// Serialize `value` and replace `path` with it atomically; see
-/// [`write_atomic`].
-fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> DbResult<()> {
-    let write_error = |error: &dyn std::fmt::Display| {
-        tracing::error!(file = %path.display(), %error, "cannot write database metadata");
-        ApiError::new(
-            500,
-            "internal_server_error",
-            format!("{}: {error}", file_name(path)),
-        )
-    };
-    let bytes = serde_json::to_vec(value).map_err(|error| write_error(&error))?;
-    write_atomic(path, &bytes).map_err(|error| write_error(&error))
-}
-
-/// Temporary files of writes in flight in this process. Cleanup of stale
-/// temporary files must not remove one of these.
-static LIVE_TEMPS: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
-    std::sync::Mutex::new(None);
-
-fn live_temps() -> std::sync::MutexGuard<'static, Option<std::collections::HashSet<PathBuf>>> {
-    LIVE_TEMPS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// A temporary file being written; it counts as in flight until dropped,
-/// which is after the caller has renamed or removed it.
-struct LiveTemp(PathBuf);
-
-impl LiveTemp {
-    fn register(path: PathBuf) -> LiveTemp {
-        live_temps()
-            .get_or_insert_with(Default::default)
-            .insert(path.clone());
-        LiveTemp(path)
-    }
-}
-
-impl Drop for LiveTemp {
-    fn drop(&mut self) {
-        if let Some(set) = live_temps().as_mut() {
-            set.remove(&self.0);
-        }
-    }
-}
-
-/// Whether `name` is one `write_temp` produces: `.<name>.<pid>.<n>.tmp`.
-fn is_temp_name(name: &str) -> bool {
-    let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
-        return false;
-    };
-    let mut parts = stem.rsplitn(3, '.');
-    let numeric = |part: Option<&str>| {
-        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    };
-    let (counter, pid, target) = (parts.next(), parts.next(), parts.next());
-    numeric(counter) && numeric(pid) && target.is_some_and(|t| !t.is_empty())
-}
-
-/// Remove the temporary files of interrupted writes from `dir` (not its
-/// subdirectories). Only names matching [`is_temp_name`] go, and never one a
-/// write in this process is still using, so this is safe while the directory
-/// is in use; whether the pid in a name is alive is not considered. A file
-/// that cannot be removed is logged, not an error.
-pub(crate) fn remove_stale_temps(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_str().is_some_and(is_temp_name) {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        // Hold the registry while removing: a write registers its file before
-        // creating it, so a file that is not registered here is not in use.
-        let live = live_temps();
-        if live.as_ref().is_some_and(|set| set.contains(&path)) {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(file = %path.display(), "removed stale temporary file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(file = %path.display(), %error, "cannot remove stale temporary file")
-            }
-        }
-    }
-}
-
-/// Write `bytes` to a temporary file next to `path` and fsync it. A crash
-/// before the caller publishes it leaves only the temporary file behind.
-fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveTemp> {
+/// Write `bytes` to a new temporary file next to `path` and fsync it. A
+/// crash before the caller publishes it leaves only the temporary file. A
+/// name already taken (a leftover of an earlier process that had this pid,
+/// as a container's pid 1 always does) is skipped for the next one, never
+/// written over or removed.
+fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    static TEMPS: AtomicU64 = AtomicU64::new(0);
-    let temp = LiveTemp::register(path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        file_name(path),
-        std::process::id(),
-        TEMPS.fetch_add(1, Ordering::Relaxed)
-    )));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -315,34 +358,48 @@ fn write_temp(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<LiveT
     }
     #[cfg(not(unix))]
     let _ = private;
-    let written = options.open(&temp.0).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    match written {
+    let (temp, mut file) = loop {
+        let temp = path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            file_name(path),
+            std::process::id(),
+            TEMPS.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    match file.write_all(bytes).and_then(|()| file.sync_all()) {
         Ok(()) => Ok(temp),
         Err(error) => {
-            let _ = std::fs::remove_file(&temp.0);
+            let _ = std::fs::remove_file(&temp);
             Err(error)
         }
     }
 }
 
-/// Make a rename or link in the directory of `path` durable.
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+/// Make the renames, links and new entries in directory `dir` durable.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let dir = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
         std::fs::File::open(dir)?.sync_all()
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = dir;
         Ok(())
     }
+}
+
+/// Make a rename or link in the directory of `path` durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    sync_dir(
+        path.parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
 }
 
 /// Replace `path` with `bytes` so that a reader, or a restart after a crash,
@@ -351,8 +408,8 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 /// then fsync the directory.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, false)?;
-    if let Err(error) = std::fs::rename(&temp.0, path) {
-        let _ = std::fs::remove_file(&temp.0);
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
     sync_parent(path)
@@ -363,30 +420,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// all: it is written to a temporary file and hard-linked into place.
 pub(crate) fn create_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = write_temp(path, bytes, true)?;
-    let linked = std::fs::hard_link(&temp.0, path);
-    let _ = std::fs::remove_file(&temp.0);
+    let linked = std::fs::hard_link(&temp, path);
+    let _ = std::fs::remove_file(&temp);
     linked?;
     sync_parent(path)
-}
-
-/// Read the stored security object. No file is an empty object; a file that
-/// is there but unusable is an error, since falling back to `{}` would make
-/// the database public.
-fn load_security(path: &Path) -> DbResult<(u64, Value)> {
-    let versioned = path.join("security-versioned.json");
-    if let Some(stored) = read_metadata::<Value>(&versioned)? {
-        return match (
-            stored.get("version").and_then(Value::as_u64),
-            stored.get("security"),
-        ) {
-            (Some(version), Some(security)) => Ok((version, security.clone())),
-            _ => Err(metadata_error(
-                &versioned,
-                "expected an object with `version` and `security`",
-            )),
-        };
-    }
-    Ok((0, json!({})))
 }
 
 /// JSON text with object keys sorted, for ordering values independently of
@@ -434,8 +471,19 @@ pub struct Db {
     pub partitioned: bool,
     pub uuid: String,
     pub instance_start_time: String,
-    shard_map: std::sync::RwLock<ShardMap>,
-    security: std::sync::RwLock<(u64, Value)>,
+    /// The database's settings in memory, as shard 0 stores them. Each is
+    /// shared with the task that stores a new value and installs it once
+    /// it is durable (see `store_setting`).
+    shard_map: Arc<std::sync::RwLock<ShardMap>>,
+    security: Arc<std::sync::RwLock<(u64, Value)>>,
+    pending_shard_map: Arc<std::sync::RwLock<Option<ShardMap>>>,
+    /// Held from reading a setting to installing its replacement, so two
+    /// updates on this node never interleave.
+    setting_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Set when `open` put the configured placement in place of a map
+    /// stored for another cluster size, until `store_replaced_shard_map`
+    /// stores it.
+    map_replaced: AtomicBool,
     /// Visible as `compact_running` in `GET /db`; the shard actor still owns
     /// the actual compaction and blocks its shard while it runs.
     compact_running: AtomicBool,
@@ -487,6 +535,8 @@ pub struct MapCursor {
 pub struct DbConfig {
     pub q: u32,
     pub revs_limit: u64,
+    /// Page cache of each shard file (`--cache-mb`).
+    pub cache_bytes: usize,
     pub shard_map: ShardMap,
     pub partitioned: bool,
 }
@@ -525,6 +575,52 @@ pub fn db_dir_name(name: &str) -> String {
     name.replace('/', "%2F")
 }
 
+/// The file of shard `index` of the database in `dir`. Built only here,
+/// from the data root, so a file has one spelling everywhere, which is what
+/// `kv` remembers verification by.
+pub(crate) fn shard_file(dir: &Path, index: u32) -> PathBuf {
+    dir.join(format!("shard-{index:04}.redb"))
+}
+
+/// Whether `name` is a shard file's name, `shard-NNNN.redb`.
+fn is_shard_file_name(name: &str) -> bool {
+    name.strip_prefix("shard-")
+        .and_then(|rest| rest.strip_suffix(".redb"))
+        .is_some_and(|digits| digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `dir` holds a database: a directory with at least one shard
+/// file. A database that lost some of its shards (shard 0 included) is
+/// still one, and fails closed when opened. A directory that merely has a
+/// legal name (`lost+found` at the root of a volume) is not. One that lost
+/// every shard file is not either: it is neither listed nor found, and a
+/// create of its name answers 412, since publishing a new database cannot
+/// replace a directory that is not empty.
+pub(crate) fn is_db_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(is_shard_file_name)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+    })
+}
+
+/// Peek shard `index` of the database in `dir` (see `kv::peek`): what
+/// `read` returns, or a 500 naming the file when it is missing, damaged or
+/// open elsewhere.
+fn peek_shard<R>(
+    dir: &Path,
+    index: u32,
+    read: impl FnOnce(&dyn redb::ReadableDatabase) -> anyhow::Result<R>,
+) -> DbResult<R> {
+    let file = shard_file(dir, index);
+    match crate::kv::peek(&file, PEEK_CACHE, read) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(shard_error(&file, format!("{error:#}"))),
+        Err(error) => Err(shard_error(&file, error)),
+    }
+}
+
 /// The data-root directory of database `name`.
 pub fn db_path(root: &Path, name: &str) -> PathBuf {
     root.join(db_dir_name(name))
@@ -538,87 +634,79 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
 }
 
 impl Db {
+    /// Open the database `name`, which must exist (see
+    /// `state::create_db_staged`). Every shard file is opened as it is: one
+    /// that is missing or cannot be opened fails the open with a 500 and is
+    /// left untouched, never replaced, so damage is not mistaken for a new
+    /// database. Blocking: shard files are checked on their first open.
     pub fn open(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
+        if !Db::exists(root, name) {
+            return Err(ApiError::db_not_found());
+        }
         let path = db_path(root, name);
-        remove_stale_temps(&path);
-        if let Ok(indexes) = std::fs::read_dir(path.join("_search_indexes")) {
-            for index in indexes.flatten() {
-                remove_stale_temps(&index.path());
-            }
+        // Every file is checked with a peek before any is opened for
+        // writing: a damaged database fails here, its healthy files opened
+        // read-only once verified, so a request to it neither writes to
+        // them nor reads them in full again.
+        let rows = peek_shard(&path, 0, |db| {
+            crate::store::check_file(db, &shard_file(&path, 0))?;
+            crate::store::read_settings(db, DB_SETTINGS)
+        })?;
+        let stored = Stored::parse(&path, rows)?;
+        let q = stored.info.q;
+        for index in 1..q {
+            peek_shard(&path, index, |db| {
+                crate::store::check_file(db, &shard_file(&path, index))
+            })?;
         }
-        let db_file = path.join("db.json");
-        let file: DbFile = match read_metadata(&db_file)? {
-            Some(file) => file,
-            None => {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| ApiError::new(500, "internal_server_error", e.to_string()))?;
-                let file = DbFile {
-                    q: config.q.max(1),
-                    uuid: uuid(),
-                    instance_start_time: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros()
-                        .to_string(),
-                    partitioned: config.partitioned,
-                };
-                write_json_atomic(&db_file, &file)?;
-                file
-            }
-        };
 
-        let map_path = path.join("shard-map.json");
-        let stored_map: Option<ShardMap> = read_metadata(&map_path)?;
-        if let Some(map) = &stored_map {
-            if !map.is_valid(file.q, map.node_count) {
-                return Err(metadata_error(&map_path, "not a valid shard map"));
-            }
-        }
-        let shard_map = match stored_map {
-            Some(map) if map.node_count == config.shard_map.node_count => map,
-            stored => {
-                // A database without a shard map yet (a new one, or one
-                // interrupted before the map was written), and one stored for a
-                // different cluster size, start from the configured placement,
-                // which is then persisted.
-                if stored.is_some() {
-                    tracing::warn!(
-                        file = %map_path.display(),
-                        "shard map is for a different cluster size; replacing it"
-                    );
-                }
-                let map = if config.shard_map.q == file.q {
-                    config.shard_map.clone()
-                } else {
-                    ShardMap::single(file.q)
-                };
-                write_json_atomic(&map_path, &map)?;
-                map
-            }
-        };
-
-        let mut shards = Vec::new();
         let commits = Arc::new(tokio::sync::watch::Sender::new(()));
-        for i in 0..file.q {
-            let shard = ShardHandle::spawn(
-                path.join(format!("shard-{i:04}")),
+        let mut shards = Vec::new();
+        for index in 0..q {
+            let file = shard_file(&path, index);
+            match ShardHandle::spawn(
+                &file,
                 config.revs_limit,
+                config.cache_bytes,
                 commits.clone(),
-            )?;
-            shards.push(shard);
+            ) {
+                Ok(shard) => shards.push(shard),
+                Err(error) => {
+                    // Closed unchecked, as a damaged database's healthy
+                    // shards are not to be read in full on every request.
+                    for shard in shards {
+                        shard.discard();
+                    }
+                    return Err(shard_error(&file, format!("{error:#}")));
+                }
+            }
         }
 
-        let security = load_security(&path)?;
+        // A map stored for a different cluster size gives way to the
+        // configured placement (see `store_replaced_shard_map`).
+        let map_replaced = stored.shard_map.node_count != config.shard_map.node_count;
+        let shard_map = if map_replaced {
+            tracing::warn!(
+                db = %path.display(),
+                "shard map is for a different cluster size; using the configured placement"
+            );
+            placement_for(&config, q)
+        } else {
+            stored.shard_map
+        };
 
         Ok(Db {
             name: name.to_string(),
             path,
-            q: file.q.max(1),
-            partitioned: file.partitioned,
-            uuid: file.uuid,
-            instance_start_time: file.instance_start_time,
-            shard_map: std::sync::RwLock::new(shard_map),
-            security: std::sync::RwLock::new(security),
+            q,
+            partitioned: stored.info.partitioned,
+            uuid: stored.info.uuid,
+            instance_start_time: stored.info.instance_start_time,
+            shard_map: Arc::new(std::sync::RwLock::new(shard_map)),
+            security: Arc::new(std::sync::RwLock::new(stored.security)),
+            pending_shard_map: Arc::new(std::sync::RwLock::new(stored.pending_shard_map)),
+            setting_writes: Arc::default(),
+            map_replaced: AtomicBool::new(map_replaced),
             compact_running: AtomicBool::new(false),
             migration_map: std::sync::RwLock::new(None),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -634,64 +722,72 @@ impl Db {
         })
     }
 
-    /// Open a database that is already on disk. Unlike `open`, a missing
-    /// database is an error and nothing is created, so a request that races a
-    /// drop cannot bring the database back.
-    pub fn open_existing(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
+    /// Open the database, creating it first (staged, as a client's create
+    /// does) when it does not exist.
+    #[cfg(test)]
+    pub fn open_or_create(root: &Path, name: &str, config: DbConfig) -> DbResult<Db> {
         if !Db::exists(root, name) {
-            return Err(ApiError::db_not_found());
+            crate::state::create_db_staged(root, name, &DbSettings::of(&config))?;
         }
         Db::open(root, name, config)
     }
 
+    /// Whether database `name` exists: see [`is_db_dir`]. Whether its files
+    /// can be opened is for the open to find out.
     pub fn exists(root: &Path, name: &str) -> bool {
-        db_path(root, name).join("db.json").is_file()
+        is_db_dir(&db_path(root, name))
     }
 
-    /// The security object of a database that need not be open: what its
-    /// directory holds, which is what an open one holds in memory too, since
-    /// it is written before it is installed.
-    pub fn read_security(root: &Path, name: &str) -> DbResult<Value> {
+    /// The settings of a database that is not open, read from shard 0
+    /// through `kv::peek`, which checks the file only when an open would
+    /// and leaves it as verified as it found it. `None` when the file is
+    /// open: the database is being opened or closed, so ask it instead.
+    /// Blocking.
+    fn read_stored(root: &Path, name: &str) -> DbResult<Option<Stored>> {
         if !Db::exists(root, name) {
             return Err(ApiError::db_not_found());
         }
-        load_security(&db_path(root, name)).map(|(_, security)| security)
+        let path = db_path(root, name);
+        let file = shard_file(&path, 0);
+        match crate::kv::peek(&file, PEEK_CACHE, |db| {
+            crate::store::read_settings(db, DB_SETTINGS)
+        }) {
+            Ok(Ok(rows)) => Stored::parse(&path, rows).map(Some),
+            Ok(Err(error)) => Err(shard_error(&file, format!("{error:#}"))),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(None),
+            // Deleted meanwhile.
+            Err(_) if !path.is_dir() => Err(ApiError::db_not_found()),
+            Err(error) => Err(shard_error(&file, error)),
+        }
     }
 
-    /// What `open` would settle on for placement, read from the directory
-    /// without opening the database. `None` when `open` would have to rewrite
-    /// the shard map (none stored, or one for a different cluster size), so
-    /// the caller must open the database instead.
+    /// The security object of a database that is not open; `None` when it
+    /// is open after all (see `read_stored`). Blocking.
+    pub fn read_security(root: &Path, name: &str) -> DbResult<Option<Value>> {
+        Ok(Db::read_stored(root, name)?.map(|stored| stored.security.1))
+    }
+
+    /// What `open` would settle on for placement, read without opening the
+    /// database. `None` when only an open can say: the database is open
+    /// (see `read_stored`), or its map is for another cluster size, which
+    /// `open` replaces. Blocking.
     pub fn read_closed_meta(
         root: &Path,
         name: &str,
         node_count: usize,
     ) -> DbResult<Option<ClosedMeta>> {
-        let path = db_path(root, name);
-        let Some(file) = read_metadata::<DbFile>(&path.join("db.json"))? else {
-            return Err(ApiError::db_not_found());
-        };
-        let map_path = path.join("shard-map.json");
-        let Some(shard_map) = read_metadata::<ShardMap>(&map_path)? else {
+        let Some(stored) = Db::read_stored(root, name)? else {
             return Ok(None);
         };
-        if shard_map.node_count != node_count || !shard_map.is_valid(file.q, shard_map.node_count) {
+        if stored.shard_map.node_count != node_count {
             return Ok(None);
         }
         Ok(Some(ClosedMeta {
-            q: file.q.max(1),
-            partitioned: file.partitioned,
-            shard_map,
-            pending_shard_map: Db::has_pending_shard_map(root, name)?,
+            q: stored.info.q,
+            partitioned: stored.info.partitioned,
+            shard_map: stored.shard_map,
+            pending_shard_map: stored.pending_shard_map.is_some(),
         }))
-    }
-
-    /// Whether a shard map this node has not acknowledged is waiting on disk.
-    pub fn has_pending_shard_map(root: &Path, name: &str) -> DbResult<bool> {
-        Ok(
-            read_metadata::<ShardMap>(&db_path(root, name).join("pending-shard-map.json"))?
-                .is_some(),
-        )
     }
 
     /// Drop every shard's lazily built indexes so an idle database holds none
@@ -699,11 +795,19 @@ impl Db {
     pub async fn release_indexes(&self) {
         for shard in &self.shards {
             let _ = shard
-                .call(|shard| {
+                .read(|shard| {
                     shard.release_indexes();
                     Ok(())
                 })
                 .await;
+        }
+    }
+
+    /// Close the shard files without the close-time integrity check when the
+    /// last handle to this database goes: the process is exiting.
+    pub fn skip_close_checks(&self) {
+        for shard in &self.shards {
+            shard.skip_close_check();
         }
     }
 
@@ -719,7 +823,7 @@ impl Db {
         let mut total = 0;
         for shard in &self.shards {
             total += shard
-                .call(|shard| Ok(shard.index_entries()))
+                .read(|shard| Ok(shard.index_entries()))
                 .await
                 .unwrap_or(0);
         }
@@ -754,13 +858,13 @@ impl Db {
         }
     }
 
-    pub fn destroy(root: &Path, name: &str) -> DbResult<()> {
-        match std::fs::remove_dir_all(db_path(root, name)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(ApiError::db_not_found())
-            }
-            Err(error) => Err(metadata_error(&db_path(root, name), error)),
+    /// Stop every shard of a database being deleted and wait until their
+    /// files are closed (see `ShardHandle::close_deleted`). Handles cloned
+    /// before get `not_found` from then on.
+    pub async fn close_deleted(&self) {
+        self.mark_deleted();
+        for shard in &self.shards {
+            shard.close_deleted().await;
         }
     }
 
@@ -823,7 +927,7 @@ impl Db {
         let shard = &self.shards[self.partition_shard(partition)];
         let partition = partition.to_string();
         shard
-            .call(move |s| s.partition_counts(&partition).map_err(ApiError::from))
+            .read(move |s| s.partition_counts(&partition).map_err(ApiError::from))
             .await
     }
 
@@ -869,7 +973,7 @@ impl Db {
         let generation = self.design_generation();
         let mut ids = Vec::new();
         for shard in &self.shards {
-            let (mut found, corrupt) = shard.call(|s| Ok(s.design_docs()?)).await?;
+            let (mut found, corrupt) = shard.read(|s| Ok(s.design_docs()?)).await?;
             if let Some(id) = corrupt.first() {
                 // Skipping it would let writes through unvalidated.
                 return Err(ApiError::corrupt(format!(
@@ -886,7 +990,7 @@ impl Db {
             let shard = &self.shards[self.shard_index(&id)];
             let id_for_shard = id.clone();
             let doc = shard
-                .call(move |s| {
+                .read(move |s| {
                     let Some(meta) = s.get_meta(&id_for_shard)? else {
                         return Ok(None);
                     };
@@ -968,18 +1072,48 @@ impl Db {
         self.design_generation.load(Ordering::SeqCst)
     }
 
+    /// Store database setting `name` (removing it for `None`) in shard 0,
+    /// then `install` it in memory. Both run in a task of their own, so a
+    /// caller that stops waiting cannot leave memory behind what is on disk;
+    /// `writing`, the guard of `setting_writes`, is released only once the
+    /// value is installed.
+    async fn store_setting(
+        &self,
+        writing: tokio::sync::OwnedMutexGuard<()>,
+        name: &'static str,
+        value: Option<Vec<u8>>,
+        install: impl FnOnce() + Send + 'static,
+    ) -> DbResult<()> {
+        let write = self.shards[0].call(move |txn| {
+            match &value {
+                Some(value) => txn.put_setting(name, value),
+                None => txn.remove_setting(name),
+            }
+            .map_err(ApiError::from)
+        });
+        tokio::spawn(async move {
+            let _writing = writing;
+            write.await?;
+            install();
+            Ok(())
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("storing {name}: {error}")))?
+    }
+
+    async fn lock_settings(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.setting_writes.clone().lock_owned().await
+    }
+
     /// Replace the security object with a client-supplied one, one version
     /// newer than the current one. Returns the version it was stored at.
-    pub fn set_security(&self, value: Value) -> DbResult<u64> {
+    pub async fn set_security(&self, value: Value) -> DbResult<u64> {
         // Pick the version under the lock: two concurrent writes on this node
         // must not share a version, or the tiebreak could drop an acknowledged
         // one.
-        let mut current = self
-            .security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let version = current.0.saturating_add(1);
-        self.store_security(&mut current, version, value)?;
+        let writing = self.lock_settings().await;
+        let version = self.security_versioned().0.saturating_add(1);
+        self.store_security(writing, version, value).await?;
         Ok(version)
     }
 
@@ -987,11 +1121,9 @@ impl Db {
     /// Equal versions are ordered by the canonical form of the object so that
     /// concurrent updates settle on the same winner on every node. Returns
     /// whether the object is now the stored one.
-    pub fn set_security_versioned(&self, version: u64, value: Value) -> DbResult<bool> {
-        let mut current = self
-            .security
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+    pub async fn set_security_versioned(&self, version: u64, value: Value) -> DbResult<bool> {
+        let writing = self.lock_settings().await;
+        let current = self.security_versioned();
         if version < current.0 {
             return Ok(false);
         }
@@ -1002,23 +1134,25 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        self.store_security(&mut current, version, value)?;
+        self.store_security(writing, version, value).await?;
         Ok(true)
     }
 
     /// Persist and install a security object; the caller holds the lock.
-    fn store_security(
+    async fn store_security(
         &self,
-        current: &mut (u64, Value),
+        writing: tokio::sync::OwnedMutexGuard<()>,
         version: u64,
         value: Value,
     ) -> DbResult<()> {
-        write_json_atomic(
-            &self.path.join("security-versioned.json"),
-            &json!({"version": version, "security": value}),
-        )?;
-        *current = (version, value);
-        Ok(())
+        let bytes = security_json(version, &value)?;
+        let security = self.security.clone();
+        self.store_setting(writing, SECURITY_SETTING, Some(bytes), move || {
+            *security
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = (version, value);
+        })
+        .await
     }
 
     pub fn shard_map(&self) -> ShardMap {
@@ -1048,17 +1182,15 @@ impl Db {
         }
     }
 
-    pub fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
+    pub async fn set_shard_map(&self, shard_map: ShardMap) -> DbResult<bool> {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
         }
-        // Hold the lock across compare, persist and swap, so two calls on
-        // this node cannot interleave and leave the file and the in-memory
+        // Hold the lock across compare, persist and install, so two calls on
+        // this node cannot interleave and leave the stored and the in-memory
         // map disagreeing.
-        let mut current = self
-            .shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let writing = self.lock_settings().await;
+        let current = self.shard_map();
         if shard_map.version < current.version {
             return Ok(false);
         }
@@ -1071,7 +1203,7 @@ impl Db {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        self.store_shard_map(&mut current, shard_map)?;
+        self.store_shard_map(writing, shard_map).await?;
         Ok(true)
     }
 
@@ -1079,24 +1211,44 @@ impl Db {
     /// current one, and return it with that version. The version is picked
     /// under the lock, as `set_security` does, so two concurrent updates on
     /// this node never share one.
-    pub fn set_next_shard_map(&self, mut shard_map: ShardMap) -> DbResult<ShardMap> {
+    pub async fn set_next_shard_map(&self, mut shard_map: ShardMap) -> DbResult<ShardMap> {
         if !shard_map.is_valid(self.q, shard_map.node_count) {
             return Err(ApiError::bad_request("invalid shard map"));
         }
-        let mut current = self
-            .shard_map
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        shard_map.version = current.version.saturating_add(1);
-        self.store_shard_map(&mut current, shard_map.clone())?;
+        let writing = self.lock_settings().await;
+        shard_map.version = self.shard_map().version.saturating_add(1);
+        self.store_shard_map(writing, shard_map.clone()).await?;
         Ok(shard_map)
     }
 
+    /// Store the placement `open` put in place of a map stored for another
+    /// cluster size, so later opens and reads of the closed database find
+    /// it. Nothing to do when the stored map was kept; a failure leaves it
+    /// to be stored on the next call.
+    pub async fn store_replaced_shard_map(&self) -> DbResult<()> {
+        if !self.map_replaced.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let writing = self.lock_settings().await;
+        let stored = self.store_shard_map(writing, self.shard_map()).await;
+        if stored.is_err() {
+            self.map_replaced.store(true, Ordering::SeqCst);
+        }
+        stored
+    }
+
     /// Persist and install a shard map; the caller holds the lock.
-    fn store_shard_map(&self, current: &mut ShardMap, shard_map: ShardMap) -> DbResult<()> {
-        write_json_atomic(&self.path.join("shard-map.json"), &shard_map)?;
-        *current = shard_map;
-        Ok(())
+    async fn store_shard_map(
+        &self,
+        writing: tokio::sync::OwnedMutexGuard<()>,
+        shard_map: ShardMap,
+    ) -> DbResult<()> {
+        let bytes = to_json(&shard_map)?;
+        let current = self.shard_map.clone();
+        self.store_setting(writing, SHARD_MAP_SETTING, Some(bytes), move || {
+            *current.write().unwrap_or_else(|poison| poison.into_inner()) = shard_map;
+        })
+        .await
     }
 
     /// The migration target while a rebalance freeze is running. A map left
@@ -1329,25 +1481,34 @@ impl Db {
         crate::since::encode(&copies)
     }
 
-    pub fn pending_shard_map(&self) -> DbResult<Option<ShardMap>> {
-        read_metadata(&self.path.join("pending-shard-map.json"))
+    /// The shard map this node has not had acknowledged, if any.
+    pub fn pending_shard_map(&self) -> Option<ShardMap> {
+        self.pending_shard_map
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
-    pub fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
-        write_json_atomic(&self.path.join("pending-shard-map.json"), map)
+    pub async fn set_pending_shard_map(&self, map: &ShardMap) -> DbResult<()> {
+        self.store_pending_shard_map(Some(map.clone())).await
     }
 
-    /// Remove the pending shard map and make the removal durable. Already
-    /// gone is fine; any other failure is an error, since the map would
-    /// otherwise reappear or be retried as if still pending.
-    pub fn clear_pending_shard_map(&self) -> DbResult<()> {
-        let path = self.path.join("pending-shard-map.json");
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(clear_error(&path, &error)),
+    /// Remove the pending shard map, durably. Nothing pending is fine.
+    pub async fn clear_pending_shard_map(&self) -> DbResult<()> {
+        self.store_pending_shard_map(None).await
+    }
+
+    async fn store_pending_shard_map(&self, map: Option<ShardMap>) -> DbResult<()> {
+        let writing = self.lock_settings().await;
+        if map.is_none() && self.pending_shard_map().is_none() {
+            return Ok(());
         }
-        sync_parent(&path).map_err(|error| clear_error(&path, &error))
+        let bytes = map.as_ref().map(to_json).transpose()?;
+        let pending = self.pending_shard_map.clone();
+        self.store_setting(writing, PENDING_SHARD_MAP_SETTING, bytes, move || {
+            *pending.write().unwrap_or_else(|poison| poison.into_inner()) = map;
+        })
+        .await
     }
 
     pub fn replicas_of_shard(&self, shard: u32) -> Vec<usize> {
@@ -1395,17 +1556,20 @@ impl Db {
     pub async fn shard_counts(&self) -> DbResult<Vec<(u64, u64)>> {
         let mut out = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
-            out.push(shard.call(|s| Ok(s.counts())).await?);
+            out.push(shard.read(|s| Ok(s.counts())).await?);
         }
         Ok(out)
     }
 
-    pub async fn shard_states(&self, with_digest: bool) -> DbResult<Vec<crate::store::ShardState>> {
+    pub async fn shard_states(
+        &self,
+        with_digest: bool,
+    ) -> DbResult<Vec<crate::store::ShardSummary>> {
         let mut out = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
             out.push(
                 shard
-                    .call(move |s| s.state(with_digest).map_err(ApiError::from))
+                    .read(move |s| s.summary(with_digest).map_err(ApiError::from))
                     .await?,
             );
         }
@@ -1454,7 +1618,7 @@ impl Db {
         let counts = futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok((s.counts(), s.purge_seq()?)))),
+                .map(|shard| shard.read(|s| Ok((s.counts(), s.purge_seq()?)))),
         )
         .await;
         for counted in counts {
@@ -1597,7 +1761,7 @@ impl Db {
         let id = id.to_string();
         let opts = opts.clone();
         self.shard(id.as_str())
-            .call(move |s| read_doc(s, &id, &opts))
+            .lease(move |s| read_doc(s, &id, &opts))
             .await
     }
 
@@ -1620,7 +1784,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].lease(move |s| {
                         Ok(batch
                             .into_iter()
                             .map(|(slot, id)| (slot, read_doc(s, &id, &opts)))
@@ -1665,7 +1829,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].lease(move |s| {
                         batch
                             .into_iter()
                             .filter_map(|id| match all_docs_key_row(s, &id, &opts) {
@@ -1759,7 +1923,7 @@ impl Db {
                 })
                 .map(|(_, shard)| {
                     let opts = opts.clone();
-                    shard.call(move |s| {
+                    shard.read(move |s| {
                         let docs = all_docs_live_total(s, &opts)?;
                         let (rows, offset) = collect_all_docs(s, &opts, take)?;
                         Ok((rows, offset, docs))
@@ -1819,7 +1983,7 @@ impl Db {
             }
             let shard_opts = opts.clone();
             let (before, docs) = shard
-                .call(move |s| {
+                .read(move |s| {
                     let docs = all_docs_live_total(s, &shard_opts)?;
                     Ok((all_docs_before_start(s, &shard_opts)?, docs))
                 })
@@ -1858,7 +2022,7 @@ impl Db {
                         let shard = &db.shards[index];
                         async move {
                             shard
-                                .call(move |s| {
+                                .read(move |s| {
                                     let scanned =
                                         scan_all_docs(s, &shard_opts, after.as_deref(), wanted)?;
                                     let last = scanned.last().map(|row| row.id.clone());
@@ -1932,7 +2096,7 @@ impl Db {
                             let mut wanted = cursor.buffer.split_off(cursor.loaded);
                             rests.push(wanted.split_off(taken[*slot] - cursor.loaded));
                             let shard_opts = opts.clone();
-                            fetches.push(db.shards[cursor.index].call(move |s| {
+                            fetches.push(db.shards[cursor.index].read(move |s| {
                                 load_all_docs(s, wanted.into_iter().collect(), &shard_opts)
                             }));
                         }
@@ -2020,21 +2184,12 @@ impl Db {
         while let Some(&index) = shards.get(cursor.shard) {
             let after = cursor.after.take();
             let (docs, last) = self.shards[index]
-                .call(move |s| {
-                    // Build (or reuse) the live map, then read only bodies.
-                    // This avoids decoding every full DocMeta record again for
-                    // each cold view build.
-                    let from = match &after {
-                        Some(after) => std::ops::Bound::Excluded(after.clone()),
-                        None => std::ops::Bound::Unbounded,
-                    };
-                    let metas: Vec<(String, String)> = s
-                        .live_docs()?
-                        .range((from, std::ops::Bound::Unbounded))
-                        .filter(|(id, _)| !id.starts_with("_design/") && !id.starts_with("_local/"))
-                        .take(limit)
-                        .map(|(id, doc)| (id.clone(), doc.rev.clone()))
-                        .collect();
+                .lease(move |s| {
+                    // One page of live documents from the metadata records
+                    // of the lease's snapshot, then their bodies.
+                    let metas = s.live_docs_after(after.as_deref(), limit, |id| {
+                        !id.starts_with("_design/") && !id.starts_with("_local/")
+                    })?;
                     let last = (metas.len() == limit)
                         .then(|| metas.last().map(|(id, _)| id.clone()))
                         .flatten();
@@ -2098,14 +2253,14 @@ impl Db {
             } else {
                 let partition = partition.clone();
                 total_rows = self.shards[shard]
-                    .call(move |s| s.partition_live_count(&partition).map_err(ApiError::from))
+                    .read(move |s| s.partition_live_count(&partition).map_err(ApiError::from))
                     .await?;
             }
         } else {
             let counts =
                 futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| all_docs_live_total(s, &opts))
+                    self.shards[index].read(move |s| all_docs_live_total(s, &opts))
                 }))
                 .await;
             for count in counts {
@@ -2201,7 +2356,7 @@ impl Db {
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
                     let opts = opts.clone();
-                    self.shards[index].call(move |s| {
+                    self.shards[index].read(move |s| {
                         let rows = batch
                             .into_iter()
                             .map(|(slot, key)| {
@@ -2328,7 +2483,7 @@ impl Db {
                 let shard_opts = opts.clone();
                 let until = bound.get(index);
                 let read = self.shards[index]
-                    .call(move |s| collect_changes(s, &shard_opts, index, cursor, until, page))
+                    .read(move |s| collect_changes(s, &shard_opts, index, cursor, until, page))
                     .await?;
                 reached[index] = true;
                 let mut matched = match &opts.filter {
@@ -2391,7 +2546,7 @@ impl Db {
         futures::future::join_all(self.selected_shards(owned).into_iter().map(|index| {
             let after = after.get(index);
             self.shards[index]
-                .call(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
+                .read(move |s| s.pending_changes(after, descending).map_err(ApiError::from))
         }))
         .await
         .into_iter()
@@ -2497,7 +2652,7 @@ impl Db {
                     };
                     let shard_opts = opts.clone();
                     let read = match db.shards[index]
-                        .call(move |shard| collect_changes(shard, &shard_opts, index, cursor, until, page))
+                        .read(move |shard| collect_changes(shard, &shard_opts, index, cursor, until, page))
                         .await
                     {
                         Ok(read) => read,
@@ -2601,7 +2756,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].call(move |s| {
+                    self.shards[index].lease(move |s| {
                         batch
                             .into_iter()
                             .map(|(slot, id, wanted)| {
@@ -2715,7 +2870,7 @@ impl Db {
                 .enumerate()
                 .filter(|(_, batch)| !batch.is_empty())
                 .map(|(index, batch)| {
-                    self.shards[index].call(move |shard| {
+                    self.shards[index].lease(move |shard| {
                         let mut out = Vec::with_capacity(batch.len());
                         for (slot, id, opts) in batch {
                             let rev = opts
@@ -2761,7 +2916,7 @@ impl Db {
     pub async fn local_get(&self, id: &str) -> DbResult<Option<Value>> {
         let id = id.to_string();
         self.local_shard(&id)
-            .call(move |s| read_local(s, &id))
+            .read(move |s| read_local(s, &id))
             .await
     }
 
@@ -2868,7 +3023,7 @@ impl Db {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| shard_owned(owned, *index))
-                .map(|(_, shard)| shard.call(list_local)),
+                .map(|(_, shard)| shard.read(list_local)),
         )
         .await;
         let mut docs: Vec<(String, Value)> = Vec::new();
@@ -2891,9 +3046,9 @@ impl Db {
     /// `_local_docs`, and they live on the first shard whatever the
     /// placement.
     pub async fn checkpoint_get(&self, id: &str) -> DbResult<Option<Value>> {
-        let key = checkpoint_key(id);
+        let id = id.to_string();
         self.shards[0]
-            .call(move |s| match s.get_checked(&key)? {
+            .read(move |s| match s.get_checkpoint(&id)? {
                 Some(bytes) => serde_json::from_slice::<Value>(&bytes)
                     .map(Some)
                     .map_err(|error| {
@@ -2909,15 +3064,10 @@ impl Db {
     }
 
     pub async fn checkpoint_put(&self, id: &str, value: &Value) -> DbResult<()> {
-        let key = checkpoint_key(id);
-        let value = value.clone();
+        let id = id.to_string();
+        let value = serde_json::to_vec(value).map_err(ApiError::internal)?;
         self.shards[0]
-            .call(move |s| {
-                let mut tx = Tx::new();
-                tx.put_json(&key, &value)?;
-                s.commit(tx)?;
-                Ok(())
-            })
+            .call(move |s| Ok(s.put_checkpoint(&id, &value)?))
             .await
     }
 
@@ -2929,14 +3079,13 @@ impl Db {
         shard: usize,
         prefix: &str,
     ) -> DbResult<Vec<(String, Value)>> {
-        let key = checkpoint_key(prefix);
+        let prefix = prefix.to_string();
         let found = self.shards[shard]
-            .call(move |s| Ok(s.scan_from(&key, &key)?))
+            .read(move |s| Ok(s.checkpoints(&prefix)?))
             .await?;
         found
             .into_iter()
-            .map(|(key, value)| {
-                let id = String::from_utf8_lossy(&key[3..]).into_owned();
+            .map(|(id, value)| {
                 serde_json::from_slice::<Value>(&value)
                     .map(|value| (id, value))
                     .map_err(|error| {
@@ -2959,16 +3108,14 @@ impl Db {
         value: &Value,
         stale: Vec<String>,
     ) -> DbResult<()> {
-        let key = checkpoint_key(id);
-        let value = value.clone();
+        let id = id.to_string();
+        let value = serde_json::to_vec(value).map_err(ApiError::internal)?;
         self.shards[shard]
             .call(move |s| {
-                let mut tx = Tx::new();
                 for old in stale {
-                    tx.delete(&checkpoint_key(&old));
+                    s.remove_checkpoint(&old)?;
                 }
-                tx.put_json(&key, &value)?;
-                s.commit(tx)?;
+                s.put_checkpoint(&id, &value)?;
                 Ok(())
             })
             .await
@@ -2981,7 +3128,7 @@ impl Db {
         futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.call(|s| Ok(s.purge_seq()?))),
+                .map(|shard| shard.read(|s| Ok(s.purge_seq()?))),
         )
         .await
         .into_iter()
@@ -3012,10 +3159,12 @@ impl Db {
         let reads = self.shards.iter().enumerate().map(|(index, shard)| {
             let after = since.get(index).copied().unwrap_or(0);
             shard.call(move |s| {
+                // Read before writing, so a failed read fails only this job.
+                let purged = s.purged_since(after)?;
                 if let Some(node) = reader {
                     s.report_purge_checkpoint(node, after)?;
                 }
-                Ok(s.purged_since(after)?)
+                Ok(purged)
             })
         });
         futures::future::join_all(reads).await.into_iter().collect()
@@ -3036,9 +3185,20 @@ impl Db {
         let peers = self.purge_peers(shard, me);
         handle
             .call(move |s| {
-                let mut removed = false;
+                // Everything is read before the first write: which infos are
+                // new here, and the documents they name.
+                let mut fresh = Vec::new();
                 for info in infos {
-                    if s.has_purge(&info.uuid)? {
+                    if !s.has_purge(&info.uuid)? {
+                        fresh.push(info);
+                    }
+                }
+                let mut targets = purge_targets(s, fresh.iter().map(|info| info.id.as_str()))?;
+                let mut applied = std::collections::HashSet::new();
+                let mut removed = false;
+                for info in &fresh {
+                    // An info listed twice is applied once.
+                    if !applied.insert(info.uuid.as_str()) {
                         continue;
                     }
                     let gone = purge_one(
@@ -3047,6 +3207,7 @@ impl Db {
                         &info.revs,
                         PurgeSource::Replayed(&info.uuid),
                         &peers,
+                        &mut targets,
                     )?;
                     removed |= !gone.is_empty();
                 }
@@ -3101,7 +3262,7 @@ impl Db {
                 .map(|(id, revs)| (id.to_string(), revs))
                 .collect();
             let hits = self.shards[index]
-                .call(move |s| {
+                .lease(move |s| {
                     let mut hits = Vec::new();
                     for (id, revs) in docs {
                         for rev in s.purged_revs(&id, &revs)? {
@@ -3170,13 +3331,15 @@ impl Db {
             done.push(
                 self.shards[index]
                     .call(move |s| {
+                        let mut targets =
+                            purge_targets(s, batch.iter().map(|(_, id, _, _)| id.as_str()))?;
                         batch
                             .into_iter()
                             .map(|(slot, id, requested, assigned)| {
                                 let source = assigned
                                     .as_deref()
                                     .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
-                                purge_one(s, &id, &requested, source, &peers)
+                                purge_one(s, &id, &requested, source, &peers, &mut targets)
                                     .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
@@ -3202,7 +3365,7 @@ impl Db {
         self.compact_running.store(true, Ordering::SeqCst);
         let result = async {
             for shard in &self.shards {
-                shard.call(|s| s.compact().map_err(ApiError::from)).await?;
+                shard.alone(|s| s.compact().map_err(ApiError::from)).await?;
             }
             Ok(())
         }
@@ -3211,19 +3374,18 @@ impl Db {
         result
     }
 
+    /// Every acknowledged write is already synced (each group commit is), so
+    /// there is nothing left to flush.
     pub async fn ensure_full_commit(&self) -> DbResult<Value> {
-        for shard in &self.shards {
-            shard.call(|s| s.flush().map_err(ApiError::from)).await?;
-        }
         Ok(json!({ "ok": true, "instance_start_time": self.instance_start_time }))
     }
 
     pub async fn get_revs_limit(&self) -> DbResult<u64> {
-        self.shards[0].call(|s| Ok(s.revs_limit())).await
+        self.shards[0].read(|s| Ok(s.revs_limit())).await
     }
 
     pub async fn get_purged_infos_limit(&self) -> DbResult<u64> {
-        self.shards[0].call(|s| Ok(s.purged_infos_limit())).await
+        self.shards[0].read(|s| Ok(s.purged_infos_limit())).await
     }
 
     pub async fn set_purged_infos_limit(&self, limit: u64) -> DbResult<()> {
@@ -3258,7 +3420,7 @@ pub fn attachments_unsupported() -> ApiError {
 /// The requested revisions of one document the shard does not have, and the
 /// leaves that could be their ancestors.
 fn revs_diff_one(
-    s: &mut crate::store::Shard,
+    s: &impl DocRead,
     id: &str,
     wanted: &[String],
 ) -> DbResult<(Vec<String>, Vec<String>)> {
@@ -3348,7 +3510,54 @@ impl<'a> PurgeSource<'a> {
     }
 }
 
+/// A document as a purge job read it before its first write.
+enum PurgeTarget {
+    /// No metadata record.
+    Missing,
+    /// A record that reads but does not decode: the document goes whole.
+    Undecodable,
+    /// The document's metadata.
+    Doc(DocMeta),
+}
+
+/// The documents a purge job will change, keyed by id: as stored when the
+/// job starts, then as the job's own purges leave them.
+type PurgeTargets = HashMap<String, PurgeTarget>;
+
+/// Read and decode the metadata of every document in `ids`, before the
+/// purge job writes anything (a job validates before it writes): a read that
+/// fails, such as a value failing its checksum, fails the job while it has
+/// written nothing, so the other jobs of its group still commit.
+fn purge_targets<'a>(
+    s: &ShardTxn,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> DbResult<PurgeTargets> {
+    let mut targets = HashMap::new();
+    for id in ids {
+        if targets.contains_key(id) {
+            continue;
+        }
+        let target = match s.get_meta(id) {
+            Ok(Some(meta)) => PurgeTarget::Doc(meta),
+            Ok(None) => PurgeTarget::Missing,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::error::CorruptRecord>()
+                    .is_some() =>
+            {
+                PurgeTarget::Undecodable
+            }
+            Err(error) => return Err(error.into()),
+        };
+        targets.insert(id.to_string(), target);
+    }
+    Ok(targets)
+}
+
 /// Purge the requested leaf revisions of one document; the revisions removed.
+/// The document comes from `targets`, which [`purge_targets`] filled before
+/// the job's first write, and goes back into it as the purge leaves it, for
+/// a later purge of the same document in the job.
 ///
 /// The purge is recorded as a purge info in the same transaction. A fresh
 /// purge records the revisions it removed, under a new uuid, and nothing when
@@ -3358,20 +3567,34 @@ impl<'a> PurgeSource<'a> {
 /// `Assigned` uuid is a fresh purge whose uuid the coordinator chose, so every
 /// copy records the same one (fabric_doc_purge.erl).
 fn purge_one(
-    s: &mut crate::store::Shard,
+    s: &mut ShardTxn,
     id: &str,
     requested: &[String],
     source: PurgeSource<'_>,
     peers: &[usize],
+    targets: &mut PurgeTargets,
 ) -> DbResult<Vec<String>> {
-    let mut tx = Tx::new();
-    let meta = match s.get_meta(id) {
-        Ok(meta) => meta,
-        Err(error)
-            if error
-                .downcast_ref::<crate::error::CorruptRecord>()
-                .is_some() =>
-        {
+    let target = targets.remove(id).ok_or_else(|| {
+        ApiError::internal(format!("purge of {id} was not read before the job wrote"))
+    })?;
+    let (removed, after) = purge_target(s, id, requested, source, peers, target)?;
+    targets.insert(id.to_string(), after);
+    Ok(removed)
+}
+
+/// [`purge_one`] of the document as `target` holds it: the revisions removed
+/// and the document as the purge leaves it.
+fn purge_target(
+    s: &mut ShardTxn,
+    id: &str,
+    requested: &[String],
+    source: PurgeSource<'_>,
+    peers: &[usize],
+    target: PurgeTarget,
+) -> DbResult<(Vec<String>, PurgeTarget)> {
+    let mut meta = match target {
+        PurgeTarget::Doc(meta) => meta,
+        PurgeTarget::Undecodable => {
             // The revisions cannot be checked against unreadable metadata, so
             // the document goes whole; this is the repair path for it.
             let info = PurgeInfo {
@@ -3380,23 +3603,23 @@ fn purge_one(
                 revs: requested.to_vec(),
             };
             s.purge_corrupt(id, &info, peers)?;
-            return Ok(requested.to_vec());
+            return Ok((requested.to_vec(), PurgeTarget::Missing));
         }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(mut meta) = meta else {
-        if let PurgeSource::Replayed(uuid) = source {
-            let info = PurgeInfo {
-                uuid: uuid.to_string(),
-                id: id.to_string(),
-                revs: requested.to_vec(),
-            };
-            s.record_purge(&mut tx, &info, peers)?;
-            s.commit(tx)?;
+        PurgeTarget::Missing => {
+            if let PurgeSource::Replayed(uuid) = source {
+                let info = PurgeInfo {
+                    uuid: uuid.to_string(),
+                    id: id.to_string(),
+                    revs: requested.to_vec(),
+                };
+                s.record_purge(&info, peers)?;
+            }
+            return Ok((Vec::new(), PurgeTarget::Missing));
         }
-        return Ok(Vec::new());
     };
+    let old_state = meta_state(&meta);
     let mut removed = Vec::new();
+    let mut dead_bodies = Vec::new();
     // Like CouchDB, purge leaves only: each takes its unshared
     // ancestors with it, and a listed non-leaf revision is
     // ignored and not reported.
@@ -3406,11 +3629,12 @@ fn purge_one(
         if gone.is_empty() {
             continue;
         }
-        for dead in &gone {
-            tx.delete(&body_key(id, dead));
-        }
+        dead_bodies.extend(gone);
         removed.push(rev.clone());
     }
+    // The purge info is recorded before this document's own writes: it
+    // reads the shard's purge state. Earlier documents in the job may
+    // already have written (#74).
     if matches!(source, PurgeSource::Replayed(_)) || !removed.is_empty() {
         let info = match source {
             PurgeSource::Replayed(uuid) => PurgeInfo {
@@ -3424,30 +3648,31 @@ fn purge_one(
                 revs: removed.clone(),
             },
         };
-        s.record_purge(&mut tx, &info, peers)?;
+        s.record_purge(&info, peers)?;
     }
-    if !removed.is_empty() {
-        if meta.tree.is_empty() {
-            tx.delete(&meta_key(id));
-            if meta.seq != 0 {
-                tx.delete(&seq_key(meta.seq));
-            }
-            s.commit(tx)?;
-        } else {
-            let old_seq = meta.seq;
-            // Purging the winner changes what a normal read sees,
-            // so it is a change as far as `_changes` is concerned.
-            let seq = s.next_seq();
-            meta.seq = seq;
-            tx.delete(&seq_key(old_seq));
-            tx.put(&seq_key(seq), id.as_bytes());
-            tx.put_json(&meta_key(id), &meta)?;
-            s.commit(tx)?;
+    if removed.is_empty() {
+        return Ok((removed, PurgeTarget::Doc(meta)));
+    }
+    for dead in &dead_bodies {
+        s.remove_body(id, dead)?;
+    }
+    if meta.tree.is_empty() {
+        if meta.seq != 0 {
+            s.remove_seq(meta.seq)?;
         }
-    } else {
-        s.commit(tx)?;
+        s.remove_meta(id, old_state)?;
+        return Ok((removed, PurgeTarget::Missing));
     }
-    Ok(removed)
+    let old_seq = meta.seq;
+    // Purging the winner changes what a normal read sees,
+    // so it is a change as far as `_changes` is concerned.
+    let seq = s.next_seq();
+    meta.seq = seq;
+    s.remove_seq(old_seq)?;
+    s.put_seq(seq, id)?;
+    let bytes = meta_bytes(&meta).map_err(ApiError::internal)?;
+    s.put_meta(id, &bytes, old_state, meta_state(&meta), seq)?;
+    Ok((removed, PurgeTarget::Doc(meta)))
 }
 
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
@@ -3592,7 +3817,7 @@ async fn compile_design_docs(
                 continue;
             }
             let stored = shard
-                .call(move |shard| {
+                .read(move |shard| {
                     Ok(candidates
                         .into_iter()
                         .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
@@ -3624,7 +3849,7 @@ fn compile_needed(obj: &Map<String, Value>) -> bool {
 /// Whether `Stage::stage_replicated` would find this replicated revision
 /// already stored, and so never validate it. Anything malformed is "not
 /// stored": the stage reports its own error for it.
-fn replicated_is_stored(shard: &mut crate::store::Shard, doc: Value) -> bool {
+fn replicated_is_stored(shard: &mut ShardTxn, doc: Value) -> bool {
     let Ok(SplitDoc {
         id, rev, revisions, ..
     }) = split_doc(doc)
@@ -3785,7 +4010,7 @@ fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
 }
 
 fn put_many(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     docs: Vec<(usize, Value)>,
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
@@ -3833,7 +4058,7 @@ fn put_many(
         if let Ok(bytes) = meta_bytes(meta) {
             let old = origin.get(id).cloned().flatten();
             metas.push(MetaWrite {
-                key: meta_key(id),
+                id: id.clone(),
                 bytes,
                 old,
                 new: meta_state(meta),
@@ -3857,14 +4082,14 @@ fn put_many(
     results
 }
 
-struct Stage<'a> {
-    shard: &'a mut crate::store::Shard,
+struct Stage<'a, 's> {
+    shard: &'a mut ShardTxn<'s>,
     ops: &'a mut Ops,
     staged: &'a mut HashMap<String, DocMeta>,
     origin: &'a mut HashMap<String, Option<MetaState>>,
 }
 
-impl Stage<'_> {
+impl Stage<'_, '_> {
     fn next_seq(&mut self) -> u64 {
         self.shard.next_seq()
     }
@@ -3962,13 +4187,17 @@ impl Stage<'_> {
         let seq = self.next_seq();
         meta.seq = seq;
 
-        self.ops.push((
-            body_key(&id, &rev),
-            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
-        ));
-        self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
+        self.ops.push(Op::Body {
+            id: id.clone(),
+            rev: rev.clone(),
+            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+        });
+        self.ops.push(Op::Seq {
+            seq,
+            id: id.clone(),
+        });
         if old_seq != 0 {
-            self.ops.push((seq_key(old_seq), None));
+            self.ops.push(Op::Unseq(old_seq));
         }
         self.flush_meta(&id, &meta);
 
@@ -4012,17 +4241,21 @@ impl Stage<'_> {
             meta.tree.merge_path(&path, deleted);
         }
 
-        self.ops.push((
-            body_key(&id, &rev),
-            Some(serde_json::to_vec(&body).map_err(ApiError::internal)?),
-        ));
+        self.ops.push(Op::Body {
+            id: id.clone(),
+            rev: rev.clone(),
+            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+        });
         if changed {
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
-            self.ops.push((seq_key(seq), Some(id.as_bytes().to_vec())));
+            self.ops.push(Op::Seq {
+                seq,
+                id: id.clone(),
+            });
             if old_seq != 0 {
-                self.ops.push((seq_key(old_seq), None));
+                self.ops.push(Op::Unseq(old_seq));
             }
             self.flush_meta(&id, &meta);
         }
@@ -4132,30 +4365,27 @@ fn meta_bytes(meta: &DocMeta) -> serde_json::Result<Vec<u8>> {
 /// A document's metadata record, with the state it replaces and the state it
 /// leaves.
 struct MetaWrite {
-    key: Vec<u8>,
+    id: String,
     bytes: Vec<u8>,
     old: Option<MetaState>,
     new: Option<MetaState>,
     seq: u64,
 }
 
-/// Commit a batch's operations and its documents' metadata records.
-fn commit_ops(
-    shard: &mut crate::store::Shard,
-    ops: Ops,
-    metas: Vec<MetaWrite>,
-) -> anyhow::Result<()> {
-    let mut tx = Tx::new();
-    for (key, value) in ops {
-        match value {
-            Some(v) => tx.put(&key, &v),
-            None => tx.delete(&key),
+/// Write a staged batch's operations and its documents' metadata records.
+/// Everything was read and validated while staging, so this only writes.
+fn commit_ops(shard: &mut ShardTxn, ops: Ops, metas: Vec<MetaWrite>) -> anyhow::Result<()> {
+    for op in ops {
+        match op {
+            Op::Body { id, rev, body } => shard.put_body(&id, &rev, &body)?,
+            Op::Seq { seq, id } => shard.put_seq(seq, &id)?,
+            Op::Unseq(seq) => shard.remove_seq(seq)?,
         }
     }
     for meta in metas {
-        tx.put_meta(&meta.key, &meta.bytes, meta.old, meta.new, meta.seq);
+        shard.put_meta(&meta.id, &meta.bytes, meta.old, meta.new, meta.seq)?;
     }
-    shard.commit(tx)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4620,13 +4850,10 @@ fn canonical_rev(rev: &str) -> String {
 
 /// In a listing, a document whose stored record cannot be decoded is skipped,
 /// logged and counted so one bad record does not fail the whole request.
-/// Only a decode failure (`ApiError::corrupt`) is skipped: an error from
-/// LevelDB itself, or any other failure, still fails the request.
-fn skip_corrupt<T>(
-    shard: &crate::store::Shard,
-    id: &str,
-    result: DbResult<T>,
-) -> DbResult<Option<T>> {
+/// Only a decode failure (`ApiError::corrupt`) is skipped: a storage error or
+/// a value failing its checksum, or any other failure, still fails the
+/// request.
+fn skip_corrupt<T>(shard: &impl DocRead, id: &str, result: DbResult<T>) -> DbResult<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.corrupt => {
@@ -4637,7 +4864,7 @@ fn skip_corrupt<T>(
     }
 }
 
-fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResult<Value> {
+fn read_doc(shard: &impl DocRead, id: &str, opts: &DocOpts) -> DbResult<Value> {
     let meta = shard
         .get_meta(id)?
         .ok_or_else(|| ApiError::not_found("missing"))?;
@@ -4715,7 +4942,7 @@ fn read_doc(shard: &mut crate::store::Shard, id: &str, opts: &DocOpts) -> DbResu
 }
 
 fn read_doc_rev(
-    shard: &mut crate::store::Shard,
+    shard: &impl DocRead,
     id: &str,
     meta: &DocMeta,
     rev: &str,
@@ -4750,7 +4977,7 @@ fn read_doc_rev(
     }
     if opts.revs {
         let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
-        let limit = shard.revs_limit().max(1) as usize;
+        let limit = shard.revs_limit()?.max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
@@ -4767,7 +4994,7 @@ fn read_doc_rev(
     }
     if opts.revs_info {
         let mut path = meta.tree.path(rev).map_err(|e| corrupt_tree(id, e))?;
-        let limit = shard.revs_limit().max(1) as usize;
+        let limit = shard.revs_limit()?.max(1) as usize;
         if path.len() > limit {
             path.drain(0..path.len() - limit);
         }
@@ -4822,7 +5049,7 @@ fn keys_page(opts: &AllDocsOpts, keys: &[Value]) -> Vec<Value> {
 
 /// The `total_rows` of one shard: its live documents, or those of the query's
 /// partition or `count_range`.
-fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<u64> {
+fn all_docs_live_total(shard: &mut ShardTxn, opts: &AllDocsOpts) -> DbResult<u64> {
     Ok(match (&opts.partition, &opts.count_range) {
         (Some(partition), _) => shard.partition_live_count(partition)?,
         (None, Some((first, last))) => shard.live_range_count(first, last)? as u64,
@@ -4830,7 +5057,7 @@ fn all_docs_live_total(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> D
     })
 }
 
-fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) -> DbResult<usize> {
+fn all_docs_before_start(shard: &mut ShardTxn, opts: &AllDocsOpts) -> DbResult<usize> {
     let Some(start) = opts.startkey.as_deref() else {
         return Ok(0);
     };
@@ -4854,7 +5081,7 @@ fn all_docs_before_start(shard: &mut crate::store::Shard, opts: &AllDocsOpts) ->
 /// already returned (or the start of the range), so a later page continues
 /// where the last one stopped.
 fn scan_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &AllDocsOpts,
     after: Option<&str>,
     take: usize,
@@ -4910,7 +5137,7 @@ fn scan_all_docs(
 /// Attach each row's document when the query asks for them, leaving out any
 /// whose record is corrupt.
 fn load_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     rows: Vec<AllDocsRow>,
     opts: &AllDocsOpts,
 ) -> DbResult<Vec<AllDocsRow>> {
@@ -4934,7 +5161,7 @@ fn load_all_docs(
 }
 
 fn collect_all_docs(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &AllDocsOpts,
     take: usize,
 ) -> DbResult<(Vec<AllDocsRow>, usize)> {
@@ -4960,7 +5187,7 @@ fn embed_doc_meta(id: &str, rev: &str, body: &[u8]) -> String {
 }
 
 fn all_docs_key_row(
-    shard: &mut crate::store::Shard,
+    shard: &impl DocRead,
     key: &str,
     opts: &AllDocsOpts,
 ) -> DbResult<Option<DocListRow>> {
@@ -5007,8 +5234,8 @@ fn local_rev_number(doc: &Value) -> Option<u64> {
         .ok()
 }
 
-fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
-    match s.get_checked(&local_key(id))? {
+fn read_local(s: &mut ShardTxn, id: &str) -> DbResult<Option<Value>> {
+    match s.get_local(id)? {
         Some(bytes) => serde_json::from_slice::<Value>(&bytes)
             .map(Some)
             .map_err(|error| corrupt_local(id, error)),
@@ -5016,7 +5243,7 @@ fn read_local(s: &mut Shard, id: &str) -> DbResult<Option<Value>> {
     }
 }
 
-fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
+fn write_local(s: &mut ShardTxn, id: &str, mut body: Value) -> DbResult<WriteOk> {
     // CouchDB (couch_db_updater:update_local_docs/2) numbers a local write
     // from the supplied `_rev`, absent meaning 0, and never conflicts: the
     // stored revision is not consulted.
@@ -5034,24 +5261,20 @@ fn write_local(s: &mut Shard, id: &str, mut body: Value) -> DbResult<WriteOk> {
         obj.insert("_id".into(), json!(format!("_local/{id}")));
         obj.insert("_rev".into(), json!(rev));
     }
-    let mut tx = Tx::new();
-    tx.put_json(&local_key(id), &body)?;
-    s.commit(tx)?;
+    s.put_local(id, &serde_json::to_vec(&body).map_err(ApiError::internal)?)?;
     Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
-fn delete_local(s: &mut Shard, id: &str) -> DbResult<WriteOk> {
-    if s.get_checked(&local_key(id))?.is_none() {
+fn delete_local(s: &mut ShardTxn, id: &str) -> DbResult<WriteOk> {
+    if s.get_local(id)?.is_none() {
         return Err(ApiError::not_found("missing"));
     }
-    let mut tx = Tx::new();
-    tx.delete(&local_key(id));
-    s.commit(tx)?;
+    s.remove_local(id)?;
     Ok(WriteOk::new(format!("_local/{id}"), "0-0".to_string()))
 }
 
 /// Keep a copy of a local document as it is, unless a newer one is stored.
-fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
+fn install_local(s: &mut ShardTxn, id: &str, doc: Value) -> DbResult<WriteOk> {
     let Some(incoming) = local_rev_number(&doc) else {
         return Err(ApiError::bad_request("Invalid rev format"));
     };
@@ -5062,37 +5285,20 @@ fn install_local(s: &mut Shard, id: &str, doc: Value) -> DbResult<WriteOk> {
         .unwrap_or_default()
         .to_string();
     if held.is_none_or(|held| held < incoming) {
-        let mut tx = Tx::new();
-        tx.put_json(&local_key(id), &doc)?;
-        s.commit(tx)?;
+        s.put_local(id, &serde_json::to_vec(&doc).map_err(ApiError::internal)?)?;
     }
     Ok(WriteOk::new(format!("_local/{id}"), rev))
 }
 
 /// Every local document of one shard, with its `_local/` id.
-fn list_local(s: &mut Shard) -> DbResult<Vec<(String, Value)>> {
-    let mut docs: Vec<(String, Value)> = Vec::new();
-    let mut corrupt = None;
-    s.scan_range_while(b"l/", None, false, |key, value| {
-        let Some(id) = key
-            .strip_prefix(b"l/")
-            .and_then(|id| std::str::from_utf8(id).ok())
-        else {
-            return true;
-        };
-        match serde_json::from_slice::<Value>(value) {
-            Ok(doc) => docs.push((format!("_local/{id}"), doc)),
-            Err(error) => {
-                corrupt = Some(corrupt_local(id, error));
-                return false;
-            }
-        }
-        true
-    })?;
-    match corrupt {
-        Some(error) => Err(error),
-        None => Ok(docs),
-    }
+fn list_local(s: &mut ShardTxn) -> DbResult<Vec<(String, Value)>> {
+    s.locals()?
+        .into_iter()
+        .map(|(id, doc)| match serde_json::from_slice::<Value>(&doc) {
+            Ok(doc) => Ok((format!("_local/{id}"), doc)),
+            Err(error) => Err(corrupt_local(&id, error)),
+        })
+        .collect()
 }
 
 /// Select and render `_local_docs` rows from every local document, which
@@ -5229,7 +5435,7 @@ struct ChangesPage {
 /// `cursor` up to `until`; going down, the rows at or below `cursor`, so a
 /// caller pages back by lowering it.
 fn collect_changes(
-    shard: &mut crate::store::Shard,
+    shard: &mut ShardTxn,
     opts: &ChangesOpts,
     index: usize,
     cursor: u64,
@@ -5393,7 +5599,10 @@ mod tests {
         let parses = crate::store::meta_parses();
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
         let docs = docs.into_iter().enumerate().collect();
-        for (_, result) in put_many(shard, docs, true, HashMap::new()) {
+        let results = shard
+            .write(move |s| Ok(put_many(s, docs, true, HashMap::new())))
+            .unwrap();
+        for (_, result) in results {
             result.unwrap();
         }
         (
@@ -5407,21 +5616,25 @@ mod tests {
     /// each decode or encode it again: five decodes and two encodes per update.
     #[test]
     fn a_write_decodes_the_metadata_once_and_encodes_it_once() {
-        let dir = std::env::temp_dir().join(format!("douchdb-write-cost-{}", uuid()));
-        let mut shard = crate::store::Shard::open(&dir, 1000).unwrap();
+        let file = crate::store::tests::temp_file("write-cost");
+        let mut shard = crate::store::tests::open(&file);
 
         // A new document has no stored metadata to decode.
         let costs = write_costs(&mut shard, vec![json!({"_id": "a", "n": 1})]);
         assert_eq!(costs, (0, 1), "create");
 
-        let rev = shard.get_meta("a").unwrap().unwrap().tree.winner().unwrap();
+        let rev = shard
+            .read(|s| Ok(s.get_meta("a")?.unwrap().tree.winner().unwrap()))
+            .unwrap();
         let update = vec![json!({"_id": "a", "_rev": rev, "n": 2})];
         assert_eq!(write_costs(&mut shard, update), (1, 1), "update");
 
         // Each document in a batch costs the same.
         let batch = vec![json!({"_id": "b"}), json!({"_id": "c"})];
         assert_eq!(write_costs(&mut shard, batch), (0, 2), "batch");
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(shard);
+        crate::kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     #[test]
@@ -5467,12 +5680,13 @@ mod tests {
 
     async fn single_shard_db(name: &str) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             name,
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -5497,12 +5711,13 @@ mod tests {
     #[tokio::test]
     async fn compaction_drops_bodies_of_revisions_stemmed_by_revs_limit() {
         let root = std::env::temp_dir().join(format!("douchdb-stem-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "stem",
             DbConfig {
                 q: 1,
                 revs_limit: 2,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -5532,12 +5747,13 @@ mod tests {
     async fn local_docs_spread_over_shards_and_checkpoints_stay_out_of_the_listing() {
         let root =
             std::env::temp_dir().join(format!("douchdb-local-shards-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "local-shards",
             DbConfig {
                 q: 4,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(4),
                 partitioned: false,
             },
@@ -5862,7 +6078,7 @@ mod tests {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&local_key("bad"), b"{not json");
+                shard.put_raw(crate::kv::LOCAL, "bad", b"{not json");
                 Ok(())
             })
             .await
@@ -5899,7 +6115,7 @@ mod tests {
         let (db, root) = single_shard_db("ddoc-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&meta_key("_design/v"), b"{not json");
+                shard.put_raw(crate::kv::META, "_design/v", b"{not json");
                 Ok(())
             })
             .await
@@ -5962,12 +6178,13 @@ mod tests {
     async fn streamed_all_docs_match_the_buffered_reply() {
         let root = std::env::temp_dir().join(format!("douchdb-stream-{}", crate::util::uuid()));
         let db = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &root,
                 "stream",
                 DbConfig {
                     q: 3,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(3, 1, 1),
                     partitioned: false,
                 },
@@ -5985,7 +6202,7 @@ mod tests {
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
-                s.put_raw(&body_key(bad_id, &bad_rev), b"{not json");
+                s.put_raw(crate::kv::BODIES, (bad_id, bad_rev.as_str()), b"{not json");
                 Ok(())
             })
             .await
@@ -6141,12 +6358,13 @@ mod tests {
         let empty_root =
             std::env::temp_dir().join(format!("douchdb-stream-empty-{}", crate::util::uuid()));
         let empty = Arc::new(
-            Db::open(
+            Db::open_or_create(
                 &empty_root,
                 "empty",
                 DbConfig {
                     q: 3,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(3, 1, 1),
                     partitioned: false,
                 },
@@ -6171,7 +6389,7 @@ mod tests {
         // indexes, so the first scan meets it.
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(&meta_key("bad-meta"), b"{not json");
+                shard.put_raw(crate::kv::META, "bad-meta", b"{not json");
                 Ok(())
             })
             .await
@@ -6191,7 +6409,11 @@ mod tests {
         let corrupt_rev = bad_rev.clone();
         db.shards[0]
             .call(move |shard| {
-                shard.put_raw(&body_key("bad-body", &corrupt_rev), b"{not json");
+                shard.put_raw(
+                    crate::kv::BODIES,
+                    ("bad-body", corrupt_rev.as_str()),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6268,12 +6490,13 @@ mod tests {
     #[tokio::test]
     async fn a_failed_shard_write_still_invalidates_the_validator_cache() {
         let root = std::env::temp_dir().join(format!("douchdb-valfail-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "valfail",
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::balanced(2, 1, 1),
                 partitioned: false,
             },
@@ -6291,7 +6514,7 @@ mod tests {
 
         db.shards[1]
             .call(|shard| {
-                shard.inject_flush_failure();
+                shard.inject_commit_failure();
                 Ok(())
             })
             .await
@@ -6314,30 +6537,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn security_versions_order_updates_and_survive_reopen() {
+    #[tokio::test]
+    async fn security_versions_order_updates_and_survive_reopen() {
         let root = std::env::temp_dir().join(format!("douchdb-secver-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(1, 1, 1),
             partitioned: false,
         };
-        let db = Db::open(&root, "sec", config()).unwrap();
+        let db = Db::open_or_create(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (0, json!({})));
 
-        assert_eq!(db.set_security(json!({"a": 1})).unwrap(), 1);
-        assert!(db.set_security_versioned(3, json!({"a": 3})).unwrap());
+        assert_eq!(db.set_security(json!({"a": 1})).await.unwrap(), 1);
+        assert!(db.set_security_versioned(3, json!({"a": 3})).await.unwrap());
         // Older versions are rejected; equal ones are ordered by canonical form.
-        assert!(!db.set_security_versioned(2, json!({"a": 2})).unwrap());
-        assert!(!db.set_security_versioned(3, json!({"a": 2})).unwrap());
-        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
-        assert!(db.set_security_versioned(3, json!({"a": 4})).unwrap());
+        assert!(!db.set_security_versioned(2, json!({"a": 2})).await.unwrap());
+        assert!(!db.set_security_versioned(3, json!({"a": 2})).await.unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).await.unwrap());
+        assert!(db.set_security_versioned(3, json!({"a": 4})).await.unwrap());
         assert_eq!(db.security(), json!({"a": 4}));
         drop(db);
 
         let db = Db::open(&root, "sec", config()).unwrap();
         assert_eq!(db.security_versioned(), (3, json!({"a": 4})));
+        drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6345,83 +6570,117 @@ mod tests {
         DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(1, 1, 1),
             partitioned: false,
         }
     }
 
-    fn open_error(file: &str, contents: &[u8]) -> ApiError {
-        let root = std::env::temp_dir().join(format!("douchdb-corrupt-{}", crate::util::uuid()));
-        drop(Db::open(&root, "meta", meta_config()).unwrap());
-        std::fs::write(db_path(&root, "meta").join(file), contents).unwrap();
-        let error = match Db::open(&root, "meta", meta_config()) {
-            Ok(_) => panic!("{file} with {contents:?} opened"),
-            Err(error) => error,
-        };
-        // The corrupt file is left for the operator, not overwritten.
-        assert_eq!(
-            std::fs::read(db_path(&root, "meta").join(file)).unwrap(),
-            contents
-        );
-        std::fs::remove_dir_all(root).ok();
-        error
-    }
-
+    /// Every database setting but the pending map is written when the
+    /// database is created, so one that is missing or does not parse is
+    /// damage: the open fails with a 500 naming it, never falls back to a
+    /// default (an empty security object would make the database public),
+    /// and the file is left as it is.
     #[test]
-    fn corrupt_metadata_fails_open_with_a_server_error() {
-        for (file, contents) in [
-            ("db.json", &b"{ not json"[..]),
-            ("shard-map.json", b"{ not json"),
-            ("shard-map.json", br#"{"q":1,"node_count":1,"replicas":[]}"#),
-            ("security-versioned.json", b"{ not json"),
-            ("security-versioned.json", br#"{"version":1}"#),
-        ] {
-            let error = open_error(file, contents);
-            assert_eq!(error.status, 500, "{file}: {}", error.reason);
-            assert!(error.reason.contains(file), "{file}: {}", error.reason);
+    fn a_missing_or_unusable_database_setting_fails_open_with_a_server_error() {
+        let broken: [(&str, Option<&[u8]>); 7] = [
+            (INFO_SETTING, None),
+            (INFO_SETTING, Some(b"{ not json")),
+            (SHARD_MAP_SETTING, None),
+            (
+                SHARD_MAP_SETTING,
+                Some(br#"{"q":1,"node_count":1,"replicas":[]}"#),
+            ),
+            (SECURITY_SETTING, None),
+            (SECURITY_SETTING, Some(br#"{"version":1}"#)),
+            (PENDING_SHARD_MAP_SETTING, Some(b"{ not json")),
+        ];
+        for (setting, value) in broken {
+            let root =
+                std::env::temp_dir().join(format!("douchdb-badsetting-{}", crate::util::uuid()));
+            drop(Db::open_or_create(&root, "meta", meta_config()).unwrap());
+            let file = shard_file(&db_path(&root, "meta"), 0);
+            let db = crate::kv::open(&file, 1 << 20).unwrap();
+            let txn = crate::kv::begin_write(&db).unwrap();
+            {
+                let mut table = txn.open_table(crate::kv::SETTINGS).unwrap();
+                match value {
+                    Some(bytes) => {
+                        table
+                            .insert(setting, crate::kv::seal(bytes).as_slice())
+                            .unwrap();
+                    }
+                    None => {
+                        table.remove(setting).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+            drop(db);
+
+            let error = match Db::open(&root, "meta", meta_config()) {
+                Ok(_) => panic!("{setting} = {value:?} opened"),
+                Err(error) => error,
+            };
+            assert_eq!(error.status, 500, "{setting}: {}", error.reason);
+            assert!(
+                error.reason.contains(setting),
+                "{setting}: {}",
+                error.reason
+            );
+            let closed = Db::read_security(&root, "meta").map(|_| ());
+            assert_eq!(closed.unwrap_err().status, 500, "{setting} read closed");
+            // Left as it was for the operator, not repaired or defaulted.
+            let db = crate::kv::open(&file, 1 << 20).unwrap();
+            let left = crate::store::read_settings(&db, setting).unwrap();
+            let left = left.into_iter().find(|(name, _)| name == setting);
+            assert_eq!(left.map(|(_, bytes)| bytes).as_deref(), value, "{setting}");
+            drop(db);
+            crate::kv::forget_verified(&file);
+            std::fs::remove_dir_all(root).ok();
         }
     }
 
-    #[test]
-    fn concurrent_equal_version_shard_maps_leave_file_and_memory_in_step() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_equal_version_shard_maps_leave_disk_and_memory_in_step() {
         let root = std::env::temp_dir().join(format!("douchdb-mapraced-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 2,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::balanced(2, 3, 1),
             partitioned: false,
         };
         for round in 0..40 {
-            let db = Db::open(&root, &format!("race{round}"), config()).unwrap();
-            let maps: Vec<ShardMap> = (0..3)
-                .map(|node| ShardMap {
-                    q: 2,
-                    node_count: 3,
-                    replicas: vec![vec![node], vec![node]],
-                    version: 9,
+            let name = format!("race{round}");
+            let db = Arc::new(Db::open_or_create(&root, &name, config()).unwrap());
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let racers: Vec<_> = (0..3)
+                .map(|node| {
+                    let (db, barrier) = (db.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        db.set_shard_map(ShardMap {
+                            q: 2,
+                            node_count: 3,
+                            replicas: vec![vec![node], vec![node]],
+                            version: 9,
+                        })
+                        .await
+                        .unwrap();
+                    })
                 })
                 .collect();
-            let barrier = std::sync::Barrier::new(maps.len());
-            std::thread::scope(|scope| {
-                for map in &maps {
-                    let (db, barrier) = (&db, &barrier);
-                    scope.spawn(move || {
-                        barrier.wait();
-                        db.set_shard_map(map.clone()).unwrap();
-                    });
-                }
-            });
-            // The tiebreak winner is the greatest placement, and the file on
-            // disk is the one in memory.
-            let stored: ShardMap =
-                serde_json::from_slice(&std::fs::read(db.path.join("shard-map.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                db.shard_map().replicas,
-                vec![vec![2], vec![2]],
-                "round {round}"
-            );
-            assert_eq!(stored, db.shard_map(), "round {round}");
+            for racer in racers {
+                racer.await.unwrap();
+            }
+            // The tiebreak winner is the greatest placement, and what is
+            // stored is what is in memory.
+            let in_memory = db.shard_map();
+            assert_eq!(in_memory.replicas, vec![vec![2], vec![2]], "round {round}");
+            drop(db);
+            let stored = Db::read_closed_meta(&root, &name, 3).unwrap().unwrap();
+            assert_eq!(stored.shard_map, in_memory, "round {round}");
         }
         std::fs::remove_dir_all(root).ok();
     }
@@ -6433,6 +6692,33 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// Temporary files an earlier process with this pid left (a container
+    /// runs the server as pid 1 every time) under the next names do not
+    /// make a write fail, and are neither written over nor removed.
+    #[test]
+    fn write_atomic_skips_temporary_names_already_taken() {
+        let dir = std::env::temp_dir().join(format!("douchdb-taken-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("meta.json");
+        let next = TEMPS.load(Ordering::Relaxed);
+        let taken: Vec<String> = (next..next + 64)
+            .map(|n| format!(".meta.json.{}.{n}.tmp", std::process::id()))
+            .collect();
+        for name in &taken {
+            std::fs::write(dir.join(name), b"leftover").unwrap();
+        }
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        for name in &taken {
+            assert_eq!(
+                std::fs::read(dir.join(name)).unwrap(),
+                b"leftover",
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -6447,162 +6733,57 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn open_removes_stale_temporary_files_and_nothing_else() {
-        let root = std::env::temp_dir().join(format!("douchdb-stale-{}", crate::util::uuid()));
+    #[tokio::test]
+    async fn the_pending_shard_map_is_stored_and_cleared_durably() {
+        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
         let config = || DbConfig {
             q: 1,
             revs_limit: 100,
+            cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
             shard_map: ShardMap::single(1),
             partitioned: false,
         };
-        let db = Db::open(&root, "stale", config()).unwrap();
-        let dir = db.path.clone();
-        drop(db);
-
-        // Temporary files an interrupted write_atomic left behind, from
-        // another process and from one that happened to share our pid.
-        let foreign = format!(".db.json.{}.7.tmp", std::process::id().wrapping_add(1));
-        let same_pid = format!(".shard-map.json.{}.0.tmp", std::process::id());
-        let search = dir.join("_search_indexes").join("abc");
-        std::fs::create_dir_all(&search).unwrap();
-        let stale_search = search.join(".douchdb-search-meta.json.1.2.tmp");
-        for stale in [
-            dir.join(&foreign),
-            dir.join(&same_pid),
-            stale_search.clone(),
-        ] {
-            std::fs::write(stale, b"partial").unwrap();
-        }
-        // Names that merely resemble the pattern are left alone.
-        let keep = [
-            "db.json.1.2.tmp",
-            ".db.json.x.2.tmp",
-            ".db.json.1.tmp",
-            ".db.json.1.2.tmp.bak",
-            ".notes.tmp",
-        ];
-        for name in keep {
-            std::fs::write(dir.join(name), b"keep").unwrap();
-        }
-        let before = names_in(&dir);
-
-        let db = Db::open(&root, "stale", config()).unwrap();
-        drop(db);
-
-        let mut expected: Vec<String> = before
-            .into_iter()
-            .filter(|name| *name != foreign && *name != same_pid)
-            .collect();
-        expected.sort();
-        assert_eq!(names_in(&dir), expected);
-        assert!(!stale_search.exists());
-        for name in keep {
-            assert!(dir.join(name).exists(), "{name} was removed");
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn cleanup_spares_a_temporary_file_a_write_is_using() {
-        let dir = std::env::temp_dir().join(format!("douchdb-live-{}", crate::util::uuid()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("meta.json");
-        let live = write_temp(&target, b"partial", false).unwrap();
-        let stale = dir.join(".meta.json.1.1.tmp");
-        std::fs::write(&stale, b"old").unwrap();
-        remove_stale_temps(&dir);
-        assert!(live.0.exists(), "a temporary file in use was removed");
-        assert!(!stale.exists());
-        std::fs::remove_file(&live.0).unwrap();
-        drop(live);
-        remove_stale_temps(&dir);
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn an_unusable_pending_shard_map_is_an_error_not_none() {
-        let root =
-            std::env::temp_dir().join(format!("douchdb-pending-bad-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "pending",
-            DbConfig {
-                q: 1,
-                revs_limit: 100,
-                shard_map: ShardMap::single(1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-        let pending = db.path.join("pending-shard-map.json");
-        let is_err = |text: String| text.starts_with("Err");
-
-        // Missing is the legitimate "nothing pending".
-        assert_eq!(format!("{:?}", db.pending_shard_map()), "Ok(None)");
-        assert_eq!(
-            format!("{:?}", Db::has_pending_shard_map(&root, "pending")),
-            "Ok(false)"
-        );
-
-        // Content that does not parse.
-        std::fs::write(&pending, b"{not json").unwrap();
-        assert!(is_err(format!("{:?}", db.pending_shard_map())));
-        assert!(is_err(format!(
-            "{:?}",
-            Db::has_pending_shard_map(&root, "pending")
-        )));
-
-        // A read error that is not NotFound: a directory in place of the file.
-        std::fs::remove_file(&pending).unwrap();
-        std::fs::create_dir(&pending).unwrap();
-        assert!(is_err(format!("{:?}", db.pending_shard_map())));
-        assert!(is_err(format!(
-            "{:?}",
-            Db::has_pending_shard_map(&root, "pending")
-        )));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn destroy_answers_not_found_only_for_a_missing_database() {
-        let root = std::env::temp_dir().join(format!("douchdb-destroy-{}", crate::util::uuid()));
-        std::fs::create_dir_all(&root).unwrap();
-        assert_eq!(Db::destroy(&root, "gone").unwrap_err().status, 404);
-
-        // A path that exists but is not a directory cannot be removed as one.
-        std::fs::write(db_path(&root, "stuck"), b"not a directory").unwrap();
-        assert_eq!(Db::destroy(&root, "stuck").unwrap_err().status, 500);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn clear_pending_shard_map_reports_what_it_cannot_remove() {
-        let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "pending",
-            DbConfig {
-                q: 1,
-                revs_limit: 100,
-                shard_map: ShardMap::single(1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
-        let pending = db.path.join("pending-shard-map.json");
-
+        let db = Db::open_or_create(&root, "pending", config()).unwrap();
         // Nothing pending is not an error.
-        db.clear_pending_shard_map().unwrap();
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
 
-        db.set_pending_shard_map(&ShardMap::single(1)).unwrap();
-        assert!(db.pending_shard_map().unwrap().is_some());
-        db.clear_pending_shard_map().unwrap();
-        assert!(db.pending_shard_map().unwrap().is_none());
+        db.set_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap();
+        assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
+        drop(db);
+        let closed = Db::read_closed_meta(&root, "pending", 1).unwrap().unwrap();
+        assert!(closed.pending_shard_map);
 
-        // A path that cannot be unlinked is an error, not a silent success.
-        std::fs::create_dir(&pending).unwrap();
-        assert!(db.clear_pending_shard_map().is_err());
+        let db = Db::open(&root, "pending", config()).unwrap();
+        assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
+        drop(db);
+        let closed = Db::read_closed_meta(&root, "pending", 1).unwrap().unwrap();
+        assert!(!closed.pending_shard_map);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A shard of a database whose shard 0 is cleared (it moved elsewhere)
+    /// keeps the database's own settings, which live beside its own.
+    #[tokio::test]
+    async fn clearing_shard_0_keeps_the_database_settings() {
+        let root = std::env::temp_dir().join(format!("douchdb-clear0-{}", crate::util::uuid()));
+        let db = Db::open_or_create(&root, "clear0", meta_config()).unwrap();
+        db.set_security(json!({"members": {"names": ["a"]}}))
+            .await
+            .unwrap();
+        db.set_pending_shard_map(&ShardMap::balanced(1, 1, 1))
+            .await
+            .unwrap();
+        db.clear_shards(&[0]).await.unwrap();
+        drop(db);
+        let db = Db::open(&root, "clear0", meta_config()).unwrap();
+        assert_eq!(db.security(), json!({"members": {"names": ["a"]}}));
+        assert!(db.pending_shard_map().is_some());
+        drop(db);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6661,56 +6842,62 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn concurrent_client_shard_maps_get_distinct_versions() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_client_shard_maps_get_distinct_versions() {
         let root = std::env::temp_dir().join(format!("douchdb-nextmap-{}", crate::util::uuid()));
-        let db = Db::open(
-            &root,
-            "next",
-            DbConfig {
-                q: 2,
-                revs_limit: 100,
-                shard_map: ShardMap::balanced(2, 3, 1),
-                partitioned: false,
-            },
-        )
-        .unwrap();
+        let db = Arc::new(
+            Db::open_or_create(
+                &root,
+                "next",
+                DbConfig {
+                    q: 2,
+                    revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: ShardMap::balanced(2, 3, 1),
+                    partitioned: false,
+                },
+            )
+            .unwrap(),
+        );
         let start = db.shard_map().version;
-        let versions: Vec<u64> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|node| {
-                    let db = &db;
-                    scope.spawn(move || {
-                        db.set_next_shard_map(ShardMap {
-                            q: 2,
-                            node_count: 3,
-                            replicas: vec![vec![node % 3], vec![node % 3]],
-                            version: 0,
-                        })
-                        .unwrap()
-                        .version
+        let racers: Vec<_> = (0..8)
+            .map(|node| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    db.set_next_shard_map(ShardMap {
+                        q: 2,
+                        node_count: 3,
+                        replicas: vec![vec![node % 3], vec![node % 3]],
+                        version: 0,
                     })
+                    .await
+                    .unwrap()
+                    .version
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let mut sorted = versions.clone();
-        sorted.sort();
-        assert_eq!(sorted, (start + 1..=start + 8).collect::<Vec<_>>());
+            })
+            .collect();
+        let mut versions = Vec::new();
+        for racer in racers {
+            versions.push(racer.await.unwrap());
+        }
+        versions.sort();
+        assert_eq!(versions, (start + 1..=start + 8).collect::<Vec<_>>());
         assert_eq!(db.shard_map().version, start + 8);
+        drop(db);
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn equal_version_shard_maps_converge_on_one_winner() {
+    #[tokio::test]
+    async fn equal_version_shard_maps_converge_on_one_winner() {
         let root = std::env::temp_dir().join(format!("douchdb-tiebreak-{}", crate::util::uuid()));
         let open = |name: &str| {
-            Db::open(
+            Db::open_or_create(
                 &root,
                 name,
                 DbConfig {
                     q: 2,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::balanced(2, 2, 1),
                     partitioned: false,
                 },
@@ -6727,15 +6914,16 @@ mod tests {
         let b = map(vec![vec![1], vec![1]]);
 
         let first = open("tie-a");
-        assert!(first.set_shard_map(a.clone()).unwrap());
-        let first_accepts_b = first.set_shard_map(b.clone()).unwrap();
+        assert!(first.set_shard_map(a.clone()).await.unwrap());
+        let first_accepts_b = first.set_shard_map(b.clone()).await.unwrap();
         let second = open("tie-b");
-        assert!(second.set_shard_map(b.clone()).unwrap());
-        let second_accepts_a = second.set_shard_map(a.clone()).unwrap();
+        assert!(second.set_shard_map(b.clone()).await.unwrap());
+        let second_accepts_a = second.set_shard_map(a.clone()).await.unwrap();
 
         // Exactly one of the two competing maps wins on both replicas.
         assert_ne!(first_accepts_b, second_accepts_a);
         assert_eq!(first.shard_map().replicas, second.shard_map().replicas);
+        drop((first, second));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6752,12 +6940,13 @@ mod tests {
             replicas: vec![vec![1], vec![1]],
             ..active.clone()
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "stale-mig",
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active.clone(),
                 partitioned: false,
             },
@@ -6794,12 +6983,13 @@ mod tests {
             replicas: vec![vec![1], vec![1]],
             ..active.clone()
         };
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "mig-id",
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: active,
                 partitioned: false,
             },
@@ -6825,12 +7015,13 @@ mod tests {
     #[tokio::test]
     async fn design_documents_replicate_to_every_node() {
         let root = std::env::temp_dir().join(format!("douchdb-placement-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "placement",
             DbConfig {
                 q: 4,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::balanced(4, 3, 1),
                 partitioned: false,
             },
@@ -6860,12 +7051,13 @@ mod tests {
     #[tokio::test]
     async fn changes_limit_reports_pending_documents() {
         let root = std::env::temp_dir().join(format!("douchdb-pending-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "pending",
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(1),
                 partitioned: false,
             },
@@ -6909,12 +7101,13 @@ mod tests {
     }
 
     fn scan_db(root: &std::path::Path, name: &str, q: u32, partitioned: bool) -> Db {
-        Db::open(
+        Db::open_or_create(
             root,
             name,
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned,
             },
@@ -7244,12 +7437,13 @@ mod tests {
             let q = 2u32;
             let root =
                 std::env::temp_dir().join(format!("douchdb-info-wire-{}", crate::util::uuid()));
-            let db = Db::open(
+            let db = Db::open_or_create(
                 &root,
                 "infowire",
                 DbConfig {
                     q,
                     revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                     shard_map: ShardMap::single(q),
                     partitioned,
                 },
@@ -7298,18 +7492,98 @@ mod tests {
         }
     }
 
+    /// Document reads (`get_doc`, `get_docs`, `_bulk_get`, `_revs_diff`, the
+    /// view and anti-entropy fetches) run on leases off the shard actor, so
+    /// they answer while a write group holds it, from the committed state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn document_reads_answer_while_a_write_group_holds_the_actor() {
+        let (db, root) = single_shard_db("leased-reads").await;
+        db.set_revs_limit(2).await.unwrap();
+        let mut rev = String::new();
+        for n in 0..3 {
+            let mut doc = json!({"_id": "a", "n": n});
+            if !rev.is_empty() {
+                doc["_rev"] = json!(rev);
+            }
+            let written = db.put_docs(vec![doc], true).await.unwrap();
+            rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        }
+        db.put_docs(vec![json!({"_id": "b"})], true).await.unwrap();
+
+        // A job that holds the actor, and with it the next group, until the
+        // reads are done.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = db.shard_handle(0).call(move |shard| {
+            shard.put_local("held", b"{}")?;
+            entered_tx.send(()).unwrap();
+            release_rx.recv().map_err(ApiError::internal)?;
+            Ok(())
+        });
+        let reads = async {
+            entered_rx.await.unwrap();
+            let opts = DocOpts {
+                revs: true,
+                ..Default::default()
+            };
+            let doc = db.get_doc("a", &opts).await.unwrap();
+            assert_eq!(doc["n"], json!(2));
+            assert_eq!(
+                doc["_revisions"]["ids"].as_array().unwrap().len(),
+                2,
+                "revs_limit applies off the actor"
+            );
+            let docs = db
+                .get_docs(&["a".to_string(), "zz".to_string()], &DocOpts::default())
+                .await
+                .unwrap();
+            assert!(docs[0].is_ok() && docs[1].is_err());
+            let by_id = db.docs_by_ids(&["b".to_string()]).await.unwrap();
+            assert!(by_id.contains_key("b"));
+            let diff = db
+                .revs_diff(&json!({"a": [rev.clone(), "9-ffff"]}))
+                .await
+                .unwrap();
+            assert_eq!(diff.0.len(), 1);
+            assert_eq!(diff.0[0].1.missing, vec!["9-ffff".to_string()]);
+            let got = db
+                .bulk_get(
+                    &json!({"docs": [{"id": "a", "rev": rev.clone()}]}),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(got.results.len(), 1);
+            let pairs = [("a".to_string(), rev.clone())].into_iter().collect();
+            assert!(db.purged_among(&pairs).await.unwrap().is_empty());
+            let page = db
+                .map_docs_page(None, &mut MapCursor::default(), 10)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = page.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, ["a", "b"]);
+            release_tx.send(()).unwrap();
+        };
+        let (held, ()) = tokio::join!(held, reads);
+        held.unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `_revs_diff` answers in request order, leaves `possible_ancestors` out
     /// when there are none, and omits documents that miss nothing.
     #[tokio::test]
     async fn revs_diff_serializes_in_request_order() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-revs-wire-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "revswire",
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7343,12 +7617,13 @@ mod tests {
     async fn per_document_answers_survive_the_per_shard_fan_out() {
         let q = 4u32;
         let root = std::env::temp_dir().join(format!("douchdb-fan-out-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "fanout",
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7418,16 +7693,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A storage error part way through writing a batch fails the whole
+    /// batch, though `put_many` turns it into per-document results: none of
+    /// its documents is readable, its sequences are not committed, and the
+    /// shard takes the batch afterwards.
     #[tokio::test]
-    async fn failed_shard_flush_leaves_no_phantom_documents_or_stalled_changes() {
+    async fn a_write_failing_inside_a_batch_fails_the_batch_and_leaves_none_of_it() {
+        let (db, root) = single_shard_db("batch-write-fail").await;
+        db.put_docs(vec![json!({"_id": "kept"})], true)
+            .await
+            .unwrap();
+        let before = db.shard_seqs()[0].1;
+        // Bodies and sequence rows of the first two documents get through.
+        db.shards[0]
+            .call(|s| {
+                s.inject_write_failure(4);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let batch = vec![
+            json!({"_id": "x"}),
+            json!({"_id": "y"}),
+            json!({"_id": "z"}),
+        ];
+        let failed = db.put_docs(batch.clone(), true).await;
+        assert!(failed.is_err(), "{failed:?}");
+        for id in ["x", "y", "z"] {
+            let read = db.get_doc(id, &DocOpts::default()).await;
+            assert_eq!(read.unwrap_err().status, 404, "{id}");
+        }
+        let all = db.all_docs(&AllDocsOpts::default()).await.unwrap();
+        assert_eq!(all.rows.len(), 1, "{all:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
+        assert_eq!(db.shard_seqs()[0].1, before, "no sequence was committed");
+
+        let written = db.put_docs(batch, true).await.unwrap();
+        assert!(written.iter().all(WriteResult::is_ok), "{written:?}");
+        assert_eq!(db.info().await.unwrap().doc_count, 4);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_shard_commit_leaves_no_phantom_documents_or_stalled_changes() {
         let q = 2u32;
         let root = std::env::temp_dir().join(format!("douchdb-flushfail-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             "flushfail",
             DbConfig {
                 q,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(q),
                 partitioned: false,
             },
@@ -7445,7 +7763,7 @@ mod tests {
 
         db.shards[0]
             .call(|s| {
-                s.inject_flush_failure();
+                s.inject_commit_failure();
                 Ok(())
             })
             .await
@@ -7458,7 +7776,8 @@ mod tests {
         assert_eq!(all.rows.len(), 1, "{all:?}");
         assert_eq!(db.info().await.unwrap().doc_count, 1);
 
-        // The lost write's sequence is a gap; the feed is not held back.
+        // Nothing of the lost write is committed, its sequence included;
+        // the feed is not held back.
         let before = db.shard_seqs()[0].1;
         let opts = ChangesOpts {
             since: ShardSince::default(),
@@ -7487,8 +7806,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let after = db.shard_seqs()[0].1;
         assert_eq!(last_seq.get(0), after);
-        // The retried write took a new sequence, past the lost one.
-        assert!(after >= before + 2, "{before} -> {after}");
+        // The retried write takes the sequence the failed one never
+        // committed, which no reader saw.
+        assert_eq!(after, before + 1, "{before} -> {after}");
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -7496,12 +7816,13 @@ mod tests {
 
     fn two_shard_db(tag: &str) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             tag,
             DbConfig {
                 q: 2,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map: ShardMap::single(2),
                 partitioned: false,
             },
@@ -7660,12 +7981,13 @@ mod tests {
 
     fn purge_test_db(name: &str, shard_map: ShardMap) -> (Db, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
-        let db = Db::open(
+        let db = Db::open_or_create(
             &root,
             name,
             DbConfig {
                 q: 1,
                 revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
                 shard_map,
                 partitioned: false,
             },
@@ -7786,10 +8108,10 @@ mod tests {
     async fn put_then_corrupt_meta(db: &Db, id: &str) -> String {
         let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
         let rev = written[0].json()["rev"].as_str().unwrap().to_string();
-        let key = meta_key(id);
+        let id = id.to_string();
         db.shards[0]
             .call(move |s| {
-                s.put_raw(&key, b"{not json");
+                s.put_raw(crate::kv::META, id.as_str(), b"{not json");
                 Ok(())
             })
             .await
@@ -7876,6 +8198,62 @@ mod tests {
         assert!(crate::metrics::corrupt_records_skipped() > before);
         assert!(!body_exists(&db, "good", &first).await);
         assert!(body_exists(&db, "bad", &bad_rev).await);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge job reads and checks every document's metadata before its
+    /// first write: a later document whose metadata fails its checksum fails
+    /// that purge alone, and the other jobs of its group commit.
+    #[tokio::test]
+    async fn a_purge_reads_every_document_before_it_writes() {
+        let (db, root) = purge_test_db("purge-reads-first", ShardMap::single(1));
+        let written = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        db.shards[0]
+            .call(|s| {
+                s.put_unsealed(crate::kv::META, "z", br#"{"tree":{},"seq":9}"#);
+                // A job that wrote nothing through the shard commits nothing.
+                Ok(s.put_local("setup", b"1")?)
+            })
+            .await
+            .unwrap();
+
+        // Hold the actor until the purge and a bystander are queued behind
+        // it, so the three run as one group, the purge before the bystander.
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = db.shards[0].call(move |_| {
+            let _ = started_tx.send(());
+            held.recv().map_err(ApiError::internal)
+        });
+        // "a" comes first and loses its only leaf; "z" cannot be read.
+        let body = json!({"a": [rev], "z": ["1-ffffffffffffffffffffffffffffffff"]});
+        let uuids = std::collections::BTreeMap::new();
+        let purge = db.purge(&body, 0, &uuids);
+        let bystander = db.shards[0].call(|s| Ok(s.put_local("bystander", b"1")?));
+        let releaser = async {
+            started.await.unwrap();
+            while db.shards[0].queued() < 2 {
+                tokio::task::yield_now().await;
+            }
+            release.send(()).unwrap();
+        };
+        let (blocked, purged, bystood, ()) = tokio::join!(blocker, purge, bystander, releaser);
+
+        let error = purged.expect_err("a purge over a damaged record succeeded");
+        assert!(error.reason.contains("checksum"), "{}", error.reason);
+        bystood.expect("the purge's failure aborted another job's write");
+        blocked.unwrap();
+        let local = db.shards[0]
+            .read(|s| Ok(s.get_local("bystander")?))
+            .await
+            .unwrap();
+        assert_eq!(local.as_deref(), Some(&b"1"[..]));
+        // The failed purge wrote nothing: "a" is still there.
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
+        assert_eq!(db.shard_purge_seqs().await.unwrap(), [0]);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
