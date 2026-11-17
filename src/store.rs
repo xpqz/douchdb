@@ -21,6 +21,8 @@
 //! ([`Shard::recover`]); if the file cannot be reopened the shard fails
 //! closed ([`ShardState::Failed`]).
 
+pub mod journal;
+use journal::KeyBytes;
 #[cfg(test)]
 mod model_test;
 
@@ -622,6 +624,8 @@ pub struct Shard {
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
     latest: Option<LatestChanges>,
+    /// The keys a running compaction must catch up on.
+    journal: journal::Journal,
     /// Test seam: make the next group that has something to commit fail
     /// instead of committing.
     #[cfg(test)]
@@ -669,6 +673,7 @@ impl Shard {
             body_reads: Arc::new(AtomicU64::new(0)),
             partition_ranks: Vec::new(),
             latest: None,
+            journal: Default::default(),
             #[cfg(test)]
             fail_next_commit: false,
             #[cfg(test)]
@@ -691,6 +696,7 @@ impl Shard {
     /// so whatever must learn that the file was reopened (a running
     /// compaction's journal) is told here.
     fn recover(&mut self, cause: &str) {
+        self.journal.invalidate();
         tracing::warn!(
             db = %self.name.db,
             shard = %self.name.shard,
@@ -1135,11 +1141,13 @@ impl Shard {
             } else {
                 {
                     let mut bodies = txn.open_table(BODIES)?;
-                    for key in stale {
+                    for key in &stale {
                         bodies.remove(key)?;
                     }
                 }
                 txn.commit()?;
+                self.journal
+                    .record(stale.iter().map(|key| (Table::Bodies, key.key_bytes())));
             }
             after = Some(last);
         }
@@ -1189,6 +1197,11 @@ pub struct ShardTxn<'s> {
     /// The group cleared the shard or removed a corrupt record: the indexes
     /// are dropped after the commit and rebuilt on next use.
     reset_indexes: bool,
+    /// The keys the group wrote, for the journal once it commits.
+    journaled: Vec<journal::JournalKey>,
+    /// The group cleared the shard: its commit invalidates the journal
+    /// rather than recording keys.
+    cleared: bool,
     /// The settings as the current job found them, restored if it fails
     /// before writing.
     job_start: Settings,
@@ -1209,6 +1222,8 @@ impl<'s> ShardTxn<'s> {
             txn,
             changes: Vec::new(),
             reset_indexes: false,
+            journaled: Vec::new(),
+            cleared: false,
             job_wrote: false,
             group_wrote: false,
             write_failed: None,
@@ -1235,6 +1250,8 @@ impl<'s> ShardTxn<'s> {
             staged,
             changes,
             reset_indexes,
+            mut journaled,
+            cleared,
             group_wrote,
             ..
         } = self;
@@ -1249,6 +1266,7 @@ impl<'s> ShardTxn<'s> {
             let mut settings = txn.open_table(SETTINGS)?;
             if staged.uuid != shard.settings.uuid {
                 settings.insert(UUID, kv::seal(staged.uuid.as_bytes()).as_slice())?;
+                journaled.push((Table::Settings, UUID.key_bytes()));
             }
             for (name, new, old) in [
                 (SEQ, staged.seq, shard.settings.seq),
@@ -1257,6 +1275,7 @@ impl<'s> ShardTxn<'s> {
             ] {
                 if new != old {
                     settings.insert(name, kv::seal(&new.to_be_bytes()).as_slice())?;
+                    journaled.push((Table::Settings, name.key_bytes()));
                 }
             }
         }
@@ -1265,6 +1284,13 @@ impl<'s> ShardTxn<'s> {
             anyhow::bail!("injected commit failure");
         }
         txn.commit()?;
+        // Before any caller hears back, so a compaction catching up cannot
+        // miss an acknowledged write.
+        if cleared {
+            shard.journal.invalidate();
+        } else {
+            shard.journal.record(journaled);
+        }
         if staged.uuid != shard.settings.uuid {
             if let Some(shared) = &shard.shared_uuid {
                 *shared.write().unwrap_or_else(|poison| poison.into_inner()) = staged.uuid.clone();
@@ -1359,9 +1385,14 @@ impl<'s> ShardTxn<'s> {
     fn put_value<'k, K: Key + 'static>(
         &mut self,
         def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
         key: K::SelfType<'k>,
         value: &[u8],
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        K::SelfType<'k>: KeyBytes,
+    {
+        self.journaled.push((table, key.key_bytes()));
         self.write(def, |table| {
             table.insert(key, kv::seal(value).as_slice())?;
             Ok(())
@@ -1371,8 +1402,13 @@ impl<'s> ShardTxn<'s> {
     fn remove_value<'k, K: Key + 'static>(
         &mut self,
         def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
         key: K::SelfType<'k>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        K::SelfType<'k>: KeyBytes,
+    {
+        self.journaled.push((table, key.key_bytes()));
         self.write(def, |table| {
             table.remove(key)?;
             Ok(())
@@ -1410,24 +1446,29 @@ impl<'s> ShardTxn<'s> {
 
     /// Store `value` under the setting `name`, with this group's commit.
     pub fn put_setting(&mut self, name: &str, value: &[u8]) -> Result<()> {
-        self.put_value(SETTINGS, name, value)
+        self.put_value(SETTINGS, Table::Settings, name, value)
     }
 
     /// Remove the setting `name`, with this group's commit.
     pub fn remove_setting(&mut self, name: &str) -> Result<()> {
-        self.remove_value(SETTINGS, name)
+        self.remove_value(SETTINGS, Table::Settings, name)
     }
 
     pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {
         let limit = limit.max(1);
-        self.put_value(SETTINGS, REVS_LIMIT, &limit.to_be_bytes())?;
+        self.put_value(SETTINGS, Table::Settings, REVS_LIMIT, &limit.to_be_bytes())?;
         self.staged.revs_limit = limit;
         Ok(())
     }
 
     pub fn set_purged_infos_limit(&mut self, limit: u64) -> Result<()> {
         let limit = limit.max(1);
-        self.put_value(SETTINGS, PURGED_INFOS_LIMIT, &limit.to_be_bytes())?;
+        self.put_value(
+            SETTINGS,
+            Table::Settings,
+            PURGED_INFOS_LIMIT,
+            &limit.to_be_bytes(),
+        )?;
         self.staged.purged_infos_limit = limit;
         Ok(())
     }
@@ -1468,7 +1509,7 @@ impl<'s> ShardTxn<'s> {
         new: Option<MetaState>,
         seq: u64,
     ) -> Result<()> {
-        self.put_value(META, docid, bytes)?;
+        self.put_value(META, Table::Meta, docid, bytes)?;
         self.count(old.as_ref(), new.as_ref());
         self.changes.push(DocChange {
             id: docid.to_string(),
@@ -1480,7 +1521,7 @@ impl<'s> ShardTxn<'s> {
 
     /// Remove a document's metadata record, whose state was `old`.
     pub fn remove_meta(&mut self, docid: &str, old: Option<MetaState>) -> Result<()> {
-        self.remove_value(META, docid)?;
+        self.remove_value(META, Table::Meta, docid)?;
         self.count(old.as_ref(), None);
         self.changes.push(DocChange {
             id: docid.to_string(),
@@ -1506,20 +1547,20 @@ impl<'s> ShardTxn<'s> {
     }
 
     pub fn put_body(&mut self, docid: &str, rev: &str, body: &[u8]) -> Result<()> {
-        self.put_value(BODIES, (docid, rev), body)
+        self.put_value(BODIES, Table::Bodies, (docid, rev), body)
     }
 
     pub fn remove_body(&mut self, docid: &str, rev: &str) -> Result<()> {
-        self.remove_value(BODIES, (docid, rev))
+        self.remove_value(BODIES, Table::Bodies, (docid, rev))
     }
 
     /// Record that `docid` changed at `seq`.
     pub fn put_seq(&mut self, seq: u64, docid: &str) -> Result<()> {
-        self.put_value(BY_SEQ, seq, docid.as_bytes())
+        self.put_value(BY_SEQ, Table::BySeq, seq, docid.as_bytes())
     }
 
     pub fn remove_seq(&mut self, seq: u64) -> Result<()> {
-        self.remove_value(BY_SEQ, seq)
+        self.remove_value(BY_SEQ, Table::BySeq, seq)
     }
 
     pub fn get_local(&self, id: &str) -> Result<Option<Vec<u8>>> {
@@ -1527,11 +1568,11 @@ impl<'s> ShardTxn<'s> {
     }
 
     pub fn put_local(&mut self, id: &str, doc: &[u8]) -> Result<()> {
-        self.put_value(LOCAL, id, doc)
+        self.put_value(LOCAL, Table::Local, id, doc)
     }
 
     pub fn remove_local(&mut self, id: &str) -> Result<()> {
-        self.remove_value(LOCAL, id)
+        self.remove_value(LOCAL, Table::Local, id)
     }
 
     /// Every local document of this shard, in id order.
@@ -1557,11 +1598,11 @@ impl<'s> ShardTxn<'s> {
     }
 
     pub fn put_checkpoint(&mut self, id: &str, value: &[u8]) -> Result<()> {
-        self.put_value(CHECKPOINTS, id, value)
+        self.put_value(CHECKPOINTS, Table::Checkpoints, id, value)
     }
 
     pub fn remove_checkpoint(&mut self, id: &str) -> Result<()> {
-        self.remove_value(CHECKPOINTS, id)
+        self.remove_value(CHECKPOINTS, Table::Checkpoints, id)
     }
 
     /// The checkpoints whose ids start with `prefix`, in id order.
@@ -1892,7 +1933,11 @@ impl<'s> ShardTxn<'s> {
         key: K::SelfType<'k>,
         value: &[u8],
     ) {
-        self.put_value(def, key, value).unwrap();
+        self.write(def, |table| {
+            table.insert(key, kv::seal(value).as_slice())?;
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// Store `value` under `key` in `def` without its seal, as damage on
@@ -1930,7 +1975,12 @@ impl<'s> ShardTxn<'s> {
         if self.purge_checkpoint(node)? == seq {
             return Ok(());
         }
-        self.put_value(SETTINGS, &purge_checkpoint_name(node), &seq.to_be_bytes())
+        self.put_value(
+            SETTINGS,
+            Table::Settings,
+            &purge_checkpoint_name(node),
+            &seq.to_be_bytes(),
+        )
     }
 
     /// The purge infos at sequences `from..=through`, in order.
@@ -1984,17 +2034,32 @@ impl<'s> ShardTxn<'s> {
         }
 
         for (old_seq, gone) in &old {
-            self.remove_value(PURGE_INFOS, *old_seq)?;
-            self.remove_value(PURGE_UUIDS, gone.uuid.as_str())?;
+            self.remove_value(PURGE_INFOS, Table::PurgeInfos, *old_seq)?;
+            self.remove_value(PURGE_UUIDS, Table::PurgeUuids, gone.uuid.as_str())?;
         }
         for (id, rev) in &stale_revs {
-            self.remove_value(PURGED_REVS, (id.as_str(), rev.as_str()))?;
+            self.remove_value(PURGED_REVS, Table::PurgedRevs, (id.as_str(), rev.as_str()))?;
         }
         let seq_bytes = seq.to_be_bytes();
-        self.put_value(PURGE_INFOS, seq, &serde_json::to_vec(info)?)?;
-        self.put_value(PURGE_UUIDS, info.uuid.as_str(), &seq_bytes)?;
+        self.put_value(
+            PURGE_INFOS,
+            Table::PurgeInfos,
+            seq,
+            &serde_json::to_vec(info)?,
+        )?;
+        self.put_value(
+            PURGE_UUIDS,
+            Table::PurgeUuids,
+            info.uuid.as_str(),
+            &seq_bytes,
+        )?;
         for rev in &info.revs {
-            self.put_value(PURGED_REVS, (info.id.as_str(), rev.as_str()), &seq_bytes)?;
+            self.put_value(
+                PURGED_REVS,
+                Table::PurgedRevs,
+                (info.id.as_str(), rev.as_str()),
+                &seq_bytes,
+            )?;
         }
         Ok(())
     }
@@ -2051,7 +2116,7 @@ impl<'s> ShardTxn<'s> {
         for seq in seqs {
             self.remove_seq(seq)?;
         }
-        self.remove_value(META, id)?;
+        self.remove_value(META, Table::Meta, id)?;
 
         let (mut docs, mut deleted) = (0u64, 0u64);
         self.scan(
@@ -2098,6 +2163,7 @@ impl<'s> ShardTxn<'s> {
         self.staged.docs = 0;
         self.staged.deleted = 0;
         self.reset_indexes = true;
+        self.cleared = true;
         Ok(())
     }
 
@@ -2377,15 +2443,18 @@ enum Message {
     Close(oneshot::Sender<()>),
 }
 
-/// A job run alone: handed the shard, or the error to answer with.
-type AloneJob = Box<dyn FnOnce(std::result::Result<&mut Shard, ApiError>) + Send>;
+/// A job run alone: handed the shard, or the error to answer with. It
+/// returns its answer, sent once the actor has checked what its commits
+/// left behind.
+type AloneJob =
+    Box<dyn FnOnce(std::result::Result<&mut Shard, ApiError>) -> Box<dyn FnOnce() + Send> + Send>;
 
 impl Message {
     /// Answer with `error` without running.
     fn fail(self, error: ApiError) {
         match self {
             Message::Write(job) | Message::Read(job) => job.fail(error),
-            Message::Alone(job) => job(Err(error)),
+            Message::Alone(job) => job(Err(error))(),
             Message::Close(done) => drop(done),
         }
     }
@@ -2552,11 +2621,14 @@ impl ShardHandle {
                         }
                     }
                     Message::Alone(job) => {
-                        job(Ok(&mut shard));
-                        // Its own commits (compaction's) may have failed.
+                        let answer = job(Ok(&mut shard));
+                        // Its own commits (compaction's) may have failed:
+                        // recovered before it answers, so whoever hears
+                        // back meets the recovered file.
                         if shard.poisoned() {
                             shard.recover("an I/O error in a job run alone");
                         }
+                        answer();
                     }
                 }
             }
@@ -2759,7 +2831,9 @@ impl ShardHandle {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(shard)))
                     .unwrap_or_else(|payload| Err(panicked(payload)))
             });
-            let _ = reply.send(result);
+            Box::new(move || {
+                let _ = reply.send(result);
+            }) as Box<dyn FnOnce() + Send>
         });
         self.send(Message::Alone(job), answer).await
     }
@@ -3109,7 +3183,7 @@ pub(crate) mod tests {
             let file = temp_file("no-setting");
             let mut shard = open(&file);
             shard
-                .write(move |txn| Ok(txn.remove_value(SETTINGS, setting)?))
+                .write(move |txn| Ok(txn.remove_value(SETTINGS, Table::Settings, setting)?))
                 .unwrap();
             drop(shard);
             let error = Shard::open(&file, 1000, CACHE)
@@ -4596,30 +4670,33 @@ mod recovery_tests {
         put(&rig.handle, "a", 1).await.unwrap();
 
         rig.switch.fail_writes(ErrorKind::StorageFull);
-        let failed = rig
-            .handle
-            .alone(|shard| {
-                let commit = || -> Result<()> {
-                    let txn = shard.gate.begin_write_txn()?;
-                    txn.open_table(LOCAL)?
-                        .insert("x", kv::seal(b"x").as_slice())?;
-                    txn.commit()?;
-                    Ok(())
-                };
-                commit().map_err(ApiError::from)
-            })
-            .await;
-        assert!(failed.is_err());
-        // The job has answered; the actor reopens the file before the next
-        // job, a read, which would otherwise meet the failing handle.
-        let mut next = tokio::spawn({
+        let mut failed = tokio::spawn({
             let handle = Arc::clone(&rig.handle);
-            async move { handle.read(|txn| Ok(txn.counts())).await }
+            async move {
+                handle
+                    .alone(|shard| {
+                        let commit = || -> Result<()> {
+                            let txn = shard.gate.begin_write_txn()?;
+                            txn.open_table(LOCAL)?
+                                .insert("x", kv::seal(b"x").as_slice())?;
+                            txn.commit()?;
+                            Ok(())
+                        };
+                        commit().map_err(ApiError::from)
+                    })
+                    .await
+            }
         });
-        reopening(&mut rig, &mut next).await;
+        // The actor reopens the file before the job answers, so neither its
+        // caller nor the next job meets the failing handle.
+        reopening(&mut rig, &mut failed).await;
         rig.switch.restore_writes();
         rig.go.send(()).unwrap();
-        assert_eq!(next.await.unwrap().unwrap(), (1, 0));
+        assert!(failed.await.unwrap().is_err());
+        assert_eq!(
+            rig.handle.read(|txn| Ok(txn.counts())).await.unwrap(),
+            (1, 0)
+        );
         assert_eq!(put(&rig.handle, "b", 2).await.unwrap(), 2);
         assert_eq!(rig.handle.state(), ShardState::Serving);
     }
@@ -4627,6 +4704,21 @@ mod recovery_tests {
     /// A test disk that lost its settings is reopened as the damaged file
     /// it is, not initialised again as a new shard: only the first open of a
     /// test disk creates its tables.
+    #[test]
+    fn failed_commit_recovery_invalidates_a_recording_journal() {
+        let (_, switch) = PowerCut::new();
+        let mut shard = Shard::create_over_backend(&switch, 1000).unwrap();
+        shard.journal.start();
+        let failed = shard.write(|txn| {
+            write_doc(txn, "a", false, b"{}", 1)?;
+            txn.inject_commit_failure();
+            Ok(())
+        });
+        assert!(failed.is_err());
+        assert_eq!(*shard.state.read().unwrap(), ShardState::Serving);
+        assert_eq!(shard.journal.take(), journal::Taken::Invalidated);
+    }
+
     #[test]
     fn a_test_disk_that_lost_its_settings_does_not_reopen_as_new() {
         let (_, switch) = PowerCut::new();

@@ -52,7 +52,7 @@ pub const CHECKPOINTS: TableDefinition<&str, &[u8]> = TableDefinition::new("chec
 pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
 /// One variant per table definition above.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Table {
     Meta,
     BySeq,
