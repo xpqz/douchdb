@@ -8434,4 +8434,88 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Replay one golden case on a fresh database with `q` shards: each
+    /// request's responses, then the stored body of every revision named by
+    /// a request or a response, as text (`None` when not stored).
+    async fn replay_golden(case: &Value, q: u32) -> (Vec<Value>, Vec<Value>) {
+        let name = case["name"].as_str().unwrap();
+        let root = std::env::temp_dir().join(format!("douchdb-golden-{name}-{}", uuid()));
+        let db = Db::open_or_create(
+            &root,
+            name,
+            DbConfig {
+                q,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut responses = Vec::new();
+        let mut named: Vec<(String, String)> = Vec::new();
+        for request in case["requests"].as_array().unwrap() {
+            let docs = request["docs"].as_array().unwrap().clone();
+            for doc in &docs {
+                if let (Some(id), Some(rev)) = (doc["_id"].as_str(), doc["_rev"].as_str()) {
+                    named.push((id.to_string(), rev.to_string()));
+                }
+            }
+            let new_edits = request["new_edits"].as_bool().unwrap();
+            let out = db.put_docs(docs, new_edits).await.unwrap();
+            let out: Vec<Value> = out.iter().map(WriteResult::json).collect();
+            for result in &out {
+                if let (Some(id), Some(rev)) = (result["id"].as_str(), result["rev"].as_str()) {
+                    named.push((id.to_string(), rev.to_string()));
+                }
+            }
+            responses.push(Value::Array(out));
+        }
+        let mut stored = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, rev) in named {
+            if !seen.insert((id.clone(), rev.clone())) {
+                continue;
+            }
+            let shard = db.shard_index(&id);
+            let (doc, at) = (id.clone(), rev.clone());
+            let body = db.shards[shard]
+                .call(move |s| Ok(s.get_body(&doc, &at)?))
+                .await
+                .unwrap()
+                .map(|bytes| String::from_utf8(bytes).unwrap());
+            stored.push(json!({"id": id, "rev": rev, "body": body}));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        (responses, stored)
+    }
+
+    /// `_bulk_docs` answers and stores exactly what main did when the
+    /// fixture was captured: revision ids, responses, error precedence and
+    /// the stored body bytes, at q=1 and q=2.
+    #[tokio::test]
+    async fn bulk_write_matches_golden() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/golden/bulk_write.json")).unwrap();
+        assert_eq!(cases.len(), 10);
+        for case in &cases {
+            for q in [1, 2] {
+                let (responses, stored) = replay_golden(case, q).await;
+                let name = &case["name"];
+                assert_eq!(
+                    Value::Array(responses),
+                    case["responses"],
+                    "{name} responses, q={q}"
+                );
+                // As text, so the comparison is of the stored bytes.
+                assert_eq!(
+                    serde_json::to_string(&stored).unwrap(),
+                    serde_json::to_string(&case["stored_bodies"]).unwrap(),
+                    "{name} stored bodies, q={q}"
+                );
+            }
+        }
+    }
 }
