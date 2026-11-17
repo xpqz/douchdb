@@ -373,7 +373,7 @@ fn reopen(switch: &PowerSwitch) -> Shard {
 /// Run `operations` jobs from `seed` against a fresh shard and the model.
 fn run(seed: u64, operations: u64) {
     let (_, switch) = PowerCut::new();
-    let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+    let mut shard = Shard::create_over_backend(&switch, 1000).unwrap();
     let mut model = Model::new();
     let mut rng = Rng(seed | 1);
     let mut n = 0;

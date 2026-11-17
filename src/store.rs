@@ -807,7 +807,29 @@ impl Shard {
         }
     }
 
-    /// A shard over a test disk, reopened over what the disk then holds.
+    /// A shard over a new test disk, whose first open makes the file as
+    /// `create_file` makes one. Recoveries reopen what the disk then holds.
+    #[cfg(test)]
+    pub(crate) fn create_over_backend(
+        switch: &kv::powercut::PowerSwitch,
+        revs_limit: u64,
+    ) -> Result<Shard> {
+        let switch = switch.clone();
+        let mut first = true;
+        Shard::over_test_opener(
+            Box::new(move || {
+                let db = kv::open_with(switch.backend(), 1 << 20)?;
+                if std::mem::take(&mut first) {
+                    init_tables(&db)?;
+                }
+                Ok(db)
+            }),
+            revs_limit,
+        )
+    }
+
+    /// A shard over a test disk that already holds one, reopened over what
+    /// the disk then holds, as `open` reopens a file: nothing is created.
     #[cfg(test)]
     pub(crate) fn over_backend(
         switch: &kv::powercut::PowerSwitch,
@@ -815,12 +837,7 @@ impl Shard {
     ) -> Result<Shard> {
         let switch = switch.clone();
         Shard::over_test_opener(
-            Box::new(move || {
-                // A fresh test disk is a new file, made as `create_file` makes one.
-                let db = kv::open_with(switch.backend(), 1 << 20)?;
-                init_tables(&db)?;
-                Ok(db)
-            }),
+            Box::new(move || Ok(kv::open_with(switch.backend(), 1 << 20)?)),
             revs_limit,
         )
     }
@@ -2423,7 +2440,8 @@ impl ShardHandle {
         })
     }
 
-    /// A shard over a test disk, on a new actor thread.
+    /// A shard over a test disk that already holds one, on a new actor
+    /// thread.
     #[cfg(test)]
     pub(crate) fn over_backend(switch: &kv::powercut::PowerSwitch) -> Result<ShardHandle> {
         let switch = switch.clone();
@@ -3639,6 +3657,8 @@ pub(crate) mod tests {
         // Every acknowledged write: local id -> value.
         let mut acknowledged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut groups: Vec<Vec<String>> = Vec::new();
+        // The shard file, made once; each round reopens it.
+        drop(Shard::create_over_backend(&switch, 1000).unwrap());
         for round in 0..12u64 {
             let handle = Arc::new(ShardHandle::over_backend(&switch).unwrap());
             let writes = 20 + rng.below(40);
@@ -4204,13 +4224,17 @@ mod recovery_tests {
         let lease_held = Arc::clone(&held);
         let mut first = true;
         let open: Opener = Box::new(move || {
-            if !std::mem::take(&mut first) {
+            let creating = std::mem::take(&mut first);
+            if !creating {
                 let _ = opening_tx.send(lease_held.load(Ordering::SeqCst));
                 go_rx.recv()?;
             }
-            // The first open makes the file, as `create_file` would.
             let db = kv::open_with(disk.backend(), CACHE)?;
-            init_tables(&db)?;
+            // Only the first open makes the file, as `create_file` would; a
+            // recovery reopens what the disk holds.
+            if creating {
+                init_tables(&db)?;
+            }
             Ok(db)
         });
         let handle = ShardHandle::spawn_with(
@@ -4554,10 +4578,30 @@ mod recovery_tests {
         assert_eq!(rig.handle.state(), ShardState::Serving);
     }
 
+    /// A test disk that lost its settings is reopened as the damaged file
+    /// it is, not initialised again as a new shard: only the first open of a
+    /// test disk creates its tables.
+    #[test]
+    fn a_test_disk_that_lost_its_settings_does_not_reopen_as_new() {
+        let (_, switch) = PowerCut::new();
+        let shard = Shard::create_over_backend(&switch, 1000).unwrap();
+        let txn = shard.gate.begin_write_txn().unwrap();
+        txn.open_table(SETTINGS)
+            .unwrap()
+            .retain(|_, _| false)
+            .unwrap();
+        txn.commit().unwrap();
+        drop(shard);
+        assert!(
+            Shard::over_backend(&switch, 1000).is_err(),
+            "a shard file without settings opened"
+        );
+    }
+
     #[test]
     fn a_handle_left_failing_is_reopened_before_the_next_group() {
         let (_, switch) = PowerCut::new();
-        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let mut shard = Shard::create_over_backend(&switch, 1000).unwrap();
         shard
             .write(|txn| write_doc(txn, "a", false, b"{}", 1))
             .unwrap();
