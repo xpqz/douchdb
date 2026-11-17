@@ -3470,7 +3470,7 @@ pub(crate) mod tests {
         let file = temp_file("corrupt-compact");
         let mut shard = open(&file);
         // A stale-looking body next to an unreadable metadata record: the
-        // sweep cannot know it is stale, so it must keep it and carry on.
+        // copy cannot know it is stale, so it must keep it and carry on.
         shard
             .write(|txn| {
                 txn.put_raw(META, Table::Meta, "bad", b"{not json");

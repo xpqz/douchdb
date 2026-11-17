@@ -22,7 +22,9 @@ every commit.
   staging directory, synced, published with one rename, and the parent
   directory is synced before the create is acknowledged. A delete renames the
   directory to a tombstone and syncs the parent before it is acknowledged.
-  Recovery on start removes only staging and tombstone directories.
+  Recovery on start removes only staging and tombstone directories and, under
+  a database's own name, search-index temporary files and leftover compaction
+  files.
 - **A failed commit does not leave a half-usable shard.** If a commit fails,
   every write in the group gets an error and the shard reopens (running redb's
   recovery); if that fails the shard answers 500 until its database is next
@@ -60,10 +62,15 @@ every commit.
   the shard, checks the copy in full, catches it up, renames it over the
   shard file and syncs the directory before serving it. The pages the
   catch-up commits after the check are trusted as any live two-phase commit
-  is, until the file's next idle-close check. Until the rename the shard file is untouched,
-  and a leftover compaction file is removed on start; a swap that fails part
-  way fails the shard closed rather than serve a file whose name may not
-  survive a power cut. Crash tests of the swap itself are still to come.
+  is, until the file's next idle-close check. redb checks no page checksum on
+  an ordinary read, so before the swap every table but the bodies must hold
+  as many entries in the copy as in the shard; otherwise the copy is thrown
+  away. Until the rename the shard file is untouched, and a leftover
+  compaction file is removed on start; a swap that fails part way fails the
+  shard closed rather than serve a file whose name may not survive a power
+  cut. The crash tests in `store::compact` and the `sigkill-mid-compaction`
+  scenario of `scripts/storage_faults.py` kill or cut power before and after
+  the rename.
 
 ## Operational guidance
 

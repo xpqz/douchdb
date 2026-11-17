@@ -8293,9 +8293,9 @@ mod tests {
     }
 
     /// One corrupt record must not stop compaction of the rest of the shard:
-    /// the record and its bodies stay, the other documents are swept.
+    /// the record and its bodies stay, the other documents are compacted.
     #[tokio::test]
-    async fn compaction_skips_a_corrupt_record_and_sweeps_the_rest() {
+    async fn compaction_skips_a_corrupt_record_and_compacts_the_rest() {
         let (db, root) = purge_test_db("compact-corrupt", ShardMap::single(1));
         let first = db
             .put_docs(vec![json!({"_id": "good"})], true)

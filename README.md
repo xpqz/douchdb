@@ -671,8 +671,8 @@ reports how many requests from other nodes it served per protocol under
   a partition; `?r=1` is the explicit local-availability trade-off.
 - **Best-effort database lifecycle.** A node that is offline during a database
   create or drop is not repaired automatically.
-- **Node-local operations.** `_purge`, `_compact` and `_revs_limit` act only on
-  the node that receives them.
+- **Node-local compaction.** `_compact` compacts only the node that receives
+  it; `_purge` and `_revs_limit` reach every copy, as in CouchDB.
 - **Failover replays a range.** A `since` token names a shard copy; when that
   copy is down or was replaced, its range replays from 0 on another copy
   rather than resuming from a checkpoint as CouchDB does (issue #52).
@@ -703,7 +703,7 @@ The cluster paths are covered by the integration tests, including
 
 `GET /`, `_up`, `_all_dbs` (with `startkey`/`endkey`/`limit`/`skip`/
 `descending`), `_db_updates` (normal/longpoll/continuous, heartbeat),
-`_dbs_info`, `_uuids`, `_membership`, `_session`, `_security`, database
+`_dbs_info`, `_uuids`, `_active_tasks`, `_membership`, `_session`, `_security`, database
 create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
 `?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
 `_design_docs`, `_local_docs`, `_changes` (normal/longpoll/true continuous, `feed=eventsource` SSE, heartbeat,
@@ -1044,7 +1044,7 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
   copies each shard into a new file (dropping non-leaf bodies) while the
   shard keeps serving, checks the copy in full, catches up with the writes
   made meanwhile, and swaps the new file in with writes paused only for the
-  last catch-up and the rename. It is node-local, like `_purge`;
+  last catch-up and the rename. It is node-local;
   `--compact-concurrency` bounds concurrent compactions across databases;
   the rest wait their turn. The swap pauses that shard's writes and actor
   reads (reads on their own transactions carry on). `GET /db` reports
