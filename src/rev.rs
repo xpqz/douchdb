@@ -178,10 +178,11 @@ mod tests {
     fn revid_is_deterministic_and_order_sensitive() {
         let body = json!({"x": 1, "y": 2});
         let reordered = json!({"y": 2, "x": 1});
-        let a = new_revid(false, None, &body);
-        assert_eq!(a, new_revid(false, None, &body));
-        assert_ne!(a, new_revid(false, None, &reordered));
-        assert_ne!(a, new_revid(true, None, &body));
+        let (body, reordered) = (body.as_object().unwrap(), reordered.as_object().unwrap());
+        let a = new_revid_doc(false, None, body);
+        assert_eq!(a, new_revid_doc(false, None, body));
+        assert_ne!(a, new_revid_doc(false, None, reordered));
+        assert_ne!(a, new_revid_doc(true, None, body));
     }
 
     #[test]
@@ -189,8 +190,8 @@ mod tests {
         let body = json!({"x": 1});
         let parent = Rev::parse("1-aabbccddeeff00112233445566778899").unwrap();
         assert_ne!(
-            new_revid(false, Some(&parent), &body),
-            new_revid(false, None, &body)
+            new_revid_doc(false, Some(&parent), body.as_object().unwrap()),
+            new_revid_doc(false, None, body.as_object().unwrap())
         );
     }
 
@@ -210,7 +211,7 @@ mod tests {
             (json!({"a": [0, 255]}), "ebdd13a7ecf6387443aa094a0d18b4d6"),
         ];
         for (body, expected) in cases {
-            let got = hex16(new_revid(false, None, &body));
+            let got = hex16(new_revid_doc(false, None, body.as_object().unwrap()));
             assert_eq!(got, expected, "body {body}");
         }
     }
@@ -228,7 +229,7 @@ mod tests {
         ];
         for (raw, expected) in cases {
             let body = crate::json::from_slice(raw.as_bytes()).unwrap();
-            let got = hex16(new_revid(false, None, &body));
+            let got = hex16(new_revid_doc(false, None, body.as_object().unwrap()));
             assert_eq!(got, expected, "body {raw}");
         }
     }

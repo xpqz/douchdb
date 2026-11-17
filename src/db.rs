@@ -7,6 +7,7 @@
 
 use crate::cluster::{ShardMap, ShardMask};
 pub use crate::error::{ApiError, DbResult};
+use crate::prepare::{prepare, Prepared};
 use crate::rev::{new_revid_doc, Rev};
 use crate::store::{
     meta_state, DocMeta, DocRead, LiveDoc, MetaState, PurgeInfo, ShardHandle, ShardTxn,
@@ -36,6 +37,8 @@ pub const META_FIELDS: [&str; 9] = [
 /// Names of the database's own settings, kept in the settings table of
 /// shard 0 beside that shard's own.
 const DB_SETTINGS: &str = "db/";
+/// A write with more documents than this prepares them on the blocking pool.
+const PREPARE_INLINE_MAX: usize = 1000;
 /// [`DbRecord`].
 const INFO_SETTING: &str = "db/info";
 /// The active [`ShardMap`].
@@ -1670,41 +1673,72 @@ impl Db {
 
     // ----- documents -------------------------------------------------------
 
-    pub async fn put_docs(&self, docs: Vec<Value>, new_edits: bool) -> DbResult<Vec<WriteResult>> {
-        if docs.iter().any(|doc| doc.get("_attachments").is_some()) {
+    pub async fn put_docs<D>(&self, docs: Vec<D>, new_edits: bool) -> DbResult<Vec<WriteResult>>
+    where
+        D: std::borrow::Borrow<Value> + Send + 'static,
+    {
+        if docs
+            .iter()
+            .any(|doc| doc.borrow().get("_attachments").is_some())
+        {
             return Err(attachments_unsupported());
         }
         let touches_design = docs.iter().any(|doc| {
-            doc.get("_id")
+            doc.borrow()
+                .get("_id")
                 .and_then(Value::as_str)
                 .map(|id| id.starts_with("_design/"))
                 .unwrap_or(false)
         });
         let mut out: Vec<Option<WriteResult>> = (0..docs.len()).map(|_| None).collect();
-        let mut grouped: Vec<Vec<(usize, Value)>> = (0..self.q).map(|_| Vec::new()).collect();
+        let mut grouped: Vec<Vec<(usize, Prepared)>> = (0..self.q).map(|_| Vec::new()).collect();
         let mut ids: Vec<Option<String>> = vec![None; docs.len()];
 
         let mut locals: Vec<(usize, Value)> = Vec::new();
+        let mut pending: Vec<(usize, String, D)> = Vec::new();
         for (i, doc) in docs.into_iter().enumerate() {
+            let value = doc.borrow();
             // `_local/` documents have no revision tree and no sequence; they
             // are applied to the shard of their id further down.
-            if doc
+            if value
                 .get("_id")
                 .and_then(Value::as_str)
                 .is_some_and(|id| id.starts_with("_local/"))
             {
-                locals.push((i, doc));
+                locals.push((i, value.clone()));
                 continue;
             }
-            match doc_id(&doc) {
+            match doc_id(value) {
                 Ok(id) => match self.validate_doc_id(&id) {
-                    Ok(()) => {
-                        ids[i] = Some(id.clone());
-                        grouped[self.shard_index(&id)].push((i, doc));
-                    }
+                    Ok(()) => pending.push((i, id, doc)),
                     Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
                 },
                 Err(e) => out[i] = Some(WriteResult::error(None, e)),
+            }
+        }
+        // Splitting, serialising and hashing happen here, not on the shard's
+        // writer; a large batch uses the blocking pool.
+        let prepare_all = move |pending: Vec<(usize, String, D)>| {
+            pending
+                .into_iter()
+                .map(|(i, id, doc)| (i, id, prepare(doc.borrow(), new_edits)))
+                .collect::<Vec<_>>()
+        };
+        let prepared = if pending.len() > PREPARE_INLINE_MAX {
+            tokio::task::spawn_blocking(move || prepare_all(pending))
+                .await
+                .map_err(ApiError::internal)?
+        } else {
+            prepare_all(pending)
+        };
+        for (i, id, result) in prepared {
+            match result {
+                Ok(doc) => {
+                    let shard = self.shard_index(&doc.id);
+                    ids[i] = Some(doc.id.clone());
+                    grouped[shard].push((i, doc));
+                }
+                Err(e) => out[i] = Some(WriteResult::error(Some(Value::String(id)), e)),
             }
         }
 
@@ -3856,31 +3890,32 @@ fn validate_design_doc(id: &str, deleted: bool, obj: &Map<String, Value>) -> DbR
 /// skipped too, as `Stage::stage_replicated` never validates it.
 async fn compile_design_docs(
     shards: &[crate::store::ShardHandle],
-    grouped: &[Vec<(usize, Value)>],
+    grouped: &[Vec<(usize, Prepared)>],
     new_edits: bool,
 ) -> DbResult<HashMap<usize, ApiError>> {
     let mut pending: Vec<(usize, usize, Map<String, Value>)> = Vec::new();
+    // For `new_edits=false`: each candidate's id and revision fields.
+    let mut revs: HashMap<usize, (String, Option<String>, Option<Value>)> = HashMap::new();
     for (shard_idx, batch) in grouped.iter().enumerate() {
         for (i, doc) in batch {
-            let Some(obj) = doc.as_object() else { continue };
-            let Some(id) = obj.get("_id").and_then(Value::as_str) else {
+            let Some(members) = &doc.members else {
                 continue;
             };
-            let deleted = obj.get("_deleted") == Some(&Value::Bool(true));
-            if id.starts_with("_design/")
-                && compile_needed(obj)
-                && validate_design_doc(id, deleted, obj).is_ok()
+            if compile_needed(members) && validate_design_doc(&doc.id, doc.deleted, members).is_ok()
             {
-                pending.push((*i, shard_idx, obj.clone()));
+                pending.push((*i, shard_idx, members.clone()));
+                if !new_edits {
+                    revs.insert(*i, (doc.id.clone(), doc.rev.clone(), doc.revisions.clone()));
+                }
             }
         }
     }
     if !new_edits {
         for (shard_idx, shard) in shards.iter().enumerate() {
-            let candidates: Vec<(usize, Value)> = pending
+            let candidates: Vec<_> = pending
                 .iter()
                 .filter(|(_, owner, _)| *owner == shard_idx)
-                .map(|(i, _, doc)| (*i, Value::Object(doc.clone())))
+                .filter_map(|(i, _, _)| revs.remove(i).map(|fields| (*i, fields)))
                 .collect();
             if candidates.is_empty() {
                 continue;
@@ -3889,7 +3924,9 @@ async fn compile_design_docs(
                 .read(move |shard| {
                     Ok(candidates
                         .into_iter()
-                        .filter(|(_, doc)| replicated_is_stored(shard, doc.clone()))
+                        .filter(|(_, (id, rev, revisions))| {
+                            replicated_is_stored(shard, id, rev.clone(), revisions.as_ref())
+                        })
                         .map(|(i, _)| i)
                         .collect::<Vec<usize>>())
                 })
@@ -3918,17 +3955,16 @@ fn compile_needed(obj: &Map<String, Value>) -> bool {
 /// Whether `Stage::stage_replicated` would find this replicated revision
 /// already stored, and so never validate it. Anything malformed is "not
 /// stored": the stage reports its own error for it.
-fn replicated_is_stored(shard: &mut ShardTxn, doc: Value) -> bool {
-    let Ok(SplitDoc {
-        id, rev, revisions, ..
-    }) = split_doc(doc)
-    else {
+fn replicated_is_stored(
+    shard: &mut ShardTxn,
+    id: &str,
+    rev: Option<String>,
+    revisions: Option<&Value>,
+) -> bool {
+    let Ok((rev, _)) = revisions_path(rev, revisions) else {
         return false;
     };
-    let Ok((rev, _)) = revisions_path(rev, revisions.as_ref()) else {
-        return false;
-    };
-    matches!(shard.get_meta(&id), Ok(Some(meta)) if meta.tree.contains(&rev))
+    matches!(shard.get_meta(id), Ok(Some(meta)) if meta.tree.contains(&rev))
 }
 
 /// Every compile of a view function with the name of the thread that ran it,
@@ -4004,16 +4040,24 @@ fn doc_id(doc: &Value) -> DbResult<String> {
     }
 }
 
-/// A client document split into its metadata fields and its body.
-struct SplitDoc {
-    id: String,
-    rev: Option<String>,
-    deleted: bool,
-    revisions: Option<Value>,
-    body: Map<String, Value>,
+/// A client document split into its metadata fields and its body: the
+/// reference for [`prepare`].
+#[cfg(test)]
+pub(crate) struct SplitDoc {
+    pub(crate) id: String,
+    pub(crate) rev: Option<String>,
+    pub(crate) deleted: bool,
+    pub(crate) revisions: Option<Value>,
+    pub(crate) body: Map<String, Value>,
 }
 
-fn split_doc(doc: Value) -> DbResult<SplitDoc> {
+/// The decoded body members of a stored or prepared body.
+pub(crate) fn body_members(body: &[u8]) -> DbResult<Map<String, Value>> {
+    serde_json::from_slice(body).map_err(ApiError::internal)
+}
+
+#[cfg(test)]
+pub(crate) fn split_doc(doc: Value) -> DbResult<SplitDoc> {
     /// `_id`/`_rev`/... are document metadata, not body. `_conflicts` and
     /// friends are read-only decorations a client may echo back.
     const META: [&str; 9] = META_FIELDS;
@@ -4080,7 +4124,7 @@ fn corrupt_tree(id: &str, error: crate::revtree::CyclicTree) -> ApiError {
 
 fn put_many(
     shard: &mut ShardTxn,
-    docs: Vec<(usize, Value)>,
+    docs: Vec<(usize, Prepared)>,
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
 ) -> Vec<(usize, DbResult<WriteOk>)> {
@@ -4184,37 +4228,36 @@ impl Stage<'_, '_> {
     /// before the shard job; it is raised where the structural check is.
     fn stage(
         &mut self,
-        doc: Value,
+        doc: Prepared,
         new_edits: bool,
         compile_error: Option<ApiError>,
     ) -> DbResult<WriteOk> {
-        let doc = split_doc(doc)?;
         let mut meta = self.meta(&doc.id)?.unwrap_or_default();
         if !new_edits {
             return self.stage_replicated(doc, meta, compile_error);
         }
-        let SplitDoc {
+        let Prepared {
             id,
-            rev: parent_rev,
+            rev: client_rev,
             deleted,
-            revisions: _,
             body,
+            members,
+            rev_hash,
+            ..
         } = doc;
-        let parent_rev = parent_rev.map(|rev| canonical_rev(&rev));
-        let body = Value::Object(body);
 
-        let parent = match parent_rev {
+        let parent = match &client_rev {
             Some(rev) => {
-                if Rev::parse(&rev).is_none() {
+                if Rev::parse(rev).is_none() {
                     return Err(ApiError::bad_request("Invalid rev format"));
                 }
-                if !meta.tree.contains(&rev) || !meta.tree.is_leaf(&rev) {
+                if !meta.tree.contains(rev) || !meta.tree.is_leaf(rev) {
                     return Err(ApiError::conflict());
                 }
-                if meta.tree.is_deleted(&rev) {
+                if meta.tree.is_deleted(rev) {
                     return Err(ApiError::conflict());
                 }
-                Some(rev)
+                Some(rev.clone())
             }
             None => match meta.tree.winner() {
                 Some(winner) if !meta.tree.is_deleted(&winner) => return Err(ApiError::conflict()),
@@ -4224,7 +4267,7 @@ impl Stage<'_, '_> {
 
         // CouchDB validates a design document only once its revision is known
         // to be the right one: a conflict wins over a malformed member.
-        if let Value::Object(members) = &body {
+        if let Some(members) = &members {
             validate_design_doc(&id, deleted, members)?;
             if let Some(error) = compile_error {
                 return Err(error);
@@ -4235,18 +4278,23 @@ impl Stage<'_, '_> {
             Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
             None => Vec::new(),
         };
-        let pos = parent
-            .as_ref()
-            .and_then(|p| Rev::parse(p).map(|r| r.pos))
-            .unwrap_or(0)
-            + 1;
+        let parent = parent.as_deref().and_then(Rev::parse);
+        let pos = parent.as_ref().map_or(0, |p| p.pos) + 1;
 
-        let rev_id = hex(&new_revid_doc(
-            deleted,
-            parent.as_ref().and_then(|p| Rev::parse(p)).as_ref(),
-            body.as_object().expect("body is an object"),
-        ));
-        let rev = format!("{pos}-{rev_id}");
+        // The prepared hash is for the client's parent. Without `_rev` over a
+        // deleted winner the parent is the winner, and the hash is computed
+        // here, from the body.
+        let hash = match (rev_hash, &client_rev, &parent) {
+            (Some(hash), Some(_), _) | (Some(hash), None, None) => hash,
+            _ => {
+                let members = match members {
+                    Some(members) => members,
+                    None => body_members(&body)?,
+                };
+                new_revid_doc(deleted, parent.as_ref(), &members)
+            }
+        };
+        let rev = format!("{pos}-{}", hex(&hash));
 
         let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
         path.push(Rev::parse(&rev).expect("valid rev"));
@@ -4259,7 +4307,7 @@ impl Stage<'_, '_> {
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
-            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+            body,
         });
         self.ops.push(Op::Seq {
             seq,
@@ -4275,18 +4323,19 @@ impl Stage<'_, '_> {
 
     fn stage_replicated(
         &mut self,
-        doc: SplitDoc,
+        doc: Prepared,
         mut meta: DocMeta,
         compile_error: Option<ApiError>,
     ) -> DbResult<WriteOk> {
-        let SplitDoc {
+        let Prepared {
             id,
             rev,
             deleted,
             revisions,
             body,
+            members,
+            ..
         } = doc;
-        let body = Value::Object(body);
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
         let known = meta.tree.contains(&rev);
         // A revision that is only an ancestor on a stored path has no body
@@ -4297,7 +4346,7 @@ impl Stage<'_, '_> {
         // A replicated design document is validated too (couch_db:
         // prep_and_validate_replicated_updates), unless it is already stored.
         if !known {
-            if let Value::Object(members) = &body {
+            if let Some(members) = &members {
                 validate_design_doc(&id, deleted, members)?;
                 if let Some(error) = compile_error {
                     return Err(error);
@@ -4313,7 +4362,7 @@ impl Stage<'_, '_> {
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
-            body: serde_json::to_vec(&body).map_err(ApiError::internal)?,
+            body,
         });
         if changed {
             let old_seq = meta.seq;
@@ -5667,7 +5716,11 @@ mod tests {
     fn write_costs(shard: &mut crate::store::Shard, docs: Vec<Value>) -> (usize, usize) {
         let parses = crate::store::meta_parses();
         let serialises = META_SERIALISES.with(std::cell::Cell::get);
-        let docs = docs.into_iter().enumerate().collect();
+        let docs = docs
+            .iter()
+            .map(|doc| prepare(doc, true).unwrap())
+            .enumerate()
+            .collect();
         let results = shard
             .write(move |s| Ok(put_many(s, docs, true, HashMap::new())))
             .unwrap();
@@ -8517,6 +8570,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A batch large enough to be prepared on the blocking pool keeps each
+    /// result in its document's slot, a document that fails to prepare
+    /// included, and a document without `_id` is stored under the id its
+    /// result names.
+    #[tokio::test]
+    async fn large_batches_keep_their_order() {
+        let root = std::env::temp_dir().join(format!("douchdb-large-batch-{}", uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "large",
+            DbConfig {
+                q: 2,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let count = PREPARE_INLINE_MAX + 2;
+        let mut docs: Vec<Value> = (0..count)
+            .map(|i| json!({"_id": format!("d{i:05}"), "n": i}))
+            .collect();
+        docs[7] = json!({"_id": "bad", "_rev": 5});
+        docs[8] = json!({"n": 8});
+        let out = db.put_docs(docs, true).await.unwrap();
+        assert_eq!(out.len(), count);
+        for (i, result) in out.iter().enumerate() {
+            let result = serde_json::to_value(result).unwrap();
+            match i {
+                7 => assert_eq!(result["reason"], "Invalid rev format", "{result}"),
+                8 => {
+                    let id = result["id"].as_str().unwrap();
+                    let doc = db.get_doc(id, &DocOpts::default()).await.unwrap();
+                    assert_eq!(doc["n"], 8);
+                }
+                _ => assert_eq!(result["id"], format!("d{i:05}"), "{result}"),
+            }
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A write counts its shard group, the time spent in its jobs and its
