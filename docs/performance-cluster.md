@@ -133,6 +133,8 @@ metadata to compute their local offsets, including with a far-away `startkey`.
 | `_all_docs?startkey=doc-005000&limit=100` | 118 req/s, p50 8.27 ms | 524 req/s, p50 1.86 ms |
 | `_bulk_docs`, 250 docs/request | 11,956 docs/s | 12,177 docs/s |
 
+The `_bulk_docs` row is OS-buffered (pre-redb; see Environment).
+
 ## Scaling with node count
 
 This run keeps one replica per document (`q=4`, `n=1`) and spreads clients
@@ -157,6 +159,8 @@ python3 scripts/perf_cluster.py --nodes N --q 4 --n 1 --spread \
 \* The one-node row uses the single-node view path; at two or more nodes the
 coordinator performs a cluster fan-out, so the view row is not directly
 comparable across that boundary.
+
+The PUT and `_bulk_docs` rows are OS-buffered (pre-redb; see Environment).
 
 The table above is the historical `n=1` Python-client run. A native Rust client
 on the same host, with `n=3`, `?r=1`, and 32 concurrent GETs, measured:

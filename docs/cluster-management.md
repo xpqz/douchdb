@@ -60,7 +60,8 @@ request:
    documents pulled for shards this node does not replicate are checkpointed
    apart, under `ae3d:`. Checkpoints are node-local records, not `_local`
    documents: they are never listed by `_local_docs` or shared with other
-   nodes, and clearing a shard copy drops its checkpoints with it.
+   nodes, and clearing a shard copy drops its `ae3:` and `ae3d:` checkpoints
+   with it.
 
 Checkpoints are advanced only after every requested revision has reached a
 terminal state: applied locally, already present locally, or explicitly
@@ -76,9 +77,9 @@ replaced (a new uuid), that shard is read from 0 and the checkpoint moves to the
 new uuid. Purges are tracked apart, in one checkpoint per peer on shard 0 with
 id `purge-ae2:<peer URL>:<hash>`, the hash being an MD5 of the replica lists,
 so a placement change rereads the peer's purges from zero. No manual checkpoint
-reset is needed. This path also repairs replicas after failed writes, a restart, or a
-period offline, and keeps search/view indexes warm because their documents
-arrive without a client read.
+reset is needed. This path also repairs replicas after failed writes, a
+restart, or a period offline, and keeps search/view indexes warm because their
+documents arrive without a client read.
 
 The replicator is pull-based. There is no separate push scheduler: normal
 writes already fan out to replicas, and the timer repairs what they missed.

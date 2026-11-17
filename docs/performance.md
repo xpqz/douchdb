@@ -177,8 +177,8 @@ Caveats:
 
 - Linux `fdatasync` was not measured.
 - The write mix was creates only.
-- Single-document writes do not yet coalesce into larger commits; that is
-  issue #90.
+- Concurrent single-document writes share commits poorly under the synced
+  group commit; that is issue #90.
 
 ## JavaScript sandbox throughput
 
