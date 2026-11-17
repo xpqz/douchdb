@@ -1091,8 +1091,8 @@ impl Db {
     /// A write that fails may still have landed (a commit can report an
     /// error and be on the disk), so the setting is then read back from
     /// shard 0 once it has recovered, and installed if it is what was
-    /// written; the caller still hears the error. Every other setting
-    /// already matched the disk, as `writing` admits no other write. If it
+    /// written; the caller still hears the error. Every other setting is as
+    /// it was: `writing` admits no other write. If it
     /// cannot be read back, memory keeps what clients were last told until
     /// the database reopens.
     async fn store_setting(
