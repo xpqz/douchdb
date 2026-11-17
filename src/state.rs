@@ -897,12 +897,24 @@ pub fn recover_root(root: &Path) -> std::io::Result<()> {
             // is discarded, as CouchDB discards a `.compact` file. The
             // shard file it would have replaced is untouched until the
             // rename.
+            // One that cannot be removed is logged and left, as a search
+            // temporary file is: it holds nothing the shard needs.
             for file in std::fs::read_dir(entry.path())?.flatten() {
-                if file.file_name().to_str().is_some_and(|name| {
+                if !file.file_name().to_str().is_some_and(|name| {
                     name.starts_with("shard-") && name.ends_with(".compact.redb")
                 }) {
-                    std::fs::remove_file(file.path())?;
-                    tracing::info!(path = %file.path().display(), "removed an interrupted compaction");
+                    continue;
+                }
+                match std::fs::remove_file(file.path()) {
+                    Ok(()) => tracing::info!(
+                        path = %file.path().display(),
+                        "removed an interrupted compaction"
+                    ),
+                    Err(error) => tracing::warn!(
+                        path = %file.path().display(),
+                        %error,
+                        "cannot remove an interrupted compaction"
+                    ),
                 }
             }
         }
@@ -1695,6 +1707,8 @@ mod tests {
             std::fs::write(root.join(file), b"x").unwrap();
         }
         std::fs::write(root.join("keep").join("shard-0000.compact.redb"), b"x").unwrap();
+        // One that cannot be removed is logged, and the sweep carries on.
+        std::fs::create_dir(root.join("a%2Fb").join("shard-0001.compact.redb")).unwrap();
         recover_root(&root).unwrap();
         assert_eq!(
             entries(&root),
@@ -1707,6 +1721,10 @@ mod tests {
             ]
         );
         assert_eq!(entries(&root.join("keep")), ["shard-0000.redb"]);
+        assert_eq!(
+            entries(&root.join("a%2Fb")),
+            ["shard-0000.redb", "shard-0001.compact.redb"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
