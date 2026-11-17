@@ -178,10 +178,17 @@ term's MD5 as it reads it. So:
   `StorageError::Corrupted` ("Primary is corrupted despite 2-phase commit"):
   a shard fails closed (500), a view file is deleted and rebuilt. Power lost
   between the two syncs leaves the previous commit in force and the write
-  unacknowledged. Cost: a second sync per commit. **Residual:** redb records
-  whether the newest commit was two-phase in a bit of the header's god byte,
-  outside every checksum; damage that flips exactly that bit re-enables the
-  silent fallback for that file.
+  unacknowledged. Cost: a second sync per commit. **Residual:** two bits of
+  the header's god byte sit outside every checksum: the primary-slot bit
+  (which commit slot is the newest) and the two-phase bit. Once the
+  two-phase bit is set, redb trusts the slot the primary-slot bit names
+  without comparing transaction ids, so flipping the primary-slot bit on a
+  file closed by a crash makes redb serve the older slot, which verifies,
+  silently. That single-bit path is new with two-phase commit: under
+  one-phase commit the transaction-id comparison would have caught the flip.
+  Clearing the two-phase bit brings back the one-phase fallback. So two-phase
+  commit narrows "any damage to the newest commit's pages silently rolls it
+  back" to "only a flip of one of these two header bits does".
 - **Guarantee, stated narrowly:** a damaged *value* is detected when read. A
   damaged *tree page* (a branch page, which can misroute a lookup into a
   false "not found") is detected by the next integrity check: when its idle
