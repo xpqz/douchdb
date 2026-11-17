@@ -124,7 +124,9 @@ Each database directory also contains:
 
 A database is created in a `.creating-<uuid>` staging directory and published by
 one rename; it is deleted by renaming it to `.deleted-<uuid>`. Recovery on start
-removes only those two kinds of directory.
+removes those two kinds of directory and, inside each database, only two kinds
+of file: search-index metadata temporary files and the half-built files of
+interrupted compactions (`shard-NNNN.compact.redb`).
 
 View and search indexes are derived data: they can be deleted and rebuilt from
 documents and design documents. `_view_cleanup` and `_search_cleanup` remove
@@ -136,8 +138,11 @@ so a shard's `_changes` feed is exactly its committed snapshot and there is no
 reserved/committed watermark. Every transaction commits in two phases (pages
 synced, then the header that names them), so a write is acknowledged only once
 it is on disk and damage to the newest commit is reported as corruption rather
-than silently falling back to the previous one. Group commit still turns many
-small writes into one pair of syncs. See `docs/durability.md`.
+than silently falling back to the previous one. The one known exception is in
+redb's header: the primary-slot and two-phase bits sit outside every checksum,
+and flipping the primary-slot bit of a file closed by a crash makes redb serve
+the older commit without detection. Group commit still turns many small writes into one pair of syncs. See
+`docs/durability.md`.
 
 ## The rev hash
 
@@ -636,7 +641,7 @@ API, keeps concurrent writers running (group commit), probes read latency, then
 compacts the shard and kills the server with `SIGKILL` to check process-crash
 durability. It does not test power loss (the `kv::powercut` tests do).
 The run below is historical: it was measured on the earlier LSM-based
-engine, before `fsync` per commit and the interim `_compact`.
+engine, before `fsync` per commit.
 Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
 
 | Metric | Result |
@@ -654,8 +659,8 @@ The interesting number is the last one: the old engine's range compaction owned 
 for its whole duration, so every request behind it waits. At 10 GB that is a
 27-second p99 for that shard. The write path itself is acceptable (80 MB/s,
 ~0.5 s p99) with one 22-second outlier where compaction stalled the
-writer. Keeping `_compact` synchronous is no longer defensible for large
-databases; the options are a background job that still takes the shard lock
-(same stall, but observable via `compact_running`) or sharding compaction work
-across more shards (`q > 1` divides the stall).
+writer. That made a synchronous `_compact` indefensible for large databases.
+This is superseded: `_compact` now runs online in the background, and a shard's
+writes pause only for the final catch-up and the swap; `docs/durability.md`
+describes the copy and swap.
 

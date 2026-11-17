@@ -222,7 +222,7 @@ where behaviour is best-effort, it says so.
 | Map/reduce, grouping, collation, reductions | `views_map_reduce_collation_and_query_options`, `couchdb_view_*`, `differential/run.py --views` |
 | Native/JS/sandbox view equivalence | `native_map_matches_javascript_for_generated_corpus`, `js_sandboxes_agree_on_view_rows` |
 | View freshness after writes and design changes | `differential/run.py --views --view-mutations N` |
-| Search API and cluster fan-out | `couchdb_search_ports`, `search_fans_out_across_cluster_shards`, `cluster_partition_search_ports` |
+| Search API and cluster fan-out | `couchdb_search_ports`, `search_fans_out_across_cluster_shards`, `couchdb_partition_search_ports` |
 | Anti-entropy convergence and node loss | `cluster_anti_entropy_converges_without_client_reads`, `cluster_survives_killing_a_node_mid_replication`, `replication_source_and_target_agree_after_convergence` |
 | Rebalance freeze, activation and cleanup | `cluster_rebalance_converges_and_cleans_old_replicas`, `cluster_rebalance_timeout_does_not_clean_old_replicas`, `rebalance_verifies_conflict_leaves_before_cleanup` |
 | Cross-endpoint consistency under concurrent writes/faults | `internal_consistency_after_concurrent_writes`, `internal_consistency_survives_node_loss_and_restart` |

@@ -4,8 +4,9 @@
 Measures the thing the plan is unsure about: what a single shard actor costs
 when the shard file is large and `_compact` runs. The workload is deliberately unfriendly:
 
-  * incompressible payloads (base64 of random bytes), so Snappy cannot turn
-    10 GB of logical data into a few MB on disk;
+  * incompressible payloads (base64 of random bytes), so 10 GB of logical
+    data is 10 GB on disk whether or not the storage engine compresses (redb
+    does not);
   * several concurrent writers, so the shard actor's group commit is exercised;
   * a latency probe running before and during `_compact`, which measures the
     p99 a client sees while `_compact` runs;
@@ -118,8 +119,8 @@ def du_bytes(path):
 
 
 def make_payload(size):
-    # Random bytes, base64'd, are incompressible to Snappy. Reusing a small
-    # pool is still incompressible because Snappy works per block.
+    # Random bytes, base64'd, are incompressible. Reusing a small pool would
+    # only matter to a compressor that looks across documents.
     return base64.b64encode(os.urandom(max(3, size * 3 // 4))).decode()
 
 
