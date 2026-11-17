@@ -4701,9 +4701,6 @@ mod recovery_tests {
         assert_eq!(rig.handle.state(), ShardState::Serving);
     }
 
-    /// A test disk that lost its settings is reopened as the damaged file
-    /// it is, not initialised again as a new shard: only the first open of a
-    /// test disk creates its tables.
     #[test]
     fn failed_commit_recovery_invalidates_a_recording_journal() {
         let (_, switch) = PowerCut::new();
@@ -4719,6 +4716,9 @@ mod recovery_tests {
         assert_eq!(shard.journal.take(), journal::Taken::Invalidated);
     }
 
+    /// A test disk that lost its settings is reopened as the damaged file
+    /// it is, not initialised again as a new shard: only the first open of a
+    /// test disk creates its tables.
     #[test]
     fn a_test_disk_that_lost_its_settings_does_not_reopen_as_new() {
         let (_, switch) = PowerCut::new();
