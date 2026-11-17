@@ -22,10 +22,10 @@ pub(crate) struct Prepared {
     pub body: Vec<u8>,
     /// The body members of a `_design/` document, for its checks.
     pub members: Option<Map<String, Value>>,
-    /// `new_edits=true`: the revision id for the parent the client's `_rev`
-    /// names, or for no parent without `_rev`. `None` when `_rev` is not a
-    /// revision; the shard rejects the document.
-    pub rev_hash: Option<[u8; 16]>,
+    /// `new_edits=true`: the revision the edit writes over the parent the
+    /// client's `_rev` names, or over no parent without `_rev`. `None` when
+    /// `_rev` is not a revision; the shard rejects the document.
+    pub new_rev: Option<String>,
 }
 
 fn is_body(key: &str) -> bool {
@@ -71,16 +71,23 @@ pub(crate) fn prepare(doc: &Value, id: String, new_edits: bool) -> DbResult<Prep
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     });
-    let (rev, revisions, rev_hash) = if new_edits {
-        let (rev, rev_hash) = match rev.map(|raw| (raw, Rev::parse(raw))) {
-            None => (None, Some(new_revid_doc(deleted, None, obj))),
+    let (rev, revisions, new_rev) = if new_edits {
+        let leaf = |parent: Option<&Rev>| Rev {
+            // Wrapping, as the shard's position arithmetic does in a release
+            // build: a `_rev` at the last position must not panic here.
+            pos: parent.map_or(0, |p| p.pos).wrapping_add(1),
+            id: new_revid_doc(deleted, parent, obj).to_vec(),
+            hex: true,
+        };
+        let (rev, new_rev) = match rev.map(|raw| (raw, Rev::parse(raw))) {
+            None => (None, Some(leaf(None).to_string())),
             Some((_, Some(parent))) => (
                 Some(parent.to_string()),
-                Some(new_revid_doc(deleted, Some(&parent), obj)),
+                Some(leaf(Some(&parent)).to_string()),
             ),
             Some((raw, None)) => (Some(raw.clone()), None),
         };
-        (rev, None, rev_hash)
+        (rev, None, new_rev)
     } else {
         (rev.cloned(), revisions.cloned(), None)
     };
@@ -91,7 +98,7 @@ pub(crate) fn prepare(doc: &Value, id: String, new_edits: bool) -> DbResult<Prep
         revisions,
         body,
         members,
-        rev_hash,
+        new_rev,
     })
 }
 
@@ -271,27 +278,44 @@ mod tests {
     }
 
     #[test]
-    fn prepared_hash_is_for_the_client_parent() {
+    fn prepared_rev_is_for_the_client_parent() {
         let parent = "2-aabbccddeeff00112233445566778899";
+        let hex = |hash: [u8; 16]| {
+            Rev {
+                pos: 0,
+                id: hash.to_vec(),
+                hex: true,
+            }
+            .id_string()
+        };
         let doc = json!({"_id": "a", "_rev": parent, "z": 1, "a": [1, 2]});
         let want = new_revid_doc(false, Rev::parse(parent).as_ref(), doc.as_object().unwrap());
-        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
+        assert_eq!(
+            prepared(&doc, true).new_rev,
+            Some(format!("3-{}", hex(want)))
+        );
 
         let doc = json!({"_id": "a", "_deleted": true, "k": "v"});
         let want = new_revid_doc(true, None, doc.as_object().unwrap());
-        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
+        assert_eq!(
+            prepared(&doc, true).new_rev,
+            Some(format!("1-{}", hex(want)))
+        );
 
         // An upper-case `_rev` names the same parent as its lower-case form.
         let doc = json!({"_id": "a", "_rev": "2-AABBCCDDEEFF00112233445566778899"});
         let want = new_revid_doc(false, Rev::parse(parent).as_ref(), doc.as_object().unwrap());
-        assert_eq!(prepared(&doc, true).rev_hash, Some(want));
+        assert_eq!(
+            prepared(&doc, true).new_rev,
+            Some(format!("3-{}", hex(want)))
+        );
 
         // A replicated write keeps its revision; the shard computes none.
-        assert_eq!(prepared(&doc, false).rev_hash, None);
+        assert_eq!(prepared(&doc, false).new_rev, None);
 
-        // Not a revision: no hash, and the shard rejects the document.
+        // Not a revision: none, and the shard rejects the document.
         let doc = json!({"_id": "a", "_rev": "nope"});
-        assert_eq!(prepared(&doc, true).rev_hash, None);
+        assert_eq!(prepared(&doc, true).new_rev, None);
     }
 
     /// The shard recomputes a hash from the stored body bytes when it picks a

@@ -1640,14 +1640,15 @@ impl<'s> ShardTxn<'s> {
 
     /// Write each of `metas`, as [`ShardTxn::put_meta`] does, with one open
     /// of the table.
-    pub fn put_metas(&mut self, metas: &[MetaWrite]) -> Result<()> {
+    pub fn put_metas(&mut self, metas: Vec<MetaWrite>) -> Result<()> {
         let entries = metas.iter().map(|m| (m.id.as_str(), m.bytes.as_slice()));
         self.put_values(META, Table::Meta, entries)?;
+        self.changes.reserve(metas.len());
         for meta in metas {
             self.count(meta.old.as_ref(), meta.new.as_ref());
             self.changes.push(DocChange {
-                id: meta.id.clone(),
-                new: meta.new.clone(),
+                id: meta.id,
+                new: meta.new,
                 seq: Some(meta.seq),
             });
         }

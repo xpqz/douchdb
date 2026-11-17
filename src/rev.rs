@@ -31,7 +31,13 @@ impl Rev {
     /// emits it: 16-byte ids as lowercase hex, anything else verbatim.
     pub fn id_string(&self) -> String {
         if self.hex {
-            self.id.iter().map(|b| format!("{b:02x}")).collect()
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(self.id.len() * 2);
+            for &b in &self.id {
+                out.push(DIGITS[usize::from(b >> 4)] as char);
+                out.push(DIGITS[usize::from(b & 15)] as char);
+            }
+            out
         } else {
             String::from_utf8_lossy(&self.id).into_owned()
         }

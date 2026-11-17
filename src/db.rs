@@ -12,7 +12,7 @@ use crate::rev::{new_revid_doc, Rev};
 use crate::store::{
     meta_state, DocMeta, DocRead, LiveDoc, MetaState, MetaWrite, PurgeInfo, ShardHandle, ShardTxn,
 };
-use crate::util::{hex, uuid};
+use crate::util::uuid;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -4063,33 +4063,53 @@ fn put_many(
     new_edits: bool,
     mut compile_errors: HashMap<usize, ApiError>,
 ) -> Vec<(usize, DbResult<WriteOk>)> {
-    let mut ops: Ops = Vec::new();
-    let mut staged: HashMap<String, DocMeta> = HashMap::new();
-    // What each staged document's record held in the shard before this batch.
-    let mut origin: HashMap<String, Option<MetaState>> = HashMap::new();
-    let mut results = Vec::new();
+    let mut ops: Ops = Vec::with_capacity(docs.len() * 2);
+    let mut results = Vec::with_capacity(docs.len());
+    // One slot per distinct id, in id order; `slot_of[k]` is the `k`th
+    // document's.
+    let mut by_id: Vec<usize> = (0..docs.len()).collect();
+    by_id.sort_unstable_by(|&a, &b| docs[a].1.id.cmp(&docs[b].1.id));
+    let mut ids: Vec<&str> = Vec::with_capacity(docs.len());
+    let mut slot_of = vec![0; docs.len()];
+    for k in by_id {
+        let id = docs[k].1.id.as_str();
+        if ids.last() != Some(&id) {
+            ids.push(id);
+        }
+        slot_of[k] = ids.len() - 1;
+    }
     // Every document's stored metadata, read in one pass before staging. If
     // a record cannot be read, each document reads its own instead, so the
     // failure is only theirs.
-    let read = {
-        let mut ids: Vec<&str> = docs.iter().map(|(_, doc)| doc.id.as_str()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let metas = shard.get_metas(&ids).ok();
-        metas.map(|metas| ids.into_iter().map(str::to_string).zip(metas).collect())
+    let mut slots: Vec<Slot> = match shard.get_metas(&ids) {
+        Ok(metas) => metas
+            .into_iter()
+            .map(|meta| Slot {
+                meta: meta.unwrap_or_default(),
+                read: true,
+                origin: None,
+            })
+            .collect(),
+        Err(_) => ids.iter().map(|_| Slot::default()).collect(),
     };
+    // The staged slots with their ids, in the order they were first staged.
+    let mut staged: Vec<(usize, String)> = Vec::with_capacity(slots.len());
 
-    for (i, doc) in docs {
+    for ((i, doc), k) in docs.into_iter().zip(slot_of) {
         let mark = ops.len();
+        let slot = &mut slots[k];
+        let was_staged = slot.origin.is_some();
         let mut ctx = Stage {
             shard,
             ops: &mut ops,
-            staged: &mut staged,
-            origin: &mut origin,
-            read: &read,
         };
-        match ctx.stage(doc, new_edits, compile_errors.remove(&i)) {
-            Ok(value) => results.push((i, Ok(value))),
+        match ctx.stage(doc, new_edits, compile_errors.remove(&i), slot) {
+            Ok(value) => {
+                if !was_staged && slot.origin.is_some() {
+                    staged.push((k, value.id.clone()));
+                }
+                results.push((i, Ok(value)));
+            }
             Err(e) => {
                 ops.truncate(mark);
                 results.push((i, Err(e)));
@@ -4103,24 +4123,26 @@ fn put_many(
     let limit = shard.revs_limit();
     // Each document's record is written once, here, in its final form.
     let mut metas: Vec<MetaWrite> = Vec::with_capacity(staged.len());
-    for (id, meta) in staged.iter_mut() {
+    for (k, id) in staged {
+        let Slot {
+            mut meta, origin, ..
+        } = std::mem::take(&mut slots[k]);
         // The batch's bodies and sequence numbers are already staged, so a
         // tree that cannot be pruned fails the whole batch rather than being
         // written back as if it were valid.
         if let Err(e) = meta.tree.prune(limit) {
-            let message = corrupt_tree(id, e).reason;
+            let message = corrupt_tree(&id, e).reason;
             return results
                 .into_iter()
                 .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
                 .collect();
         }
-        if let Ok(bytes) = meta_bytes(meta) {
-            let old = origin.get(id).cloned().flatten();
+        if let Ok(bytes) = meta_bytes(&meta) {
             metas.push(MetaWrite {
-                id: id.clone(),
+                id,
                 bytes,
-                old,
-                new: meta_state(meta),
+                old: origin.flatten(),
+                new: meta_state(&meta),
                 seq: meta.seq,
             });
         }
@@ -4141,39 +4163,39 @@ fn put_many(
     results
 }
 
+/// One document id of a batch being staged.
+#[derive(Default)]
+struct Slot {
+    /// The document's metadata, empty when it has none: as stored until a
+    /// document of the batch is staged, then as staged.
+    meta: DocMeta,
+    /// Whether `meta` was read; false until then when the one-pass read
+    /// failed.
+    read: bool,
+    /// Set when the first document is staged: what the record held before
+    /// the batch.
+    origin: Option<Option<MetaState>>,
+}
+
+impl Slot {
+    /// The metadata to change for a document being staged; everything that
+    /// can fail must come first.
+    fn staging(&mut self) -> &mut DocMeta {
+        if self.origin.is_none() {
+            self.origin = Some(meta_state(&self.meta));
+        }
+        &mut self.meta
+    }
+}
+
 struct Stage<'a, 's> {
     shard: &'a mut ShardTxn<'s>,
     ops: &'a mut Ops,
-    staged: &'a mut HashMap<String, DocMeta>,
-    origin: &'a mut HashMap<String, Option<MetaState>>,
-    /// What the shard held for every document of the batch, if it could be
-    /// read in one pass.
-    read: &'a Option<HashMap<String, Option<DocMeta>>>,
 }
 
 impl Stage<'_, '_> {
     fn next_seq(&mut self) -> u64 {
         self.shard.next_seq()
-    }
-
-    fn meta(&mut self, id: &str) -> DbResult<Option<DocMeta>> {
-        if let Some(m) = self.staged.get(id) {
-            return Ok(Some(m.clone()));
-        }
-        let meta = match self.read {
-            Some(read) => read[id].clone(),
-            None => self.shard.get_meta(id)?,
-        };
-        self.origin
-            .entry(id.to_string())
-            .or_insert_with(|| meta.as_ref().and_then(meta_state));
-        Ok(meta)
-    }
-
-    /// Record the document's new metadata. `put_many` writes it, once, after
-    /// the whole batch is staged and pruned.
-    fn flush_meta(&mut self, id: &str, meta: &DocMeta) {
-        self.staged.insert(id.to_string(), meta.clone());
     }
 
     /// `compile_error` is the design document's compile verdict, computed
@@ -4183,10 +4205,14 @@ impl Stage<'_, '_> {
         doc: Prepared,
         new_edits: bool,
         compile_error: Option<ApiError>,
+        slot: &mut Slot,
     ) -> DbResult<WriteOk> {
-        let mut meta = self.meta(&doc.id)?.unwrap_or_default();
+        if !slot.read {
+            slot.meta = self.shard.get_meta(&doc.id)?.unwrap_or_default();
+            slot.read = true;
+        }
         if !new_edits {
-            return self.stage_replicated(doc, meta, compile_error);
+            return self.stage_replicated(doc, slot, compile_error);
         }
         let Prepared {
             id,
@@ -4194,25 +4220,26 @@ impl Stage<'_, '_> {
             deleted,
             body,
             members,
-            rev_hash,
+            new_rev,
             ..
         } = doc;
+        let tree = &slot.meta.tree;
 
         let parent = match &client_rev {
             Some(rev) => {
                 if Rev::parse(rev).is_none() {
                     return Err(ApiError::bad_request("Invalid rev format"));
                 }
-                if !meta.tree.contains(rev) || !meta.tree.is_leaf(rev) {
+                if !tree.contains(rev) || !tree.is_leaf(rev) {
                     return Err(ApiError::conflict());
                 }
-                if meta.tree.is_deleted(rev) {
+                if tree.is_deleted(rev) {
                     return Err(ApiError::conflict());
                 }
                 Some(rev.clone())
             }
-            None => match meta.tree.winner() {
-                Some(winner) if !meta.tree.is_deleted(&winner) => return Err(ApiError::conflict()),
+            None => match tree.winner() {
+                Some(winner) if !tree.is_deleted(&winner) => return Err(ApiError::conflict()),
                 other => other,
             },
         };
@@ -4227,31 +4254,40 @@ impl Stage<'_, '_> {
         }
 
         let parent_path = match parent.as_ref() {
-            Some(p) => meta.tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
+            Some(p) => tree.path(p).map_err(|e| corrupt_tree(&id, e))?,
             None => Vec::new(),
         };
         let parent = parent.as_deref().and_then(Rev::parse);
         let pos = parent.as_ref().map_or(0, |p| p.pos) + 1;
 
-        // The prepared hash is for the client's parent. Without `_rev` over a
-        // deleted winner the parent is the winner, and the hash is computed
-        // here, from the body.
-        let hash = match (rev_hash, &client_rev, &parent) {
-            (Some(hash), Some(_), _) | (Some(hash), None, None) => hash,
+        // The prepared revision is for the client's parent. Without `_rev`
+        // over a deleted winner the parent is the winner, and the revision is
+        // computed here, from the body.
+        let rev = match (new_rev, &client_rev, &parent) {
+            (Some(rev), Some(_), _) | (Some(rev), None, None) => rev,
             _ => {
                 let members = match members {
                     Some(members) => members,
                     None => body_members(&body)?,
                 };
-                new_revid_doc(deleted, parent.as_ref(), &members)
+                let hash = new_revid_doc(deleted, parent.as_ref(), &members);
+                let leaf = Rev {
+                    pos,
+                    id: hash.to_vec(),
+                    hex: true,
+                };
+                leaf.to_string()
             }
         };
-        let rev = format!("{pos}-{}", hex(&hash));
 
-        let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
-        path.push(Rev::parse(&rev).expect("valid rev"));
-
-        meta.tree.merge_path(&path, deleted);
+        let meta = slot.staging();
+        if parent_path.is_empty() {
+            meta.tree.merge_root(rev.clone(), deleted);
+        } else {
+            let mut path: Vec<Rev> = parent_path.iter().filter_map(|r| Rev::parse(r)).collect();
+            path.extend(Rev::parse(&rev));
+            meta.tree.merge_path(&path, deleted);
+        }
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
@@ -4268,7 +4304,6 @@ impl Stage<'_, '_> {
         if old_seq != 0 {
             self.ops.push(Op::Unseq(old_seq));
         }
-        self.flush_meta(&id, &meta);
 
         Ok(WriteOk::new(id, rev))
     }
@@ -4276,7 +4311,7 @@ impl Stage<'_, '_> {
     fn stage_replicated(
         &mut self,
         doc: Prepared,
-        mut meta: DocMeta,
+        slot: &mut Slot,
         compile_error: Option<ApiError>,
     ) -> DbResult<WriteOk> {
         let Prepared {
@@ -4289,7 +4324,7 @@ impl Stage<'_, '_> {
             ..
         } = doc;
         let (rev, path) = revisions_path(rev, revisions.as_ref())?;
-        let known = meta.tree.contains(&rev);
+        let known = slot.meta.tree.contains(&rev);
         // A revision that is only an ancestor on a stored path has no body
         // yet; the replicated write supplies it.
         if known && self.shard.get_body(&id, &rev)?.is_some() {
@@ -4306,17 +4341,14 @@ impl Stage<'_, '_> {
             }
         }
 
-        let changed = !known;
-        if changed {
-            meta.tree.merge_path(&path, deleted);
-        }
-
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
             body,
         });
-        if changed {
+        if !known {
+            let meta = slot.staging();
+            meta.tree.merge_path(&path, deleted);
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
@@ -4327,7 +4359,6 @@ impl Stage<'_, '_> {
             if old_seq != 0 {
                 self.ops.push(Op::Unseq(old_seq));
             }
-            self.flush_meta(&id, &meta);
         }
 
         Ok(WriteOk::new(id, rev))
@@ -4450,7 +4481,7 @@ fn commit_ops(shard: &mut ShardTxn, ops: Ops, metas: Vec<MetaWrite>) -> anyhow::
     // removing, leaves by_seq as writing them in order did.
     shard.put_seqs(&seqs)?;
     shard.remove_seqs(&unseqs)?;
-    shard.put_metas(&metas)?;
+    shard.put_metas(metas)?;
     Ok(())
 }
 
@@ -5731,6 +5762,91 @@ mod tests {
         drop(shard);
         crate::kv::forget_verified(&file);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A batch stores what its documents store written one per batch: the
+    /// same results, metadata records, sequences and counts, whatever repeats
+    /// an id, fails, or replicates a revision the batch or the shard holds.
+    #[test]
+    fn a_batch_stores_what_its_documents_store_one_at_a_time() {
+        let hex = |n: u8| format!("{n:02x}").repeat(16);
+        let batches: [(bool, Vec<Value>); 3] = [
+            (true, vec![json!({"_id": "a"}), json!({"_id": "c", "n": 1})]),
+            (
+                true,
+                vec![
+                    json!({"_id": "b", "_deleted": true}),
+                    json!({"_id": "a"}),
+                    json!({"_id": "a", "_rev": "1-967a00dff5e02add41819138abb3284d", "v": 2}),
+                    json!({"_id": "a", "_rev": "1-967a00dff5e02add41819138abb3284d"}),
+                    json!({"_id": "b"}),
+                    json!({"_id": "c", "_rev": "bad"}),
+                    json!({"_id": "d", "_deleted": true}),
+                    json!({"_id": "d"}),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    json!({"_id": "a", "_revisions": {"start": 3, "ids": [hex(3), hex(2), hex(1)]}}),
+                    json!({"_id": "a", "_revisions": {"start": 3, "ids": [hex(3), hex(2), hex(1)]}}),
+                    json!({"_id": "c", "_rev": "1-967a00dff5e02add41819138abb3284d"}),
+                    json!({"_id": "e", "_revisions": {"start": 2, "ids": [hex(5), hex(4)]}, "_deleted": true}),
+                    json!({"_id": "e", "_rev": format!("2-{}", hex(6))}),
+                    json!({"_id": "f"}),
+                ],
+            ),
+        ];
+        let state = |by_batch: bool| {
+            let file = crate::store::tests::temp_file("batch-vs-single");
+            let mut shard = crate::store::tests::open(&file);
+            let mut results = Vec::new();
+            for (new_edits, docs) in &batches {
+                let docs: Vec<Prepared> = docs
+                    .iter()
+                    .map(|doc| prepare(doc, doc_id(doc).unwrap(), *new_edits).unwrap())
+                    .collect();
+                let jobs: Vec<Vec<Prepared>> = if by_batch {
+                    vec![docs]
+                } else {
+                    docs.into_iter().map(|doc| vec![doc]).collect()
+                };
+                for job in jobs {
+                    let new_edits = *new_edits;
+                    let job = job.into_iter().enumerate().collect();
+                    let out = shard
+                        .write(move |s| Ok(put_many(s, job, new_edits, HashMap::new())))
+                        .unwrap();
+                    results.extend(out.into_iter().map(|(_, result)| match result {
+                        Ok(ok) => json!({"id": ok.id, "rev": ok.rev}),
+                        Err(e) => json!({"error": e.error, "reason": e.reason}),
+                    }));
+                }
+            }
+            let stored = shard
+                .read(|s| {
+                    let metas = ["a", "b", "c", "d", "e", "f"].map(|id| {
+                        s.get_meta(id)
+                            .unwrap()
+                            .map(|m| serde_json::to_string(&m).unwrap())
+                    });
+                    Ok((metas, s.by_seq()?, s.counts()))
+                })
+                .unwrap();
+            drop(shard);
+            crate::kv::forget_verified(&file);
+            let _ = std::fs::remove_dir_all(file.parent().unwrap());
+            (results, stored)
+        };
+        let single = state(false);
+        assert_eq!(state(true), single);
+        // The cases ran as meant: a's first revision is the one the batch
+        // names, and the replicated revision of `a` was not stored twice.
+        assert_eq!(single.0[0]["rev"], "1-967a00dff5e02add41819138abb3284d");
+        assert!(single.1 .0[0]
+            .as_ref()
+            .unwrap()
+            .contains(&format!("3-{}", hex(3))));
     }
 
     /// A bulk job journals every key its commit writes, as writing each key
