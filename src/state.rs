@@ -271,7 +271,7 @@ pub struct AppState {
     pub feed_stats: FeedStats,
     pub cluster_state: Arc<crate::cluster_state::ClusterState>,
     pub admission: Arc<crate::admission::Admission>,
-    /// Bound concurrent `_compact` requests across databases on this node.
+    /// Bound the compactions running at once on this node; the rest wait.
     pub compaction: Arc<tokio::sync::Semaphore>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,

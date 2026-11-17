@@ -704,14 +704,15 @@ impl Shard {
             cause,
             "reopening the shard file"
         );
-        self.reopen(|| ());
+        self.reopen(|| Ok(()));
     }
 
     /// Reopen the file through the gate, running `prepare` once every lease
     /// is back and the old handle is closed, and reload the settings (see
-    /// [`Shard::recover`]); fail closed if the file cannot be opened or is
-    /// behind what was committed. Whether the shard still serves.
-    fn reopen(&mut self, prepare: impl FnOnce()) -> bool {
+    /// [`Shard::recover`]); fail closed if `prepare` fails, or the file
+    /// cannot be opened or is behind what was committed. Whether the shard
+    /// still serves.
+    fn reopen(&mut self, prepare: impl FnOnce() -> Result<()>) -> bool {
         let Shard {
             gate,
             open,
@@ -722,7 +723,7 @@ impl Shard {
         } = self;
         let mut loaded = None;
         let reopened = gate.reopen(|| {
-            prepare();
+            prepare()?;
             let db = open()?;
             let found = check_shard(&db, name, *default_revs_limit)?;
             // A commit that reported an error may still have landed, so the
@@ -793,7 +794,7 @@ impl Shard {
     }
 
     /// A write transaction for a group; a handle that an I/O error left
-    /// failing every write (a read, or compaction, met it) is reopened first.
+    /// failing every write (a read met it) is reopened first.
     fn begin_group(&mut self) -> Result<WriteTransaction> {
         match self.gate.begin_write_txn() {
             Err(error) if io_failure(&error) => {
@@ -1091,18 +1092,23 @@ impl Shard {
     /// keys the journal still holds, check it and close it, rename it over
     /// the live file, reopen and stop the journal. `false` when the journal
     /// was invalidated (the shard was cleared or reopened since it started):
-    /// the compaction must start again. A failure before the rename leaves
-    /// the live file as it is; once the file is renamed, a shard that cannot
-    /// reopen it fails closed, and nothing is renamed back.
+    /// the compaction must start again. A failure before the swap leaves
+    /// the live file as it is. A swap that fails (the rename, the directory
+    /// sync that makes it durable, or the reopen) fails the shard closed,
+    /// and nothing is renamed back: a shard never serves a file whose name
+    /// may not survive a power cut.
     fn finish_compaction(&mut self, target: Database, hook: &compact::Hook) -> Result<bool> {
         hook(compact::Stage::Swap);
         let journal::Taken::Batch(keys) = self.journal.take() else {
             return Ok(false);
         };
-        let changes = self
-            .gate
-            .read_here(|txn| compact::catch_up(txn, &self.name, keys))?;
-        compact::write(&target, changes)?;
+        let mut keys: std::collections::VecDeque<_> = keys.into_iter().collect();
+        while !keys.is_empty() {
+            let changes = self
+                .gate
+                .read_here(|txn| compact::catch_up(txn, &self.name, &mut keys))?;
+            compact::write(&target, changes)?;
+        }
         let built = check_shard(&target, &self.name, self.default_revs_limit)?;
         anyhow::ensure!(
             built == self.settings,
@@ -1116,11 +1122,12 @@ impl Shard {
             return Ok(false);
         }
         let target = Arc::clone(&self.target);
-        let mut installed = Ok(());
-        let serving = self.reopen(|| installed = target.install());
+        let serving = self.reopen(|| target.install());
         self.journal.stop();
-        installed?;
-        anyhow::ensure!(serving, "the compacted shard file could not be opened");
+        anyhow::ensure!(
+            serving,
+            "the compacted shard file could not be put in place"
+        );
         Ok(true)
     }
 
@@ -2620,7 +2627,7 @@ impl ShardHandle {
                     }
                     Message::Alone(job) => {
                         let answer = job(Ok(&mut shard));
-                        // Its own commits (compaction's) may have failed:
+                        // Its own commits may have failed:
                         // recovered before it answers, so whoever hears
                         // back meets the recovered file.
                         if shard.poisoned() {
@@ -2827,8 +2834,8 @@ impl ShardHandle {
             .clone()
     }
 
-    /// Run a job that has the shard to itself between groups, such as
-    /// compaction, which commits as it goes.
+    /// Run a job that has the shard to itself between groups, such as the
+    /// start and the swap of a compaction.
     pub async fn alone<R, F>(&self, f: F) -> std::result::Result<R, ApiError>
     where
         R: Send + 'static,

@@ -542,6 +542,31 @@ mod tests {
         is_verified(path)
     }
 
+    /// The compaction swap: a file checked under its temporary name opens
+    /// without the full check under the shard's name, and an unchecked one
+    /// renamed over a verified name does not inherit the verification.
+    #[test]
+    fn a_renamed_file_keeps_its_own_verification() {
+        let scratch = Scratch::new("rename");
+        let (live, next) = (scratch.file(), scratch.0.join("shard-0000.compact.redb"));
+        close_verified(create(&next, CACHE).unwrap(), &next).unwrap();
+        rename_verified(&next, &live).unwrap();
+        assert!(
+            is_verified(&live),
+            "the checked file is verified as the shard"
+        );
+        assert!(!is_verified(&next));
+        assert!(!next.exists());
+
+        drop(create(&next, CACHE).unwrap());
+        rename_verified(&next, &live).unwrap();
+        assert!(
+            !is_verified(&live),
+            "an unchecked file took a verified name"
+        );
+        drop(open(&live, CACHE).unwrap());
+    }
+
     #[test]
     fn unseal_rejects_a_flipped_bit() {
         let value = b"{\"_id\":\"a\",\"_rev\":\"1-x\"}";

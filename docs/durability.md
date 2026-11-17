@@ -56,9 +56,12 @@ every commit.
   write-ahead archive.
 - **Search indexes** (Tantivy) are derived from the shards and written without
   fsync; after a crash they rebuild from the shards.
-- **`_compact` is an interim sweep.** It deletes bodies of non-leaf revisions
-  in batches, but the file does not shrink: redb reuses the freed pages. Online
-  copy-and-swap compaction is planned.
+- **`_compact` copies and swaps.** It builds `shard-NNNN.compact.redb` beside
+  the shard, checks it in full, renames it over the shard file and syncs the
+  directory before serving it. Until the rename the shard file is untouched,
+  and a leftover compaction file is removed on start; a swap that fails part
+  way fails the shard closed rather than serve a file whose name may not
+  survive a power cut. Crash tests of the swap itself are still to come.
 
 ## Operational guidance
 

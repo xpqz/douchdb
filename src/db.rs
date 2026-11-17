@@ -1603,9 +1603,9 @@ impl Db {
     }
 
     pub async fn info(&self) -> DbResult<DbInfo> {
-        // Snapshot the flag before queueing on the shard actors. A compaction
-        // holds its shard's actor while it runs, so reading the flag afterwards
-        // would block and report the post-compaction state instead.
+        // Snapshot the flag before queueing on the shard actors: a
+        // compaction's swap holds its shard's actor, so reading the flag
+        // afterwards could report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
         let shard_seqs = self.shard_seqs();
         let update_seq = shard_seqs

@@ -31,6 +31,7 @@ use crate::kv::{
 };
 use anyhow::Result;
 use redb::{Database, Key, ReadableTable, TableDefinition, WriteTransaction};
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
@@ -243,6 +244,33 @@ fn doc(txn: &LeaseTxn<'_>, name: &ShardName, id: &str, meta: Option<Vec<u8>>) ->
     })
 }
 
+/// What one lease reads and one transaction writes: at most
+/// [`PAGE_ENTRIES`] changes, ending early once they reach [`PAGE_BYTES`],
+/// bodies included.
+#[derive(Default)]
+struct Page(Vec<Change>, usize);
+
+impl Page {
+    fn full(&self) -> bool {
+        self.0.len() >= PAGE_ENTRIES || self.1 >= PAGE_BYTES
+    }
+
+    fn push(&mut self, change: Change) {
+        self.1 += match &change {
+            Change::Set(_, key, value) => key.len() + value.as_ref().map_or(0, Vec::len),
+            Change::Doc { id, meta, bodies } => {
+                id.len()
+                    + meta.as_ref().map_or(0, Vec::len)
+                    + bodies
+                        .iter()
+                        .map(|(rev, body)| rev.len() + body.len())
+                        .sum::<usize>()
+            }
+        };
+        self.0.push(change);
+    }
+}
+
 /// One page of the copy from `at`: what to write, where the next page
 /// starts (`None` when the copy is done) and how many documents it holds.
 pub(crate) fn copy_page(
@@ -251,73 +279,64 @@ pub(crate) fn copy_page(
     at: Cursor,
 ) -> Result<(Vec<Change>, Option<Cursor>, u64)> {
     let (mut index, mut after) = at;
-    let (mut changes, mut entries, mut bytes, mut docs) = (Vec::new(), 0, 0, 0);
+    let (mut page, mut docs) = (Page::default(), 0);
     while let Some(&table) = TABLES.get(index) {
         let from = match after.take() {
             Some(key) => Bound::Excluded(key),
             None => Bound::Unbounded,
         };
-        let (mut metas, mut full) = (Vec::new(), false);
+        let mut full = false;
         if table != Table::Bodies {
             txn.scan(table, (from, Bound::Unbounded), false, |key, value| {
-                if entries >= PAGE_ENTRIES || bytes >= PAGE_BYTES {
+                if page.full() {
                     full = true;
                     return Ok(false);
                 }
-                entries += 1;
-                bytes += key.len() + value.len();
-                after = Some(key.to_vec());
-                if table == Table::Meta {
-                    metas.push((key.to_vec(), value.to_vec()));
+                page.push(if table == Table::Meta {
+                    docs += 1;
+                    doc(txn, name, key::split_text(key)?, Some(value.to_vec()))?
                 } else {
-                    changes.push(Change::Set(table, key.to_vec(), Some(value.to_vec())));
-                }
+                    Change::Set(table, key.to_vec(), Some(value.to_vec()))
+                });
+                after = Some(key.to_vec());
                 Ok(true)
             })?;
         }
-        for (id, meta) in metas {
-            let change = doc(txn, name, key::split_text(&id)?, Some(meta))?;
-            if let Change::Doc { bodies, .. } = &change {
-                bytes += bodies.iter().map(|(_, body)| body.len()).sum::<usize>();
-            }
-            changes.push(change);
-            docs += 1;
-        }
         if full {
-            return Ok((changes, Some((index, after)), docs));
+            return Ok((page.0, Some((index, after)), docs));
         }
         (index, after) = (index + 1, None);
     }
-    Ok((changes, None, docs))
+    Ok((page.0, None, docs))
 }
 
-/// What to write for `keys`, read as they now stand.
+/// What to write for the keys at the front of `keys`, read as they now
+/// stand, a page's worth: the keys it covers are taken off `keys`.
 pub(crate) fn catch_up(
     txn: &LeaseTxn<'_>,
     name: &ShardName,
-    keys: impl IntoIterator<Item = JournalKey>,
+    keys: &mut VecDeque<JournalKey>,
 ) -> Result<Vec<Change>> {
-    let mut ids = std::collections::BTreeSet::new();
-    let mut changes = Vec::new();
-    for (table, key) in keys {
-        match table {
-            Table::Meta => {
-                ids.insert(key::split_text(&key)?.to_string());
-            }
-            Table::Bodies => {
-                ids.insert(key::split_pair(&key)?.0.to_string());
-            }
+    let (mut page, mut ids) = (Page::default(), BTreeSet::new());
+    while !page.full() {
+        let Some((table, key)) = keys.pop_front() else {
+            break;
+        };
+        let id = match table {
+            Table::Meta => key::split_text(&key)?,
+            Table::Bodies => key::split_pair(&key)?.0,
             _ => {
                 let value = txn.get(table, &key)?;
-                changes.push(Change::Set(table, key, value));
+                page.push(Change::Set(table, key, value));
+                continue;
             }
+        };
+        if ids.insert(id.to_string()) {
+            let meta = txn.get(Table::Meta, &key::text(id))?;
+            page.push(doc(txn, name, id, meta)?);
         }
     }
-    for id in ids {
-        let meta = txn.get(Table::Meta, &key::text(&id))?;
-        changes.push(doc(txn, name, &id, meta)?);
-    }
-    Ok(changes)
+    Ok(page.0)
 }
 
 /// Write `changes` into the new file in one transaction.
@@ -453,12 +472,15 @@ async fn run(handle: &ShardHandle, hook: &Hook) -> Result<()> {
                 continue 'run;
             };
             let small = keys.len() <= PAGE_ENTRIES;
-            let keys: Vec<JournalKey> = keys.into_iter().collect();
-            for chunk in keys.chunks(PAGE_ENTRIES) {
-                let (target, name, chunk) = (Arc::clone(&target), name.clone(), chunk.to_vec());
-                handle
+            let mut keys: VecDeque<JournalKey> = keys.into_iter().collect();
+            while !keys.is_empty() {
+                let (target, name) = (Arc::clone(&target), name.clone());
+                keys = handle
                     .gate
-                    .read(move |txn| write(&target, catch_up(txn, &name, chunk)?))
+                    .read(move |txn| {
+                        write(&target, catch_up(txn, &name, &mut keys)?)?;
+                        Ok(keys)
+                    })
                     .await?;
             }
             hook(Stage::Round);
@@ -938,17 +960,17 @@ mod tests {
         rig.close();
     }
 
-    /// A database with one shard, for tests that go through `Db`.
-    fn db(tag: &str) -> (Arc<crate::db::Db>, PathBuf) {
+    /// A database with `q` shards, for tests that go through `Db`.
+    fn db(tag: &str, q: u32) -> (Arc<crate::db::Db>, PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
         let db = crate::db::Db::open_or_create(
             &root,
             tag,
             crate::db::DbConfig {
-                q: 1,
+                q,
                 revs_limit: 1000,
                 cache_bytes: CACHE,
-                shard_map: crate::cluster::ShardMap::single(1),
+                shard_map: crate::cluster::ShardMap::single(q),
                 partitioned: false,
             },
         )
@@ -956,13 +978,16 @@ mod tests {
         (Arc::new(db), root)
     }
 
-    #[tokio::test]
+    /// A view queried while its database compacts, and afterwards, keeps
+    /// its index: the shard's uuid, which its cursor names, is unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uuid_is_unchanged_so_indexes_do_not_rebuild() {
         use serde_json::json;
-        let (db, root) = db("compactview");
+        let (db, root) = db("compactview", 1);
         let docs = vec![
             json!({"_id": "a", "n": 1}),
             json!({"_id": "b", "n": 2}),
+            json!({"_id": "c", "n": 3}),
             json!({"_id": "_design/v", "views": {"v": {"map": "function(doc){ emit(doc._id, doc.n); }"}}}),
         ];
         db.put_docs(docs, true).await.unwrap();
@@ -974,20 +999,74 @@ mod tests {
         let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
         let (uuid, reads) = (db.shard_handle(0).uuid(), db.shard_handle(0).body_reads());
 
-        db.compact().await.unwrap();
+        let (hook, mut stops, _) = pauses(&[Stage::Page]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move { compact(db.shard_handle(0), hook).await }
+        });
+        reached.await.unwrap();
+        let during = crate::view::query(&db, "_design/v", "v", &query)
+            .await
+            .unwrap();
+        assert_eq!(during, rows);
+        resume.send(()).unwrap();
+        compaction.await.unwrap().unwrap();
 
         let replaced = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
         assert_ne!(replaced, inode, "the shard file was rewritten");
         assert_eq!(db.shard_handle(0).uuid(), uuid);
-        let again = crate::view::query(&db, "_design/v", "v", &query)
+        let after = crate::view::query(&db, "_design/v", "v", &query)
             .await
             .unwrap();
-        assert_eq!(again, rows);
+        assert_eq!(after, rows);
         assert_eq!(
             db.shard_handle(0).body_reads(),
             reads,
             "the view read no document: its index was kept"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `_active_tasks` lists a running compaction per shard, named by its
+    /// hash range as CouchDB names shard files, and nothing once it is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_tasks_list_a_running_compaction_as_couchdb_does() {
+        use serde_json::json;
+        let (db, root) = db("compacttasks", 2);
+        let ids: Vec<String> = (0..100)
+            .map(|n| format!("doc{n}"))
+            .filter(|id| db.shard_index(id) == 1)
+            .take(5)
+            .collect();
+        let docs = ids.iter().map(|id| json!({"_id": id})).collect();
+        db.put_docs(docs, true).await.unwrap();
+        assert_eq!(db.active_tasks("node1"), Vec::<serde_json::Value>::new());
+
+        let (hook, mut stops, _) = pauses(&[Stage::Page]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move { compact(db.shard_handle(1), hook).await }
+        });
+        reached.await.unwrap();
+        let tasks = db.active_tasks("node1");
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        let task = &tasks[0];
+        assert_eq!(task["type"], "database_compaction");
+        assert_eq!(task["database"], "shards/80000000-ffffffff/compacttasks");
+        assert_eq!(task["node"], "node1");
+        assert_eq!(task["phase"], "document_copy");
+        assert_eq!(task["changes_done"], 2);
+        assert_eq!(task["total_changes"], 5);
+        assert_eq!(task["progress"], 40);
+        let started = task["started_on"].as_u64().unwrap();
+        assert!(started > 0 && task["updated_on"].as_u64().unwrap() >= started);
+        assert_eq!(task.as_object().unwrap().len(), 9, "{task}");
+        resume.send(()).unwrap();
+        compaction.await.unwrap().unwrap();
+        assert!(db.active_tasks("node1").is_empty());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1000,7 +1079,7 @@ mod tests {
     async fn a_continuous_feed_streams_across_the_swap_without_skip_or_repeat() {
         use serde_json::json;
         const TOTAL: usize = 12;
-        let (db, root) = db("compactfeed");
+        let (db, root) = db("compactfeed", 1);
         let put = |id: String| {
             let db = Arc::clone(&db);
             async move { db.put_docs(vec![json!({"_id": id})], true).await.unwrap() }

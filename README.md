@@ -485,7 +485,7 @@ Every flag that takes a value also accepts `--flag=VALUE`. A value that is exact
 | `--heavy-in-flight` | `8` | Global concurrent view/search requests |
 | `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
 | `--background-in-flight` | `2` | Concurrent anti-entropy/discovery passes |
-| `--compact-concurrency` | `1` | Concurrent `_compact` requests across databases on this node |
+| `--compact-concurrency` | `1` | Compactions that run at once on this node; further `_compact` requests wait their turn |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
@@ -1044,8 +1044,9 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
   shard keeps serving, catches up with the writes made meanwhile, and swaps
   the new file in with writes paused only for the last catch-up, a full
   check of the new file and the rename. It is node-local, like `_purge`;
-  `--compact-concurrency` bounds concurrent compactions across databases
-  (another `_compact` while all are busy answers `409`). `GET /db` reports
+  `--compact-concurrency` bounds concurrent compactions across databases;
+  the rest wait their turn. The swap pauses that shard's writes and actor
+  reads (reads on their own transactions carry on). `GET /db` reports
   `compact_running` and `GET /_active_tasks` (admins) lists this node's
   running compactions in CouchDB's `database_compaction` form.
 - No Mango or lists/shows. Attachments are not supported.

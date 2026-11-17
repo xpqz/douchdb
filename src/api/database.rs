@@ -668,19 +668,16 @@ async fn invalidate_indexes(db: &Db) -> DbResult<()> {
 
 /// `POST /{db}/_compact`.
 async fn compact(req: DbRequest<'_>) -> Response {
-    let Ok(permit) = Arc::clone(&req.st.compaction).try_acquire_owned() else {
-        return fail(ApiError::new(
-            409,
-            "compaction_in_progress",
-            "another compaction is already running on this node",
-        ));
-    };
     // CouchDB answers at once and compacts in the background; `GET /db`
-    // reports `compact_running` and `_active_tasks` its progress meanwhile.
+    // reports `compact_running` (queued included) and `_active_tasks` the
+    // progress meanwhile. `--compact-concurrency` compactions run at once on
+    // this node; the rest wait their turn. One already running or queued on
+    // this database is left to finish.
     if req.db.claim_compaction() {
-        let db = Arc::clone(req.db);
+        let (db, permits) = (Arc::clone(req.db), Arc::clone(&req.st.compaction));
         tokio::spawn(async move {
-            let _permit = permit;
+            // The semaphore is never closed; were it, the compaction runs.
+            let _permit = permits.acquire_owned().await.ok();
             if let Err(error) = db.run_compaction().await {
                 tracing::error!(db = %db.name, error = %error.reason, "compaction failed");
             }
