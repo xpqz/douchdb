@@ -557,9 +557,10 @@ the bulk of the growth.
   node. Reduce partials are recombined after fallback, including
   grouped and custom `rereduce` reducers. Changes use the live-document index
   for winning revisions and compact sequence tokens, avoiding per-row metadata
-  decodes and duplicate detection. Reassigned shard masks after an owner loss
-  resume from zero because the survivor's checkpoint belongs to a different
-  shard set. Cluster `_all_docs` keys are ordered after the merge, including
+  decodes and duplicate detection. A shard reassigned after an owner loss
+  replays from 0 on the replica that takes it over, because the token's
+  position names the lost copy; resuming from a checkpoint there is issue #52.
+  Cluster `_all_docs` keys are ordered after the merge, including
   descending requests; streamed changes are tested for strict sequence order,
   resume boundaries and duplicate-free pagination across interleaved shards.
   A lazy per-shard sequence index caches
@@ -596,7 +597,8 @@ the bulk of the growth.
   peers. Maps carry monotonic versions; updates track metadata quorum and a
   pending map file, and anti-entropy reconciles newer/older peers after a
   missed update. Routing and anti-entropy read the map; anti-entropy
-  checkpoints are tagged by map hash so new replicas backfill after a move. A
+  checkpoints live in each shard copy, so a new replica has none and backfills
+  from 0 after a move. A
   balanced planner endpoint verifies per-shard revision-metadata digests; a
   timeout leaves the active map unchanged, destructive cleanup is explicit
   (`?cleanup=true`), and writes are frozen on every node only for the bounded

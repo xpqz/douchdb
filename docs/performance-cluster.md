@@ -327,9 +327,12 @@ curl -X PUT localhost:5984/_node/_local/_dbs/mydb \
   -d '{"q":4,"node_count":3,"replicas":[[1],[1],[1],[1]]}'
 ```
 
-Anti-entropy checkpoints include a hash of the shard map, so a new replica
-starts from zero and pulls documents that were filtered out under the previous
-placement. A conformance test pins all shards to node0, writes a document,
+Anti-entropy checkpoints included a hash of the shard map, so a new replica
+started from zero and pulled documents that were filtered out under the
+previous placement. Since then document checkpoints have moved into each shard
+copy (`ae3:<peer>:<shard>:<peer shard uuid>`); a shard a node newly replicates
+has none and is still pulled from zero. Only the purge checkpoint id still
+carries the map hash. A conformance test pins all shards to node0, writes a document,
 moves all shards to node1, waits for replication, then reads through node0 and
 node1 and after killing node0.
 
@@ -566,7 +569,8 @@ work. Three changes target it:
   row. Tombstones and `style=all_docs` still use the full metadata path.
 - Cluster sequence tokens wrap a compact `v1:<node seqs>` body instead of
   base64(JSON) of a map encoded per row; they are then written in CouchDB's
-  `<sum>-<base64url>` shape.
+  `<sum>-<base64url>` shape. (Since replaced: a token now holds one position
+  per shard on a named shard copy; see [consistency.md](consistency.md).)
 
 Before/after on the 6,000-document cluster benchmark:
 
@@ -588,7 +592,7 @@ constructing a `serde_json::Value` tree and serializing it again.
 inserted, so document bodies are never parsed and rebuilt. Single-node feeds
 use this path directly; a clustered feed uses it when the coordinator holds
 every selected shard and rewrites only the trailing `last_seq` to the cluster
-vector.
+vector (now the cluster token of per-shard positions).
 
 Before/after against the previous `_changes` path:
 
@@ -675,8 +679,11 @@ partition.
 
 Cluster `_changes` now skips unavailable nodes and continues with reachable
 replicas in both limited and full feeds. The failed node’s version-vector
-component remains at its last checkpoint; when the node returns it resumes from
-there. Surviving replicas can supply the replicated changes meanwhile.
+component remained at its last checkpoint; when the node returned it resumed
+from there. Surviving replicas supplied the replicated changes meanwhile.
+Since per-shard sequences, a token names shard copies rather than nodes: the
+failed node's shards replay from 0 on a replica, and later tokens name that
+replica's copy (see [consistency.md](consistency.md)).
 
 The node-loss test kills one of three nodes, writes a new document, and resumes
 `_changes` from the pre-kill `last_seq`; the new change is present. The existing
