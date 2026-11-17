@@ -3185,9 +3185,20 @@ impl Db {
         let peers = self.purge_peers(shard, me);
         handle
             .call(move |s| {
-                let mut removed = false;
+                // Everything is read before the first write: which infos are
+                // new here, and the documents they name.
+                let mut fresh = Vec::new();
                 for info in infos {
-                    if s.has_purge(&info.uuid)? {
+                    if !s.has_purge(&info.uuid)? {
+                        fresh.push(info);
+                    }
+                }
+                let mut targets = purge_targets(s, fresh.iter().map(|info| info.id.as_str()))?;
+                let mut applied = std::collections::HashSet::new();
+                let mut removed = false;
+                for info in &fresh {
+                    // An info listed twice is applied once.
+                    if !applied.insert(info.uuid.as_str()) {
                         continue;
                     }
                     let gone = purge_one(
@@ -3196,6 +3207,7 @@ impl Db {
                         &info.revs,
                         PurgeSource::Replayed(&info.uuid),
                         &peers,
+                        &mut targets,
                     )?;
                     removed |= !gone.is_empty();
                 }
@@ -3319,13 +3331,15 @@ impl Db {
             done.push(
                 self.shards[index]
                     .call(move |s| {
+                        let mut targets =
+                            purge_targets(s, batch.iter().map(|(_, id, _, _)| id.as_str()))?;
                         batch
                             .into_iter()
                             .map(|(slot, id, requested, assigned)| {
                                 let source = assigned
                                     .as_deref()
                                     .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
-                                purge_one(s, &id, &requested, source, &peers)
+                                purge_one(s, &id, &requested, source, &peers, &mut targets)
                                     .map(|removed| (slot, removed))
                             })
                             .collect::<DbResult<Vec<_>>>()
@@ -3496,7 +3510,54 @@ impl<'a> PurgeSource<'a> {
     }
 }
 
+/// A document as a purge job read it before its first write.
+enum PurgeTarget {
+    /// No metadata record.
+    Missing,
+    /// A record that reads but does not decode: the document goes whole.
+    Undecodable,
+    /// The document's metadata.
+    Doc(DocMeta),
+}
+
+/// The documents a purge job will change, keyed by id: as stored when the
+/// job starts, then as the job's own purges leave them.
+type PurgeTargets = HashMap<String, PurgeTarget>;
+
+/// Read and decode the metadata of every document in `ids`, before the
+/// purge job writes anything (a job validates before it writes): a read that
+/// fails, such as a value failing its checksum, fails the job while it has
+/// written nothing, so the other jobs of its group still commit.
+fn purge_targets<'a>(
+    s: &ShardTxn,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> DbResult<PurgeTargets> {
+    let mut targets = HashMap::new();
+    for id in ids {
+        if targets.contains_key(id) {
+            continue;
+        }
+        let target = match s.get_meta(id) {
+            Ok(Some(meta)) => PurgeTarget::Doc(meta),
+            Ok(None) => PurgeTarget::Missing,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::error::CorruptRecord>()
+                    .is_some() =>
+            {
+                PurgeTarget::Undecodable
+            }
+            Err(error) => return Err(error.into()),
+        };
+        targets.insert(id.to_string(), target);
+    }
+    Ok(targets)
+}
+
 /// Purge the requested leaf revisions of one document; the revisions removed.
+/// The document comes from `targets`, which [`purge_targets`] filled before
+/// the job's first write, and goes back into it as the purge leaves it, for
+/// a later purge of the same document in the job.
 ///
 /// The purge is recorded as a purge info in the same transaction. A fresh
 /// purge records the revisions it removed, under a new uuid, and nothing when
@@ -3511,14 +3572,29 @@ fn purge_one(
     requested: &[String],
     source: PurgeSource<'_>,
     peers: &[usize],
+    targets: &mut PurgeTargets,
 ) -> DbResult<Vec<String>> {
-    let meta = match s.get_meta(id) {
-        Ok(meta) => meta,
-        Err(error)
-            if error
-                .downcast_ref::<crate::error::CorruptRecord>()
-                .is_some() =>
-        {
+    let target = targets.remove(id).ok_or_else(|| {
+        ApiError::internal(format!("purge of {id} was not read before the job wrote"))
+    })?;
+    let (removed, after) = purge_target(s, id, requested, source, peers, target)?;
+    targets.insert(id.to_string(), after);
+    Ok(removed)
+}
+
+/// [`purge_one`] of the document as `target` holds it: the revisions removed
+/// and the document as the purge leaves it.
+fn purge_target(
+    s: &mut ShardTxn,
+    id: &str,
+    requested: &[String],
+    source: PurgeSource<'_>,
+    peers: &[usize],
+    target: PurgeTarget,
+) -> DbResult<(Vec<String>, PurgeTarget)> {
+    let mut meta = match target {
+        PurgeTarget::Doc(meta) => meta,
+        PurgeTarget::Undecodable => {
             // The revisions cannot be checked against unreadable metadata, so
             // the document goes whole; this is the repair path for it.
             let info = PurgeInfo {
@@ -3527,20 +3603,19 @@ fn purge_one(
                 revs: requested.to_vec(),
             };
             s.purge_corrupt(id, &info, peers)?;
-            return Ok(requested.to_vec());
+            return Ok((requested.to_vec(), PurgeTarget::Missing));
         }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(mut meta) = meta else {
-        if let PurgeSource::Replayed(uuid) = source {
-            let info = PurgeInfo {
-                uuid: uuid.to_string(),
-                id: id.to_string(),
-                revs: requested.to_vec(),
-            };
-            s.record_purge(&info, peers)?;
+        PurgeTarget::Missing => {
+            if let PurgeSource::Replayed(uuid) = source {
+                let info = PurgeInfo {
+                    uuid: uuid.to_string(),
+                    id: id.to_string(),
+                    revs: requested.to_vec(),
+                };
+                s.record_purge(&info, peers)?;
+            }
+            return Ok((Vec::new(), PurgeTarget::Missing));
         }
-        return Ok(Vec::new());
     };
     let old_state = meta_state(&meta);
     let mut removed = Vec::new();
@@ -3557,8 +3632,6 @@ fn purge_one(
         dead_bodies.extend(gone);
         removed.push(rev.clone());
     }
-    // The purge info is recorded first: it reads the shard's purge state,
-    // and a job reads everything before its first write.
     if matches!(source, PurgeSource::Replayed(_)) || !removed.is_empty() {
         let info = match source {
             PurgeSource::Replayed(uuid) => PurgeInfo {
@@ -3575,7 +3648,7 @@ fn purge_one(
         s.record_purge(&info, peers)?;
     }
     if removed.is_empty() {
-        return Ok(removed);
+        return Ok((removed, PurgeTarget::Doc(meta)));
     }
     for dead in &dead_bodies {
         s.remove_body(id, dead)?;
@@ -3585,18 +3658,18 @@ fn purge_one(
             s.remove_seq(meta.seq)?;
         }
         s.remove_meta(id, old_state)?;
-    } else {
-        let old_seq = meta.seq;
-        // Purging the winner changes what a normal read sees,
-        // so it is a change as far as `_changes` is concerned.
-        let seq = s.next_seq();
-        meta.seq = seq;
-        s.remove_seq(old_seq)?;
-        s.put_seq(seq, id)?;
-        let bytes = meta_bytes(&meta).map_err(ApiError::internal)?;
-        s.put_meta(id, &bytes, old_state, meta_state(&meta), seq)?;
+        return Ok((removed, PurgeTarget::Missing));
     }
-    Ok(removed)
+    let old_seq = meta.seq;
+    // Purging the winner changes what a normal read sees,
+    // so it is a change as far as `_changes` is concerned.
+    let seq = s.next_seq();
+    meta.seq = seq;
+    s.remove_seq(old_seq)?;
+    s.put_seq(seq, id)?;
+    let bytes = meta_bytes(&meta).map_err(ApiError::internal)?;
+    s.put_meta(id, &bytes, old_state, meta_state(&meta), seq)?;
+    Ok((removed, PurgeTarget::Doc(meta)))
 }
 
 /// CouchDB rejects unknown `_`-prefixed members outright (`doc_validation`),
@@ -8122,6 +8195,62 @@ mod tests {
         assert!(crate::metrics::corrupt_records_skipped() > before);
         assert!(!body_exists(&db, "good", &first).await);
         assert!(body_exists(&db, "bad", &bad_rev).await);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge job reads and checks every document's metadata before its
+    /// first write: a later document whose metadata fails its checksum fails
+    /// that purge alone, and the other jobs of its group commit.
+    #[tokio::test]
+    async fn a_purge_reads_every_document_before_it_writes() {
+        let (db, root) = purge_test_db("purge-reads-first", ShardMap::single(1));
+        let written = db.put_docs(vec![json!({"_id": "a"})], true).await.unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        db.shards[0]
+            .call(|s| {
+                s.put_unsealed(crate::kv::META, "z", br#"{"tree":{},"seq":9}"#);
+                // A job that wrote nothing through the shard commits nothing.
+                Ok(s.put_local("setup", b"1")?)
+            })
+            .await
+            .unwrap();
+
+        // Hold the actor until the purge and a bystander are queued behind
+        // it, so the three run as one group, the purge before the bystander.
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = db.shards[0].call(move |_| {
+            let _ = started_tx.send(());
+            held.recv().map_err(ApiError::internal)
+        });
+        // "a" comes first and loses its only leaf; "z" cannot be read.
+        let body = json!({"a": [rev], "z": ["1-ffffffffffffffffffffffffffffffff"]});
+        let uuids = std::collections::BTreeMap::new();
+        let purge = db.purge(&body, 0, &uuids);
+        let bystander = db.shards[0].call(|s| Ok(s.put_local("bystander", b"1")?));
+        let releaser = async {
+            started.await.unwrap();
+            while db.shards[0].queued() < 2 {
+                tokio::task::yield_now().await;
+            }
+            release.send(()).unwrap();
+        };
+        let (blocked, purged, bystood, ()) = tokio::join!(blocker, purge, bystander, releaser);
+
+        let error = purged.expect_err("a purge over a damaged record succeeded");
+        assert!(error.reason.contains("checksum"), "{}", error.reason);
+        bystood.expect("the purge's failure aborted another job's write");
+        blocked.unwrap();
+        let local = db.shards[0]
+            .read(|s| Ok(s.get_local("bystander")?))
+            .await
+            .unwrap();
+        assert_eq!(local.as_deref(), Some(&b"1"[..]));
+        // The failed purge wrote nothing: "a" is still there.
+        assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
+        assert_eq!(db.shard_purge_seqs().await.unwrap(), [0]);
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);

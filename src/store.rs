@@ -1876,6 +1876,21 @@ impl<'s> ShardTxn<'s> {
         self.put_value(def, key, value).unwrap();
     }
 
+    /// Store `value` under `key` in `def` without its seal, as damage on
+    /// disk would leave it: reading it fails its checksum.
+    #[cfg(test)]
+    pub(crate) fn put_unsealed<'k, K: Key + 'static>(
+        &mut self,
+        def: TableDefinition<'static, K, &'static [u8]>,
+        key: K::SelfType<'k>,
+        value: &[u8],
+    ) {
+        let Txn::Write(raw) = &self.txn else {
+            unreachable!("a write job runs on a write transaction")
+        };
+        raw.open_table(def).unwrap().insert(key, value).unwrap();
+    }
+
     /// Sequence of the newest purge info of this shard: how many have been
     /// recorded. Trimming never removes the newest one.
     pub fn purge_seq(&self) -> Result<u64> {
