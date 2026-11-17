@@ -172,6 +172,36 @@ impl Stored {
             pending_shard_map,
         })
     }
+
+    /// Whether the stored shard map is for a cluster of `node_count` nodes.
+    /// One for another size gives way to the configured placement (see
+    /// `store_replaced_shard_map`).
+    fn map_fits(&self, node_count: usize) -> bool {
+        self.shard_map.node_count == node_count
+    }
+
+    /// Put these settings in memory in place of those there, as reopening
+    /// the database would: the shard map only when it fits the cluster of
+    /// the one in memory, which otherwise is the configured placement.
+    fn install(
+        self,
+        shard_map: &std::sync::RwLock<ShardMap>,
+        security: &std::sync::RwLock<(u64, Value)>,
+        pending_shard_map: &std::sync::RwLock<Option<ShardMap>>,
+    ) {
+        let mut map = shard_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.map_fits(map.node_count) {
+            *map = self.shard_map;
+        }
+        *security
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = self.security;
+        *pending_shard_map
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = self.pending_shard_map;
+    }
 }
 
 /// One staged write of a document batch, applied once the whole batch is
@@ -694,7 +724,7 @@ impl Db {
 
         // A map stored for a different cluster size gives way to the
         // configured placement (see `store_replaced_shard_map`).
-        let map_replaced = stored.shard_map.node_count != config.shard_map.node_count;
+        let map_replaced = !stored.map_fits(config.shard_map.node_count);
         let shard_map = if map_replaced {
             tracing::warn!(
                 db = %path.display(),
@@ -1087,6 +1117,12 @@ impl Db {
     /// caller that stops waiting cannot leave memory behind what is on disk;
     /// `writing`, the guard of `setting_writes`, is released only once the
     /// value is installed.
+    ///
+    /// A write that fails may still have landed (a commit can report an
+    /// error and be on the disk), so memory then takes every setting from
+    /// what shard 0 holds once it has recovered, and the caller still hears
+    /// the error. If they cannot be read back, memory keeps what clients
+    /// were last told until the database reopens.
     async fn store_setting(
         &self,
         writing: tokio::sync::OwnedMutexGuard<()>,
@@ -1101,11 +1137,32 @@ impl Db {
             }
             .map_err(ApiError::from)
         });
+        // Made here, as the task cannot borrow the shard; sent only if the
+        // write fails. An actor job, so it runs after the recovery.
+        let read_back = self.shards[0].read(|txn| Ok(txn.settings(DB_SETTINGS)?));
+        let path = self.path.clone();
+        let shard_map = self.shard_map.clone();
+        let security = self.security.clone();
+        let pending_shard_map = self.pending_shard_map.clone();
         tokio::spawn(async move {
             let _writing = writing;
-            write.await?;
-            install();
-            Ok(())
+            let Err(error) = write.await else {
+                install();
+                return Ok(());
+            };
+            match read_back
+                .await
+                .and_then(|rows| Stored::parse(&path, rows))
+            {
+                Ok(stored) => stored.install(&shard_map, &security, &pending_shard_map),
+                Err(read) => tracing::error!(
+                    db = %path.display(),
+                    setting = name,
+                    error = %read.reason,
+                    "the settings cannot be read back after a failed write; memory keeps the last acknowledged ones"
+                ),
+            }
+            Err(error)
         })
         .await
         .map_err(|error| ApiError::internal(format!("storing {name}: {error}")))?
@@ -6903,6 +6960,106 @@ mod tests {
         // Shard 0 committed the design document before shard 1 failed.
         assert_ne!(db.design_generation(), generation);
         assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A database of one shard, moved onto a test disk holding the same
+    /// settings, so its commits can be made to fail.
+    async fn db_on_test_disk(
+        tag: &str,
+    ) -> (Db, std::path::PathBuf, crate::kv::powercut::PowerSwitch) {
+        use crate::store::{Shard, ShardHandle};
+        let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
+        let mut db = Db::open_or_create(
+            &root,
+            tag,
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let rows = db.shards[0]
+            .read(|s| Ok(s.settings(DB_SETTINGS)?))
+            .await
+            .unwrap();
+        let (_, switch) = crate::kv::powercut::PowerCut::new();
+        drop(Shard::create_over_backend(&switch, 1000).unwrap());
+        let disk = ShardHandle::over_backend(&switch).unwrap();
+        disk.call(move |s| {
+            for (name, value) in &rows {
+                s.put_setting(name, value)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.shards[0] = disk;
+        (db, root, switch)
+    }
+
+    /// A settings write whose commit reports an error yet lands (its pages
+    /// and header reach the disk; only the sync of the header fails) is
+    /// still an error to the client, but memory holds what the recovered
+    /// shard holds, so a later versioned write orders against it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_settings_write_that_landed_is_what_memory_holds() {
+        let (db, root, switch) = db_on_test_disk("landed").await;
+        let old = json!({"members": {"names": ["m"]}});
+        let landed = json!({"members": {"names": ["z"]}});
+        let version = db.set_security(old.clone()).await.unwrap();
+        assert_eq!(db.security_versioned(), (version, old));
+
+        // The commit's pages sync; the sync of its header fails, once.
+        switch.fail_one_sync_after(1, std::io::ErrorKind::Other);
+        let error = db.set_security(landed.clone()).await.unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        let on_disk = db.shards[0]
+            .read(|s| Ok(s.settings(DB_SETTINGS)?))
+            .await
+            .unwrap();
+        let on_disk = Stored::parse(&root, on_disk).unwrap().security;
+        assert_eq!(on_disk, (version + 1, landed.clone()), "the write landed");
+        assert_eq!(db.security_versioned(), on_disk);
+
+        // Ordered against the landed object: an equal version with a lesser
+        // object loses. Against the old one it would be newer, and stored.
+        let lesser = json!({"members": {"names": ["a"]}});
+        assert!(!db
+            .set_security_versioned(version + 1, lesser)
+            .await
+            .unwrap());
+        assert_eq!(db.security_versioned(), (version + 1, landed));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A failed settings write whose shard cannot recover leaves memory with
+    /// what clients were last told: nothing can be read back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_settings_write_that_cannot_be_read_back_leaves_memory() {
+        let (db, root, switch) = db_on_test_disk("unread").await;
+        let old = json!({"members": {"names": ["m"]}});
+        let version = db.set_security(old.clone()).await.unwrap();
+
+        // Every sync from the header's on fails, so the reopen fails too.
+        switch.fail_syncs_after(1, std::io::ErrorKind::Other);
+        let error = db
+            .set_security(json!({"members": {"names": ["z"]}}))
+            .await
+            .unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+        assert_eq!(db.security_versioned(), (version, old));
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
