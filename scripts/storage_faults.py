@@ -684,7 +684,10 @@ def sigkill_mid_compaction(binary, work, port):
     """q=1, COMPACT_DOCS documents, then for each kill point: start the
     writers, start `_compact`, SIGKILL at the point, restart. Every
     acknowledged write is there with its body, no compaction file is left,
-    and the database takes a write; at the end it compacts in full."""
+    and the database takes a write; at the end it compacts in full. A kill
+    counts only once a write was acknowledged after `_compact` (and, after
+    the swap, after the compaction ended): with the writers stalled, the
+    survival check would prove nothing."""
     data = os.path.join(work, "data")
     server = Server(binary, data, port, os.path.join(work, "server.log"), ("--q", "1"))
     seed(port, count=0)
@@ -707,8 +710,15 @@ def sigkill_mid_compaction(binary, work, port):
             status, raw = request(port, "POST", "/faults/_compact", {})
             if status != 202:
                 raise Failure(f"POST _compact -> {status} {raw[:200]}")
-            while compact_running(port) and not reached(port, data):
+            floor = load.acked
+            while compact_running(port) and not (load.acked > floor and reached(port, data)):
                 pass
+            if not before_rename:
+                # And one more on the compacted file, after the swap.
+                floor = load.acked
+                if not load.wait_acked(floor + 1):
+                    raise Failure(f"{point}: writes stalled after the swap")
+            acked = load.acked
             server.stop(signal.SIGKILL)
             load.stop()
             leftover = compaction_file(data).exists()
@@ -721,7 +731,7 @@ def sigkill_mid_compaction(binary, work, port):
             if request(port, "PUT", f"/faults/after-{round_}", {"ok": True})[0] != 201:
                 raise Failure(f"{point}: no write after the restart")
             load.created[f"after-{round_}"] = {"ok": True}
-            if (leftover, swapped) == (before_rename, not before_rename):
+            if acked > floor and (leftover, swapped) == (before_rename, not before_rename):
                 hits.append(f"{point} (try {tries})")
                 break
         else:

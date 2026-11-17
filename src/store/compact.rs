@@ -181,6 +181,10 @@ pub(crate) struct DiskTarget {
     next: std::sync::Mutex<Option<kv::powercut::PowerSwitch>>,
 }
 
+/// The names [`DiskTarget`] installs through `kv::rename_verified_in`.
+#[cfg(test)]
+const DISK_NAMES: (&str, &str) = ("test-disk/shard.compact.redb", "test-disk/shard.redb");
+
 #[cfg(test)]
 impl DiskTarget {
     pub(crate) fn new(live: kv::powercut::PowerSwitch) -> DiskTarget {
@@ -212,14 +216,30 @@ impl Target for DiskTarget {
     }
 
     fn install(&self) -> Result<()> {
-        let next = self.next.lock().unwrap().take();
-        self.live
-            .replace_with(&next.ok_or_else(|| anyhow::anyhow!("nothing to install"))?);
-        Ok(())
+        let (from, to) = DISK_NAMES;
+        Ok(kv::rename_verified_in(
+            self,
+            Path::new(from),
+            Path::new(to),
+        )?)
     }
 
     fn remove(&self) {
         *self.next.lock().unwrap() = None;
+    }
+}
+
+/// The shard's name on the test disk, which the new disk is renamed over.
+#[cfg(test)]
+impl kv::Directory for DiskTarget {
+    fn rename(&self, _: &Path, _: &Path) -> std::io::Result<()> {
+        let next = self.next.lock().unwrap().take();
+        self.live
+            .rename_over(&next.ok_or_else(|| std::io::Error::other("nothing to install"))?)
+    }
+
+    fn sync(&self, _: &Path) -> std::io::Result<()> {
+        self.live.sync_directory()
     }
 }
 
@@ -1362,10 +1382,12 @@ mod tests {
     }
 
     /// A crash at any step before the rename leaves the live file as it
-    /// was, with every write acknowledged until then; on the next start the
-    /// half-built file is removed, the database opens, and it compacts.
+    /// was, with every write acknowledged until then, and on the next start
+    /// the half-built file is removed; a crash once the rename is done
+    /// leaves the compacted file in its place and nothing else. Either way
+    /// the database opens, and it compacts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_crash_before_the_rename_leaves_the_live_file_and_removes_the_leftover() {
+    async fn a_crash_during_compaction_keeps_one_whole_shard_file() {
         const TAG: &str = "compactcrash";
         for stage in [
             Stage::Page,
@@ -1373,13 +1395,16 @@ mod tests {
             Stage::Round,
             Stage::Swap,
             Stage::Sealed,
+            Stage::Installed,
         ] {
+            let installed = stage == Stage::Installed;
             let (db, root) = db(TAG, 1);
             let setup = setup();
             db.shard_handle(0)
                 .call(move |txn| setup(txn))
                 .await
                 .unwrap();
+            let before = dump(db.shard_handle(0)).await;
             let (hook, mut stops, _) = pauses(&[stage]);
             let Pause { reached, resume } = stops.remove(0);
             let compaction = tokio::spawn({
@@ -1387,14 +1412,18 @@ mod tests {
                 async move { compact(db.shard_handle(0), hook).await }
             });
             reached.await.unwrap();
-            if !matches!(stage, Stage::Swap | Stage::Sealed) {
+            let expected = if matches!(stage, Stage::Swap | Stage::Sealed | Stage::Installed) {
+                // On the actor: nothing writes, and once the live file is
+                // closed for the rename nothing reads either.
+                before
+            } else {
                 // Off the actor, so the shard acknowledges a write meanwhile.
                 db.shard_handle(0)
                     .call(|txn| write_doc(txn, "during", false, b"{}", 50).map(drop))
                     .await
                     .unwrap();
-            }
-            let expected = dump(db.shard_handle(0)).await;
+                dump(db.shard_handle(0)).await
+            };
             let crashed = root.with_extension("crashed");
             copy_dir(&root, &crashed);
             resume.send(()).unwrap();
@@ -1403,15 +1432,26 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
 
             let dir = crate::db::db_path(&crashed, TAG);
-            let leftover = crate::db::shard_file(&dir, 0).with_extension("compact.redb");
-            assert!(
+            let live = crate::db::shard_file(&dir, 0);
+            let leftover = live.with_extension("compact.redb");
+            assert_eq!(
                 leftover.exists(),
-                "{stage:?}: no compaction file to crash with"
+                !installed,
+                "{stage:?}: the compaction file before the restart"
             );
             crate::state::recover_root(&crashed).unwrap();
             assert!(!leftover.exists(), "{stage:?}: the leftover was kept");
+            assert!(live.exists(), "{stage:?}: the live file was removed");
             let db = crate::db::Db::open(&crashed, TAG, config(1)).unwrap();
-            assert_eq!(dump(db.shard_handle(0)).await, expected, "{stage:?}");
+            if installed {
+                assert_eq!(
+                    without_uuid(dump(db.shard_handle(0)).await),
+                    compacted(expected.clone()),
+                    "{stage:?}"
+                );
+            } else {
+                assert_eq!(dump(db.shard_handle(0)).await, expected, "{stage:?}");
+            }
             compact_shard(db.shard_handle(0)).await.unwrap();
             assert_eq!(
                 without_uuid(dump(db.shard_handle(0)).await),
@@ -1456,10 +1496,12 @@ mod tests {
     }
 
     /// A power cut once the new file is in place keeps it whole, with the
-    /// writes that landed during the copy and between rounds: the swap
-    /// installs only what the new file made durable.
+    /// writes that landed during the copy and between rounds (the swap
+    /// installs only what the new file made durable) and those acknowledged
+    /// after the swap: the rename was made durable before the shard served
+    /// the new file, so the cut cannot bring back the old one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_power_cut_after_the_rename_keeps_the_compacted_file_complete() {
+    async fn a_power_cut_after_the_swap_keeps_the_compacted_file_and_later_writes() {
         let (_, switch) = crate::kv::powercut::PowerCut::new();
         drop(crate::store::Shard::create_over_backend(&switch, 1000).unwrap());
         let shard = Arc::new(ShardHandle::over_backend(&switch).unwrap());
@@ -1477,10 +1519,13 @@ mod tests {
                 Ok(())
             }),
         ];
+        let after = op(|txn| write_doc(txn, "after", false, b"{}", 104).map(drop));
         for op in [&setup()].into_iter().chain(&changes) {
             twin.run(op).await.unwrap();
         }
-        let expected = compacted(dump(&twin.handle).await);
+        compact_shard(&twin.handle).await.unwrap();
+        twin.run(&after).await.unwrap();
+        let expected = without_uuid(dump(&twin.handle).await);
         twin.close();
         let setup = setup();
         shard.call(move |txn| setup(txn)).await.unwrap();
@@ -1496,6 +1541,7 @@ mod tests {
             resume.send(()).unwrap();
         }
         compaction.await.unwrap().unwrap();
+        shard.call(move |txn| after(txn)).await.unwrap();
         switch.cut();
         drop(Arc::into_inner(shard).unwrap());
 
@@ -1519,21 +1565,62 @@ mod tests {
         compact(&rig.handle, hook)
             .await
             .expect_err("a failed swap succeeded");
-        let failed = rig.handle.state();
+        failed_for_good(&rig.handle).await;
+        rig.close();
+    }
+
+    /// The shard has failed, and a request's retry does not reopen it.
+    async fn failed_for_good(handle: &ShardHandle) {
+        let failed = handle.state();
         assert!(
             matches!(failed, crate::store::ShardState::Failed(_)),
             "{failed:?}"
         );
-
+        assert!(handle.gate.is_shut());
         // A request asks for a retry, which must not reopen the file.
-        assert!(rig
-            .handle
-            .lease(|s| Ok(s.txn.len(Table::Meta)?))
-            .await
-            .is_err());
-        assert!(rig.handle.barrier().await.unwrap().is_err());
-        assert_eq!(rig.handle.state(), failed);
-        rig.close();
+        assert!(handle.lease(|s| Ok(s.txn.len(Table::Meta)?)).await.is_err());
+        assert!(handle.barrier().await.unwrap().is_err());
+        assert_eq!(handle.state(), failed);
+    }
+
+    /// A swap whose rename or directory sync fails fails the shard closed
+    /// for good, and nothing is renamed back: the name keeps the old file
+    /// when the rename failed, and the compacted one when the sync did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_rename_or_directory_sync_fails_the_shard_closed() {
+        use crate::kv::powercut::{PowerCut, PowerSwitch};
+        use std::io::ErrorKind;
+        let fail_rename = |switch: &PowerSwitch| switch.fail_renames(ErrorKind::PermissionDenied);
+        let fail_sync = |switch: &PowerSwitch| switch.fail_directory_syncs(ErrorKind::Other);
+        for (step, fail, renamed) in [
+            ("rename", &fail_rename as &dyn Fn(&PowerSwitch), false),
+            ("directory sync", &fail_sync, true),
+        ] {
+            let (_, switch) = PowerCut::new();
+            drop(crate::store::Shard::create_over_backend(&switch, 1000).unwrap());
+            let shard = ShardHandle::over_backend(&switch).unwrap();
+            let setup = setup();
+            shard.call(move |txn| setup(txn)).await.unwrap();
+            let before = dump(&shard).await;
+            shard.set_retry_wait(std::time::Duration::ZERO);
+            fail(&switch);
+            let error = compact_shard(&shard).await.expect_err(step);
+            assert!(
+                format!("{error:#}").contains("could not be put in place"),
+                "{step}: {error:#}"
+            );
+            failed_for_good(&shard).await;
+            drop(shard);
+
+            // What the name holds now, without a power cut.
+            let shard = ShardHandle::over_backend(&switch).unwrap();
+            let expected = if renamed {
+                compacted(before)
+            } else {
+                without_uuid(before)
+            };
+            assert_eq!(without_uuid(dump(&shard).await), expected, "{step}");
+        }
     }
 
     /// The new file's check is trusted only by the process that ran it:
@@ -1542,7 +1629,7 @@ mod tests {
     /// process never checked) runs the full check on its first open, and
     /// so refuses a damaged body.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_power_cut_after_the_rename_leaves_the_check_to_the_next_process() {
+    async fn another_process_checks_the_compacted_file_in_full() {
         const MARKER: &str = "<<douchdb-compacted-body>>";
         let rig = Rig::new("compact-trust");
         rig.run(&setup()).await.unwrap();

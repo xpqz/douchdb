@@ -417,13 +417,43 @@ pub(crate) fn is_verified(path: &Path) -> bool {
 /// of it skips the full read. The flag moves only once the directory sync
 /// has made the rename durable. Call it with `to` closed.
 pub fn rename_verified(from: &Path, to: &Path) -> Result<()> {
+    rename_verified_in(&Files, from, to)
+}
+
+/// The directory operations a rename over a file needs: the file system's,
+/// or a test disk's, on which a power cut undoes a rename whose directory
+/// was not synced.
+pub(crate) trait Directory {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    /// Make the renames in `dir` durable.
+    fn sync(&self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// The file system.
+struct Files;
+
+impl Directory for Files {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    /// No test in this process can observe a real directory fsync; the
+    /// tests cover the call to it in [`rename_verified_in`], through the
+    /// test disk.
+    fn sync(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+/// [`rename_verified`] through `directory`.
+pub(crate) fn rename_verified_in(directory: &impl Directory, from: &Path, to: &Path) -> Result<()> {
     let (source, target) = (verified_flag(from), verified_flag(to));
     let (mut source, mut target) = (lock(&source), lock(&target));
-    std::fs::rename(from, to)?;
+    directory.rename(from, to)?;
     let verified = std::mem::take(&mut *source);
     *target = false;
     if let Some(dir) = to.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+        directory.sync(dir)?;
     }
     *target = verified;
     Ok(())
