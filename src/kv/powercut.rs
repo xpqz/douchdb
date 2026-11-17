@@ -38,6 +38,8 @@ enum Fault {
     /// This sync and every later one fail with the error; writes still
     /// succeed.
     Fail(ErrorKind),
+    /// This sync fails with the error; later ones succeed.
+    FailOnce(ErrorKind),
     /// The power is cut at this sync, which fails.
     Cut,
 }
@@ -111,6 +113,15 @@ impl PowerSwitch {
         self.disk.lock().unwrap().sync_fault = Some(SyncFault {
             after,
             kind: Fault::Fail(error),
+        });
+    }
+
+    /// As [`PowerSwitch::fail_syncs_after`], but only the one sync fails: a
+    /// passing I/O error, so the reopen that recovers from it succeeds.
+    pub fn fail_one_sync_after(&self, after: usize, error: ErrorKind) {
+        self.disk.lock().unwrap().sync_fault = Some(SyncFault {
+            after,
+            kind: Fault::FailOnce(error),
         });
     }
 
@@ -191,6 +202,10 @@ impl redb::StorageBackend for PowerCut {
             } else {
                 match fault.kind {
                     Fault::Fail(kind) => return Err(Error::from(kind)),
+                    Fault::FailOnce(kind) => {
+                        disk.sync_fault = None;
+                        return Err(Error::from(kind));
+                    }
                     Fault::Cut => {
                         disk.cut();
                         return Err(Error::other("the power was cut"));

@@ -1560,6 +1560,11 @@ impl<'s> ShardTxn<'s> {
         self.remove_value(SETTINGS, Table::Settings, name)
     }
 
+    /// The setting `name`, if there is one.
+    pub fn get_setting(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get_value(SETTINGS, Table::Settings, name)
+    }
+
     pub fn set_revs_limit(&mut self, limit: u64) -> Result<()> {
         let limit = limit.max(1);
         self.put_value(SETTINGS, Table::Settings, REVS_LIMIT, &limit.to_be_bytes())?;
