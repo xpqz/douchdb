@@ -54,9 +54,13 @@ request:
 3. Keep documents whose shard this node replicates, and always keep
    `_design/` documents so every node can evaluate local views and search.
 4. Write them with `_bulk_docs?new_edits=false`.
-5. Store a checkpoint keyed by a checkpoint-namespace version, peer and
-   shard-map hash. Checkpoints are node-local records, not `_local` documents:
-   they are never listed by `_local_docs`, shared or moved with a shard.
+5. Store a checkpoint per shard in that shard copy's own `checkpoints` table,
+   with id `ae3:<peer>:<shard>:<peer shard uuid>`: `<peer>` is the peer's
+   index in `--nodes` and the uuid names the peer's copy that was read. Design
+   documents pulled for shards this node does not replicate are checkpointed
+   apart, under `ae3d:`. Checkpoints are node-local records, not `_local`
+   documents: they are never listed by `_local_docs` or shared with other
+   nodes, and clearing a shard copy drops its checkpoints with it.
 
 Checkpoints are advanced only after every requested revision has reached a
 terminal state: applied locally, already present locally, or explicitly
@@ -65,12 +69,14 @@ reported unavailable by the peer (purged/pruned). A partial or malformed
 next tick retries those revisions. `partial_bulk_get_does_not_advance_the_checkpoint`
 covers this path.
 
-The map-hash key means a placement change starts a fresh backfill instead of
-resuming a checkpoint that filtered out newly owned documents. The namespace
-version is `2`: deployments that ran the earlier filter skipped design
-documents on non-owning nodes, so their `ae2:` checkpoint starts at zero once
-and replays history to repair those documents. No manual checkpoint reset is
-needed. This path also repairs replicas after failed writes, a restart, or a
+A shard this node newly replicates has no `ae3:` checkpoint, so a placement
+change starts a full backfill of it from 0; an `ae3d:` checkpoint says nothing
+about its other documents and is not used for it. When the peer's copy is
+replaced (a new uuid), that shard is read from 0 and the checkpoint moves to the
+new uuid. Purges are tracked apart, in one checkpoint per peer on shard 0 with
+id `purge-ae2:<peer URL>:<hash>`, the hash being an MD5 of the replica lists,
+so a placement change rereads the peer's purges from zero. No manual checkpoint
+reset is needed. This path also repairs replicas after failed writes, a restart, or a
 period offline, and keeps search/view indexes warm because their documents
 arrive without a client read.
 
