@@ -19,6 +19,8 @@ struct Disk {
     generation: u64,
     /// Every later write and sync fails with this.
     failing: Option<ErrorKind>,
+    /// Every later read fails with this.
+    reads_failing: Option<ErrorKind>,
     /// What befalls a later sync, once `after` more syncs have succeeded.
     sync_fault: Option<SyncFault>,
     /// `sync_data` succeeds without making anything durable.
@@ -105,6 +107,16 @@ impl PowerSwitch {
         self.disk.lock().unwrap().failing = Some(error);
     }
 
+    /// Make every later read fail with `error`.
+    pub fn fail_reads(&self, error: ErrorKind) {
+        self.disk.lock().unwrap().reads_failing = Some(error);
+    }
+
+    /// Let reads succeed again.
+    pub fn restore_reads(&self) {
+        self.disk.lock().unwrap().reads_failing = None;
+    }
+
     /// Let `after` more `sync_data` calls succeed, then make every later one
     /// fail with `error` while writes still succeed: what was written stays
     /// in the volatile image, as in a page cache, so a commit can report an
@@ -179,6 +191,9 @@ impl redb::StorageBackend for PowerCut {
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
         let disk = self.live()?;
+        if let Some(kind) = disk.reads_failing {
+            return Err(Error::from(kind));
+        }
         let start = usize::try_from(offset).map_err(Error::other)?;
         let bytes = start
             .checked_add(out.len())

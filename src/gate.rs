@@ -91,6 +91,7 @@
 
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, Result};
@@ -170,8 +171,11 @@ enum Phase {
     Open,
     /// A reopen is under way: new reads wait for it.
     Closed,
-    /// The file is closed for good, or a reopen failed or panicked: reads
-    /// fail, and the gate never opens again.
+    /// A reopen failed or panicked: reads fail until a later reopen
+    /// succeeds.
+    Failed,
+    /// The file is closed for good: reads fail, and the gate never opens
+    /// again.
     Shut,
 }
 
@@ -190,6 +194,9 @@ struct Inner {
     returned: Condvar,
     /// The phase, for reads waiting at a closed gate.
     phase: watch::Sender<Phase>,
+    /// A read met an I/O failure (see [`kv::io_failure`]) since the last
+    /// [`Gate::take_io_failure`].
+    io_failed: AtomicBool,
     /// The count of reads waiting, for tests.
     #[cfg(test)]
     waiting: watch::Sender<usize>,
@@ -242,6 +249,8 @@ impl Drop for Lease {
 /// a miss.
 pub struct LeaseTxn<'l> {
     txn: ReadTransaction,
+    /// The gate's record of a read that met an I/O failure.
+    io_failed: &'l AtomicBool,
     /// Tied to the lease the transaction was opened under.
     _lease: PhantomData<&'l Lease>,
     /// Neither `Send` nor `Sync`: the transaction stays on the thread the
@@ -284,6 +293,10 @@ pub(crate) fn table_len(txn: &ReadTransaction, table: Table) -> Result<u64> {
 impl LeaseTxn<'_> {
     /// The value under `key` in `table`, unsealed and checked.
     pub fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        noted(self.io_failed, self.get_any(table, key))
+    }
+
+    fn get_any(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match table {
             Table::Meta => self.get_in(META, table, key::split_text(key)?),
             Table::BySeq => self.get_in(BY_SEQ, table, key::split_seq(key)?),
@@ -301,6 +314,16 @@ impl LeaseTxn<'_> {
     /// until `f` returns `false`. The key and the unsealed value are lent to
     /// `f` for that call only.
     pub fn scan(
+        &self,
+        table: Table,
+        range: impl RangeBounds<Vec<u8>>,
+        reverse: bool,
+        f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        noted(self.io_failed, self.scan_any(table, range, reverse, f))
+    }
+
+    fn scan_any(
         &self,
         table: Table,
         range: impl RangeBounds<Vec<u8>>,
@@ -344,7 +367,7 @@ impl LeaseTxn<'_> {
 
     /// How many entries `table` holds.
     pub fn len(&self, table: Table) -> Result<u64> {
-        table_len(&self.txn, table)
+        noted(self.io_failed, table_len(&self.txn, table))
     }
 
     /// A missing table is an error, never an empty answer: every shard file
@@ -393,6 +416,14 @@ impl LeaseTxn<'_> {
     }
 }
 
+/// `result`, with an I/O failure in it recorded in `io_failed`.
+fn noted<T>(io_failed: &AtomicBool, result: Result<T>) -> Result<T> {
+    if result.as_ref().is_err_and(kv::io_failure) {
+        io_failed.store(true, Ordering::SeqCst);
+    }
+    result
+}
+
 /// What a panic's payload says.
 fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
     payload
@@ -415,6 +446,7 @@ impl Gate {
                 }),
                 returned: Condvar::new(),
                 phase: watch::Sender::new(Phase::Open),
+                io_failed: AtomicBool::new(false),
                 #[cfg(test)]
                 waiting: watch::Sender::new(0),
             }),
@@ -440,10 +472,14 @@ impl Gate {
                     .db
                     .as_ref()
                     .ok_or_else(|| anyhow!("the shard file is closed"))?;
-                db.begin_read()?
+                noted(
+                    &lease.inner.io_failed,
+                    db.begin_read().map_err(anyhow::Error::from),
+                )?
             };
             let txn = LeaseTxn {
                 txn,
+                io_failed: &lease.inner.io_failed,
                 _lease: PhantomData::<&Lease>,
                 _here: PhantomData,
             };
@@ -481,7 +517,7 @@ impl Gate {
                             inner: Arc::clone(&self.inner),
                         };
                     }
-                    Phase::Shut => anyhow::bail!("the shard file is closed"),
+                    Phase::Shut | Phase::Failed => anyhow::bail!("the shard file is closed"),
                     Phase::Closed =>
                     {
                         #[cfg(test)]
@@ -504,9 +540,9 @@ impl Gate {
     /// Close the gate, wait until every lease is back, drop the database,
     /// open the one `open` returns and open the gate on it. Reads asked for
     /// meanwhile wait, then run on the new database. If `open` fails or
-    /// panics, the gate is shut and every read fails (a panic is returned as
-    /// an error). A gate already shut stays shut: the reopen fails without
-    /// calling `open`. Blocks: call it from the shard's own thread (or the
+    /// panics, every read fails until a later reopen succeeds (a panic is
+    /// returned as an error). A gate shut for good stays shut: the reopen
+    /// fails without calling `open`. Blocks: call it from the shard's own thread (or the
     /// blocking pool), holding no transaction.
     pub fn reopen(&self, open: impl FnOnce() -> Result<Database>) -> Result<()> {
         {
@@ -539,7 +575,9 @@ impl Gate {
                 Ok(())
             }
             Err(error) => {
-                self.inner.phase.send_replace(Phase::Shut);
+                if *self.inner.phase.borrow() != Phase::Shut {
+                    self.inner.phase.send_replace(Phase::Failed);
+                }
                 Err(error)
             }
         }
@@ -589,10 +627,17 @@ impl Gate {
     pub(crate) fn read_here<R>(&self, f: impl FnOnce(&LeaseTxn<'_>) -> Result<R>) -> Result<R> {
         let txn = LeaseTxn {
             txn: self.begin_read()?,
+            io_failed: &self.inner.io_failed,
             _lease: PhantomData,
             _here: PhantomData,
         };
         f(&txn)
+    }
+
+    /// Whether a read has met an I/O failure since this was last asked;
+    /// asking clears it.
+    pub(crate) fn take_io_failure(&self) -> bool {
+        self.inner.io_failed.swap(false, Ordering::SeqCst)
     }
 
     /// Wait until the gate is no longer open.
@@ -614,7 +659,6 @@ impl Gate {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     const CACHE: usize = 1 << 20;
@@ -937,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_panicking_open_shuts_the_gate_and_fails_waiting_reads() {
+    async fn a_panicking_open_fails_waiting_reads() {
         let scratch = Scratch::new("panic");
         let path = scratch.file("shard-0000.redb");
         let gate = Gate::new(database(&path, "a", "1"));
@@ -1034,6 +1078,26 @@ mod tests {
         );
         assert!(gate.read(|txn| txn.len(Table::Meta)).await.is_err());
         assert!(gate.shut().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_gate_whose_reopen_failed_opens_on_the_next_reopen() {
+        let scratch = Scratch::new("retry");
+        let path = scratch.file("shard-0000.redb");
+        let gate = Gate::new(database(&path, "a", "1"));
+        let failed = gate.clone();
+        tokio::task::spawn_blocking(move || failed.reopen(|| anyhow::bail!("disk on fire")))
+            .await
+            .unwrap()
+            .expect_err("a failed open reopened the gate");
+        assert!(gate.read(|txn| txn.len(Table::Meta)).await.is_err());
+
+        let retry = gate.clone();
+        tokio::task::spawn_blocking(move || retry.reopen(|| Ok(kv::open(&path, CACHE)?)))
+            .await
+            .unwrap()
+            .expect("the retry did not reopen the gate");
+        assert_eq!(value_of(&gate, "a").await.as_deref(), Some("1"));
     }
 
     #[tokio::test]

@@ -262,8 +262,18 @@ on the next open. Policy:
    live-key rank) and settings from the committed tables, then reopens the
    gate.
 3. If reopening fails, the shard fails closed: every request to it returns
-   500 until the database is next opened. It is never left half-usable in the
-   cache.
+   500. It is never left half-usable in the cache. A request to a failed
+   shard also has its actor retry the reopen, at most once per backoff (1 s,
+   doubling per failed retry, capped at 60 s, reset on success). The retry
+   keeps the sequence the shard published, so a file that came back behind it
+   fails again and is never served; one that could not be opened (a full
+   disk, a passing I/O error) serves again once it opens. Each failed retry
+   is logged as an error, a return to service as a warning.
+4. A read through the gate that meets an I/O error (`Io` or `PreviousIo`,
+   never a checksum mismatch) asks the actor to check its handle once the
+   lease is back; the actor reopens as in step 2 if the handle fails writes.
+   So a shard that only serves reads recovers too. At most one such check is
+   queued per shard.
 
 ## Compaction
 
