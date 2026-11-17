@@ -4440,6 +4440,50 @@ mod recovery_tests {
         assert_eq!(rig.handle.committed_seq(), 3);
     }
 
+    /// A commit whose first sync, of its pages, fails never lands: the
+    /// header that would make it the newest commit is not written. The
+    /// recovered shard serves the commit before it, and so does the disk
+    /// after a power cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_whose_page_sync_fails_is_not_served_after_recovery() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_syncs_after(0, ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { put(&handle, "lost", 2).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.committed_seq(), 1);
+        assert_eq!(by_seq(&rig.handle).await, rows(&[(1, "a")]));
+        let lost = rig
+            .handle
+            .lease(|s| Ok(s.get_meta("lost")?.is_some()))
+            .await
+            .unwrap();
+        assert!(!lost, "the failed commit is served");
+        let counts = rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+        assert_eq!(counts, (1, 0));
+        assert_eq!(put(&rig.handle, "c", 2).await.unwrap(), 2);
+
+        let Rig { switch, handle, .. } = rig;
+        drop(Arc::into_inner(handle).unwrap());
+        switch.cut();
+        let mut shard = Shard::over_backend(&switch, 1000).unwrap();
+        let live: Vec<String> = shard
+            .read(|txn| Ok(txn.live_docs()?.keys().cloned().collect()))
+            .unwrap();
+        assert_eq!(live, ["a", "c"]);
+        assert_eq!(shard.seq(), 2);
+    }
+
     /// The published position never goes back: a file that comes back
     /// without changes that were acknowledged (here, a disk that ignored
     /// syncs and then lost power) fails the shard instead.
