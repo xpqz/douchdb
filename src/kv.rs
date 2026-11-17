@@ -52,7 +52,7 @@ pub const CHECKPOINTS: TableDefinition<&str, &[u8]> = TableDefinition::new("chec
 pub const SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
 /// One variant per table definition above.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Table {
     Meta,
     BySeq,
@@ -233,7 +233,42 @@ fn builder(cache_bytes: usize, check_integrity: bool) -> Builder {
 /// open, and the error is returned. Call it off the request path, with no
 /// transaction open: the check reads the whole file.
 pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
-    let outcome = db.check_integrity();
+    let checked = check(&mut db, path);
+    let closed = close_recording(db, path, checked.is_ok());
+    checked?;
+    closed
+}
+
+/// Proof that a database passed a full integrity check, which
+/// [`close_checked`] needs to record its file as verified. Only [`check`]
+/// makes one.
+pub struct Checked(PathBuf);
+
+/// Run the full integrity check on `db`, the file at `path`, now, while it
+/// stays open: a file still being written can be checked before its last
+/// commits, and closed with [`close_checked`] later. A file that fails (or
+/// had to be repaired) is an error.
+pub fn check(db: &mut Database, path: &Path) -> Result<Checked> {
+    match db.check_integrity()? {
+        true => Ok(Checked(path.to_path_buf())),
+        false => Err(StorageError::Corrupted(format!(
+            "{} failed its integrity check and was repaired",
+            path.display()
+        ))
+        .into()),
+    }
+}
+
+/// Close `db`, the file `checked` vouches for, and record it as verified
+/// if the close succeeds. Commits made after the check are trusted as any
+/// two-phase commit is, until the file's next close-time check.
+pub fn close_checked(db: Database, checked: Checked) -> Result<()> {
+    close_recording(db, &checked.0, true)
+}
+
+/// Close `db`, the file at `path`, and record whether it is verified:
+/// only if `checked` and the close succeeds.
+fn close_recording(db: Database, path: &Path, checked: bool) -> Result<()> {
     // Held from the release of the file until it is recorded: an open of
     // this path in between would be marked verified by the record below. A
     // close that fails leaves the file for its next open to recover, so it
@@ -241,20 +276,8 @@ pub fn close_verified(mut db: Database, path: &Path) -> Result<()> {
     let flag = verified_flag(path);
     let mut verified = lock(&flag);
     let closed = db.close();
-    *verified = false;
-    match outcome {
-        Ok(true) => {
-            closed?;
-            *verified = true;
-            Ok(())
-        }
-        Ok(false) => Err(StorageError::Corrupted(format!(
-            "{} failed its integrity check and was repaired",
-            path.display()
-        ))
-        .into()),
-        Err(error) => Err(error),
-    }
+    *verified = checked && closed.is_ok();
+    closed
 }
 
 /// Begin a write transaction on `db` that commits in two phases, at redb's
@@ -280,6 +303,24 @@ pub(crate) fn begin_write(
 #[cfg(test)]
 pub(crate) fn is_verified(path: &Path) -> bool {
     *lock(&verified_flag(path))
+}
+
+/// Move the closed file `from` over `to` and sync their directory, carrying
+/// over whether `from` passed [`close_verified`]: the compaction swap checks
+/// the new file before it takes the shard's name, so the shard's first open
+/// of it skips the full read. The flag moves only once the directory sync
+/// has made the rename durable. Call it with `to` closed.
+pub fn rename_verified(from: &Path, to: &Path) -> Result<()> {
+    let (source, target) = (verified_flag(from), verified_flag(to));
+    let (mut source, mut target) = (lock(&source), lock(&target));
+    std::fs::rename(from, to)?;
+    let verified = std::mem::take(&mut *source);
+    *target = false;
+    if let Some(dir) = to.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    *target = verified;
+    Ok(())
 }
 
 /// Forget that the file at `path` was verified, because it has been replaced
@@ -527,6 +568,58 @@ mod tests {
         is_verified(path)
     }
 
+    /// The compaction swap: a file checked under its temporary name opens
+    /// without the full check under the shard's name, and an unchecked one
+    /// renamed over a verified name does not inherit the verification.
+    #[test]
+    fn a_renamed_file_keeps_its_own_verification() {
+        let scratch = Scratch::new("rename");
+        let (live, next) = (scratch.file(), scratch.0.join("shard-0000.compact.redb"));
+        close_verified(create(&next, CACHE).unwrap(), &next).unwrap();
+        rename_verified(&next, &live).unwrap();
+        assert!(
+            is_verified(&live),
+            "the checked file is verified as the shard"
+        );
+        assert!(!is_verified(&next));
+        assert!(!next.exists());
+
+        drop(create(&next, CACHE).unwrap());
+        rename_verified(&next, &live).unwrap();
+        assert!(
+            !is_verified(&live),
+            "an unchecked file took a verified name"
+        );
+        drop(open(&live, CACHE).unwrap());
+    }
+
+    /// A rename is not durable until its directory is synced: a file whose
+    /// directory sync failed is checked on its next open, whichever file
+    /// held the name before.
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_whose_directory_sync_fails_leaves_the_name_unverified() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("rename-sync");
+        let (live, next) = (scratch.file(), scratch.0.join("shard-0000.compact.redb"));
+        close_verified(open(&live, CACHE).unwrap(), &live).unwrap();
+        close_verified(create(&next, CACHE).unwrap(), &next).unwrap();
+        // Writable but not readable: the rename goes through and opening
+        // the directory to sync it fails.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let renamed = rename_verified(&next, &live);
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root ignores the mode; the sync then simply succeeds.
+        if renamed.is_err() {
+            assert!(!next.exists(), "the rename itself went through");
+            assert!(
+                !is_verified(&live),
+                "an unsynced rename kept a verified name"
+            );
+            assert!(!is_verified(&next));
+        }
+    }
+
     #[test]
     fn unseal_rejects_a_flipped_bit() {
         let value = b"{\"_id\":\"a\",\"_rev\":\"1-x\"}";
@@ -637,23 +730,43 @@ mod tests {
     }
 
     /// Every write transaction commits in two phases only if it begins in
-    /// [`begin_write`]: nothing else in `src/` begins one.
+    /// [`begin_write`]: nothing else in `src/` begins one, in method or path
+    /// form, or changes how one commits. The helper's own body is the one
+    /// exemption. The patterns are assembled at run time so that this test
+    /// does not match itself.
     #[test]
     fn every_write_transaction_goes_through_kv_begin_write() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let own = root.join("kv.rs");
+        let calls = ["begin_write", "try_begin_write"];
+        let mut patterns: Vec<String> = calls
+            .iter()
+            .flat_map(|call| [format!(".{call}("), format!("Database::{call}(")])
+            .collect();
+        patterns.extend(["two_phase_commit", "durability"].map(|knob| format!("set_{knob}(")));
+        let helper = format!("pub(crate) fn {}(", calls[0]);
         let mut dirs = vec![root];
-        let (mut scanned, mut found) = (0, Vec::new());
+        let (mut scanned, mut found, mut exempt) = (0, Vec::new(), 0);
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     dirs.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
                     scanned += 1;
                     let text = std::fs::read_to_string(&path).unwrap();
+                    let mut in_helper = false;
                     for (n, line) in text.lines().enumerate() {
-                        if line.contains(".begin_write(") || line.contains(".try_begin_write(") {
+                        if path == own && line.starts_with(&helper) {
+                            in_helper = true;
+                        }
+                        if in_helper {
+                            exempt += 1;
+                            in_helper = line != "}";
+                        } else if patterns
+                            .iter()
+                            .any(|pattern| line.contains(pattern.as_str()))
+                        {
                             found.push(format!("{}:{}", path.display(), n + 1));
                         }
                     }
@@ -661,9 +774,10 @@ mod tests {
             }
         }
         assert!(scanned > 10, "only {scanned} source files found");
+        assert!(exempt > 0, "the helper was not found in {}", own.display());
         assert!(
             found.is_empty(),
-            "write transactions begun outside kv::begin_write: {found:#?}"
+            "write transactions begun or configured outside kv::begin_write: {found:#?}"
         );
     }
 

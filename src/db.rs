@@ -484,8 +484,8 @@ pub struct Db {
     /// stored for another cluster size, until `store_replaced_shard_map`
     /// stores it.
     map_replaced: AtomicBool,
-    /// Visible as `compact_running` in `GET /db`; the shard actor still owns
-    /// the actual compaction and blocks its shard while it runs.
+    /// Visible as `compact_running` in `GET /db`, and keeps the database
+    /// open while a compaction runs.
     compact_running: AtomicBool,
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
@@ -633,6 +633,16 @@ pub fn dir_name_to_db_name(dir: &str) -> Option<String> {
     (!name.contains('%')).then_some(name)
 }
 
+/// A running compaction of a database, from [`Db::claim_compaction`]: the
+/// database reports `compact_running` until this is dropped.
+pub struct CompactionClaim<'a>(&'a AtomicBool);
+
+impl Drop for CompactionClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Db {
     /// Open the database `name`, which must exist (see
     /// `state::create_db_staged`). Every shard file is opened as it is: one
@@ -644,6 +654,11 @@ impl Db {
             return Err(ApiError::db_not_found());
         }
         let path = db_path(root, name);
+        // A shard file renamed in place (a compaction swap whose directory
+        // sync failed) is made durable before any write is acknowledged.
+        sync_dir(&path).map_err(|error| {
+            ApiError::internal(format!("cannot sync {}: {error}", path.display()))
+        })?;
         // Every file is checked with a peek before any is opened for
         // writing: a damaged database fails here, its healthy files opened
         // read-only once verified, so a request to it neither writes to
@@ -1603,9 +1618,9 @@ impl Db {
     }
 
     pub async fn info(&self) -> DbResult<DbInfo> {
-        // Snapshot the flag before queueing on the shard actors. A compaction
-        // holds its shard's actor while it runs, so reading the flag afterwards
-        // would block and report the post-compaction state instead.
+        // Snapshot the flag before queueing on the shard actors: a
+        // compaction's swap holds its shard's actor, so reading the flag
+        // afterwards could report the post-compaction state instead.
         let compact_running = self.compact_running.load(Ordering::SeqCst);
         let shard_seqs = self.shard_seqs();
         let update_seq = shard_seqs
@@ -3361,17 +3376,71 @@ impl Db {
         Ok(json!({ "purge_seq": Value::Null, "purged": purged }))
     }
 
+    /// Compact every shard online, one after another (see
+    /// `store::compact`). A compaction already running on this database is
+    /// left to finish, as CouchDB leaves one: this returns at once.
+    #[cfg(test)]
     pub async fn compact(&self) -> DbResult<()> {
-        self.compact_running.store(true, Ordering::SeqCst);
-        let result = async {
-            for shard in &self.shards {
-                shard.alone(|s| s.compact().map_err(ApiError::from)).await?;
-            }
-            Ok(())
+        match self.claim_compaction() {
+            Some(claim) => self.run_compaction(claim).await,
+            None => Ok(()),
         }
-        .await;
-        self.compact_running.store(false, Ordering::SeqCst);
-        result
+    }
+
+    /// Whether a compaction of this database is running.
+    pub fn compacting(&self) -> bool {
+        self.compact_running.load(Ordering::SeqCst)
+    }
+
+    /// Mark a compaction as running, unless one already is. Until the claim
+    /// is dropped, however the compaction ends (a panic included), `GET /db`
+    /// reports it and the database stays open.
+    pub fn claim_compaction(&self) -> Option<CompactionClaim<'_>> {
+        self.compact_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then_some(CompactionClaim(&self.compact_running))
+    }
+
+    /// Run the compaction `claim` claimed.
+    pub async fn run_compaction(&self, claim: CompactionClaim<'_>) -> DbResult<()> {
+        for shard in &self.shards {
+            crate::store::compact::compact_shard(shard).await?;
+        }
+        drop(claim);
+        Ok(())
+    }
+
+    /// The `_active_tasks` entries of this database's running compaction on
+    /// node `node`: one per shard being compacted, as CouchDB reports a
+    /// `database_compaction` task per shard file.
+    pub fn active_tasks(&self, node: &str) -> Vec<Value> {
+        let q = u64::from(self.q);
+        let mut tasks = Vec::new();
+        for (index, shard) in self.shards.iter().enumerate() {
+            let Some(task) = shard.compaction() else {
+                continue;
+            };
+            // The shard's hash range, named as CouchDB names shard files.
+            let index = index as u64;
+            let (low, high) = ((index << 32) / q, ((index + 1) << 32) / q - 1);
+            let progress = (task.changes_done * 100)
+                .checked_div(task.total_changes)
+                .unwrap_or(0)
+                .min(100);
+            tasks.push(json!({
+                "type": "database_compaction",
+                "database": format!("shards/{low:08x}-{high:08x}/{}", self.name),
+                "node": node,
+                "phase": task.phase,
+                "progress": progress,
+                "changes_done": task.changes_done,
+                "total_changes": task.total_changes,
+                "started_on": task.started_on,
+                "updated_on": task.updated_on,
+            }));
+        }
+        tasks
     }
 
     /// Every acknowledged write is already synced (each group commit is), so
@@ -6078,7 +6147,12 @@ mod tests {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::LOCAL, "bad", b"{not json");
+                shard.put_raw(
+                    crate::kv::LOCAL,
+                    crate::kv::Table::Local,
+                    "bad",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6115,7 +6189,12 @@ mod tests {
         let (db, root) = single_shard_db("ddoc-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::META, "_design/v", b"{not json");
+                shard.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    "_design/v",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6202,7 +6281,12 @@ mod tests {
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
-                s.put_raw(crate::kv::BODIES, (bad_id, bad_rev.as_str()), b"{not json");
+                s.put_raw(
+                    crate::kv::BODIES,
+                    crate::kv::Table::Bodies,
+                    (bad_id, bad_rev.as_str()),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6389,7 +6473,12 @@ mod tests {
         // indexes, so the first scan meets it.
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::META, "bad-meta", b"{not json");
+                shard.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    "bad-meta",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6411,6 +6500,7 @@ mod tests {
             .call(move |shard| {
                 shard.put_raw(
                     crate::kv::BODIES,
+                    crate::kv::Table::Bodies,
                     ("bad-body", corrupt_rev.as_str()),
                     b"{not json",
                 );
@@ -8111,7 +8201,12 @@ mod tests {
         let id = id.to_string();
         db.shards[0]
             .call(move |s| {
-                s.put_raw(crate::kv::META, id.as_str(), b"{not json");
+                s.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    id.as_str(),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -8177,10 +8272,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// One corrupt record must not stop compaction of the rest of the shard:
-    /// the record and its bodies stay, the other documents are swept.
+    /// A compaction that panics must not leave its database compacting: it
+    /// would report `compact_running` and never close again.
     #[tokio::test]
-    async fn compaction_skips_a_corrupt_record_and_sweeps_the_rest() {
+    async fn a_panicking_compaction_releases_its_claim() {
+        let (db, root) = purge_test_db("compact-panic", ShardMap::single(1));
+        let db = Arc::new(db);
+        let held = Arc::clone(&db);
+        let panicked = tokio::spawn(async move {
+            let _claim = held.claim_compaction().expect("nothing else compacts");
+            panic!("the compaction panicked");
+        })
+        .await;
+        assert!(panicked.is_err());
+        assert!(db.quiescent());
+        assert!(!db.info().await.unwrap().compact_running);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One corrupt record must not stop compaction of the rest of the shard:
+    /// the record and its bodies stay, the other documents are compacted.
+    #[tokio::test]
+    async fn compaction_skips_a_corrupt_record_and_compacts_the_rest() {
         let (db, root) = purge_test_db("compact-corrupt", ShardMap::single(1));
         let first = db
             .put_docs(vec![json!({"_id": "good"})], true)

@@ -485,7 +485,7 @@ Every flag that takes a value also accepts `--flag=VALUE`. A value that is exact
 | `--heavy-in-flight` | `8` | Global concurrent view/search requests |
 | `--heavy-per-user` | `1` | Concurrent view/search requests per principal |
 | `--background-in-flight` | `2` | Concurrent anti-entropy/discovery passes |
-| `--compact-concurrency` | `1` | Concurrent `_compact` requests across databases on this node |
+| `--compact-concurrency` | `1` | Compactions that run at once on this node; further `_compact` requests wait their turn |
 | `--nodes` | empty | Comma-separated base URLs of every node |
 | `--me` | `0` | This node's index in `--nodes` |
 | `--sync-secs` | `5` | Anti-entropy pull and discovery interval |
@@ -671,8 +671,8 @@ reports how many requests from other nodes it served per protocol under
   a partition; `?r=1` is the explicit local-availability trade-off.
 - **Best-effort database lifecycle.** A node that is offline during a database
   create or drop is not repaired automatically.
-- **Node-local operations.** `_purge`, `_compact` and `_revs_limit` act only on
-  the node that receives them.
+- **Node-local compaction.** `_compact` compacts only the node that receives
+  it; `_purge` and `_revs_limit` reach every copy, as in CouchDB.
 - **Failover replays a range.** A `since` token names a shard copy; when that
   copy is down or was replaced, its range replays from 0 on another copy
   rather than resuming from a checkpoint as CouchDB does (issue #52).
@@ -703,7 +703,7 @@ The cluster paths are covered by the integration tests, including
 
 `GET /`, `_up`, `_all_dbs` (with `startkey`/`endkey`/`limit`/`skip`/
 `descending`), `_db_updates` (normal/longpoll/continuous, heartbeat),
-`_dbs_info`, `_uuids`, `_membership`, `_session`, `_security`, database
+`_dbs_info`, `_uuids`, `_active_tasks`, `_membership`, `_session`, `_security`, database
 create/get/delete, document CRUD with `?rev=`, `?revs=`, `?open_revs=`,
 `?new_edits=false`, `COPY`, `_bulk_docs`, `_bulk_get`, `_all_docs`,
 `_design_docs`, `_local_docs`, `_changes` (normal/longpoll/true continuous, `feed=eventsource` SSE, heartbeat,
@@ -998,8 +998,9 @@ cargo build --release
 python3 scripts/storage_faults.py --bin target/release/douchdb
 ```
 
-It covers repeated SIGKILL mid-write (every acknowledged write must come
-back), then deliberate damage: a truncated shard file, bit flips in a value
+It covers repeated SIGKILL mid-write and mid-compaction (every acknowledged
+write must come back, and no half-built compaction file stays), then
+deliberate damage: a truncated shard file, bit flips in a value
 page and in a branch page (while the server is stopped and while it runs), a
 removed shard file, and a damaged view index. Damaged shards must fail closed
 (500) with the rest of the server unaffected; a damaged view index is rebuilt.
@@ -1039,12 +1040,16 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
-- `_compact` is an interim sweep that deletes non-leaf bodies. It runs as one
-  job holding each shard's actor for its whole run, so that shard's writes and
-  actor reads queue behind it (reads on their own transactions carry on); the
-  file does not shrink, as redb reuses the freed pages. Online compaction is
-  the next phase. `--compact-concurrency` bounds concurrent compactions across
-  databases, and `GET /db` reports `compact_running`.
+- `_compact` compacts online, as CouchDB does: it answers `202` at once,
+  copies each shard into a new file (dropping non-leaf bodies) while the
+  shard keeps serving, checks the copy in full, catches up with the writes
+  made meanwhile, and swaps the new file in with writes paused only for the
+  last catch-up and the rename. It is node-local;
+  `--compact-concurrency` bounds concurrent compactions across databases;
+  the rest wait their turn. The swap pauses that shard's writes and actor
+  reads (reads on their own transactions carry on). `GET /db` reports
+  `compact_running` and `GET /_active_tasks` (admins) lists this node's
+  running compactions in CouchDB's `database_compaction` form.
 - No Mango or lists/shows. Attachments are not supported.
 
 ## License

@@ -197,6 +197,7 @@ fn build_state(
         fs_health: Default::default(),
         config,
         compaction: std::sync::Arc::new(tokio::sync::Semaphore::new(args.compact_concurrency)),
+        compactions_queued: Default::default(),
         admission: std::sync::Arc::new(admission::Admission::new(admission::Limits {
             max_in_flight: args.max_in_flight,
             per_user_in_flight: args.per_user_in_flight,
@@ -239,6 +240,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .route("/_db_updates", get(api::db_updates))
         .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
         .route("/_uuids", get(api::uuids))
+        .route("/_active_tasks", get(api::active_tasks))
         .route("/_membership", get(api::membership))
         .route("/_node/_local/_dbs", get(api::dbs_metadata))
         .route("/_node/_local/_cluster", get(api::cluster_status))

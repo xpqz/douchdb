@@ -215,9 +215,10 @@ term's MD5 as it reads it. So:
   background.
 - **Recovery on start removes only staging and tombstone directories**
   (`.creating-*`, `.deleted-*`), then `fsync`s the parent. Nothing under a
-  published database name is ever removed by recovery, with one exception:
+  published database name is ever removed by recovery, with two exceptions:
   search-index temporary files (`.douchdb-search-meta.json.*.tmp` under
-  `_search_indexes/`) left by an interrupted metadata write are swept.
+  `_search_indexes/`) left by an interrupted metadata write, and half-built
+  compaction files (`shard-NNNN.compact.redb`, see "Compaction"), are swept.
 - **A published database with a missing or unopenable shard fails closed:**
   requests to it return 500, it stays listed, and no remaining file is
   recreated or removed, nor is its data repaired (redb may still rebuild a
@@ -271,21 +272,42 @@ Online, as CouchDB's compactor does; the shard keeps serving throughout.
    `purge_*`). An aborted transaction records nothing. The journal is the only
    catch-up mechanism, so purges, `_local` and settings changes, checkpoint
    writes and deletions of any kind cannot be missed.
-2. **Copy a snapshot.** Open a read transaction and copy the live data into
+2. **Copy, a page at a time.** Copy the live data into
    `shard-NNNN.compact.redb`: every document's metadata and only its leaf
    bodies (CouchDB drops non-leaf bodies), and all other tables whole,
-   including the shard's sequence and uuid.
-3. **Catch up from the journal.** Take the keys recorded so far, read each
-   one's current value from a fresh snapshot of the live file, and apply it to
-   the new file: present means upsert, absent means delete. A body key is
-   copied only if it is still a leaf. Repeat until a round is small.
-4. **Swap through the gate.** On the actor, with writes paused: apply the
-   remaining journal keys, `fsync` the new file, close and drain the gate,
-   rename the new file over the live one, `fsync` the directory, reopen, open
-   the gate, stop the journal.
-5. **Crash safety.** Until the rename, the live file is untouched; a leftover
+   including the shard's sequence and uuid. Each page is read under a lease
+   of its own (see "The shard handle gate"), bounded by entries and bytes,
+   bodies included, so a copy never holds up a reopen. Pages see different
+   snapshots; that is safe because the journal started first, so any key
+   that changes after its page was read is caught up.
+3. **Check the copy.** Off the actor, run the full integrity check on the
+   new file while the shard keeps serving writes. The catch-up commits that
+   follow are trusted as any two-phase commit is, until the file's next
+   close-time check.
+4. **Catch up from the journal.** Take the keys recorded so far, read each
+   one's current value from a fresh lease, and apply it to the new file:
+   present means upsert, absent means delete. A document named by a
+   metadata or body key is reconciled whole, so its bodies in the new file
+   are exactly its leaf bodies. Repeat until a round is small, as CouchDB's
+   compactor retries until it has caught up.
+5. **Swap through the gate.** On the actor, with writes paused: apply the
+   remaining journal keys, compare the new file's settings, and the entry
+   count of every table but `bodies`, with the shard's (a mismatch fails the
+   compaction and keeps the live file), close it (recorded as verified by step 3), close and drain the gate,
+   rename the new file over the live one, `fsync` the directory, reopen,
+   open the gate, stop the journal. A failure at any step of the swap fails
+   the shard closed; nothing is renamed back.
+6. **Crash safety.** Until the rename, the live file is untouched; a leftover
    `.compact.redb` is deleted on start, as CouchDB discards a half-built
-   `.compact` file. After the rename, the new file is complete.
+   `.compact` file. After the rename, the new file is complete. A
+   compaction's cleanup runs on its shard's actor, so one whose database was
+   deleted (and perhaps created again) never touches another's file.
+
+`_compact` answers `202` at once and compacts in the background, as in
+CouchDB; `--compact-concurrency` compactions run at once on a node and the
+rest wait their turn. `GET /_active_tasks` lists this node's running
+compactions in CouchDB's `database_compaction` form (node-local, as
+`_compact` is).
 
 The shard file's uuid is preserved, since the data and sequences are the same,
 so `since` tokens and index cursors stay valid across compaction.

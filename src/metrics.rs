@@ -441,8 +441,9 @@ fn is_probe(route: &str) -> bool {
 /// Low-cardinality route template. Every label comes from a fixed set; a path
 /// segment chosen by the client is never copied into it.
 pub fn route_label(path: &str) -> String {
-    const TOP: [&str; 8] = [
+    const TOP: [&str; 9] = [
         "_up",
+        "_active_tasks",
         "_health",
         "_all_dbs",
         "_db_updates",

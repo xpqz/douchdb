@@ -8,7 +8,7 @@ use crate::dbname::{illegal_db_name, valid_db_name};
 use crate::health::FsHealthCache;
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -271,8 +271,11 @@ pub struct AppState {
     pub feed_stats: FeedStats,
     pub cluster_state: Arc<crate::cluster_state::ClusterState>,
     pub admission: Arc<crate::admission::Admission>,
-    /// Bound concurrent `_compact` requests across databases on this node.
+    /// Bound the compactions running at once on this node; the rest wait.
     pub compaction: Arc<tokio::sync::Semaphore>,
+    /// The databases whose compaction waits for a slot. They wait by name,
+    /// not held open, so `max_open_dbs` still bounds the open databases.
+    pub compactions_queued: std::sync::Mutex<HashSet<String>>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,
     /// Cancelled when the server starts shutting down. Streaming feeds end
@@ -330,6 +333,14 @@ pub const LOCAL_FEED_RECHECK: std::time::Duration = std::time::Duration::from_se
 // state
 
 impl AppState {
+    /// Whether a compaction of `name` waits for a slot.
+    pub fn compaction_queued(&self, name: &str) -> bool {
+        self.compactions_queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    }
+
     pub async fn db(&self, name: &str) -> DbResult<Arc<Db>> {
         self.open_db(name, true).await
     }
@@ -882,10 +893,10 @@ pub fn delete_db(root: &Path, name: &str) -> DbResult<()> {
 }
 
 /// Finish what a crash interrupted, before the node serves: remove every
-/// staging and tombstone directory under `root`, then sync it, and the
-/// temporary files of search index metadata writes in each database.
-/// Nothing else under a database's own name is touched, whatever state it
-/// is in.
+/// staging and tombstone directory under `root`, then sync it, and in each
+/// database the temporary files of search index metadata writes and the
+/// half-built files of compactions (`shard-NNNN.compact.redb`). Nothing
+/// else under a database's own name is touched, whatever state it is in.
 pub fn recover_root(root: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -893,6 +904,30 @@ pub fn recover_root(root: &Path) -> std::io::Result<()> {
             // No search index is open yet, so no metadata write can be in
             // flight: every temporary file there is a crash's leftover.
             crate::search::remove_stale_temps(&entry.path());
+            // Nor is any compaction running: a half-built compaction file
+            // is discarded, as CouchDB discards a `.compact` file. The
+            // shard file it would have replaced is untouched until the
+            // rename.
+            // One that cannot be removed is logged and left, as a search
+            // temporary file is: it holds nothing the shard needs.
+            for file in std::fs::read_dir(entry.path())?.flatten() {
+                if !file.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("shard-") && name.ends_with(".compact.redb")
+                }) {
+                    continue;
+                }
+                match std::fs::remove_file(file.path()) {
+                    Ok(()) => tracing::info!(
+                        path = %file.path().display(),
+                        "removed an interrupted compaction"
+                    ),
+                    Err(error) => tracing::warn!(
+                        path = %file.path().display(),
+                        %error,
+                        "cannot remove an interrupted compaction"
+                    ),
+                }
+            }
         }
         let interrupted = entry.file_name().to_str().is_some_and(|name| {
             name.starts_with(STAGING_PREFIX) || name.starts_with(TOMBSTONE_PREFIX)
@@ -955,6 +990,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         cluster_state: Arc::new(crate::cluster_state::ClusterState::new()),
         admission: Arc::new(crate::admission::Admission::new(Default::default())),
         compaction: Arc::new(tokio::sync::Semaphore::new(1)),
+        compactions_queued: Default::default(),
     })
 }
 
@@ -1667,11 +1703,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Recovery removes staging and tombstone directories and nothing else
-    /// in the root: databases, the health probe's scratch files, temporary
-    /// files and anything else that only resembles them stay.
+    /// Recovery removes staging and tombstone directories, and compaction
+    /// leftovers inside databases, and nothing else: databases, the health
+    /// probe's scratch files, temporary files and anything else that only
+    /// resembles them stay.
     #[test]
-    fn recovery_removes_only_staging_and_tombstone_directories() {
+    fn recovery_removes_only_staging_tombstones_and_compaction_leftovers() {
         let root = scratch_root("recover");
         std::fs::create_dir_all(&root).unwrap();
         for dir in [".creating-1", ".deleted-2", "keep", "a%2Fb"] {
@@ -1681,6 +1718,9 @@ mod tests {
         for file in [".creating-3", ".health-4", ".secret.1.2.tmp"] {
             std::fs::write(root.join(file), b"x").unwrap();
         }
+        std::fs::write(root.join("keep").join("shard-0000.compact.redb"), b"x").unwrap();
+        // One that cannot be removed is logged, and the sweep carries on.
+        std::fs::create_dir(root.join("a%2Fb").join("shard-0001.compact.redb")).unwrap();
         recover_root(&root).unwrap();
         assert_eq!(
             entries(&root),
@@ -1693,6 +1733,10 @@ mod tests {
             ]
         );
         assert_eq!(entries(&root.join("keep")), ["shard-0000.redb"]);
+        assert_eq!(
+            entries(&root.join("a%2Fb")),
+            ["shard-0000.redb", "shard-0001.compact.redb"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

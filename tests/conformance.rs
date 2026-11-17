@@ -5623,6 +5623,7 @@ async fn compaction_keeps_leaf_bodies_whose_revision_contains_a_slash() {
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = s.post("/compactslash/_compact", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
+    compacted(&s, "compactslash").await;
 
     let (status, body) = s.get("/compactslash/doc").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -5672,6 +5673,7 @@ async fn compaction_drops_non_leaf_bodies_but_keeps_every_leaf() {
 
     let (status, _) = s.post("/compactbodies/_compact", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
+    compacted(&s, "compactbodies").await;
 
     let (status, body) = s.get(&format!("/compactbodies/a?rev={rev1}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -5687,6 +5689,22 @@ async fn compaction_drops_non_leaf_bodies_but_keeps_every_leaf() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// Wait until the compaction `_compact` started in the background on `db`
+/// is done: `GET /db` reports `compact_running` until then.
+async fn compacted(s: &Server, db: &str) {
+    loop {
+        let (status, info) = s.get(&format!("/{db}")).await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        if info["compact_running"] == false {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+// CouchDB answers `_compact` with 202 at once and compacts in the
+// background; `_active_tasks` lists a running compaction and is empty once
+// it is done.
 #[tokio::test]
 async fn compact_and_ensure_full_commit() {
     let s = Server::start(false);
@@ -5694,9 +5712,10 @@ async fn compact_and_ensure_full_commit() {
     let (status, body) = s.post("/maint/_compact", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body, json!({"ok": true}));
-    let (status, info) = s.get("/maint").await;
-    assert_eq!(status, StatusCode::OK, "{info}");
-    assert_eq!(info["compact_running"], false);
+    compacted(&s, "maint").await;
+    let (status, tasks) = s.get("/_active_tasks").await;
+    assert_eq!(status, StatusCode::OK, "{tasks}");
+    assert_eq!(tasks, json!([]));
 
     let (status, body) = s.post("/maint/_ensure_full_commit", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);

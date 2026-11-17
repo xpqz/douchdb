@@ -165,7 +165,8 @@ where behaviour is best-effort, it says so.
   most one of those directories, which the next start removes. Nothing under
   a database's own name is removed on start, except search-index temporary
   files (`.douchdb-search-meta.json.*.tmp` under `_search_indexes/`) that an
-  interrupted metadata write left behind.
+  interrupted metadata write left behind and compaction files
+  (`shard-NNNN.compact.redb`) that an interrupted compaction left behind.
 - A database with a missing or damaged shard file fails closed: it stays
   listed, requests to it answer 500, and its files are not recreated or
   removed, nor is their data repaired (redb's first open of a file that was

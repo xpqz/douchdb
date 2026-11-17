@@ -194,8 +194,11 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             .collect();
         return json(StatusCode::OK, json!({ "shards": shards }));
     }
+    // Read first: a compaction that leaves the queue is claimed already.
+    let queued = st.compaction_queued(name);
     match db.info().await {
-        Ok(info) => {
+        Ok(mut info) => {
+            info.compact_running |= queued;
             if st.ctx.cluster.is_internal(headers) {
                 return json_of(StatusCode::OK, &info);
             }
@@ -668,17 +671,62 @@ async fn invalidate_indexes(db: &Db) -> DbResult<()> {
 
 /// `POST /{db}/_compact`.
 async fn compact(req: DbRequest<'_>) -> Response {
-    let Ok(_permit) = req.st.compaction.try_acquire() else {
-        return fail(ApiError::new(
-            409,
-            "compaction_in_progress",
-            "another compaction is already running on this node",
+    // CouchDB answers at once and compacts in the background; `GET /db`
+    // reports `compact_running` (queued included) and `_active_tasks` the
+    // progress meanwhile. `--compact-concurrency` compactions run at once on
+    // this node; the rest wait their turn. One already running or queued on
+    // this database is left to finish.
+    // Under the queue's lock: a queued compaction claims the database
+    // before it leaves the queue, so it is seen as one or the other.
+    let mut queue = req
+        .st
+        .compactions_queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let queued = !req.db.compacting() && queue.insert(req.name.to_string());
+    drop(queue);
+    if queued {
+        tokio::spawn(run_queued_compaction(
+            Arc::clone(req.st),
+            req.name.to_string(),
         ));
-    };
-    if let Err(e) = req.db.compact().await {
-        return fail(e);
     }
     json(StatusCode::ACCEPTED, json!({"ok": true}))
+}
+
+/// Wait for a compaction slot, then compact `name`. Only the name waits,
+/// so a queued database can be closed meanwhile.
+async fn run_queued_compaction(st: Arc<AppState>, name: String) {
+    // The semaphore is never closed; were it, the compaction runs.
+    let _slot = st.compaction.acquire().await.ok();
+    let db = st.db(&name).await;
+    // Claimed before the name leaves the queue, so `GET /db` never finds
+    // the compaction in neither.
+    let claim = db.as_ref().ok().and_then(|db| db.claim_compaction());
+    st.compactions_queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&name);
+    match (&db, claim) {
+        (Ok(db), Some(claim)) => {
+            if let Err(error) = db.run_compaction(claim).await {
+                // A database deleted under its compaction is no fault.
+                if db.check_live().is_err() {
+                    tracing::warn!(db = %name, error = %error.reason, "compaction stopped: database deleted");
+                } else {
+                    tracing::error!(db = %name, error = %error.reason, "compaction failed");
+                }
+            }
+        }
+        (Ok(_), None) => {}
+        // Deleted while it waited.
+        (Err(error), _) if error.status == 404 => {
+            tracing::warn!(db = %name, error = %error.reason, "compaction not started");
+        }
+        (Err(error), _) => {
+            tracing::error!(db = %name, error = %error.reason, "compaction not started");
+        }
+    };
 }
 
 /// `POST /{db}/_ensure_full_commit`.
@@ -851,4 +899,71 @@ async fn fan_out_db(
         },
     )))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `method path` as an admin, through the router's database handlers.
+    async fn request(st: &Arc<AppState>, method: Method, path: &str) -> (StatusCode, Value) {
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method(method.clone())
+            .uri(path)
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.extensions.insert(Principal::service_admin());
+        let (name, rest) = path[1..].split_once('/').unwrap_or((&path[1..], ""));
+        let response = db_rest(
+            State(Arc::clone(st)),
+            DbName(name.to_string()),
+            Path((name.to_string(), rest.to_string())),
+            parts,
+            Bytes::new(),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Compactions waiting for `--compact-concurrency` wait by name: each
+    /// queued database reports `compact_running` but is not held open, so
+    /// `--max-open-dbs` still bounds the open databases.
+    #[tokio::test]
+    async fn queued_compactions_hold_no_database_open() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-compact-queue-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 2);
+        let names: Vec<String> = (0..5).map(|n| format!("queued{n}")).collect();
+        for name in &names {
+            st.create_db(name, false, None, None).await.unwrap();
+        }
+        // The only compaction slot is taken, so every compaction queues.
+        let slot = Arc::clone(&st.compaction).acquire_owned().await.unwrap();
+        for name in &names {
+            let (status, body) = request(&st, Method::POST, &format!("/{name}/_compact")).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        }
+        assert!(st.dbs.read().await.len() <= 2, "queued databases stay open");
+        for name in &names {
+            let (status, info) = request(&st, Method::GET, &format!("/{name}")).await;
+            assert_eq!(status, StatusCode::OK, "{info}");
+            assert_eq!(info["compact_running"], true, "{name}: {info}");
+            assert!(st.dbs.read().await.len() <= 2, "queued databases stay open");
+        }
+
+        drop(slot);
+        for name in &names {
+            while request(&st, Method::GET, &format!("/{name}")).await.1["compact_running"] != false
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
