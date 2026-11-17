@@ -422,17 +422,6 @@ impl AppState {
         }
     }
 
-    /// Close the least recently used databases until at most
-    /// `max_open_dbs` are open. A database is closed only when nothing but the
-    /// map holds it and it is quiescent (see `Db::quiescent`), and its name
-    /// is not being opened, created or dropped, so a request in flight never
-    /// loses its database and a rebalance is never forgotten.
-    ///
-    /// Dropping a `Db` joins its shard actor threads, which waits for their
-    /// queued work, so the drop runs on the blocking pool and not on an async
-    /// worker. The name's lock travels with it: a request that wants the
-    /// database back waits for the drop, so it never meets a shard file's
-    /// lock that is still held.
     /// Close every open database and view file as the process exits, off
     /// the async threads. Each database joins its shard actors, which finish
     /// their queued writes first, so a restart finds every acknowledged
@@ -457,6 +446,17 @@ impl AppState {
         self.release_idle_indexes().await;
     }
 
+    /// Close the least recently used databases until at most
+    /// `max_open_dbs` are open. A database is closed only when nothing but the
+    /// map holds it and it is quiescent (see `Db::quiescent`), and its name
+    /// is not being opened, created or dropped, so a request in flight never
+    /// loses its database and a rebalance is never forgotten.
+    ///
+    /// Dropping a `Db` joins its shard actor threads, which waits for their
+    /// queued work, so the drop runs on the blocking pool and not on an async
+    /// worker. The name's lock travels with it: a request that wants the
+    /// database back waits for the drop, so it never meets a shard file's
+    /// lock that is still held.
     async fn close_over_cap(&self) {
         let cap = self.config.max_open_dbs.max(1);
         let mut closing = Vec::new();

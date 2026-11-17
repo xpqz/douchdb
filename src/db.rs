@@ -3632,6 +3632,9 @@ fn purge_target(
         dead_bodies.extend(gone);
         removed.push(rev.clone());
     }
+    // The purge info is recorded before this document's own writes: it
+    // reads the shard's purge state. Earlier documents in the job may
+    // already have written (#74).
     if matches!(source, PurgeSource::Replayed(_)) || !removed.is_empty() {
         let info = match source {
             PurgeSource::Replayed(uuid) => PurgeInfo {

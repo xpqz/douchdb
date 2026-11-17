@@ -219,8 +219,9 @@ term's MD5 as it reads it. So:
   search-index temporary files (`.douchdb-search-meta.json.*.tmp` under
   `_search_indexes/`) left by an interrupted metadata write are swept.
 - **A published database with a missing or unopenable shard fails closed:**
-  requests to it return 500, it stays listed, and every remaining file is left
-  untouched for inspection or repair. Damage is never mistaken for an
+  requests to it return 500, it stays listed, and no remaining file is
+  recreated or removed, nor is its data repaired (redb may still rebuild a
+  file's allocator state on open), so it is kept for inspection or repair. Damage is never mistaken for an
   interrupted create.
 - View and search index files are rebuildable from the shards, so losing a
   newly created one costs a rebuild, not data; they need no directory sync.
