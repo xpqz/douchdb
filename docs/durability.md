@@ -81,3 +81,14 @@ every commit.
 - `scripts/storage_faults.py` checks crash recovery and fail-closed behaviour
   on a release build; run it after changing anything under `src/kv.rs` or
   `src/store.rs`.
+
+## History
+
+Builds up to and including `cf9295a` (before PR #76, which moved storage to
+redb) acknowledged a write once rusty-leveldb's `write(batch, sync=true)`
+returned. That call only flushed the log buffer to the OS. Acknowledged writes
+survived a process crash or `SIGKILL`, but not a kernel crash or power loss;
+the only `fsync` calls were for metadata temporary files and the renames that
+published them. Write throughput figures from before PR #76 in
+[performance.md](performance.md), [performance-cluster.md](performance-cluster.md)
+and [couchdb-comparison.md](couchdb-comparison.md) are OS-buffered.

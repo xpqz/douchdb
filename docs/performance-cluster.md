@@ -19,6 +19,11 @@ and views — and records the cost of replication and coordinator merging.
 | Seed data | 6,000 small documents |
 | Anti-entropy | `--sync-secs 3600` (writes are synchronously replicated) |
 
+Every write figure in this document (the single PUT and `_bulk_docs` rows) was
+measured before the redb storage engine (PR #76) and is OS-buffered: writes
+were flushed to the OS, not fsynced. The durable redb numbers are in
+[performance.md](performance.md#storage-change-redb-2026-11).
+
 ## Reproduce
 
 ```sh
@@ -52,7 +57,8 @@ cargo run --release --bin loadgen -- \
 ## Results
 
 These are the numbers after the cluster fan-out (#32) and live-document index
-(#33) passes. Latency is in milliseconds. Throughput for bulk operations is
+(#33) passes. The write rows are OS-buffered (pre-redb; see above). Latency is
+in milliseconds. Throughput for bulk operations is
 documents per second.
 
 | Operation | n | Throughput | p50 | p99 |
@@ -127,6 +133,8 @@ metadata to compute their local offsets, including with a far-away `startkey`.
 | `_all_docs?startkey=doc-005000&limit=100` | 118 req/s, p50 8.27 ms | 524 req/s, p50 1.86 ms |
 | `_bulk_docs`, 250 docs/request | 11,956 docs/s | 12,177 docs/s |
 
+The `_bulk_docs` row is OS-buffered (pre-redb; see Environment).
+
 ## Scaling with node count
 
 This run keeps one replica per document (`q=4`, `n=1`) and spreads clients
@@ -151,6 +159,8 @@ python3 scripts/perf_cluster.py --nodes N --q 4 --n 1 --spread \
 \* The one-node row uses the single-node view path; at two or more nodes the
 coordinator performs a cluster fan-out, so the view row is not directly
 comparable across that boundary.
+
+The PUT and `_bulk_docs` rows are OS-buffered (pre-redb; see Environment).
 
 The table above is the historical `n=1` Python-client run. A native Rust client
 on the same host, with `n=3`, `?r=1`, and 32 concurrent GETs, measured:
@@ -317,9 +327,12 @@ curl -X PUT localhost:5984/_node/_local/_dbs/mydb \
   -d '{"q":4,"node_count":3,"replicas":[[1],[1],[1],[1]]}'
 ```
 
-Anti-entropy checkpoints include a hash of the shard map, so a new replica
-starts from zero and pulls documents that were filtered out under the previous
-placement. A conformance test pins all shards to node0, writes a document,
+Anti-entropy checkpoints included a hash of the shard map, so a new replica
+started from zero and pulled documents that were filtered out under the
+previous placement. Since then document checkpoints have moved into each shard
+copy (`ae3:<peer>:<shard>:<peer shard uuid>`); a shard a node newly replicates
+has none and is still pulled from zero. Only the purge checkpoint id still
+carries the map hash. A conformance test pins all shards to node0, writes a document,
 moves all shards to node1, waits for replication, then reads through node0 and
 node1 and after killing node0.
 
@@ -556,7 +569,8 @@ work. Three changes target it:
   row. Tombstones and `style=all_docs` still use the full metadata path.
 - Cluster sequence tokens wrap a compact `v1:<node seqs>` body instead of
   base64(JSON) of a map encoded per row; they are then written in CouchDB's
-  `<sum>-<base64url>` shape.
+  `<sum>-<base64url>` shape. (Since replaced: a token now holds one position
+  per shard on a named shard copy; see [consistency.md](consistency.md).)
 
 Before/after on the 6,000-document cluster benchmark:
 
@@ -578,7 +592,7 @@ constructing a `serde_json::Value` tree and serializing it again.
 inserted, so document bodies are never parsed and rebuilt. Single-node feeds
 use this path directly; a clustered feed uses it when the coordinator holds
 every selected shard and rewrites only the trailing `last_seq` to the cluster
-vector.
+vector (now the cluster token of per-shard positions).
 
 Before/after against the previous `_changes` path:
 
@@ -665,8 +679,11 @@ partition.
 
 Cluster `_changes` now skips unavailable nodes and continues with reachable
 replicas in both limited and full feeds. The failed node’s version-vector
-component remains at its last checkpoint; when the node returns it resumes from
-there. Surviving replicas can supply the replicated changes meanwhile.
+component remained at its last checkpoint; when the node returned it resumed
+from there. Surviving replicas supplied the replicated changes meanwhile.
+Since per-shard sequences, a token names shard copies rather than nodes: the
+failed node's shards replay from 0 on a replica, and later tokens name that
+replica's copy (see [consistency.md](consistency.md)).
 
 The node-loss test kills one of three nodes, writes a new document, and resumes
 `_changes` from the pre-kill `last_seq`; the new change is present. The existing

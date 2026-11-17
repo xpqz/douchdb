@@ -460,7 +460,7 @@ douchdb [--listen ADDR] [--data DIR] [--q N] [--n N] [--revs-limit N]
         [--cors-methods METHOD,METHOD] [--cors-exposed-headers HEADER,HEADER]
         [--cors-max-age SECS]
         [--view-timeout-ms N] [--view-memory-mb N] [--max-request-mb N]
-        [--max-open-indexes N] [--max-open-dbs N]
+        [--max-open-indexes N] [--max-open-dbs N] [--cache-mb N]
         [--rebalance-write-drain-ms N] [--rebalance-stable-wait-ms N]
         [--rebalance-freeze-ms N] [--js-worker-startup-ms N]
         [--otel-endpoint URL]
@@ -508,7 +508,8 @@ Every flag that takes a value also accepts `--flag=VALUE`. A value that is exact
 | `--rebalance-stable-wait-ms` | `10000` | How long a rebalance waits for the frozen old replicas to agree on one content digest per shard. Slow or heavily loaded hosts may need a larger value |
 | `--rebalance-freeze-ms` | `420000` | Upper bound on a rebalance write freeze; if the coordinator disappears, writes resume after this long. It also bounds the whole rebalance, so a slow or heavily loaded cluster may need a larger value. Set it the same on every node: each node applies its own value to the freeze it accepts from a peer |
 | `--js-worker-startup-ms` | `10000` | How long a `--js-sandbox process` worker may take to start before it is killed. Slow or heavily loaded hosts may need a larger value |
-| `--max-open-dbs` | `256` | Most databases kept open between requests (CouchDB's `max_dbs_open` is 500, but a database here costs a thread and several file descriptors per shard). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. |
+| `--max-open-dbs` | `256` | Most databases kept open between requests (CouchDB's `max_dbs_open` is 500, but a database here costs a thread and several file descriptors per shard). Past it the least recently used database that no request is using, and that is not rebalancing or compacting, is closed and reopened from disk on its next request. Each open database holds one actor thread and store per shard (`q`), so size this with `q` and the file descriptor limit in mind. Each shard file also has a page cache of up to `--cache-mb`, so open databases hold at most about `--max-open-dbs` × `q` × `--cache-mb` of it (`q` being each database's own), plus one more for each running compaction's copy (see `--compact-concurrency`). |
+| `--cache-mb` | `16` | Page cache of each shard file, in MiB (redb's cache size). View indexes have their own cache and are not counted |
 | `--max-open-indexes` | `256` | Most view indexes, and most search indexes, kept open between queries. Past it the least recently used index that no query is using is closed and reopened from disk on its next query. CouchDB keeps an index process per active view with no such cap; this bounds memory and file descriptors on nodes with many databases. |
 | `--otel-endpoint` | env | OTLP HTTP base endpoint; `/v1/traces` and `/v1/metrics` are appended |
 

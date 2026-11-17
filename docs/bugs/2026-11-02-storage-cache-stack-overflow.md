@@ -28,11 +28,11 @@ link/unlink operations are O(1); teardown is iterative. The vendored copy also
 fixes duplicate-key insertion, which linked a new node without unlinking the old
 one, and adds debug list/map invariant checks.
 
-See [`vendor/rusty-leveldb/PATCHES.md`](../../vendor/rusty-leveldb/PATCHES.md).
+See `vendor/rusty-leveldb/PATCHES.md` (removed).
 
 This is a temporary vendoring decision. The rationale, risks and removal
-checklist are in [`docs/storage-dependency.md`](../storage-dependency.md),
-tracked by issue #105.
+checklist are in `docs/storage-dependency.md` (removed), tracked by issue
+#105.
 
 ## Limits
 

@@ -124,7 +124,9 @@ Each database directory also contains:
 
 A database is created in a `.creating-<uuid>` staging directory and published by
 one rename; it is deleted by renaming it to `.deleted-<uuid>`. Recovery on start
-removes only those two kinds of directory.
+removes those two kinds of directory and, inside each database, only two kinds
+of file: search-index metadata temporary files and the half-built files of
+interrupted compactions (`shard-NNNN.compact.redb`).
 
 View and search indexes are derived data: they can be deleted and rebuilt from
 documents and design documents. `_view_cleanup` and `_search_cleanup` remove
@@ -136,8 +138,11 @@ so a shard's `_changes` feed is exactly its committed snapshot and there is no
 reserved/committed watermark. Every transaction commits in two phases (pages
 synced, then the header that names them), so a write is acknowledged only once
 it is on disk and damage to the newest commit is reported as corruption rather
-than silently falling back to the previous one. Group commit still turns many
-small writes into one pair of syncs. See `docs/durability.md`.
+than silently falling back to the previous one. The one known exception is in
+redb's header: the primary-slot and two-phase bits sit outside every checksum,
+and flipping the primary-slot bit of a file closed by a crash makes redb serve
+the older commit without detection. Group commit still turns many small writes into one pair of syncs. See
+`docs/durability.md`.
 
 ## The rev hash
 
@@ -245,7 +250,8 @@ bodies, status codes (`409` on conflict, `412` on bad rev, `404` on missing db),
 Not Raft. CouchDB's document model — revision trees with deterministic conflict
 resolution — is already a join-semilattice, so concurrent writes on different
 replicas converge without consensus. Raft would buy linearizable `_changes`
-ordering; a version vector buys the same resumption correctness for ~60 lines.
+ordering; per-shard sequences with opaque `since` tokens, as in CouchDB 3, buy
+resumption that may replay a change but never skips one.
 
 * **Sharding:** `md5(docid)` → first four bytes `% q` → shard index. `q` is
   fixed at database creation, as in CouchDB.
@@ -268,14 +274,17 @@ ordering; a version vector buys the same resumption correctness for ~60 lines.
   replicas; the rebalance endpoint broadcasts a migration map, keeps reads on
   the old owners, freezes writes, waits for target digests, and only then
   activates the new map. Destructive cleanup remains explicit.
-* **Sequence numbers:** one counter per database; `since` and `update_seq` are
-  `v1:` comma-separated **version vectors** keyed by node `{node → seq}`
-  (legacy base64url tokens are still accepted). Clients treat
-  `since` as opaque (CouchDB 2 already returns strings like `"12-g1AAA…"`), and
-  `0`/`now` still work. Node keys are coarser than per-shard-replica keys, but
-  resumption remains exact because a node's changes feed is one cursor. A
-  single hybrid-logical-clock integer would be smaller but silently drops
-  changes under clock skew.
+* **Sequence numbers:** each shard has its own sequence, assigned inside its
+  write transaction. `since`, `last_seq` and `update_seq` are opaque
+  CouchDB-style `<sum>-<base64url>` tokens that hold, for each shard range, a
+  position on a named shard copy (node, shard, sequence and the copy's uuid),
+  standalone and clustered alike. `since` takes `0`, `now` or such a token;
+  anything else is a 400, as in CouchDB. A range resumes on the copy its token
+  names. If that copy is down, or was replaced (its uuid changed), the range
+  replays from 0 on another copy; resuming from a checkpoint there, as
+  CouchDB's `mem3_rep:find_source_seq` does, is issue #52. A resumed feed may
+  re-read rows but never skips one. A single hybrid-logical-clock integer
+  would be smaller but silently drops changes under clock skew.
 * **Anti-entropy:** one pull per peer per database every `--sync-secs`, using
   the same `_changes` + `_bulk_get` + `new_edits=false` protocol clients use,
   with documents filtered to the shards this node replicates. `_bulk_get` asks
@@ -400,10 +409,9 @@ the bulk of the growth.
   (generated ids are routed after parsing). `_all_docs` fans out to every node,
   merges by id preferring the shard owner, then applies `startkey`/`skip`/
   `limit`; `keys` queries also surface tombstones and preserve request order,
-  including descending keys. `_changes` fans out per node,
-  dedupes replicated documents and returns a `v1:` version-vector `since`/
-  `last_seq` (legacy base64url tokens are still accepted); `GET /db` reports the
-  same vector as `update_seq`. Forwarded
+  including descending keys. `_changes` fans out per node, reads each shard
+  from one copy and returns an opaque per-shard `since`/`last_seq` token;
+  `GET /db` reports the same kind of token as `update_seq`. Forwarded
   subrequests carry `x-douchdb-forwarded` so the receiving peer serves them
   locally instead of re-fanning out.
 * **Cluster replicas green.** `--n N` selects N distinct nodes per shard by
@@ -424,11 +432,11 @@ the bulk of the growth.
   (client Basic/cookie auth is forwarded to peers). The v0.1 gate — kill a node mid-replication and keep serving
   from the survivors — is covered by
   `cluster_survives_killing_a_node_mid_replication`.
-* **Version vectors.** `since`/`update_seq` are keyed by node, not by shard
-  replica: sequence allocation is one counter per database, so a node's changes
-  feed is a single cursor and the coarser key still resumes exactly (no change
-  is skipped). Per-shard-replica keys would require per-shard sequence
-  allocation, which the storage layout does not currently do.
+* **Per-shard sequences.** Each shard assigns its own sequence inside its
+  write transaction, so a shard's feed is exactly its committed snapshot and
+  there is no reserved/committed watermark. Tokens hold one position per shard
+  range on a named copy (see Sequence numbers above); rows from different
+  shards are not in one global order.
 * **Views.** Design-document map/reduce views run on embedded QuickJS with
   CouchDB's `emit`/`sum`/`log` helpers, `key`/`keys`/range/page/include_docs
   query options, `_count`/`_sum`/`_stats`/`_approx_count_distinct` and custom
@@ -549,9 +557,10 @@ the bulk of the growth.
   node. Reduce partials are recombined after fallback, including
   grouped and custom `rereduce` reducers. Changes use the live-document index
   for winning revisions and compact sequence tokens, avoiding per-row metadata
-  decodes and duplicate detection. Reassigned shard masks after an owner loss
-  resume from zero because the survivor's checkpoint belongs to a different
-  shard set. Cluster `_all_docs` keys are ordered after the merge, including
+  decodes and duplicate detection. A shard reassigned after an owner loss
+  replays from 0 on the replica that takes it over, because the token's
+  position names the lost copy; resuming from a checkpoint there is issue #52.
+  Cluster `_all_docs` keys are ordered after the merge, including
   descending requests; streamed changes are tested for strict sequence order,
   resume boundaries and duplicate-free pagination across interleaved shards.
   A lazy per-shard sequence index caches
@@ -560,9 +569,9 @@ the bulk of the growth.
   streamed by merging shard pages and serializing bounded chunks, with
   `include_docs` bodies embedded verbatim rather than parsed and rebuilt. Full `_changes` feeds
   also query peers concurrently; limited
-  feeds merge node prefixes round-robin up to the global limit. Unavailable
-  change nodes are skipped and covered by replicas, with their vector
-  component resuming on return. New edits are written directly to every
+  feeds merge node prefixes round-robin up to the global limit. The shards of
+  an unavailable node are read from another replica, from 0 on that copy, and
+  later tokens name the copy that served them. New edits are written directly to every
   replica in parallel and return once `w` acknowledgements are reached;
   documents are shared as `Arc<Value>` across replica groups and forwarded
   payloads are serialized directly, avoiding one deep clone and one
@@ -586,9 +595,10 @@ the bulk of the growth.
 * **Shard-map metadata and movement.** Each database has a persisted, cached
   mem3-style shard map, exposed at `/_node/_local/_dbs/{db}` and broadcast to
   peers. Maps carry monotonic versions; updates track metadata quorum and a
-  pending map file, and anti-entropy reconciles newer/older peers after a
+  pending map (in shard 0's settings table), and anti-entropy reconciles newer/older peers after a
   missed update. Routing and anti-entropy read the map; anti-entropy
-  checkpoints are tagged by map hash so new replicas backfill after a move. A
+  checkpoints live in each shard copy, so a new replica has none and backfills
+  from 0 after a move. A
   balanced planner endpoint verifies per-shard revision-metadata digests; a
   timeout leaves the active map unchanged, destructive cleanup is explicit
   (`?cleanup=true`), and writes are frozen on every node only for the bounded
@@ -633,7 +643,7 @@ API, keeps concurrent writers running (group commit), probes read latency, then
 compacts the shard and kills the server with `SIGKILL` to check process-crash
 durability. It does not test power loss (the `kv::powercut` tests do).
 The run below is historical: it was measured on the earlier LSM-based
-engine, before `fsync` per commit and the interim `_compact`.
+engine, before `fsync` per commit.
 Release build, `--q 1`, 4 writers, 10,001 documents, 10.002 GB logical:
 
 | Metric | Result |
@@ -651,8 +661,8 @@ The interesting number is the last one: the old engine's range compaction owned 
 for its whole duration, so every request behind it waits. At 10 GB that is a
 27-second p99 for that shard. The write path itself is acceptable (80 MB/s,
 ~0.5 s p99) with one 22-second outlier where compaction stalled the
-writer. Keeping `_compact` synchronous is no longer defensible for large
-databases; the options are a background job that still takes the shard lock
-(same stall, but observable via `compact_running`) or sharding compaction work
-across more shards (`q > 1` divides the stall).
+writer. That made a synchronous `_compact` indefensible for large databases.
+This is superseded: `_compact` now runs online in the background, and a shard's
+writes pause only for the final catch-up and the swap; `docs/durability.md`
+describes the copy and swap.
 
