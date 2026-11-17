@@ -260,15 +260,17 @@ not clearly under it. Aligning the floor and re-measuring is issue #95.
 
 End to end, with one client, douchdb runs at 0.53-0.94x the floor's docs/s
 (q1: 0.82, 0.64, 0.58; q2: 0.94, 0.79, 0.53 at 250, 1,000 and 10,000
-documents), up from roughly 0.42-0.69. The gap is request parsing and HTTP,
-which the floor does not pay.
+documents), up from roughly 0.42-0.69. The gap is request work the floor does
+not pay: HTTP, JSON parsing, and preparing each document (serialising its body
+and hashing its revision).
 
 What the numbers say:
 
 - **Job time.** With one client the shard actor's median job time is now
   0.90–1.146× the floor's insert time, against a goal of 1.15×, which the
-  medians meet at every size and q; q=1 with 1,000 documents is just under the
-  limit, at 1.146. It
+  medians meet at every size and q against this floor (see the caveat above);
+  q=1 with 1,000 documents, at 1.146, is at the limit within measurement
+  precision. It
   was 2.0–3.6× before the bulk write path work, and `4d1f3d1` measured
   1.47–1.84× in the same rounds (1.35–1.72× in an earlier, more loaded run).
   The trimmed staging alone cut job time by 26–38% against `4d1f3d1` in the
