@@ -637,23 +637,43 @@ mod tests {
     }
 
     /// Every write transaction commits in two phases only if it begins in
-    /// [`begin_write`]: nothing else in `src/` begins one.
+    /// [`begin_write`]: nothing else in `src/` begins one, in method or path
+    /// form, or changes how one commits. The helper's own body is the one
+    /// exemption. The patterns are assembled at run time so that this test
+    /// does not match itself.
     #[test]
     fn every_write_transaction_goes_through_kv_begin_write() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let own = root.join("kv.rs");
+        let calls = ["begin_write", "try_begin_write"];
+        let mut patterns: Vec<String> = calls
+            .iter()
+            .flat_map(|call| [format!(".{call}("), format!("Database::{call}(")])
+            .collect();
+        patterns.extend(["two_phase_commit", "durability"].map(|knob| format!("set_{knob}(")));
+        let helper = format!("pub(crate) fn {}(", calls[0]);
         let mut dirs = vec![root];
-        let (mut scanned, mut found) = (0, Vec::new());
+        let (mut scanned, mut found, mut exempt) = (0, Vec::new(), 0);
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     dirs.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
                     scanned += 1;
                     let text = std::fs::read_to_string(&path).unwrap();
+                    let mut in_helper = false;
                     for (n, line) in text.lines().enumerate() {
-                        if line.contains(".begin_write(") || line.contains(".try_begin_write(") {
+                        if path == own && line.starts_with(&helper) {
+                            in_helper = true;
+                        }
+                        if in_helper {
+                            exempt += 1;
+                            in_helper = line != "}";
+                        } else if patterns
+                            .iter()
+                            .any(|pattern| line.contains(pattern.as_str()))
+                        {
                             found.push(format!("{}:{}", path.display(), n + 1));
                         }
                     }
@@ -661,9 +681,10 @@ mod tests {
             }
         }
         assert!(scanned > 10, "only {scanned} source files found");
+        assert!(exempt > 0, "the helper was not found in {}", own.display());
         assert!(
             found.is_empty(),
-            "write transactions begun outside kv::begin_write: {found:#?}"
+            "write transactions begun or configured outside kv::begin_write: {found:#?}"
         );
     }
 
