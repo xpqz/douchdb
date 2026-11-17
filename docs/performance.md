@@ -14,7 +14,7 @@ warm local filesystem and no authentication. Multi-node numbers are in
 | Memory | 28 GiB |
 | OS | Linux 7.2.8 / glibc 2.44 |
 | Build | `cargo build --release` |
-| Server | single node, `--q 1 --n 1`, no `--admin`, sync writes enabled |
+| Server | single node, `--q 1 --n 1`, no `--admin`; writes flushed to the OS, not fsynced (pre-redb) |
 | Client | Python 3.14 `http.client`, keep-alive, local loopback |
 | Seed data | 6,000 small documents; ~13,000 total at metadata/view points |
 | Large docs | 10 × 1 MiB bodies, measured separately |
@@ -33,7 +33,9 @@ reuse an existing server.
 ## Results
 
 These are the numbers after the metadata scan (#30), view map (#31) and
-live-document index (#33) passes. Latency is in milliseconds. Throughput for bulk operations is documents per
+live-document index (#33) passes. They predate the redb storage engine: write
+figures are OS-buffered, not durable on disk (see
+[Storage change: redb](#storage-change-redb-2026-11)). Latency is in milliseconds. Throughput for bulk operations is documents per
 second; the request rate is shown separately.
 
 | Operation | n | Throughput | p50 | p99 |
@@ -142,6 +144,41 @@ Storage at the end of the run:
   "compact_seconds": 0.093
 }
 ```
+
+## Storage change: redb (2026-11)
+
+The redb storage engine (PR #76) acknowledges a write only once it is synced
+to disk. The engine before it acknowledged writes once they were flushed to the
+OS. Write throughput fell accordingly. Throughput is the median of three
+rounds; the range across rounds is in parentheses.
+
+| Workload | Nodes | Pre-redb (`cf9295a`) | redb (`12cadce`) | Ratio |
+|---|---|---:|---:|---:|
+| Bulk import, 150,959 docs, 250 per batch | 3, `n=3` | 9,866 docs/s (9,628–9,946), 15.3 s | 3,379 docs/s (3,326–3,421), 44.7 s | 0.34× |
+| Bulk import, 150,959 docs, 250 per batch | 1 | 17,131 docs/s (16,697–17,162), 8.8 s | 7,254 docs/s (6,747–7,256), 20.8 s | 0.42× |
+| Single-document PUT, 16 concurrent | 3, `n=3` | 9,466 docs/s, p50 1.5 ms | 260 docs/s, p50 58.5 ms | 0.027× |
+| Single-document PUT, 16 concurrent | 1 | 18,698 docs/s, p50 0.53 ms | 786 docs/s, p50 20.3 ms | 0.042× |
+
+Conditions: release builds of `cf9295a` (pre-redb) and `12cadce`, `q=2`,
+`--sync-secs 3600`, default `--cache-mb 16`. Each configuration ran three
+interleaved rounds after a discarded pilot round. The single-document PUTs
+were creates only, about 260 bytes each. Apple M2 Pro, 10 cores, 32 GiB, data
+on an external APFS disk, on a loaded machine.
+
+The cause is durability, not a defect. The pre-redb engine acknowledged a
+group once rusty-leveldb's `write(batch, sync=true)` returned, and that call
+only flushed the log buffer to the OS: nothing in the engine called `fsync`.
+redb commits each group in two phases (see [durability.md](durability.md)),
+which is two `sync_data` calls per commit. On macOS Rust's `sync_data` issues
+`fcntl(F_FULLFSYNC)`, and on this disk `F_FULLFSYNC` took 3.0 ms median against
+0.13 ms for a plain `fsync`.
+
+Caveats:
+
+- Linux `fdatasync` was not measured.
+- The write mix was creates only.
+- Single-document writes do not yet coalesce into larger commits; that is
+  issue #90.
 
 ## JavaScript sandbox throughput
 

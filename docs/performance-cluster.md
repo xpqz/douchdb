@@ -19,6 +19,11 @@ and views — and records the cost of replication and coordinator merging.
 | Seed data | 6,000 small documents |
 | Anti-entropy | `--sync-secs 3600` (writes are synchronously replicated) |
 
+Every write figure in this document (the single PUT and `_bulk_docs` rows) was
+measured before the redb storage engine (PR #76) and is OS-buffered: writes
+were flushed to the OS, not fsynced. The durable redb numbers are in
+[performance.md](performance.md#storage-change-redb-2026-11).
+
 ## Reproduce
 
 ```sh
@@ -52,7 +57,8 @@ cargo run --release --bin loadgen -- \
 ## Results
 
 These are the numbers after the cluster fan-out (#32) and live-document index
-(#33) passes. Latency is in milliseconds. Throughput for bulk operations is
+(#33) passes. The write rows are OS-buffered (pre-redb; see above). Latency is
+in milliseconds. Throughput for bulk operations is
 documents per second.
 
 | Operation | n | Throughput | p50 | p99 |
