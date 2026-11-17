@@ -1122,8 +1122,13 @@ impl Shard {
         if !self.journal.is_recording() {
             return Ok(false);
         }
+        hook(compact::Stage::Sealed);
         let target = Arc::clone(&self.target);
-        let serving = self.reopen(|| target.install());
+        let serving = self.reopen(|| {
+            target.install()?;
+            hook(compact::Stage::Installed);
+            Ok(())
+        });
         self.journal.stop();
         anyhow::ensure!(
             serving,

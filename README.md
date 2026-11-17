@@ -998,8 +998,9 @@ cargo build --release
 python3 scripts/storage_faults.py --bin target/release/douchdb
 ```
 
-It covers repeated SIGKILL mid-write (every acknowledged write must come
-back), then deliberate damage: a truncated shard file, bit flips in a value
+It covers repeated SIGKILL mid-write and mid-compaction (every acknowledged
+write must come back, and no half-built compaction file stays), then
+deliberate damage: a truncated shard file, bit flips in a value
 page and in a branch page (while the server is stopped and while it runs), a
 removed shard file, and a damaged view index. Damaged shards must fail closed
 (500) with the rest of the server unaffected; a damaged view index is rebuilt.

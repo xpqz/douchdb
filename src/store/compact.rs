@@ -75,6 +75,11 @@ pub(crate) enum Stage {
     Round,
     /// On the actor, writes paused, before the final round.
     Swap,
+    /// The caught-up file is closed and about to be renamed over the live
+    /// one.
+    Sealed,
+    /// The rename is done and durable; the shard has yet to reopen.
+    Installed,
 }
 
 /// A compaction's progress, as `_active_tasks` reports it.
@@ -1010,21 +1015,20 @@ mod tests {
         rig.close();
     }
 
+    fn config(q: u32) -> crate::db::DbConfig {
+        crate::db::DbConfig {
+            q,
+            revs_limit: 1000,
+            cache_bytes: CACHE,
+            shard_map: crate::cluster::ShardMap::single(q),
+            partitioned: false,
+        }
+    }
+
     /// A database with `q` shards, for tests that go through `Db`.
     fn db(tag: &str, q: u32) -> (Arc<crate::db::Db>, PathBuf) {
         let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
-        let db = crate::db::Db::open_or_create(
-            &root,
-            tag,
-            crate::db::DbConfig {
-                q,
-                revs_limit: 1000,
-                cache_bytes: CACHE,
-                shard_map: crate::cluster::ShardMap::single(q),
-                partitioned: false,
-            },
-        )
-        .unwrap();
+        let db = crate::db::Db::open_or_create(&root, tag, config(q)).unwrap();
         (Arc::new(db), root)
     }
 
@@ -1339,6 +1343,187 @@ mod tests {
         assert_eq!(reader.await.unwrap().unwrap(), 6);
         compaction.await.unwrap().unwrap();
         assert_eq!(body_keys(&dump(&rig.handle).await).len(), 6);
+        rig.close();
+    }
+
+    /// Copy the directory `from` to `to` with its files as they now stand,
+    /// open ones included: what a process killed now leaves behind.
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// A crash at any step before the rename leaves the live file as it
+    /// was, with every write acknowledged until then; on the next start the
+    /// half-built file is removed, the database opens, and it compacts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crash_before_the_rename_leaves_the_live_file_and_removes_the_leftover() {
+        const TAG: &str = "compactcrash";
+        for stage in [
+            Stage::Page,
+            Stage::Check,
+            Stage::Round,
+            Stage::Swap,
+            Stage::Sealed,
+        ] {
+            let (db, root) = db(TAG, 1);
+            let setup = setup();
+            db.shard_handle(0)
+                .call(move |txn| setup(txn))
+                .await
+                .unwrap();
+            let (hook, mut stops, _) = pauses(&[stage]);
+            let Pause { reached, resume } = stops.remove(0);
+            let compaction = tokio::spawn({
+                let db = Arc::clone(&db);
+                async move { compact(db.shard_handle(0), hook).await }
+            });
+            reached.await.unwrap();
+            if !matches!(stage, Stage::Swap | Stage::Sealed) {
+                // Off the actor, so the shard acknowledges a write meanwhile.
+                db.shard_handle(0)
+                    .call(|txn| write_doc(txn, "during", false, b"{}", 50).map(drop))
+                    .await
+                    .unwrap();
+            }
+            let expected = dump(db.shard_handle(0)).await;
+            let crashed = root.with_extension("crashed");
+            copy_dir(&root, &crashed);
+            resume.send(()).unwrap();
+            compaction.await.unwrap().unwrap();
+            drop(db);
+            let _ = std::fs::remove_dir_all(&root);
+
+            let dir = crate::db::db_path(&crashed, TAG);
+            let leftover = crate::db::shard_file(&dir, 0).with_extension("compact.redb");
+            assert!(
+                leftover.exists(),
+                "{stage:?}: no compaction file to crash with"
+            );
+            crate::state::recover_root(&crashed).unwrap();
+            assert!(!leftover.exists(), "{stage:?}: the leftover was kept");
+            let db = crate::db::Db::open(&crashed, TAG, config(1)).unwrap();
+            assert_eq!(dump(db.shard_handle(0)).await, expected, "{stage:?}");
+            compact_shard(db.shard_handle(0)).await.unwrap();
+            assert_eq!(
+                without_uuid(dump(db.shard_handle(0)).await),
+                compacted(expected),
+                "{stage:?}"
+            );
+            assert!(!leftover.exists());
+            drop(db);
+            let _ = std::fs::remove_dir_all(&crashed);
+        }
+    }
+
+    /// A power cut once the new file is in place keeps it whole, with the
+    /// writes that landed during the copy and between rounds: the swap
+    /// installs only what the new file made durable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_power_cut_after_the_rename_keeps_the_compacted_file_complete() {
+        let (_, switch) = crate::kv::powercut::PowerCut::new();
+        drop(crate::store::Shard::create_over_backend(&switch, 1000).unwrap());
+        let shard = Arc::new(ShardHandle::over_backend(&switch).unwrap());
+        let twin = Rig::new("compact-cut-twin");
+        let changes = [
+            op(|txn| {
+                write_doc(txn, "d1", false, b"{\"v\":2}", 100)?;
+                write_doc(txn, "d2", true, b"{}", 101)?;
+                Ok(())
+            }),
+            op(|txn| {
+                write_doc(txn, "d1", false, b"{\"v\":3}", 102)?;
+                write_doc(txn, "new", false, b"{}", 103)?;
+                txn.put_local("l0", b"{\"v\":2}")?;
+                Ok(())
+            }),
+        ];
+        for op in [&setup()].into_iter().chain(&changes) {
+            twin.run(op).await.unwrap();
+        }
+        let expected = compacted(dump(&twin.handle).await);
+        twin.close();
+        let setup = setup();
+        shard.call(move |txn| setup(txn)).await.unwrap();
+
+        let (hook, stops, _) = pauses(&[Stage::Page, Stage::Round]);
+        let compaction = tokio::spawn({
+            let shard = Arc::clone(&shard);
+            async move { compact(&shard, hook).await }
+        });
+        for (Pause { reached, resume }, change) in stops.into_iter().zip(changes) {
+            reached.await.unwrap();
+            shard.call(move |txn| change(txn)).await.unwrap();
+            resume.send(()).unwrap();
+        }
+        compaction.await.unwrap().unwrap();
+        switch.cut();
+        drop(Arc::into_inner(shard).unwrap());
+
+        let shard = ShardHandle::over_backend(&switch).unwrap();
+        assert_eq!(without_uuid(dump(&shard).await), expected);
+    }
+
+    /// The new file's check is trusted only by the process that ran it:
+    /// once the file is renamed, this process opens it without the check,
+    /// but one that never saw it (modelled by a copy at a path this
+    /// process never checked) runs the full check on its first open, and
+    /// so refuses a damaged body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_power_cut_after_the_rename_leaves_the_check_to_the_next_process() {
+        const MARKER: &str = "<<douchdb-compacted-body>>";
+        let rig = Rig::new("compact-trust");
+        rig.run(&setup()).await.unwrap();
+        let body = format!("{{\"m\":\"{}\"}}", MARKER.repeat(64));
+        rig.run(&op(move |txn| {
+            write_doc(txn, "marked", false, body.as_bytes(), 20).map(drop)
+        }))
+        .await
+        .unwrap();
+        let (hook, mut stops, _) = pauses(&[Stage::Installed]);
+        let Pause { reached, resume } = stops.remove(0);
+        let compaction = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { compact(&handle, hook).await }
+        });
+        reached.await.unwrap();
+        assert!(kv::is_verified(&rig.file), "the swap carried the check");
+        let next = temp_file("compact-trust-next");
+        let mut bytes = std::fs::read(&rig.file).unwrap();
+        resume.send(()).unwrap();
+        compaction.await.unwrap().unwrap();
+
+        let hits: Vec<usize> = bytes
+            .windows(MARKER.len())
+            .enumerate()
+            .filter(|(_, window)| *window == MARKER.as_bytes())
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!hits.is_empty(), "the body was not found");
+        for at in hits {
+            bytes[at + 3] ^= 0x55;
+        }
+        std::fs::write(&next, bytes).unwrap();
+        let error = crate::store::Shard::open(&next, 1000, CACHE)
+            .err()
+            .expect("a damaged compacted file opened unchecked");
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<redb::DatabaseError>(),
+                Some(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                    _
+                )))
+            )),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(next.parent().unwrap());
         rig.close();
     }
 }

@@ -7,6 +7,9 @@ storage design ("Corruption detection", "Testing"):
 
   * A crash (SIGKILL mid-write, repeated) keeps every acknowledged write,
     with the acknowledged body. No exceptions.
+  * So does a SIGKILL during `_compact`, at each point from the compaction
+    file's creation to just after the swap; the restart leaves no
+    `.compact.redb` behind, and the database takes writes and compacts.
   * Deliberate damage (truncation, bit flips, a removed file) must fail
     closed: requests to the damaged database answer 500 (the file refuses to
     open), the server stays up and keeps serving its other databases, and
@@ -497,100 +500,99 @@ def seeded(binary, work, port, extra=("--q", "1")):
     return data, server, expected, healthy
 
 
-def sigkill_mid_write(binary, work, port):
-    """Four writers create documents (single PUTs and _bulk_docs) and update
-    their own counter document; SIGKILL once a random number of requests is
-    acknowledged; restart and check every acknowledged write, with its body.
-    Repeated KILL_ROUNDS times on one data directory (q=2)."""
-    data = os.path.join(work, "data")
-    rng = random.Random(7)
-    created = {}  # docid -> acknowledged body
-    counters = {}  # docid -> (rev, body) of the last acknowledged update
-    pending = {}  # docid -> body of the update in flight
-    lock = threading.Lock()
-    server = Server(binary, data, port, os.path.join(work, "server.log"), ("--q", "2"))
-    if request(port, "PUT", "/faults")[0] != 201:
-        raise Failure("create faults")
-    total_acked = 0
-    for round_ in range(KILL_ROUNDS):
-        stop = threading.Event()
-        reached = threading.Event()
-        acked = [0]
-        target = rng.randrange(20, 200)
+class Load:
+    """Four writers that create documents (single PUTs and _bulk_docs) and
+    update their own counter document, and what the server acknowledged."""
 
-        def ack():
-            with lock:
-                acked[0] += 1
-                if acked[0] >= target:
-                    reached.set()
+    def __init__(self):
+        self.created = {}  # docid -> acknowledged body
+        self.counters = {}  # docid -> (rev, body) of the last acknowledged update
+        self.pending = {}  # docid -> body of the update in flight
+        self.lock = threading.Condition()
+        self.acked = 0
+        self.stopping = threading.Event()
+        self.threads = []
 
-        def writer(w, round_=round_):
-            counter = f"counter-{w}"
-            i = 0
-            while not stop.is_set():
-                i += 1
-                try:
-                    if i % 3 == 0:
-                        with lock:
-                            rev = counters.get(counter, (None, None))[0]
-                            body = {"round": round_, "i": i, "w": w}
-                            pending[counter] = body
-                        sent = dict(body, _rev=rev) if rev else body
-                        status, raw = request(port, "PUT", f"/faults/{counter}", sent, timeout=5)
-                        if status == 201:
-                            with lock:
-                                counters[counter] = (json.loads(raw)["rev"], body)
-                                pending.pop(counter, None)
-                            ack()
-                    elif i % 3 == 1:
-                        docid = f"r{round_}-w{w}-{i}"
-                        body = {"round": round_, "i": i, "blob": "y" * (10 + (i * 37) % 400)}
-                        status, _ = request(port, "PUT", f"/faults/{docid}", body, timeout=5)
-                        if status == 201:
-                            with lock:
-                                created[docid] = body
-                            ack()
-                    else:
-                        docs = [
-                            {"_id": f"r{round_}-w{w}-{i}-b{k}", "k": k, "blob": "z" * 50}
-                            for k in range(10)
-                        ]
-                        status, raw = request(port, "POST", "/faults/_bulk_docs", {"docs": docs}, timeout=5)
-                        if status == 201:
-                            with lock:
-                                for d, result in zip(docs, json.loads(raw)):
-                                    if result.get("ok"):
-                                        created[d["_id"]] = strip(d)
-                            ack()
-                except (OSError, http.client.HTTPException, ValueError):
-                    return
-
-        threads = [threading.Thread(target=writer, args=(w,), daemon=True) for w in range(4)]
-        for thread in threads:
+    def start(self, port, round_):
+        self.stopping.clear()
+        self.threads = [
+            threading.Thread(target=self.writer, args=(port, round_, w), daemon=True) for w in range(4)
+        ]
+        for thread in self.threads:
             thread.start()
-        if not reached.wait(timeout=60):
-            raise Failure(f"round {round_}: only {acked[0]} writes acknowledged")
-        server.stop(signal.SIGKILL)
-        stop.set()
-        for thread in threads:
+
+    def ack(self):
+        with self.lock:
+            self.acked += 1
+            self.lock.notify_all()
+
+    def wait_acked(self, count, timeout=60):
+        """Whether `count` requests in all have been acknowledged."""
+        with self.lock:
+            return self.lock.wait_for(lambda: self.acked >= count, timeout)
+
+    def writer(self, port, round_, w):
+        counter = f"counter-{w}"
+        i = 0
+        while not self.stopping.is_set():
+            i += 1
+            try:
+                if i % 3 == 0:
+                    with self.lock:
+                        rev = self.counters.get(counter, (None, None))[0]
+                        body = {"round": round_, "i": i, "w": w}
+                        self.pending[counter] = body
+                    sent = dict(body, _rev=rev) if rev else body
+                    status, raw = request(port, "PUT", f"/faults/{counter}", sent, timeout=5)
+                    if status == 201:
+                        with self.lock:
+                            self.counters[counter] = (json.loads(raw)["rev"], body)
+                            self.pending.pop(counter, None)
+                        self.ack()
+                elif i % 3 == 1:
+                    docid = f"r{round_}-w{w}-{i}"
+                    body = {"round": round_, "i": i, "blob": "y" * (10 + (i * 37) % 400)}
+                    status, _ = request(port, "PUT", f"/faults/{docid}", body, timeout=5)
+                    if status == 201:
+                        with self.lock:
+                            self.created[docid] = body
+                        self.ack()
+                else:
+                    docs = [{"_id": f"r{round_}-w{w}-{i}-b{k}", "k": k, "blob": "z" * 50} for k in range(10)]
+                    status, raw = request(port, "POST", "/faults/_bulk_docs", {"docs": docs}, timeout=5)
+                    if status == 201:
+                        with self.lock:
+                            for d, result in zip(docs, json.loads(raw)):
+                                if result.get("ok"):
+                                    self.created[d["_id"]] = strip(d)
+                        self.ack()
+            except (OSError, http.client.HTTPException, ValueError):
+                return
+
+    def stop(self):
+        """Stop the writers (call once the server is killed)."""
+        self.stopping.set()
+        for thread in self.threads:
             thread.join(timeout=15)
             if thread.is_alive():
                 raise Failure("a writer did not stop after the kill")
-        total_acked += acked[0]
-        server = server.restart()
-        for docid, body in created.items():
+
+    def check(self, port, round_):
+        """Every acknowledged write reads back with its body; an update in
+        flight at the kill may have landed."""
+        for docid, body in self.created.items():
             status, got = read_doc(port, "faults", docid)
             if status != 200 or strip(got) != body:
                 raise Failure(f"round {round_}: acknowledged {docid} -> {status} {str(got)[:160]}")
         for w in range(4):
             docid = f"counter-{w}"
             status, got = read_doc(port, "faults", docid)
-            if docid not in counters:
+            if docid not in self.counters:
                 # Never acknowledged: whatever landed is the next round's base.
                 if status == 200:
-                    counters[docid] = (got["_rev"], strip(got))
+                    self.counters[docid] = (got["_rev"], strip(got))
                 continue
-            rev, body = counters[docid]
+            rev, body = self.counters[docid]
             if status != 200:
                 raise Failure(f"round {round_}: acknowledged {docid} -> {status}")
             if got["_rev"] == rev and strip(got) == body:
@@ -598,24 +600,164 @@ def sigkill_mid_write(binary, work, port):
             # The update in flight at the kill may have landed: one
             # generation on, with the body that was sent.
             generation = int(got["_rev"].split("-")[0])
-            if generation == int(rev.split("-")[0]) + 1 and strip(got) == pending.get(docid):
-                counters[docid] = (got["_rev"], strip(got))
+            if generation == int(rev.split("-")[0]) + 1 and strip(got) == self.pending.get(docid):
+                self.counters[docid] = (got["_rev"], strip(got))
                 continue
             raise Failure(f"round {round_}: {docid} is {got['_rev']} {strip(got)}, acknowledged {rev} {body}")
-        pending.clear()
+        self.pending.clear()
+
+
+def sigkill_mid_write(binary, work, port):
+    """Four writers create documents (single PUTs and _bulk_docs) and update
+    their own counter document; SIGKILL once a random number of requests is
+    acknowledged; restart and check every acknowledged write, with its body.
+    Repeated KILL_ROUNDS times on one data directory (q=2)."""
+    data = os.path.join(work, "data")
+    rng = random.Random(7)
+    load = Load()
+    server = Server(binary, data, port, os.path.join(work, "server.log"), ("--q", "2"))
+    if request(port, "PUT", "/faults")[0] != 201:
+        raise Failure("create faults")
+    for round_ in range(KILL_ROUNDS):
+        target = load.acked + rng.randrange(20, 200)
+        load.start(port, round_)
+        if not load.wait_acked(target):
+            raise Failure(f"round {round_}: only {load.acked} writes acknowledged")
+        server.stop(signal.SIGKILL)
+        load.stop()
+        server = server.restart()
+        load.check(port, round_)
     server.stop()
-    return f"{KILL_ROUNDS} kills, {total_acked} acknowledged requests, {len(created)} documents, all intact"
+    return f"{KILL_ROUNDS} kills, {load.acked} acknowledged requests, {len(load.created)} documents, all intact"
 
 
-def closed_damage(damage, kill_before):
+# Documents seeded before the compaction kills: enough that the compaction
+# runs long enough to be killed at each point.
+COMPACT_DOCS = 20000
+
+
+def compaction_file(data):
+    return Path(data, "faults", "shard-0000.compact.redb")
+
+
+def compacting(port):
+    """The progress of the running compaction of `faults`, or None."""
+    status, tasks = get_json(port, "/_active_tasks")
+    if status != 200:
+        raise Failure(f"GET /_active_tasks -> {status} {str(tasks)[:200]}")
+    for task in tasks:
+        if task.get("type") == "database_compaction" and task["database"].endswith("/faults"):
+            return task["changes_done"] / max(task["total_changes"], 1)
+    return None
+
+
+def check_seeds(port, point):
+    """The COMPACT_DOCS seeded documents are all there, by `_all_docs`."""
+    status, rows = get_json(port, "/faults/_all_docs?startkey=%22seed-%22&endkey=%22seed-~%22")
+    if status != 200 or len(rows.get("rows", [])) != COMPACT_DOCS:
+        raise Failure(f"{point}: _all_docs over the seeds -> {status} {str(rows)[:200]}")
+
+
+def compact_running(port):
+    status, info = get_json(port, "/faults")
+    if status != 200:
+        raise Failure(f"GET /faults -> {status} {str(info)[:200]}")
+    return info["compact_running"]
+
+
+# Where to kill a compaction: a condition on (port, data) that holds at that
+# point, and whether the kill comes before the rename. The kill lands right
+# after the condition is seen, or once the compaction ends; a kill that
+# finds the compaction elsewhere (the file gone before the rename, or the
+# shard file not replaced after it) is a miss, and the round is retried.
+KILL_POINTS = [
+    ("file created", lambda port, data: compaction_file(data).exists(), True),
+    ("copy started", lambda port, data: (compacting(port) or 0) > 0, True),
+    ("copy half done", lambda port, data: (compacting(port) or 0) >= 0.5, True),
+    ("copy done", lambda port, data: (compacting(port) or 0) >= 1, True),
+    ("after the swap", lambda port, data: not compact_running(port), False),
+]
+KILL_POINT_TRIES = 5
+
+
+def sigkill_mid_compaction(binary, work, port):
+    """q=1, COMPACT_DOCS documents, then for each kill point: start the
+    writers, start `_compact`, SIGKILL at the point, restart. Every
+    acknowledged write is there with its body, no compaction file is left,
+    and the database takes a write; at the end it compacts in full."""
+    data = os.path.join(work, "data")
+    server = Server(binary, data, port, os.path.join(work, "server.log"), ("--q", "1"))
+    seed(port, count=0)
+    for offset in range(0, COMPACT_DOCS, 500):
+        docs = [{"_id": f"seed-{i:06}", "blob": "x" * 300} for i in range(offset, offset + 500)]
+        status, raw = request(port, "POST", "/faults/_bulk_docs", {"docs": docs})
+        if status != 201:
+            raise Failure(f"seed: {status} {raw[:200]}")
+    live = Path(shard(data))
+    load = Load()
+    hits = []
+    round_ = 0
+    for point, reached, before_rename in KILL_POINTS:
+        for tries in range(1, KILL_POINT_TRIES + 1):
+            round_ += 1
+            load.start(port, round_)
+            if not load.wait_acked(load.acked + 20):
+                raise Failure(f"{point}: writes stalled")
+            inode = live.stat().st_ino
+            status, raw = request(port, "POST", "/faults/_compact", {})
+            if status != 202:
+                raise Failure(f"POST _compact -> {status} {raw[:200]}")
+            while compact_running(port) and not reached(port, data):
+                pass
+            server.stop(signal.SIGKILL)
+            load.stop()
+            leftover = compaction_file(data).exists()
+            swapped = live.stat().st_ino != inode
+            server = server.restart()
+            load.check(port, round_)
+            check_seeds(port, point)
+            if list(Path(data).rglob("*.compact.redb")):
+                raise Failure(f"{point}: a compaction file survived the restart")
+            if request(port, "PUT", f"/faults/after-{round_}", {"ok": True})[0] != 201:
+                raise Failure(f"{point}: no write after the restart")
+            load.created[f"after-{round_}"] = {"ok": True}
+            if (leftover, swapped) == (before_rename, not before_rename):
+                hits.append(f"{point} (try {tries})")
+                break
+        else:
+            raise Failure(f"{point}: missed in {KILL_POINT_TRIES} tries")
+    inode = live.stat().st_ino
+    if request(port, "POST", "/faults/_compact", {})[0] != 202:
+        raise Failure("POST _compact after the kills")
+    while compact_running(port):
+        pass
+    if live.stat().st_ino == inode or compaction_file(data).exists():
+        raise Failure(f"the compaction after the kills did not finish\n{tail(server.log)}")
+    load.check(port, "final")
+    check_seeds(port, "final")
+    server.stop()
+    return f"killed at {', '.join(hits)}; {load.acked} acknowledged requests, all intact; no leftover; compacts after"
+
+
+def closed_damage(damage, kill_before, compact_first=False):
     """Damage the shard file of a stopped server, then restart: the
     database must fail closed, twice (no crash loop). The newest commit is a
     lone PUT; with `kill_before` the server is SIGKILLed after it, so that
-    commit is the newest in the file rather than redb's close-time one."""
+    commit is the newest in the file rather than redb's close-time one. With
+    `compact_first` the database is compacted after it: the file checked
+    before its rename is checked again by the next process."""
 
     def run(binary, work, port):
         data, server, expected, healthy = seeded(binary, work, port)
         expected.update(put_last(port))
+        if compact_first:
+            inode = os.stat(shard(data)).st_ino
+            if request(port, "POST", "/faults/_compact", {})[0] != 202:
+                raise Failure("POST _compact")
+            while compact_running(port):
+                pass
+            if os.stat(shard(data)).st_ino == inode:
+                raise Failure(f"the compaction did not replace the shard file\n{tail(server.log)}")
         server.stop(signal.SIGKILL if kill_before else signal.SIGTERM)
         what = damage(shard(data))
         server = server.restart()
@@ -786,10 +928,12 @@ def flip_view_row(path):
 
 SCENARIOS = [
     ("sigkill-mid-write", sigkill_mid_write),
+    ("sigkill-mid-compaction", sigkill_mid_compaction),
     ("truncate", closed_damage(truncate, kill_before=False)),
     ("truncate-after-kill", closed_damage(truncate, kill_before=True)),
     ("value-flip", closed_damage(flip_value, kill_before=False)),
     ("value-flip-after-kill", closed_damage(flip_value, kill_before=True)),
+    ("value-flip-after-compaction", closed_damage(flip_value, kill_before=True, compact_first=True)),
     ("branch-flip", closed_damage(flip_branch, kill_before=False)),
     ("branch-flip-after-kill", closed_damage(flip_branch, kill_before=True)),
     ("removed-shard", removed_shard),
@@ -822,7 +966,7 @@ def main():
         began = time.monotonic()
         remaining = int(TOTAL_SECONDS - (time.monotonic() - started))
         if remaining < 1:
-            print(f"{name:24s} FAIL  the run exceeded {TOTAL_SECONDS}s")
+            print(f"{name:28s} FAIL  the run exceeded {TOTAL_SECONDS}s")
             failures.append(name)
             continue
         signal.alarm(min(SCENARIO_SECONDS, remaining))
@@ -837,7 +981,7 @@ def main():
             signal.alarm(0)
             kill_children()
             shutil.rmtree(work, ignore_errors=True)
-        print(f"{name:24s} {result} {time.monotonic() - began:5.1f}s  {detail}", flush=True)
+        print(f"{name:28s} {result} {time.monotonic() - began:5.1f}s  {detail}", flush=True)
 
     print(f"total {time.monotonic() - started:.1f}s")
     if failures:
