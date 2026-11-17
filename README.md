@@ -1039,12 +1039,15 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
 - Static cluster membership. Rebalancing is operator-triggered through
   `POST /_node/_local/_dbs/{db}/rebalance`.
 - A `since` token whose shard copy is down or replaced replays that range from 0 (#52).
-- `_compact` is an interim sweep that deletes non-leaf bodies. It runs as one
-  job holding each shard's actor for its whole run, so that shard's writes and
-  actor reads queue behind it (reads on their own transactions carry on); the
-  file does not shrink, as redb reuses the freed pages. Online compaction is
-  the next phase. `--compact-concurrency` bounds concurrent compactions across
-  databases, and `GET /db` reports `compact_running`.
+- `_compact` compacts online, as CouchDB does: it answers `202` at once,
+  copies each shard into a new file (dropping non-leaf bodies) while the
+  shard keeps serving, catches up with the writes made meanwhile, and swaps
+  the new file in with writes paused only for the last catch-up, a full
+  check of the new file and the rename. It is node-local, like `_purge`;
+  `--compact-concurrency` bounds concurrent compactions across databases
+  (another `_compact` while all are busy answers `409`). `GET /db` reports
+  `compact_running` and `GET /_active_tasks` (admins) lists this node's
+  running compactions in CouchDB's `database_compaction` form.
 - No Mango or lists/shows. Attachments are not supported.
 
 ## License

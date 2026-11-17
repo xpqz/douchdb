@@ -882,10 +882,10 @@ pub fn delete_db(root: &Path, name: &str) -> DbResult<()> {
 }
 
 /// Finish what a crash interrupted, before the node serves: remove every
-/// staging and tombstone directory under `root`, then sync it, and the
-/// temporary files of search index metadata writes in each database.
-/// Nothing else under a database's own name is touched, whatever state it
-/// is in.
+/// staging and tombstone directory under `root`, then sync it, and in each
+/// database the temporary files of search index metadata writes and the
+/// half-built files of compactions (`shard-NNNN.compact.redb`). Nothing
+/// else under a database's own name is touched, whatever state it is in.
 pub fn recover_root(root: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -893,6 +893,18 @@ pub fn recover_root(root: &Path) -> std::io::Result<()> {
             // No search index is open yet, so no metadata write can be in
             // flight: every temporary file there is a crash's leftover.
             crate::search::remove_stale_temps(&entry.path());
+            // Nor is any compaction running: a half-built compaction file
+            // is discarded, as CouchDB discards a `.compact` file. The
+            // shard file it would have replaced is untouched until the
+            // rename.
+            for file in std::fs::read_dir(entry.path())?.flatten() {
+                if file.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("shard-") && name.ends_with(".compact.redb")
+                }) {
+                    std::fs::remove_file(file.path())?;
+                    tracing::info!(path = %file.path().display(), "removed an interrupted compaction");
+                }
+            }
         }
         let interrupted = entry.file_name().to_str().is_some_and(|name| {
             name.starts_with(STAGING_PREFIX) || name.starts_with(TOMBSTONE_PREFIX)
@@ -1667,11 +1679,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Recovery removes staging and tombstone directories and nothing else
-    /// in the root: databases, the health probe's scratch files, temporary
-    /// files and anything else that only resembles them stay.
+    /// Recovery removes staging and tombstone directories, and compaction
+    /// leftovers inside databases, and nothing else: databases, the health
+    /// probe's scratch files, temporary files and anything else that only
+    /// resembles them stay.
     #[test]
-    fn recovery_removes_only_staging_and_tombstone_directories() {
+    fn recovery_removes_only_staging_tombstones_and_compaction_leftovers() {
         let root = scratch_root("recover");
         std::fs::create_dir_all(&root).unwrap();
         for dir in [".creating-1", ".deleted-2", "keep", "a%2Fb"] {
@@ -1681,6 +1694,7 @@ mod tests {
         for file in [".creating-3", ".health-4", ".secret.1.2.tmp"] {
             std::fs::write(root.join(file), b"x").unwrap();
         }
+        std::fs::write(root.join("keep").join("shard-0000.compact.redb"), b"x").unwrap();
         recover_root(&root).unwrap();
         assert_eq!(
             entries(&root),

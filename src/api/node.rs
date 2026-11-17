@@ -15,6 +15,25 @@ pub async fn membership(State(st): State<Arc<AppState>>, _: AdminOnly) -> Respon
     )
 }
 
+/// `GET /_active_tasks`: this node's running compactions, as CouchDB lists
+/// them (`type`, `database`, `node`, `phase`, `progress`, `changes_done`,
+/// `total_changes`, `started_on`, `updated_on`).
+pub async fn active_tasks(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {
+    let node = st
+        .ctx
+        .cluster
+        .nodes
+        .get(st.ctx.cluster.me)
+        .map_or("nonode@localhost", String::as_str);
+    let mut tasks = Vec::new();
+    for name in st.open_db_names().await {
+        if let Some(db) = st.open_db_if_cached(&name).await {
+            tasks.extend(db.active_tasks(node));
+        }
+    }
+    json(StatusCode::OK, Value::Array(tasks))
+}
+
 /// Cluster overview for the management console: membership, discovery probes,
 /// per-database shard maps and the background replicator snapshot.
 pub async fn cluster_status(State(st): State<Arc<AppState>>, _: AdminOnly) -> Response {

@@ -239,6 +239,7 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .route("/_db_updates", get(api::db_updates))
         .route("/_dbs_info", get(api::dbs_info).post(api::dbs_info))
         .route("/_uuids", get(api::uuids))
+        .route("/_active_tasks", get(api::active_tasks))
         .route("/_membership", get(api::membership))
         .route("/_node/_local/_dbs", get(api::dbs_metadata))
         .route("/_node/_local/_cluster", get(api::cluster_status))

@@ -369,10 +369,11 @@ the bulk of the growth.
   filesystem confinement is Linux-only; use the portable `--js-sandbox wasm`
   engine on other hosts that need a hard boundary.
 * **Compaction placement.** Measured at 10 GB: compaction blocks a shard for
-  ~27 s on the earlier engine. `_compact` is now an interim sweep that deletes
-  non-leaf bodies in batches on the shard actor (the file does not shrink; redb
-  reuses the freed pages) and returns `202 Accepted`. Online copy-and-swap
-  compaction, as CouchDB does, is the planned next phase.
+  ~27 s on the earlier engine. `_compact` now compacts online, as CouchDB
+  does: it returns `202 Accepted` at once, copies each shard into a new file
+  off the shard actor while it serves, catches up from a journal of the keys
+  committed meanwhile, and swaps the file in with writes paused only for the
+  last catch-up, the new file's integrity check and the rename.
 
 ## Progress
 
@@ -494,8 +495,8 @@ the bulk of the growth.
   fmt/clippy/tests/both wasm backends/container build, search rebuilds are
   serialized per index and run on the blocking pool, and `_compact` has a
   configurable node-wide concurrency bound and a visible `compact_running`
-  flag. (Compaction is now an interim sweep that holds each shard's actor for
-  its whole run; see "Compaction placement".) Non-Linux process RSS and
+  flag. (Compaction is now online copy-and-swap; see "Compaction
+  placement".) Non-Linux process RSS and
   thread metrics are explicitly `null` until a platform collector is added. Observability handlers
   moved out of `api.rs` into `observability.rs`.
 * **Multiuser and fair admission.** A deployment-owned `--users-file` supplies

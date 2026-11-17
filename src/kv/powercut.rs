@@ -141,6 +141,16 @@ impl PowerSwitch {
         self.disk.lock().unwrap().syncs
     }
 
+    /// Put what `other` holds durably in place of this disk's contents, as
+    /// a rename over the file and a sync of its directory would: the
+    /// compaction swap of a shard on a test disk.
+    pub fn replace_with(&self, other: &PowerSwitch) {
+        let image = other.disk.lock().unwrap().durable.clone();
+        let mut disk = self.disk.lock().unwrap();
+        disk.volatile = image.clone();
+        disk.durable = image;
+    }
+
     /// A live backend over the disk as it now stands, to reopen after a cut.
     pub fn backend(&self) -> PowerCut {
         let generation = self.disk.lock().unwrap().generation;

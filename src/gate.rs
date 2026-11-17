@@ -11,6 +11,13 @@
 //! [`Gate::reopen`] closes the gate (new reads wait), waits until every lease
 //! is back, drops the old database, opens the new one and opens the gate.
 //!
+//! Only the shard's actor (`store::Shard`) opens transactions without a
+//! lease, through [`Gate::begin_write_txn`], [`Gate::begin_read`] and
+//! [`Gate::read_here`]: it is the only caller of [`Gate::reopen`] and holds
+//! none of them when it calls it. Every other read of a shard file goes
+//! through [`Gate::read`]. Below the gate, only this module and `kv` call
+//! redb's own `begin_read` and `begin_write` on a shard file the gate holds.
+//!
 //! Nothing a reader is handed can outlive its lease: `LeaseTxn` is only ever
 //! lent, is neither `Send` nor `Sync` nor `Clone`, and returns owned bytes or
 //! lends them to a callback for the length of one call. These do not compile:
@@ -567,6 +574,19 @@ impl Gate {
             .as_ref()
             .ok_or_else(|| anyhow!("the shard file is closed"))?;
         Ok(db.begin_read()?)
+    }
+
+    /// Run `f` here, on a read transaction of the shard's actor, which
+    /// needs no lease (see [`Gate::begin_read`]): the actor's own reads of
+    /// the committed state, such as compaction's final round, go through
+    /// the same [`LeaseTxn`] as reads off it.
+    pub(crate) fn read_here<R>(&self, f: impl FnOnce(&LeaseTxn<'_>) -> Result<R>) -> Result<R> {
+        let txn = LeaseTxn {
+            txn: self.begin_read()?,
+            _lease: PhantomData,
+            _here: PhantomData,
+        };
+        f(&txn)
     }
 
     /// Wait until the gate is no longer open.

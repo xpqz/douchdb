@@ -8,7 +8,7 @@ when the shard file is large and `_compact` runs. The workload is deliberately u
     10 GB of logical data into a few MB on disk;
   * several concurrent writers, so the shard actor's group commit is exercised;
   * a latency probe running before and during `_compact`, which measures the
-    p99 a client sees while `_compact` runs on the shard actor;
+    p99 a client sees while `_compact` runs;
   * a SIGKILL/restart at the end to confirm acknowledged commits survived.
 
 Run it against a release build:
@@ -273,6 +273,13 @@ def main():
     probe.start()
     compact_started = time.time()
     status, raw, _ = request(conn, "POST", f"/{args.db}/_compact", {}, timeout=7200)
+    # `_compact` answers at once; the compaction runs until `GET /db` stops
+    # reporting `compact_running`.
+    while status in (200, 202):
+        _, info, _ = request(conn, "GET", f"/{args.db}")
+        if not json.loads(info)["compact_running"]:
+            break
+        time.sleep(0.05)
     compact_seconds = time.time() - compact_started
     stop.set()
     probe.join()

@@ -268,8 +268,8 @@ mod tests {
     }
 
     /// Every key a commit changes, in every table and however it was
-    /// written (the group's own writes, the settings its commit writes, the
-    /// body sweep), is recorded in the form a lease reads it by.
+    /// written (the group's own writes, the settings its commit writes), is
+    /// recorded in the form a lease reads it by.
     #[tokio::test]
     async fn every_committed_change_is_recorded_under_the_key_a_lease_reads() {
         let mut shard = shard();
@@ -300,11 +300,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // Drops the body of the first revision of "a".
-        shard.compact().unwrap();
         let after = dump(&shard).await;
         let changed = changed(&before, &after);
-        assert!(changed.contains(&(Table::Bodies, key::pair("a", &format!("1-{:032x}", 1)))));
         assert!(changed.contains(&(Table::PurgeInfos, key::seq(1))));
         assert_eq!(batch(shard.journal.take()), changed);
     }

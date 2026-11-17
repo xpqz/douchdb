@@ -282,6 +282,21 @@ pub(crate) fn is_verified(path: &Path) -> bool {
     *lock(&verified_flag(path))
 }
 
+/// Move the closed file `from` over `to` and sync their directory, carrying
+/// over whether `from` passed [`close_verified`]: the compaction swap checks
+/// the new file before it takes the shard's name, so the shard's first open
+/// of it skips the full read. Call it with `to` closed.
+pub fn rename_verified(from: &Path, to: &Path) -> Result<()> {
+    let (source, target) = (verified_flag(from), verified_flag(to));
+    let (mut source, mut target) = (lock(&source), lock(&target));
+    std::fs::rename(from, to)?;
+    *target = std::mem::take(&mut *source);
+    if let Some(dir) = to.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Forget that the file at `path` was verified, because it has been replaced
 /// (compaction swap, delete, recreate): its next open runs the check.
 pub fn forget_verified(path: &Path) {

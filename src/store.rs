@@ -21,6 +21,7 @@
 //! ([`Shard::recover`]); if the file cannot be reopened the shard fails
 //! closed ([`ShardState::Failed`]).
 
+pub mod compact;
 pub mod journal;
 use journal::KeyBytes;
 #[cfg(test)]
@@ -46,12 +47,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-
-/// Body records examined per transaction of the compaction sweep.
-#[cfg(not(test))]
-const BODY_SWEEP_BATCH: usize = 1000;
-#[cfg(test)]
-const BODY_SWEEP_BATCH: usize = 3;
 
 /// Jobs one group commit takes at most.
 const GROUP_JOBS: usize = 64;
@@ -624,8 +619,11 @@ pub struct Shard {
     /// returns one row per document at its latest change, not one row per
     /// historical sequence entry.
     latest: Option<LatestChanges>,
-    /// The keys a running compaction must catch up on.
-    journal: journal::Journal,
+    /// The keys a running compaction must catch up on, shared with the
+    /// shard's handle, which takes them off the actor.
+    journal: Arc<journal::Journal>,
+    /// Where compaction builds the next file, shared with the handle.
+    target: Arc<dyn compact::Target>,
     /// Test seam: make the next group that has something to commit fail
     /// instead of committing.
     #[cfg(test)]
@@ -641,6 +639,7 @@ impl Shard {
         let file = path.to_path_buf();
         Shard::over(
             Box::new(move || Ok(kv::open(&file, cache_bytes)?)),
+            Arc::new(compact::FileTarget::new(path, cache_bytes)),
             Some(path.to_path_buf()),
             ShardName::of(path),
             revs_limit,
@@ -652,6 +651,7 @@ impl Shard {
     /// finds a table missing and a file with a uuid always has the rest.
     fn over(
         mut open: Opener,
+        target: Arc<dyn compact::Target>,
         path: Option<PathBuf>,
         name: ShardName,
         revs_limit: u64,
@@ -674,6 +674,7 @@ impl Shard {
             partition_ranks: Vec::new(),
             latest: None,
             journal: Default::default(),
+            target,
             #[cfg(test)]
             fail_next_commit: false,
             #[cfg(test)]
@@ -703,6 +704,14 @@ impl Shard {
             cause,
             "reopening the shard file"
         );
+        self.reopen(|| ());
+    }
+
+    /// Reopen the file through the gate, running `prepare` once every lease
+    /// is back and the old handle is closed, and reload the settings (see
+    /// [`Shard::recover`]); fail closed if the file cannot be opened or is
+    /// behind what was committed. Whether the shard still serves.
+    fn reopen(&mut self, prepare: impl FnOnce()) -> bool {
         let Shard {
             gate,
             open,
@@ -713,6 +722,7 @@ impl Shard {
         } = self;
         let mut loaded = None;
         let reopened = gate.reopen(|| {
+            prepare();
             let db = open()?;
             let found = check_shard(&db, name, *default_revs_limit)?;
             // A commit that reported an error may still have landed, so the
@@ -736,6 +746,7 @@ impl Shard {
                     }
                 }
                 self.settings = found;
+                true
             }
             (reopened, _) => {
                 let reason = match reopened {
@@ -754,6 +765,7 @@ impl Shard {
                     .state
                     .write()
                     .unwrap_or_else(|poison| poison.into_inner()) = ShardState::Failed(reason);
+                false
             }
         }
     }
@@ -820,16 +832,17 @@ impl Shard {
         switch: &kv::powercut::PowerSwitch,
         revs_limit: u64,
     ) -> Result<Shard> {
-        let switch = switch.clone();
+        let disk = switch.clone();
         let mut first = true;
         Shard::over_test_opener(
             Box::new(move || {
-                let db = kv::open_with(switch.backend(), 1 << 20)?;
+                let db = kv::open_with(disk.backend(), 1 << 20)?;
                 if std::mem::take(&mut first) {
                     init_tables(&db)?;
                 }
                 Ok(db)
             }),
+            switch,
             revs_limit,
         )
     }
@@ -841,21 +854,28 @@ impl Shard {
         switch: &kv::powercut::PowerSwitch,
         revs_limit: u64,
     ) -> Result<Shard> {
-        let switch = switch.clone();
+        let disk = switch.clone();
         Shard::over_test_opener(
-            Box::new(move || Ok(kv::open_with(switch.backend(), 1 << 20)?)),
+            Box::new(move || Ok(kv::open_with(disk.backend(), 1 << 20)?)),
+            switch,
             revs_limit,
         )
     }
 
-    /// A shard over the test databases `open` opens.
+    /// A shard over the test databases `open` opens from `switch`'s disk,
+    /// which compaction replaces.
     #[cfg(test)]
-    fn over_test_opener(open: Opener, revs_limit: u64) -> Result<Shard> {
+    fn over_test_opener(
+        open: Opener,
+        switch: &kv::powercut::PowerSwitch,
+        revs_limit: u64,
+    ) -> Result<Shard> {
         let name = ShardName {
             db: "test".to_string(),
             shard: "shard-0000".to_string(),
         };
-        Shard::over(open, None, name, revs_limit)
+        let target = Arc::new(compact::DiskTarget::new(switch.clone()));
+        Shard::over(open, target, None, name, revs_limit)
     }
 
     /// Run `f` as a group of its own and answer.
@@ -1060,97 +1080,66 @@ impl Shard {
         Some(reply)
     }
 
-    /// Delete every revision body that is not a leaf of its document's tree:
-    /// superseded revisions, revisions stemmed by `revs_limit` and orphans.
-    /// CouchDB keeps them readable until compaction and then drops them;
-    /// leaves (conflicts and tombstones included) always stay.
-    ///
-    /// Runs on the actor as one job run alone, holding it for the whole
-    /// sweep: the shard's writes and actor reads queue behind it until it
-    /// ends (reads on leases carry on). It commits one write transaction
-    /// per [`BODY_SWEEP_BATCH`] bodies, so memory stays bounded. The file
-    /// does not shrink: redb reuses the freed pages. Online compaction is
-    /// the next phase.
-    pub fn compact(&mut self) -> Result<()> {
-        let mut after: Option<(String, String)> = None;
-        // Documents whose corrupt metadata was already reported this sweep.
-        let mut reported: BTreeSet<String> = BTreeSet::new();
-        loop {
-            let txn = self.gate.begin_write_txn()?;
-            let keys: Vec<(String, String)> = {
-                let bodies = txn.open_table(BODIES)?;
-                let start = match &after {
-                    Some((id, rev)) => Bound::Excluded((id.as_str(), rev.as_str())),
-                    None => Bound::Unbounded,
-                };
-                bodies
-                    .range::<(&str, &str)>((start, Unbounded))?
-                    .take(BODY_SWEEP_BATCH)
-                    .map(|entry| {
-                        let (key, _) = entry?;
-                        let (id, rev) = key.value();
-                        Ok((id.to_string(), rev.to_string()))
-                    })
-                    .collect::<Result<_>>()?
-            };
-            let Some(last) = keys.last().cloned() else {
-                txn.abort()?;
-                return Ok(());
-            };
-            let mut stale = Vec::new();
-            {
-                let metas = txn.open_table(META)?;
-                // Leaf sets by document id, for this batch only; `None` for
-                // a document without a record (its bodies are orphans).
-                let mut leaves: BTreeMap<&str, Option<BTreeSet<String>>> = BTreeMap::new();
-                for (id, rev) in &keys {
-                    if !leaves.contains_key(id.as_str()) {
-                        let found = match metas.get(id.as_str())? {
-                            None => Some(None),
-                            Some(stored) => {
-                                match parse_meta(id, unsealed(Table::Meta, stored.value())?) {
-                                    Ok(meta) => {
-                                        Some(Some(meta.tree.leaves().into_iter().collect()))
-                                    }
-                                    // A record that cannot be decoded cannot
-                                    // say which bodies are stale: keep them
-                                    // all, report it once and carry on.
-                                    Err(corrupt) => {
-                                        if reported.insert(id.clone()) {
-                                            self.name.report_compaction_skip(id, &corrupt);
-                                        }
-                                        None
-                                    }
-                                }
-                            }
-                        };
-                        let Some(found) = found else { continue };
-                        leaves.insert(id, found);
-                    }
-                    let is_leaf = leaves
-                        .get(id.as_str())
-                        .and_then(Option::as_ref)
-                        .is_some_and(|set| set.contains(rev));
-                    if !is_leaf {
-                        stale.push((id.as_str(), rev.as_str()));
-                    }
-                }
-            }
-            if stale.is_empty() {
-                txn.abort()?;
-            } else {
-                {
-                    let mut bodies = txn.open_table(BODIES)?;
-                    for key in &stale {
-                        bodies.remove(key)?;
-                    }
-                }
-                txn.commit()?;
-                self.journal
-                    .record(stale.iter().map(|key| (Table::Bodies, key.key_bytes())));
-            }
-            after = Some(last);
+    /// Start a compaction: record every later commit's keys, and create the
+    /// empty file the copy goes into.
+    fn begin_compaction(&mut self) -> Result<Database> {
+        self.journal.start();
+        self.target.create()
+    }
+
+    /// End a compaction, writes paused: catch the new file up with the
+    /// keys the journal still holds, check it and close it, rename it over
+    /// the live file, reopen and stop the journal. `false` when the journal
+    /// was invalidated (the shard was cleared or reopened since it started):
+    /// the compaction must start again. A failure before the rename leaves
+    /// the live file as it is; once the file is renamed, a shard that cannot
+    /// reopen it fails closed, and nothing is renamed back.
+    fn finish_compaction(&mut self, target: Database, hook: &compact::Hook) -> Result<bool> {
+        hook(compact::Stage::Swap);
+        let journal::Taken::Batch(keys) = self.journal.take() else {
+            return Ok(false);
+        };
+        let changes = self
+            .gate
+            .read_here(|txn| compact::catch_up(txn, &self.name, keys))?;
+        compact::write(&target, changes)?;
+        let built = check_shard(&target, &self.name, self.default_revs_limit)?;
+        anyhow::ensure!(
+            built == self.settings,
+            "the compacted file's settings {built:?} differ from the shard's {:?}",
+            self.settings
+        );
+        self.target.seal(target)?;
+        // Nothing commits on the actor between the take and here; checked
+        // again all the same, right before the swap.
+        if !self.journal.is_recording() {
+            return Ok(false);
         }
+        let target = Arc::clone(&self.target);
+        let mut installed = Ok(());
+        let serving = self.reopen(|| installed = target.install());
+        self.journal.stop();
+        installed?;
+        anyhow::ensure!(serving, "the compacted shard file could not be opened");
+        Ok(true)
+    }
+
+    /// Compact the shard here, on the actor, with nothing writing meanwhile:
+    /// for tests that drive a shard without its actor.
+    #[cfg(test)]
+    pub fn compact(&mut self) -> Result<()> {
+        let target = self.begin_compaction()?;
+        let mut cursor = Some(compact::Cursor::default());
+        while let Some(at) = cursor.take() {
+            let (changes, next, _) = self
+                .gate
+                .read_here(|txn| compact::copy_page(txn, &self.name, at))?;
+            compact::write(&target, changes)?;
+            cursor = next;
+        }
+        let hook: compact::Hook = Arc::new(|_| {});
+        anyhow::ensure!(self.finish_compaction(target, &hook)?, "restarted");
+        Ok(())
     }
 }
 
@@ -1925,19 +1914,18 @@ impl<'s> ShardTxn<'s> {
 
     /// Store `value` under `key` in `def` exactly as given (sealed, so its
     /// checksum holds), bypassing the counters and indexes, so tests can
-    /// plant records that do not decode.
+    /// plant records that do not decode. Journaled like any write.
     #[cfg(test)]
     pub(crate) fn put_raw<'k, K: Key + 'static>(
         &mut self,
         def: TableDefinition<'static, K, &'static [u8]>,
+        table: Table,
         key: K::SelfType<'k>,
         value: &[u8],
-    ) {
-        self.write(def, |table| {
-            table.insert(key, kv::seal(value).as_slice())?;
-            Ok(())
-        })
-        .unwrap();
+    ) where
+        K::SelfType<'k>: KeyBytes,
+    {
+        self.put_value(def, table, key, value).unwrap();
     }
 
     /// Store `value` under `key` in `def` without its seal, as damage on
@@ -2489,6 +2477,12 @@ pub struct ShardHandle {
     scanned: Arc<AtomicU64>,
     /// Document bodies the shard has read, shared with the shard.
     body_reads: Arc<AtomicU64>,
+    /// Shared with the shard: a compaction takes it off the actor.
+    journal: Arc<journal::Journal>,
+    /// Shared with the shard: a compaction that stops removes its file.
+    target: Arc<dyn compact::Target>,
+    /// The running compaction's progress.
+    task: std::sync::Mutex<Option<compact::Task>>,
 }
 
 impl ShardHandle {
@@ -2537,6 +2531,8 @@ impl ShardHandle {
             Arc<std::sync::RwLock<ShardState>>,
             Gate,
             ReadContext,
+            Arc<journal::Journal>,
+            Arc<dyn compact::Target>,
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
@@ -2567,6 +2563,8 @@ impl ShardHandle {
                 Arc::clone(&shard.state),
                 shard.gate.clone(),
                 context,
+                Arc::clone(&shard.journal),
+                Arc::clone(&shard.target),
             );
             if ready_tx.send(Ok(ready)).is_err() {
                 return;
@@ -2641,7 +2639,7 @@ impl ShardHandle {
                 None => shard.close(),
             }
         })?;
-        let (initial_seq, uuid, state, gate, read_context) = ready_rx
+        let (initial_seq, uuid, state, gate, read_context, journal, target) = ready_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
@@ -2657,6 +2655,9 @@ impl ShardHandle {
             jobs: AtomicU64::new(0),
             scanned,
             body_reads,
+            journal,
+            target,
+            task: Default::default(),
         })
     }
 
@@ -2816,6 +2817,14 @@ impl ShardHandle {
             .read(move |txn| Ok(f(&ShardView { txn, shard: &shard })))
             .await
             .map_err(ApiError::from)?
+    }
+
+    /// The running compaction's progress, if one is running.
+    pub fn compaction(&self) -> Option<compact::Task> {
+        self.task
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Run a job that has the shard to itself between groups, such as
@@ -3354,7 +3363,7 @@ pub(crate) mod tests {
             .write(|txn| {
                 let seq = txn.next_seq();
                 put_doc_meta(txn, "a", &meta(false, seq))?;
-                txn.put_raw(META, "p:bad", b"{not json");
+                txn.put_raw(META, Table::Meta, "p:bad", b"{not json");
                 Ok(())
             })
             .unwrap();
@@ -3421,8 +3430,8 @@ pub(crate) mod tests {
         // sweep cannot know it is stale, so it must keep it and carry on.
         shard
             .write(|txn| {
-                txn.put_raw(META, "bad", b"{not json");
-                txn.put_raw(BODIES, ("bad", "1-aaa"), b"{}");
+                txn.put_raw(META, Table::Meta, "bad", b"{not json");
+                txn.put_raw(BODIES, Table::Bodies, ("bad", "1-aaa"), b"{}");
                 Ok(())
             })
             .unwrap();
@@ -4297,6 +4306,7 @@ mod recovery_tests {
         let (go, go_rx) = std::sync::mpsc::channel::<()>();
         let committed: Arc<watch::Sender<()>> = Default::default();
         let disk = switch.clone();
+        let rig_switch = switch.clone();
         let lease_held = Arc::clone(&held);
         let mut first = true;
         let open: Opener = Box::new(move || {
@@ -4316,7 +4326,7 @@ mod recovery_tests {
         let handle = ShardHandle::spawn_with(
             "shard-recovery".to_string(),
             Arc::clone(&committed),
-            move || Shard::over_test_opener(open, 1000),
+            move || Shard::over_test_opener(open, &rig_switch, 1000),
         )
         .unwrap();
         Rig {

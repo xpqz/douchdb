@@ -484,8 +484,8 @@ pub struct Db {
     /// stored for another cluster size, until `store_replaced_shard_map`
     /// stores it.
     map_replaced: AtomicBool,
-    /// Visible as `compact_running` in `GET /db`; the shard actor still owns
-    /// the actual compaction and blocks its shard while it runs.
+    /// Visible as `compact_running` in `GET /db`, and keeps the database
+    /// open while a compaction runs.
     compact_running: AtomicBool,
     /// Target placement while a rebalance is being verified. Reads and writes
     /// continue to use the active `shard_map`; anti-entropy uses this map to
@@ -3361,17 +3361,69 @@ impl Db {
         Ok(json!({ "purge_seq": Value::Null, "purged": purged }))
     }
 
+    /// Compact every shard online, one after another (see
+    /// `store::compact`). A compaction already running on this database is
+    /// left to finish, as CouchDB leaves one: this returns at once.
+    #[cfg(test)]
     pub async fn compact(&self) -> DbResult<()> {
-        self.compact_running.store(true, Ordering::SeqCst);
+        if !self.claim_compaction() {
+            return Ok(());
+        }
+        self.run_compaction().await
+    }
+
+    /// Mark a compaction as running, unless one already is. From here until
+    /// [`Db::run_compaction`] ends, `GET /db` reports it and the database
+    /// stays open.
+    pub fn claim_compaction(&self) -> bool {
+        self.compact_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Run the compaction [`Db::claim_compaction`] claimed.
+    pub async fn run_compaction(&self) -> DbResult<()> {
         let result = async {
             for shard in &self.shards {
-                shard.alone(|s| s.compact().map_err(ApiError::from)).await?;
+                crate::store::compact::compact_shard(shard).await?;
             }
             Ok(())
         }
         .await;
         self.compact_running.store(false, Ordering::SeqCst);
         result
+    }
+
+    /// The `_active_tasks` entries of this database's running compaction on
+    /// node `node`: one per shard being compacted, as CouchDB reports a
+    /// `database_compaction` task per shard file.
+    pub fn active_tasks(&self, node: &str) -> Vec<Value> {
+        let q = u64::from(self.q);
+        let mut tasks = Vec::new();
+        for (index, shard) in self.shards.iter().enumerate() {
+            let Some(task) = shard.compaction() else {
+                continue;
+            };
+            // The shard's hash range, named as CouchDB names shard files.
+            let index = index as u64;
+            let (low, high) = ((index << 32) / q, ((index + 1) << 32) / q - 1);
+            let progress = (task.changes_done * 100)
+                .checked_div(task.total_changes)
+                .unwrap_or(0)
+                .min(100);
+            tasks.push(json!({
+                "type": "database_compaction",
+                "database": format!("shards/{low:08x}-{high:08x}/{}", self.name),
+                "node": node,
+                "phase": task.phase,
+                "progress": progress,
+                "changes_done": task.changes_done,
+                "total_changes": task.total_changes,
+                "started_on": task.started_on,
+                "updated_on": task.updated_on,
+            }));
+        }
+        tasks
     }
 
     /// Every acknowledged write is already synced (each group commit is), so
@@ -6078,7 +6130,12 @@ mod tests {
         let (db, root) = single_shard_db("local-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::LOCAL, "bad", b"{not json");
+                shard.put_raw(
+                    crate::kv::LOCAL,
+                    crate::kv::Table::Local,
+                    "bad",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6115,7 +6172,12 @@ mod tests {
         let (db, root) = single_shard_db("ddoc-corrupt").await;
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::META, "_design/v", b"{not json");
+                shard.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    "_design/v",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6202,7 +6264,12 @@ mod tests {
         let shard = db.shard_index(bad_id);
         db.shards[shard]
             .call(move |s| {
-                s.put_raw(crate::kv::BODIES, (bad_id, bad_rev.as_str()), b"{not json");
+                s.put_raw(
+                    crate::kv::BODIES,
+                    crate::kv::Table::Bodies,
+                    (bad_id, bad_rev.as_str()),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6389,7 +6456,12 @@ mod tests {
         // indexes, so the first scan meets it.
         db.shards[0]
             .call(|shard| {
-                shard.put_raw(crate::kv::META, "bad-meta", b"{not json");
+                shard.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    "bad-meta",
+                    b"{not json",
+                );
                 Ok(())
             })
             .await
@@ -6411,6 +6483,7 @@ mod tests {
             .call(move |shard| {
                 shard.put_raw(
                     crate::kv::BODIES,
+                    crate::kv::Table::Bodies,
                     ("bad-body", corrupt_rev.as_str()),
                     b"{not json",
                 );
@@ -8111,7 +8184,12 @@ mod tests {
         let id = id.to_string();
         db.shards[0]
             .call(move |s| {
-                s.put_raw(crate::kv::META, id.as_str(), b"{not json");
+                s.put_raw(
+                    crate::kv::META,
+                    crate::kv::Table::Meta,
+                    id.as_str(),
+                    b"{not json",
+                );
                 Ok(())
             })
             .await

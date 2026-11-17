@@ -35,9 +35,6 @@ pub(crate) mod server;
 pub(crate) mod since;
 pub(crate) mod state;
 pub(crate) mod store;
-// Public until compaction (the journal's consumer) lands.
-#[doc(hidden)]
-pub use store::journal;
 pub(crate) mod telemetry;
 pub(crate) mod ui;
 pub(crate) mod util;

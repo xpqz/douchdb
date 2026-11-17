@@ -375,7 +375,13 @@ def main():
 
         # Storage and compaction.
         size_before = subprocess.check_output(["du", "-sb", args.data], text=True).split()[0]
-        compact_elapsed, _ = request(conn, "POST", "/perf/_compact", {})
+        # `_compact` answers at once; the compaction runs until `GET /perf`
+        # stops reporting `compact_running`.
+        compact_started = time.perf_counter()
+        request(conn, "POST", "/perf/_compact", {})
+        while json.loads(request(conn, "GET", "/perf")[1])["compact_running"]:
+            time.sleep(0.05)
+        compact_elapsed = (time.perf_counter() - compact_started) * 1000.0
         size_after = subprocess.check_output(["du", "-sb", args.data], text=True).split()[0]
         result["storage"] = {
             "data_dir_bytes_before_compact": int(size_before),
