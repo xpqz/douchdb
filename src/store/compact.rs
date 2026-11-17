@@ -1503,6 +1503,39 @@ mod tests {
         assert_eq!(without_uuid(dump(&shard).await), expected);
     }
 
+    /// A swap that fails once the new file is in place (here, a panic right
+    /// after the rename) fails the shard for good: a retry would serve a
+    /// file whose name may not survive a power cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_swap_is_never_retried() {
+        let rig = Rig::new("compact-swap-fails");
+        rig.run(&setup()).await.unwrap();
+        rig.handle.set_retry_wait(std::time::Duration::ZERO);
+        let hook: Hook = Arc::new(|stage| {
+            if stage == Stage::Installed {
+                panic!("the swap failed");
+            }
+        });
+        compact(&rig.handle, hook)
+            .await
+            .expect_err("a failed swap succeeded");
+        let failed = rig.handle.state();
+        assert!(
+            matches!(failed, crate::store::ShardState::Failed(_)),
+            "{failed:?}"
+        );
+
+        // A request asks for a retry, which must not reopen the file.
+        assert!(rig
+            .handle
+            .lease(|s| Ok(s.txn.len(Table::Meta)?))
+            .await
+            .is_err());
+        assert!(rig.handle.barrier().await.unwrap().is_err());
+        assert_eq!(rig.handle.state(), failed);
+        rig.close();
+    }
+
     /// The new file's check is trusted only by the process that ran it:
     /// once the file is renamed, this process opens it without the check,
     /// but one that never saw it (modelled by a copy at a path this

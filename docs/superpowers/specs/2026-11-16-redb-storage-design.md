@@ -268,12 +268,20 @@ on the next open. Policy:
    keeps the sequence the shard published, so a file that came back behind it
    fails again and is never served; one that could not be opened (a full
    disk, a passing I/O error) serves again once it opens. Each failed retry
-   is logged as an error, a return to service as a warning.
-4. A read through the gate that meets an I/O error (`Io` or `PreviousIo`,
-   never a checksum mismatch) asks the actor to check its handle once the
-   lease is back; the actor reopens as in step 2 if the handle fails writes.
-   So a shard that only serves reads recovers too. At most one such check is
-   queued per shard.
+   is logged as an error, a return to service as a warning. A compaction
+   swap that fails is never retried: the file now under the shard's name may
+   not keep that name through a power cut, so the shard stays failed until
+   the database is next opened.
+4. A read that meets an I/O error (`Io` or `PreviousIo`, never a checksum
+   mismatch) leads to the same reopen when the handle fails writes. A read
+   through the gate asks the actor to check its handle once the lease is
+   back (at most one such check is queued per shard); a read job on the
+   actor that fails with a 500 is followed by the check before it answers.
+   So a shard that only serves reads recovers too.
+5. A database setting whose write failed and that cannot be read back
+   because shard 0 has failed is read back on shard 0's actor as soon as a
+   retry brings it back, before any later settings write, and installed in
+   memory if the write landed.
 
 ## Compaction
 

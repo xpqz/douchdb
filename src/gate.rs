@@ -195,7 +195,12 @@ struct Inner {
     /// The phase, for reads waiting at a closed gate.
     phase: watch::Sender<Phase>,
     /// A read met an I/O failure (see [`kv::io_failure`]) since the last
-    /// [`Gate::take_io_failure`].
+    /// [`Gate::take_io_failure`]. One flag for the whole gate, not one per
+    /// lease: whichever caller asks next takes it, also one whose own read
+    /// succeeded, and one set by a read nobody asks after (the actor's own,
+    /// compaction's, or a lease whose caller stopped waiting) waits for the
+    /// next caller. Harmless: the handle that met the error fails the next
+    /// read that reaches the disk too, and that sets the flag again.
     io_failed: AtomicBool,
     /// The count of reads waiting, for tests.
     #[cfg(test)]
@@ -634,6 +639,11 @@ impl Gate {
         f(&txn)
     }
 
+    /// Whether the gate is shut for good.
+    pub(crate) fn is_shut(&self) -> bool {
+        *self.inner.phase.borrow() == Phase::Shut
+    }
+
     /// Whether a read has met an I/O failure since this was last asked;
     /// asking clears it.
     pub(crate) fn take_io_failure(&self) -> bool {
@@ -895,6 +905,43 @@ mod tests {
             .await
             .expect_err("a scan skipped a damaged value");
         assert!(format!("{error:#}").contains("checksum"), "{error:#}");
+        // Damage is not an I/O failure: nothing asks for the file to reopen.
+        assert!(!gate.take_io_failure(), "a checksum error noted as I/O");
+    }
+
+    /// An I/O error met opening a table (redb's `TableError`, which hides
+    /// its cause) is noted as one.
+    #[tokio::test]
+    async fn an_io_error_opening_a_table_is_noted() {
+        let (_, switch) = kv::powercut::PowerCut::new();
+        let db = kv::open_with(switch.backend(), CACHE).unwrap();
+        let txn = kv::begin_write(&db).unwrap();
+        drop(txn.open_table(META).unwrap());
+        // Enough tables that finding one reads a page below the root.
+        let names: Vec<String> = (0..1000).map(|n| format!("table-{n:04}")).collect();
+        for name in &names {
+            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(name);
+            drop(txn.open_table(def).unwrap());
+        }
+        txn.commit().unwrap();
+        drop(db);
+        // No page cache: every read reaches the disk.
+        let gate = Gate::new(kv::open_with(switch.backend(), 0).unwrap());
+
+        let failing = switch.clone();
+        let error = gate
+            .read(move |txn| {
+                // The transaction has begun; opening the table reads a page.
+                failing.fail_reads(std::io::ErrorKind::Other);
+                txn.len(Table::Meta)
+            })
+            .await
+            .expect_err("a read of a failing disk succeeded");
+        assert!(
+            error.chain().any(|cause| cause.is::<redb::TableError>()),
+            "{error:#}"
+        );
+        assert!(gate.take_io_failure(), "the I/O error was not noted");
     }
 
     #[tokio::test]
