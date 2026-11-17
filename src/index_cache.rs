@@ -1,6 +1,6 @@
 //! Bounded registries of the index handles kept open between queries.
 //!
-//! A view index holds a LevelDB handle and its sorted rows; a search index
+//! A view index holds its open redb file and its sorted rows; a search index
 //! holds a Tantivy index and every stored document. Without a bound, every
 //! index ever queried stays resident until its database is deleted. A
 //! registry keeps at most `--max-open-indexes` entries and, on inserting past
@@ -76,9 +76,13 @@ pub trait Slot: Default {
         Arc::strong_count(this) > 1
     }
 
+    /// Called on an entry that `retain` removes: it is gone for good, not
+    /// merely idle.
+    fn retire(&self) {}
+
     /// Whether an evicted entry must be dropped before the registry's lock is
-    /// released. A LevelDB handle holds the database's lock file until it is
-    /// dropped, and a reopen of the same path must not see it still held.
+    /// released, so that whatever its drop sets in motion is visible to a
+    /// reopen of the same path.
     const DROP_UNDER_LOCK: bool = false;
 }
 
@@ -169,11 +173,17 @@ impl<V: Slot> Registry<V> {
         self.retain(|path| path != key);
     }
 
-    /// Forget every entry whose key `keep` rejects.
+    /// Forget every entry whose key `keep` rejects, retiring it.
     pub fn retain(&self, keep: impl Fn(&Path) -> bool) {
         let mut guard = self.lock();
         if let Some(inner) = guard.as_mut() {
-            inner.entries.retain(|path, _| keep(path));
+            inner.entries.retain(|path, (_, entry)| {
+                let kept = keep(path);
+                if !kept {
+                    entry.retire();
+                }
+                kept
+            });
         }
     }
 

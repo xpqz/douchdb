@@ -2039,6 +2039,9 @@ mod tests {
     /// that is using its indexes, and must leave no gate behind.
     #[tokio::test]
     async fn forget_db_waits_for_a_search_in_flight() {
+        // Other tests lower the registries' shared cap, and an idle index or
+        // gate over it is evicted, whoever owns it. Run with them excluded.
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
         let root =
             std::env::temp_dir().join(format!("douchdb-search-forget-{}", crate::util::uuid()));
         let db = Db::open_or_create(

@@ -1,9 +1,9 @@
 //! CouchDB map/reduce views, evaluated with an embedded QuickJS runtime.
 //!
-//! Each view has a persistent LevelDB index under `_view_indexes/`. A query
-//! applies `_changes` since the last indexed sequence and only re-runs the map
-//! function for documents that changed; a design-document change rebuilds the
-//! index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
+//! Each view has a persistent index, a redb file under `_view_indexes/`. A
+//! query applies each shard's `_changes` since the position the index has
+//! read and only re-runs the map function for documents that changed; a
+//! design-document change rebuilds the index. The JS engine exposes the same `doc`/`emit` environment as CouchDB's
 //! JavaScript view server.
 
 use crate::db::{cursor_valid, AllDocsOpts, ApiError, ChangesOpts, Db, DbResult, IndexCursor};
@@ -11,18 +11,17 @@ use crate::index_cache::{Gate, Registry, Slot};
 use crate::js::JsError;
 use crate::util::hex;
 use crate::viewfn::{run_map_js, Builtin, Row, WRAPPER_SOURCE};
-use base64::Engine as _;
 use icu_collator::options::CollatorOptions;
 use icu_collator::Collator;
 use md5::{Digest, Md5};
-use rusty_leveldb::{LdbIterator, Options as LdbOptions, WriteBatch, DB as Ldb};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub use crate::js::ViewLimits;
@@ -70,13 +69,6 @@ pub struct ViewSpec {
 }
 
 #[derive(Serialize, Deserialize)]
-struct IndexMeta {
-    /// How far the index has read each shard.
-    cursor: IndexCursor,
-    design: String,
-}
-
-#[derive(Serialize, Deserialize)]
 struct StoredRow {
     key: Value,
     value: Value,
@@ -88,14 +80,37 @@ struct StoredRowRef<'a> {
     value: &'a Value,
 }
 
-/// A persistent index for one (database, design document, view) tuple. Rows
-/// are stored per document so a changed document can be re-mapped without
-/// walking the whole database.
-/// A raw LevelDB key and value.
-type KeyValue = (Vec<u8>, Vec<u8>);
+/// Page cache of each view file: fixed and small, since many can be open.
+const VIEW_CACHE_BYTES: usize = 4 << 20;
 
+// The tables of a view file. Every value is sealed (`kv::seal`), so a damaged
+// one is an error when read, never a wrong or missing row.
+
+/// (document id, ordinal) → one row the document emitted, as
+/// `{"key": …, "value": …}`. A document's rows sit together, so a changed
+/// document's old rows are found without walking the index.
+const ROWS: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("rows");
+/// [`DESIGN`] → the signature of the map and reduce functions the rows were
+/// made with.
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Shard number → `[uuid, seq]`: the shard copy the index has read, and how
+/// far (the [`IndexCursor`]).
+const CURSOR: TableDefinition<u32, &[u8]> = TableDefinition::new("cursor");
+const DESIGN: &str = "design";
+
+/// A persistent index for one (database, design document, view) tuple, in a
+/// redb file of its own. Rows are stored per document so a changed document
+/// can be re-mapped without walking the whole database; an update's rows,
+/// design and cursor are one transaction, so they always agree.
 struct ViewIndex {
-    db: Ldb,
+    /// The open file. `None` once a failed write has closed it; the next use
+    /// reopens it from `file`.
+    db: Option<Database>,
+    /// Where the file is; `None` for an index over a test backend.
+    file: Option<PathBuf>,
+    /// Set when the index is removed (invalidated, cleaned up, its database
+    /// deleted): its file then closes without the close-time check.
+    retired: Arc<AtomicBool>,
     cursor: IndexCursor,
     design: String,
     /// Shard count and partitioning of the database and view, used to split
@@ -1402,6 +1417,9 @@ fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
 #[derive(Default)]
 struct IndexSlot {
     index: tokio::sync::OnceCell<Arc<AsyncMutex<ViewIndex>>>,
+    /// Shared with the index: set when the registry lets the slot go for
+    /// good rather than for idleness.
+    retired: Arc<AtomicBool>,
 }
 
 impl Slot for IndexSlot {
@@ -1411,6 +1429,12 @@ impl Slot for IndexSlot {
         Arc::strong_count(this) > 1 || this.index.get().is_some_and(|i| Arc::strong_count(i) > 1)
     }
 
+    fn retire(&self) {
+        self.retired.store(true, AtomicOrdering::SeqCst);
+    }
+
+    /// An evicted index registers its background close as it drops, so a
+    /// reopen of its file, which waits for that close, must come after.
     const DROP_UNDER_LOCK: bool = true;
 }
 
@@ -1426,25 +1450,23 @@ fn open_indexes_under(db_path: &Path) -> usize {
 
 fn index_path(db: &Db, ddoc_id: &str, view_name: &str) -> PathBuf {
     let digest = Md5::digest(format!("{ddoc_id}\0{view_name}").as_bytes());
-    db.path.join("_view_indexes").join(hex(&digest))
+    db.path
+        .join("_view_indexes")
+        .join(format!("{}.redb", hex(&digest)))
 }
 
 /// The open index at `path`. Opening happens on the blocking pool in a task of
 /// its own, so a request that goes away mid-open still leaves the index open
-/// for the next one rather than a LevelDB lock held by nobody.
+/// for the next one rather than a file held by nobody.
 async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
     let slot = indexes().get(path);
     let path = path.to_path_buf();
     let opened = tokio::spawn(async move {
+        let retired = Arc::clone(&slot.retired);
         slot.index
             .get_or_try_init(|| {
                 blocking(move || {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|error| {
-                            ApiError::new(500, "view_index_error", error.to_string())
-                        })?;
-                    }
-                    ViewIndex::open(&path)
+                    ViewIndex::open(&path, retired)
                         .map(|index| Arc::new(AsyncMutex::new(index)))
                         .map_err(ApiError::from)
                 })
@@ -1456,9 +1478,9 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
     opened.map_err(|error| ApiError::new(500, "view_index_error", error.to_string()))?
 }
 
-/// Gate for a database's view index directories. A query holds the read side
+/// Gate for a database's view index files. A query holds the read side
 /// while it uses an index; `invalidate` and `cleanup` take the write side, so
-/// they never delete a directory under a live handle and a new open never
+/// they never delete a file under a live handle and a new open never
 /// races with the removal. One gate per database keeps other databases
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
@@ -1472,8 +1494,8 @@ fn gates() -> &'static Registry<Gate> {
 }
 
 /// Drop cached index handles when a database is deleted or recreated, and the
-/// database's gate with them. The LevelDB files live under the database
-/// directory.
+/// database's gate with them. The index files live under the database
+/// directory; the handles are retired, so they close without a check.
 ///
 /// Signals the gate first, so a build in flight and a query waiting for the
 /// gate or the index fail with not_found at their next check, then takes the
@@ -1490,21 +1512,207 @@ pub async fn forget_db(db_path: &Path) {
     gates().retain(|path| path != db_path);
 }
 
+/// A view file closing in the background, and whether it has closed.
+#[derive(Default)]
+struct Closing {
+    done: StdMutex<bool>,
+    finished: Condvar,
+}
+
+/// View files whose close is still running, by path. redb locks a file while
+/// it is open, so an open of one of these waits for its close first.
+static CLOSING: LazyLock<StdMutex<HashMap<PathBuf, Arc<Closing>>>> =
+    LazyLock::new(Default::default);
+
+fn closing_files() -> MutexGuard<'static, HashMap<PathBuf, Arc<Closing>>> {
+    CLOSING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A background close of one file. Dropping it closes the file, if the
+/// close never ran, and then marks the close done.
+struct Closed {
+    db: Option<Database>,
+    file: PathBuf,
+    closing: Arc<Closing>,
+}
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        drop(self.db.take());
+        {
+            let mut files = closing_files();
+            if files
+                .get(&self.file)
+                .is_some_and(|closing| Arc::ptr_eq(closing, &self.closing))
+            {
+                files.remove(&self.file);
+            }
+        }
+        *self
+            .closing
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        self.closing.finished.notify_all();
+    }
+}
+
+/// Close `db`, the view file at `file`, after a full integrity check, on a
+/// thread of its own: the check reads the whole file, and the index is
+/// closed from the request path. The close is registered before this
+/// returns, so an open of the same file from here on waits for it.
+fn close_in_background(db: Database, file: PathBuf) {
+    let closing = Arc::new(Closing::default());
+    closing_files().insert(file.clone(), Arc::clone(&closing));
+    let mut closed = Closed {
+        db: Some(db),
+        file,
+        closing,
+    };
+    // A thread that cannot start drops `closed`: a close without the check.
+    let _ = std::thread::Builder::new()
+        .name("view-close".to_string())
+        .spawn(move || {
+            if let Some(db) = closed.db.take() {
+                if let Err(error) = crate::kv::close_verified(db, &closed.file) {
+                    tracing::error!(
+                        file = %closed.file.display(),
+                        %error,
+                        "view index failed its integrity check on close"
+                    );
+                }
+            }
+            drop(closed);
+        });
+}
+
+/// Wait until no background close of `file` is running.
+fn wait_closed(file: &Path) {
+    let Some(closing) = closing_files().get(file).cloned() else {
+        return;
+    };
+    let mut done = closing.done.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*done {
+        done = closing
+            .finished
+            .wait(done)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+fn index_error(error: impl std::fmt::Display) -> JsError {
+    JsError::Index(error.to_string())
+}
+
+/// The value inside a sealed view value; a checksum mismatch is an error.
+fn unsealed(stored: &[u8]) -> Result<&[u8], JsError> {
+    crate::kv::unseal(stored).map_err(|corrupt| JsError::Index(format!("view index: {corrupt}")))
+}
+
+fn encode_row(row: &Row) -> Result<Vec<u8>, JsError> {
+    let encoded = serde_json::to_vec(&StoredRowRef {
+        key: &row.key,
+        value: &row.value,
+    })
+    .map_err(index_error)?;
+    Ok(crate::kv::seal(&encoded))
+}
+
+fn decode_row(stored: &[u8]) -> Result<StoredRow, JsError> {
+    serde_json::from_slice(unsealed(stored)?).map_err(index_error)
+}
+
+/// Create a view file's tables, empty.
+fn init_tables(db: &Database) -> Result<(), JsError> {
+    let txn = db.begin_write().map_err(index_error)?;
+    txn.open_table(ROWS).map_err(index_error)?;
+    txn.open_table(META).map_err(index_error)?;
+    txn.open_table(CURSOR).map_err(index_error)?;
+    txn.commit().map_err(index_error)
+}
+
+/// A new, empty view file at `path`. It is made under a temporary name and
+/// renamed into place once redb has initialised it and its tables, so a crash
+/// part-way leaves no half-made file under the index's name (cleanup removes
+/// the temporary one).
+fn create_file(path: &Path) -> Result<Database, JsError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(index_error)?;
+    }
+    let staging = path.with_extension("redb.creating");
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(index_error(error)),
+    }
+    let db = crate::kv::create(&staging, VIEW_CACHE_BYTES).map_err(index_error)?;
+    init_tables(&db)?;
+    std::fs::rename(&staging, path).map_err(index_error)?;
+    // Whatever was verified under this name before, this is a new file.
+    crate::kv::forget_verified(path);
+    Ok(db)
+}
+
+/// The cursor and design a view file records.
+fn read_state(db: &Database) -> Result<(IndexCursor, String), JsError> {
+    let txn = db.begin_read().map_err(index_error)?;
+    let meta = txn.open_table(META).map_err(index_error)?;
+    let design = match meta.get(DESIGN).map_err(index_error)? {
+        Some(stored) => {
+            String::from_utf8(unsealed(stored.value())?.to_vec()).map_err(index_error)?
+        }
+        None => String::new(),
+    };
+    let positions = txn.open_table(CURSOR).map_err(index_error)?;
+    let mut cursor = Vec::new();
+    for entry in positions.iter().map_err(index_error)? {
+        let (_, stored) = entry.map_err(index_error)?;
+        cursor.push(serde_json::from_slice(unsealed(stored.value())?).map_err(index_error)?);
+    }
+    Ok((IndexCursor(cursor), design))
+}
+
+/// Record `cursor` and `design` in the transaction that writes the rows they
+/// describe.
+fn write_state(txn: &WriteTransaction, cursor: &IndexCursor, design: &str) -> Result<(), JsError> {
+    txn.open_table(META)
+        .map_err(index_error)?
+        .insert(DESIGN, crate::kv::seal(design.as_bytes()).as_slice())
+        .map_err(index_error)?;
+    let mut positions = txn.open_table(CURSOR).map_err(index_error)?;
+    positions.retain(|_, _| false).map_err(index_error)?;
+    for (shard, position) in cursor.0.iter().enumerate() {
+        let shard = u32::try_from(shard).map_err(index_error)?;
+        let encoded = serde_json::to_vec(position).map_err(index_error)?;
+        positions
+            .insert(shard, crate::kv::seal(&encoded).as_slice())
+            .map_err(index_error)?;
+    }
+    Ok(())
+}
+
 impl ViewIndex {
-    fn open(path: &Path) -> Result<Self, JsError> {
-        let options = LdbOptions {
-            create_if_missing: true,
-            ..LdbOptions::default()
+    fn open(path: &Path, retired: Arc<AtomicBool>) -> Result<Self, JsError> {
+        // An eviction may still be closing the file.
+        wait_closed(path);
+        let db = if path.try_exists().map_err(index_error)? {
+            crate::kv::open(path, VIEW_CACHE_BYTES).map_err(index_error)?
+        } else {
+            create_file(path)?
         };
-        let mut db = Ldb::open(path, options).map_err(|error| JsError::Index(error.to_string()))?;
-        let meta = db
-            .get(b"m")
-            .and_then(|bytes| serde_json::from_slice::<IndexMeta>(&bytes).ok());
-        let (cursor, design) = meta
-            .map(|meta| (meta.cursor, meta.design))
-            .unwrap_or_default();
+        let mut index = Self::over(db)?;
+        index.file = Some(path.to_path_buf());
+        index.retired = retired;
+        Ok(index)
+    }
+
+    /// An index over an open view file, with the state it records.
+    fn over(db: Database) -> Result<Self, JsError> {
+        let (cursor, design) = read_state(&db)?;
         Ok(ViewIndex {
-            db,
+            db: Some(db),
+            file: None,
+            retired: Arc::default(),
             cursor,
             design,
             placement: Placement::shards(1, false),
@@ -1512,28 +1720,57 @@ impl ViewIndex {
         })
     }
 
+    /// The open file, reopened if a failed write closed it. A reopened index
+    /// takes its cursor and design from the file again.
+    fn db(&mut self) -> Result<&Database, JsError> {
+        let db = match self.db.take() {
+            Some(db) => db,
+            None => {
+                let file = self
+                    .file
+                    .as_deref()
+                    .ok_or_else(|| JsError::Index("the view index is closed".to_string()))?;
+                let db = crate::kv::open(file, VIEW_CACHE_BYTES).map_err(index_error)?;
+                (self.cursor, self.design) = read_state(&db)?;
+                self.cached = None;
+                db
+            }
+        };
+        Ok(self.db.insert(db))
+    }
+
+    /// Run `write` in one write transaction and commit it. A failure closes
+    /// the file and reopens it: redb may refuse writes after a failed commit,
+    /// and whether the commit reached the disk is only known from the file.
+    fn commit(
+        &mut self,
+        write: impl FnOnce(&WriteTransaction) -> Result<(), JsError>,
+    ) -> Result<(), JsError> {
+        let db = self.db()?;
+        let outcome = db.begin_write().map_err(index_error).and_then(|txn| {
+            write(&txn)?;
+            txn.commit().map_err(index_error)
+        });
+        if outcome.is_err() {
+            drop(self.db.take());
+            self.cursor = IndexCursor::default();
+            self.design.clear();
+            self.cached = None;
+            // A reopen that fails is retried on the next use.
+            let _ = self.db();
+        }
+        outcome
+    }
+
     fn load_rows(&mut self) -> Result<Vec<Row>, JsError> {
-        // Keys are `r/<base64(docid)>/<ordinal>`; the id is recovered from the
-        // key rather than duplicated in every stored row.
+        let txn = self.db()?.begin_read().map_err(index_error)?;
+        let table = txn.open_table(ROWS).map_err(index_error)?;
         let mut rows = Vec::new();
-        for (key, bytes) in self.scan(b"r/")? {
-            let Some(rest) = key.strip_prefix(b"r/") else {
-                continue;
-            };
-            let Some(encoded) = rest.split(|byte| *byte == b'/').next() else {
-                continue;
-            };
-            let Ok(id) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) else {
-                continue;
-            };
-            let Ok(id) = String::from_utf8(id) else {
-                continue;
-            };
-            let Ok(stored) = serde_json::from_slice::<StoredRow>(&bytes) else {
-                continue;
-            };
+        for entry in table.iter().map_err(index_error)? {
+            let (key, stored) = entry.map_err(index_error)?;
+            let stored = decode_row(stored.value())?;
             rows.push(Row {
-                id,
+                id: key.value().0.to_string(),
                 key: stored.key,
                 value: stored.value,
             });
@@ -1561,50 +1798,8 @@ impl ViewIndex {
         }
     }
 
-    fn scan(&mut self, prefix: &[u8]) -> Result<Vec<KeyValue>, JsError> {
-        let mut iterator = self
-            .db
-            .new_iter()
-            .map_err(|error| JsError::Index(error.to_string()))?;
-        iterator.seek(prefix);
-        let mut out = Vec::new();
-        while let Some((key, value)) = iterator.current() {
-            if !key.starts_with(prefix) {
-                break;
-            }
-            out.push((key.to_vec(), value.to_vec()));
-            if !iterator.advance() {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    /// The keys that start with `prefix`, without their values.
-    fn scan_keys(&mut self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, JsError> {
-        let mut iterator = self
-            .db
-            .new_iter()
-            .map_err(|error| JsError::Index(error.to_string()))?;
-        iterator.seek(prefix);
-        let mut out = Vec::new();
-        while let Some((key, _)) = iterator.current() {
-            if !key.starts_with(prefix) {
-                break;
-            }
-            out.push(key.to_vec());
-            if !iterator.advance() {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    fn doc_prefix(id: &str) -> Vec<u8> {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes());
-        format!("r/{encoded}/").into_bytes()
-    }
-
+    /// Replace the rows of the `changed` documents with `by_doc` and record
+    /// `cursor` and `design`, in one transaction.
     fn apply(
         &mut self,
         changed: Vec<String>,
@@ -1612,65 +1807,52 @@ impl ViewIndex {
         cursor: IndexCursor,
         design: &str,
     ) -> Result<(), JsError> {
-        let mut batch = WriteBatch::default();
         // The keys of the rows being replaced locate them in the snapshot.
+        let track = self.cached.is_some();
         let mut removed = Vec::new();
-        for id in &changed {
-            for (key, stored) in self.scan(&Self::doc_prefix(id))? {
-                batch.delete(&key);
-                if self.cached.is_some() {
-                    let stored: StoredRow = serde_json::from_slice(&stored)
-                        .map_err(|error| JsError::Index(error.to_string()))?;
-                    removed.push((id.clone(), stored.key));
+        let mut added = Vec::new();
+        self.commit(|txn| {
+            let mut table = txn.open_table(ROWS).map_err(index_error)?;
+            for id in &changed {
+                let rows = (id.as_str(), 0)..=(id.as_str(), u32::MAX);
+                if track {
+                    for entry in table.range(rows.clone()).map_err(index_error)? {
+                        let (_, stored) = entry.map_err(index_error)?;
+                        removed.push((id.clone(), decode_row(stored.value())?.key));
+                    }
+                }
+                table.retain_in(rows, |_, _| false).map_err(index_error)?;
+            }
+            for (id, rows) in &by_doc {
+                for (ordinal, row) in rows.iter().enumerate() {
+                    let ordinal = u32::try_from(ordinal).map_err(index_error)?;
+                    table
+                        .insert((id.as_str(), ordinal), encode_row(row)?.as_slice())
+                        .map_err(index_error)?;
+                    added.push(row.clone());
                 }
             }
-        }
-
-        let mut added = Vec::new();
-        for (id, rows) in &by_doc {
-            let prefix = Self::doc_prefix(id);
-            for (ordinal, row) in rows.iter().enumerate() {
-                let key = format!("{}{ordinal:08}", String::from_utf8_lossy(&prefix));
-                batch.put(
-                    key.as_bytes(),
-                    &serde_json::to_vec(&StoredRowRef {
-                        key: &row.key,
-                        value: &row.value,
-                    })
-                    .map_err(|error| JsError::Index(error.to_string()))?,
-                );
-                added.push(row.clone());
-            }
-        }
+            drop(table);
+            write_state(txn, &cursor, design)
+        })?;
 
         // Update the in-memory snapshot incrementally: drop rows for changed
         // documents and merge in the new ones, in the blocks they touch.
-        let next_cached = match self.cached.take() {
-            Some(cached) => {
-                // Reuse the cached allocation when no in-flight query still
-                // holds the snapshot; otherwise clone it.
-                let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
-                kept.replace_docs(&removed, added, self.placement);
-                Some(Arc::new(kept))
-            }
-            None => None,
-        };
-
-        put_meta(&mut batch, &cursor, design)?;
+        if let Some(cached) = self.cached.take() {
+            // Reuse the cached allocation when no in-flight query still
+            // holds the snapshot; otherwise clone it.
+            let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
+            kept.replace_docs(&removed, added, self.placement);
+            self.cached = Some(Arc::new(kept));
+        }
         self.cursor = cursor;
         self.design = design.to_string();
-        self.db
-            .write(batch, true)
-            .map_err(|error| JsError::Index(error.to_string()))?;
-        self.cached = next_cached;
         Ok(())
     }
 
-    /// Replace every stored row with `rows`. The old rows are deleted and the
-    /// new ones written a batch at a time, so a rebuild holds neither the old
-    /// index nor the whole new one as a single write. Until the last write
-    /// records the new design the index matches no design, so a rebuild that
-    /// stops part-way is redone by the next query.
+    /// Replace every stored row with `rows`, recording `cursor` and
+    /// `design`, in one transaction: a rebuild that stops part-way leaves the
+    /// index as it was.
     fn rebuild(
         &mut self,
         mut rows: Vec<Row>,
@@ -1678,75 +1860,43 @@ impl ViewIndex {
         design: &str,
     ) -> Result<(), JsError> {
         sort_rows(&mut rows);
-        let stale = self.scan_keys(b"r/")?;
-        self.cached = None;
-        self.cursor = IndexCursor::default();
-        self.design.clear();
-        let mut batch = WriteBatch::default();
-        put_meta(&mut batch, &IndexCursor::default(), "")?;
-        self.write_batch(batch, false)?;
-        for keys in stale.chunks(WRITE_BATCH_ROWS) {
-            let mut batch = WriteBatch::default();
-            for key in keys {
-                batch.delete(key);
-            }
-            self.write_batch(batch, false)?;
-        }
-        drop(stale);
-
-        // A document's rows are numbered in the order they are stored.
-        let mut ordinals: HashMap<&str, usize> = HashMap::new();
-        for page in rows.chunks(WRITE_BATCH_ROWS) {
-            let mut batch = WriteBatch::default();
-            for row in page {
+        self.commit(|txn| {
+            txn.delete_table(ROWS).map_err(index_error)?;
+            let mut table = txn.open_table(ROWS).map_err(index_error)?;
+            // A document's rows are numbered in the order they are stored.
+            let mut ordinals: HashMap<&str, u32> = HashMap::new();
+            for row in &rows {
                 let ordinal = ordinals.entry(row.id.as_str()).or_default();
-                let key = format!(
-                    "{}{ordinal:08}",
-                    String::from_utf8_lossy(&Self::doc_prefix(&row.id))
-                );
+                table
+                    .insert((row.id.as_str(), *ordinal), encode_row(row)?.as_slice())
+                    .map_err(index_error)?;
                 *ordinal += 1;
-                batch.put(
-                    key.as_bytes(),
-                    &serde_json::to_vec(&StoredRowRef {
-                        key: &row.key,
-                        value: &row.value,
-                    })
-                    .map_err(|error| JsError::Index(error.to_string()))?,
-                );
             }
-            self.write_batch(batch, false)?;
-        }
-        drop(ordinals);
-
-        let mut batch = WriteBatch::default();
-        put_meta(&mut batch, &cursor, design)?;
-        self.write_batch(batch, true)?;
+            drop(table);
+            write_state(txn, &cursor, design)
+        })?;
         self.cursor = cursor;
         self.design = design.to_string();
         self.cached = Some(Arc::new(ViewRows::from_rows(rows, self.placement)));
         Ok(())
     }
-
-    fn write_batch(&mut self, batch: WriteBatch, sync: bool) -> Result<(), JsError> {
-        self.db
-            .write(batch, sync)
-            .map_err(|error| JsError::Index(error.to_string()))
-    }
 }
 
-/// Rows deleted or written by one batch of a rebuild.
-const WRITE_BATCH_ROWS: usize = 4096;
-
-fn put_meta(batch: &mut WriteBatch, cursor: &IndexCursor, design: &str) -> Result<(), JsError> {
-    batch.put(
-        b"m",
-        &serde_json::to_vec(&IndexMeta {
-            cursor: cursor.clone(),
-            design: design.to_string(),
-        })
-        .map_err(|error| JsError::Index(error.to_string()))?,
-    );
-    Ok(())
+impl Drop for ViewIndex {
+    /// An index closed for idleness is checked as it closes, off the request
+    /// path, so its next open in this process skips the check. A retired one
+    /// closes as it is: its file is about to go.
+    fn drop(&mut self) {
+        let Some(db) = self.db.take() else {
+            return;
+        };
+        match self.file.take() {
+            Some(file) if !self.retired.load(AtomicOrdering::SeqCst) => {
+                close_in_background(db, file);
+            }
+            _ => drop(db),
+        }
+    }
 }
 
 /// Run one view query against the local shards.
@@ -2043,7 +2193,7 @@ async fn ensure_rows(
     // The map functions and the index writes run on the blocking pool, with
     // the gate and the index lock moved in: they stay held until the work is
     // done even if the request is dropped meanwhile, and the async workers
-    // never wait on user JavaScript or on LevelDB.
+    // never wait on user JavaScript or on the index file.
     let (mut gate, mut index) = (gate, index);
     let mut rebuild = index.design != design || !cursor_valid(&index.cursor, db);
     if !rebuild && index.cursor != bound {
@@ -2154,7 +2304,7 @@ async fn ensure_rows(
         .await;
     }
 
-    // Warm: the snapshot is an Arc clone. Only a cold one reads LevelDB.
+    // Warm: the snapshot is an Arc clone. Only a cold one reads the file.
     if let Some(rows) = &index.cached {
         return Ok(rows.clone());
     }
@@ -2168,8 +2318,8 @@ async fn ensure_rows(
 /// Changes read, mapped and applied to a view index at a time.
 const CHANGES_PAGE: usize = 1000;
 
-/// Run `work` on the blocking pool. User JavaScript, LevelDB and the worker
-/// pipes all block their thread, which must not be an async worker.
+/// Run `work` on the blocking pool. User JavaScript, index files and the
+/// worker pipes all block their thread, which must not be an async worker.
 pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> DbResult<T> + Send + 'static,
 ) -> DbResult<T> {
@@ -2237,18 +2387,16 @@ pub async fn invalidate(db: &Db) -> DbResult<()> {
     db.check_live()?;
     let directory = db.path.join("_view_indexes");
     indexes().retain(|path| !path.starts_with(&directory));
-    if let Ok(entries) = std::fs::read_dir(&directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-        }
-    }
-    Ok(())
+    blocking(move || {
+        remove_index_files(&directory, |_| true);
+        Ok(())
+    })
+    .await
 }
 
-/// Remove index directories whose design document or view no longer exists.
+/// Remove index files whose design document or view no longer exists, and
+/// anything else in the index directory that is not a live view's file (an
+/// interrupted creation, an index of an earlier format).
 pub async fn cleanup(db: &Db) -> DbResult<()> {
     // Before the live set is read, so a view queried meanwhile is not removed
     // as stale, and so no query holds an index being removed.
@@ -2279,17 +2427,36 @@ pub async fn cleanup(db: &Db) -> DbResult<()> {
     }
 
     let directory = db.path.join("_view_indexes");
-    if let Ok(entries) = std::fs::read_dir(&directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) && !live.contains(&path)
-            {
-                let _ = std::fs::remove_dir_all(&path);
-            }
+    indexes().retain(|path| !path.starts_with(&directory) || live.contains(path));
+    blocking(move || {
+        remove_index_files(&directory, |path| !live.contains(path));
+        Ok(())
+    })
+    .await
+}
+
+/// Remove the entries of the index directory `directory` that `stale`
+/// picks. Their handles must be retired first. Each file's background close,
+/// if one is still running, is waited for, so it cannot record the file as
+/// verified after it has gone; then the file is forgotten, so a new one under
+/// its name is checked on its first open.
+fn remove_index_files(directory: &Path, stale: impl Fn(&Path) -> bool) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !stale(&path) {
+            continue;
         }
+        wait_closed(&path);
+        let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        crate::kv::forget_verified(&path);
     }
-    indexes().retain(|path| live.contains(path));
-    Ok(())
 }
 
 pub async fn load_spec(db: &Db, ddoc_id: &str, view_name: &str) -> DbResult<ViewSpec> {
@@ -3564,7 +3731,9 @@ fn compare_strings(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::StorageBackend;
     use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     fn reduce_value(
@@ -4874,7 +5043,7 @@ mod tests {
     #[test]
     fn index_cache_tracks_incremental_updates() {
         let dir = std::env::temp_dir().join(format!("douchdb-view-cache-{}", crate::util::uuid()));
-        let mut index = ViewIndex::open(&dir).unwrap();
+        let mut index = ViewIndex::open(&dir.join("v.redb"), Arc::default()).unwrap();
         index
             .rebuild(
                 vec![
@@ -4917,6 +5086,7 @@ mod tests {
         assert_eq!(rows.shards[0].len(), 1);
         assert_eq!(rows.shards[0].row(0).id, "a");
         assert_eq!(rows.shards[0].row(0).key, json!("z"));
+        drop(index);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4951,6 +5121,7 @@ mod tests {
     #[test]
     fn index_rows_survive_reopen() {
         let dir = std::env::temp_dir().join(format!("douchdb-view-index-{}", crate::util::uuid()));
+        let file = dir.join("v.redb");
         let rows = vec![
             Row {
                 id: "a".into(),
@@ -4964,13 +5135,14 @@ mod tests {
             },
         ];
         {
-            let mut index = ViewIndex::open(&dir).unwrap();
+            let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
             index
                 .rebuild(rows, IndexCursor(vec![("u".into(), 7)]), "map|")
                 .unwrap();
         }
         {
-            let mut index = ViewIndex::open(&dir).unwrap();
+            // The first handle closes in the background; this open waits.
+            let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
             assert_eq!(index.cursor, IndexCursor(vec![("u".into(), 7)]));
             assert_eq!(index.design, "map|");
             let mut restored = index.load_rows().unwrap();
@@ -4980,6 +5152,287 @@ mod tests {
             assert_eq!(restored[1].key, json!("Paris"));
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A power-cut backend that loses power at a chosen `sync_data`: once
+    /// `syncs` have succeeded, the next one cuts the power and fails.
+    struct CutAtSync {
+        inner: crate::kv::powercut::PowerCut,
+        switch: crate::kv::powercut::PowerSwitch,
+        syncs: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Debug for CutAtSync {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CutAtSync").finish_non_exhaustive()
+        }
+    }
+
+    impl StorageBackend for CutAtSync {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            self.inner.set_len(len)
+        }
+
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            let left =
+                self.syncs
+                    .try_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    });
+            if left.is_err() {
+                self.switch.cut();
+                return Err(std::io::Error::other("the power was cut"));
+            }
+            self.inner.sync_data()
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            self.inner.write(offset, data)
+        }
+
+        fn close(&self) -> Result<(), std::io::Error> {
+            self.inner.close()
+        }
+    }
+
+    /// An index over a fresh database on `backend`, as `create_file` makes one.
+    fn index_over(backend: impl StorageBackend) -> ViewIndex {
+        let db = crate::kv::open_with(backend, VIEW_CACHE_BYTES).unwrap();
+        init_tables(&db).unwrap();
+        ViewIndex::over(db).unwrap()
+    }
+
+    fn row(id: &str, key: &str) -> Row {
+        Row {
+            id: id.into(),
+            key: json!(key),
+            value: json!(null),
+        }
+    }
+
+    /// (id, key) of every stored row, in order.
+    fn stored(index: &mut ViewIndex) -> Vec<(String, Value)> {
+        let mut rows: Vec<_> = index
+            .load_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.key))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp_json(&a.1, &b.1)));
+        rows
+    }
+
+    /// One update's rows, design and cursor are a single commit: whichever
+    /// sync the power is lost at, the reopened index holds the rows of the
+    /// cursor it records, never the rows of one update and the cursor of
+    /// another.
+    #[test]
+    fn view_rows_and_cursor_commit_together() {
+        let before = IndexCursor(vec![("u".into(), 1)]);
+        let after = IndexCursor(vec![("u".into(), 2)]);
+        let old = vec![("a".to_string(), json!("a")), ("b".to_string(), json!("b"))];
+        let new = vec![
+            ("a".to_string(), json!("z")),
+            ("c".to_string(), json!("c")),
+            ("c".to_string(), json!("d")),
+        ];
+        let mut cuts = 0;
+        for syncs in 0.. {
+            let (backend, switch) = crate::kv::powercut::PowerCut::new();
+            let budget = Arc::new(AtomicUsize::new(usize::MAX));
+            let mut index = index_over(CutAtSync {
+                inner: backend,
+                switch: switch.clone(),
+                syncs: Arc::clone(&budget),
+            });
+            index
+                .rebuild(vec![row("a", "a"), row("b", "b")], before.clone(), "map|")
+                .unwrap();
+            budget.store(syncs, AtomicOrdering::SeqCst);
+            let mut by_doc = HashMap::new();
+            by_doc.insert("a".to_string(), vec![row("a", "z")]);
+            by_doc.insert("c".to_string(), vec![row("c", "c"), row("c", "d")]);
+            let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+            let finished = index.apply(changed, by_doc, after.clone(), "map|").is_ok();
+            switch.cut();
+            drop(index);
+
+            let mut index =
+                ViewIndex::over(crate::kv::open_with(switch.backend(), VIEW_CACHE_BYTES).unwrap())
+                    .unwrap();
+            assert_eq!(index.design, "map|");
+            if index.cursor == before {
+                assert!(!finished, "an acknowledged update was lost");
+                assert_eq!(stored(&mut index), old, "cut at sync {syncs}");
+            } else {
+                assert_eq!(index.cursor, after, "cut at sync {syncs}");
+                assert_eq!(stored(&mut index), new, "cut at sync {syncs}");
+            }
+            if finished {
+                break;
+            }
+            cuts += 1;
+        }
+        assert!(cuts > 0, "the power was never cut during the update");
+    }
+
+    /// A stored row whose checksum fails is an error, never a row silently
+    /// left out of the result.
+    #[tokio::test]
+    async fn a_corrupt_view_row_is_a_500_not_a_missing_row() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-viewcorrupt-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "viewcorrupt",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        db.put_docs(
+            vec![json!({"_id": "a", "n": 1}), json!({"_id": "b", "n": 2})],
+            true,
+        )
+        .await
+        .unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(result["total_rows"], 2, "{result}");
+
+        // Damage the value of a's row, and drop the warm rows so the next
+        // query reads the file.
+        let handle = index_handle(&index_path(&db, "_design/d", "v"))
+            .await
+            .unwrap();
+        {
+            let mut index = handle.lock().await;
+            let file = index.db.as_ref().unwrap();
+            let txn = file.begin_write().unwrap();
+            let mut damaged = crate::kv::seal(br#"{"key":1,"value":null}"#);
+            damaged[0] ^= 0x20;
+            txn.open_table(ROWS)
+                .unwrap()
+                .insert(("a", 0), damaged.as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+            index.cached = None;
+        }
+        drop(handle);
+
+        let error = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .expect_err("a damaged row was served or left out");
+        assert_eq!(error.status, 500, "{}", error.reason);
+        assert_eq!(error.error, "view_index_error");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A view index closed for idleness is checked as it closes, so its next
+    /// open skips the check; a removed one is forgotten, so a new file under
+    /// its name is checked. An index directory of the old (LevelDB) format
+    /// is never read, and cleanup removes it.
+    #[tokio::test]
+    async fn an_evicted_view_closes_verified_and_a_removed_one_is_forgotten() {
+        let _cap = crate::index_cache::CapGuard::new(1).await;
+        let root = std::env::temp_dir().join(format!("douchdb-viewclose-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "viewclose",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let map = |n: u32| format!("function(doc) {{ if (doc.n) emit(doc.n + {n}, null); }}");
+        db.put_docs(
+            vec![
+                json!({"_id": "a", "n": 1}),
+                json!({"_id": "_design/d", "views": {"v0": {"map": map(0)}, "v1": {"map": map(1)}}}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let first = index_path(&db, "_design/d", "v0");
+        let second = index_path(&db, "_design/d", "v1");
+        assert_eq!(first.extension().and_then(|e| e.to_str()), Some("redb"));
+        let old_format = first.with_extension("");
+        std::fs::create_dir_all(&old_format).unwrap();
+        std::fs::write(old_format.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let spec = |n: u32| ViewSpec {
+            map: map(n),
+            reduce: None,
+            partitioned: false,
+        };
+        let run = |n: u32| {
+            let (db, spec, query) = (&db, spec(n), query.clone());
+            async move {
+                query_with_spec(db, "_design/d", &format!("v{n}"), &spec, &query)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(run(0).await["rows"][0]["key"], json!(1));
+        // Opening the second evicts the first, which closes in the background.
+        assert_eq!(run(1).await["rows"][0]["key"], json!(2));
+        let waited = first.clone();
+        tokio::task::spawn_blocking(move || wait_closed(&waited))
+            .await
+            .unwrap();
+        assert!(
+            crate::kv::is_verified(&first),
+            "the idle close did not verify"
+        );
+        // Reopened, it serves its rows; the second is evicted in turn.
+        assert_eq!(run(0).await["rows"][0]["key"], json!(1));
+
+        cleanup(&db).await.unwrap();
+        assert!(!old_format.exists(), "cleanup kept an old-format index");
+        assert!(first.exists() && second.exists());
+
+        invalidate(&db).await.unwrap();
+        assert!(
+            !first.exists() && !second.exists(),
+            "invalidate kept a file"
+        );
+        assert!(!crate::kv::is_verified(&first));
+        assert!(!crate::kv::is_verified(&second));
+        assert_eq!(run(1).await["rows"][0]["key"], json!(2));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The same for a reduce function, which also runs user JavaScript.
@@ -5051,7 +5504,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Every view ever queried used to keep its LevelDB handle and cached rows
+    /// Every view ever queried used to keep its open file and cached rows
     /// until the database was deleted. The registry must stay at the cap.
     #[tokio::test]
     async fn open_view_indexes_stay_within_the_cap() {
@@ -5168,7 +5621,7 @@ mod tests {
     /// cancelled and its query fails with not_found, as CouchDB's index
     /// processes are shut down with the database. The build is held at the
     /// index lock, where it waits with the gate's read permit; nothing here
-    /// depends on timing, and the timeout only turns a hang into a failure.
+    /// depends on timing (a hang is reported by the run's bound).
     #[tokio::test]
     async fn forget_db_does_not_wait_for_a_build() {
         // Other tests lower the registries' shared cap, and an idle index or
@@ -5203,21 +5656,16 @@ mod tests {
             let (db, spec, query) = (db.clone(), spec.clone(), query.clone());
             tokio::spawn(async move { query_with_spec(&db, "_design/d", "v", &spec, &query).await })
         };
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            while !gate_is_held(&db) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the build never took the gate");
+        while !gate_is_held(&db) {
+            tokio::task::yield_now().await;
+        }
 
         let path = db.path.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(120), forget_db(&path))
+        // With the index lock still held by this test, forget_db and the
+        // build can only finish if forget_db does not wait for the build.
+        forget_db(&path).await;
+        let error = build
             .await
-            .expect("forget_db waited for a view build in flight");
-        let error = tokio::time::timeout(std::time::Duration::from_secs(120), build)
-            .await
-            .expect("the build did not end")
             .unwrap()
             .expect_err("the database was deleted under the query");
         assert_eq!(error.status, 404, "{}", error.reason);
