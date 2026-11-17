@@ -215,7 +215,9 @@ term's MD5 as it reads it. So:
   background.
 - **Recovery on start removes only staging and tombstone directories**
   (`.creating-*`, `.deleted-*`), then `fsync`s the parent. Nothing under a
-  published database name is ever removed by recovery.
+  published database name is ever removed by recovery, with one exception:
+  search-index temporary files (`.douchdb-search-meta.json.*.tmp` under
+  `_search_indexes/`) left by an interrupted metadata write are swept.
 - **A published database with a missing or unopenable shard fails closed:**
   requests to it return 500, it stays listed, and every remaining file is left
   untouched for inspection or repair. Damage is never mistaken for an

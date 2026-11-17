@@ -163,10 +163,13 @@ where behaviour is best-effort, it says so.
   renames the directory to `.deleted-<uuid>` and syncs the root before it is
   acknowledged; the files are removed in the background. A crash leaves at
   most one of those directories, which the next start removes. Nothing under
-  a database's own name is removed on start.
+  a database's own name is removed on start, except search-index temporary
+  files (`.douchdb-search-meta.json.*.tmp` under `_search_indexes/`) that an
+  interrupted metadata write left behind.
 - A database with a missing or damaged shard file fails closed: it stays
-  listed, requests to it answer 500, and its files are not recreated,
-  repaired or removed.
+  listed, requests to it answer 500, and its files are not recreated or
+  removed, nor is their data repaired (redb's first open of a file that was
+  not closed cleanly may commit a rebuild of its allocator state).
 - A directory counts as a database when it holds at least one shard file, so
   a directory that only has a legal name (`lost+found` at a volume root) is
   ignored. The residual case: a database that lost *every* shard file is no
