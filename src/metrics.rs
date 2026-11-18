@@ -188,6 +188,8 @@ struct FabricStat {
     rebalance_completed: u64,
     rebalance_timeout: u64,
     cleaned_shards: u64,
+    /// `_compact` requests cast to peers (see `cluster_ops::compact_on_peer`).
+    compaction_casts: u64,
 }
 
 #[derive(Default)]
@@ -400,6 +402,7 @@ pub fn record_fabric(kind: &str, value: u64) {
         "rebalance_completed" => fabric.rebalance_completed += value,
         "rebalance_timeout" => fabric.rebalance_timeout += value,
         "cleaned_shards" => fabric.cleaned_shards += value,
+        "compaction_casts" => fabric.compaction_casts += value,
         _ => {}
     }
 }
@@ -742,6 +745,7 @@ pub fn snapshot() -> Value {
             "rebalance_completed": state.fabric.rebalance_completed,
             "rebalance_timeout": state.fabric.rebalance_timeout,
             "cleaned_shards": state.fabric.cleaned_shards,
+            "compaction_casts": state.fabric.compaction_casts,
         },
     })
 }

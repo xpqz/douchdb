@@ -112,39 +112,34 @@ pub(crate) fn compaction_peers(ctx: &ClusterCtx, db: &Db, headers: &HeaderMap) -
     holders.into_iter().collect()
 }
 
-/// Ask each of `peers` to compact its copies of `name`, as CouchDB's
-/// `fabric:compact` casts the compaction to every shard copy. The requests
-/// are internal, so a peer compacts its own copies and passes nothing on.
-/// As with a cast, a peer that cannot be reached or refuses is only logged.
-pub(crate) async fn compact_on_peers(
+/// Ask node `node` to compact its copies of `name`, as CouchDB's
+/// `fabric:compact` casts the compaction to every shard copy. The request is
+/// internal, so the peer compacts its own copies and passes nothing on. As
+/// with a cast, a peer that cannot be reached or refuses is only logged.
+pub(crate) async fn compact_on_peer(
     ctx: &ClusterCtx,
     name: &str,
-    peers: &[usize],
+    node: usize,
     headers: &HeaderMap,
 ) {
-    join_all(peers.iter().map(|&node| {
-        let peer = &ctx.cluster.nodes[node];
-        let request = internal_request(
-            ctx,
-            reqwest::Method::POST,
-            peer,
-            &[name, "_compact"],
-            Some(headers),
-        )
-        .json(&json!({}));
-        async move {
-            match send_peer(request).await {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => {
-                    tracing::warn!(db = %name, peer = %peer, status = %response.status(), "peer refused to compact");
-                }
-                Err(error) => {
-                    tracing::warn!(db = %name, peer = %peer, error = %error, "peer not asked to compact");
-                }
-            }
+    let peer = &ctx.cluster.nodes[node];
+    let request = internal_request(
+        ctx,
+        reqwest::Method::POST,
+        peer,
+        &[name, "_compact"],
+        Some(headers),
+    )
+    .json(&json!({}));
+    match send_peer(request).await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            tracing::warn!(db = %name, peer = %peer, status = %response.status(), "peer refused to compact");
         }
-    }))
-    .await;
+        Err(error) => {
+            tracing::warn!(db = %name, peer = %peer, error = %error, "peer not asked to compact");
+        }
+    }
 }
 
 fn shard_map_rejected() -> ApiError {

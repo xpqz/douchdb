@@ -1043,10 +1043,12 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
   copies each shard into a new file (dropping non-leaf bodies) while the
   shard keeps serving, checks the copy in full, catches up with the writes
   made meanwhile, and swaps the new file in with writes paused only for the
-  last catch-up and the rename. In a cluster the receiving node first asks
+  last catch-up and the rename. In a cluster the receiving node also asks
   every other node holding a copy of one of the database's shards to compact
-  its copies, as CouchDB's `fabric:compact` does; a peer that is down is
-  skipped and logged. `--compact-concurrency` bounds concurrent compactions
+  its copies, as CouchDB's `fabric:compact` does, each request sent on its
+  own alongside the local compaction; a peer that is down is skipped and
+  logged. `_node/_local/_metrics` counts these requests as
+  `fabric.compaction_casts`. `--compact-concurrency` bounds concurrent compactions
   on a node, across databases;
   the rest wait their turn. The swap pauses that shard's writes and actor
   reads (reads on their own transactions carry on). `GET /db` reports
