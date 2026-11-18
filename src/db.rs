@@ -38,7 +38,7 @@ const SHARD_MAP_SETTING: &str = "db/shard_map";
 /// `{"version": .., "security": ..}`.
 const SECURITY_SETTING: &str = "db/security";
 /// A [`ShardMap`] this node has not had acknowledged; absent when none is.
-const PENDING_SHARD_MAP_SETTING: &str = "db/pending_shard_map";
+pub(crate) const PENDING_SHARD_MAP_SETTING: &str = "db/pending_shard_map";
 
 /// Page cache for reading a closed database's settings: a few pages.
 const PEEK_CACHE: usize = 1 << 20;

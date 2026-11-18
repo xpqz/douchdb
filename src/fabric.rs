@@ -316,14 +316,13 @@ async fn sync_metadata_batch(state: &Arc<AppState>, names: &[String]) {
             if adoptable_peer_map(map, desired.version, ctx.cluster.nodes.len())
                 && db.set_shard_map(map.clone()).await.unwrap_or(false)
             {
-                if db
-                    .pending_shard_map()
-                    .is_some_and(|pending| pending.version <= map.version)
-                {
-                    // The adopted map supersedes (or beat the tiebreak against) ours.
-                    if let Err(error) = db.clear_pending_shard_map().await {
-                        tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
-                    }
+                // The adopted map supersedes (or beat the tiebreak against)
+                // any pending one: one in memory is never newer, as it is
+                // the desired map when it is the newest. The clear writes
+                // even with none in memory, for one on disk only (a write
+                // that failed yet landed).
+                if let Err(error) = db.clear_pending_shard_map().await {
+                    tracing::warn!(db = %db.name, %error, "cannot clear the pending shard map");
                 }
                 desired = map.clone();
             }
@@ -3484,6 +3483,74 @@ mod tests {
             in_flight < 200,
             "{in_flight} replica writes are in flight to a peer that never answers"
         );
+    }
+
+    /// Adopting a peer's shard map clears a pending map that shard 0 holds
+    /// although memory does not (a write that failed yet landed), so it
+    /// cannot come back over the adopted map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopting_a_peer_map_clears_a_pending_map_only_on_disk() {
+        let root = std::env::temp_dir().join(format!("douchdb-adoptclear-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 4);
+        let peer_map = Arc::new(std::sync::Mutex::new(None::<crate::cluster::ShardMap>));
+        let app = axum::Router::new().fallback({
+            let peer_map = Arc::clone(&peer_map);
+            move || async move {
+                let map = peer_map.lock().unwrap().clone().unwrap();
+                let mut reply = MetadataSyncReply::default();
+                reply.differs.insert(
+                    "adoptclear".to_string(),
+                    DbEntries {
+                        shard_map: Some(map),
+                        security: None,
+                    },
+                );
+                axum::Json(reply)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Arc::get_mut(&mut st).expect("sole owner").ctx.cluster = crate::cluster::Cluster {
+            nodes: vec!["http://127.0.0.1:1".to_string(), peer],
+            me: 0,
+            n: 2,
+            secret: "test-secret".to_string(),
+        };
+        let db = st
+            .create_db("adoptclear", false, Some(1), Some(2))
+            .await
+            .unwrap();
+        let mut newer = db.shard_map();
+        newer.version += 1;
+        *peer_map.lock().unwrap() = Some(newer.clone());
+
+        let pending = serde_json::to_vec(&newer).unwrap();
+        let on_disk = |db: &Db| {
+            db.shard_handle(0)
+                .read(|s| Ok(s.get_setting(crate::db::PENDING_SHARD_MAP_SETTING)?))
+        };
+        db.shard_handle(0)
+            .call(move |s| Ok(s.put_setting(crate::db::PENDING_SHARD_MAP_SETTING, &pending)?))
+            .await
+            .unwrap();
+        assert!(db.pending_shard_map().is_none());
+        assert!(on_disk(&db).await.unwrap().is_some());
+
+        sync_metadata(&st, &["adoptclear".to_string()]).await;
+        assert_eq!(db.shard_map(), newer, "the peer's map was not adopted");
+        assert!(db.pending_shard_map().is_none());
+        assert!(
+            on_disk(&db).await.unwrap().is_none(),
+            "the adopted map left a pending map on disk"
+        );
+
+        server.abort();
+        drop(db);
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A database of two shards, one copy each, on a cluster of this node
