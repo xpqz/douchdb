@@ -1627,18 +1627,20 @@ impl Db {
     }
 
     pub async fn clear_shards(&self, shards: &[usize]) -> DbResult<()> {
-        let mut result = Ok(());
-        for &index in shards {
-            let Some(shard) = self.shards.get(index) else {
-                continue;
-            };
-            result = shard.call(|s| s.clear().map_err(ApiError::from)).await;
-            if result.is_err() {
-                break;
+        let clears: Vec<_> = shards
+            .iter()
+            .filter_map(|&index| self.shards.get(index))
+            .map(|shard| shard.call(|s| s.clear().map_err(ApiError::from)))
+            .collect();
+        // One shard after another, stopping at the first that fails; a
+        // cleared shard may have held design documents.
+        self.invalidating(async move {
+            for clear in clears {
+                clear.await?;
             }
-        }
-        self.design.invalidate();
-        result
+            Ok(())
+        })
+        .await?
     }
 
     pub async fn shard_counts(&self) -> DbResult<Vec<(u64, u64)>> {
@@ -9205,6 +9207,34 @@ mod tests {
             purger.purge(&body, 0, &Default::default()).await
         })
         .await;
+
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        let error = db.design_doc(id).await.unwrap_err();
+        assert_eq!(error.status, 404, "{error:?}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A shard cleanup whose request is dropped after its clear was sent
+    /// still lands, and the caches then hold neither the validator nor the
+    /// design document it removed.
+    #[tokio::test]
+    async fn a_dropped_shard_clear_invalidates_the_design_caches_once_it_lands() {
+        let (db, root) = purge_test_db("drop-ddoc-clear", ShardMap::single(1));
+        let db = Arc::new(db);
+        let id = "_design/v";
+        let source = "function(newDoc) { var old = 1; }";
+        db.put_docs(
+            vec![json!({"_id": id, "validate_doc_update": source})],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.validation_functions().await.unwrap(), [source]);
+        db.design_doc(id).await.unwrap();
+
+        let clearer = Arc::clone(&db);
+        drop_after_send(&db, async move { clearer.clear_shards(&[0]).await }).await;
 
         assert!(db.validation_functions().await.unwrap().is_empty());
         let error = db.design_doc(id).await.unwrap_err();
