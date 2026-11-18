@@ -459,6 +459,41 @@ struct Migration {
     id: String,
 }
 
+/// What a database caches from its design documents.
+#[derive(Default)]
+struct DesignCache {
+    /// Cached `validate_doc_update` sources. Invalidated when a design
+    /// document is written.
+    validation: std::sync::RwLock<Option<Vec<String>>>,
+    /// Bumped on every design-document write, so a validator load that raced
+    /// with one is not cached.
+    generation: AtomicU64,
+    /// Design documents already read, with the committed sequence of their
+    /// shard at the time (see `Db::design_doc`).
+    docs: std::sync::Mutex<HashMap<String, (u64, Arc<Value>)>>,
+    /// Bumped by the operations that change documents without moving a
+    /// shard's sequence, so a read that raced with one is not cached.
+    epoch: AtomicU64,
+}
+
+impl DesignCache {
+    /// Everything cached is stale: bump the generation, drop the validation
+    /// functions and every cached design document. Run after anything that
+    /// may have changed a design document.
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *self
+            .validation
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.docs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
+}
+
 pub struct Db {
     pub name: String,
     pub path: PathBuf,
@@ -498,18 +533,10 @@ pub struct Db {
     /// Pinged by the shard actors after a flushed batch that committed a new
     /// sequence; feeds wait on it instead of polling.
     commits: Arc<tokio::sync::watch::Sender<()>>,
-    /// Cached `validate_doc_update` sources. Invalidated when a design
-    /// document is written.
-    validation: std::sync::RwLock<Option<Vec<String>>>,
-    /// Bumped on every design-document write, so a validator load that raced
-    /// with one is not cached.
-    design_generation: AtomicU64,
-    /// Design documents already read, with the committed sequence of their
-    /// shard at the time (see `design_doc`).
-    design_docs: std::sync::Mutex<HashMap<String, (u64, Arc<Value>)>>,
-    /// Bumped by the operations that change documents without moving a
-    /// shard's sequence, so a read that raced with one is not cached.
-    design_epoch: AtomicU64,
+    /// What is cached from design documents. Shared with the task that
+    /// awaits a write which may change one, and invalidates it once the
+    /// write is done (see `invalidating`).
+    design: Arc<DesignCache>,
     /// Set when the database is deleted; see `mark_deleted`.
     deleted: AtomicBool,
     /// Index rows view queries have looked at since the database opened.
@@ -723,10 +750,7 @@ impl Db {
             rebalance_until: AtomicU64::new(0),
             shards,
             commits,
-            validation: std::sync::RwLock::new(None),
-            design_generation: AtomicU64::new(0),
-            design_docs: std::sync::Mutex::new(HashMap::new()),
-            design_epoch: AtomicU64::new(0),
+            design: Arc::default(),
             deleted: AtomicBool::new(false),
             view_rows_visited: Arc::new(AtomicU64::new(0)),
         })
@@ -972,6 +996,7 @@ impl Db {
     /// skipped validator.
     pub async fn validation_functions(&self) -> DbResult<Vec<String>> {
         if let Some(functions) = self
+            .design
             .validation
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1021,6 +1046,7 @@ impl Db {
         }
 
         let mut cached = self
+            .design
             .validation
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1040,23 +1066,25 @@ impl Db {
         let committed = self.shards[index].committed_seq();
         {
             let cached = self
-                .design_docs
+                .design
+                .docs
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             if let Some((_, doc)) = cached.get(id).filter(|(seq, _)| *seq == committed) {
                 return Ok(doc.clone());
             }
         }
-        let epoch = self.design_epoch.load(Ordering::SeqCst);
+        let epoch = self.design.epoch.load(Ordering::SeqCst);
         let doc = Arc::new(self.get_doc(id, &DocOpts::default()).await?);
         // A write committed while the read ran may or may not be in it; the
         // copy is cached only when the shard did not move.
         if self.shards[index].committed_seq() == committed {
             let mut cached = self
-                .design_docs
+                .design
+                .docs
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if self.design_epoch.load(Ordering::SeqCst) == epoch {
+            if self.design.epoch.load(Ordering::SeqCst) == epoch {
                 // Few enough design documents are read per database that a
                 // full cache is cleared rather than evicted from.
                 if cached.len() >= DESIGN_CACHE_LIMIT {
@@ -1068,25 +1096,27 @@ impl Db {
         Ok(doc)
     }
 
-    /// Everything cached from design documents is stale: bump the design
-    /// generation, drop the validation functions and every cached design
-    /// document. Run after anything that may have changed a design document.
-    fn invalidate_design_state(&self) {
-        self.design_generation.fetch_add(1, Ordering::SeqCst);
-        *self
-            .validation
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = None;
-        self.design_epoch.fetch_add(1, Ordering::SeqCst);
-        self.design_docs
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clear();
+    /// Await `commit` in a task of its own, then invalidate the design
+    /// caches. A caller that stops waiting (a client that disconnects drops
+    /// its request) cannot leave them stale: the commit still lands on the
+    /// shard's actor, and the invalidation follows it.
+    async fn invalidating<T: Send + 'static>(
+        &self,
+        commit: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> DbResult<T> {
+        let design = Arc::clone(&self.design);
+        tokio::spawn(async move {
+            let done = commit.await;
+            design.invalidate();
+            done
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("invalidating the design caches: {error}")))
     }
 
     /// Generation of this node's design documents.
     pub(crate) fn design_generation(&self) -> u64 {
-        self.design_generation.load(Ordering::SeqCst)
+        self.design.generation.load(Ordering::SeqCst)
     }
 
     /// Store database setting `name` (removing it for `None`) in shard 0,
@@ -1607,7 +1637,7 @@ impl Db {
                 break;
             }
         }
-        self.invalidate_design_state();
+        self.design.invalidate();
         result
     }
 
@@ -1792,7 +1822,7 @@ impl Db {
             HashMap::new()
         };
         // Every shard's batch is sent at once; each commits on its own.
-        let calls = grouped
+        let calls: Vec<_> = grouped
             .into_iter()
             .enumerate()
             .filter(|(_, batch)| !batch.is_empty())
@@ -1802,11 +1832,20 @@ impl Db {
                     .filter_map(|(i, _)| compile_errors.remove(i).map(|error| (*i, error)))
                     .collect();
                 self.shards[shard_idx].call(move |s| Ok(put_many(s, batch, new_edits, verdicts)))
-            });
-        // The lowest shard's error is held back until the validator cache is
-        // dropped: the other shards may have committed design documents.
+            })
+            .collect();
+        // A batch with a design document drops the design caches once every
+        // shard has answered, whether or not one failed: the others may have
+        // committed design documents.
+        let answers = if touches_design {
+            self.invalidating(futures::future::join_all(calls)).await?
+        } else {
+            futures::future::join_all(calls).await
+        };
+        // The lowest shard's error is held back until every shard's results
+        // are in.
         let mut shard_error = None;
-        for answer in futures::future::join_all(calls).await {
+        for answer in answers {
             let results = match answer {
                 Ok(results) => results,
                 Err(error) => {
@@ -1827,10 +1866,6 @@ impl Db {
 
         for (slot, result) in self.put_local_docs(locals).await {
             out[slot] = Some(result);
-        }
-
-        if touches_design {
-            self.invalidate_design_state();
         }
 
         if let Some(error) = shard_error {
@@ -3272,41 +3307,38 @@ impl Db {
             return Ok(false);
         };
         let peers = self.purge_peers(shard, me);
+        let purge = handle.call(move |s| {
+            // Everything is read before the first write: which infos are
+            // new here, and the documents they name.
+            let mut fresh = Vec::new();
+            for info in infos {
+                if !s.has_purge(&info.uuid)? {
+                    fresh.push(info);
+                }
+            }
+            let mut targets = purge_targets(s, fresh.iter().map(|info| info.id.as_str()))?;
+            let mut applied = std::collections::HashSet::new();
+            let mut removed = false;
+            for info in &fresh {
+                // An info listed twice is applied once.
+                if !applied.insert(info.uuid.as_str()) {
+                    continue;
+                }
+                let gone = purge_one(
+                    s,
+                    &info.id,
+                    &info.revs,
+                    PurgeSource::Replayed(&info.uuid),
+                    &peers,
+                    &mut targets,
+                )?;
+                removed |= !gone.is_empty();
+            }
+            Ok(removed)
+        });
         // A purge can remove a design document without taking a sequence,
         // and a failed commit can still land.
-        let result = handle
-            .call(move |s| {
-                // Everything is read before the first write: which infos are
-                // new here, and the documents they name.
-                let mut fresh = Vec::new();
-                for info in infos {
-                    if !s.has_purge(&info.uuid)? {
-                        fresh.push(info);
-                    }
-                }
-                let mut targets = purge_targets(s, fresh.iter().map(|info| info.id.as_str()))?;
-                let mut applied = std::collections::HashSet::new();
-                let mut removed = false;
-                for info in &fresh {
-                    // An info listed twice is applied once.
-                    if !applied.insert(info.uuid.as_str()) {
-                        continue;
-                    }
-                    let gone = purge_one(
-                        s,
-                        &info.id,
-                        &info.revs,
-                        PurgeSource::Replayed(&info.uuid),
-                        &peers,
-                        &mut targets,
-                    )?;
-                    removed |= !gone.is_empty();
-                }
-                Ok(removed)
-            })
-            .await;
-        self.invalidate_design_state();
-        result
+        self.invalidating(purge).await?
     }
 
     /// Apply a read repair to this copy: the given leaves as replicated
@@ -3380,18 +3412,6 @@ impl Db {
         me: usize,
         uuids: &std::collections::BTreeMap<String, String>,
     ) -> DbResult<Value> {
-        let result = self.purge_docs(body, me, uuids).await;
-        // A purge can remove a design document without taking a sequence.
-        self.invalidate_design_state();
-        result
-    }
-
-    async fn purge_docs(
-        &self,
-        body: &Value,
-        me: usize,
-        uuids: &std::collections::BTreeMap<String, String>,
-    ) -> DbResult<Value> {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
@@ -3415,31 +3435,38 @@ impl Db {
             ));
             ids.push(id);
         }
-        let mut done = Vec::new();
+        let mut calls = Vec::new();
         for (index, batch) in grouped.into_iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
             let peers = self.purge_peers(index, me);
-            done.push(
-                self.shards[index]
-                    .call(move |s| {
-                        let mut targets =
-                            purge_targets(s, batch.iter().map(|(_, id, _, _)| id.as_str()))?;
-                        batch
-                            .into_iter()
-                            .map(|(slot, id, requested, assigned)| {
-                                let source = assigned
-                                    .as_deref()
-                                    .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
-                                purge_one(s, &id, &requested, source, &peers, &mut targets)
-                                    .map(|removed| (slot, removed))
-                            })
-                            .collect::<DbResult<Vec<_>>>()
+            calls.push(self.shards[index].call(move |s| {
+                let mut targets = purge_targets(s, batch.iter().map(|(_, id, _, _)| id.as_str()))?;
+                batch
+                    .into_iter()
+                    .map(|(slot, id, requested, assigned)| {
+                        let source = assigned
+                            .as_deref()
+                            .map_or(PurgeSource::Fresh, PurgeSource::Assigned);
+                        purge_one(s, &id, &requested, source, &peers, &mut targets)
+                            .map(|removed| (slot, removed))
                     })
-                    .await,
-            );
+                    .collect::<DbResult<Vec<_>>>()
+            }));
         }
+        // A purge can remove a design document without taking a sequence,
+        // and a failed commit can still land. The shards answer one after
+        // another.
+        let done = self
+            .invalidating(async move {
+                let mut done = Vec::new();
+                for call in calls {
+                    done.push(call.await);
+                }
+                done
+            })
+            .await?;
         let mut removed: Vec<Vec<String>> = ids.iter().map(|_| Vec::new()).collect();
         for batch in done {
             for (slot, revs) in batch? {
@@ -9076,6 +9103,112 @@ mod tests {
         assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
         assert_eq!(db.shard_purge_seqs().await.unwrap(), [0]);
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Hold shard 0's actor with a job that waits for the returned sender;
+    /// returns once the job runs, with the job's answer.
+    async fn hold_shard_0(
+        db: &Db,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<DbResult<()>>,
+    ) {
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::spawn(db.shards[0].call(move |_| {
+            let _ = started_tx.send(());
+            held.recv().map_err(ApiError::internal)
+        }));
+        started.await.unwrap();
+        (release, blocker)
+    }
+
+    /// Drop `request` once its shard job is queued behind the held shard 0,
+    /// then let the job run and wait until the task the request left behind,
+    /// if any, is done with the design caches.
+    async fn drop_after_send<T: Send + 'static>(
+        db: &Db,
+        request: impl std::future::Future<Output = T> + Send + 'static,
+    ) {
+        let (release, blocker) = hold_shard_0(db).await;
+        let request = tokio::spawn(request);
+        while db.shards[0].queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        assert!(request.await.is_err_and(|error| error.is_cancelled()));
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        db.shards[0].barrier().await.unwrap().unwrap();
+        while Arc::strong_count(&db.design) > 1 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A design-document write whose request is dropped after its shard job
+    /// was sent still commits, and the caches then serve the new validator
+    /// and the new design document.
+    #[tokio::test]
+    async fn a_dropped_design_write_invalidates_the_design_caches_once_it_commits() {
+        let (db, root) = purge_test_db("drop-ddoc-write", ShardMap::single(1));
+        let db = Arc::new(db);
+        let id = "_design/v";
+        let old = "function(newDoc) { var old = 1; }";
+        let new = "function(newDoc) { var new_ = 2; }";
+        let written = db
+            .put_docs(vec![json!({"_id": id, "validate_doc_update": old})], true)
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        assert_eq!(db.validation_functions().await.unwrap(), [old]);
+        assert_eq!(db.design_doc(id).await.unwrap()["validate_doc_update"], old);
+
+        let writer = Arc::clone(&db);
+        let update = json!({"_id": id, "_rev": rev, "validate_doc_update": new});
+        drop_after_send(
+            &db,
+            async move { writer.put_docs(vec![update], true).await },
+        )
+        .await;
+
+        assert_eq!(db.validation_functions().await.unwrap(), [new]);
+        assert_eq!(db.design_doc(id).await.unwrap()["validate_doc_update"], new);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge of a design document whose request is dropped after its shard
+    /// job was sent still lands, and the caches then hold neither its
+    /// validator nor the document.
+    #[tokio::test]
+    async fn a_dropped_design_purge_invalidates_the_design_caches_once_it_lands() {
+        let (db, root) = purge_test_db("drop-ddoc-purge", ShardMap::single(1));
+        let db = Arc::new(db);
+        let id = "_design/v";
+        let source = "function(newDoc) { var old = 1; }";
+        let written = db
+            .put_docs(
+                vec![json!({"_id": id, "validate_doc_update": source})],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        assert_eq!(db.validation_functions().await.unwrap(), [source]);
+        db.design_doc(id).await.unwrap();
+
+        let purger = Arc::clone(&db);
+        let body = json!({ id: [rev] });
+        drop_after_send(&db, async move {
+            purger.purge(&body, 0, &Default::default()).await
+        })
+        .await;
+
+        assert!(db.validation_functions().await.unwrap().is_empty());
+        let error = db.design_doc(id).await.unwrap_err();
+        assert_eq!(error.status, 404, "{error:?}");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
