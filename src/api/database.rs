@@ -593,7 +593,9 @@ async fn purge(req: DbRequest<'_>) -> Response {
     let w = num(req.q, "w").unwrap_or(0);
     // The purge and the index invalidation run in a task of their own, so a
     // client that goes away once the purge is sent cannot skip the
-    // invalidation.
+    // invalidation. A purge that fails may still have landed, in part (one
+    // shard's batch before another's failure) or whole (a failed commit can
+    // land), so the indexes are dropped whatever it answered.
     let purged = req
         .db
         .purging(
@@ -616,7 +618,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
                     Ok(purge_results_to_json(results))
                 }
             },
-            Result::is_ok,
+            |_| true,
         )
         .await;
     match purged {
@@ -1046,6 +1048,81 @@ mod tests {
             json!([]),
             "the view still serves the purged document"
         );
+        drop(db);
+        st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A `_purge` that lands on one shard and fails on another answers with
+    /// the failure, and still drops the view indexes: the landed purge must
+    /// not leave its document in them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partly_failed_purge_still_invalidates_the_view_indexes() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-purge-partial-{}", crate::util::uuid()));
+        let st = crate::state::test_state(root.clone(), 2);
+        let db = st.create_db("partial", false, Some(2), None).await.unwrap();
+        let on = |shard: usize, tag: &str| {
+            (0..)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .unwrap()
+        };
+        let (doc, damaged) = (on(0, "doc"), on(1, "damaged"));
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": doc}),
+                    json!({"_id": "_design/d",
+                           "views": {"v": {"map": "function(doc) { emit(doc._id, null); }"}}}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let (status, indexed) = request(&st, Method::GET, "/partial/_design/d/_view/v").await;
+        assert_eq!(status, StatusCode::OK, "{indexed}");
+        assert!(indexed["rows"].to_string().contains(&doc), "{indexed}");
+        let indexes = || {
+            std::fs::read_dir(db.path.join("_view_indexes"))
+                .unwrap()
+                .count()
+        };
+        assert_ne!(indexes(), 0, "the view built no index file");
+        // Shard 1's purge cannot read the damaged document's metadata.
+        let key = damaged.clone();
+        db.shard_handle(1)
+            .call(move |s| {
+                s.put_unsealed(crate::kv::META, key.as_str(), br#"{"tree":{},"seq":9}"#);
+                // A job that wrote nothing through the shard commits nothing.
+                Ok(s.put_local("setup", b"1")?)
+            })
+            .await
+            .unwrap();
+
+        let body = json!({ doc.clone(): [rev], damaged: ["1-ffffffffffffffffffffffffffffffff"] });
+        let (status, failed) = request_with(
+            &st,
+            Method::POST,
+            "/partial/_purge",
+            Bytes::from(body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{failed}");
+        assert!(
+            failed["reason"].to_string().contains("checksum"),
+            "{failed}"
+        );
+        let gone = db.get_doc(&doc, &crate::db::DocOpts::default()).await;
+        assert_eq!(
+            gone.unwrap_err().status,
+            404,
+            "shard 0's purge did not land"
+        );
+        // The damaged record would fail the rebuild a query starts, so the
+        // index files are looked at instead: the invalidation removed them.
+        assert_eq!(indexes(), 0, "the view index outlived the purge");
         drop(db);
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
