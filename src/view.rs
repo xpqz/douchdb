@@ -108,8 +108,8 @@ struct ViewIndex {
     db: Option<Database>,
     /// Where the file is; `None` for an index over a test backend.
     file: Option<PathBuf>,
-    /// Set when the index is removed (cleaned up, its database
-    /// deleted): its file then closes without the close-time check.
+    /// Set when the index is removed (cleaned up, its database deleted): its
+    /// file then closes without the close-time check.
     retired: Arc<AtomicBool>,
     cursor: IndexCursor,
     design: String,
@@ -1481,9 +1481,9 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 /// Gate for a database's view index files. A query holds the read side
 /// while it uses an index; `cleanup` takes the write side, so it never
 /// deletes a file under a live handle and a new open never races with the
-/// removal. One gate per database keeps other databases
-/// independent. The gate is taken once per call, in `ensure_rows` only, so no
-/// path re-acquires it while a writer waits.
+/// removal. One gate per database keeps other databases independent. The
+/// gate is taken once per call, in `ensure_rows` only, so no path
+/// re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<Gate> {
     gates().get(&db.path)
 }
@@ -2315,7 +2315,7 @@ async fn ensure_rows(
         // it cannot be served. As a search index does, check that the copies
         // are still the ones the index records, with nothing purged since,
         // and rebuild at once if not.
-        if index.cursor.same_copies(&db.index_cursor()) {
+        if index.cursor.same_copies_unpurged(&db.index_cursor()) {
             return blocking(move || {
                 let _gate = gate;
                 index.sorted_rows().map_err(ApiError::from)
@@ -4278,10 +4278,14 @@ mod tests {
     }
 
     /// A purge leaves no change row. One that lands while an update catches
-    /// the index up, after the update read the shard, must not leave the
-    /// purged document in the index: the next query rebuilds it.
+    /// the index up (behind the update's read of the shard) must not leave
+    /// the purged document in the index: by the next query at the latest,
+    /// the index is rebuilt. Whether the update's own re-check or the next
+    /// query rebuilds depends on when the purge commits. That a full rebuild
+    /// takes the cursor before it reads is not tested: its reads go through
+    /// leases, off the actor, and cannot be lined up with a purge.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_purge_during_catch_up_leads_to_a_rebuild() {
+    async fn a_purge_during_an_update_is_noticed_by_the_next_query() {
         let (db, root) = two_shard_view_db("viewpurgerace");
         let db = Arc::new(db);
         let on_shard = |shard: usize, tag: &str| {
@@ -4309,9 +4313,9 @@ mod tests {
         // Shard 1 has a change to catch up on.
         db.put_docs(vec![json!({"_id": late})], true).await.unwrap();
 
-        // Hold shard 1's actor. The update's read of shard 1 queues behind
-        // it, then the purge behind that, so the read sees the document and
-        // the purge commits once it is read.
+        // Hold shard 1's actor. The update's read of shard 1's new change
+        // queues behind it, then the purge behind that, so the purge commits
+        // after the update checked the cursor and read the shard.
         let shard = db.shard_handle(1);
         let (started_tx, started) = tokio::sync::oneshot::channel();
         let (release, held) = std::sync::mpsc::channel::<()>();

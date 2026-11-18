@@ -606,30 +606,33 @@ async fn purge(req: DbRequest<'_>) -> Response {
     } else {
         None
     };
-    let purged = req
-        .db
-        .purging(move |db| async move {
-            let _slot = slot;
-            let cluster = &st.ctx.cluster;
-            if !coordinating {
-                let request = Value::Object(map);
-                // A peer's request carries the uuid the coordinator chose.
-                let (request, uuids) = if cluster.is_internal(&headers) {
-                    crate::db::split_purge_uuids(&request)
-                } else {
-                    (request, Default::default())
-                };
-                let purged = db.purge(&request, cluster.me, &uuids).await?;
-                Ok(json(StatusCode::CREATED, purged))
+    // The purge runs in a task of its own, carrying the request's peer
+    // accounting, so a coordinated purge's forwarded calls outlive a client
+    // that goes away. The view and search indexes need no telling: each
+    // records every shard's purge sequence and rebuilds once one moves.
+    let db = Arc::clone(req.db);
+    let purge = tokio::spawn(crate::cluster_http::in_request_scope(async move {
+        let _slot = slot;
+        let cluster = &st.ctx.cluster;
+        if !coordinating {
+            let request = Value::Object(map);
+            // A peer's request carries the uuid the coordinator chose.
+            let (request, uuids) = if cluster.is_internal(&headers) {
+                crate::db::split_purge_uuids(&request)
             } else {
-                let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
-                Ok(purge_results_to_json(results))
-            }
-        })
-        .await;
-    match purged {
+                (request, Default::default())
+            };
+            let purged = db.purge(&request, cluster.me, &uuids).await?;
+            Ok::<_, ApiError>(json(StatusCode::CREATED, purged))
+        } else {
+            let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
+            Ok(purge_results_to_json(results))
+        }
+    }));
+    match purge.await {
         Ok(Ok(response)) => response,
-        Err(e) | Ok(Err(e)) => fail(e),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(ApiError::internal(format!("purging: {e}"))),
     }
 }
 

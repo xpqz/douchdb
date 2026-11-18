@@ -1554,7 +1554,19 @@ impl<'s> ShardTxn<'s> {
         if std::mem::take(&mut shard.fail_next_commit) {
             anyhow::bail!("injected commit failure");
         }
-        txn.commit()?;
+        if let Err(error) = txn.commit() {
+            // A commit that reports an error may have landed, and the reopen
+            // that follows may fail too, leaving no way to tell. A purge it
+            // may hold is published meanwhile, so an index that read the
+            // shard before it rebuilds rather than serve a purged document;
+            // a reopen that succeeds publishes what the file holds.
+            if staged.purge_seq != shard.settings.purge_seq {
+                shard
+                    .shared_purge_seq
+                    .store(staged.purge_seq, Ordering::SeqCst);
+            }
+            return Err(error.into());
+        }
         // Before any caller hears back, so a compaction catching up cannot
         // miss an acknowledged write.
         if cleared {
@@ -5248,6 +5260,47 @@ mod recovery_tests {
 
         assert_eq!(rig.handle.state(), ShardState::Serving);
         assert_eq!(rig.handle.purge_seq(), 1, "the landed purge is published");
+    }
+
+    /// A purge whose commit reports an error may have landed. If the reopen
+    /// after it fails too, the shard cannot tell, so it publishes the purge
+    /// sequence the commit would have reached: an index that read the shard
+    /// before it rebuilds (and meets the failed shard) rather than serve
+    /// the purged document.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_purge_commit_whose_reopen_fails_publishes_the_purge() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+
+        rig.switch.fail_syncs_after(1, ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move {
+                handle
+                    .call(|txn| {
+                        let info = PurgeInfo {
+                            uuid: "landed".to_string(),
+                            id: "gone".to_string(),
+                            revs: vec![format!("1-{:032x}", 1)],
+                        };
+                        Ok(txn.record_purge(&info, &[])?)
+                    })
+                    .await
+            }
+        });
+        reopening(&mut rig, &mut failing).await;
+        // The file cannot be read, so the reopen fails.
+        rig.switch.fail_reads(ErrorKind::Other);
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert!(matches!(rig.handle.state(), ShardState::Failed(_)));
+        assert_eq!(
+            rig.handle.purge_seq(),
+            1,
+            "the purge that may have landed is not published"
+        );
     }
 
     /// A commit whose first sync, of its pages, fails never lands: the

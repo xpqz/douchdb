@@ -266,7 +266,7 @@ impl IndexCursor {
     /// Whether two cursors are over the same shard copies (same uuids, in
     /// order) with nothing purged from either since: rows read up to one
     /// can be carried up to the other by the changes in between.
-    pub fn same_copies(&self, other: &IndexCursor) -> bool {
+    pub fn same_copies_unpurged(&self, other: &IndexCursor) -> bool {
         self.0.len() == other.0.len()
             && self
                 .0
@@ -282,7 +282,7 @@ impl IndexCursor {
 /// change row to follow). Otherwise it is rebuilt from 0.
 pub fn cursor_valid(cursor: &IndexCursor, db: &Db) -> bool {
     let current = db.index_cursor();
-    cursor.same_copies(&current)
+    cursor.same_copies_unpurged(&current)
         && cursor
             .0
             .iter()
@@ -1124,26 +1124,6 @@ impl Db {
         })
         .await
         .map_err(|error| ApiError::internal(format!("invalidating the design caches: {error}")))
-    }
-
-    /// Run the purge `purge` makes in a task of its own, carrying the
-    /// request's peer accounting: a coordinated purge's forwarded calls
-    /// outlive a caller that stops waiting. The view and search indexes
-    /// need no telling: each records the purge sequence of every shard it
-    /// read and rebuilds once one moves.
-    pub(crate) async fn purging<T, F>(
-        self: &Arc<Self>,
-        purge: impl FnOnce(Arc<Self>) -> F,
-    ) -> DbResult<T>
-    where
-        T: Send + 'static,
-        F: std::future::Future<Output = T> + Send + 'static,
-    {
-        tokio::spawn(crate::cluster_http::in_request_scope(purge(Arc::clone(
-            self,
-        ))))
-        .await
-        .map_err(|error| ApiError::internal(format!("purging: {error}")))
     }
 
     /// Generation of this node's design documents.
