@@ -442,6 +442,12 @@ fn decode_u64(table: Table, value: &[u8]) -> Result<u64> {
         .map_err(|_| anyhow::anyhow!("{table:?} table: a number of {} bytes", value.len()))
 }
 
+/// The purge sequence a shard's handle publishes while it cannot know its
+/// own: after a commit that may have recorded a purge or cleared the shard
+/// failed, until a reopen publishes what the file holds. No shard records
+/// this many purges, so no index cursor that holds it is ever current.
+const UNKNOWN_PURGE_SEQ: u64 = u64::MAX;
+
 /// The shard's scalar state, as stored in its settings table, and its purge
 /// sequence, which the purge infos table holds (the key of its newest info).
 #[derive(Clone, Debug, PartialEq)]
@@ -1556,14 +1562,18 @@ impl<'s> ShardTxn<'s> {
         }
         if let Err(error) = txn.commit() {
             // A commit that reports an error may have landed, and the reopen
-            // that follows may fail too, leaving no way to tell. A purge it
-            // may hold is published meanwhile, so an index that read the
-            // shard before it rebuilds rather than serve a purged document;
-            // a reopen that succeeds publishes what the file holds.
-            if staged.purge_seq != shard.settings.purge_seq {
+            // that follows may fail too, leaving no way to tell. If it may
+            // hold a purge or a clear, the purge sequence is unknown until a
+            // reopen publishes what the file holds: an index that read the
+            // shard before must rebuild rather than serve what may be gone.
+            // The value published meanwhile is one no purge sequence ever
+            // reaches, so an index that records it can never take it for
+            // current later (the staged value could come back with the next
+            // real purge, over rows read before it).
+            if staged.purge_seq != shard.settings.purge_seq || staged.uuid != shard.settings.uuid {
                 shard
                     .shared_purge_seq
-                    .store(staged.purge_seq, Ordering::SeqCst);
+                    .store(UNKNOWN_PURGE_SEQ, Ordering::SeqCst);
             }
             return Err(error.into());
         }
@@ -3212,8 +3222,10 @@ impl ShardHandle {
 
     /// The shard's purge sequence as of its last commit: how many purge
     /// infos it has recorded. A purge leaves no change row, so an index
-    /// learns of one by this moving.
-    pub fn purge_seq(&self) -> u64 {
+    /// learns of one by this moving. While a failed commit's outcome is
+    /// unknown it is [`UNKNOWN_PURGE_SEQ`], which no index may treat as a
+    /// count: it is for index cursors only, never for clients.
+    pub(crate) fn purge_seq(&self) -> u64 {
         self.purge_seq.load(Ordering::SeqCst)
     }
 
@@ -5298,8 +5310,82 @@ mod recovery_tests {
         assert!(matches!(rig.handle.state(), ShardState::Failed(_)));
         assert_eq!(
             rig.handle.purge_seq(),
-            1,
-            "the purge that may have landed is not published"
+            UNKNOWN_PURGE_SEQ,
+            "the purge that may have landed is not published as unknown"
+        );
+    }
+
+    /// A purge sequence published while a failed commit's reopen runs must
+    /// never be one the shard reaches later. Here the purge's commit fails
+    /// without landing and the reopen succeeds: an index that took the
+    /// published value during the reopen (as a rebuild started then would)
+    /// must not find it current again after the next real purge, or it would
+    /// serve rows read before that purge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_sequence_published_while_a_failed_commit_reopens_is_never_reached() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        let info = |uuid: &str| PurgeInfo {
+            uuid: uuid.to_string(),
+            id: "gone".to_string(),
+            revs: vec![format!("1-{:032x}", 1)],
+        };
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            let info = info("lost");
+            async move {
+                handle
+                    .call(move |txn| Ok(txn.record_purge(&info, &[])?))
+                    .await
+            }
+        });
+        reopening(&mut rig, &mut failing).await;
+        let during = rig.handle.purge_seq();
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        failing.await.unwrap().unwrap_err();
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.purge_seq(), 0, "the lost purge is published");
+
+        let real = info("real");
+        rig.handle
+            .call(move |txn| Ok(txn.record_purge(&real, &[])?))
+            .await
+            .unwrap();
+        assert_eq!(rig.handle.purge_seq(), 1);
+        assert_ne!(
+            during,
+            rig.handle.purge_seq(),
+            "a value published during the reopen came back with a real purge"
+        );
+    }
+
+    /// The same for a failed clear: it stages a new uuid and a purge
+    /// sequence of 0, while the published uuid stays the old one. Publishing
+    /// that 0 would pair the old uuid with a value an index built before any
+    /// purge recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_clear_never_publishes_a_purge_sequence_of_the_old_copy() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        let before = rig.handle.purge_seq();
+        assert_eq!(before, 0);
+
+        rig.switch.fail_writes(ErrorKind::StorageFull);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move { handle.call(|txn| Ok(txn.clear()?)).await }
+        });
+        reopening(&mut rig, &mut failing).await;
+        let during = rig.handle.purge_seq();
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        failing.await.unwrap().unwrap_err();
+        assert_ne!(
+            during, before,
+            "an index built before the clear still looks current during the reopen"
         );
     }
 
