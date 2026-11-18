@@ -1632,10 +1632,9 @@ impl Db {
     }
 
     async fn store_pending_shard_map(&self, map: Option<ShardMap>) -> DbResult<()> {
+        // A clear writes even with nothing pending in memory: a pending map
+        // whose write failed yet landed may be on disk.
         let writing = self.lock_settings().await;
-        if map.is_none() && self.pending_shard_map().is_none() {
-            return Ok(());
-        }
         let bytes = map.as_ref().map(to_json).transpose()?;
         let pending = self.pending_shard_map.clone();
         self.store_setting(writing, PENDING_SHARD_MAP_SETTING, bytes, move || {
@@ -7171,6 +7170,77 @@ mod tests {
             .security;
         assert_eq!(on_disk, (version + 1, landed), "the write landed");
         assert_eq!(db.security_versioned(), on_disk);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether shard 0 holds a pending shard map, read through its actor.
+    async fn pending_map_on_disk(db: &Db) -> bool {
+        stored_rows(db)
+            .await
+            .iter()
+            .any(|(name, _)| name == PENDING_SHARD_MAP_SETTING)
+    }
+
+    /// A clear with no pending map in memory still removes one on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_the_pending_shard_map_removes_one_memory_does_not_hold() {
+        let (db, root, _switch) = db_on_test_disk("clearondisk").await;
+        let map = to_json(&ShardMap::single(1)).unwrap();
+        db.shards[0]
+            .call(move |s| Ok(s.put_setting(PENDING_SHARD_MAP_SETTING, &map)?))
+            .await
+            .unwrap();
+        assert!(db.pending_shard_map().is_none());
+        assert!(pending_map_on_disk(&db).await);
+
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
+        assert!(!pending_map_on_disk(&db).await, "the clear left it on disk");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pending map whose write fails yet lands while shard 0 fails is in
+    /// neither memory nor reach until the shard serves again. A clear
+    /// meanwhile cannot reach the disk, so it is an error, not an ok over a
+    /// map that the parked read back then installs; once the shard serves,
+    /// a clear removes it from memory and disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_a_pending_shard_map_that_landed_while_shard_0_failed() {
+        let (db, root, switch) = db_on_test_disk("clearlanded").await;
+        // Every sync from the header's on fails, so the reopen fails too.
+        switch.fail_syncs_after(1, std::io::ErrorKind::Other);
+        let error = db
+            .set_pending_shard_map(&ShardMap::single(1))
+            .await
+            .unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+        assert!(db.pending_shard_map().is_none());
+
+        assert!(
+            db.clear_pending_shard_map().await.is_err(),
+            "a clear that wrote nothing answered ok"
+        );
+
+        // The fault clears and a request has shard 0 retry: the landed map
+        // is read back.
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        assert!(pending_map_on_disk(&db).await, "the write landed");
+        assert_eq!(db.pending_shard_map(), Some(ShardMap::single(1)));
+
+        db.clear_pending_shard_map().await.unwrap();
+        assert!(db.pending_shard_map().is_none());
+        assert!(!pending_map_on_disk(&db).await);
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
