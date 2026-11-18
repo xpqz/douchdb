@@ -324,9 +324,10 @@ impl PullCtx<'_> {
                 .collect();
             batches.push(infos);
         }
-        // Applied in a task that then invalidates the indexes, also when a
-        // later shard fails after an earlier one removed a revision: a
-        // dropped or failed pull cannot leave them serving purged documents.
+        // Applied in a task that then invalidates the indexes when a shard
+        // removed a revision or failed (a failed commit can land, and the
+        // next pass would skip its infos as recorded): a dropped or failed
+        // pull cannot leave them serving purged documents.
         let me = self.cluster.me;
         let ((_, applied), indexes) = self
             .db
@@ -341,7 +342,7 @@ impl PullCtx<'_> {
                     }
                     (removed, Ok(()))
                 },
-                |(removed, _)| *removed,
+                |(removed, applied)| *removed || applied.is_err(),
             )
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -1520,6 +1521,21 @@ mod tests {
     /// drop the view indexes even when a later shard's infos fail to apply.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_purge_pull_failing_on_a_later_shard_still_invalidates_the_view_indexes() {
+        pull_failing_purge(true).await;
+    }
+
+    /// A shard whose purge infos fail to apply may still have committed
+    /// them, and would then skip them on the next pass: the view indexes are
+    /// dropped although no shard reported a removed revision.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_pull_failing_alone_still_invalidates_the_view_indexes() {
+        pull_failing_purge(false).await;
+    }
+
+    /// Pull purge infos whose shard 1 entry names a document with damaged
+    /// metadata, so that shard's apply fails, after a shard 0 entry that
+    /// purges a document if `purge_doc`; the view indexes must go.
+    async fn pull_failing_purge(purge_doc: bool) {
         let root =
             std::env::temp_dir().join(format!("douchdb-ae-purge-fail-{}", crate::util::uuid()));
         let db = Arc::new(
@@ -1571,8 +1587,13 @@ mod tests {
             .await
             .expect("damage");
 
+        let first = if purge_doc {
+            json!({"purge_seq": 1, "infos": [{"uuid": crate::util::uuid(), "id": doc, "revs": [rev]}]})
+        } else {
+            json!({"purge_seq": 0, "infos": []})
+        };
         let infos = json!({"shards": [
-            {"purge_seq": 1, "infos": [{"uuid": crate::util::uuid(), "id": doc, "revs": [rev]}]},
+            first,
             {"purge_seq": 1, "infos": [{"uuid": crate::util::uuid(), "id": damaged,
                                         "revs": ["1-ffffffffffffffffffffffffffffffff"]}]}
         ]});
@@ -1606,12 +1627,8 @@ mod tests {
         .expect_err("a damaged document was purged");
         assert!(error.to_string().contains("checksum"), "{error}");
 
-        let gone = db.get_doc(&doc, &crate::db::DocOpts::default()).await;
-        assert_eq!(
-            gone.unwrap_err().status,
-            404,
-            "shard 0's purge did not land"
-        );
+        let kept = db.get_doc(&doc, &crate::db::DocOpts::default()).await;
+        assert_eq!(kept.is_err(), purge_doc, "shard 0's purge: {kept:?}");
         // The damaged record would fail the rebuild a query starts, so the
         // index files are looked at instead: the invalidation removed them.
         let indexes = std::fs::read_dir(db.path.join("_view_indexes")).expect("index directory");

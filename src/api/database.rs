@@ -595,6 +595,17 @@ async fn purge(req: DbRequest<'_>) -> Response {
     let name = req.name.to_string();
     let headers = req.headers.clone();
     let w = num(req.q, "w").unwrap_or(0);
+    let cluster = &req.st.ctx.cluster;
+    let coordinating = cluster.is_clustered() && !cluster.is_internal(req.headers);
+    // A coordinated purge's forwarded calls outlive a client that goes
+    // away, so they hold a detached-write slot, as replica writes do: a
+    // slow peer pushes back on new purges rather than piling them up. A
+    // peer's request (node-to-node traffic) takes none.
+    let slot = if coordinating {
+        st.admission.acquire_detached().await
+    } else {
+        None
+    };
     // The purge and the index invalidation run in a task of their own, so a
     // client that goes away once the purge is sent cannot skip the
     // invalidation. A purge that fails may still have landed, in part (one
@@ -604,8 +615,9 @@ async fn purge(req: DbRequest<'_>) -> Response {
         .db
         .purging(
             move |db| async move {
+                let _slot = slot;
                 let cluster = &st.ctx.cluster;
-                if !cluster.is_clustered() || cluster.is_internal(&headers) {
+                if !coordinating {
                     let request = Value::Object(map);
                     // A peer's request carries the uuid the coordinator chose.
                     let (request, uuids) = if cluster.is_internal(&headers) {
