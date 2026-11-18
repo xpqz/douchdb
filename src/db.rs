@@ -242,40 +242,52 @@ impl ShardSince {
     }
 }
 
-/// How far an index (view or search) has read each shard: the shard copy's
-/// uuid and its sequence.
+/// How far an index has read one shard: the shard copy's uuid, its sequence,
+/// and its purge sequence (CouchDB's index `purge_seq`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct IndexCursor(pub Vec<(String, u64)>);
+pub struct ShardPosition {
+    pub uuid: String,
+    pub seq: u64,
+    pub purge_seq: u64,
+}
+
+/// How far an index (view or search) has read each shard, by shard index.
+/// A cursor stored in another shape fails to parse, and its index is
+/// rebuilt.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexCursor(pub Vec<ShardPosition>);
 
 impl IndexCursor {
     /// The positions alone, for a changes read.
     pub fn since(&self) -> ShardSince {
-        ShardSince(self.0.iter().map(|(_, seq)| *seq).collect())
+        ShardSince(self.0.iter().map(|position| position.seq).collect())
     }
 
     /// Whether two cursors are over the same shard copies (same uuids, in
-    /// order).
+    /// order) with nothing purged from either since: rows read up to one
+    /// can be carried up to the other by the changes in between.
     pub fn same_copies(&self, other: &IndexCursor) -> bool {
         self.0.len() == other.0.len()
             && self
                 .0
                 .iter()
                 .zip(&other.0)
-                .all(|((left, _), (right, _))| left == right)
+                .all(|(left, right)| left.uuid == right.uuid && left.purge_seq == right.purge_seq)
     }
 }
 
 /// Whether an index that has read up to `cursor` can be brought up to date
-/// incrementally: it read these very shard copies (same uuids) and none of
-/// them is behind it. Otherwise it is rebuilt from 0.
+/// incrementally: it read these very shard copies (same uuids), none of
+/// them is behind it, and none has purged anything since (a purge leaves no
+/// change row to follow). Otherwise it is rebuilt from 0.
 pub fn cursor_valid(cursor: &IndexCursor, db: &Db) -> bool {
-    let current = db.shard_seqs();
-    cursor.0.len() == current.len()
+    let current = db.index_cursor();
+    cursor.same_copies(&current)
         && cursor
             .0
             .iter()
-            .zip(&current)
-            .all(|((uuid, seq), (now_uuid, now_seq))| uuid == now_uuid && seq <= now_seq)
+            .zip(&current.0)
+            .all(|(recorded, now)| recorded.seq <= now.seq)
 }
 
 /// Whether the shard at `index` is selected by an `owned` mask: every shard
@@ -1114,41 +1126,24 @@ impl Db {
         .map_err(|error| ApiError::internal(format!("invalidating the design caches: {error}")))
     }
 
-    /// Run the purge `purge` makes in a task of its own (carrying the
-    /// request's peer accounting), then drop the view and search indexes
-    /// if `stale` says it may have removed a revision: a purge leaves no
-    /// change row, so the indexes cannot follow it. A caller that stops
-    /// waiting cannot leave them serving purged documents. The purge's
-    /// outcome, then the invalidation's (`Ok` when there was none).
+    /// Run the purge `purge` makes in a task of its own, carrying the
+    /// request's peer accounting: a coordinated purge's forwarded calls
+    /// outlive a caller that stops waiting. The view and search indexes
+    /// need no telling: each records the purge sequence of every shard it
+    /// read and rebuilds once one moves.
     pub(crate) async fn purging<T, F>(
         self: &Arc<Self>,
         purge: impl FnOnce(Arc<Self>) -> F,
-        stale: impl FnOnce(&T) -> bool + Send + 'static,
-    ) -> DbResult<(T, DbResult<()>)>
+    ) -> DbResult<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
-        let purge = purge(Arc::clone(self));
-        let db = Arc::clone(self);
-        tokio::spawn(crate::cluster_http::in_request_scope(async move {
-            let done = purge.await;
-            let indexes = if stale(&done) {
-                db.invalidate_indexes().await
-            } else {
-                Ok(())
-            };
-            (done, indexes)
-        }))
+        tokio::spawn(crate::cluster_http::in_request_scope(purge(Arc::clone(
+            self,
+        ))))
         .await
-        .map_err(|error| ApiError::internal(format!("invalidating the indexes: {error}")))
-    }
-
-    /// Drop every view and search index of this database; they are rebuilt
-    /// on their next query.
-    async fn invalidate_indexes(&self) -> DbResult<()> {
-        crate::view::invalidate(self).await?;
-        crate::search::cleanup(self).await
+        .map_err(|error| ApiError::internal(format!("purging: {error}")))
     }
 
     /// Generation of this node's design documents.
@@ -1563,6 +1558,24 @@ impl Db {
             .iter()
             .map(|shard| (shard.uuid(), shard.committed_seq()))
             .collect()
+    }
+
+    /// Every shard's uuid, committed position and purge sequence, by shard
+    /// index: what an index records as read when it reads the shards now.
+    /// The purge sequences are taken before an index reads anything, so a
+    /// purge that lands while it reads leaves the recorded one behind, and
+    /// the next use rebuilds.
+    pub fn index_cursor(&self) -> IndexCursor {
+        IndexCursor(
+            self.shards
+                .iter()
+                .map(|shard| ShardPosition {
+                    purge_seq: shard.purge_seq(),
+                    uuid: shard.uuid(),
+                    seq: shard.committed_seq(),
+                })
+                .collect(),
+        )
     }
 
     /// Where a feed starts on each shard of this node, for a `since` that
@@ -3339,16 +3352,15 @@ impl Db {
     }
 
     /// Record purge infos another copy of `shard` made and purge what they
-    /// list. Infos already recorded here are skipped. Whether any revision was
-    /// removed.
+    /// list. Infos already recorded here are skipped.
     pub async fn apply_purge_infos(
         &self,
         shard: usize,
         infos: Vec<PurgeInfo>,
         me: usize,
-    ) -> DbResult<bool> {
+    ) -> DbResult<()> {
         let Some(handle) = self.shards.get(shard) else {
-            return Ok(false);
+            return Ok(());
         };
         let peers = self.purge_peers(shard, me);
         let purge = handle.call(move |s| {
@@ -3362,13 +3374,12 @@ impl Db {
             }
             let mut targets = purge_targets(s, fresh.iter().map(|info| info.id.as_str()))?;
             let mut applied = std::collections::HashSet::new();
-            let mut removed = false;
             for info in &fresh {
                 // An info listed twice is applied once.
                 if !applied.insert(info.uuid.as_str()) {
                     continue;
                 }
-                let gone = purge_one(
+                purge_one(
                     s,
                     &info.id,
                     &info.revs,
@@ -3376,9 +3387,8 @@ impl Db {
                     &peers,
                     &mut targets,
                 )?;
-                removed |= !gone.is_empty();
             }
-            Ok(removed)
+            Ok(())
         });
         // A purge can remove a design document without taking a sequence,
         // and a failed commit can still land.
@@ -9014,19 +9024,124 @@ mod tests {
             revs: vec![rev.clone()],
         };
 
-        assert!(db
-            .apply_purge_infos(0, vec![info.clone()], 0)
+        db.apply_purge_infos(0, vec![info.clone()], 0)
             .await
-            .unwrap());
+            .unwrap();
         assert_eq!(db.shard_purge_seqs().await.unwrap().iter().sum::<u64>(), 1);
         assert!(db.get_doc("a", &DocOpts::default()).await.is_err());
 
         db.put_docs(vec![doc], false).await.unwrap();
-        assert!(!db.apply_purge_infos(0, vec![info], 0).await.unwrap());
+        db.apply_purge_infos(0, vec![info], 0).await.unwrap();
         assert_eq!(db.shard_purge_seqs().await.unwrap().iter().sum::<u64>(), 1);
         assert!(db.get_doc("a", &DocOpts::default()).await.is_ok());
 
         drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The ids view `_design/d/v` of `db` serves.
+    async fn view_ids(db: &Db) -> Vec<String> {
+        let query = crate::view::ViewQuery {
+            limit: usize::MAX,
+            inclusive_end: true,
+            ..Default::default()
+        };
+        let rows = crate::view::query(db, "_design/d", "v", &query)
+            .await
+            .unwrap();
+        rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The ids search index `_design/d/i` of `db` finds for `name:fig`.
+    async fn search_ids(db: &Db) -> Vec<String> {
+        let request = crate::search::SearchRequest {
+            query: "name:fig".to_string(),
+            ..Default::default()
+        };
+        let limits = crate::view::ViewQuery::default().limits;
+        let found = crate::search::query(db, "_design/d", "i", &request, limits)
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A purge that lands on the shard while nothing drops the indexes (a
+    /// crash before the invalidation, here a purge that never asks for one):
+    /// once the database is opened again from scratch, the view and the
+    /// search index see that the shard's purge sequence moved past the one
+    /// they recorded, and no longer serve the purged document.
+    #[tokio::test]
+    async fn indexes_drop_a_purged_document_after_a_restart() {
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        let root = std::env::temp_dir().join(format!("douchdb-purge-restart-{}", uuid()));
+        let open = || {
+            Db::open_or_create(
+                &root,
+                "purgerestart",
+                DbConfig {
+                    q: 1,
+                    revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: ShardMap::single(1),
+                    partitioned: false,
+                },
+            )
+            .unwrap()
+        };
+        let db = open();
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": "_design/d",
+                           "views": {"v": {"map": "function(doc) { emit(doc._id, null); }"}},
+                           "indexes": {"i": {"index": "function(doc) { index('name', doc.name); }"}}}),
+                    json!({"_id": "a", "name": "fig"}),
+                    json!({"_id": "b", "name": "fig"}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        assert_eq!(view_ids(&db).await, ["a", "b"]);
+        assert_eq!(search_ids(&db).await, ["a", "b"]);
+
+        db.purge(&json!({ "a": [rev] }), 0, &Default::default())
+            .await
+            .unwrap();
+        // Closed as a crash leaves it: the index files stay as they were.
+        let path = db.path.clone();
+        drop(db);
+        crate::view::forget_db(&path).await;
+        crate::search::forget_db(&path).await;
+
+        let db = open();
+        assert_eq!(
+            view_ids(&db).await,
+            ["b"],
+            "the view serves a purged document"
+        );
+        assert_eq!(
+            search_ids(&db).await,
+            ["b"],
+            "the search index serves a purged document"
+        );
+        let path = db.path.clone();
+        drop(db);
+        crate::view::forget_db(&path).await;
+        crate::search::forget_db(&path).await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9486,7 +9601,7 @@ mod tests {
             id: "_design/v".to_string(),
             revs: vec![rev],
         };
-        assert!(db.apply_purge_infos(0, vec![info], 0).await.unwrap());
+        db.apply_purge_infos(0, vec![info], 0).await.unwrap();
         assert_design_caches_forgotten(&db).await;
         drop(db);
         let _ = std::fs::remove_dir_all(root);

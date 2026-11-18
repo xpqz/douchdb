@@ -442,7 +442,8 @@ fn decode_u64(table: Table, value: &[u8]) -> Result<u64> {
         .map_err(|_| anyhow::anyhow!("{table:?} table: a number of {} bytes", value.len()))
 }
 
-/// The shard's scalar state, as stored in its settings table.
+/// The shard's scalar state, as stored in its settings table, and its purge
+/// sequence, which the purge infos table holds (the key of its newest info).
 #[derive(Clone, Debug, PartialEq)]
 struct Settings {
     uuid: String,
@@ -451,6 +452,7 @@ struct Settings {
     deleted: u64,
     revs_limit: u64,
     purged_infos_limit: u64,
+    purge_seq: u64,
 }
 
 /// Give a new file every table, a uuid, its sequence and counters in one
@@ -619,6 +621,10 @@ fn load_settings(
             .map(number)
             .transpose()?
             .unwrap_or(DEFAULT_PURGED_INFOS_LIMIT),
+        purge_seq: txn
+            .open_table(PURGE_INFOS)?
+            .last()?
+            .map_or(0, |(seq, _)| seq.value()),
     })
 }
 
@@ -682,6 +688,8 @@ pub struct Shard {
     default_revs_limit: u64,
     /// `settings.uuid`, shared with the shard's handle once it has one.
     shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
+    /// `settings.purge_seq`, shared with the shard's handle.
+    shared_purge_seq: Arc<AtomicU64>,
     /// Live document id -> winning revision, built lazily on the first
     /// `_all_docs` range query and then maintained in memory.
     live: Option<BTreeMap<String, LiveDoc>>,
@@ -753,6 +761,7 @@ impl Shard {
     ) -> Result<Shard> {
         let db = open()?;
         let settings = check_shard(&db, &name, revs_limit)?;
+        let shared_purge_seq = Arc::new(AtomicU64::new(settings.purge_seq));
         Ok(Shard {
             gate: Gate::new(db),
             open,
@@ -764,6 +773,7 @@ impl Shard {
             settings,
             default_revs_limit: revs_limit,
             shared_uuid: None,
+            shared_purge_seq,
             live: None,
             rank_cursor: None,
             scanned: Arc::new(AtomicU64::new(0)),
@@ -865,6 +875,8 @@ impl Shard {
                             found.uuid.clone();
                     }
                 }
+                self.shared_purge_seq
+                    .store(found.purge_seq, Ordering::SeqCst);
                 self.settings = found;
                 self.checkup.served();
                 if matches!(*state, ShardState::Failed(_)) {
@@ -1555,6 +1567,11 @@ impl<'s> ShardTxn<'s> {
                 *shared.write().unwrap_or_else(|poison| poison.into_inner()) = staged.uuid.clone();
             }
         }
+        // Before any caller hears back, so a purge that was acknowledged is
+        // inside the purge sequence an index checks.
+        shard
+            .shared_purge_seq
+            .store(staged.purge_seq, Ordering::SeqCst);
         shard.settings = staged;
         if reset_indexes {
             shard.release_indexes();
@@ -2435,6 +2452,7 @@ impl<'s> ShardTxn<'s> {
                 &seq_bytes,
             )?;
         }
+        self.staged.purge_seq = seq;
         Ok(())
     }
 
@@ -2536,6 +2554,8 @@ impl<'s> ShardTxn<'s> {
         self.staged.uuid = crate::util::uuid();
         self.staged.docs = 0;
         self.staged.deleted = 0;
+        // The purge infos went with the rest.
+        self.staged.purge_seq = 0;
         self.reset_indexes = true;
         self.cleared = true;
         Ok(())
@@ -2897,6 +2917,9 @@ pub struct ShardHandle {
     seq_tracker: Arc<AtomicU64>,
     /// The shard copy's uuid, which `clear` replaces.
     uuid: Arc<std::sync::RwLock<String>>,
+    /// The shard's purge sequence as of the last commit, shared with the
+    /// shard.
+    purge_seq: Arc<AtomicU64>,
     /// Shared with the shard.
     state: Arc<std::sync::RwLock<ShardState>>,
     /// Shared with the shard.
@@ -2963,6 +2986,7 @@ impl ShardHandle {
         type Ready = (
             u64,
             Arc<std::sync::RwLock<String>>,
+            Arc<AtomicU64>,
             Arc<std::sync::RwLock<ShardState>>,
             Arc<Checkup>,
             Gate,
@@ -2996,6 +3020,7 @@ impl ShardHandle {
             let ready = (
                 shard.seq(),
                 uuid,
+                Arc::clone(&shard.shared_purge_seq),
                 Arc::clone(&shard.state),
                 Arc::clone(&shard.checkup),
                 shard.gate.clone(),
@@ -3128,9 +3153,10 @@ impl ShardHandle {
                 None => shard.close(),
             }
         })?;
-        let (initial_seq, uuid, state, checkup, gate, read_context, journal, target) = ready_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
+        let (initial_seq, uuid, purge_seq, state, checkup, gate, read_context, journal, target) =
+            ready_rx.recv().map_err(|_| {
+                anyhow::anyhow!("shard thread exited before opening its database")
+            })??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
         Ok(ShardHandle {
             tx: Some(tx),
@@ -3138,6 +3164,7 @@ impl ShardHandle {
             thread: Some(thread),
             seq_tracker,
             uuid,
+            purge_seq,
             state,
             checkup,
             gate,
@@ -3169,6 +3196,13 @@ impl ShardHandle {
     /// The shard's committed position.
     pub fn committed_seq(&self) -> u64 {
         self.seq_tracker.load(Ordering::SeqCst)
+    }
+
+    /// The shard's purge sequence as of its last commit: how many purge
+    /// infos it has recorded. A purge leaves no change row, so an index
+    /// learns of one by this moving.
+    pub fn purge_seq(&self) -> u64 {
+        self.purge_seq.load(Ordering::SeqCst)
     }
 
     /// The shard copy's uuid.
@@ -4686,6 +4720,38 @@ mod group_tests {
         cleanup(handle, file);
     }
 
+    /// The handle's purge sequence follows what is committed: a recorded
+    /// purge moves it, a failed group that recorded one does not, and a
+    /// clear (which drops the purge infos) takes it back to 0.
+    #[tokio::test]
+    async fn the_handle_publishes_the_committed_purge_sequence() {
+        let (handle, file) = handle("purge-seq");
+        let info = |n: u64| PurgeInfo {
+            uuid: format!("purge-{n}"),
+            id: format!("gone-{n}"),
+            revs: vec![format!("1-{n:032x}")],
+        };
+        assert_eq!(handle.purge_seq(), 0);
+        handle
+            .call(move |txn| Ok(txn.record_purge(&info(1), &[])?))
+            .await
+            .unwrap();
+        assert_eq!(handle.purge_seq(), 1);
+        let failed = handle
+            .call(move |txn| -> Result<(), ApiError> {
+                txn.record_purge(&info(2), &[])?;
+                Err(ApiError::bad_request("failed after writing"))
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(handle.purge_seq(), 1, "a failed group moved it");
+        handle.call(|txn| Ok(txn.clear()?)).await.unwrap();
+        assert_eq!(handle.purge_seq(), 0);
+        let on_disk = handle.read(|txn| Ok(txn.purge_seq()?)).await.unwrap();
+        assert_eq!(on_disk, 0);
+        cleanup(handle, file);
+    }
+
     /// A job that carries on past a failed write (as a batch write that turns
     /// a storage error into per-document results would) still fails its
     /// group: part of its writes may be in the transaction.
@@ -5145,6 +5211,43 @@ mod recovery_tests {
         assert_eq!(latest, rows(&[(1, "a"), (2, "landed")]));
         assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
         assert_eq!(rig.handle.committed_seq(), 3);
+    }
+
+    /// A purge whose commit reports an error and still lands is in the
+    /// purge sequence the recovered shard publishes, so an index that read
+    /// the shard before it rebuilds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_purge_commit_that_landed_moves_the_published_purge_sequence() {
+        let mut rig = rig();
+        put(&rig.handle, "a", 1).await.unwrap();
+        assert_eq!(rig.handle.purge_seq(), 0);
+
+        // As above: the header that makes the commit the newest is written,
+        // and its sync fails.
+        rig.switch.fail_syncs_after(1, ErrorKind::Other);
+        let mut failing = tokio::spawn({
+            let handle = Arc::clone(&rig.handle);
+            async move {
+                handle
+                    .call(|txn| {
+                        let info = PurgeInfo {
+                            uuid: "landed".to_string(),
+                            id: "gone".to_string(),
+                            revs: vec![format!("1-{:032x}", 1)],
+                        };
+                        Ok(txn.record_purge(&info, &[])?)
+                    })
+                    .await
+            }
+        });
+        reopening(&mut rig, &mut failing).await;
+        rig.switch.restore_writes();
+        rig.go.send(()).unwrap();
+        let error = failing.await.unwrap().unwrap_err();
+        assert!(error.reason.starts_with("shard commit failed"), "{error:?}");
+
+        assert_eq!(rig.handle.state(), ShardState::Serving);
+        assert_eq!(rig.handle.purge_seq(), 1, "the landed purge is published");
     }
 
     /// A commit whose first sync, of its pages, fails never lands: the

@@ -108,7 +108,7 @@ struct ViewIndex {
     db: Option<Database>,
     /// Where the file is; `None` for an index over a test backend.
     file: Option<PathBuf>,
-    /// Set when the index is removed (invalidated, cleaned up, its database
+    /// Set when the index is removed (cleaned up, its database
     /// deleted): its file then closes without the close-time check.
     retired: Arc<AtomicBool>,
     cursor: IndexCursor,
@@ -1479,9 +1479,9 @@ async fn index_handle(path: &Path) -> DbResult<Arc<AsyncMutex<ViewIndex>>> {
 }
 
 /// Gate for a database's view index files. A query holds the read side
-/// while it uses an index; `invalidate` and `cleanup` take the write side, so
-/// they never delete a file under a live handle and a new open never
-/// races with the removal. One gate per database keeps other databases
+/// while it uses an index; `cleanup` takes the write side, so it never
+/// deletes a file under a live handle and a new open never races with the
+/// removal. One gate per database keeps other databases
 /// independent. The gate is taken once per call, in `ensure_rows` only, so no
 /// path re-acquires it while a writer waits.
 fn index_gate(db: &Db) -> Arc<Gate> {
@@ -2243,7 +2243,7 @@ async fn ensure_rows(
     // would look like a recreated database and force a full rebuild.
     // Each shard is read up to where it is now; writes that land during the
     // update are left for the next one.
-    let bound = IndexCursor(db.shard_seqs());
+    let bound = db.index_cursor();
     let map = spec.map.clone();
 
     // The map functions and the index writes run on the blocking pool, with
@@ -2260,7 +2260,7 @@ async fn ensure_rows(
         for shard in 0..bound.0.len() {
             let mut owned = crate::cluster::ShardMask::none(db.q);
             owned.select(shard);
-            while index.cursor.0[shard].1 < bound.0[shard].1 {
+            while index.cursor.0[shard].seq < bound.0[shard].seq {
                 gate.check()?;
                 let (rows, last) = db
                     .changes_rows_only(&ChangesOpts {
@@ -2273,7 +2273,7 @@ async fn ensure_rows(
                     })
                     .await?;
                 let mut cursor = index.cursor.clone();
-                cursor.0[shard].1 = last.get(shard);
+                cursor.0[shard].seq = last.get(shard);
                 let (map, design) = (map.clone(), design.clone());
                 (gate, index) = blocking(move || {
                     gate.check()?;
@@ -2310,11 +2310,12 @@ async fn ensure_rows(
             }
         }
         // A shard cleared or recreated since the cursor was checked is a new
-        // copy: its documents may be gone without a change row, so rows
-        // caught up from it cannot be served. As a search index does, check
-        // that the copies are still the ones the index records, and rebuild
-        // at once if not.
-        if index.cursor.same_copies(&IndexCursor(db.shard_seqs())) {
+        // copy, and one that purged since has dropped documents: either way
+        // documents may be gone without a change row, so rows caught up from
+        // it cannot be served. As a search index does, check that the copies
+        // are still the ones the index records, with nothing purged since,
+        // and rebuild at once if not.
+        if index.cursor.same_copies(&db.index_cursor()) {
             return blocking(move || {
                 let _gate = gate;
                 index.sorted_rows().map_err(ApiError::from)
@@ -2330,8 +2331,9 @@ async fn ensure_rows(
         // The positions are read again first, so they name the copies the
         // documents are read from even when a shard changed since `bound`.
         // Writes after them may be read too; the next update reads them
-        // again, which only re-maps them.
-        let bound = IndexCursor(db.shard_seqs());
+        // again, which only re-maps them. A purge after them leaves the
+        // recorded purge sequence behind, so the next use rebuilds.
+        let bound = db.index_cursor();
         let mut cursor = crate::db::MapCursor::default();
         let mut rows = Vec::new();
         loop {
@@ -2434,20 +2436,6 @@ pub(crate) async fn docs_by_ids(db: &Db, ids: &[String]) -> DbResult<HashMap<Str
         return Ok(HashMap::new());
     }
     db.docs_by_ids(ids).await
-}
-
-/// Drop every index for a database. Used by `_purge`, which can remove a
-/// document without advancing the database sequence.
-pub async fn invalidate(db: &Db) -> DbResult<()> {
-    let _gate = index_gate(db).write().await?;
-    db.check_live()?;
-    let directory = db.path.join("_view_indexes");
-    indexes().retain(|path| !path.starts_with(&directory));
-    blocking(move || {
-        remove_index_files(&directory, |_| true);
-        Ok(())
-    })
-    .await
 }
 
 /// Remove index files whose design document or view no longer exists, and
@@ -4003,7 +3991,7 @@ mod tests {
         db.put_docs(vec![write("b"), write("c")], true)
             .await
             .unwrap();
-        let caught_up = crate::db::IndexCursor(db.shard_seqs());
+        let caught_up = db.index_cursor();
         holder.cursor = caught_up.clone();
         drop(holder);
 
@@ -4091,14 +4079,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidating_views_waits_for_a_query_in_flight() {
-        removal_waits_for_a_query_in_flight(|db| {
-            tokio::spawn(async move { invalidate(&db).await.unwrap() })
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn cleaning_up_views_waits_for_a_query_in_flight() {
         removal_waits_for_a_query_in_flight(|db| {
             tokio::spawn(async move { cleanup(&db).await.unwrap() })
@@ -4176,10 +4156,7 @@ mod tests {
         let handle = index_handle(&index_path(&db, "_design/v", "v"))
             .await
             .unwrap();
-        assert_eq!(
-            handle.lock().await.cursor,
-            crate::db::IndexCursor(db.shard_seqs())
-        );
+        assert_eq!(handle.lock().await.cursor, db.index_cursor());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4232,10 +4209,7 @@ mod tests {
         let handle = index_handle(&index_path(&db, "_design/v", "v"))
             .await
             .unwrap();
-        assert_eq!(
-            handle.lock().await.cursor,
-            crate::db::IndexCursor(db.shard_seqs())
-        );
+        assert_eq!(handle.lock().await.cursor, db.index_cursor());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4298,9 +4272,85 @@ mod tests {
         let handle = index_handle(&index_path(&db, "_design/v", "v"))
             .await
             .unwrap();
+        assert_eq!(handle.lock().await.cursor, db.index_cursor());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge leaves no change row. One that lands while an update catches
+    /// the index up, after the update read the shard, must not leave the
+    /// purged document in the index: the next query rebuilds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_during_catch_up_leads_to_a_rebuild() {
+        let (db, root) = two_shard_view_db("viewpurgerace");
+        let db = Arc::new(db);
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let spec = ViewSpec {
+            map: "function(doc){ emit(doc._id, 1); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let limits = ViewQuery::default().limits;
+        let (kept, gone, late) = (on_shard(0, "k"), on_shard(1, "g"), on_shard(1, "h"));
+        let written = db
+            .put_docs(vec![json!({"_id": kept}), json!({"_id": gone})], true)
+            .await
+            .unwrap();
+        let rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows).len(), 2);
+        // Shard 1 has a change to catch up on.
+        db.put_docs(vec![json!({"_id": late})], true).await.unwrap();
+
+        // Hold shard 1's actor. The update's read of shard 1 queues behind
+        // it, then the purge behind that, so the read sees the document and
+        // the purge commits once it is read.
+        let shard = db.shard_handle(1);
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::spawn(shard.call(move |_| {
+            let _ = started_tx.send(());
+            held.recv().map_err(ApiError::internal)
+        }));
+        started.await.unwrap();
+        let update = tokio::spawn({
+            let (db, spec) = (db.clone(), spec.clone());
+            async move { ensure_rows(&db, "_design/v", "v", &spec, limits).await }
+        });
+        while shard.queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let purge = tokio::spawn({
+            let db = db.clone();
+            let mut body = serde_json::Map::new();
+            body.insert(gone.clone(), json!([rev]));
+            let body = Value::Object(body);
+            async move { db.purge(&body, 0, &Default::default()).await }
+        });
+        while shard.queued() < 2 {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        update.await.unwrap().unwrap();
+        purge.await.unwrap().unwrap();
+
+        let rows = ensure_rows(&db, "_design/v", "v", &spec, limits)
+            .await
+            .unwrap();
+        let mut expected = vec![kept, late];
+        expected.sort();
         assert_eq!(
-            handle.lock().await.cursor,
-            crate::db::IndexCursor(db.shard_seqs())
+            view_ids(&rows),
+            expected,
+            "the view serves a purged document"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -5095,6 +5145,15 @@ mod tests {
         }
     }
 
+    /// A one-shard cursor at sequence `seq`.
+    fn cursor_at(seq: u64) -> IndexCursor {
+        IndexCursor(vec![crate::db::ShardPosition {
+            uuid: "u".into(),
+            seq,
+            purge_seq: 0,
+        }])
+    }
+
     #[test]
     fn index_cache_tracks_incremental_updates() {
         let dir = std::env::temp_dir().join(format!("douchdb-view-cache-{}", crate::util::uuid()));
@@ -5113,7 +5172,7 @@ mod tests {
                         value: json!(2),
                     },
                 ],
-                IndexCursor(vec![("u".into(), 1)]),
+                cursor_at(1),
                 "map|",
             )
             .unwrap();
@@ -5133,7 +5192,7 @@ mod tests {
             .apply(
                 vec!["a".to_string(), "b".to_string()],
                 by_doc,
-                IndexCursor(vec![("u".into(), 2)]),
+                cursor_at(2),
                 "map|",
             )
             .unwrap();
@@ -5191,14 +5250,12 @@ mod tests {
         ];
         {
             let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
-            index
-                .rebuild(rows, IndexCursor(vec![("u".into(), 7)]), "map|")
-                .unwrap();
+            index.rebuild(rows, cursor_at(7), "map|").unwrap();
         }
         {
             // The first handle closes in the background; this open waits.
             let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
-            assert_eq!(index.cursor, IndexCursor(vec![("u".into(), 7)]));
+            assert_eq!(index.cursor, cursor_at(7));
             assert_eq!(index.design, "map|");
             let mut restored = index.load_rows().unwrap();
             restored.sort_by(|a, b| a.id.cmp(&b.id));
@@ -5242,8 +5299,8 @@ mod tests {
     /// another.
     #[test]
     fn view_rows_and_cursor_commit_together() {
-        let before = IndexCursor(vec![("u".into(), 1)]);
-        let after = IndexCursor(vec![("u".into(), 2)]);
+        let before = cursor_at(1);
+        let after = cursor_at(2);
         let old = vec![("a".to_string(), json!("a")), ("b".to_string(), json!("b"))];
         let new = vec![
             ("a".to_string(), json!("z")),
@@ -5427,10 +5484,21 @@ mod tests {
         assert!(!old_format.exists(), "cleanup kept an old-format index");
         assert!(first.exists() && second.exists());
 
-        invalidate(&db).await.unwrap();
+        // The design document goes, and cleanup removes both its views.
+        let ddoc = db
+            .get_doc("_design/d", &crate::db::DocOpts::default())
+            .await
+            .unwrap();
+        db.put_docs(
+            vec![json!({"_id": "_design/d", "_rev": ddoc["_rev"], "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+        cleanup(&db).await.unwrap();
         assert!(
             !first.exists() && !second.exists(),
-            "invalidate kept a file"
+            "cleanup kept a removed view's file"
         );
         assert!(!crate::kv::is_verified(&first));
         assert!(!crate::kv::is_verified(&second));
@@ -5732,8 +5800,67 @@ mod tests {
             let (cursor, _) = read_state(&file)
                 .unwrap()
                 .expect("the state is still damaged");
-            assert_eq!(cursor, IndexCursor(db.shard_seqs()), "damaged {damage}");
+            assert_eq!(cursor, db.index_cursor(), "damaged {damage}");
         }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A view file whose cursor is in the shape earlier versions stored
+    /// (each shard's uuid and sequence, no purge sequence) is rebuilt, not
+    /// an error, and records the cursor in the current shape.
+    #[tokio::test]
+    async fn a_view_file_with_a_cursor_in_the_old_shape_is_rebuilt() {
+        let _cap = crate::index_cache::CapGuard::new(crate::index_cache::DEFAULT_MAX_OPEN).await;
+        let (db, root) = two_shard_view_db("viewoldcursor");
+        let docs = (0..10)
+            .map(|n| json!({"_id": format!("d{n:02}"), "n": n}))
+            .collect();
+        db.put_docs(docs, true).await.unwrap();
+        let spec = ViewSpec {
+            map: "function(doc) { emit(doc.n, null); }".to_string(),
+            reduce: None,
+            partitioned: false,
+        };
+        let query = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let before = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(before["total_rows"], 10, "{before}");
+        let path = index_path(&db, "_design/d", "v");
+        {
+            let handle = index_handle(&path).await.unwrap();
+            let index = handle.lock().await;
+            let file = index.db.as_ref().unwrap();
+            let txn = crate::kv::begin_write(file).unwrap();
+            {
+                let mut positions = txn.open_table(CURSOR).unwrap();
+                for (shard, position) in db.index_cursor().0.iter().enumerate() {
+                    let old = serde_json::to_vec(&json!([position.uuid, position.seq])).unwrap();
+                    let shard = u32::try_from(shard).unwrap();
+                    positions
+                        .insert(shard, crate::kv::seal(&old).as_slice())
+                        .unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        indexes().remove(&path);
+
+        let after = query_with_spec(&db, "_design/d", "v", &spec, &query)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "the rebuilt index answers differently");
+        indexes().remove(&path);
+        let file = crate::kv::open(&path, VIEW_CACHE_BYTES).unwrap();
+        let (cursor, _) = read_state(&file)
+            .unwrap()
+            .expect("the cursor is unreadable");
+        assert_eq!(cursor, db.index_cursor());
+        drop(file);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

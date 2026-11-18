@@ -577,8 +577,9 @@ pub async fn db_rest(
 }
 
 /// `POST /{db}/_purge`. A fully purged document is removed from `_changes`
-/// entirely, so the view and search indexes cannot be updated incrementally;
-/// they are rebuilt on the next query.
+/// entirely, so the view and search indexes cannot be updated incrementally:
+/// each sees the purge sequence of a shard it read move, and is rebuilt on
+/// its next query.
 ///
 /// In a cluster the coordinator sends each document's purge to every copy of
 /// its shard and answers per `purge_results_to_json` (chttpd_db.erl); a
@@ -587,7 +588,6 @@ async fn purge(req: DbRequest<'_>) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
-    // Checked before anything runs: a bad request must not drop the indexes.
     let Value::Object(map) = request else {
         return fail(ApiError::bad_request("Request body must be a JSON object"));
     };
@@ -606,38 +606,30 @@ async fn purge(req: DbRequest<'_>) -> Response {
     } else {
         None
     };
-    // The purge and the index invalidation run in a task of their own, so a
-    // client that goes away once the purge is sent cannot skip the
-    // invalidation. A purge that fails may still have landed, in part (one
-    // shard's batch before another's failure) or whole (a failed commit can
-    // land), so the indexes are dropped whatever it answered.
     let purged = req
         .db
-        .purging(
-            move |db| async move {
-                let _slot = slot;
-                let cluster = &st.ctx.cluster;
-                if !coordinating {
-                    let request = Value::Object(map);
-                    // A peer's request carries the uuid the coordinator chose.
-                    let (request, uuids) = if cluster.is_internal(&headers) {
-                        crate::db::split_purge_uuids(&request)
-                    } else {
-                        (request, Default::default())
-                    };
-                    let purged = db.purge(&request, cluster.me, &uuids).await?;
-                    Ok(json(StatusCode::CREATED, purged))
+        .purging(move |db| async move {
+            let _slot = slot;
+            let cluster = &st.ctx.cluster;
+            if !coordinating {
+                let request = Value::Object(map);
+                // A peer's request carries the uuid the coordinator chose.
+                let (request, uuids) = if cluster.is_internal(&headers) {
+                    crate::db::split_purge_uuids(&request)
                 } else {
-                    let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
-                    Ok(purge_results_to_json(results))
-                }
-            },
-            |_| true,
-        )
+                    (request, Default::default())
+                };
+                let purged = db.purge(&request, cluster.me, &uuids).await?;
+                Ok(json(StatusCode::CREATED, purged))
+            } else {
+                let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
+                Ok(purge_results_to_json(results))
+            }
+        })
         .await;
     match purged {
-        Ok((Ok(response), Ok(()))) => response,
-        Err(e) | Ok((Err(e), _) | (Ok(_), Err(e))) => fail(e),
+        Ok(Ok(response)) => response,
+        Err(e) | Ok(Err(e)) => fail(e),
     }
 }
 
@@ -1001,10 +993,9 @@ mod tests {
     }
 
     /// A `_purge` whose client goes away once the purge is queued on the
-    /// shard still drops the view indexes once it lands: the view no longer
-    /// serves the purged document.
+    /// shard still lands, and the view no longer serves the purged document.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_dropped_purge_still_invalidates_the_view_indexes() {
+    async fn a_dropped_purge_leaves_no_purged_document_in_the_view() {
         let root = std::env::temp_dir().join(format!("douchdb-purge-drop-{}", crate::util::uuid()));
         let st = crate::state::test_state(root.clone(), 2);
         let db = st.create_db("purged", false, None, None).await.unwrap();
@@ -1068,10 +1059,10 @@ mod tests {
     }
 
     /// A `_purge` that lands on one shard and fails on another answers with
-    /// the failure, and still drops the view indexes: the landed purge must
-    /// not leave its document in them.
+    /// the failure, and the landed purge leaves no document in the view.
+    /// A refused body purges nothing and leaves the view index in place.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_partly_failed_purge_still_invalidates_the_view_indexes() {
+    async fn a_partly_failed_purge_leaves_no_purged_document_in_the_view() {
         let root =
             std::env::temp_dir().join(format!("douchdb-purge-partial-{}", crate::util::uuid()));
         let st = crate::state::test_state(root.clone(), 2);
@@ -1121,7 +1112,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
         assert_ne!(indexes(), 0, "a refused purge dropped the view index");
 
-        let body = json!({ doc.clone(): [rev], damaged: ["1-ffffffffffffffffffffffffffffffff"] });
+        let body =
+            json!({ doc.clone(): [rev], damaged.clone(): ["1-ffffffffffffffffffffffffffffffff"] });
         let (status, failed) = request_with(
             &st,
             Method::POST,
@@ -1140,9 +1132,20 @@ mod tests {
             404,
             "shard 0's purge did not land"
         );
-        // The damaged record would fail the rebuild a query starts, so the
-        // index files are looked at instead: the invalidation removed them.
-        assert_eq!(indexes(), 0, "the view index outlived the purge");
+        // The damaged record would fail the rebuild a query starts, so it
+        // goes first; removing it moves neither the shard's uuid nor its
+        // purge sequence.
+        db.shard_handle(1)
+            .call(move |s| Ok(s.remove_meta(&damaged, None)?))
+            .await
+            .unwrap();
+        let (status, after) = request(&st, Method::GET, "/partial/_design/d/_view/v").await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(
+            after["rows"],
+            json!([]),
+            "the view still serves the purged document"
+        );
         drop(db);
         st.dbs.write().await.clear();
         let _ = std::fs::remove_dir_all(root);
