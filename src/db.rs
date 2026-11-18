@@ -1068,8 +1068,15 @@ impl Db {
         Ok(doc)
     }
 
-    /// Forget every cached design document.
-    fn forget_design_docs(&self) {
+    /// Everything cached from design documents is stale: bump the design
+    /// generation, drop the validation functions and every cached design
+    /// document. Run after anything that may have changed a design document.
+    fn invalidate_design_state(&self) {
+        self.design_generation.fetch_add(1, Ordering::SeqCst);
+        *self
+            .validation
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
         self.design_epoch.fetch_add(1, Ordering::SeqCst);
         self.design_docs
             .lock()
@@ -1600,7 +1607,7 @@ impl Db {
                 break;
             }
         }
-        self.forget_design_docs();
+        self.invalidate_design_state();
         result
     }
 
@@ -1823,11 +1830,7 @@ impl Db {
         }
 
         if touches_design {
-            self.design_generation.fetch_add(1, Ordering::SeqCst);
-            *self
-                .validation
-                .write()
-                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            self.invalidate_design_state();
         }
 
         if let Some(error) = shard_error {
@@ -3269,7 +3272,9 @@ impl Db {
             return Ok(false);
         };
         let peers = self.purge_peers(shard, me);
-        handle
+        // A purge can remove a design document without taking a sequence,
+        // and a failed commit can still land.
+        let result = handle
             .call(move |s| {
                 // Everything is read before the first write: which infos are
                 // new here, and the documents they name.
@@ -3299,7 +3304,9 @@ impl Db {
                 }
                 Ok(removed)
             })
-            .await
+            .await;
+        self.invalidate_design_state();
+        result
     }
 
     /// Apply a read repair to this copy: the given leaves as replicated
@@ -3375,7 +3382,7 @@ impl Db {
     ) -> DbResult<Value> {
         let result = self.purge_docs(body, me, uuids).await;
         // A purge can remove a design document without taking a sequence.
-        self.forget_design_docs();
+        self.invalidate_design_state();
         result
     }
 
@@ -9109,6 +9116,62 @@ mod tests {
             .collect();
         assert_eq!(db.purged_among(&revs).await.unwrap(), kept);
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A database holding a design document with a validator, the validation
+    /// and design caches warm; returns the design document's revision.
+    async fn db_with_warm_design_caches(name: &str) -> (Db, std::path::PathBuf, String) {
+        let (db, root) = purge_test_db(name, ShardMap::single(1));
+        let written = db
+            .put_docs(
+                vec![json!({
+                    "_id": "_design/v",
+                    "validate_doc_update": "function(){ throw({forbidden: 'no'}); }",
+                })],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        assert_eq!(db.validation_functions().await.unwrap().len(), 1);
+        db.design_doc("_design/v").await.unwrap();
+        (db, root, rev)
+    }
+
+    async fn assert_design_caches_forgotten(db: &Db) {
+        assert!(
+            db.validation_functions().await.unwrap().is_empty(),
+            "the purged validator no longer runs"
+        );
+        assert!(
+            db.design_doc("_design/v").await.is_err(),
+            "the purged design document is no longer served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_purge_of_a_design_document_forgets_its_caches() {
+        let (db, root, rev) = db_with_warm_design_caches("purge-design-local").await;
+        db.purge(&json!({ "_design/v": [rev] }), 0, &Default::default())
+            .await
+            .unwrap();
+        assert_design_caches_forgotten(&db).await;
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_replicated_purge_of_a_design_document_forgets_its_caches() {
+        let (db, root, rev) = db_with_warm_design_caches("purge-design-repl").await;
+        let info = PurgeInfo {
+            uuid: uuid(),
+            id: "_design/v".to_string(),
+            revs: vec![rev],
+        };
+        assert!(db.apply_purge_infos(0, vec![info], 0).await.unwrap());
+        assert_design_caches_forgotten(&db).await;
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
