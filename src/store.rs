@@ -446,7 +446,7 @@ fn decode_u64(table: Table, value: &[u8]) -> Result<u64> {
 /// own: after a commit that may have recorded a purge or cleared the shard
 /// failed, until a reopen publishes what the file holds. No shard records
 /// this many purges, so no index cursor that holds it is ever current.
-const UNKNOWN_PURGE_SEQ: u64 = u64::MAX;
+pub(crate) const UNKNOWN_PURGE_SEQ: u64 = u64::MAX;
 
 /// The shard's scalar state, as stored in its settings table, and its purge
 /// sequence, which the purge infos table holds (the key of its newest info).
@@ -5343,6 +5343,10 @@ mod recovery_tests {
         });
         reopening(&mut rig, &mut failing).await;
         let during = rig.handle.purge_seq();
+        assert_eq!(
+            during, UNKNOWN_PURGE_SEQ,
+            "the reopen window published {during}"
+        );
         rig.switch.restore_writes();
         rig.go.send(()).unwrap();
         failing.await.unwrap().unwrap_err();
@@ -5380,6 +5384,10 @@ mod recovery_tests {
         });
         reopening(&mut rig, &mut failing).await;
         let during = rig.handle.purge_seq();
+        assert_eq!(
+            during, UNKNOWN_PURGE_SEQ,
+            "the reopen window published {during}"
+        );
         rig.switch.restore_writes();
         rig.go.send(()).unwrap();
         failing.await.unwrap().unwrap_err();

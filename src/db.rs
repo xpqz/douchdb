@@ -265,14 +265,23 @@ impl IndexCursor {
 
     /// Whether two cursors are over the same shard copies (same uuids, in
     /// order) with nothing purged from either since: rows read up to one
-    /// can be carried up to the other by the changes in between.
+    /// can be carried up to the other by the changes in between. A purge
+    /// sequence a shard published while it could not know its own
+    /// ([`crate::store::UNKNOWN_PURGE_SEQ`]) matches nothing, itself
+    /// included: rows read then may hold a purged document.
     pub fn same_copies_unpurged(&self, other: &IndexCursor) -> bool {
         self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(&other.0)
-                .all(|(left, right)| left.uuid == right.uuid && left.purge_seq == right.purge_seq)
+            && self.0.iter().zip(&other.0).all(|(left, right)| {
+                left.uuid == right.uuid
+                    && left.purge_seq == right.purge_seq
+                    && left.purge_seq != crate::store::UNKNOWN_PURGE_SEQ
+            })
+    }
+
+    /// Whether an index that has read up to this cursor is up to date with
+    /// the shards at `current`, and can be served as it is.
+    pub fn is_current(&self, current: &IndexCursor) -> bool {
+        self.same_copies_unpurged(current) && self == current
     }
 }
 
@@ -9017,6 +9026,26 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A cursor that recorded the purge sequence a shard publishes while it
+    /// cannot know its own is never current, not even against a shard that
+    /// still publishes it: the rows it covers may hold a purged document.
+    #[test]
+    fn a_cursor_holding_the_unknown_purge_sequence_is_never_current() {
+        let cursor = |purge_seq| {
+            IndexCursor(vec![ShardPosition {
+                uuid: "u".to_string(),
+                seq: 3,
+                purge_seq,
+            }])
+        };
+        let unknown = cursor(crate::store::UNKNOWN_PURGE_SEQ);
+        assert!(!unknown.same_copies_unpurged(&unknown.clone()));
+        assert!(!unknown.is_current(&unknown.clone()));
+        assert!(cursor(2).same_copies_unpurged(&cursor(2)));
+        assert!(cursor(2).is_current(&cursor(2)));
+        assert!(!cursor(2).is_current(&cursor(3)));
     }
 
     /// The ids view `_design/d/v` of `db` serves.

@@ -1127,7 +1127,7 @@ async fn ensure_index(
     if let Some(cached) = entry.as_ref() {
         let meta = &cached.snapshot.meta;
         if meta.version == SEARCH_VERSION && meta.design == signature {
-            if meta.cursor == db.index_cursor() {
+            if meta.cursor.is_current(&db.index_cursor()) {
                 return Ok((cached.snapshot.clone(), gate));
             }
             // A cursor over other shard copies (cleared, recreated), or over
