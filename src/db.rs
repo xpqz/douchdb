@@ -1171,8 +1171,10 @@ impl Db {
     /// the read back is parked on shard 0's actor: it runs, and installs
     /// the setting if the write landed, as soon as a retry brings the shard
     /// back, before any later settings write, so installs keep the order of
-    /// the writes. The caller hears its error at once and `writing` is not
-    /// held meanwhile. A shard that never comes back never runs it.
+    /// the writes. A read back that meets an I/O failure is read again once
+    /// the shard serves again, still before any later settings write. The
+    /// caller hears its error at once and `writing` is not held meanwhile.
+    /// A shard that never comes back never runs it.
     async fn store_setting(
         &self,
         writing: tokio::sync::OwnedMutexGuard<()>,
@@ -1211,12 +1213,14 @@ impl Db {
                         "the setting cannot be read back after a failed write; it is read back once the shard serves again"
                     );
                     later
-                        .run(move |txn| {
-                            if txn.get_setting(name)? == attempted {
-                                install();
-                            }
-                            Ok(())
-                        })
+                        .run(
+                            move |txn| txn.get_setting(name),
+                            move |stored| {
+                                if stored == attempted {
+                                    install();
+                                }
+                            },
+                        )
                         .await;
                 }
             }
@@ -7158,6 +7162,65 @@ mod tests {
         // The fault clears and a request has shard 0 retry.
         switch.restore_writes();
         db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (version + 1, landed), "the write landed");
+        assert_eq!(db.security_versioned(), on_disk);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A parked read back whose own read meets an I/O failure, failing
+    /// shard 0 again, is read again after the next retry, so memory still
+    /// comes to hold the write that landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_read_back_whose_read_fails_the_shard_again_is_read_again() {
+        let (db, root, switch) = db_on_test_disk("rereadback").await;
+        // Larger than the page cache, so reading one back reaches the disk.
+        let old = json!({"members": {"names": ["m".repeat(4 << 20)]}});
+        let landed = json!({"members": {"names": ["z".repeat(4 << 20)]}});
+        let before = switch.syncs();
+        let version = db.set_security(old.clone()).await.unwrap();
+        // The commit's syncs; the last writes its header.
+        let syncs = switch.syncs() - before;
+
+        // Once a retry has reopened the file, before the read back runs,
+        // every read fails.
+        let fault = switch.clone();
+        db.shards[0]
+            .alone(move |shard| {
+                shard.on_next_reopen(move || fault.fail_reads(std::io::ErrorKind::Other));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        switch.fail_syncs_after(syncs - 1, std::io::ErrorKind::Other);
+        assert!(db.set_security(landed.clone()).await.is_err());
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+
+        // The retry reopens the file; the read back's read fails, and so
+        // does the reopen after it.
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        assert!(db.shards[0].barrier().await.unwrap().is_err());
+        assert!(
+            matches!(db.shards[0].state(), crate::store::ShardState::Failed(_)),
+            "{:?}",
+            db.shards[0].state()
+        );
+        assert_eq!(db.security_versioned(), (version, old));
+
+        // The next retry reads it back.
+        switch.restore_reads();
         assert!(db.shards[0].read(|_| Ok(())).await.is_err());
         db.shards[0].barrier().await.unwrap().unwrap();
         assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);

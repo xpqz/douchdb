@@ -284,7 +284,9 @@ on the next open. Policy:
 5. A database setting whose write failed and that cannot be read back
    because shard 0 has failed is read back on shard 0's actor as soon as a
    retry brings it back, before any later settings write, and installed in
-   memory if the write landed.
+   memory if the write landed. A read back that meets an I/O failure (and so
+   may fail the shard again) is read again once the shard serves, still
+   before any later settings write; any other error ends it.
 
 ## Compaction
 
