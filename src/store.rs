@@ -120,8 +120,10 @@ pub enum ShardState {
     /// [`Shard::recover`]): every request to the shard answers 500 with this
     /// reason. A request also has the actor retry the reopen, at most once
     /// per backoff ([`Checkup`]), and a retry that succeeds serves again. The
-    /// retry keeps the sequence the shard published, so a file behind it
-    /// stays failed. A failed compaction swap is never retried.
+    /// retry keeps the sequence the shard published, so it finds a file
+    /// behind it. Such a file can never come back, nor can a failed
+    /// compaction swap: the shard's gate is shut for good and it is never
+    /// retried.
     Failed(String),
     /// Its database was deleted: every request answers `not_found`, as
     /// CouchDB answers for a database that is gone.
@@ -774,7 +776,7 @@ impl Shard {
     /// file cannot be opened, or it lost a change that was acknowledged
     /// (its sequence is behind the one published), the shard fails closed:
     /// [`ShardState::Failed`], until a retry, which comes through here too,
-    /// reopens it.
+    /// reopens it. A file behind is never retried.
     ///
     /// Runs on the actor, between groups. Every recovery comes through here,
     /// so whatever must learn that the file was reopened (a running
@@ -805,14 +807,16 @@ impl Shard {
             ..
         } = self;
         let mut loaded = None;
+        let mut behind = false;
         let reopened = gate.reopen(|| {
             prepare()?;
             let db = open()?;
             let found = check_shard(&db, name, *default_revs_limit)?;
             // A commit that reported an error may still have landed, so the
             // file may be ahead of what was published; never behind it.
+            behind = found.seq < settings.seq;
             anyhow::ensure!(
-                found.seq >= settings.seq,
+                !behind,
                 "the file's sequence {} is behind the committed {}",
                 found.seq,
                 settings.seq
@@ -821,6 +825,12 @@ impl Shard {
             Ok(db)
         });
         self.release_indexes();
+        // A file behind what was committed never comes back (no reopen moves
+        // it forward): its gate is shut for good and the shard never
+        // retries, as after a failed compaction swap.
+        if behind {
+            drop(self.gate.shut());
+        }
         let reopened = reopened.and_then(|()| {
             loaded.ok_or_else(|| anyhow::anyhow!("the shard file reopened without its settings"))
         });
@@ -2943,7 +2953,7 @@ impl ShardHandle {
                             .clone();
                         match state {
                             // A gate shut for good (a failed compaction
-                            // swap) is never reopened.
+                            // swap, a file behind) is never reopened.
                             ShardState::Failed(_)
                                 if !shard.gate.is_shut() && shard.checkup.due(Instant::now()) =>
                             {
@@ -5035,7 +5045,8 @@ mod recovery_tests {
 
     /// The published position never goes back: a file that comes back
     /// without changes that were acknowledged (here, a disk that ignored
-    /// syncs and then lost power) fails the shard instead.
+    /// syncs and then lost power) fails the shard instead, for good: no
+    /// request retries it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reopened_file_missing_acknowledged_changes_fails_closed() {
         let mut rig = rig();
@@ -5056,18 +5067,25 @@ mod recovery_tests {
             state => panic!("served a file that lost acknowledged changes: {state:?}"),
         }
         assert_eq!(rig.handle.committed_seq(), 2);
+        assert!(rig.handle.gate.is_shut(), "a file behind can be retried");
 
-        // Requests retry the reopen, which finds the file behind again.
-        for _ in 0..2 {
+        // No reopen could move the file forward, so however many requests
+        // arrive, none retries it, although no wait holds them back. An open
+        // is let through, so a retry shows as a count, not a hang.
+        rig.go.send(()).unwrap();
+        for _ in 0..4 {
             refused(rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await);
-            let mut checked = barrier(&rig.handle);
-            reopening(&mut rig, &mut checked).await;
-            rig.go.send(()).unwrap();
-            refused(checked.await.unwrap());
-            match rig.handle.state() {
-                ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
-                state => panic!("served a file that lost acknowledged changes: {state:?}"),
-            }
+            refused(rig.handle.read(|txn| Ok(txn.counts())).await);
+            refused(put(&rig.handle, "d", 4).await);
+            refused(barrier(&rig.handle).await.unwrap());
+        }
+        assert!(
+            rig.opening.try_recv().is_err(),
+            "a file behind was reopened"
+        );
+        match rig.handle.state() {
+            ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
+            state => panic!("served a file that lost acknowledged changes: {state:?}"),
         }
         assert_eq!(rig.handle.committed_seq(), 2);
     }
