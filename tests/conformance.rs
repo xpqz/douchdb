@@ -5723,6 +5723,149 @@ async fn compact_and_ensure_full_commit() {
     assert!(body["instance_start_time"].is_string());
 }
 
+// chttpd_db:handle_compact_req starts with chttpd:validate_ctype(Req,
+// "application/json"): no Content-Type, or one whose first `;` part is not
+// exactly `application/json`, is 415 `bad_content_type`.
+#[tokio::test]
+async fn compact_requires_a_json_content_type() {
+    let s = Server::start(false);
+    s.fresh_db("compactctype").await;
+    let refused = json!({
+        "error": "bad_content_type",
+        "reason": "Content-Type must be application/json"
+    });
+    let (status, _, body) = s
+        .req_headers(Method::POST, "/compactctype/_compact", None, &[])
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body, refused);
+    let (status, _, body) = s
+        .req_headers(
+            Method::POST,
+            "/compactctype/_compact",
+            None,
+            &[("content-type", "text/plain".to_string())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body, refused);
+    let (status, _, body) = s
+        .req_headers(
+            Method::POST,
+            "/compactctype/_compact",
+            None,
+            &[(
+                "content-type",
+                "application/json; charset=utf-8".to_string(),
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    compacted(&s, "compactctype").await;
+}
+
+/// `GET /db` sizes as numbers: `(file, active, external)`, after checking
+/// that the deprecated `disk_size` and `data_size` repeat `file` and
+/// `active`.
+fn db_sizes(info: &Value) -> (u64, u64, u64) {
+    let size = |field: &str| {
+        info["sizes"][field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{field}: {info}"))
+    };
+    let sizes = (size("file"), size("active"), size("external"));
+    assert_eq!(info["disk_size"], sizes.0, "{info}");
+    assert_eq!(info["data_size"], sizes.1, "{info}");
+    sizes
+}
+
+// CouchDB reports `sizes.file` (the files on disk), `sizes.active` (the live
+// data in them) and `sizes.external` (the live documents' bodies, as JSON),
+// and compaction shrinks `file` towards `active`. Superseded revisions'
+// bodies count in `file` until compaction drops them, never in `external`.
+#[tokio::test]
+async fn db_info_reports_real_sizes() {
+    let s = Server::start(false);
+    s.fresh_db("dbsizes").await;
+    let (status, info) = s.get("/dbsizes").await;
+    assert_eq!(status, StatusCode::OK);
+    let (file, _, external) = db_sizes(&info);
+    assert!(file > 0, "an empty database has files: {info}");
+    assert_eq!(external, 0, "{info}");
+
+    let filler = "x".repeat(4000);
+    let mut revs = Vec::new();
+    for i in 0..10 {
+        let (status, body) = s.put(&format!("/dbsizes/d{i}"), json!({"v": filler})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        revs.push(body["rev"].as_str().unwrap().to_string());
+    }
+    let (_, info) = s.get("/dbsizes").await;
+    let (_, _, once) = db_sizes(&info);
+    assert!(once >= 10 * 4000, "{info}");
+    assert!(once < 10 * 4100, "{info}");
+
+    // Every document rewritten nine times: ten bodies each in the file, one
+    // in `external`.
+    for _ in 0..9 {
+        for (i, rev) in revs.iter_mut().enumerate() {
+            let (status, body) = s
+                .put(
+                    &format!("/dbsizes/d{i}"),
+                    json!({"_rev": rev.clone(), "v": filler}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            *rev = body["rev"].as_str().unwrap().to_string();
+        }
+    }
+    let (_, info) = s.get("/dbsizes").await;
+    let (file, active, external) = db_sizes(&info);
+    assert_eq!(external, once, "{info}");
+    assert!(file > 100 * 4000, "{info}");
+    assert!(active >= external && active <= file, "{info}");
+
+    let (status, _) = s.post("/dbsizes/_compact", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    compacted(&s, "dbsizes").await;
+    let (_, info) = s.get("/dbsizes").await;
+    let (compacted_file, active, compacted_external) = db_sizes(&info);
+    assert_eq!(compacted_external, external, "{info}");
+    assert!(compacted_file < file, "compaction shrinks the file: {info}");
+    // Measured once the compaction is done: the bodies plus the rest of
+    // the tables, within the file.
+    assert!(active > external, "{info}");
+    assert!(active <= compacted_file, "{info}");
+}
+
+// A partition's `sizes.external` covers the partition's documents only, so
+// the partitions of a database add up to the database's.
+#[tokio::test]
+async fn partition_info_reports_its_external_size() {
+    let s = Server::start(false);
+    let (status, _) = s.put("/partsizes?partitioned=true", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<Value> = (0..12)
+        .map(|i| {
+            let partition = if i % 3 == 0 { "small" } else { "large" };
+            json!({"_id": format!("{partition}:d{i}"), "v": "y".repeat(100 * (i + 1))})
+        })
+        .collect();
+    let (status, _) = s.post("/partsizes/_bulk_docs", json!({"docs": docs})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, info) = s.get("/partsizes").await;
+    let (_, _, external) = db_sizes(&info);
+    let mut total = 0;
+    for partition in ["small", "large"] {
+        let (status, body) = s.get(&format!("/partsizes/_partition/{partition}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let size = body["sizes"]["external"].as_u64().unwrap();
+        assert!(size > 0, "{body}");
+        total += size;
+    }
+    assert_eq!(total, external, "{info}");
+}
+
 /// CouchDB answers 405 with `Allow` and `{"error":"method_not_allowed",
 /// "reason":"Only POST allowed"}` for a wrong method on the POST-only
 /// endpoints (checked against CouchDB 3.5.3), instead of running the handler.
@@ -7633,6 +7776,51 @@ async fn cluster_purge_reaches_every_replica() {
             "node {i} still holds the purged revision"
         );
     }
+}
+
+// fabric_db_info sums the sizes of one copy of each shard range, so a
+// cluster `GET /db` reports each document's body once, whichever node answers
+// and however many copies there are. Each node's own copies (an internal
+// `GET /db`) together hold every body twice with `n=2`.
+#[tokio::test]
+async fn cluster_db_info_sizes_count_one_copy_of_each_range() {
+    let nodes = start_cluster_full(3, 4, "3600", 2, false);
+    for node in &nodes {
+        node.fresh_db("clsizes").await;
+    }
+    let docs: Vec<Value> = (0..40)
+        .map(|i| json!({"_id": format!("d{i:02}"), "v": "z".repeat(50 * (i + 1))}))
+        .collect();
+    // `w=2`: answered once both copies hold every document.
+    let (status, body) = nodes[0]
+        .post("/clsizes/_bulk_docs?w=2", json!({"docs": docs}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let mut local_total = 0;
+    for node in &nodes {
+        let (status, info) = node
+            .req_with(Method::GET, "/clsizes", None, &internal)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        local_total += info["sizes"]["external"].as_u64().unwrap();
+    }
+    let mut seen = Vec::new();
+    for node in &nodes {
+        let (status, info) = node.get("/clsizes").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        let external = info["sizes"]["external"].as_u64().unwrap();
+        let file = info["sizes"]["file"].as_u64().unwrap();
+        assert!(external > 40 * 50, "{info}");
+        assert!(file > external, "{info}");
+        assert_eq!(info["disk_size"], file, "{info}");
+        seen.push(external);
+    }
+    assert!(seen.iter().all(|external| *external == seen[0]), "{seen:?}");
+    assert_eq!(local_total, 2 * seen[0], "{seen:?}");
 }
 
 // purge_results_to_json (chttpd_db.erl) answers 202 when an entry reached

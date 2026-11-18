@@ -206,6 +206,26 @@ pub(crate) fn require_method(method: &Method, allowed: &[&str]) -> Option<Respon
     }
 }
 
+/// `Some(415 response)` unless the request says its body is JSON, as
+/// CouchDB's `chttpd:validate_ctype(Req, "application/json")` checks: the
+/// first `;`-separated part of `Content-Type` must be exactly
+/// `application/json`.
+pub(crate) fn require_json_content_type(headers: &HeaderMap) -> Option<Response> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    // `string:tokens/2` drops empty parts.
+    let first = content_type.and_then(|value| value.split(';').find(|part| !part.is_empty()));
+    if first == Some("application/json") {
+        return None;
+    }
+    Some(fail(ApiError::new(
+        415,
+        "bad_content_type",
+        "Content-Type must be application/json",
+    )))
+}
+
 /// The largest `limit` CouchDB accepts.
 const MAX_LIMIT: u64 = 576_460_752_303_423_487;
 
@@ -307,14 +327,14 @@ async fn query_update_seq(
     headers: &HeaderMap,
 ) -> DbResult<Value> {
     if st.ctx.cluster.is_clustered() && !st.ctx.cluster.is_internal(headers) {
-        let (seq, _) = cluster_seq_tokens(ClusterRead {
+        let tokens = cluster_seq_tokens(ClusterRead {
             ctx: &st.ctx,
             db,
             dbname: name,
             headers,
         })
         .await?;
-        return Ok(json!(seq));
+        return Ok(json!(tokens.update_seq));
     }
     let all: Vec<usize> = (0..db.q as usize).collect();
     let seqs = crate::db::ShardSince(db.shard_seqs().into_iter().map(|(_, seq)| seq).collect());

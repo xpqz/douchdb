@@ -978,7 +978,10 @@ impl Db {
         shard_index(&format!("{partition}:foo"), self.q)
     }
 
-    pub async fn partition_counts(&self, partition: &str) -> DbResult<(u64, u64)> {
+    pub async fn partition_counts(
+        &self,
+        partition: &str,
+    ) -> DbResult<crate::store::PartitionCounts> {
         let shard = &self.shards[self.partition_shard(partition)];
         let partition = partition.to_string();
         shard
@@ -1749,18 +1752,20 @@ impl Db {
         let mut deleted_count = 0;
         let mut purge_seq = 0u64;
         let mut shard_purge_seqs = Vec::with_capacity(self.shards.len());
+        let mut sizes = DbSizes::default();
         let counts = futures::future::join_all(
             self.shards
                 .iter()
-                .map(|shard| shard.read(|s| Ok((s.counts(), s.purge_seq()?)))),
+                .map(|shard| shard.read(|s| Ok((s.counts(), s.purge_seq()?, s.external_size())))),
         )
         .await;
-        for counted in counts {
-            let ((docs, deleted), purged) = counted?;
+        for (index, (counted, shard)) in counts.into_iter().zip(&self.shards).enumerate() {
+            let ((docs, deleted), purged, external) = counted?;
             doc_count += docs;
             deleted_count += deleted;
             purge_seq = purge_seq.saturating_add(purged);
             shard_purge_seqs.push(purged);
+            sizes.add(self.shard_sizes(index, shard, external));
         }
         Ok(DbInfo {
             db_name: self.name.clone(),
@@ -1769,13 +1774,10 @@ impl Db {
             update_seq,
             purge_seq,
             compact_running,
-            disk_size: 0,
-            data_size: 0,
-            sizes: DbSizes {
-                active: 0,
-                external: 0,
-                file: 0,
-            },
+            // Both deprecated in CouchDB 3, which still sends them.
+            disk_size: sizes.file,
+            data_size: sizes.active,
+            sizes,
             instance_start_time: self.instance_start_time.clone(),
             disk_format_version: 8,
             committed_update_seq: update_seq,
@@ -3296,6 +3298,25 @@ impl Db {
     /// publishes, read from the file instead while that is unknown (after a
     /// failed commit, until a reopen), so a client never sees the
     /// placeholder.
+    /// The sizes of shard `index`, whose documents' external sizes sum to
+    /// `external`. The file's length is read from its metadata; a file
+    /// missing for a moment (a compaction's rename) counts as empty.
+    fn shard_sizes(&self, index: usize, shard: &ShardHandle, external: u64) -> DbSizes {
+        let file = std::fs::metadata(shard_file(&self.path, index as u32))
+            .map_or(0, |metadata| metadata.len());
+        DbSizes::of_shard(file, external, shard.index_bytes(!self.compacting()))
+    }
+
+    /// Each shard's sizes as of its last commit, without a round trip to
+    /// its actor.
+    pub fn published_shard_sizes(&self) -> Vec<DbSizes> {
+        self.shards
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| self.shard_sizes(index, shard, shard.external_size()))
+            .collect()
+    }
+
     pub async fn shard_purge_seqs(&self) -> DbResult<Vec<u64>> {
         futures::future::join_all(self.shards.iter().map(|shard| async move {
             match shard.purge_seq() {
@@ -3556,6 +3577,11 @@ impl Db {
     pub async fn run_compaction(&self, claim: CompactionClaim<'_>) -> DbResult<()> {
         for shard in &self.shards {
             crate::store::compact::compact_shard(shard).await?;
+            // The new file's tables, measured before the compaction is
+            // reported done. A failure leaves the next `GET /db` to.
+            if let Err(error) = shard.measure_index().await {
+                tracing::debug!(db = %self.name, error = %error, "shard size not measured");
+            }
         }
         drop(claim);
         Ok(())
@@ -3882,6 +3908,7 @@ fn purge_target(
         s.remove_meta(id, old_state)?;
         return Ok((removed, PurgeTarget::Missing));
     }
+    meta.keep_leaf_sizes();
     let old_seq = meta.seq;
     // Purging the winner changes what a normal read sees,
     // so it is a change as far as `_changes` is concerned.
@@ -4248,6 +4275,7 @@ fn put_many(
                 .map(|(i, _)| (i, Err(ApiError::corrupt(message.clone()))))
                 .collect();
         }
+        meta.keep_leaf_sizes();
         if let Ok(bytes) = meta_bytes(&meta) {
             metas.push(MetaWrite {
                 id,
@@ -4401,6 +4429,7 @@ impl Stage<'_, '_> {
             path.extend(Rev::parse(&rev));
             meta.tree.merge_path(&path, deleted);
         }
+        meta.sizes.insert(rev.clone(), body.len() as u64);
         let old_seq = meta.seq;
         let seq = self.next_seq();
         meta.seq = seq;
@@ -4454,14 +4483,22 @@ impl Stage<'_, '_> {
             }
         }
 
+        let size = body.len() as u64;
         self.ops.push(Op::Body {
             id: id.clone(),
             rev: rev.clone(),
             body,
         });
-        if !known {
+        if known {
+            // A leaf stored without its body (never written so, but a
+            // damaged copy may hold one) counts once the body arrives.
+            if slot.meta.tree.is_leaf(&rev) {
+                slot.staging().sizes.insert(rev.clone(), size);
+            }
+        } else {
             let meta = slot.staging();
             meta.tree.merge_path(&path, deleted);
+            meta.sizes.insert(rev.clone(), size);
             let old_seq = meta.seq;
             let seq = self.next_seq();
             meta.seq = seq;
@@ -4992,6 +5029,14 @@ pub struct DbInfo {
 }
 
 impl DbInfo {
+    /// Report `sizes` (and the deprecated `disk_size` and `data_size`
+    /// that repeat two of them).
+    pub(crate) fn set_sizes(&mut self, sizes: DbSizes) {
+        self.sizes = sizes;
+        self.disk_size = sizes.file;
+        self.data_size = sizes.active;
+    }
+
     /// The `update_seq` and `purge_seq` of this node's copies as opaque
     /// tokens naming node `me`, as a standalone node reports them.
     pub(crate) fn local_tokens(&self, me: usize) -> (String, String) {
@@ -5016,11 +5061,34 @@ impl DbInfo {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+/// `sizes` in `GET /db`, in bytes. `file` is the shard files' length on
+/// disk. `external` is CouchDB's: the JSON bodies of every document's leaf
+/// revisions (conflicts and tombstones included), counted exactly as each
+/// write commits. `active` is what compaction would keep: `external` plus
+/// the tables other than the bodies as last measured
+/// ([`ShardHandle::index_bytes`]), at most `file`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DbSizes {
     pub active: u64,
     pub external: u64,
     pub file: u64,
+}
+
+impl DbSizes {
+    /// The sizes of a shard whose file is `file` bytes long.
+    fn of_shard(file: u64, external: u64, index: u64) -> DbSizes {
+        DbSizes {
+            active: external.saturating_add(index).min(file),
+            external,
+            file,
+        }
+    }
+
+    pub fn add(&mut self, other: DbSizes) {
+        self.active = self.active.saturating_add(other.active);
+        self.external = self.external.saturating_add(other.external);
+        self.file = self.file.saturating_add(other.file);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -6088,7 +6156,7 @@ mod tests {
         for seq in start + 1..=end {
             expected.insert((Table::BySeq, seq.key_bytes()));
         }
-        for name in ["seq", "doc_count", "doc_del_count"] {
+        for name in ["seq", "doc_count", "doc_del_count", "external_size"] {
             expected.insert((Table::Settings, name.key_bytes()));
         }
         assert_eq!(shard.journal().take(), Taken::Batch(expected));
@@ -6208,6 +6276,137 @@ mod tests {
             [false, false, false, true],
             "stemmed and superseded bodies go, the leaf stays"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Check `db`'s sizes after `step`: `external` is the stored bodies of
+    /// every leaf revision of `ids`, by length summed; `file` is the shard
+    /// file's length; `active` lies between them. Returns `external`.
+    async fn check_sizes(db: &Db, ids: &[&str], step: &str) -> u64 {
+        let info = db.info().await.unwrap();
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let expected = db.shards[0]
+            .call(move |shard| {
+                let mut total = 0;
+                for id in &ids {
+                    let Some(meta) = shard.get_meta(id)? else {
+                        continue;
+                    };
+                    for leaf in meta.tree.leaves() {
+                        total += shard
+                            .get_body(id, &leaf)?
+                            .map_or(0, |body| body.len() as u64);
+                    }
+                }
+                Ok(total)
+            })
+            .await
+            .unwrap();
+        assert_eq!(info.sizes.external, expected, "{step}");
+        let file = std::fs::metadata(shard_file(&db.path, 0)).unwrap().len();
+        assert_eq!(info.sizes.file, file, "{step}");
+        assert!(info.sizes.active >= info.sizes.external, "{step}");
+        assert!(info.sizes.active <= info.sizes.file, "{step}");
+        info.sizes.external
+    }
+
+    /// `sizes.external` is CouchDB's: every leaf revision's body (conflicts
+    /// and tombstones included) counted once, whatever superseded bodies
+    /// the file still holds, through updates, conflicts, deletes, purges,
+    /// stemming, a compaction and a reopen.
+    #[tokio::test]
+    async fn sizes_follow_the_leaf_bodies_and_the_file() {
+        let (db, root) = single_shard_db("sizes").await;
+        let ids = ["a", "b", "c"];
+        let rev = |written: &[WriteResult]| written[0].json()["rev"].as_str().unwrap().to_string();
+        assert_eq!(check_sizes(&db, &ids, "empty").await, 0);
+
+        let a1 = rev(&db
+            .put_docs(vec![json!({"_id": "a", "v": "x".repeat(300)})], true)
+            .await
+            .unwrap());
+        let b1 = rev(&db
+            .put_docs(vec![json!({"_id": "b", "v": 1})], true)
+            .await
+            .unwrap());
+        let created = check_sizes(&db, &ids, "created").await;
+        assert!(created > 300);
+        let a2 = rev(&db
+            .put_docs(vec![json!({"_id": "a", "_rev": a1, "v": "y"})], true)
+            .await
+            .unwrap());
+        assert!(
+            check_sizes(&db, &ids, "updated").await < created,
+            "the superseded body no longer counts"
+        );
+
+        // A conflicting branch adds its leaf.
+        let a1_id = a1.split_once('-').unwrap().1.to_string();
+        let branch = "ffffffffffffffffffffffffffffffff";
+        let conflict = db
+            .put_docs(
+                vec![json!({"_id": "a", "_rev": format!("2-{branch}"),
+                    "_revisions": {"start": 2, "ids": [branch, a1_id]},
+                    "w": "z".repeat(100)})],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            conflict[0].json()["error"].is_null(),
+            "{}",
+            conflict[0].json()
+        );
+        let conflicted = check_sizes(&db, &ids, "conflict").await;
+
+        // A delete leaves a tombstone leaf; a purge takes leaves away.
+        let b2 = rev(&db
+            .put_docs(
+                vec![json!({"_id": "b", "_rev": b1, "_deleted": true})],
+                true,
+            )
+            .await
+            .unwrap());
+        check_sizes(&db, &ids, "deleted").await;
+        let none = Default::default();
+        db.purge(&json!({"b": [b2], "a": [a2]}), 0, &none)
+            .await
+            .unwrap();
+        assert!(check_sizes(&db, &ids, "purged").await < conflicted);
+
+        // A document whose old revisions are stemmed counts its leaf.
+        db.set_revs_limit(1).await.unwrap();
+        let c1 = rev(&db
+            .put_docs(vec![json!({"_id": "c", "v": 1})], true)
+            .await
+            .unwrap());
+        db.put_docs(vec![json!({"_id": "c", "_rev": c1, "v": 22})], true)
+            .await
+            .unwrap();
+        let before = check_sizes(&db, &ids, "stemmed").await;
+
+        db.compact().await.unwrap();
+        assert_eq!(check_sizes(&db, &ids, "compacted").await, before);
+        let info = db.info().await.unwrap();
+        assert!(
+            info.sizes.active > info.sizes.external,
+            "the other tables are measured once the compaction is done: {info:?}"
+        );
+        drop(db);
+        let db = Db::open(
+            &root,
+            "sizes",
+            DbConfig {
+                q: 1,
+                revs_limit: 100,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(check_sizes(&db, &ids, "reopened").await, before);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8477,10 +8676,11 @@ mod tests {
             }
             assert_eq!(keys, expected);
             keys.clear();
-            assert_eq!(
-                info["sizes"],
-                json!({"active": 0, "external": 0, "file": 0})
-            );
+            let file = info["sizes"]["file"].as_u64().unwrap();
+            assert!(file > 0, "{info}");
+            assert_eq!(info["sizes"]["external"], json!(0));
+            assert_eq!(info["disk_size"], json!(file));
+            assert_eq!(info["data_size"], info["sizes"]["active"]);
             assert_eq!(info["cluster"], json!({"q": 2, "n": 1, "w": 1, "r": 1}));
             assert_eq!(info["doc_count"], json!(0));
             assert_eq!(info["compact_running"], json!(false));

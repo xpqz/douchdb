@@ -73,6 +73,8 @@ const SEQ: &str = "seq";
 const DOC_COUNT: &str = "doc_count";
 /// Documents whose winning revision is deleted.
 const DELETED_COUNT: &str = "doc_del_count";
+/// The documents' external sizes ([`DocMeta::external_size`]) summed.
+const EXTERNAL_SIZE: &str = "external_size";
 const REVS_LIMIT: &str = "revs_limit";
 const PURGED_INFOS_LIMIT: &str = "purged_infos_limit";
 /// `purge_checkpoint/<node>`: the purge sequence replica `node` has
@@ -96,11 +98,42 @@ pub struct PurgeInfo {
 pub struct DocMeta {
     pub tree: RevTree,
     pub seq: u64,
+    /// The length of each leaf revision's stored body, as JSON: what
+    /// CouchDB keeps as a leaf's external size. Kept for leaves only (see
+    /// [`DocMeta::keep_leaf_sizes`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sizes: BTreeMap<String, u64>,
+}
+
+impl DocMeta {
+    /// The document's external size, as CouchDB counts it: the bodies of
+    /// all its leaf revisions, conflicts and tombstones included.
+    pub fn external_size(&self) -> u64 {
+        self.sizes
+            .iter()
+            .filter(|(rev, _)| self.tree.is_leaf(rev))
+            .map(|(_, size)| *size)
+            .sum()
+    }
+
+    /// Forget the sizes of revisions that are no longer leaves.
+    pub fn keep_leaf_sizes(&mut self) {
+        let tree = &self.tree;
+        self.sizes.retain(|rev, _| tree.is_leaf(rev));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveDoc {
     pub rev: String,
+}
+
+/// One partition's document counts and external size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PartitionCounts {
+    pub docs: u64,
+    pub deleted: u64,
+    pub external: u64,
 }
 
 /// Counts plus an optional content digest for rebalance verification.
@@ -352,13 +385,13 @@ impl Fenwick {
 }
 
 /// What a document's metadata says about it: the winning revision, whether it
-/// is live.
-pub(crate) type MetaState = (String, bool);
+/// is live, and its external size ([`DocMeta::external_size`]).
+pub(crate) type MetaState = (String, bool, u64);
 
 pub(crate) fn meta_state(meta: &DocMeta) -> Option<MetaState> {
     meta.tree.winner().map(|winner| {
         let live = !meta.tree.is_deleted(&winner);
-        (winner, live)
+        (winner, live, meta.external_size())
     })
 }
 
@@ -456,6 +489,8 @@ struct Settings {
     seq: u64,
     docs: u64,
     deleted: u64,
+    /// See [`EXTERNAL_SIZE`].
+    external: u64,
     revs_limit: u64,
     purged_infos_limit: u64,
     purge_seq: u64,
@@ -480,7 +515,7 @@ fn init_tables(db: &Database) -> Result<()> {
         // damaged, and fails in `load_settings` rather than starting over.
         if settings.first()?.is_none() {
             settings.insert(UUID, kv::seal(crate::util::uuid().as_bytes()).as_slice())?;
-            for counter in [SEQ, DOC_COUNT, DELETED_COUNT] {
+            for counter in [SEQ, DOC_COUNT, DELETED_COUNT, EXTERNAL_SIZE] {
                 settings.insert(counter, kv::seal(&0u64.to_be_bytes()).as_slice())?;
             }
             true
@@ -619,6 +654,7 @@ fn load_settings(
         seq: number(required(SEQ)?)?,
         docs: number(required(DOC_COUNT)?)?,
         deleted: number(required(DELETED_COUNT)?)?,
+        external: number(required(EXTERNAL_SIZE)?)?,
         revs_limit: get(REVS_LIMIT)?
             .map(number)
             .transpose()?
@@ -696,6 +732,8 @@ pub struct Shard {
     shared_uuid: Option<Arc<std::sync::RwLock<String>>>,
     /// `settings.purge_seq`, shared with the shard's handle.
     shared_purge_seq: Arc<AtomicU64>,
+    /// `settings.external`, shared with the shard's handle.
+    shared_external: Arc<AtomicU64>,
     /// Live document id -> winning revision, built lazily on the first
     /// `_all_docs` range query and then maintained in memory.
     live: Option<BTreeMap<String, LiveDoc>>,
@@ -768,6 +806,7 @@ impl Shard {
         let db = open()?;
         let settings = check_shard(&db, &name, revs_limit)?;
         let shared_purge_seq = Arc::new(AtomicU64::new(settings.purge_seq));
+        let shared_external = Arc::new(AtomicU64::new(settings.external));
         Ok(Shard {
             gate: Gate::new(db),
             open,
@@ -780,6 +819,7 @@ impl Shard {
             default_revs_limit: revs_limit,
             shared_uuid: None,
             shared_purge_seq,
+            shared_external,
             live: None,
             rank_cursor: None,
             scanned: Arc::new(AtomicU64::new(0)),
@@ -883,6 +923,7 @@ impl Shard {
                 }
                 self.shared_purge_seq
                     .store(found.purge_seq, Ordering::SeqCst);
+                self.shared_external.store(found.external, Ordering::SeqCst);
                 self.settings = found;
                 self.checkup.served();
                 if matches!(*state, ShardState::Failed(_)) {
@@ -1152,7 +1193,7 @@ impl Shard {
             return;
         };
         let (was_live, is_live) = match new {
-            Some((rev, true)) => (live.insert(id.clone(), LiveDoc { rev }).is_some(), true),
+            Some((rev, true, _)) => (live.insert(id.clone(), LiveDoc { rev }).is_some(), true),
             _ => (live.remove(&id).is_some(), false),
         };
         if was_live == is_live {
@@ -1549,6 +1590,7 @@ impl<'s> ShardTxn<'s> {
                 (SEQ, staged.seq, shard.settings.seq),
                 (DOC_COUNT, staged.docs, shard.settings.docs),
                 (DELETED_COUNT, staged.deleted, shard.settings.deleted),
+                (EXTERNAL_SIZE, staged.external, shard.settings.external),
             ] {
                 if new != old {
                     settings.insert(name, kv::seal(&new.to_be_bytes()).as_slice())?;
@@ -1594,6 +1636,9 @@ impl<'s> ShardTxn<'s> {
         shard
             .shared_purge_seq
             .store(staged.purge_seq, Ordering::SeqCst);
+        shard
+            .shared_external
+            .store(staged.external, Ordering::SeqCst);
         shard.settings = staged;
         if reset_indexes {
             shard.release_indexes();
@@ -1778,6 +1823,11 @@ impl<'s> ShardTxn<'s> {
         (self.staged.docs, self.staged.deleted)
     }
 
+    /// The documents' external sizes summed ([`DocMeta::external_size`]).
+    pub fn external_size(&self) -> u64 {
+        self.staged.external
+    }
+
     pub fn revs_limit(&self) -> u64 {
         self.staged.revs_limit
     }
@@ -1913,15 +1963,21 @@ impl<'s> ShardTxn<'s> {
     /// Move the counters from a document's old state to its new one.
     fn count(&mut self, old: Option<&MetaState>, new: Option<&MetaState>) {
         let staged = &mut self.staged;
-        match old.map(|(_, live)| *live) {
-            Some(true) => staged.docs = staged.docs.saturating_sub(1),
-            Some(false) => staged.deleted = staged.deleted.saturating_sub(1),
-            None => {}
+        if let Some((_, live, size)) = old {
+            if *live {
+                staged.docs = staged.docs.saturating_sub(1);
+            } else {
+                staged.deleted = staged.deleted.saturating_sub(1);
+            }
+            staged.external = staged.external.saturating_sub(*size);
         }
-        match new.map(|(_, live)| *live) {
-            Some(true) => staged.docs += 1,
-            Some(false) => staged.deleted += 1,
-            None => {}
+        if let Some((_, live, size)) = new {
+            if *live {
+                staged.docs += 1;
+            } else {
+                staged.deleted += 1;
+            }
+            staged.external += size;
         }
     }
 
@@ -2027,7 +2083,7 @@ impl<'s> ShardTxn<'s> {
                 hasher.update(b"doc");
                 hasher.update(id.as_bytes());
                 match meta_state(&meta) {
-                    Some((winner, live)) => {
+                    Some((winner, live, _)) => {
                         hasher.update(winner.as_bytes());
                         hasher.update([live as u8]);
                     }
@@ -2081,17 +2137,23 @@ impl<'s> ShardTxn<'s> {
         })
     }
 
-    /// Live and deleted document counts for one partition. The scan stays
-    /// inside the partition's id range.
-    pub fn partition_counts(&self, partition: &str) -> Result<(u64, u64)> {
-        let (mut docs, mut deleted) = (0u64, 0u64);
+    /// Live and deleted document counts for one partition, and its
+    /// documents' external sizes summed. The scan stays inside the
+    /// partition's id range.
+    pub fn partition_counts(&self, partition: &str) -> Result<PartitionCounts> {
+        let mut counts = PartitionCounts::default();
         let (first, last) = (format!("{partition}:"), format!("{partition};"));
-        self.metas_in(&first, &last, |_, meta| match meta_state(&meta) {
-            Some((_, true)) => docs += 1,
-            Some((_, false)) => deleted += 1,
-            None => {}
+        self.metas_in(&first, &last, |_, meta| {
+            if let Some((_, live, size)) = meta_state(&meta) {
+                if live {
+                    counts.docs += 1;
+                } else {
+                    counts.deleted += 1;
+                }
+                counts.external += size;
+            }
         })?;
-        Ok((docs, deleted))
+        Ok(counts)
     }
 
     /// The ids of the design documents (deleted ones included), and those
@@ -2124,7 +2186,7 @@ impl<'s> ShardTxn<'s> {
         if self.shard.live.is_none() {
             let mut live = BTreeMap::new();
             self.shard.committed_metas(|id, meta| {
-                if let Some((rev, true)) = meta_state(&meta) {
+                if let Some((rev, true, _)) = meta_state(&meta) {
                     live.insert(id.to_string(), LiveDoc { rev });
                 }
             })?;
@@ -2532,7 +2594,7 @@ impl<'s> ShardTxn<'s> {
         }
         self.remove_value(META, Table::Meta, id)?;
 
-        let (mut docs, mut deleted) = (0u64, 0u64);
+        let (mut docs, mut deleted, mut external) = (0u64, 0u64, 0u64);
         self.scan(
             META,
             Table::Meta,
@@ -2540,10 +2602,13 @@ impl<'s> ShardTxn<'s> {
             false,
             |id, stored| {
                 if let Ok(meta) = parse_meta(id, stored) {
-                    match meta_state(&meta) {
-                        Some((_, true)) => docs += 1,
-                        Some((_, false)) => deleted += 1,
-                        None => {}
+                    if let Some((_, live, size)) = meta_state(&meta) {
+                        if live {
+                            docs += 1;
+                        } else {
+                            deleted += 1;
+                        }
+                        external += size;
                     }
                 }
                 Ok(true)
@@ -2551,6 +2616,7 @@ impl<'s> ShardTxn<'s> {
         )?;
         self.staged.docs = docs;
         self.staged.deleted = deleted;
+        self.staged.external = external;
         self.reset_indexes = true;
         Ok(())
     }
@@ -2576,6 +2642,7 @@ impl<'s> ShardTxn<'s> {
         self.staged.uuid = crate::util::uuid();
         self.staged.docs = 0;
         self.staged.deleted = 0;
+        self.staged.external = 0;
         // The purge infos went with the rest.
         self.staged.purge_seq = 0;
         self.reset_indexes = true;
@@ -2723,7 +2790,7 @@ impl ShardView<'_, '_> {
                 }
                 match parse_meta(id, stored) {
                     Ok(meta) => {
-                        if let Some((rev, true)) = meta_state(&meta) {
+                        if let Some((rev, true, _)) = meta_state(&meta) {
                             out.push((id.to_string(), rev));
                         }
                     }
@@ -2963,6 +3030,53 @@ pub struct ShardHandle {
     target: Arc<dyn compact::Target>,
     /// The running compaction's progress.
     task: std::sync::Mutex<Option<compact::Task>>,
+    /// The shard's documents' external sizes summed as of its last
+    /// commit, shared with the shard.
+    external: Arc<AtomicU64>,
+    /// The size of the tables other than the bodies, as last measured.
+    index: Arc<IndexSize>,
+}
+
+/// What [`ShardHandle::index_bytes`] last measured, and when.
+#[derive(Default)]
+struct IndexSize {
+    bytes: AtomicU64,
+    /// The shard's committed position and documents (live and deleted)
+    /// when `bytes` was measured.
+    seq: AtomicU64,
+    docs: AtomicU64,
+    /// Whether `bytes` measures the file the shard has now; a compaction
+    /// replaces the file.
+    measured: AtomicBool,
+    measuring: AtomicBool,
+}
+
+impl IndexSize {
+    /// Measure the tables of the file under `gate` other than the bodies.
+    async fn measure(&self, gate: &Gate, seq: u64) -> Result<()> {
+        let (bytes, docs) = gate
+            .read(|txn| {
+                let mut bytes = 0;
+                for table in compact::TABLES {
+                    if table != Table::Bodies {
+                        bytes += txn.table_bytes(table)?;
+                    }
+                }
+                let mut docs = 0;
+                for counter in [DOC_COUNT, DELETED_COUNT] {
+                    if let Some(count) = txn.get(Table::Settings, &gate::key::text(counter))? {
+                        docs += decode_u64(Table::Settings, &count)?;
+                    }
+                }
+                Ok((bytes, docs))
+            })
+            .await?;
+        self.bytes.store(bytes, Ordering::SeqCst);
+        self.seq.store(seq, Ordering::SeqCst);
+        self.docs.store(docs, Ordering::SeqCst);
+        self.measured.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl ShardHandle {
@@ -3022,6 +3136,8 @@ impl ShardHandle {
         let shard_scanned = scanned.clone();
         let body_reads = Arc::new(AtomicU64::new(0));
         let shard_body_reads = body_reads.clone();
+        let external = Arc::new(AtomicU64::new(0));
+        let shard_external = external.clone();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             // Opened on this thread, so the file never crosses threads.
             let mut shard = match open() {
@@ -3032,6 +3148,8 @@ impl ShardHandle {
                 }
             };
             shard.set_counters(shard_scanned, shard_body_reads);
+            shard_external.store(shard.settings.external, Ordering::SeqCst);
+            shard.shared_external = shard_external;
             let uuid = Arc::new(std::sync::RwLock::new(shard.settings.uuid.clone()));
             shard.shared_uuid = Some(uuid.clone());
             let context = ReadContext {
@@ -3197,7 +3315,53 @@ impl ShardHandle {
             journal,
             target,
             task: Default::default(),
+            external,
+            index: Arc::default(),
         })
+    }
+
+    /// The bytes the shard's tables other than the bodies take (keys,
+    /// values and tree overhead; see [`gate::LeaseTxn::table_bytes`]), as
+    /// last measured: 0 until the first measurement. Measuring reads every
+    /// page of those tables, so it is never done here: a call that finds no
+    /// measurement of the current file, or finds that the shard has taken
+    /// at least as many changes since the last one as it held documents
+    /// then, starts one in the background and answers with what it has.
+    /// Measurements are thus spread out in proportion to the writes, and
+    /// a shard nobody asks about is never measured. None starts unless
+    /// `may_measure`: a caller passes false while the database compacts,
+    /// since a measurement holds a lease on the file, which the
+    /// compaction's swap would wait for with the shard's writes paused.
+    pub fn index_bytes(&self, may_measure: bool) -> u64 {
+        let index = &self.index;
+        let seq = self.committed_seq();
+        let changes = seq.saturating_sub(index.seq.load(Ordering::SeqCst));
+        let stale = !index.measured.load(Ordering::SeqCst)
+            || changes >= index.docs.load(Ordering::SeqCst).max(1);
+        if may_measure && stale && !index.measuring.swap(true, Ordering::SeqCst) {
+            let index = Arc::clone(&self.index);
+            let gate = self.gate.clone();
+            tokio::spawn(async move {
+                if let Err(error) = index.measure(&gate, seq).await {
+                    tracing::debug!(error = %error, "shard size not measured");
+                }
+                index.measuring.store(false, Ordering::SeqCst);
+            });
+        }
+        index.bytes.load(Ordering::SeqCst)
+    }
+
+    /// The shard's documents' external sizes summed
+    /// ([`DocMeta::external_size`]), as of its last commit.
+    pub fn external_size(&self) -> u64 {
+        self.external.load(Ordering::SeqCst)
+    }
+
+    /// Measure [`ShardHandle::index_bytes`] now, as a compaction does once
+    /// it has replaced the file.
+    pub async fn measure_index(&self) -> Result<()> {
+        self.index.measured.store(false, Ordering::SeqCst);
+        self.index.measure(&self.gate, self.committed_seq()).await
     }
 
     /// Index entries the shard has walked to answer reads so far.
@@ -3536,7 +3700,11 @@ pub(crate) mod tests {
         let rev = Rev::parse("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[rev], deleted);
-        DocMeta { tree, seq }
+        DocMeta {
+            tree,
+            seq,
+            ..DocMeta::default()
+        }
     }
 
     /// Write `meta` as `id`'s record, reading the record it replaces first.
@@ -3578,6 +3746,8 @@ pub(crate) mod tests {
         let rev = format!("{pos}-{n:032x}");
         path.push(Rev::parse(&rev).unwrap());
         meta.tree.merge_path(&path, deleted);
+        meta.sizes.insert(rev.clone(), body.len() as u64);
+        meta.keep_leaf_sizes();
         let old_seq = meta.seq;
         let seq = txn.next_seq();
         meta.seq = seq;
@@ -3649,7 +3819,11 @@ pub(crate) mod tests {
             let edges: BTreeMap<&str, Option<&str>> = edges.iter().copied().collect();
             let tree: RevTree =
                 serde_json::from_value(serde_json::json!({"edges": edges, "deleted": []})).unwrap();
-            DocMeta { tree, seq: 1 }
+            DocMeta {
+                tree,
+                seq: 1,
+                ..DocMeta::default()
+            }
         };
         shard
             .write(move |txn| {
@@ -3697,7 +3871,11 @@ pub(crate) mod tests {
         let new = Rev::parse("2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let mut tree = RevTree::default();
         tree.merge_path(&[old.clone(), new.clone()], false);
-        let doc_meta = DocMeta { tree, seq: 1 };
+        let doc_meta = DocMeta {
+            tree,
+            seq: 1,
+            ..DocMeta::default()
+        };
         // Ids with '/' sort between and around each other's keys.
         let ids = ["a", "a/b", "a/b/c", "a0", "b", "b/", "c", "d/e", "e", "f"];
         let (old_rev, new_rev) = (old.to_string(), new.to_string());
@@ -3856,7 +4034,7 @@ pub(crate) mod tests {
     /// lost any of them is damaged, not new, and must not open as if empty.
     #[test]
     fn a_shard_missing_a_setting_fails_to_open() {
-        for setting in [UUID, SEQ, DOC_COUNT, DELETED_COUNT] {
+        for setting in [UUID, SEQ, DOC_COUNT, DELETED_COUNT, EXTERNAL_SIZE] {
             let file = temp_file("no-setting");
             let mut shard = open(&file);
             shard
@@ -4044,7 +4222,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         let partition = shard.read(|txn| Ok(txn.partition_counts("p")?)).unwrap();
-        assert_eq!(partition, (0, 0));
+        assert_eq!((partition.docs, partition.deleted), (0, 0));
         assert!(crate::metrics::corrupt_records_skipped() >= before + 3);
         // The anti-entropy fingerprint must not paper over it, and a point
         // read fails rather than answering "missing".
@@ -4248,7 +4426,7 @@ pub(crate) mod tests {
         type Observed = (
             Vec<String>,
             usize,
-            (u64, u64),
+            crate::store::PartitionCounts,
             usize,
             usize,
             usize,
@@ -4296,7 +4474,7 @@ pub(crate) mod tests {
         assert_eq!(entries(&mut shard), 0, "a write rebuilt the indexes");
         assert_eq!(live_ids(&mut shard), ["a", "p:0", "p:1", "p:2", "q:1"]);
         let partition = shard.read(|txn| Ok(txn.partition_counts("p")?)).unwrap();
-        assert_eq!(partition, (3, 1));
+        assert_eq!((partition.docs, partition.deleted), (3, 1));
         assert_eq!(shard.read(|txn| Ok(txn.live_rank("q:")?)).unwrap(), 4);
         let latest = shard
             .read(|txn| {

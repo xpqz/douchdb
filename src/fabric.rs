@@ -2888,12 +2888,26 @@ pub(crate) async fn fetch_node_changes(
         .map_err(|e| ApiError::new(502, "bad_gateway", e.to_string()))
 }
 
-/// One node's copies of every shard: uuid, committed position and purge
-/// sequence, by shard index. Its own, or what the peer reports.
-async fn fetch_node_shards(
-    read: ClusterRead<'_>,
-    node: usize,
-) -> DbResult<Vec<(String, u64, u64)>> {
+/// One node's copy of a shard, as a coordinator's `GET /db` reads it:
+/// uuid, committed position, purge sequence and sizes.
+type LocalCopy = (String, u64, u64, crate::db::DbSizes);
+
+/// This node's copies of every shard, by shard index, from what each shard
+/// publishes: no round trip to the shard actors.
+pub(crate) async fn local_copies(db: &Db) -> DbResult<Vec<LocalCopy>> {
+    let purge_seqs = db.shard_purge_seqs().await?;
+    Ok(db
+        .shard_seqs()
+        .into_iter()
+        .zip(purge_seqs)
+        .zip(db.published_shard_sizes())
+        .map(|(((uuid, seq), purged), sizes)| (uuid, seq, purged, sizes))
+        .collect())
+}
+
+/// One node's copies of every shard, by shard index. Its own, or what the
+/// peer reports.
+async fn fetch_node_shards(read: ClusterRead<'_>, node: usize) -> DbResult<Vec<LocalCopy>> {
     let ClusterRead {
         ctx,
         db,
@@ -2901,13 +2915,7 @@ async fn fetch_node_shards(
         headers,
     } = read;
     if node == ctx.cluster.me {
-        let purge_seqs = db.shard_purge_seqs().await?;
-        return Ok(db
-            .shard_seqs()
-            .into_iter()
-            .zip(purge_seqs)
-            .map(|((uuid, seq), purged)| (uuid, seq, purged))
-            .collect());
+        return local_copies(db).await;
     }
     let peer = &ctx.cluster.nodes[node];
     let request = internal_request(ctx, reqwest::Method::GET, peer, &[dbname], Some(headers))
@@ -2928,17 +2936,26 @@ async fn fetch_node_shards(
         .map_err(|e| bad(format!("{peer}: no shard positions: {e}")))
 }
 
+/// What a cluster `GET /db` reports from one copy of every shard range.
+pub(crate) struct ClusterTokens {
+    pub update_seq: String,
+    pub purge_seq: String,
+    /// The chosen copies' sizes summed, as `fabric_db_info` sums them.
+    pub sizes: crate::db::DbSizes,
+}
+
 /// The `update_seq` and `purge_seq` that `GET /db` reports in a cluster, and
 /// that a query reports with `update_seq=true`: opaque tokens holding one
 /// copy of every shard range, as CouchDB's `fabric_db_info` builds them, in
-/// one fan-out to the nodes. The preferred copy is used where it answered,
-/// else another replica; a range with no copy answering is 412 `nodedown`.
-pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(String, String)> {
+/// one fan-out to the nodes, with those copies' sizes. The preferred copy is
+/// used where it answered, else another replica; a range with no copy
+/// answering is 412 `nodedown`.
+pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<ClusterTokens> {
     let ClusterRead { ctx, db, .. } = read;
     let nodes = ctx.cluster.nodes.len();
     // Every node is asked, including one discovery marked down: the mark may
     // be stale.
-    let answers: Vec<Option<Vec<(String, u64, u64)>>> =
+    let answers: Vec<Option<Vec<LocalCopy>>> =
         crate::cluster_http::in_one_round(futures::future::join_all(
             (0..nodes).map(|node| async move { fetch_node_shards(read, node).await.ok() }),
         ))
@@ -2947,9 +2964,10 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(Strin
     let map = db.shard_map();
     let mut seqs = Vec::with_capacity(db.q as usize);
     let mut purges = Vec::with_capacity(db.q as usize);
+    let mut sizes = crate::db::DbSizes::default();
     for shard in 0..db.q as usize {
         let owner = preferred.iter().position(|mask| mask.covers(shard));
-        let (node, (uuid, seq, purged)) = owner
+        let (node, (uuid, seq, purged, copy_sizes)) = owner
             .into_iter()
             .chain(map.replicas_of(shard as u32).iter().copied())
             .find_map(|node| {
@@ -2957,6 +2975,7 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(Strin
                 Some((node, copy.clone()))
             })
             .ok_or_else(nodedown)?;
+        sizes.add(copy_sizes);
         seqs.push(CopyPos {
             node,
             shard,
@@ -2970,7 +2989,11 @@ pub(crate) async fn cluster_seq_tokens(read: ClusterRead<'_>) -> DbResult<(Strin
             uuid,
         });
     }
-    Ok((crate::since::encode(&seqs), crate::since::encode(&purges)))
+    Ok(ClusterTokens {
+        update_seq: crate::since::encode(&seqs),
+        purge_seq: crate::since::encode(&purges),
+        sizes,
+    })
 }
 
 // ---------------------------------------------------------------------------

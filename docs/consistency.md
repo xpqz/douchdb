@@ -247,6 +247,45 @@ where behaviour is best-effort, it says so.
 | Attachments | No |
 | Mango/lists/shows | No |
 
+## Compatibility notes
+
+### Database sizes
+
+`GET /{db}` reports CouchDB's `sizes` (and the deprecated `disk_size` and
+`data_size`, equal to `sizes.file` and `sizes.active`), from what each shard
+already holds, so the request reads no data:
+
+- `file` is exact: the shard files' lengths, from their file metadata.
+- `external` is exact and counts what CouchDB counts: the JSON body of every
+  document's leaf revisions (conflicts and tombstones included), each body as
+  the bytes it is stored as (CouchDB measures its own term encoding, so the
+  numbers are close, not equal). Each document's record keeps its leaves'
+  body lengths and the shard keeps the total in its settings, changed in the
+  commit that changes a document, so it survives crashes and compaction.
+  Superseded revisions' bodies, which stay in the file until compaction,
+  never count.
+- `active` is what compaction would keep: `external` plus the bytes the
+  shard's other tables (document records, the sequence index, `_local`
+  documents, purge history, checkpoints and settings) take in redb, keys,
+  values and tree overhead, at most `file`. Those tables cannot be sized
+  without reading every page, so they are measured off the request path:
+  when a compaction finishes, and in the background when `GET /db` finds no
+  measurement since the database opened or finds that a shard has taken as
+  many changes since its last one as it held documents then (never while
+  the database compacts, so a measurement cannot hold up the swap). Until then that
+  part is the last measurement (0 before the first), so `active` can lag the
+  file by the tables' growth since. The bodies table's keys and tree overhead
+  are not counted.
+
+In a cluster, `GET /db` sums the sizes of the same copy of each shard range
+that its sequence token names, as CouchDB's `fabric_db_info` does; an
+internal `GET /db` reports the node's own copies. `_dbs_info` reports the
+answering node's own copies.
+
+`GET /{db}/_partition/{p}` reports the partition's `external` exactly (from
+the walk of its records that counts its documents) and `active` as 0: the
+partition's share of the other tables is not known.
+
 ## Open gaps
 
 - Exact CouchDB client-suite coverage is tracked in #122.

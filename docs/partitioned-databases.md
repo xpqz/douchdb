@@ -96,13 +96,15 @@ curl http://localhost:5984/sensors/_partition/field-1
   "partition": "field-1",
   "sizes": {
     "active": 0,
-    "external": 0
+    "external": 118
   }
 }
 ```
 
 `doc_count` is the number of live documents in the partition.
 `doc_del_count` counts documents whose winning revision is a tombstone.
+`sizes.external` is the JSON size of the partition's documents' leaf
+revisions; `sizes.active` is always 0.
 
 In a cluster, the coordinator forwards this request to a replica of the
 partition's shard when it does not hold one itself.
@@ -249,8 +251,9 @@ Consequences:
 
 - Mango is not implemented, so partition-scoped `_find`/`_explain` are not
   available. `_all_docs` and views are.
-- Partition `sizes` are zero placeholders, matching the existing database-info
-  behavior. `doc_count` and `doc_del_count` are real.
+- Partition `sizes.external` is real (the partition's documents' leaf
+  bodies); `sizes.active` is 0. See the database sizes note in
+  [consistency.md](consistency.md#database-sizes).
 - View indexes are built from all local documents and filtered to the partition
   at query time. Shard placement still guarantees a partition's rows come from
   one shard, but the on-disk index is not physically split per partition.
