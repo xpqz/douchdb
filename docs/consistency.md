@@ -192,6 +192,11 @@ where behaviour is best-effort, it says so.
 - Residual: two bits of redb's file header (which commit slot is newest, and
   the two-phase flag) are outside every checksum. Flipping the first on a file
   closed by a crash makes redb serve the previous commit without detection.
+- Durability assumes the disk keeps what it confirmed as synced. While a
+  database is open, a shard whose file comes back behind the sequence it
+  acknowledged fails closed. That sequence lives only in memory, so after a
+  restart or a fresh open such a file is served as it is. CouchDB makes the
+  same assumption.
 - A view index that is damaged is deleted and rebuilt from the shards.
 
 ## Explicit non-guarantees
