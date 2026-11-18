@@ -3292,13 +3292,17 @@ impl Db {
 
     // ----- maintenance -----------------------------------------------------
 
-    /// Each shard's purge sequence, by shard index.
+    /// Each shard's purge sequence, by shard index: the one its handle
+    /// publishes, read from the file instead while that is unknown (after a
+    /// failed commit, until a reopen), so a client never sees the
+    /// placeholder.
     pub async fn shard_purge_seqs(&self) -> DbResult<Vec<u64>> {
-        futures::future::join_all(
-            self.shards
-                .iter()
-                .map(|shard| shard.read(|s| Ok(s.purge_seq()?))),
-        )
+        futures::future::join_all(self.shards.iter().map(|shard| async move {
+            match shard.purge_seq() {
+                crate::store::UNKNOWN_PURGE_SEQ => shard.read(|s| Ok(s.purge_seq()?)).await,
+                published => Ok(published),
+            }
+        }))
         .await
         .into_iter()
         .collect()
@@ -9454,6 +9458,50 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The purge sequences `GET /db` reports are the shards' published
+    /// ones, which match their tables; while a shard publishes the unknown
+    /// placeholder, its table answers instead, never the placeholder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_purge_seqs_never_report_the_unknown_placeholder() {
+        let (db, root, switch) = db_on_test_disk("purgeseqs").await;
+        let table = |db: &Db| db.shards[0].read(|s| Ok(s.purge_seq()?));
+        let written = db
+            .put_docs(vec![json!({"_id": "a"}), json!({"_id": "b"})], true)
+            .await
+            .unwrap();
+        let revs: Vec<String> = written
+            .iter()
+            .map(|w| w.json()["rev"].as_str().unwrap().to_string())
+            .collect();
+        let body = |id: &str, rev: &str| json!({ id: [rev] });
+        let none = Default::default();
+        db.purge(&body("a", &revs[0]), 0, &none).await.unwrap();
+        assert_eq!(table(&db).await.unwrap(), 1);
+        assert_eq!(db.shard_purge_seqs().await.unwrap(), [1]);
+
+        // A full disk: the purge fails, and so does the reopen after it, so
+        // the shard publishes the placeholder.
+        switch.fail_writes(std::io::ErrorKind::StorageFull);
+        assert!(db.purge(&body("b", &revs[1]), 0, &none).await.is_err());
+        assert_eq!(db.shards[0].purge_seq(), crate::store::UNKNOWN_PURGE_SEQ);
+        assert!(
+            db.shard_purge_seqs().await.is_err(),
+            "a failed shard of unknown purge sequence answered"
+        );
+
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        assert_eq!(
+            db.shard_purge_seqs().await.unwrap(),
+            [table(&db).await.unwrap()]
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Hold shard 0's actor with a job that waits for the returned sender;
