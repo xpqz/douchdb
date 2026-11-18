@@ -26,6 +26,8 @@ struct Disk {
     failing: Option<ErrorKind>,
     /// Every later read fails with this.
     reads_failing: Option<ErrorKind>,
+    /// The next read fails with this; later ones succeed.
+    one_read_failing: Option<ErrorKind>,
     /// What befalls a later sync, once `after` more syncs have succeeded.
     sync_fault: Option<SyncFault>,
     /// `sync_data` succeeds without making anything durable.
@@ -125,6 +127,11 @@ impl PowerSwitch {
     /// Make every later read fail with `error`.
     pub fn fail_reads(&self, error: ErrorKind) {
         self.disk.lock().unwrap().reads_failing = Some(error);
+    }
+
+    /// Make the next read fail with `error`: a passing I/O error.
+    pub fn fail_one_read(&self, error: ErrorKind) {
+        self.disk.lock().unwrap().one_read_failing = Some(error);
     }
 
     /// Let reads succeed again.
@@ -230,8 +237,8 @@ impl redb::StorageBackend for PowerCut {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
-        let disk = self.live()?;
-        if let Some(kind) = disk.reads_failing {
+        let mut disk = self.live()?;
+        if let Some(kind) = disk.reads_failing.or_else(|| disk.one_read_failing.take()) {
             return Err(Error::from(kind));
         }
         let start = usize::try_from(offset).map_err(Error::other)?;

@@ -1171,8 +1171,8 @@ impl Db {
     /// the read back is parked on shard 0's actor: it runs, and installs
     /// the setting if the write landed, as soon as a retry brings the shard
     /// back, before any later settings write, so installs keep the order of
-    /// the writes. A read back that meets an I/O failure is read again once
-    /// the shard serves again, still before any later settings write. The
+    /// the writes. A read back that meets an I/O failure is read again, as
+    /// a failed shard is retried, still before any later settings write. The
     /// caller hears its error at once and `writing` is not held meanwhile.
     /// A shard that never comes back never runs it.
     async fn store_setting(
@@ -7174,13 +7174,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A parked read back whose own read meets an I/O failure, failing
-    /// shard 0 again, is read again after the next retry, so memory still
-    /// comes to hold the write that landed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_parked_read_back_whose_read_fails_the_shard_again_is_read_again() {
-        let (db, root, switch) = db_on_test_disk("rereadback").await;
-        // Larger than the page cache, so reading one back reaches the disk.
+    /// A settings write that lands on shard 0 while it fails, its read back
+    /// parked, and `fault` armed on the disk once the next retry has
+    /// reopened the file, before the read back runs. The objects are larger
+    /// than the page cache, so reading one back reaches the disk. Returns
+    /// the database, its root, the disk, and the version and object before
+    /// the write and the object written.
+    async fn landed_while_failed_then_fault(
+        tag: &str,
+        fault: impl FnOnce(&crate::kv::powercut::PowerSwitch) + Send + 'static,
+    ) -> (
+        Db,
+        std::path::PathBuf,
+        crate::kv::powercut::PowerSwitch,
+        u64,
+        Value,
+        Value,
+    ) {
+        let (db, root, switch) = db_on_test_disk(tag).await;
         let old = json!({"members": {"names": ["m".repeat(4 << 20)]}});
         let landed = json!({"members": {"names": ["z".repeat(4 << 20)]}});
         let before = switch.syncs();
@@ -7188,12 +7199,10 @@ mod tests {
         // The commit's syncs; the last writes its header.
         let syncs = switch.syncs() - before;
 
-        // Once a retry has reopened the file, before the read back runs,
-        // every read fails.
-        let fault = switch.clone();
+        let disk = switch.clone();
         db.shards[0]
             .alone(move |shard| {
-                shard.on_next_reopen(move || fault.fail_reads(std::io::ErrorKind::Other));
+                shard.on_next_reopen(move || fault(&disk));
                 Ok(())
             })
             .await
@@ -7205,11 +7214,24 @@ mod tests {
             "{:?}",
             db.shards[0].state()
         );
+        switch.restore_writes();
+        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
+        (db, root, switch, version, old, landed)
+    }
+
+    /// A parked read back whose own read meets an I/O failure, failing
+    /// shard 0 again, is read again after the next retry, so memory still
+    /// comes to hold the write that landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_read_back_whose_read_fails_the_shard_again_is_read_again() {
+        let (db, root, switch, version, old, landed) =
+            landed_while_failed_then_fault("rereadback", |disk| {
+                disk.fail_reads(std::io::ErrorKind::Other)
+            })
+            .await;
 
         // The retry reopens the file; the read back's read fails, and so
         // does the reopen after it.
-        switch.restore_writes();
-        db.shards[0].set_retry_wait(std::time::Duration::ZERO);
         assert!(db.shards[0].read(|_| Ok(())).await.is_err());
         assert!(db.shards[0].barrier().await.unwrap().is_err());
         assert!(
@@ -7224,6 +7246,37 @@ mod tests {
         assert!(db.shards[0].read(|_| Ok(())).await.is_err());
         db.shards[0].barrier().await.unwrap().unwrap();
         assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        let on_disk = Stored::parse(&root, stored_rows(&db).await)
+            .unwrap()
+            .security;
+        assert_eq!(on_disk, (version + 1, landed), "the write landed");
+        assert_eq!(db.security_versioned(), on_disk);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A parked read back whose own read meets a passing I/O failure: the
+    /// shard reopens and serves, and the read back runs again once the
+    /// retry wait is over and a request arrives, so memory comes to hold
+    /// the write that landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_read_back_whose_read_meets_a_passing_fault_is_read_again() {
+        let (db, root, _switch, version, old, landed) =
+            landed_while_failed_then_fault("passingreadback", |disk| {
+                disk.fail_one_read(std::io::ErrorKind::Other)
+            })
+            .await;
+
+        // The retry reopens the file; the read back's read fails, and the
+        // reopen after it succeeds.
+        assert!(db.shards[0].read(|_| Ok(())).await.is_err());
+        db.shards[0].barrier().await.unwrap().unwrap();
+        assert_eq!(db.shards[0].state(), crate::store::ShardState::Serving);
+        assert_eq!(db.security_versioned(), (version, old));
+
+        // The wait (none here) is over: a request has the read back run.
+        db.shards[0].read(|_| Ok(())).await.unwrap();
+        db.shards[0].barrier().await.unwrap().unwrap();
         let on_disk = Stored::parse(&root, stored_rows(&db).await)
             .unwrap()
             .security;
