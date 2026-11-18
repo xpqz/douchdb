@@ -264,18 +264,24 @@ already holds, so the request reads no data:
   commit that changes a document, so it survives crashes and compaction.
   Superseded revisions' bodies, which stay in the file until compaction,
   never count.
-- `active` is what compaction would keep: `external` plus the bytes the
-  shard's other tables (document records, the sequence index, `_local`
-  documents, purge history, checkpoints and settings) take in redb, keys,
-  values and tree overhead, at most `file`. Those tables cannot be sized
-  without reading every page, so they are measured off the request path:
-  when a compaction finishes, and in the background when `GET /db` finds no
-  measurement since the database opened or finds that a shard has taken as
-  many changes since its last one as it held documents then (never while
-  the database compacts, so a measurement cannot hold up the swap). Until then that
-  part is the last measurement (0 before the first), so `active` can lag the
-  file by the tables' growth since. The bodies table's keys and tree overhead
-  are not counted.
+- `active` is what compaction would keep: `external` plus the bytes of the
+  keys and values in the shard's other tables (document records, the
+  sequence index, `_local` documents, purge history, checkpoints and
+  settings), never less than `external` nor more than `file`. Those tables
+  can only be sized by reading every entry, so a read never measures them.
+  A shard measures them in the background after a commit once it has taken
+  as many changes since its last measurement (or since it opened) as it
+  held documents then, and a compaction asks for a measurement of every
+  shard once it is done and its slot is free. At most one measurement runs
+  on a node at a time; a commit that finds one running does not start
+  another. A measurement reads a page of entries per lease on the file, so
+  a delete, a close, a recovery or a compaction's swap waits for one page,
+  not for the whole walk. Until a shard's first measurement `active` is
+  its `external`, and between measurements the tables' part is the last
+  one, so `active` lags the tables' growth. The tables' tree overhead and
+  the bodies table's keys and overhead are not counted. A shard file that
+  cannot be read for a moment (a compaction's rename) counts with the
+  length last read.
 
 In a cluster, `GET /db` sums the sizes of the same copy of each shard range
 that its sequence token names, as CouchDB's `fabric_db_info` does; an

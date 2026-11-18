@@ -1046,9 +1046,11 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
   last catch-up and the rename. In a cluster the receiving node also asks
   every other node holding a copy of one of the database's shards to compact
   its copies, as CouchDB's `fabric:compact` does, each request sent on its
-  own alongside the local compaction; a peer that is down is skipped and
-  logged. `_node/_local/_metrics` counts these requests as
-  `fabric.compaction_casts`. `--compact-concurrency` bounds concurrent compactions
+  own alongside the local compaction, and none while one to the same peer
+  for the same database is unanswered; a peer that is down is skipped and
+  logged. `_node/_local/_metrics` counts these requests in `fabric`:
+  `compaction_casts` (sent), `compaction_cast_failures` (unreachable or
+  refused) and `compaction_casts_in_flight`. `--compact-concurrency` bounds concurrent compactions
   on a node, across databases;
   the rest wait their turn. The swap pauses that shard's writes and actor
   reads (reads on their own transactions carry on). `GET /db` reports

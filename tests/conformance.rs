@@ -5832,10 +5832,19 @@ async fn db_info_reports_real_sizes() {
     let (compacted_file, active, compacted_external) = db_sizes(&info);
     assert_eq!(compacted_external, external, "{info}");
     assert!(compacted_file < file, "compaction shrinks the file: {info}");
-    // Measured once the compaction is done: the bodies plus the rest of
-    // the tables, within the file.
-    assert!(active > external, "{info}");
-    assert!(active <= compacted_file, "{info}");
+    assert!(active >= external && active <= compacted_file, "{info}");
+    // The compaction asks for the other tables to be measured once it is
+    // done: then `active` is the bodies plus the rest, within the file.
+    let info = loop {
+        let (_, info) = s.get("/dbsizes").await;
+        let (_, active, external) = db_sizes(&info);
+        if active > external {
+            break info;
+        }
+        tokio::task::yield_now().await;
+    };
+    let (file, active, _) = db_sizes(&info);
+    assert!(active <= file, "{info}");
 }
 
 // A partition's `sizes.external` covers the partition's documents only, so
@@ -7823,20 +7832,46 @@ async fn cluster_db_info_sizes_count_one_copy_of_each_range() {
     assert_eq!(local_total, 2 * seen[0], "{seen:?}");
 }
 
-/// A three-node cluster holding `db` on every node, with document `a`
-/// written twice on every copy. The first revision, whose body each copy
-/// keeps until it compacts.
-async fn cluster_with_a_superseded_body(db: &str) -> (Vec<Server>, String) {
-    let nodes = start_cluster_with(3, "3600", 3);
-    for node in &nodes {
-        node.fresh_db(db).await;
-    }
+/// A three-node cluster (with an admin, if `auth`) holding `db` on every
+/// node, with document `a` written twice on every copy. Also the headers a
+/// client sends it, and the first revision, whose body each copy keeps
+/// until it compacts.
+async fn cluster_with_a_superseded_body(
+    db: &str,
+    auth: bool,
+) -> (Vec<Server>, Vec<(&'static str, String)>, String) {
+    let nodes = start_cluster_full(3, 4, "3600", 3, auth);
+    let client: Vec<(&'static str, String)> = if auth {
+        vec![(
+            "Authorization",
+            format!("Basic {}", base64_encode(b"admin:douchdb")),
+        )]
+    } else {
+        Vec::new()
+    };
+    // Created on every node, as a client's create is broadcast.
+    let (status, body) = nodes[0]
+        .req_with(Method::PUT, &format!("/{db}"), None, &client)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     // `w=3`: answered once every copy holds the revision.
-    let (status, r1) = nodes[0].put(&format!("/{db}/a?w=3"), json!({"v": 1})).await;
+    let (status, r1) = nodes[0]
+        .req_with(
+            Method::PUT,
+            &format!("/{db}/a?w=3"),
+            Some(json!({"v": 1})),
+            &client,
+        )
+        .await;
     assert_eq!(status, StatusCode::CREATED, "{r1}");
     let rev1 = r1["rev"].as_str().unwrap().to_string();
     let (status, r2) = nodes[0]
-        .put(&format!("/{db}/a?w=3"), json!({"_rev": rev1, "v": 2}))
+        .req_with(
+            Method::PUT,
+            &format!("/{db}/a?w=3"),
+            Some(json!({"_rev": rev1, "v": 2})),
+            &client,
+        )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{r2}");
     for node in &nodes {
@@ -7846,24 +7881,79 @@ async fn cluster_with_a_superseded_body(db: &str) -> (Vec<Server>, String) {
             "every copy keeps the superseded body until it compacts"
         );
     }
-    (nodes, rev1)
+    (nodes, client, rev1)
 }
 
-/// How many `_compact` requests `node` has cast to its peers, from its local
-/// metrics. A coordinator counts its casts before it answers.
-async fn compaction_casts(node: &Server) -> u64 {
-    let (status, metrics) = node.get("/_node/_local/_metrics").await;
+/// `node`'s `_compact` casts from its local metrics: (sent, failed,
+/// unanswered). A coordinator counts a cast as sent before it answers.
+async fn compaction_casts(node: &Server, client: &[(&str, String)]) -> (u64, u64, u64) {
+    let (status, metrics) = node
+        .req_with(Method::GET, "/_node/_local/_metrics", None, client)
+        .await;
     assert_eq!(status, StatusCode::OK, "{metrics}");
-    metrics["fabric"]["compaction_casts"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("no compaction_casts: {metrics}"))
+    let count = |name: &str| {
+        metrics["fabric"][name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {name}: {metrics}"))
+    };
+    (
+        count("compaction_casts"),
+        count("compaction_cast_failures"),
+        count("compaction_casts_in_flight"),
+    )
 }
 
-/// Wait until `node`'s copy of `db` no longer holds revision `rev` of `a`:
-/// its compaction has dropped the superseded body.
-async fn body_compacted_away(node: &Server, db: &str, rev: &str) {
-    while local_rev_status(node, db, "a", rev).await != StatusCode::NOT_FOUND {
+/// Wait until `node` reports no compaction of `db` queued or running.
+async fn compacted_with(node: &Server, db: &str, client: &[(&str, String)]) {
+    loop {
+        let (status, info) = node
+            .req_with(Method::GET, &format!("/{db}"), None, client)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        if info["compact_running"] == false {
+            return;
+        }
         tokio::task::yield_now().await;
+    }
+}
+
+/// `_compact` on node 0 of a cluster from `cluster_with_a_superseded_body`:
+/// it casts one compaction to each other node, every cast is accepted, and
+/// then every copy compacts. A peer queues the compaction before it accepts
+/// the cast, so once the casts are answered each peer reports its
+/// compaction until it is done: the waits end whether or not it works.
+async fn compact_every_copy(db: &str, auth: bool) {
+    let (nodes, client, rev1) = cluster_with_a_superseded_body(db, auth).await;
+    let (sent, failed, _) = compaction_casts(&nodes[0], &client).await;
+    let (status, body) = nodes[0]
+        .req_with(
+            Method::POST,
+            &format!("/{db}/_compact"),
+            Some(json!({})),
+            &client,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({"ok": true}));
+    let answered = loop {
+        let casts = compaction_casts(&nodes[0], &client).await;
+        if casts.2 == 0 {
+            break casts;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(
+        answered,
+        (sent + 2, failed, 0),
+        "one cast to each other node holding a copy, each accepted"
+    );
+    for (i, node) in nodes.iter().enumerate() {
+        compacted_with(node, db, &client).await;
+        assert_eq!(
+            local_rev_status(node, db, "a", &rev1).await,
+            StatusCode::NOT_FOUND,
+            "node {i} did not compact its copy"
+        );
     }
 }
 
@@ -7871,31 +7961,26 @@ async fn body_compacted_away(node: &Server, db: &str, rev: &str) {
 // of the database and answers 202 without waiting for them.
 #[tokio::test]
 async fn cluster_compact_compacts_every_copy() {
-    let (nodes, rev1) = cluster_with_a_superseded_body("clcompact").await;
-    let before = compaction_casts(&nodes[0]).await;
-    let (status, body) = nodes[0].post("/clcompact/_compact", json!({})).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(body, json!({"ok": true}));
-    assert_eq!(
-        compaction_casts(&nodes[0]).await,
-        before + 2,
-        "one cast to each other node holding a copy"
-    );
-    for node in &nodes {
-        body_compacted_away(node, "clcompact", &rev1).await;
-    }
+    compact_every_copy("clcompact", false).await;
+}
+
+// The cast carries the client's credentials and the cluster secret, and a
+// peer that requires an admin accepts it.
+#[tokio::test]
+async fn cluster_compact_compacts_every_copy_with_auth() {
+    compact_every_copy("clcompactauth", true).await;
 }
 
 // A `_compact` one node sends another compacts only the receiver's copies:
 // it is not cast to the cluster again.
 #[tokio::test]
 async fn cluster_internal_compact_does_not_fan_out_again() {
-    let (nodes, rev1) = cluster_with_a_superseded_body("clcompactint").await;
+    let (nodes, client, rev1) = cluster_with_a_superseded_body("clcompactint", false).await;
     let internal = [
         ("x-douchdb-forwarded", "1".to_string()),
         ("x-douchdb-secret", "test-cluster-secret".to_string()),
     ];
-    let before = compaction_casts(&nodes[1]).await;
+    let before = compaction_casts(&nodes[1], &client).await;
     let (status, body) = nodes[1]
         .req_with(
             Method::POST,
@@ -7905,8 +7990,16 @@ async fn cluster_internal_compact_does_not_fan_out_again() {
         )
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(compaction_casts(&nodes[1]).await, before, "cast again");
-    body_compacted_away(&nodes[1], "clcompactint", &rev1).await;
+    assert_eq!(
+        compaction_casts(&nodes[1], &client).await,
+        before,
+        "cast again"
+    );
+    compacted_with(&nodes[1], "clcompactint", &client).await;
+    assert_eq!(
+        local_rev_status(&nodes[1], "clcompactint", "a", &rev1).await,
+        StatusCode::NOT_FOUND
+    );
 }
 
 // purge_results_to_json (chttpd_db.erl) answers 202 when an entry reached

@@ -116,12 +116,13 @@ pub(crate) fn compaction_peers(ctx: &ClusterCtx, db: &Db, headers: &HeaderMap) -
 /// `fabric:compact` casts the compaction to every shard copy. The request is
 /// internal, so the peer compacts its own copies and passes nothing on. As
 /// with a cast, a peer that cannot be reached or refuses is only logged.
+/// Whether the peer accepted it.
 pub(crate) async fn compact_on_peer(
     ctx: &ClusterCtx,
     name: &str,
     node: usize,
     headers: &HeaderMap,
-) {
+) -> bool {
     let peer = &ctx.cluster.nodes[node];
     let request = internal_request(
         ctx,
@@ -132,12 +133,14 @@ pub(crate) async fn compact_on_peer(
     )
     .json(&json!({}));
     match send_peer(request).await {
-        Ok(response) if response.status().is_success() => {}
+        Ok(response) if response.status().is_success() => true,
         Ok(response) => {
             tracing::warn!(db = %name, peer = %peer, status = %response.status(), "peer refused to compact");
+            false
         }
         Err(error) => {
             tracing::warn!(db = %name, peer = %peer, error = %error, "peer not asked to compact");
+            false
         }
     }
 }

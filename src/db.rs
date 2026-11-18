@@ -1774,7 +1774,8 @@ impl Db {
             update_seq,
             purge_seq,
             compact_running,
-            // Both deprecated in CouchDB 3, which still sends them.
+            // Deprecated; CouchDB 3's clustered `GET /db` no longer sends
+            // them, but douchdb keeps them, equal to `file` and `active`.
             disk_size: sizes.file,
             data_size: sizes.active,
             sizes,
@@ -3294,17 +3295,24 @@ impl Db {
 
     // ----- maintenance -----------------------------------------------------
 
-    /// Each shard's purge sequence, by shard index: the one its handle
-    /// publishes, read from the file instead while that is unknown (after a
-    /// failed commit, until a reopen), so a client never sees the
-    /// placeholder.
     /// The sizes of shard `index`, whose documents' external sizes sum to
-    /// `external`. The file's length is read from its metadata; a file
-    /// missing for a moment (a compaction's rename) counts as empty.
+    /// `external`. The file's length is read from its metadata; one that
+    /// cannot be read (a compaction's rename can hide the file for a
+    /// moment) is the length last read.
     fn shard_sizes(&self, index: usize, shard: &ShardHandle, external: u64) -> DbSizes {
-        let file = std::fs::metadata(shard_file(&self.path, index as u32))
-            .map_or(0, |metadata| metadata.len());
-        DbSizes::of_shard(file, external, shard.index_bytes(!self.compacting()))
+        let read = std::fs::metadata(shard_file(&self.path, index as u32))
+            .ok()
+            .map(|metadata| metadata.len());
+        DbSizes::of_shard(shard.file_len(read), external, shard.index_bytes())
+    }
+
+    /// Measure each shard's tables other than the bodies, one shard after
+    /// another under the node's one measurement permit: what a compaction
+    /// asks for once it is done, its slot released.
+    pub async fn measure_sizes(&self) {
+        for shard in &self.shards {
+            shard.measure_index().await;
+        }
     }
 
     /// Each shard's sizes as of its last commit, without a round trip to
@@ -3317,6 +3325,10 @@ impl Db {
             .collect()
     }
 
+    /// Each shard's purge sequence, by shard index: the one its handle
+    /// publishes, read from the file instead while that is unknown (after a
+    /// failed commit, until a reopen), so a client never sees the
+    /// placeholder.
     pub async fn shard_purge_seqs(&self) -> DbResult<Vec<u64>> {
         futures::future::join_all(self.shards.iter().map(|shard| async move {
             match shard.purge_seq() {
@@ -3577,11 +3589,6 @@ impl Db {
     pub async fn run_compaction(&self, claim: CompactionClaim<'_>) -> DbResult<()> {
         for shard in &self.shards {
             crate::store::compact::compact_shard(shard).await?;
-            // The new file's tables, measured before the compaction is
-            // reported done. A failure leaves the next `GET /db` to.
-            if let Err(error) = shard.measure_index().await {
-                tracing::debug!(db = %self.name, error = %error, "shard size not measured");
-            }
         }
         drop(claim);
         Ok(())
@@ -4489,13 +4496,7 @@ impl Stage<'_, '_> {
             rev: rev.clone(),
             body,
         });
-        if known {
-            // A leaf stored without its body (never written so, but a
-            // damaged copy may hold one) counts once the body arrives.
-            if slot.meta.tree.is_leaf(&rev) {
-                slot.staging().sizes.insert(rev.clone(), size);
-            }
-        } else {
+        if !known {
             let meta = slot.staging();
             meta.tree.merge_path(&path, deleted);
             meta.sizes.insert(rev.clone(), size);
@@ -5065,8 +5066,9 @@ impl DbInfo {
 /// disk. `external` is CouchDB's: the JSON bodies of every document's leaf
 /// revisions (conflicts and tombstones included), counted exactly as each
 /// write commits. `active` is what compaction would keep: `external` plus
-/// the tables other than the bodies as last measured
-/// ([`ShardHandle::index_bytes`]), at most `file`.
+/// the keys and values of the tables other than the bodies as last
+/// measured ([`ShardHandle::index_bytes`]), at most `file` but never less
+/// than `external`; `external` alone until a first measurement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DbSizes {
     pub active: u64,
@@ -5076,9 +5078,12 @@ pub struct DbSizes {
 
 impl DbSizes {
     /// The sizes of a shard whose file is `file` bytes long.
-    fn of_shard(file: u64, external: u64, index: u64) -> DbSizes {
+    fn of_shard(file: u64, external: u64, index: Option<u64>) -> DbSizes {
         DbSizes {
-            active: external.saturating_add(index).min(file),
+            active: external
+                .saturating_add(index.unwrap_or(0))
+                .min(file)
+                .max(external),
             external,
             file,
         }
@@ -6388,10 +6393,11 @@ mod tests {
 
         db.compact().await.unwrap();
         assert_eq!(check_sizes(&db, &ids, "compacted").await, before);
+        db.measure_sizes().await;
         let info = db.info().await.unwrap();
         assert!(
             info.sizes.active > info.sizes.external,
-            "the other tables are measured once the compaction is done: {info:?}"
+            "the other tables are measured once asked: {info:?}"
         );
         drop(db);
         let db = Db::open(
@@ -6407,6 +6413,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(check_sizes(&db, &ids, "reopened").await, before);
+        for _ in 0..3 {
+            let info = db.info().await.unwrap();
+            assert_eq!(
+                info.sizes.active, info.sizes.external,
+                "a reopened shard is measured only once it has taken writes, never for a read: {info:?}"
+            );
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }

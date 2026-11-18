@@ -295,30 +295,7 @@ pub(crate) fn table_len(txn: &ReadTransaction, table: Table) -> Result<u64> {
     })
 }
 
-/// The bytes `table` takes in `txn` by redb's statistics: its keys, its
-/// values and its tree's overhead, leaving out the unused space in its pages.
-/// Reads every page of the table.
-fn table_bytes(txn: &ReadTransaction, table: Table) -> Result<u64> {
-    let stats = match table {
-        Table::Meta => txn.open_table(META)?.stats()?,
-        Table::BySeq => txn.open_table(BY_SEQ)?.stats()?,
-        Table::Bodies => txn.open_table(BODIES)?.stats()?,
-        Table::Local => txn.open_table(LOCAL)?.stats()?,
-        Table::PurgeInfos => txn.open_table(PURGE_INFOS)?.stats()?,
-        Table::PurgedRevs => txn.open_table(PURGED_REVS)?.stats()?,
-        Table::PurgeUuids => txn.open_table(PURGE_UUIDS)?.stats()?,
-        Table::Checkpoints => txn.open_table(CHECKPOINTS)?.stats()?,
-        Table::Settings => txn.open_table(SETTINGS)?.stats()?,
-    };
-    Ok(stats.stored_bytes() + stats.metadata_bytes())
-}
-
 impl LeaseTxn<'_> {
-    /// See [`table_bytes`].
-    pub(crate) fn table_bytes(&self, table: Table) -> Result<u64> {
-        noted(self.io_failed, table_bytes(&self.txn, table))
-    }
-
     /// The value under `key` in `table`, unsealed and checked.
     pub fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
         noted(self.io_failed, self.get_any(table, key))

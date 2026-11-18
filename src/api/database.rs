@@ -713,15 +713,31 @@ async fn compact(req: DbRequest<'_>) -> Response {
     }
     // In a cluster, every other node holding a copy compacts it too
     // (fabric:compact), each asked on its own, so neither a slow peer nor
-    // this node's compaction holds up another. Counted before the answer.
-    let peers = crate::cluster_ops::compaction_peers(&req.st.ctx, req.db, req.headers);
-    crate::metrics::record_fabric("compaction_casts", peers.len() as u64);
-    for node in peers {
+    // this node's compaction holds up another. A peer already being asked
+    // about this database is not asked again meanwhile: it de-duplicates
+    // anyway. Counted before the answer.
+    for node in crate::cluster_ops::compaction_peers(&req.st.ctx, req.db, req.headers) {
+        let key = (req.name.to_string(), node);
+        let new = req
+            .st
+            .compaction_casts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone());
+        if !new {
+            continue;
+        }
+        crate::metrics::compaction_cast_started();
         let st = Arc::clone(req.st);
-        let name = req.name.to_string();
         let headers = req.headers.clone();
         tokio::spawn(async move {
-            crate::cluster_ops::compact_on_peer(&st.ctx, &name, node, &headers).await;
+            let delivered =
+                crate::cluster_ops::compact_on_peer(&st.ctx, &key.0, node, &headers).await;
+            st.compaction_casts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            crate::metrics::compaction_cast_finished(delivered);
         });
     }
     json(StatusCode::ACCEPTED, json!({"ok": true}))
@@ -731,7 +747,7 @@ async fn compact(req: DbRequest<'_>) -> Response {
 /// so a queued database can be closed meanwhile.
 async fn run_queued_compaction(st: Arc<AppState>, name: String) {
     // The semaphore is never closed; were it, the compaction runs.
-    let _slot = st.compaction.acquire().await.ok();
+    let slot = st.compaction.acquire().await.ok();
     let db = st.db(&name).await;
     // Claimed before the name leaves the queue, so `GET /db` never finds
     // the compaction in neither.
@@ -740,6 +756,7 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&name);
+    let mut compacted = false;
     match (&db, claim) {
         (Ok(db), Some(claim)) => {
             if let Err(error) = db.run_compaction(claim).await {
@@ -749,6 +766,8 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
                 } else {
                     tracing::error!(db = %name, error = %error.reason, "compaction failed");
                 }
+            } else {
+                compacted = true;
             }
         }
         (Ok(_), None) => {}
@@ -759,7 +778,13 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
         (Err(error), _) => {
             tracing::error!(db = %name, error = %error.reason, "compaction not started");
         }
-    };
+    }
+    // The new files' sizes, measured once the compaction is reported done
+    // and its slot is free for the next.
+    drop(slot);
+    if let (true, Ok(db)) = (compacted, &db) {
+        db.measure_sizes().await;
+    }
 }
 
 /// `POST /{db}/_ensure_full_commit`.

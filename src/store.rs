@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 /// Jobs one group commit takes at most.
@@ -3035,48 +3036,118 @@ pub struct ShardHandle {
     external: Arc<AtomicU64>,
     /// The size of the tables other than the bodies, as last measured.
     index: Arc<IndexSize>,
+    /// The shard file's length when it was last read.
+    file_len: AtomicU64,
 }
+
+/// Measurements of shard sizes ([`ShardHandle::index_bytes`]) running on
+/// this node: at most one at a time, whatever the shard or database.
+static MEASURING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Entries one lease of a size measurement reads at most.
+const MEASURE_PAGE: usize = 1000;
 
 /// What [`ShardHandle::index_bytes`] last measured, and when.
 #[derive(Default)]
 struct IndexSize {
     bytes: AtomicU64,
+    /// Whether `bytes` holds a measurement.
+    measured: AtomicBool,
     /// The shard's committed position and documents (live and deleted)
-    /// when `bytes` was measured.
+    /// when `bytes` was measured, or when the shard opened.
     seq: AtomicU64,
     docs: AtomicU64,
-    /// Whether `bytes` measures the file the shard has now; a compaction
-    /// replaces the file.
-    measured: AtomicBool,
-    measuring: AtomicBool,
 }
 
 impl IndexSize {
-    /// Measure the tables of the file under `gate` other than the bodies.
-    async fn measure(&self, gate: &Gate, seq: u64) -> Result<()> {
-        let (bytes, docs) = gate
-            .read(|txn| {
-                let mut bytes = 0;
-                for table in compact::TABLES {
-                    if table != Table::Bodies {
-                        bytes += txn.table_bytes(table)?;
-                    }
-                }
-                let mut docs = 0;
-                for counter in [DOC_COUNT, DELETED_COUNT] {
-                    if let Some(count) = txn.get(Table::Settings, &gate::key::text(counter))? {
-                        docs += decode_u64(Table::Settings, &count)?;
-                    }
-                }
-                Ok((bytes, docs))
-            })
-            .await?;
-        self.bytes.store(bytes, Ordering::SeqCst);
-        self.seq.store(seq, Ordering::SeqCst);
-        self.docs.store(docs, Ordering::SeqCst);
-        self.measured.store(true, Ordering::SeqCst);
-        Ok(())
+    /// Whether the shard, now at `seq`, has taken as many changes since the
+    /// last measurement (or its open) as it held documents then.
+    fn due(&self, seq: u64) -> bool {
+        seq.saturating_sub(self.seq.load(Ordering::SeqCst))
+            >= self.docs.load(Ordering::SeqCst).max(1)
     }
+
+    /// Start a measurement of the shard on `runtime` if one is due and no
+    /// other runs on the node; otherwise do nothing, and a later commit
+    /// tries again.
+    fn measure_if_due(self: &Arc<Self>, seq: u64, gate: &Gate, runtime: Option<&Handle>) {
+        if !self.due(seq) {
+            return;
+        }
+        let (Some(runtime), Ok(permit)) = (runtime, MEASURING.try_acquire()) else {
+            return;
+        };
+        let (index, gate) = (Arc::clone(self), gate.clone());
+        runtime.spawn(async move {
+            index.measure(&gate, seq).await;
+            drop(permit);
+        });
+    }
+
+    /// Measure the tables of the file under `gate` other than the bodies:
+    /// their keys and values as stored, read a page per lease, so a
+    /// reopen, a close or a compaction's swap waits for one page at most.
+    /// A measurement that fails keeps the last one, and is not tried again
+    /// until the shard has taken as many changes again.
+    async fn measure(&self, gate: &Gate, seq: u64) {
+        match measure_tables(gate).await {
+            Ok((bytes, docs)) => {
+                self.bytes.store(bytes, Ordering::SeqCst);
+                self.docs.store(docs, Ordering::SeqCst);
+                self.measured.store(true, Ordering::SeqCst);
+            }
+            Err(error) => tracing::debug!(error = %error, "shard size not measured"),
+        }
+        self.seq.store(seq, Ordering::SeqCst);
+    }
+}
+
+/// The bytes of the keys and values of every table but the bodies, and the
+/// documents (live and deleted) the shard holds, read a page per lease.
+async fn measure_tables(gate: &Gate) -> Result<(u64, u64)> {
+    let mut bytes = 0u64;
+    for table in compact::TABLES {
+        if table == Table::Bodies {
+            continue;
+        }
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let from = after.take();
+            let (page, last) = gate
+                .read(move |txn| {
+                    let lower = from.map_or(Unbounded, Excluded);
+                    let (mut bytes, mut entries, mut last) = (0u64, 0usize, None);
+                    txn.scan(table, (lower, Unbounded), false, |key, value| {
+                        bytes += (key.len() + value.len()) as u64;
+                        entries += 1;
+                        if entries == MEASURE_PAGE {
+                            last = Some(key.to_vec());
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    Ok((bytes, last))
+                })
+                .await?;
+            bytes += page;
+            match last {
+                Some(key) => after = Some(key),
+                None => break,
+            }
+        }
+    }
+    let docs = gate
+        .read(|txn| {
+            let mut docs = 0;
+            for counter in [DOC_COUNT, DELETED_COUNT] {
+                if let Some(count) = txn.get(Table::Settings, &gate::key::text(counter))? {
+                    docs += decode_u64(Table::Settings, &count)?;
+                }
+            }
+            Ok(docs)
+        })
+        .await?;
+    Ok((bytes, docs))
 }
 
 impl ShardHandle {
@@ -3129,6 +3200,7 @@ impl ShardHandle {
             ReadContext,
             Arc<journal::Journal>,
             Arc<dyn compact::Target>,
+            Arc<AtomicU64>,
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready>>();
         let tracker = seq_tracker.clone();
@@ -3136,8 +3208,11 @@ impl ShardHandle {
         let shard_scanned = scanned.clone();
         let body_reads = Arc::new(AtomicU64::new(0));
         let shard_body_reads = body_reads.clone();
-        let external = Arc::new(AtomicU64::new(0));
-        let shard_external = external.clone();
+        let index = Arc::new(IndexSize::default());
+        let shard_index = Arc::clone(&index);
+        // Where measurements of the shard's size run: the runtime that opens
+        // it, if any.
+        let runtime = Handle::try_current().ok();
         let thread = std::thread::Builder::new().name(name).spawn(move || {
             // Opened on this thread, so the file never crosses threads.
             let mut shard = match open() {
@@ -3148,8 +3223,11 @@ impl ShardHandle {
                 }
             };
             shard.set_counters(shard_scanned, shard_body_reads);
-            shard_external.store(shard.settings.external, Ordering::SeqCst);
-            shard.shared_external = shard_external;
+            shard_index.seq.store(shard.seq(), Ordering::SeqCst);
+            shard_index.docs.store(
+                shard.settings.docs + shard.settings.deleted,
+                Ordering::SeqCst,
+            );
             let uuid = Arc::new(std::sync::RwLock::new(shard.settings.uuid.clone()));
             shard.shared_uuid = Some(uuid.clone());
             let context = ReadContext {
@@ -3167,6 +3245,7 @@ impl ShardHandle {
                 context,
                 Arc::clone(&shard.journal),
                 Arc::clone(&shard.target),
+                Arc::clone(&shard.shared_external),
             );
             if ready_tx.send(Ok(ready)).is_err() {
                 return;
@@ -3222,6 +3301,7 @@ impl ShardHandle {
                             Err(_) => None,
                         });
                         publish(shard.seq());
+                        shard_index.measure_if_due(shard.seq(), &shard.gate, runtime.as_ref());
                         for reply in replies {
                             reply(error.as_ref());
                         }
@@ -3293,10 +3373,20 @@ impl ShardHandle {
                 None => shard.close(),
             }
         })?;
-        let (initial_seq, uuid, purge_seq, state, checkup, gate, read_context, journal, target) =
-            ready_rx.recv().map_err(|_| {
-                anyhow::anyhow!("shard thread exited before opening its database")
-            })??;
+        let (
+            initial_seq,
+            uuid,
+            purge_seq,
+            state,
+            checkup,
+            gate,
+            read_context,
+            journal,
+            target,
+            external,
+        ) = ready_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("shard thread exited before opening its database"))??;
         seq_tracker.store(initial_seq, Ordering::SeqCst);
         Ok(ShardHandle {
             tx: Some(tx),
@@ -3316,39 +3406,36 @@ impl ShardHandle {
             target,
             task: Default::default(),
             external,
-            index: Arc::default(),
+            index,
+            file_len: AtomicU64::new(0),
         })
     }
 
-    /// The bytes the shard's tables other than the bodies take (keys,
-    /// values and tree overhead; see [`gate::LeaseTxn::table_bytes`]), as
-    /// last measured: 0 until the first measurement. Measuring reads every
-    /// page of those tables, so it is never done here: a call that finds no
-    /// measurement of the current file, or finds that the shard has taken
-    /// at least as many changes since the last one as it held documents
-    /// then, starts one in the background and answers with what it has.
-    /// Measurements are thus spread out in proportion to the writes, and
-    /// a shard nobody asks about is never measured. None starts unless
-    /// `may_measure`: a caller passes false while the database compacts,
-    /// since a measurement holds a lease on the file, which the
-    /// compaction's swap would wait for with the shard's writes paused.
-    pub fn index_bytes(&self, may_measure: bool) -> u64 {
-        let index = &self.index;
-        let seq = self.committed_seq();
-        let changes = seq.saturating_sub(index.seq.load(Ordering::SeqCst));
-        let stale = !index.measured.load(Ordering::SeqCst)
-            || changes >= index.docs.load(Ordering::SeqCst).max(1);
-        if may_measure && stale && !index.measuring.swap(true, Ordering::SeqCst) {
-            let index = Arc::clone(&self.index);
-            let gate = self.gate.clone();
-            tokio::spawn(async move {
-                if let Err(error) = index.measure(&gate, seq).await {
-                    tracing::debug!(error = %error, "shard size not measured");
-                }
-                index.measuring.store(false, Ordering::SeqCst);
-            });
+    /// The bytes the keys and values of the shard's tables other than the
+    /// bodies take, as last measured; `None` before the first measurement.
+    /// Reading every entry, a measurement never runs for a read: the shard
+    /// starts one after a commit once it has taken as many changes since
+    /// the last (or since it opened) as it held documents then, so their
+    /// cost follows the writes, and a compaction asks for one when it is
+    /// done ([`ShardHandle::measure_index`]).
+    pub fn index_bytes(&self) -> Option<u64> {
+        self.index
+            .measured
+            .load(Ordering::SeqCst)
+            .then(|| self.index.bytes.load(Ordering::SeqCst))
+    }
+
+    /// The shard file's length: `read` when it could be read, else the
+    /// length last read (a compaction's rename can hide the file for a
+    /// moment).
+    pub fn file_len(&self, read: Option<u64>) -> u64 {
+        match read {
+            Some(len) => {
+                self.file_len.store(len, Ordering::SeqCst);
+                len
+            }
+            None => self.file_len.load(Ordering::SeqCst),
         }
-        index.bytes.load(Ordering::SeqCst)
     }
 
     /// The shard's documents' external sizes summed
@@ -3358,10 +3445,13 @@ impl ShardHandle {
     }
 
     /// Measure [`ShardHandle::index_bytes`] now, as a compaction does once
-    /// it has replaced the file.
-    pub async fn measure_index(&self) -> Result<()> {
-        self.index.measured.store(false, Ordering::SeqCst);
-        self.index.measure(&self.gate, self.committed_seq()).await
+    /// it has replaced the file, under the node's one measurement permit,
+    /// waiting for it if another measurement runs.
+    pub async fn measure_index(&self) {
+        let Ok(_permit) = MEASURING.acquire().await else {
+            return;
+        };
+        self.index.measure(&self.gate, self.committed_seq()).await;
     }
 
     /// Index entries the shard has walked to answer reads so far.
@@ -4027,6 +4117,51 @@ pub(crate) mod tests {
                 ),
             }
         }
+        remove(&file);
+    }
+
+    /// Purging a document whose record cannot be decoded cannot take its
+    /// external size off the counter, so the counter is recounted from the
+    /// records that remain, as the document counts are.
+    #[test]
+    fn purging_an_undecodable_record_recounts_the_external_size() {
+        let file = temp_file("purge-corrupt-sizes");
+        let mut shard = open(&file);
+        shard
+            .write(|txn| {
+                write_doc(txn, "a", false, b"{\"v\":1}", 1)?;
+                write_doc(txn, "b", false, b"{\"v\":\"bbbb\"}", 2)?;
+                write_doc(txn, "c", true, b"{}", 3)?;
+                Ok(())
+            })
+            .unwrap();
+        let external = |shard: &mut Shard| shard.read(|txn| Ok(txn.external_size())).unwrap();
+        assert_eq!(external(&mut shard), 7 + 12 + 2);
+        shard
+            .write(|txn| {
+                txn.put_raw(META, Table::Meta, "b", b"not a record");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            external(&mut shard),
+            7 + 12 + 2,
+            "a raw write counts nothing"
+        );
+        let info = PurgeInfo {
+            uuid: "u".to_string(),
+            id: "b".to_string(),
+            revs: Vec::new(),
+        };
+        shard
+            .write(move |txn| Ok(txn.purge_corrupt("b", &info, &[])?))
+            .unwrap();
+        assert_eq!(external(&mut shard), 7 + 2);
+        assert_eq!(counts(&mut shard), (1, 1));
+        drop(shard);
+        let mut shard = open(&file);
+        assert_eq!(external(&mut shard), 7 + 2, "and as committed");
+        drop(shard);
         remove(&file);
     }
 
@@ -5252,6 +5387,13 @@ mod recovery_tests {
             .unwrap()
     }
 
+    /// The shard's external size as its actor holds it and as its handle
+    /// publishes it.
+    async fn external(handle: &ShardHandle) -> (u64, u64) {
+        let held = handle.read(|txn| Ok(txn.external_size())).await.unwrap();
+        (held, handle.external_size())
+    }
+
     fn rows(ids: &[(u64, &str)]) -> Vec<(u64, String)> {
         ids.iter().map(|(seq, id)| (*seq, id.to_string())).collect()
     }
@@ -5411,8 +5553,12 @@ mod recovery_tests {
             .unwrap();
         assert_eq!(counts, (2, 0));
         assert_eq!(latest, rows(&[(1, "a"), (2, "landed")]));
+        // Each document's body is `{}`: the landed one's counts, in the
+        // file and in what the handle publishes.
+        assert_eq!(external(&rig.handle).await, (4, 4));
         assert_eq!(put(&rig.handle, "c", 3).await.unwrap(), 3);
         assert_eq!(rig.handle.committed_seq(), 3);
+        assert_eq!(external(&rig.handle).await, (6, 6));
     }
 
     /// A purge whose commit reports an error and still lands is in the
@@ -5606,7 +5752,10 @@ mod recovery_tests {
         assert!(!lost, "the failed commit is served");
         let counts = rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
         assert_eq!(counts, (1, 0));
+        // Each document's body is `{}`: the lost one's does not count.
+        assert_eq!(external(&rig.handle).await, (2, 2));
         assert_eq!(put(&rig.handle, "c", 2).await.unwrap(), 2);
+        assert_eq!(external(&rig.handle).await, (4, 4));
 
         let Rig { switch, handle, .. } = rig;
         drop(Arc::into_inner(handle).unwrap());
