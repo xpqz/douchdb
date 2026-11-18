@@ -817,11 +817,7 @@ pub(crate) async fn commit_docs(
     // acquiring it.
     let gate = Arc::new(db.write_guard().await);
     if db.rebalance_in_progress() && !ctx.cluster.is_internal(headers) {
-        return Err(ApiError::new(
-            503,
-            "rebalance_in_progress",
-            "writes are paused while this database changes shard placement",
-        ));
+        return Err(writes_paused());
     }
 
     let ids = assign_ids(&mut docs);
@@ -849,6 +845,15 @@ pub(crate) async fn commit_docs(
     Ok((out, met))
 }
 
+/// The refusal of a client write while a rebalance freezes the database.
+fn writes_paused() -> ApiError {
+    ApiError::new(
+        503,
+        "rebalance_in_progress",
+        "writes are paused while this database changes shard placement",
+    )
+}
+
 /// What `_purge` reports for one document (`fabric_doc_purge:format_resps`).
 pub(crate) enum PurgeOutcome {
     /// At least `w` copies answered and they agree on the revisions purged.
@@ -863,7 +868,8 @@ pub(crate) enum PurgeOutcome {
 /// shard and judge each document by the write quorum. The coordinator's own
 /// copy is purged in-process and the others through the forwarded `_purge`
 /// call, which only applies to the receiving node. A copy that is down or
-/// fails counts against the quorum but does not stop the others.
+/// fails counts against the quorum but does not stop the others. Gated as
+/// a document write is: a rebalance freeze refuses it and drains it.
 pub(crate) async fn purge_docs(
     st: &AppState,
     db: &Db,
@@ -871,8 +877,13 @@ pub(crate) async fn purge_docs(
     request: &serde_json::Map<String, Value>,
     w: usize,
     headers: &HeaderMap,
-) -> Vec<(String, PurgeOutcome)> {
+) -> DbResult<Vec<(String, PurgeOutcome)>> {
     let ctx = &st.ctx;
+    // Held until every copy has answered, as `commit_docs` holds it.
+    let _gate = db.write_guard().await;
+    if db.rebalance_in_progress() && !ctx.cluster.is_internal(headers) {
+        return Err(writes_paused());
+    }
     let mut groups: HashMap<usize, serde_json::Map<String, Value>> = HashMap::new();
     let mut copies: Vec<usize> = Vec::new();
     // One uuid per document, shared by every copy, so the copies hold the same
@@ -935,7 +946,7 @@ pub(crate) async fn purge_docs(
         }
     }
 
-    request
+    Ok(request
         .keys()
         .zip(copies)
         .map(|(id, copies)| {
@@ -956,7 +967,7 @@ pub(crate) async fn purge_docs(
             };
             (id.clone(), outcome)
         })
-        .collect()
+        .collect())
 }
 
 /// The sorted revisions one copy reports purged for `id`.
@@ -3473,6 +3484,117 @@ mod tests {
             in_flight < 200,
             "{in_flight} replica writes are in flight to a peer that never answers"
         );
+    }
+
+    /// A database of two shards, one copy each, on a cluster of this node
+    /// and an unreachable peer, holding one document on a shard of this
+    /// node's. Returns the state, the database, the document's id and rev,
+    /// and the root.
+    async fn purge_gate_rig(
+        tag: &str,
+    ) -> (Arc<AppState>, Arc<Db>, String, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{tag}-{}", crate::util::uuid()));
+        let mut st = crate::state::test_state(root.clone(), 4);
+        Arc::get_mut(&mut st).expect("sole owner").ctx.cluster = crate::cluster::Cluster {
+            nodes: vec!["http://127.0.0.1:1".to_string(); 2],
+            me: 0,
+            n: 1,
+            secret: "test-secret".to_string(),
+        };
+        let db = st.create_db(tag, false, Some(2), Some(1)).await.unwrap();
+        let id = (0..)
+            .map(|i| format!("doc{i}"))
+            .find(|id| db.placement_of_doc(id).1 == [0])
+            .unwrap();
+        let written = db.put_docs(vec![json!({"_id": id})], true).await.unwrap();
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        (st, db, id, rev, root)
+    }
+
+    /// A client purge during a rebalance freeze is refused, as a document
+    /// write is, and purges nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_during_a_rebalance_freeze_is_refused() {
+        let (st, db, id, rev, root) = purge_gate_rig("purgefrozen").await;
+        db.set_rebalance_in_progress(true);
+        let request = json!({ id.clone(): [rev] });
+        let refused = purge_docs(
+            &st,
+            &db,
+            "purgefrozen",
+            request.as_object().unwrap(),
+            0,
+            &HeaderMap::new(),
+        )
+        .await
+        .err()
+        .expect("a purge was let through the freeze");
+        assert_eq!(
+            (refused.status, refused.error),
+            (503, "rebalance_in_progress")
+        );
+        assert!(db
+            .get_doc(&id, &crate::db::DocOpts::default())
+            .await
+            .is_ok());
+        drop(db);
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge holds the write gate until it has finished, so a rebalance
+    /// freeze waits for it to drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_in_flight_holds_the_write_gate() {
+        use futures::FutureExt;
+        let (st, db, id, rev, root) = purge_gate_rig("purgegate").await;
+        let shard = db.shard_handle(db.shard_index(&id));
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::spawn(shard.call(move |_| {
+            let _ = started_tx.send(());
+            held.recv().map_err(ApiError::internal)
+        }));
+        started.await.unwrap();
+        let purge = tokio::spawn({
+            let (st, db) = (Arc::clone(&st), Arc::clone(&db));
+            let request = json!({ id.clone(): [rev] });
+            async move {
+                purge_docs(
+                    &st,
+                    &db,
+                    "purgegate",
+                    request.as_object().unwrap(),
+                    0,
+                    &HeaderMap::new(),
+                )
+                .await
+            }
+        });
+        while shard.queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(
+            db.drain_writes(hour).now_or_never().is_none(),
+            "the writes drained with a purge in flight"
+        );
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        let results = purge.await.unwrap().unwrap();
+        assert!(
+            matches!(results.as_slice(), [(_, PurgeOutcome::Ok(_))]),
+            "the purge did not succeed"
+        );
+        assert!(db.drain_writes(hour).await);
+        assert!(db
+            .get_doc(&id, &crate::db::DocOpts::default())
+            .await
+            .is_err());
+        drop(db);
+        drop(st);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A replication write starts its remote call while the coordinator's own

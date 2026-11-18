@@ -625,7 +625,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
             let purged = db.purge(&request, cluster.me, &uuids).await?;
             Ok::<_, ApiError>(json(StatusCode::CREATED, purged))
         } else {
-            let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
+            let results = purge_docs(&st, &db, &name, &map, w, &headers).await?;
             Ok(purge_results_to_json(results))
         }
     }));
