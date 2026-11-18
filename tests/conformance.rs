@@ -7823,6 +7823,91 @@ async fn cluster_db_info_sizes_count_one_copy_of_each_range() {
     assert_eq!(local_total, 2 * seen[0], "{seen:?}");
 }
 
+/// A three-node cluster holding `db` on every node, with document `a`
+/// written twice on every copy. The first revision, whose body each copy
+/// keeps until it compacts.
+async fn cluster_with_a_superseded_body(db: &str) -> (Vec<Server>, String) {
+    let nodes = start_cluster_with(3, "3600", 3);
+    for node in &nodes {
+        node.fresh_db(db).await;
+    }
+    // `w=3`: answered once every copy holds the revision.
+    let (status, r1) = nodes[0].put(&format!("/{db}/a?w=3"), json!({"v": 1})).await;
+    assert_eq!(status, StatusCode::CREATED, "{r1}");
+    let rev1 = r1["rev"].as_str().unwrap().to_string();
+    let (status, r2) = nodes[0]
+        .put(&format!("/{db}/a?w=3"), json!({"_rev": rev1, "v": 2}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{r2}");
+    for node in &nodes {
+        assert_eq!(
+            local_rev_status(node, db, "a", &rev1).await,
+            StatusCode::OK,
+            "every copy keeps the superseded body until it compacts"
+        );
+    }
+    (nodes, rev1)
+}
+
+// fabric:compact casts a compaction to every node holding a copy of a shard
+// of the database and answers 202 without waiting for them.
+#[tokio::test]
+async fn cluster_compact_compacts_every_copy() {
+    let (nodes, rev1) = cluster_with_a_superseded_body("clcompact").await;
+    let (status, body) = nodes[0].post("/clcompact/_compact", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({"ok": true}));
+    // The coordinator asks its peers before compacting its own copies, so
+    // once its compaction is done each peer has one queued, running or done.
+    compacted(&nodes[0], "clcompact").await;
+    for (i, node) in nodes.iter().enumerate() {
+        compacted(node, "clcompact").await;
+        assert_eq!(
+            local_rev_status(node, "clcompact", "a", &rev1).await,
+            StatusCode::NOT_FOUND,
+            "node {i} did not compact its copy"
+        );
+    }
+}
+
+// A `_compact` one node sends another compacts only the receiver's copies:
+// it is not cast to the cluster again.
+#[tokio::test]
+async fn cluster_internal_compact_does_not_fan_out_again() {
+    let (nodes, rev1) = cluster_with_a_superseded_body("clcompactint").await;
+    let internal = [
+        ("x-douchdb-forwarded", "1".to_string()),
+        ("x-douchdb-secret", "test-cluster-secret".to_string()),
+    ];
+    let (status, body) = nodes[1]
+        .req_with(
+            Method::POST,
+            "/clcompactint/_compact",
+            Some(json!({})),
+            &internal,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    compacted(&nodes[1], "clcompactint").await;
+    assert_eq!(
+        local_rev_status(&nodes[1], "clcompactint", "a", &rev1).await,
+        StatusCode::NOT_FOUND
+    );
+    // Had node 1 cast it on, it would have done so before compacting its own
+    // copies: each peer would now report a compaction or have dropped the
+    // body.
+    for i in [0, 2] {
+        let (status, info) = nodes[i].get("/clcompactint").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        assert_eq!(info["compact_running"], false, "node {i}: {info}");
+        assert_eq!(
+            local_rev_status(&nodes[i], "clcompactint", "a", &rev1).await,
+            StatusCode::OK,
+            "node {i} compacted"
+        );
+    }
+}
+
 // purge_results_to_json (chttpd_db.erl) answers 202 when an entry reached
 // fewer than `w` copies (format_resps in fabric_doc_purge.erl marks it
 // `accepted`); the copies that were reached still purge.

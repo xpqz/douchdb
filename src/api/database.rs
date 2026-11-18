@@ -705,11 +705,20 @@ async fn compact(req: DbRequest<'_>) -> Response {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let queued = !req.db.compacting() && queue.insert(req.name.to_string());
     drop(queue);
-    if queued {
-        tokio::spawn(run_queued_compaction(
-            Arc::clone(req.st),
-            req.name.to_string(),
-        ));
+    // In a cluster, every other node holding a copy compacts it too
+    // (fabric:compact). They are asked first, so this node's compaction has
+    // not begun before theirs is queued.
+    let peers = crate::cluster_ops::compaction_peers(&req.st.ctx, req.db, req.headers);
+    if queued || !peers.is_empty() {
+        let st = Arc::clone(req.st);
+        let name = req.name.to_string();
+        let headers = req.headers.clone();
+        tokio::spawn(async move {
+            crate::cluster_ops::compact_on_peers(&st.ctx, &name, &peers, &headers).await;
+            if queued {
+                run_queued_compaction(st, name).await;
+            }
+        });
     }
     json(StatusCode::ACCEPTED, json!({"ok": true}))
 }
