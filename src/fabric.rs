@@ -3638,9 +3638,13 @@ mod tests {
                 .await
             }
         });
-        while shard.queued() < 1 {
+        while shard.queued() < 1 && !purge.is_finished() {
             tokio::task::yield_now().await;
         }
+        assert!(
+            !purge.is_finished(),
+            "the purge ended before it queued its job"
+        );
 
         let hour = std::time::Duration::from_secs(3600);
         assert!(
