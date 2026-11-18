@@ -285,11 +285,13 @@ on the next open. Policy:
    because shard 0 has failed is read back on shard 0's actor as soon as a
    retry brings it back, before any later settings write, and installed in
    memory if the write landed. A read back that meets an I/O failure is
-   read again, still before any later settings write: after the next retry
-   if the failure failed the shard, or, if the reopen after it succeeded,
-   once the retry wait (the same backoff) is over and a request arrives, so
-   a disk whose reads keep failing is reopened at most once per wait. Any
-   other error ends it.
+   read again, before any later parked read back: after the next retry if
+   the failure failed the shard, or, if the reopen after it succeeded, once
+   the retry wait (the same backoff, which keeps doubling until the read
+   back has run) is over and a request arrives, so a disk whose reads keep
+   failing is reopened at most once per wait. While the shard serves,
+   later settings writes may run first; the read back installs only what
+   shard 0 then holds, so it never undoes them. Any other error ends it.
 
 ## Compaction
 

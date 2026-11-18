@@ -1172,9 +1172,11 @@ impl Db {
     /// the setting if the write landed, as soon as a retry brings the shard
     /// back, before any later settings write, so installs keep the order of
     /// the writes. A read back that meets an I/O failure is read again, as
-    /// a failed shard is retried, still before any later settings write. The
-    /// caller hears its error at once and `writing` is not held meanwhile.
-    /// A shard that never comes back never runs it.
+    /// a failed shard is retried, before any later parked read back; if the
+    /// shard serves meanwhile, later settings writes may run first, and it
+    /// installs only if shard 0 still holds what it wrote, so it never
+    /// undoes them. The caller hears its error at once and `writing` is
+    /// not held meanwhile. A shard that never comes back never runs it.
     async fn store_setting(
         &self,
         writing: tokio::sync::OwnedMutexGuard<()>,
