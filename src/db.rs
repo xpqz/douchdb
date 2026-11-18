@@ -1114,6 +1114,43 @@ impl Db {
         .map_err(|error| ApiError::internal(format!("invalidating the design caches: {error}")))
     }
 
+    /// Run the purge `purge` makes in a task of its own (carrying the
+    /// request's peer accounting), then drop the view and search indexes
+    /// if `stale` says it may have removed a revision: a purge leaves no
+    /// change row, so the indexes cannot follow it. A caller that stops
+    /// waiting cannot leave them serving purged documents. The purge's
+    /// outcome, then the invalidation's (`Ok` when there was none).
+    pub(crate) async fn purging<T, F>(
+        self: &Arc<Self>,
+        purge: impl FnOnce(Arc<Self>) -> F,
+        stale: impl FnOnce(&T) -> bool + Send + 'static,
+    ) -> DbResult<(T, DbResult<()>)>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let purge = purge(Arc::clone(self));
+        let db = Arc::clone(self);
+        tokio::spawn(crate::cluster_http::in_request_scope(async move {
+            let done = purge.await;
+            let indexes = if stale(&done) {
+                db.invalidate_indexes().await
+            } else {
+                Ok(())
+            };
+            (done, indexes)
+        }))
+        .await
+        .map_err(|error| ApiError::internal(format!("invalidating the indexes: {error}")))
+    }
+
+    /// Drop every view and search index of this database; they are rebuilt
+    /// on their next query.
+    async fn invalidate_indexes(&self) -> DbResult<()> {
+        crate::view::invalidate(self).await?;
+        crate::search::cleanup(self).await
+    }
+
     /// Generation of this node's design documents.
     pub(crate) fn design_generation(&self) -> u64 {
         self.design.generation.load(Ordering::SeqCst)
