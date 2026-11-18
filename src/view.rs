@@ -5849,6 +5849,13 @@ mod tests {
             txn.commit().unwrap();
         }
         indexes().remove(&path);
+        {
+            let file = crate::kv::open(&path, VIEW_CACHE_BYTES).unwrap();
+            assert!(
+                read_state(&file).unwrap().is_err(),
+                "a cursor in the old shape was read"
+            );
+        }
 
         let after = query_with_spec(&db, "_design/d", "v", &spec, &query)
             .await
