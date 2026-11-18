@@ -493,7 +493,7 @@ async fn build_index(
     // that lands while the index is being built is then after the recorded
     // cursor, and the next query reads it again.
     gate.check()?;
-    let cursor = IndexCursor(db.shard_seqs());
+    let cursor = db.index_cursor();
     let docs = db.map_docs(None).await?;
     let path = index_dir(db, ddoc, index_name);
     let source = spec.source.clone();
@@ -814,17 +814,18 @@ async fn update_index(
     mut entry: OwnedMutexGuard<Option<Cached>>,
 ) -> DbResult<Update> {
     // Each shard is read up to where it is now, and the index records
-    // exactly that.
-    let cursor = IndexCursor(db.shard_seqs());
+    // exactly that. A purge after this leaves the recorded purge sequence
+    // behind, so the next use rebuilds.
+    let cursor = db.index_cursor();
     let Some(since) = entry
         .as_ref()
         .map(|cached| &cached.snapshot.meta.cursor)
-        .filter(|recorded| recorded.same_copies(&cursor))
+        .filter(|recorded| recorded.same_copies_unpurged(&cursor))
         .map(IndexCursor::since)
     else {
-        // A shard copy changed (cleared, recreated) since the caller checked
-        // the cursor: its documents may be gone without a change row, so
-        // only a rebuild is right.
+        // A shard copy changed (cleared, recreated) or purged since the
+        // caller checked the cursor: its documents may be gone without a
+        // change row, so only a rebuild is right.
         return Ok(Update::Rebuild(gate, entry));
     };
     let (changed, live) = indexable_changes(db, since, cursor.since()).await?;
@@ -1126,11 +1127,11 @@ async fn ensure_index(
     if let Some(cached) = entry.as_ref() {
         let meta = &cached.snapshot.meta;
         if meta.version == SEARCH_VERSION && meta.design == signature {
-            if meta.cursor == IndexCursor(db.shard_seqs()) {
+            if meta.cursor.is_current(&db.index_cursor()) {
                 return Ok((cached.snapshot.clone(), gate));
             }
-            // A cursor over other shard copies (cleared, recreated) is
-            // rebuilt from 0.
+            // A cursor over other shard copies (cleared, recreated), or over
+            // copies that purged since, is rebuilt from 0.
             if cursor_valid(&meta.cursor, db) {
                 return match update_index(db, spec, limits, gate, entry).await? {
                     Update::Done(snapshot, gate) => Ok((snapshot, gate)),
@@ -2742,10 +2743,89 @@ mod tests {
             let recorded = guard
                 .as_ref()
                 .map(|cached| cached.snapshot.meta.cursor.clone());
-            assert_eq!(recorded, Some(crate::db::IndexCursor(db.shard_seqs())));
+            assert_eq!(recorded, Some(db.index_cursor()));
         }
         db.clear_shards(&[1]).await.unwrap();
         assert_eq!(search().await["total_rows"], 3);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An index whose commit records its cursor in the shape earlier
+    /// versions stored (each shard's uuid and sequence, no purge sequence)
+    /// does not load, so it is rebuilt, not an error, and records the cursor
+    /// in the current shape.
+    #[tokio::test]
+    async fn an_index_with_a_cursor_in_the_old_shape_is_rebuilt() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-search-oldcursor-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "searcholdcursor",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let index = "function(doc){ index('name', doc.name); }";
+        db.put_docs(
+            vec![
+                json!({"_id": "_design/d", "indexes": {"idx": {"index": index}}}),
+                json!({"_id": "a", "name": "fig"}),
+                json!({"_id": "b", "name": "fig"}),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:fig".to_string(),
+            ..SearchRequest::default()
+        };
+        let found = query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(found["total_rows"], 2, "{found}");
+
+        let path = index_dir(&db, "_design/d", "idx");
+        registry().retain(|cached| cached != path.as_path());
+        let old: Vec<Value> = db
+            .index_cursor()
+            .0
+            .iter()
+            .map(|position| json!([position.uuid, position.seq]))
+            .collect();
+        {
+            let tantivy_index = Index::open(UnsyncedDirectory::open(&path).unwrap()).unwrap();
+            let mut writer: tantivy::IndexWriter = tantivy_index.writer(15_000_000).unwrap();
+            let mut commit = writer.prepare_commit().unwrap();
+            commit.set_payload(&serde_json::to_string(&old).unwrap());
+            commit.commit().unwrap();
+            writer.wait_merging_threads().unwrap();
+        }
+        assert!(
+            Cached::load(&path, (db.q, db.partitioned)).is_none(),
+            "an index with an old-shape cursor loaded"
+        );
+
+        let found = query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(found["total_rows"], 2, "{found}");
+        {
+            let entry = index_entry(&path);
+            let guard = entry.lock().await;
+            let recorded = guard
+                .as_ref()
+                .map(|cached| cached.snapshot.meta.cursor.clone());
+            assert_eq!(recorded, Some(db.index_cursor()));
+        }
+        registry().retain(|cached| cached != path.as_path());
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2814,6 +2894,161 @@ mod tests {
         );
         drop(update);
         drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `update_index` reads a fresh cursor and checks it against the
+    /// cached index's record. A purge that landed after the caller checked
+    /// the cursor must make it rebuild: the purged document left no change
+    /// row to delete it by. The test drives `update_index` directly with the
+    /// stale entry, as if the purge landed between the two reads, then the
+    /// next query no longer finds the document.
+    #[tokio::test]
+    async fn an_update_that_meets_a_purge_rebuilds() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-search-purgerace-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            "searchpurgerace",
+            crate::db::DbConfig {
+                q: 2,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(2),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let on_shard = |shard: usize, tag: &str| {
+            (0..10_000)
+                .map(|i| format!("{tag}{i}"))
+                .find(|id| db.shard_index(id) == shard)
+                .expect("document id for shard")
+        };
+        let ddoc = on_shard(0, "_design/purge");
+        let (gone, kept) = (on_shard(1, "gone"), on_shard(0, "kept"));
+        let index = "function(doc){ index('name', doc.name); }";
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": ddoc, "indexes": {"idx": {"index": index}}}),
+                    json!({"_id": gone, "name": "fig"}),
+                    json!({"_id": kept, "name": "fig"}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:fig".to_string(),
+            limit: 200,
+            ..SearchRequest::default()
+        };
+        let result = query(&db, &ddoc, "idx", &request, limits).await.unwrap();
+        assert_eq!(result["total_rows"], 2);
+
+        let mut body = Map::new();
+        body.insert(gone.clone(), json!([rev]));
+        db.purge(&Value::Object(body), 0, &Default::default())
+            .await
+            .unwrap();
+        let spec = load_spec(&db, &ddoc, "idx").await.unwrap();
+        let gate = build_gate(&db).read().await.unwrap();
+        let entry = index_entry(&index_dir(&db, &ddoc, "idx"))
+            .lock_owned()
+            .await;
+        assert!(entry.is_some(), "the built index is cached");
+        let update = update_index(&db, &spec, limits, gate, entry).await.unwrap();
+        assert!(
+            matches!(update, Update::Rebuild(..)),
+            "an update over a shard that purged must rebuild"
+        );
+        drop(update);
+        let result = query(&db, &ddoc, "idx", &request, limits).await.unwrap();
+        assert_eq!(result["total_rows"], 1, "{result}");
+        assert_eq!(result["rows"][0]["id"], json!(kept), "{result}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A purge that lands while nothing drops the search index (a crash
+    /// before an invalidation would have run): once the database is opened
+    /// again from scratch, the index loads from its files with its old
+    /// cursor, sees the shard's purge sequence moved past it, and no longer
+    /// finds the purged document.
+    #[tokio::test]
+    async fn a_search_index_drops_a_purged_document_after_a_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-purgerestart-{}",
+            crate::util::uuid()
+        ));
+        let open = || {
+            Db::open_or_create(
+                &root,
+                "searchpurgerestart",
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 1000,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: crate::cluster::ShardMap::single(1),
+                    partitioned: false,
+                },
+            )
+            .unwrap()
+        };
+        let db = open();
+        let index = "function(doc){ index('name', doc.name); }";
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": "_design/d", "indexes": {"idx": {"index": index}}}),
+                    json!({"_id": "a", "name": "fig"}),
+                    json!({"_id": "b", "name": "fig"}),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        let limits = crate::view::ViewQuery::default().limits;
+        let request = SearchRequest {
+            query: "name:fig".to_string(),
+            limit: 200,
+            ..SearchRequest::default()
+        };
+        let found = query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(found["total_rows"], 2, "{found}");
+
+        db.purge(&json!({ "a": [rev] }), 0, &Default::default())
+            .await
+            .unwrap();
+        let path = db.path.clone();
+        drop(db);
+        forget_db(&path).await;
+
+        let db = open();
+        // The index still loads from its files: the query below starts from
+        // it, not from a rebuild forced by something else.
+        let dir = index_dir(&db, "_design/d", "idx");
+        assert!(
+            Cached::load(&dir, (db.q, db.partitioned)).is_some(),
+            "the index did not load from its files"
+        );
+        let found = query(&db, "_design/d", "idx", &request, limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            found["total_rows"], 1,
+            "the purged document was found: {found}"
+        );
+        assert_eq!(found["rows"][0]["id"], "b", "{found}");
+        let path = db.path.clone();
+        drop(db);
+        forget_db(&path).await;
         let _ = std::fs::remove_dir_all(root);
     }
 
