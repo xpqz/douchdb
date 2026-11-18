@@ -2860,8 +2860,7 @@ impl Db {
         let Some(map) = body.as_object() else {
             return Err(ApiError::bad_request("Request body must be a JSON object"));
         };
-        // One round trip per shard, the shards in parallel, instead of one
-        // per document.
+        // One round trip per shard instead of one per document.
         let mut ids = Vec::new();
         let mut grouped: Vec<Vec<(usize, String, Vec<String>)>> =
             (0..self.q).map(|_| Vec::new()).collect();
@@ -3404,7 +3403,6 @@ impl Db {
         Ok(found)
     }
 
-    /// Purge on this node, which is replica `me`.
     /// Purge on this node, which is replica `me`, recording each document's purge under the uuid in
     /// `uuids` when it has one. The coordinator of a cluster purge picks them,
     /// so every copy of a shard holds the same purge info.
