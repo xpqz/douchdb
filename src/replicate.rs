@@ -36,7 +36,7 @@ const CHECKPOINT_VERSION: u8 = 2;
 /// per sync interval, which capped repair at 200/interval even when both sides
 /// were idle.
 pub async fn pull(
-    db: &Db,
+    db: &Arc<Db>,
     peer: &str,
     client: &reqwest::Client,
     cluster: &Cluster,
@@ -125,7 +125,7 @@ fn other_shards(db: &Db, owned: &ShardMask) -> ShardMask {
 
 /// Everything one pull needs to talk to a peer about one database.
 struct PullCtx<'a> {
-    db: &'a Db,
+    db: &'a Arc<Db>,
     peer: &'a str,
     client: &'a reqwest::Client,
     cluster: &'a Cluster,
@@ -305,9 +305,11 @@ impl PullCtx<'_> {
             .get("shards")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("_peer_purged_infos response has no shards array"))?;
+        // Every entry is read before the first is applied, so a malformed
+        // one cannot stop the applying between shards.
         let mut seqs = Vec::with_capacity(shards.len());
-        let mut removed = false;
-        for (shard, entry) in shards.iter().enumerate() {
+        let mut batches = Vec::with_capacity(shards.len());
+        for entry in shards {
             seqs.push(
                 entry
                     .get("purge_seq")
@@ -320,21 +322,31 @@ impl PullCtx<'_> {
                 .into_iter()
                 .filter(|info| crate::fabric::is_replica_of(self.db, &info.id, self.cluster.me))
                 .collect();
-            removed |= self
-                .db
-                .apply_purge_infos(shard, infos, self.cluster.me)
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
+            batches.push(infos);
         }
-        if removed {
-            // A purge leaves no change row, so the indexes cannot follow it.
-            crate::view::invalidate(self.db)
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
-            crate::search::cleanup(self.db)
-                .await
-                .map_err(|e| anyhow!(e.to_string()))?;
-        }
+        // Applied in a task that then invalidates the indexes, also when a
+        // later shard fails after an earlier one removed a revision: a
+        // dropped or failed pull cannot leave them serving purged documents.
+        let me = self.cluster.me;
+        let ((_, applied), indexes) = self
+            .db
+            .purging(
+                move |db| async move {
+                    let mut removed = false;
+                    for (shard, infos) in batches.into_iter().enumerate() {
+                        match db.apply_purge_infos(shard, infos, me).await {
+                            Ok(gone) => removed |= gone,
+                            Err(e) => return (removed, Err(e)),
+                        }
+                    }
+                    (removed, Ok(()))
+                },
+                |(removed, _)| *removed,
+            )
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        applied.map_err(|e| anyhow!(e.to_string()))?;
+        indexes.map_err(|e| anyhow!(e.to_string()))?;
         if seqs != since {
             self.db
                 .checkpoint_put(&checkpoint, &json!({ "seqs": seqs }))
@@ -857,6 +869,7 @@ mod tests {
             },
         )
         .expect("db");
+        let db = Arc::new(db);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -913,6 +926,7 @@ mod tests {
             },
         )
         .expect("db");
+        let db = Arc::new(db);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -1028,6 +1042,7 @@ mod tests {
             },
         )
         .expect("db");
+        let db = Arc::new(db);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -1170,7 +1185,7 @@ mod tests {
     async fn two_shard_pair(
         tag: &str,
     ) -> (
-        Db,
+        Arc<Db>,
         std::path::PathBuf,
         Peer,
         Cluster,
@@ -1189,6 +1204,7 @@ mod tests {
             },
         )
         .expect("db");
+        let db = Arc::new(db);
         let peer: Peer = Arc::default();
         peer.lock().unwrap().shards = vec![
             (crate::util::uuid(), Vec::new()),
@@ -1223,7 +1239,7 @@ mod tests {
             .collect()
     }
 
-    async fn pull_from(db: &Db, cluster: &Cluster) -> PullOutcome {
+    async fn pull_from(db: &Arc<Db>, cluster: &Cluster) -> PullOutcome {
         pull(
             db,
             &cluster.nodes[PEER],
@@ -1364,6 +1380,244 @@ mod tests {
             "a pass opened {opened} databases, budget is {budget}"
         );
         st.dbs.write().await.clear();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Purge infos learnt from a peer drop the view indexes once they land,
+    /// even when the pull that applies them is dropped once their purge is
+    /// queued on the shard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_pull_still_invalidates_the_view_indexes_after_a_purge() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-ae-purge-drop-{}", crate::util::uuid()));
+        let db = Arc::new(
+            Db::open_or_create(
+                &root,
+                "ae",
+                crate::db::DbConfig {
+                    q: 1,
+                    revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: crate::cluster::ShardMap::single(1),
+                    partitioned: false,
+                },
+            )
+            .expect("db"),
+        );
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": "_design/d",
+                           "views": {"v": {"map": "function(doc) { emit(doc._id, null); }"}}}),
+                    json!({"_id": "a"}),
+                ],
+                true,
+            )
+            .await
+            .expect("write");
+        let rev = written[1].json()["rev"].as_str().unwrap().to_string();
+        let query = crate::view::ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let indexed = crate::view::query(&db, "_design/d", "v", &query)
+            .await
+            .expect("query");
+        assert_eq!(indexed["rows"][0]["id"], "a", "{indexed}");
+
+        let infos = json!({"shards": [{"purge_seq": 1, "infos": [
+            {"uuid": crate::util::uuid(), "id": "a", "revs": [rev]}
+        ]}]});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        // The peer holds the shard's actor while it answers, so the purge the
+        // pull then sends waits in its queue.
+        type Held = (
+            std::sync::mpsc::Sender<()>,
+            tokio::task::JoinHandle<crate::error::DbResult<()>>,
+        );
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<Held>();
+        let held_tx = Arc::new(std::sync::Mutex::new(Some(held_tx)));
+        let answer = {
+            let db = Arc::clone(&db);
+            move || {
+                let (db, held_tx, infos) = (Arc::clone(&db), Arc::clone(&held_tx), infos.clone());
+                async move {
+                    let (started_tx, started) = tokio::sync::oneshot::channel();
+                    let (release, held) = std::sync::mpsc::channel::<()>();
+                    let blocker = tokio::spawn(db.shard_handle(0).call(move |_| {
+                        let _ = started_tx.send(());
+                        held.recv().map_err(crate::error::ApiError::internal)
+                    }));
+                    started.await.unwrap();
+                    if let Some(held_tx) = held_tx.lock().unwrap().take() {
+                        let _ = held_tx.send((release, blocker));
+                    }
+                    Json(infos)
+                }
+            }
+        };
+        let app = Router::new().route("/ae/_peer_purged_infos", get(answer));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let peer = format!("http://{addr}");
+        let shard = db.shard_handle(0);
+        let holders = Arc::strong_count(&db);
+        let pull = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                let cluster = Cluster {
+                    nodes: vec![peer.clone()],
+                    me: 0,
+                    n: 1,
+                    secret: "test-secret".to_string(),
+                };
+                pull(
+                    &db,
+                    &peer,
+                    &reqwest::Client::new(),
+                    &cluster,
+                    None,
+                    &CancellationToken::new(),
+                )
+                .await
+                .map(|outcome| outcome.docs)
+            }
+        });
+        let (release, blocker) = held_rx.await.unwrap();
+        while shard.queued() < 1 {
+            tokio::task::yield_now().await;
+        }
+        pull.abort();
+        assert!(pull.await.is_err_and(|error| error.is_cancelled()));
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        shard.barrier().await.unwrap().unwrap();
+        // Whatever the dropped pull left running is done with the database.
+        while Arc::strong_count(&db) > holders {
+            tokio::task::yield_now().await;
+        }
+
+        let gone = db.get_doc("a", &crate::db::DocOpts::default()).await;
+        assert_eq!(gone.unwrap_err().status, 404, "the purge did not land");
+        let after = crate::view::query(&db, "_design/d", "v", &query)
+            .await
+            .expect("query");
+        assert_eq!(
+            after["rows"],
+            json!([]),
+            "the view still serves the purged document"
+        );
+        server.abort();
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Purge infos learnt from a peer that remove a revision on one shard
+    /// drop the view indexes even when a later shard's infos fail to apply.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_pull_failing_on_a_later_shard_still_invalidates_the_view_indexes() {
+        let root =
+            std::env::temp_dir().join(format!("douchdb-ae-purge-fail-{}", crate::util::uuid()));
+        let db = Arc::new(
+            Db::open_or_create(
+                &root,
+                "ae",
+                crate::db::DbConfig {
+                    q: 2,
+                    revs_limit: 100,
+                    cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                    shard_map: crate::cluster::ShardMap::single(2),
+                    partitioned: false,
+                },
+            )
+            .expect("db"),
+        );
+        let doc = ids_for(&db, 0, "doc", 1).remove(0);
+        let damaged = ids_for(&db, 1, "damaged", 1).remove(0);
+        let written = db
+            .put_docs(
+                vec![
+                    json!({"_id": doc}),
+                    json!({"_id": "_design/d",
+                           "views": {"v": {"map": "function(doc) { emit(doc._id, null); }"}}}),
+                ],
+                true,
+            )
+            .await
+            .expect("write");
+        let rev = written[0].json()["rev"].as_str().unwrap().to_string();
+        let query = crate::view::ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let indexed = crate::view::query(&db, "_design/d", "v", &query)
+            .await
+            .expect("query");
+        assert!(indexed["rows"].to_string().contains(&doc), "{indexed}");
+        let indexes = std::fs::read_dir(db.path.join("_view_indexes")).expect("index directory");
+        assert_ne!(indexes.count(), 0, "the view built no index file");
+        // Shard 1's purge cannot read the damaged document's metadata.
+        let key = damaged.clone();
+        db.shard_handle(1)
+            .call(move |s| {
+                s.put_unsealed(crate::kv::META, key.as_str(), br#"{"tree":{},"seq":9}"#);
+                // A job that wrote nothing through the shard commits nothing.
+                Ok(s.put_local("setup", b"1")?)
+            })
+            .await
+            .expect("damage");
+
+        let infos = json!({"shards": [
+            {"purge_seq": 1, "infos": [{"uuid": crate::util::uuid(), "id": doc, "revs": [rev]}]},
+            {"purge_seq": 1, "infos": [{"uuid": crate::util::uuid(), "id": damaged,
+                                        "revs": ["1-ffffffffffffffffffffffffffffffff"]}]}
+        ]});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new().route(
+            "/ae/_peer_purged_infos",
+            get(move || async move { Json(infos) }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let peer = format!("http://{addr}");
+        let cluster = Cluster {
+            nodes: vec![peer.clone()],
+            me: 0,
+            n: 1,
+            secret: "test-secret".to_string(),
+        };
+        let error = pull(
+            &db,
+            &peer,
+            &reqwest::Client::new(),
+            &cluster,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a damaged document was purged");
+        assert!(error.to_string().contains("checksum"), "{error}");
+
+        let gone = db.get_doc(&doc, &crate::db::DocOpts::default()).await;
+        assert_eq!(
+            gone.unwrap_err().status,
+            404,
+            "shard 0's purge did not land"
+        );
+        // The damaged record would fail the rebuild a query starts, so the
+        // index files are looked at instead: the invalidation removed them.
+        let indexes = std::fs::read_dir(db.path.join("_view_indexes")).expect("index directory");
+        assert_eq!(indexes.count(), 0, "the view index outlived the purge");
+        server.abort();
+        drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
 }
