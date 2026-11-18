@@ -312,6 +312,7 @@ mod tests {
             admission: Arc::new(crate::admission::Admission::new(Default::default())),
             compaction: Arc::new(tokio::sync::Semaphore::new(1)),
             compactions_queued: Default::default(),
+            compaction_casts: Default::default(),
         })
     }
 

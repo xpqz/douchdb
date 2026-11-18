@@ -180,19 +180,12 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             .and_then(|value| value.to_str().ok())
             == Some("1")
     {
-        // Every local copy's uuid, committed position and purge sequence,
-        // for a coordinator building the cluster's tokens.
-        let purge_seqs = match db.shard_purge_seqs().await {
-            Ok(purge_seqs) => purge_seqs,
-            Err(e) => return fail(e),
+        // Every local copy's uuid, committed position, purge sequence and
+        // sizes, for a coordinator building the cluster's tokens and sums.
+        return match crate::fabric::local_copies(db).await {
+            Ok(shards) => json(StatusCode::OK, json!({ "shards": shards })),
+            Err(e) => fail(e),
         };
-        let shards: Vec<Value> = db
-            .shard_seqs()
-            .into_iter()
-            .zip(purge_seqs)
-            .map(|((uuid, seq), purged)| json!([uuid, seq, purged]))
-            .collect();
-        return json(StatusCode::OK, json!({ "shards": shards }));
     }
     // Read first: a compaction that leaves the queue is claimed already.
     let queued = st.compaction_queued(name);
@@ -214,7 +207,10 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
                 })
                 .await
                 {
-                    Ok(tokens) => tokens,
+                    Ok(tokens) => {
+                        info.set_sizes(tokens.sizes);
+                        (tokens.update_seq, tokens.purge_seq)
+                    }
                     Err(e) => return fail(e),
                 }
             } else {
@@ -359,14 +355,17 @@ async fn partition_info(req: DbRequest<'_>, partition: &str) -> Response {
         }
     }
     match db.partition_counts(partition).await {
-        Ok((docs, deleted)) => json(
+        // `external` comes with the counts, from the same walk of the
+        // partition's records. Its share of the other tables is not known,
+        // so `active` stays 0.
+        Ok(counts) => json(
             StatusCode::OK,
             json!({
                 "db_name": name,
-                "doc_count": docs,
-                "doc_del_count": deleted,
+                "doc_count": counts.docs,
+                "doc_del_count": counts.deleted,
                 "partition": partition,
-                "sizes": { "active": 0, "external": 0 },
+                "sizes": { "active": 0, "external": counts.external },
             }),
         ),
         Err(error) => fail(error),
@@ -689,6 +688,9 @@ fn purge_results_to_json(results: Vec<(String, PurgeOutcome)>) -> Response {
 
 /// `POST /{db}/_compact`.
 async fn compact(req: DbRequest<'_>) -> Response {
+    if let Some(response) = require_json_content_type(req.headers) {
+        return response;
+    }
     // CouchDB answers at once and compacts in the background; `GET /db`
     // reports `compact_running` (queued included) and `_active_tasks` the
     // progress meanwhile. `--compact-concurrency` compactions run at once on
@@ -709,6 +711,35 @@ async fn compact(req: DbRequest<'_>) -> Response {
             req.name.to_string(),
         ));
     }
+    // In a cluster, every other node holding a copy compacts it too
+    // (fabric:compact), each asked on its own, so neither a slow peer nor
+    // this node's compaction holds up another. A peer already being asked
+    // about this database is not asked again meanwhile: it de-duplicates
+    // anyway. Counted before the answer.
+    for node in crate::cluster_ops::compaction_peers(&req.st.ctx, req.db, req.headers) {
+        let key = (req.name.to_string(), node);
+        let new = req
+            .st
+            .compaction_casts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone());
+        if !new {
+            continue;
+        }
+        crate::metrics::compaction_cast_started();
+        let st = Arc::clone(req.st);
+        let headers = req.headers.clone();
+        tokio::spawn(async move {
+            let delivered =
+                crate::cluster_ops::compact_on_peer(&st.ctx, &key.0, node, &headers).await;
+            st.compaction_casts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            crate::metrics::compaction_cast_finished(delivered);
+        });
+    }
     json(StatusCode::ACCEPTED, json!({"ok": true}))
 }
 
@@ -716,7 +747,7 @@ async fn compact(req: DbRequest<'_>) -> Response {
 /// so a queued database can be closed meanwhile.
 async fn run_queued_compaction(st: Arc<AppState>, name: String) {
     // The semaphore is never closed; were it, the compaction runs.
-    let _slot = st.compaction.acquire().await.ok();
+    let slot = st.compaction.acquire().await.ok();
     let db = st.db(&name).await;
     // Claimed before the name leaves the queue, so `GET /db` never finds
     // the compaction in neither.
@@ -725,6 +756,7 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&name);
+    let mut compacted = false;
     match (&db, claim) {
         (Ok(db), Some(claim)) => {
             if let Err(error) = db.run_compaction(claim).await {
@@ -734,6 +766,8 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
                 } else {
                     tracing::error!(db = %name, error = %error.reason, "compaction failed");
                 }
+            } else {
+                compacted = true;
             }
         }
         (Ok(_), None) => {}
@@ -744,7 +778,13 @@ async fn run_queued_compaction(st: Arc<AppState>, name: String) {
         (Err(error), _) => {
             tracing::error!(db = %name, error = %error.reason, "compaction not started");
         }
-    };
+    }
+    // The new files' sizes, measured once the compaction is reported done
+    // and its slot is free for the next.
+    drop(slot);
+    if let (true, Ok(db)) = (compacted, &db) {
+        db.measure_sizes().await;
+    }
 }
 
 /// `POST /{db}/_ensure_full_commit`.
@@ -938,6 +978,7 @@ mod tests {
         let (mut parts, ()) = axum::http::Request::builder()
             .method(method.clone())
             .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
             .body(())
             .unwrap()
             .into_parts();

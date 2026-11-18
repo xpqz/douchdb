@@ -97,6 +97,54 @@ pub(crate) async fn set_limit_on_peers(
     }
 }
 
+/// The other nodes that hold a copy of any shard of `db`, which a client's
+/// `_compact` is passed on to; none for a request another node sent, so a
+/// compaction is cast once.
+pub(crate) fn compaction_peers(ctx: &ClusterCtx, db: &Db, headers: &HeaderMap) -> Vec<usize> {
+    if !ctx.cluster.is_clustered() || ctx.cluster.is_internal(headers) {
+        return Vec::new();
+    }
+    let map = db.shard_map();
+    let holders: std::collections::BTreeSet<usize> = (0..db.q)
+        .flat_map(|shard| map.replicas_of(shard).iter().copied())
+        .filter(|node| *node != ctx.cluster.me)
+        .collect();
+    holders.into_iter().collect()
+}
+
+/// Ask node `node` to compact its copies of `name`, as CouchDB's
+/// `fabric:compact` casts the compaction to every shard copy. The request is
+/// internal, so the peer compacts its own copies and passes nothing on. As
+/// with a cast, a peer that cannot be reached or refuses is only logged.
+/// Whether the peer accepted it.
+pub(crate) async fn compact_on_peer(
+    ctx: &ClusterCtx,
+    name: &str,
+    node: usize,
+    headers: &HeaderMap,
+) -> bool {
+    let peer = &ctx.cluster.nodes[node];
+    let request = internal_request(
+        ctx,
+        reqwest::Method::POST,
+        peer,
+        &[name, "_compact"],
+        Some(headers),
+    )
+    .json(&json!({}));
+    match send_peer(request).await {
+        Ok(response) if response.status().is_success() => true,
+        Ok(response) => {
+            tracing::warn!(db = %name, peer = %peer, status = %response.status(), "peer refused to compact");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(db = %name, peer = %peer, error = %error, "peer not asked to compact");
+            false
+        }
+    }
+}
+
 fn shard_map_rejected() -> ApiError {
     ApiError::new(
         409,

@@ -247,6 +247,51 @@ where behaviour is best-effort, it says so.
 | Attachments | No |
 | Mango/lists/shows | No |
 
+## Compatibility notes
+
+### Database sizes
+
+`GET /{db}` reports CouchDB's `sizes` (and the deprecated `disk_size` and
+`data_size`, equal to `sizes.file` and `sizes.active`), from what each shard
+already holds, so the request reads no data:
+
+- `file` is exact: the shard files' lengths, from their file metadata.
+- `external` is exact and counts what CouchDB counts: the JSON body of every
+  document's leaf revisions (conflicts and tombstones included), each body as
+  the bytes it is stored as (CouchDB measures its own term encoding, so the
+  numbers are close, not equal). Each document's record keeps its leaves'
+  body lengths and the shard keeps the total in its settings, changed in the
+  commit that changes a document, so it survives crashes and compaction.
+  Superseded revisions' bodies, which stay in the file until compaction,
+  never count.
+- `active` is what compaction would keep: `external` plus the bytes of the
+  keys and values in the shard's other tables (document records, the
+  sequence index, `_local` documents, purge history, checkpoints and
+  settings), never less than `external` nor more than `file`. Those tables
+  can only be sized by reading every entry, so a read never measures them.
+  A shard measures them in the background after a commit once it has taken
+  as many changes since its last measurement (or since it opened) as it
+  held documents then, and a compaction asks for a measurement of every
+  shard once it is done and its slot is free. At most one measurement runs
+  on a node at a time; a commit that finds one running does not start
+  another. A measurement reads a page of entries per lease on the file, so
+  a delete, a close, a recovery or a compaction's swap waits for one page,
+  not for the whole walk. Until a shard's first measurement `active` is
+  its `external`, and between measurements the tables' part is the last
+  one, so `active` lags the tables' growth. The tables' tree overhead and
+  the bodies table's keys and overhead are not counted. A shard file that
+  cannot be read for a moment (a compaction's rename) counts with the
+  length last read.
+
+In a cluster, `GET /db` sums the sizes of the same copy of each shard range
+that its sequence token names, as CouchDB's `fabric_db_info` does; an
+internal `GET /db` reports the node's own copies. `_dbs_info` reports the
+answering node's own copies.
+
+`GET /{db}/_partition/{p}` reports the partition's `external` exactly (from
+the walk of its records that counts its documents) and `active` as 0: the
+partition's share of the other tables is not known.
+
 ## Open gaps
 
 - Exact CouchDB client-suite coverage is tracked in #122.

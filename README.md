@@ -672,8 +672,6 @@ reports how many requests from other nodes it served per protocol under
   a partition; `?r=1` is the explicit local-availability trade-off.
 - **Best-effort database lifecycle.** A node that is offline during a database
   create or drop is not repaired automatically.
-- **Node-local compaction.** `_compact` compacts only the node that receives
-  it; `_purge` and `_revs_limit` reach every copy, as in CouchDB.
 - **Failover replays a range.** A `since` token names a shard copy; when that
   copy is down or was replaced, its range replays from 0 on another copy
   rather than resuming from a checkpoint as CouchDB does (issue #52).
@@ -1045,8 +1043,15 @@ test evidence are in [docs/consistency.md](docs/consistency.md). Known limits:
   copies each shard into a new file (dropping non-leaf bodies) while the
   shard keeps serving, checks the copy in full, catches up with the writes
   made meanwhile, and swaps the new file in with writes paused only for the
-  last catch-up and the rename. It is node-local;
-  `--compact-concurrency` bounds concurrent compactions across databases;
+  last catch-up and the rename. In a cluster the receiving node also asks
+  every other node holding a copy of one of the database's shards to compact
+  its copies, as CouchDB's `fabric:compact` does, each request sent on its
+  own alongside the local compaction, and none while one to the same peer
+  for the same database is unanswered; a peer that is down is skipped and
+  logged. `_node/_local/_metrics` counts these requests in `fabric`:
+  `compaction_casts` (sent), `compaction_cast_failures` (unreachable or
+  refused) and `compaction_casts_in_flight`. `--compact-concurrency` bounds concurrent compactions
+  on a node, across databases;
   the rest wait their turn. The swap pauses that shard's writes and actor
   reads (reads on their own transactions carry on). `GET /db` reports
   `compact_running` and `GET /_active_tasks` (admins) lists this node's

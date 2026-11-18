@@ -404,6 +404,27 @@ pub fn record_fabric(kind: &str, value: u64) {
     }
 }
 
+/// `_compact` requests this node has cast to its peers
+/// (`cluster_ops::compact_on_peer`), those that failed (the peer was
+/// unreachable or refused), and those not yet answered.
+static COMPACTION_CASTS: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CAST_FAILURES: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CASTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Count a `_compact` cast to a peer, before it is sent.
+pub fn compaction_cast_started() {
+    COMPACTION_CASTS.fetch_add(1, Ordering::Relaxed);
+    COMPACTION_CASTS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Count a `_compact` cast as answered: `delivered` if the peer accepted it.
+pub fn compaction_cast_finished(delivered: bool) {
+    if !delivered {
+        COMPACTION_CAST_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    COMPACTION_CASTS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Shard write groups, the microseconds spent running their jobs and
 /// committing them, and the syncs and bytes the shard files were written
 /// with: cumulative, for comparing the write path against bare redb.
@@ -742,6 +763,9 @@ pub fn snapshot() -> Value {
             "rebalance_completed": state.fabric.rebalance_completed,
             "rebalance_timeout": state.fabric.rebalance_timeout,
             "cleaned_shards": state.fabric.cleaned_shards,
+            "compaction_casts": COMPACTION_CASTS.load(Ordering::Relaxed),
+            "compaction_cast_failures": COMPACTION_CAST_FAILURES.load(Ordering::Relaxed),
+            "compaction_casts_in_flight": COMPACTION_CASTS_IN_FLIGHT.load(Ordering::Relaxed),
         },
     })
 }

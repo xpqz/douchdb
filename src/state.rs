@@ -276,6 +276,9 @@ pub struct AppState {
     /// The databases whose compaction waits for a slot. They wait by name,
     /// not held open, so `max_open_dbs` still bounds the open databases.
     pub compactions_queued: std::sync::Mutex<HashSet<String>>,
+    /// `_compact` requests being cast to peers, by database and node: one
+    /// at a time to each.
+    pub compaction_casts: std::sync::Mutex<HashSet<(String, usize)>>,
     /// Recent result of the health check's blocking filesystem probe.
     pub fs_health: FsHealthCache,
     /// Cancelled when the server starts shutting down. Streaming feeds end
@@ -991,6 +994,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
         admission: Arc::new(crate::admission::Admission::new(Default::default())),
         compaction: Arc::new(tokio::sync::Semaphore::new(1)),
         compactions_queued: Default::default(),
+        compaction_casts: Default::default(),
     })
 }
 
