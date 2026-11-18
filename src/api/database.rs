@@ -587,6 +587,10 @@ async fn purge(req: DbRequest<'_>) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(req.body) else {
         return fail(ApiError::bad_request("invalid JSON"));
     };
+    // Checked before anything runs: a bad request must not drop the indexes.
+    let Value::Object(map) = request else {
+        return fail(ApiError::bad_request("Request body must be a JSON object"));
+    };
     let st = Arc::clone(req.st);
     let name = req.name.to_string();
     let headers = req.headers.clone();
@@ -602,6 +606,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
             move |db| async move {
                 let cluster = &st.ctx.cluster;
                 if !cluster.is_clustered() || cluster.is_internal(&headers) {
+                    let request = Value::Object(map);
                     // A peer's request carries the uuid the coordinator chose.
                     let (request, uuids) = if cluster.is_internal(&headers) {
                         crate::db::split_purge_uuids(&request)
@@ -611,10 +616,7 @@ async fn purge(req: DbRequest<'_>) -> Response {
                     let purged = db.purge(&request, cluster.me, &uuids).await?;
                     Ok(json(StatusCode::CREATED, purged))
                 } else {
-                    let Some(map) = request.as_object() else {
-                        return Err(ApiError::bad_request("Request body must be a JSON object"));
-                    };
-                    let results = purge_docs(&st, &db, &name, map, w, &headers).await;
+                    let results = purge_docs(&st, &db, &name, &map, w, &headers).await;
                     Ok(purge_results_to_json(results))
                 }
             },
@@ -1100,6 +1102,12 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // A body that is not an object is refused before anything runs.
+        let (status, refused) =
+            request_with(&st, Method::POST, "/partial/_purge", Bytes::from("[]")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_ne!(indexes(), 0, "a refused purge dropped the view index");
 
         let body = json!({ doc.clone(): [rev], damaged: ["1-ffffffffffffffffffffffffffffffff"] });
         let (status, failed) = request_with(
