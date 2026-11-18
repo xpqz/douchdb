@@ -120,8 +120,10 @@ pub enum ShardState {
     /// [`Shard::recover`]): every request to the shard answers 500 with this
     /// reason. A request also has the actor retry the reopen, at most once
     /// per backoff ([`Checkup`]), and a retry that succeeds serves again. The
-    /// retry keeps the sequence the shard published, so a file behind it
-    /// stays failed. A failed compaction swap is never retried.
+    /// retry keeps the sequence the shard published, so it finds a file
+    /// behind it. Such a file can never come back, nor can a failed
+    /// compaction swap: the shard's gate is shut for good and it is never
+    /// retried.
     Failed(String),
     /// Its database was deleted: every request answers `not_found`, as
     /// CouchDB answers for a database that is gone.
@@ -138,14 +140,20 @@ const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 /// A shard's checks of itself, asked for off the actor ([`Message::Check`]):
-/// after a read met an I/O error, or by a request to a failed shard.
+/// after a read met an I/O error, or by a request to a failed shard or to
+/// one with jobs waiting to run again.
 struct Checkup {
     /// A check is queued and not yet handled; at most one is.
     queued: AtomicBool,
+    /// Jobs wait for the shard to serve although it serves: their read met
+    /// an I/O failure, and they run again when a request finds the wait
+    /// over, paced as a failed shard's retries are.
+    waiting: AtomicBool,
     retry: std::sync::Mutex<Retry>,
 }
 
-/// When a failed shard may retry reopening its file.
+/// When a failed shard may retry reopening its file, or jobs waiting to run
+/// again may run.
 struct Retry {
     /// The wait after the shard first fails: production pacing, which tests
     /// set to zero.
@@ -160,6 +168,7 @@ impl Checkup {
     fn new() -> Checkup {
         Checkup {
             queued: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
             retry: std::sync::Mutex::new(Retry {
                 first: FIRST_RETRY_WAIT,
                 wait: FIRST_RETRY_WAIT,
@@ -186,8 +195,13 @@ impl Checkup {
         retry.wait = (retry.wait * 2).min(MAX_RETRY_WAIT);
     }
 
-    /// A reopen succeeded: the next failure waits the first wait again.
+    /// A reopen succeeded: the next failure waits the first wait again,
+    /// unless jobs wait to run again, whose waits keep growing until they
+    /// have run.
     fn served(&self) {
+        if self.waiting.load(Ordering::SeqCst) {
+            return;
+        }
         let mut retry = self.retry();
         retry.wait = retry.first;
     }
@@ -653,8 +667,10 @@ pub struct Shard {
     state: Arc<std::sync::RwLock<ShardState>>,
     /// Shared with the shard's handle, which asks for checks.
     checkup: Arc<Checkup>,
-    /// Read jobs waiting for a retry to bring the failed shard back
-    /// ([`ShardHandle::when_serving`]); dropped if the actor stops first.
+    /// Read jobs waiting for a retry to bring the failed shard back, or,
+    /// on a shard that serves, for their wait to be over before they run
+    /// again ([`ShardHandle::when_serving`], [`Shard::wait_again`]);
+    /// dropped if the actor stops first.
     parked: std::collections::VecDeque<Box<dyn ShardJob>>,
     /// The file, for the integrity check when the shard closes; `None` for a
     /// test backend.
@@ -707,6 +723,9 @@ pub struct Shard {
     /// Test seam: how many times a job or a commit has opened a table.
     #[cfg(test)]
     table_opens: AtomicU64,
+    /// Test seam: run once the next reopen succeeds.
+    #[cfg(test)]
+    on_reopen: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Shard {
@@ -761,6 +780,8 @@ impl Shard {
             drop_from_copy: None,
             #[cfg(test)]
             table_opens: AtomicU64::new(0),
+            #[cfg(test)]
+            on_reopen: None,
         })
     }
 
@@ -774,7 +795,7 @@ impl Shard {
     /// file cannot be opened, or it lost a change that was acknowledged
     /// (its sequence is behind the one published), the shard fails closed:
     /// [`ShardState::Failed`], until a retry, which comes through here too,
-    /// reopens it.
+    /// reopens it. A file behind is never retried.
     ///
     /// Runs on the actor, between groups. Every recovery comes through here,
     /// so whatever must learn that the file was reopened (a running
@@ -805,14 +826,16 @@ impl Shard {
             ..
         } = self;
         let mut loaded = None;
+        let mut behind = false;
         let reopened = gate.reopen(|| {
             prepare()?;
             let db = open()?;
             let found = check_shard(&db, name, *default_revs_limit)?;
             // A commit that reported an error may still have landed, so the
             // file may be ahead of what was published; never behind it.
+            behind = found.seq < settings.seq;
             anyhow::ensure!(
-                found.seq >= settings.seq,
+                !behind,
                 "the file's sequence {} is behind the committed {}",
                 found.seq,
                 settings.seq
@@ -821,6 +844,12 @@ impl Shard {
             Ok(db)
         });
         self.release_indexes();
+        // A file behind what was committed never comes back (no reopen moves
+        // it forward): its gate is shut for good and the shard never
+        // retries, as after a failed compaction swap.
+        if behind {
+            drop(self.gate.shut());
+        }
         let reopened = reopened.and_then(|()| {
             loaded.ok_or_else(|| anyhow::anyhow!("the shard file reopened without its settings"))
         });
@@ -846,6 +875,10 @@ impl Shard {
                         "the shard file reopened; the failed shard serves again"
                     );
                 }
+                #[cfg(test)]
+                if let Some(hook) = self.on_reopen.take() {
+                    hook();
+                }
                 true
             }
             Err(error) => {
@@ -856,7 +889,8 @@ impl Shard {
                     error = %reason,
                     "the shard file could not be reopened; the shard fails closed"
                 );
-                // The gate stays closed to reads until a retry reopens it.
+                // The gate stays closed to reads until a retry reopens it,
+                // or for good if the file is behind.
                 self.checkup.failed(Instant::now());
                 // A deleted database stays deleted.
                 if *state != ShardState::Deleted {
@@ -1004,6 +1038,13 @@ impl Shard {
             reply(error.as_ref());
         }
         answer.try_recv().expect("the job answered")
+    }
+
+    /// Run `hook` once the next reopen of the file succeeds, before
+    /// anything else runs on the reopened file.
+    #[cfg(test)]
+    pub(crate) fn on_next_reopen(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.on_reopen = Some(Box::new(hook));
     }
 
     /// Run `f` as a read job and answer.
@@ -1185,8 +1226,13 @@ impl Shard {
             Ok(txn) => txn,
             Err(error) => {
                 // Recovered before the job answers, as below.
-                if io_failure(&error) && self.poisoned() {
+                let io = io_failure(&error);
+                let recovered = io && self.poisoned();
+                if recovered {
                     self.recover("an I/O error beginning a read job");
+                }
+                if io && job.waits() {
+                    return self.wait_again(job, recovered);
                 }
                 job.fail(ApiError::internal(error));
                 return None;
@@ -1196,16 +1242,59 @@ impl Shard {
         txn.begin_job();
         let (reply, abort) = job.run(&mut txn);
         let internal_error = txn.internal_error;
+        let again = txn.again.take();
         drop(txn);
         if abort.is_some() {
             self.release_indexes();
         }
         // An I/O error may have left the handle failing every write:
         // recovered before the job answers, as after a failed group.
-        if internal_error && self.poisoned() {
+        let recovered = internal_error && self.poisoned();
+        if recovered {
             self.recover("an I/O error in a read job");
         }
-        Some(reply)
+        match again {
+            Some(job) => self.wait_again(job, recovered),
+            None => Some(reply),
+        }
+    }
+
+    /// A job waiting for the shard to serve ([`WhenServing`]) whose read met
+    /// an I/O failure that failed the handle: parked again, ahead of every
+    /// job parked after it. If the shard failed, it runs after the next
+    /// retry; if the shard was reopened and serves, once the retry wait
+    /// that starts now is over, as a failed shard waits. Otherwise (the
+    /// handle did not fail) it is done with, unanswered.
+    fn wait_again(&mut self, job: Box<dyn ShardJob>, recovered: bool) -> Option<Reply> {
+        if self.is_failed() {
+            self.parked.push_front(job);
+        } else if recovered {
+            self.parked.push_front(job);
+            self.checkup.failed(Instant::now());
+            self.checkup.waiting.store(true, Ordering::SeqCst);
+        }
+        None
+    }
+
+    /// Run the parked jobs, in the order they were parked, until one fails
+    /// the shard or has to wait again; those not run wait behind it.
+    fn run_parked(&mut self) {
+        let mut jobs = std::mem::take(&mut self.parked);
+        while let Some(job) = jobs.pop_front() {
+            if let Some(reply) = self.run_read(job) {
+                reply(None);
+            }
+            if self.is_failed() || !self.parked.is_empty() {
+                break;
+            }
+        }
+        self.parked.extend(jobs);
+        let waiting = !self.parked.is_empty();
+        self.checkup.waiting.store(waiting, Ordering::SeqCst);
+        // Every job has run: a later failure waits the first wait again.
+        if !waiting && !self.is_failed() {
+            self.checkup.served();
+        }
     }
 
     /// Start a compaction: record every later commit's keys, and create the
@@ -1373,6 +1462,9 @@ pub struct ShardTxn<'s> {
     write_failed: Option<String>,
     /// The last job answered with an internal error (500).
     internal_error: bool,
+    /// A job waiting for the shard to serve whose read met an I/O failure,
+    /// to run again ([`Shard::wait_again`]).
+    again: Option<Box<dyn ShardJob>>,
 }
 
 impl<'s> ShardTxn<'s> {
@@ -1391,6 +1483,7 @@ impl<'s> ShardTxn<'s> {
             group_wrote: false,
             write_failed: None,
             internal_error: false,
+            again: None,
         }
     }
 
@@ -2610,6 +2703,44 @@ trait ShardJob: Send {
     fn run(self: Box<Self>, txn: &mut ShardTxn<'_>) -> (Reply, Option<ApiError>);
     /// Answer without running: no transaction could be opened.
     fn fail(self: Box<Self>, error: ApiError);
+    /// Whether it waits for the shard to serve ([`Waiting`]), and so waits
+    /// again when its read meets an I/O failure, instead of answering.
+    fn waits(&self) -> bool {
+        false
+    }
+}
+
+/// A read job that waits for the shard to serve ([`WhenServing::run`]).
+/// Nobody hears its answer. A read that meets an I/O failure hands the job
+/// back ([`ShardTxn::again`]) to wait again ([`Shard::wait_again`]), so it
+/// may run more than once; any other error, or a panic, ends it.
+struct Waiting(Box<WaitingRead>);
+
+/// A [`Waiting`] job's read, with what it does with the value it read.
+type WaitingRead = dyn FnMut(&mut ShardTxn<'_>) -> Result<()> + Send;
+
+impl ShardJob for Waiting {
+    fn run(mut self: Box<Self>, txn: &mut ShardTxn<'_>) -> (Reply, Option<ApiError>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(txn)));
+        // An error has the shard check its handle, as a 500 from any job.
+        txn.internal_error = !matches!(outcome, Ok(Ok(())));
+        let abort = match outcome {
+            Ok(Err(error)) if io_failure(&error) => {
+                txn.again = Some(self);
+                None
+            }
+            Ok(_) => None,
+            // It may have left an index half built.
+            Err(payload) => Some(panicked(payload)),
+        };
+        (Box::new(|_| {}), abort)
+    }
+
+    fn fail(self: Box<Self>, _: ApiError) {}
+
+    fn waits(&self) -> bool {
+        true
+    }
 }
 
 /// A caller's job and where its answer goes.
@@ -2724,10 +2855,11 @@ enum Message {
     /// sender hears once it is.
     Close(oneshot::Sender<()>),
     /// Check the shard ([`Checkup`]): reopen a handle an I/O error left
-    /// failing, or retry the reopen of a failed shard once its wait is over.
+    /// failing, retry the reopen of a failed shard once its wait is over,
+    /// or run the jobs waiting to run again once theirs is.
     Check,
     /// A read job run as soon as the shard serves: now, or parked while it
-    /// has failed (see [`ShardHandle::when_serving`]).
+    /// has failed or other such jobs wait (see [`ShardHandle::when_serving`]).
     WhenServing(Box<dyn ShardJob>),
 }
 
@@ -2929,6 +3061,10 @@ impl ShardHandle {
                             reply(error.as_ref());
                         }
                     }
+                    // Behind the jobs that wait again, in order.
+                    Message::WhenServing(job) if !shard.parked.is_empty() => {
+                        shard.parked.push_back(job);
+                    }
                     Message::Read(job) | Message::WhenServing(job) => {
                         if let Some(reply) = shard.run_read(job) {
                             reply(None);
@@ -2943,7 +3079,7 @@ impl ShardHandle {
                             .clone();
                         match state {
                             // A gate shut for good (a failed compaction
-                            // swap) is never reopened.
+                            // swap, a file behind) is never reopened.
                             ShardState::Failed(_)
                                 if !shard.gate.is_shut() && shard.checkup.due(Instant::now()) =>
                             {
@@ -2951,17 +3087,20 @@ impl ShardHandle {
                                 // Before any job queued since; a job that
                                 // fails the shard again leaves the rest for
                                 // the next retry.
-                                while !shard.is_failed() {
-                                    let Some(job) = shard.parked.pop_front() else {
-                                        break;
-                                    };
-                                    if let Some(reply) = shard.run_read(job) {
-                                        reply(None);
-                                    }
+                                if !shard.is_failed() {
+                                    shard.run_parked();
                                 }
                             }
                             ShardState::Serving if shard.poisoned() => {
                                 shard.recover("an I/O error in a read");
+                            }
+                            // Jobs whose read met an I/O failure, their
+                            // wait over: the handle was reopened then.
+                            ShardState::Serving
+                                if !shard.parked.is_empty()
+                                    && shard.checkup.due(Instant::now()) =>
+                            {
+                                shard.run_parked();
                             }
                             _ => {}
                         }
@@ -3049,11 +3188,17 @@ impl ShardHandle {
     }
 
     /// The answer to every request while the shard has failed. A request
-    /// to a failed shard has it retry, once the wait since the last retry
-    /// is over.
+    /// to a failed shard has it retry, and one to a shard with jobs waiting
+    /// to run again has them run, once the wait since the last try is over;
+    /// a shard shut for good is never retried.
     fn failure(&self) -> Option<ApiError> {
         let state = self.state();
-        if matches!(state, ShardState::Failed(_)) && self.checkup.due(Instant::now()) {
+        let retry = match state {
+            ShardState::Failed(_) => !self.gate.is_shut(),
+            ShardState::Serving => self.checkup.waiting.load(Ordering::SeqCst),
+            ShardState::Deleted => false,
+        };
+        if retry && self.checkup.due(Instant::now()) {
             self.check();
         }
         failed(&self.read_context.name, &state)
@@ -3261,18 +3406,31 @@ pub struct WhenServing {
 }
 
 impl WhenServing {
-    /// Queue `f` to run on the actor as a read job: next, if the shard
-    /// serves; while it has failed, right after a retry brings it back,
-    /// before any job queued later. Nobody hears its answer, and it never
-    /// runs if the shard is deleted or closes first. Waits only for the
-    /// queue.
-    pub async fn run<F>(self, f: F)
+    /// Queue `read` to run on the actor as a read job, and `then` on what
+    /// it read: next, if the shard serves; while it has failed, right after
+    /// a retry brings it back, before any job queued later. A `read` that
+    /// meets an I/O failure is run again, still before any job queued
+    /// this way later (other jobs do not wait for it): after the next retry
+    /// if it failed the shard, or, if the shard reopened and serves, once
+    /// the retry wait is over and a request arrives, as a failed shard is
+    /// retried, the wait growing each time. Nobody hears its answer, and
+    /// it never runs if the shard is deleted, closes, or fails for good
+    /// first. Waits only for the queue.
+    pub async fn run<T, F, G>(self, mut read: F, then: G)
     where
-        F: FnOnce(&mut ShardTxn<'_>) -> std::result::Result<(), ApiError> + Send + 'static,
+        F: FnMut(&mut ShardTxn<'_>) -> Result<T> + Send + 'static,
+        G: FnOnce(T) + Send + 'static,
     {
-        let (job, _) = call_job(f);
+        let mut then = Some(then);
+        let job = Waiting(Box::new(move |txn| {
+            let value = read(txn)?;
+            if let Some(then) = then.take() {
+                then(value);
+            }
+            Ok(())
+        }));
         if let Some(tx) = self.tx {
-            let _ = tx.send(Message::WhenServing(job)).await;
+            let _ = tx.send(Message::WhenServing(Box::new(job))).await;
         }
     }
 }
@@ -5035,7 +5193,8 @@ mod recovery_tests {
 
     /// The published position never goes back: a file that comes back
     /// without changes that were acknowledged (here, a disk that ignored
-    /// syncs and then lost power) fails the shard instead.
+    /// syncs and then lost power) fails the shard instead, for good: no
+    /// request retries it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reopened_file_missing_acknowledged_changes_fails_closed() {
         let mut rig = rig();
@@ -5056,18 +5215,27 @@ mod recovery_tests {
             state => panic!("served a file that lost acknowledged changes: {state:?}"),
         }
         assert_eq!(rig.handle.committed_seq(), 2);
+        assert!(rig.handle.gate.is_shut(), "a file behind can be retried");
 
-        // Requests retry the reopen, which finds the file behind again.
-        for _ in 0..2 {
-            refused(rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await);
-            let mut checked = barrier(&rig.handle);
-            reopening(&mut rig, &mut checked).await;
+        // No reopen could move the file forward, so however many requests
+        // arrive, none retries it, although no wait holds them back. Opens
+        // are let through, so a retry shows as a count, not a hang.
+        for _ in 0..8 {
             rig.go.send(()).unwrap();
-            refused(checked.await.unwrap());
-            match rig.handle.state() {
-                ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
-                state => panic!("served a file that lost acknowledged changes: {state:?}"),
-            }
+        }
+        for _ in 0..4 {
+            refused(rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some())).await);
+            refused(rig.handle.read(|txn| Ok(txn.counts())).await);
+            refused(put(&rig.handle, "d", 4).await);
+            refused(barrier(&rig.handle).await.unwrap());
+        }
+        assert!(
+            rig.opening.try_recv().is_err(),
+            "a file behind was reopened"
+        );
+        match rig.handle.state() {
+            ShardState::Failed(reason) => assert!(reason.contains("behind"), "{reason}"),
+            state => panic!("served a file that lost acknowledged changes: {state:?}"),
         }
         assert_eq!(rig.handle.committed_seq(), 2);
     }
@@ -5330,7 +5498,8 @@ mod recovery_tests {
 
     /// Jobs parked for a failed shard run once a retry brings it back; if
     /// one of them fails it again (its read meets an I/O error and the
-    /// reopen fails), the jobs not yet run wait for the next retry.
+    /// reopen fails), it and the jobs not yet run wait for the next retry,
+    /// in the order they were parked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parked_jobs_left_when_the_shard_fails_again_wait_for_the_next_retry() {
         let mut rig = rig();
@@ -5342,23 +5511,35 @@ mod recovery_tests {
         refused(failing.await.unwrap());
         rig.switch.restore_writes();
 
-        let switch = rig.switch.clone();
+        // The first job's first read meets the fault it sets.
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut fault = Some(rig.switch.clone());
+        let log = Arc::clone(&order);
         rig.handle
             .when_serving()
-            .run(move |txn| {
-                switch.fail_reads(ErrorKind::Other);
-                let all = (Unbounded, Unbounded);
-                txn.scan(BODIES, Table::Bodies, all, false, |_, _| Ok(true))?;
-                Ok(())
-            })
+            .run(
+                move |txn| {
+                    log.lock().unwrap().push("first read");
+                    if let Some(switch) = fault.take() {
+                        switch.fail_reads(ErrorKind::Other);
+                    }
+                    let all = (Unbounded, Unbounded);
+                    txn.scan(BODIES, Table::Bodies, all, false, |_, _| Ok(true))
+                },
+                |_| {},
+            )
             .await;
         let (ran_tx, mut ran) = oneshot::channel::<()>();
+        let log = Arc::clone(&order);
         rig.handle
             .when_serving()
-            .run(move |_| {
-                ran_tx.send(()).unwrap();
-                Ok(())
-            })
+            .run(
+                |_| Ok(()),
+                move |()| {
+                    log.lock().unwrap().push("second");
+                    ran_tx.send(()).unwrap();
+                },
+            )
             .await;
 
         // The retry succeeds; the first job's read fails, and so does the
@@ -5384,6 +5565,147 @@ mod recovery_tests {
         checked.await.unwrap().unwrap();
         assert_eq!(rig.handle.state(), ShardState::Serving);
         ran.await.expect("the parked job was dropped");
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["first read", "first read", "second"],
+            "the job whose read failed was not run again first"
+        );
+    }
+
+    /// A parked job whose read meets an I/O failure on every run, while
+    /// every reopen succeeds, runs (and so has the file reopened) at most
+    /// once per retry wait, not over and over: until the wait is over the
+    /// shard serves requests and reopens nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_whose_read_always_fails_reopens_the_shard_once_per_wait() {
+        let mut rig = rig_retrying_after(Duration::from_secs(3600));
+        put(&rig.handle, "a", 1).await.unwrap();
+        put_big(&rig.handle, 2).await;
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        rig.go.send(()).unwrap();
+        refused(failing.await.unwrap());
+        rig.switch.restore_writes();
+
+        // Every run of its read meets a passing fault.
+        let runs = Arc::new(AtomicU64::new(0));
+        let (switch, counted) = (rig.switch.clone(), Arc::clone(&runs));
+        rig.handle
+            .when_serving()
+            .run(
+                move |txn| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    switch.fail_one_read(ErrorKind::Other);
+                    let all = (Unbounded, Unbounded);
+                    txn.scan(BODIES, Table::Bodies, all, false, |_, _| Ok(true))
+                },
+                |_| {},
+            )
+            .await;
+
+        // Opens are let through, so any reopen shows as a count, not a hang.
+        for _ in 0..64 {
+            rig.go.send(()).unwrap();
+        }
+        let mut reopens = 0;
+        for round in 1..=3 {
+            // The wait is over: a request has the shard run the job (the
+            // first time, retry the failed shard first), and the job's
+            // failed read has the file reopened.
+            // The nudge reads nothing from the disk, so it cannot take the
+            // job's passing fault.
+            rig.handle.checkup.retry().at = Instant::now();
+            let _ = rig.handle.read(|txn| Ok(txn.counts())).await;
+            barrier(&rig.handle).await.unwrap().unwrap();
+            assert_eq!(rig.handle.state(), ShardState::Serving);
+            assert_eq!(runs.load(Ordering::SeqCst), round);
+            while rig.opening.try_recv().is_ok() {
+                reopens += 1;
+            }
+            // Each run's failed read reopens the file once; the first
+            // round's retry of the failed shard was one more.
+            assert_eq!(reopens, round + 1, "not one reopen per run");
+
+            // The wait is not over: requests are served and run nothing.
+            for _ in 0..4 {
+                let found = rig.handle.lease(|s| Ok(s.get_meta("a")?.is_some()));
+                assert!(found.await.unwrap());
+                rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+            }
+            barrier(&rig.handle).await.unwrap().unwrap();
+            assert!(
+                rig.opening.try_recv().is_err(),
+                "reopened before the wait was over"
+            );
+            assert_eq!(runs.load(Ordering::SeqCst), round);
+        }
+    }
+
+    /// A parked job whose read keeps meeting an I/O failure waits longer
+    /// each time, as a failed shard does (doubling, up to a minute),
+    /// although each reopen after its failed read succeeds; once it has
+    /// run, the waits start over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_whose_read_keeps_failing_waits_longer_each_time() {
+        let mut rig = rig_retrying_after(Duration::from_secs(1));
+        put(&rig.handle, "a", 1).await.unwrap();
+        put_big(&rig.handle, 2).await;
+        let mut failing = put_on_full_disk(&rig, "lost");
+        reopening(&mut rig, &mut failing).await;
+        rig.go.send(()).unwrap();
+        refused(failing.await.unwrap());
+        rig.switch.restore_writes();
+
+        let faulty = Arc::new(AtomicBool::new(true));
+        let runs = Arc::new(AtomicU64::new(0));
+        let (switch, fault, counted) = (rig.switch.clone(), Arc::clone(&faulty), Arc::clone(&runs));
+        rig.handle
+            .when_serving()
+            .run(
+                move |txn| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    if fault.load(Ordering::SeqCst) {
+                        switch.fail_one_read(ErrorKind::Other);
+                    }
+                    let all = (Unbounded, Unbounded);
+                    txn.scan(BODIES, Table::Bodies, all, false, |_, _| Ok(true))
+                },
+                |_| {},
+            )
+            .await;
+        for _ in 0..64 {
+            rig.go.send(()).unwrap();
+        }
+
+        // Each round, the wait is made over by hand and a request (one that
+        // reads nothing from the disk) has the actor's own due check run
+        // the job. Its read fails, the file is reopened, and the job waits
+        // again: the wait it now waits is the one in force before the round.
+        let secs = Duration::from_secs;
+        for (round, wait) in [1, 2, 4, 8, 16, 32, 60, 60].into_iter().enumerate() {
+            rig.handle.checkup.retry().at = Instant::now();
+            let before = Instant::now();
+            let _ = rig.handle.read(|txn| Ok(txn.counts())).await;
+            barrier(&rig.handle).await.unwrap().unwrap();
+            let after = Instant::now();
+            assert_eq!(runs.load(Ordering::SeqCst), round as u64 + 1);
+            assert_eq!(rig.handle.state(), ShardState::Serving);
+            let at = rig.handle.checkup.retry().at;
+            assert!(
+                before + secs(wait) <= at && at <= after + secs(wait),
+                "round {}: not a wait of {wait} s",
+                round + 1
+            );
+        }
+
+        // The fault clears: the job runs, and the waits start over.
+        faulty.store(false, Ordering::SeqCst);
+        rig.handle.checkup.retry().at = Instant::now();
+        rig.handle.read(|txn| Ok(txn.counts())).await.unwrap();
+        barrier(&rig.handle).await.unwrap().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 9);
+        assert!(!rig.handle.checkup.waiting.load(Ordering::SeqCst));
+        assert_eq!(rig.handle.checkup.retry().wait, secs(1));
     }
 
     /// A shard that failed for an hour's wait: requests answer 500 and
