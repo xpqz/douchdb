@@ -177,8 +177,60 @@ Caveats:
 
 - Linux `fdatasync` was not measured.
 - The write mix was creates only.
-- Concurrent single-document writes share commits poorly under the synced
-  group commit; that is issue #90.
+- Concurrent single-document writes shared commits poorly under the synced
+  group commit (issue #90); see the next section.
+
+### Single-document writes: the group linger (#90)
+
+Concurrent single-document writers split into two cohorts that took turns.
+The shard actor started the next group the instant a commit ended, about
+0.4 ms before the clients that commit answered came back, so each commit
+carried about half the writers (8 of 16). Each request waited about one full
+commit in the queue and then its own.
+
+The actor now lingers. After a group that answered more than one write job,
+it waits for as many write jobs to queue before starting the next group, for
+at most 1 ms (`GROUP_LINGER` in `src/store.rs`). It waits on the queue, so the
+group starts the moment the jobs are there. A read, close or other control
+message ends the wait at once. After a group of one it never waits, so a lone
+writer is unchanged. Durability is unchanged: two syncs per commit.
+
+`loadgen --method PUT` of new documents (about 260 B) on a single node, one
+level after another on a fresh server: c=1 300 writes, c=4 1,000, c=16 3,000,
+c=64 6,000, after 200 warm-up writes. Before (`039cc34`) and after binaries
+ran interleaved, in four rounds. Each cell is the median over the four rounds.
+T is the shard commit time per group, from `/_node/_local/_metrics`. The
+machine was heavily loaded (load average 15–32 on 10 cores), so T drifted
+between 7 and 39 ms across runs. Read the group counts first; the rates and
+latencies are noisy.
+
+| q | c | docs/s before → after | p50 ms | p99 ms | jobs/group | syncs/group | T ms |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 83 → 100 | 9.2 → 7.5 | 32.6 → 29.6 | 1.00 → 1.00 | 2.00 → 2.00 | 10.1 → 8.8 |
+| 1 | 4 | 178 → 262 | 21.5 → 14.2 | 67.5 → 31.9 | 2.00 → 3.17 | 2.00 → 2.00 | 11.3 → 9.4 |
+| 1 | 16 | 738 → 1,243 | 16.6 → 10.1 | 86.7 → 31.5 | 8.02 → 15.96 | 2.00 → 2.01 | 10.6 → 11.4 |
+| 1 | 64 | 2,958 → 4,457 | 20.0 → 13.3 | 43.6 → 40.7 | 36.6 → 60.7 | 2.01 → 2.01 | 11.3 → 10.6 |
+| 2 | 1 | 86 → 116 | 11.6 → 7.0 | 23.0 → 22.5 | 1.00 → 1.00 | 2.00 → 2.00 | 10.4 → 8.2 |
+| 2 | 4 | 140 → 192 | 25.1 → 17.7 | 68.9 → 59.5 | 1.38 → 1.60 | 2.01 → 2.01 | 18.5 → 14.3 |
+| 2 | 16 | 567 → 652 | 26.2 → 21.8 | 67.6 → 101.3 | 4.50 → 5.22 | 2.00 → 2.01 | 15.5 → 15.0 |
+| 2 | 64 | 1,656 → 1,964 | 30.9 → 26.5 | 120.7 → 88.6 | 17.6 → 20.7 | 2.01 → 2.01 | 20.9 → 18.2 |
+
+- **q=1, c=16:** every commit now carries all 16 writers: 15.96 jobs/group in
+  every round, against 8.0. p50 went from about 1.6 T to about 0.9 T.
+  Throughput rose 1.2–2.5× per round; the medians are 738 and 1,243 docs/s
+  (1.7×).
+- **c=1** is unchanged by construction: a group of one never lingers. Its
+  spread between rounds (0.6–2.1×) is machine noise.
+- **q=1, c=4:** two rounds merged fully (3.98 and 4.00 jobs/group); two
+  stayed near the old split (2.37 and 2.12). Why is not established. Either
+  the cohorts were even, so the count the linger waits for was already met
+  when a commit ended (it counts jobs already queued), or the answered clients
+  missed the 1 ms bound on the loaded machine. Idle time per group in the
+  stuck rounds (0.4–0.6 ms) does not separate the two.
+- **q=2:** each shard sees about half the writers in small, uneven groups, so
+  the gain is small: 4.5 → 5.2 jobs/group at c=16. The q=2 p99 figures move
+  both ways between rounds and show no clear trend. Shards that share one
+  device cost throughput separately; issue #90's measurement covers that.
 
 ### Bulk write path against the redb floor
 
