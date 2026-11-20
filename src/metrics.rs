@@ -433,12 +433,25 @@ static SHARD_JOBS_US: AtomicU64 = AtomicU64::new(0);
 static SHARD_COMMIT_US: AtomicU64 = AtomicU64::new(0);
 static SHARD_SYNCS: AtomicU64 = AtomicU64::new(0);
 static SHARD_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Times a shard actor waited for a group's jobs to queue, and how many of
+/// those waits ran out of time first.
+static SHARD_LINGERS: AtomicU64 = AtomicU64::new(0);
+static SHARD_LINGER_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 /// Count one shard write group: its jobs' time and its commit's.
 pub fn record_shard_group(jobs_us: u64, commit_us: u64) {
     SHARD_GROUPS.fetch_add(1, Ordering::Relaxed);
     SHARD_JOBS_US.fetch_add(jobs_us, Ordering::Relaxed);
     SHARD_COMMIT_US.fetch_add(commit_us, Ordering::Relaxed);
+}
+
+/// Count one wait of a shard actor for a group's jobs; `timed_out` if its
+/// bound passed before they queued.
+pub fn record_shard_linger(timed_out: bool) {
+    SHARD_LINGERS.fetch_add(1, Ordering::Relaxed);
+    if timed_out {
+        SHARD_LINGER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Count one sync of a shard file.
@@ -744,6 +757,8 @@ pub fn snapshot() -> Value {
             "commit_us": SHARD_COMMIT_US.load(Ordering::Relaxed),
             "syncs": SHARD_SYNCS.load(Ordering::Relaxed),
             "bytes_written": SHARD_BYTES_WRITTEN.load(Ordering::Relaxed),
+            "lingers": SHARD_LINGERS.load(Ordering::Relaxed),
+            "linger_timeouts": SHARD_LINGER_TIMEOUTS.load(Ordering::Relaxed),
         },
         "integrity": {
             "corrupt_records_skipped": state.corrupt_records_skipped,
