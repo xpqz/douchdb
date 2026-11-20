@@ -14,8 +14,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A cold cache (any Cargo.toml change) pushes this job past 10 minutes.
-    timeout-minutes: 15
+    # With a cold build cache (main's evicted, or a large dependency change)
+    # this job takes 12-16 minutes; with a warm one 7-10.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11; version pinned to rust-toolchain.toml
@@ -23,6 +24,14 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The environment hash (Cargo.toml/Cargo.lock, toolchain files,
+          # CARGO*/RUST* variables) came out different for push and
+          # pull_request runs, so pull requests never matched main's cache and
+          # always built cold. Without it there is one key per job: after a
+          # dependency change cargo rebuilds what changed, and rust-cache prunes
+          # unused artifacts before saving. The toolchain is pinned above.
+          add-rust-environment-hash-key: false
       - name: Format
         run: cargo fmt --check
       - name: Clippy
