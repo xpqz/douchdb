@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aviation Explorer</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1f23; --muted: #6b6f78; --line: #e3e1dc;
+    --accent: #2f6fde; --accent-soft: #dce7fb; --fatal: #d4483b; --fatal-soft: #f6d9d5; --ok: #2e8b57;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171b; --panel: #1d2026; --ink: #e8e9ec; --muted: #9aa0ab; --line: #2c3038;
+      --accent: #6c9cf0; --accent-soft: #24324b; --fatal: #ef6b5e; --fatal-soft: #43251f; --ok: #59c08a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); gap: 16px; padding: 16px 20px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  label { color: var(--muted); font-size: 12px; }
+  input, select, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .tabs button { padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+  .tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .kpis { display: flex; flex-wrap: wrap; gap: 10px; }
+  .kpi { flex: 1 1 120px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .kpi b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .kpi span { color: var(--muted); font-size: 12px; }
+  .nodes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .node { border: 1px solid var(--line); border-radius: 8px; padding: 8px; font-size: 12px; cursor: pointer; }
+  .node.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .node .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .node .dot.up { background: var(--ok); } .node .dot.down { background: var(--fatal); }
+  svg { display: block; width: 100%; }
+  svg text { fill: var(--muted); font-size: 11px; }
+  .bar { fill: var(--accent); } .bar:hover, .bar.sel { fill: var(--ink); }
+  .fbar { fill: var(--fatal); opacity: .85; }
+  .hit { fill: transparent; cursor: pointer; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; } tbody tr:hover { background: var(--accent-soft); }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 420px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .muted { color: var(--muted); } .err { color: var(--fatal); }
+  .crumbs { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .crumbs a { color: var(--accent); cursor: pointer; }
+  .fatal { color: var(--fatal); font-weight: 600; }
+  .q { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); word-break: break-all; margin-top: 6px; }
+  #login { max-width: 360px; margin: 12vh auto; }
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <section>
+    <h2>Sign in to the cluster</h2>
+    <div class="row" style="flex-direction:column;align-items:stretch;gap:10px">
+      <label>Node URL <input id="lg-url" value="http://127.0.0.1:5984" style="width:100%"></label>
+      <label>User <input id="lg-user" value="admin" style="width:100%"></label>
+      <label>Password <input id="lg-pass" type="password" value="secret" style="width:100%"></label>
+      <button class="primary" id="lg-go">Connect</button>
+      <div id="lg-err" class="err"></div>
+    </div>
+  </section>
+</div>
+
+<div id="app" hidden>
+<header>
+  <div><h1>Aviation Explorer</h1><div class="sub">Four Kaggle aviation datasets on a three-node douchdb cluster, read through the CouchDB API</div></div>
+  <div class="row"><label for="db">Dataset</label><select id="db"></select></div>
+  <div class="row"><label for="reg">Registration</label><input id="reg" placeholder="e.g. N2800D" size="12"><button id="reg-go">Find</button></div>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>Overview</h2>
+      <div class="kpis" id="kpis"></div>
+    </section>
+    <section>
+      <h2>Events and fatalities by year</h2>
+      <div class="crumbs" id="time-crumbs"></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>events</span><span><i style="background:var(--fatal)"></i>fatalities (scaled)</span></div>
+      <svg id="timeline" height="220"></svg>
+      <div class="q" id="time-q"></div>
+    </section>
+    <section>
+      <h2>Breakdown</h2>
+      <div class="tabs" id="dims"></div>
+      <div class="row" style="margin-bottom:8px">
+        <label>Sort</label>
+        <select id="sort"><option value="count">by events</option><option value="sum">by fatalities</option><option value="rate">by fatalities per event</option></select>
+        <label>Show</label><select id="topn"><option>15</option><option selected>25</option><option>50</option></select>
+        <input id="filter" placeholder="filter values" size="14">
+      </div>
+      <svg id="bars"></svg>
+      <div class="q" id="bars-q"></div>
+    </section>
+    <section id="map-section" hidden>
+      <h2>Where (one-degree cells, sized by events)</h2>
+      <svg id="map" height="320"></svg>
+      <div class="q" id="map-q"></div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Cluster</h2>
+      <div class="nodes" id="nodes"></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">Click a node to send every query to it. Each node answers for the whole cluster.</div>
+    </section>
+    <section>
+      <h2 id="list-title">Deadliest events</h2>
+      <div class="crumbs" id="list-crumbs"></div>
+      <table><thead><tr><th>Date</th><th>Event</th><th class="num">Fatal</th></tr></thead><tbody id="list"></tbody></table>
+      <div class="row" style="margin-top:8px"><button id="prev">‹ Prev</button><button id="next">Next ›</button><span class="muted" id="page"></span></div>
+      <div class="q" id="list-q"></div>
+    </section>
+    <section>
+      <h2>Document</h2>
+      <pre id="doc" class="muted">Click an event to see its document.</pre>
+    </section>
+  </div>
+</main>
+</div>
+
+<script>
+"use strict";
+// ---- connection ---------------------------------------------------------
+const NODES = ["http://127.0.0.1:5984", "http://127.0.0.1:5985", "http://127.0.0.1:5986"];
+const DBS = {
+  airline_accidents: "NTSB accidents (Airline Accidents)",
+  faa_incidents_data: "FAA incidents (AIDS)",
+  ntsb_aviation_data: "NTSB aviation data",
+  world_aircraft_accident_summary: "World accident summary",
+};
+const LABELS = { make: "Make", phase: "Flight phase", weather: "Weather", country: "Country", purpose: "Purpose",
+  damage: "Damage", engine: "Engine", category: "Category", state: "State", flight_type: "Flight type",
+  pilot: "Pilot certificate", severity: "Severity", conduct: "Flight rules", operator: "Operator", aircraft: "Aircraft" };
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+const state = { base: NODES[0], auth: null, db: "airline_accidents", dims: [], dim: null,
+  year: null, list: null, offset: 0, pageSize: 20 };
+const $ = id => document.getElementById(id);
+const fmt = n => (n === null || n === undefined) ? "–" : Number(n).toLocaleString();
+
+// douchdb admits only a few concurrent view queries per user (--heavy-per-user,
+// default 1) and answers the rest 429, so view queries go through a queue.
+const VIEW_SLOTS = 2;
+let viewsRunning = 0;
+const viewQueue = [];
+async function viewSlot() {
+  if (viewsRunning < VIEW_SLOTS) { viewsRunning++; return; }
+  await new Promise(resolve => viewQueue.push(resolve));
+}
+function releaseViewSlot() {
+  const next = viewQueue.shift();
+  if (next) next(); else viewsRunning--;
+}
+async function api(path, base) {
+  if (!path.includes("/_view/")) return request(path, base);
+  await viewSlot();
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try { return await request(path, base); }
+      catch (e) {
+        // A 429 carries no CORS headers, so the browser reports it as a
+        // network error; retry a few times after a pause.
+        if (!(e instanceof TypeError) || attempt >= 3) throw e;
+        await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+      }
+    }
+  } finally { releaseViewSlot(); }
+}
+async function request(path, base) {
+  const url = (base || state.base) + path;
+  const res = await fetch(url, { headers: { Authorization: state.auth, Accept: "application/json" } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${res.status} ${body.error || ""} ${body.reason || ""} — ${path}`);
+  return body;
+}
+const enc = v => encodeURIComponent(JSON.stringify(v));
+function view(name, params) {
+  const qs = Object.entries(params).map(([k, v]) => `${k}=${typeof v === "string" && !k.endsWith("key") ? v : enc(v)}`).join("&");
+  return `/${state.db}/_design/explore/_view/${name}?${qs}`;
+}
+function showQuery(id, path) { $(id).textContent = "GET " + path.replace(/%22/g, '"').replace(/%2C/g, ",").replace(/%5B/g, "[").replace(/%5D/g, "]").replace(/%7B%7D/g, "{}"); }
+
+// ---- svg helpers --------------------------------------------------------
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function tip(node, text) { el("title", {}, node, text); }
+
+// ---- overview & cluster ---------------------------------------------------
+async function loadNodes() {
+  const box = $("nodes"); clear(box);
+  let membership = null;
+  try { membership = await api("/_membership"); } catch (e) { /* shown per node */ }
+  for (const url of NODES) {
+    const d = document.createElement("div");
+    d.className = "node" + (url === state.base ? " on" : "");
+    d.innerHTML = `<div><span class="dot"></span><b></b></div><div class="muted st">…</div><div class="muted cnt"></div>`;
+    d.querySelector("b").textContent = url.replace("http://", "");
+    box.appendChild(d);
+    d.onclick = () => { state.base = url; document.querySelectorAll(".node").forEach(n => n.classList.remove("on")); d.classList.add("on"); refreshAll(); };
+    const t0 = performance.now();
+    try {
+      const up = await api("/_up", url);
+      const info = await api(`/${state.db}`, url);
+      d.querySelector(".dot").classList.add("up");
+      d.querySelector(".st").textContent = `${up.status} · ${Math.round(performance.now() - t0)} ms`;
+      d.querySelector(".cnt").textContent = `${fmt(info.doc_count)} docs`;
+    } catch (e) {
+      d.querySelector(".dot").classList.add("down");
+      d.querySelector(".st").textContent = "unreachable";
+    }
+  }
+  if (membership) box.title = "cluster_nodes: " + (membership.cluster_nodes || []).join(", ");
+}
+
+async function loadOverview() {
+  const k = $("kpis"); clear(k);
+  const [info, totals, deadly] = await Promise.all([
+    api(`/${state.db}`),
+    api(view("by_date", { reduce: "true" })),
+    api(view("by_fatalities", { descending: "true", limit: "1" })),
+  ]);
+  const s = (totals.rows[0] || {}).value || {};
+  const years = await api(view("by_date", { group_level: "1" }));
+  const ys = years.rows.map(r => r.key[0]);
+  const cards = [
+    [fmt(info.doc_count), "documents"],
+    [fmt(s.sum), state.db === "ntsb_aviation_data" ? "fatal events" : "fatalities"],
+    [ys.length ? `${ys[0]}–${ys[ys.length - 1]}` : "–", "years covered"],
+    [deadly.rows.length ? fmt(deadly.rows[0].key) : "–", "worst single event"],
+    [info.sizes ? (info.sizes.file / 1048576).toFixed(0) + " MB" : "–", "on disk (one copy)"],
+  ];
+  for (const [v, l] of cards) {
+    const c = document.createElement("div"); c.className = "kpi";
+    const b = document.createElement("b"); b.textContent = v;
+    const sp = document.createElement("span"); sp.textContent = l;
+    c.append(b, sp); k.appendChild(c);
+  }
+}
+
+// ---- timeline ---------------------------------------------------------------
+async function loadTimeline() {
+  const svg = $("timeline"); clear(svg);
+  const crumbs = $("time-crumbs"); clear(crumbs);
+  let path, rows;
+  if (state.year === null) {
+    path = view("by_date", { group_level: "1" });
+    rows = (await api(path)).rows.map(r => ({ label: String(r.key[0]), key: r.key[0], v: r.value }));
+    crumbs.textContent = "All years — click a bar for its months and events";
+  } else {
+    path = view("by_date", { group_level: "2", startkey: [state.year], endkey: [state.year, {}] });
+    rows = (await api(path)).rows.map(r => ({ label: MONTHS[r.key[1] - 1] || "?", key: r.key[1], v: r.value }));
+    const a = document.createElement("a"); a.textContent = "All years"; a.onclick = () => { state.year = null; loadTimeline(); };
+    crumbs.append(a, document.createTextNode(` › ${state.year}`));
+  }
+  showQuery("time-q", path);
+  drawColumns(svg, rows, row => {
+    if (state.year === null) { state.year = row.key; loadTimeline(); listBy("by_date", { startkey: [row.key], endkey: [row.key, {}] }, `Events in ${row.key}`); }
+    else listBy("by_date", { key: [state.year, row.key] }, `Events in ${row.label} ${state.year}`);
+  });
+}
+
+function drawColumns(svg, rows, onClick) {
+  const W = svg.clientWidth || 700, H = 220, pad = { l: 44, r: 8, t: 10, b: 28 };
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  if (!rows.length) { el("text", { x: pad.l, y: 40 }, svg, "No data"); return; }
+  const maxC = Math.max(...rows.map(r => r.v.count)), maxF = Math.max(1, ...rows.map(r => r.v.sum));
+  const bw = (W - pad.l - pad.r) / rows.length, ih = H - pad.t - pad.b;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + ih - ih * i / 4;
+    el("line", { x1: pad.l, x2: W - pad.r, y1: y, y2: y, stroke: "var(--line)" }, svg);
+    el("text", { x: pad.l - 6, y: y + 4, "text-anchor": "end" }, svg, fmt(Math.round(maxC * i / 4)));
+  }
+  const every = Math.ceil(rows.length / Math.max(1, Math.floor((W - pad.l) / 34)));
+  rows.forEach((r, i) => {
+    const x = pad.l + i * bw, h = ih * r.v.count / maxC, fh = ih * r.v.sum / maxF;
+    el("rect", { class: "bar", x: x + 1, y: pad.t + ih - h, width: Math.max(1, bw * 0.62 - 1), height: h, rx: 1 }, svg);
+    el("rect", { class: "fbar", x: x + bw * 0.62, y: pad.t + ih - fh, width: Math.max(1, bw * 0.3), height: fh, rx: 1 }, svg);
+    const hit = el("rect", { class: "hit", x, y: pad.t, width: bw, height: ih }, svg);
+    tip(hit, `${r.label}: ${fmt(r.v.count)} events, ${fmt(r.v.sum)} fatalities`);
+    hit.onclick = () => onClick(r);
+    if (i % every === 0) el("text", { x: x + bw / 2, y: H - 10, "text-anchor": "middle" }, svg, r.label);
+  });
+}
+
+// ---- breakdown --------------------------------------------------------------
+async function loadDims() {
+  const ddoc = await api(`/${state.db}/_design/explore`);
+  state.dims = ddoc.dimensions || [];
+  if (!state.dims.includes(state.dim)) state.dim = state.dims[0];
+  const tabs = $("dims"); clear(tabs);
+  for (const d of state.dims) {
+    const b = document.createElement("button");
+    b.textContent = LABELS[d] || d; if (d === state.dim) b.className = "on";
+    b.onclick = () => { state.dim = d; loadDims(); };
+    tabs.appendChild(b);
+  }
+  await loadBars();
+}
+
+async function loadBars() {
+  const svg = $("bars"); clear(svg);
+  const path = view("by_" + state.dim, { group: "true" });
+  showQuery("bars-q", path);
+  let rows = (await api(path)).rows.map(r => ({ key: r.key, v: r.value, rate: r.value.sum / r.value.count }));
+  const f = $("filter").value.trim().toUpperCase();
+  if (f) rows = rows.filter(r => String(r.key).includes(f));
+  const sort = $("sort").value;
+  rows.sort((a, b) => sort === "count" ? b.v.count - a.v.count : sort === "sum" ? b.v.sum - a.v.sum : (b.v.count >= 20) - (a.v.count >= 20) || b.rate - a.rate);
+  rows = rows.slice(0, +$("topn").value);
+  const W = svg.clientWidth || 700, rowH = 20, labelW = Math.min(220, W * 0.34), H = rows.length * rowH + 6;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("height", H);
+  const metric = r => sort === "count" ? r.v.count : sort === "sum" ? r.v.sum : r.rate;
+  const max = Math.max(1e-9, ...rows.map(metric));
+  rows.forEach((r, i) => {
+    const y = i * rowH + 3, w = (W - labelW - 190) * metric(r) / max;
+    const label = String(r.key).length > 34 ? String(r.key).slice(0, 33) + "…" : String(r.key);
+    el("text", { x: labelW - 6, y: y + 13, "text-anchor": "end" }, svg, label);
+    el("rect", { class: sort === "count" ? "bar" : "fbar", x: labelW, y: y + 2, width: Math.max(1, w), height: rowH - 6, rx: 2 }, svg);
+    el("text", { x: labelW + w + 6, y: y + 13 }, svg,
+      sort === "rate" ? `${r.rate.toFixed(2)} per event (${fmt(r.v.count)})` : `${fmt(r.v.count)} events · ${fmt(r.v.sum)} fatal`);
+    const hit = el("rect", { class: "hit", x: 0, y, width: W, height: rowH }, svg);
+    tip(hit, `${r.key}: ${fmt(r.v.count)} events, ${fmt(r.v.sum)} fatalities — click for its years and events`);
+    hit.onclick = () => drillValue(r.key);
+  });
+}
+
+async function drillValue(value) {
+  // The value's own timeline from the [value, year] view, then its events.
+  const path = view(`by_${state.dim}_year`, { group: "true", startkey: [value], endkey: [value, {}] });
+  const rows = (await api(path)).rows.map(r => ({ label: String(r.key[1]), key: r.key[1], v: r.value }));
+  const svg = $("timeline"); clear(svg);
+  const crumbs = $("time-crumbs"); clear(crumbs);
+  const a = document.createElement("a"); a.textContent = "All years"; a.onclick = () => { state.year = null; loadTimeline(); };
+  crumbs.append(a, document.createTextNode(` › ${LABELS[state.dim] || state.dim}: ${value}`));
+  showQuery("time-q", path);
+  const dim = state.dim;
+  drawColumns(svg, rows, row => listBy(`by_${dim}_year`, { key: [value, row.key] }, `${value} in ${row.key}`));
+  listBy("by_" + dim, { key: value }, `${LABELS[dim] || dim}: ${value}`);
+}
+
+// ---- map (airline_accidents only) -------------------------------------------
+async function loadMap() {
+  const sec = $("map-section");
+  sec.hidden = state.db !== "airline_accidents";
+  if (sec.hidden) return;
+  const svg = $("map"); clear(svg);
+  const path = view("by_place", { group: "true" });
+  showQuery("map-q", path);
+  const rows = (await api(path)).rows;
+  const W = svg.clientWidth || 700, H = 320;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const x = lon => (lon + 180) / 360 * W, y = lat => (90 - lat) / 180 * H;
+  for (let lon = -180; lon <= 180; lon += 30) el("line", { x1: x(lon), x2: x(lon), y1: 0, y2: H, stroke: "var(--line)" }, svg);
+  for (let lat = -90; lat <= 90; lat += 30) el("line", { x1: 0, x2: W, y1: y(lat), y2: y(lat), stroke: "var(--line)" }, svg);
+  const max = Math.max(...rows.map(r => r.value.count));
+  for (const r of rows) {
+    const [lat, lon] = r.key, v = r.value;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+    const c = el("circle", { cx: x(lon), cy: y(lat), r: 1 + 9 * Math.sqrt(v.count / max),
+      fill: v.sum > 0 ? "var(--fatal)" : "var(--accent)", "fill-opacity": 0.45, style: "cursor:pointer" }, svg);
+    tip(c, `${lat}°, ${lon}°: ${fmt(v.count)} events, ${fmt(v.sum)} fatalities`);
+    c.onclick = () => listBy("by_place", { key: [lat, lon] }, `Events near ${lat}°, ${lon}°`);
+  }
+}
+
+// ---- event lists -------------------------------------------------------------
+function describe(doc) {
+  const parts = [doc.aircraft_make || doc.aircraft, doc.aircraft_model, doc.location || [doc.event_city, doc.event_state].filter(Boolean).join(", ") || doc.event_state, doc.operator];
+  return parts.filter(Boolean).join(" · ") || doc._id;
+}
+function fatalOf(doc) {
+  if (state.db === "airline_accidents") return doc.total_fatal_injuries;
+  if (state.db === "faa_incidents_data") return doc.total_fatalities;
+  if (state.db === "world_aircraft_accident_summary") return (doc.crew_fatalities || 0) + (doc.pax_fatalities || 0);
+  return doc.injury_severity === "FATAL" ? "fatal" : "";
+}
+
+function listBy(viewName, params, title) {
+  state.list = { viewName, params, title }; state.offset = 0; loadList();
+}
+async function loadList() {
+  const { viewName, params, title } = state.list;
+  $("list-title").textContent = title;
+  const reduceParam = viewName === "by_fatalities" || viewName === "by_registration" ? {} : { reduce: "false" };
+  const path = view(viewName, Object.assign({}, params, reduceParam, { include_docs: "true", limit: String(state.pageSize), skip: String(state.offset) }));
+  showQuery("list-q", path);
+  const body = await api(path);
+  const tb = $("list"); clear(tb);
+  for (const r of body.rows) {
+    const d = r.doc || {};
+    const tr = document.createElement("tr");
+    const f = fatalOf(d);
+    for (const [text, cls] of [[d.event_date || "", ""], [describe(d), ""], [f === null || f === undefined ? "" : String(f), "num" + (f ? " fatal" : "")]]) {
+      const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td);
+    }
+    tr.onclick = () => showDoc(d);
+    tb.appendChild(tr);
+  }
+  const total = body.total_rows;
+  $("page").textContent = body.rows.length ? `${state.offset + 1}–${state.offset + body.rows.length}` : "no events";
+  $("prev").disabled = state.offset === 0;
+  $("next").disabled = body.rows.length < state.pageSize;
+}
+function showDoc(doc) {
+  const shown = Object.assign({}, doc); delete shown.source;
+  $("doc").classList.remove("muted");
+  $("doc").textContent = JSON.stringify(shown, null, 2);
+}
+
+async function findRegistration() {
+  const reg = $("reg").value.trim().toUpperCase().replace(/\s+/g, " ");
+  if (!reg) return;
+  $("list-title").textContent = `Registration ${reg} in every dataset`;
+  const tb = $("list"); clear(tb);
+  const saved = state.db;
+  let n = 0;
+  for (const db of Object.keys(DBS)) {
+    const path = `/${db}/_design/explore/_view/by_registration?key=${enc(reg)}&include_docs=true&limit=50`;
+    const body = await api(path).catch(() => ({ rows: [] }));
+    for (const r of body.rows) {
+      n++;
+      const tr = document.createElement("tr");
+      state.db = db; const f = fatalOf(r.doc); state.db = saved;
+      for (const [text, cls] of [[r.doc.event_date || "", ""], [`${DBS[db]} · ${describe(r.doc)}`, ""], [f === null || f === undefined ? "" : String(f), "num" + (f ? " fatal" : "")]]) {
+        const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td);
+      }
+      tr.onclick = () => showDoc(r.doc);
+      tb.appendChild(tr);
+    }
+  }
+  $("page").textContent = n ? `${n} events` : "not found";
+  $("prev").disabled = $("next").disabled = true;
+  $("list-q").textContent = "GET /{each dataset}/_design/explore/_view/by_registration?key=\"" + reg + "\"&include_docs=true";
+}
+
+// ---- wiring -------------------------------------------------------------------
+async function refreshAll() {
+  try {
+    await Promise.all([loadOverview(), loadTimeline(), loadDims(), loadMap(), loadNodes()]);
+    if (!state.list) listBy("by_fatalities", { descending: "true" }, "Deadliest events");
+    else loadList();
+  } catch (e) { $("kpis").innerHTML = ""; $("kpis").append(Object.assign(document.createElement("div"), { className: "err", textContent: e.message })); }
+}
+function selectDb(db) {
+  state.db = db; state.year = null; state.dim = null; state.list = null;
+  $("filter").value = ""; $("doc").textContent = "Click an event to see its document."; $("doc").classList.add("muted");
+  refreshAll();
+}
+async function connect() {
+  const url = $("lg-url").value.replace(/\/+$/, "");
+  state.auth = "Basic " + btoa(`${$("lg-user").value}:${$("lg-pass").value}`);
+  try {
+    await api("/_session", url);
+    const all = await api("/_all_dbs", url);
+    state.base = NODES.includes(url) ? url : url;
+    $("login").hidden = true; $("app").hidden = false;
+    const sel = $("db"); clear(sel);
+    for (const db of Object.keys(DBS)) if (all.includes(db)) sel.appendChild(Object.assign(document.createElement("option"), { value: db, textContent: DBS[db] }));
+    sel.onchange = () => selectDb(sel.value);
+    const wanted = new URLSearchParams(location.search).get("db");
+    if (wanted && DBS[wanted] && all.includes(wanted)) sel.value = wanted;
+    selectDb(sel.value);
+  } catch (e) { $("lg-err").textContent = e.message + " (is the cluster running with --cors-origins for this page?)"; }
+}
+$("lg-go").onclick = connect;
+$("lg-pass").addEventListener("keydown", e => { if (e.key === "Enter") connect(); });
+$("sort").onchange = $("topn").onchange = () => loadBars();
+$("filter").oninput = () => loadBars();
+$("prev").onclick = () => { state.offset = Math.max(0, state.offset - state.pageSize); loadList(); };
+$("next").onclick = () => { state.offset += state.pageSize; loadList(); };
+$("reg-go").onclick = findRegistration;
+$("reg").addEventListener("keydown", e => { if (e.key === "Enter") findRegistration(); });
+let resize; addEventListener("resize", () => { clearTimeout(resize); resize = setTimeout(() => { if (!$("app").hidden) { loadTimeline(); loadBars(); loadMap(); } }, 200); });
+$("login").hidden = false;
+// ?connect signs in at once with the defaults above (the local demo cluster).
+if (new URLSearchParams(location.search).has("connect")) connect();
+</script>
+</body>
+</html>
