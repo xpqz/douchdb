@@ -316,11 +316,14 @@ fn build_router(args: &Args, state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(api::json_cache_control))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            api::cors,
+            api::admit,
         ))
+        // Outside admission, so a request it turns away (429) still carries
+        // the CORS headers, as every CouchDB error response does, and a
+        // preflight is answered without counting against anyone's limits.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            api::admit,
+            api::cors,
         ))
         .layer(axum::middleware::from_fn(api::log_requests))
         .layer(axum::middleware::from_fn(api::security_headers))
