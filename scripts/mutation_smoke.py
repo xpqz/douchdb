@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,32 +105,35 @@ def main() -> int:
             path = work / relative
             original = (ROOT / relative).read_text()
             if original.count(old) != 1:
-                print(f"ERROR    {name}: expected one match in {relative}, found {original.count(old)}")
+                print(f"ERROR    {name}: expected one match in {relative}, found {original.count(old)}", flush=True)
                 failures += 1
                 continue
             path.write_text(original.replace(old, new))
+            started = time.monotonic()
+            print(f"START    {name} ({relative})", flush=True)
             try:
                 build = run([*test, "--no-run"], work, env, BUILD_TIMEOUT)
                 if build is None or build.returncode != 0:
                     reason = "timed out" if build is None else "does not compile"
-                    print(f"ERROR    {name} ({relative}): mutant {reason}")
+                    print(f"ERROR    {name} ({relative}): mutant {reason}", flush=True)
                     if build is not None:
                         print(build.stderr[-2000:])
                     failures += 1
                     continue
+                print(f"BUILT    {name} in {time.monotonic() - started:.0f}s", flush=True)
                 result = run(test, work, env, TEST_TIMEOUT)
             finally:
                 path.write_text(original)
             if result is None:
-                print(f"ERROR    {name} ({relative}): test timed out")
+                print(f"ERROR    {name} ({relative}): test timed out", flush=True)
                 failures += 1
             elif result.returncode == 0:
-                print(f"SURVIVED {name} ({relative})")
+                print(f"SURVIVED {name} ({relative})", flush=True)
                 failures += 1
             else:
-                print(f"KILLED   {name} ({relative})")
+                print(f"KILLED   {name} ({relative})", flush=True)
     if failures:
-        print(f"FAIL: {failures} mutation(s) survived or could not be checked")
+        print(f"FAIL: {failures} mutation(s) survived or could not be checked", flush=True)
         return 1
     print("PASS: every critical mutation was caught")
     return 0

@@ -177,8 +177,74 @@ Caveats:
 
 - Linux `fdatasync` was not measured.
 - The write mix was creates only.
-- Concurrent single-document writes share commits poorly under the synced
-  group commit; that is issue #90.
+- Concurrent single-document writes shared commits poorly under the synced
+  group commit (issue #90); see the next section.
+
+### Single-document writes: the group linger (#90)
+
+Concurrent single-document writers split into two cohorts that took turns.
+The shard actor started the next group the instant a commit ended, about
+0.4 ms before the clients that commit answered came back, so each commit
+carried about half the writers (8 of 16). Each request waited about one full
+commit in the queue and then its own.
+
+The actor now lingers. After a group that answered more than one write job,
+it waits before starting the next group until as many write jobs are queued
+as the group answered, on top of those that were already queued when it
+answered them. Without that addition, two cohorts of the same size would take
+turns for ever. The wait lasts at most a tenth of the last commit, and never
+more than 1 ms (`GROUP_LINGER` in `src/store.rs`).
+
+- It waits on the queue, so the group starts the moment the jobs are there.
+- A read, close or other control message ends the wait at once.
+- After a group of one it never waits, so a lone writer is unchanged.
+- Durability is unchanged: two syncs per commit.
+- `/_node/_local/_metrics` counts the lingers (`shard.lingers`) and those
+  that ran out of time (`shard.linger_timeouts`).
+
+`loadgen --method PUT` of new documents (about 260 B) on a single node, one
+level after another on a fresh server: c=1 300 writes, c=4 1,000, c=16 3,000,
+after 200 warm-up writes.
+
+- Before (`039cc34`) and after binaries ran interleaved in five rounds: three
+  with before first, two with after first.
+- Each cell is the median over the five rounds. T is the shard commit time
+  per group.
+- The machine was very heavily loaded (load average 20–56 on 10 cores), so T
+  drifted between 6 and 21 ms. Read the group counts first; the rates and
+  latencies are noisy.
+
+| q | c | docs/s before → after | p50 ms | p99 ms | jobs/group | syncs/group | T ms | lingers (timed out) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 78 → 72 | 9.4 → 12.6 | 35.0 → 39.0 | 1.00 → 1.00 | 2.00 → 2.00 | 10.2 → 11.7 | 1 (1) |
+| 1 | 4 | 122 → 299 | 21.6 → 11.9 | 89.7 → 34.7 | 2.08 → 3.98 | 2.00 → 2.01 | 17.7 → 11.1 | 249 (2) |
+| 1 | 16 | 714 → 844 | 19.3 → 15.6 | 51.6 → 101.4 | 8.47 → 15.23 | 2.00 → 2.01 | 11.3 → 14.8 | 195 (26) |
+| 2 | 1 | 82 → 86 | 10.2 → 9.8 | 36.0 → 26.8 | 1.00 → 1.00 | 2.00 → 2.00 | 10.4 → 9.4 | 0 (0) |
+| 2 | 4 | 147 → 188 | 21.3 → 18.1 | 67.9 → 63.0 | 1.37 → 1.63 | 2.01 → 2.01 | 17.0 → 14.9 | 294 (224) |
+| 2 | 16 | 589 → 703 | 25.5 → 20.2 | 58.9 → 77.8 | 4.51 → 5.49 | 2.00 → 2.01 | 14.6 → 13.2 | 512 (488) |
+
+- **q=1, c=4 and c=16:** the cohorts merge in every round.
+  - c=4: 3.92–4.00 jobs/group, against 2.0–2.2.
+  - c=16: 14.2–15.96 jobs/group, against 8.4–8.7.
+  - At c=4, docs/s rose 1.5–4× per round.
+  - At c=16, docs/s rose 1.4× and 2.2× in the two rounds where the after
+    binary ran first. In the three where it ran second (load average 44),
+    the after commits were slower (T 15–20 ms against 10–13) and docs/s was
+    0.85–1.0×.
+  - An earlier four-round run, with the first form of the rule (no
+    addition), had c=16 at 738 → 1,243 docs/s and p50 at 16.6 → 10.1 ms.
+- **c=1** is unchanged by construction. The one linger per run is the first
+  write after the c=8 warm-up. The rates move with noise.
+- **q=2:** most lingers run out of time. A client that one shard answered
+  sends its next document to either shard, so a shard rarely gets back as
+  many writes as it answered. Each such linger costs at most a tenth of a
+  commit. Jobs per group still rise a little: 4.5 → 5.5 at c=16. Shards
+  that share one device cost throughput separately; issue #90's measurement
+  covers that.
+- **Not measured:** c=64 (in the first run: 36.6 → 60.7 jobs/group), the n=3
+  cluster, and mixed read/write loads, where a read that ends a linger can
+  leave a group of one and so switch the linger off until a larger group
+  forms.
 
 ### Bulk write path against the redb floor
 

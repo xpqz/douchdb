@@ -57,6 +57,18 @@ use tokio::sync::{mpsc, oneshot};
 /// Jobs one group commit takes at most.
 const GROUP_JOBS: usize = 64;
 
+/// The longest the actor waits, after a group of more than one job, for the
+/// clients that group answered to queue their next write jobs before it
+/// starts the next group ([`linger`]). Without it concurrent writers split
+/// into two cohorts that take turns: the next group starts the instant a
+/// commit ends, about 0.4 ms before the clients that commit answered come
+/// back, so each commit carries only half of them. The wait is a tenth of
+/// the last commit, so a client that does not come back costs at most a
+/// tenth of a commit, and never more than this: 1 ms covers the clients'
+/// return with room for a loaded machine where a commit costs 7-10 ms (two
+/// device syncs, macOS `F_FULLFSYNC`); a faster disk waits less.
+const GROUP_LINGER: Duration = Duration::from_millis(1);
+
 /// Default for how many purge infos a shard keeps (CouchDB's
 /// `purged_infos_limit`); `_purged_infos_limit` changes it per shard.
 const DEFAULT_PURGED_INFOS_LIMIT: u64 = 1000;
@@ -763,6 +775,16 @@ pub struct Shard {
     journal: Arc<journal::Journal>,
     /// Where compaction builds the next file, shared with the handle.
     target: Arc<dyn compact::Target>,
+    /// How long the last group's commit took, which bounds a linger
+    /// ([`Shard::linger_bound`]).
+    last_commit: Duration,
+    /// Test seam: how long a linger may wait, in place of the bound from
+    /// the last commit.
+    #[cfg(test)]
+    linger: Option<Duration>,
+    /// Test seam: the lingers before groups and how each ended.
+    #[cfg(test)]
+    linger_log: Arc<LingerLog>,
     /// Test seam: make the next group that has something to commit fail
     /// instead of committing.
     #[cfg(test)]
@@ -829,6 +851,11 @@ impl Shard {
             latest: None,
             journal: Default::default(),
             target,
+            last_commit: Duration::ZERO,
+            #[cfg(test)]
+            linger: None,
+            #[cfg(test)]
+            linger_log: Default::default(),
             #[cfg(test)]
             fail_next_commit: false,
             #[cfg(test)]
@@ -1270,7 +1297,8 @@ impl Shard {
                 )
             }),
         };
-        crate::metrics::record_shard_group(jobs_us, commit_started.elapsed().as_micros() as u64);
+        self.last_commit = commit_started.elapsed();
+        crate::metrics::record_shard_group(jobs_us, self.last_commit.as_micros() as u64);
         // Before anyone hears back, so a retry meets the recovered file.
         if let Some(error) = &error {
             if commit_failed || self.poisoned() {
@@ -1278,6 +1306,16 @@ impl Shard {
             }
         }
         (replies, error)
+    }
+
+    /// How long a linger may wait: a tenth of the last commit, at most
+    /// [`GROUP_LINGER`].
+    fn linger_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.linger {
+            return bound;
+        }
+        (self.last_commit / 10).min(GROUP_LINGER)
     }
 
     /// Run a read job on a read transaction of the committed state.
@@ -3150,6 +3188,69 @@ async fn measure_tables(gate: &Gate) -> Result<(u64, u64)> {
     Ok((bytes, docs))
 }
 
+/// Wake the actor thread that waits in [`linger`].
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// How a [`linger`] ended.
+enum Lingered {
+    /// The jobs it waited for are queued.
+    Counted,
+    /// Its bound passed first.
+    TimedOut,
+    /// Another message came first; it runs after the group, as a queued
+    /// read does.
+    Message(Message),
+    /// The queue closed.
+    Closed,
+}
+
+/// Test seam: the lingers a shard entered, and how each ended.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct LingerLog {
+    entered: AtomicU64,
+    ends: std::sync::Mutex<Vec<&'static str>>,
+}
+
+/// Before a group, take write jobs off `rx` onto `queued` until it holds
+/// `want` of them (at most a group's worth) or `bound` has passed. Any other
+/// message, or the queue closing, ends the wait at once, so nothing else
+/// waits on a linger for more than `bound`. It waits on the queue itself, so
+/// the group starts the moment the jobs are there.
+fn linger(
+    rx: &mut mpsc::Receiver<Message>,
+    queued: &mut std::collections::VecDeque<Box<dyn ShardJob>>,
+    want: usize,
+    bound: Duration,
+) -> Lingered {
+    let want = want.min(GROUP_JOBS - 1);
+    let deadline = Instant::now().checked_add(bound);
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    while queued.len() < want {
+        match rx.poll_recv(&mut cx) {
+            std::task::Poll::Ready(Some(Message::Write(job))) => queued.push_back(job),
+            std::task::Poll::Ready(Some(other)) => return Lingered::Message(other),
+            std::task::Poll::Ready(None) => return Lingered::Closed,
+            // Woken by the next message, or not before the deadline.
+            std::task::Poll::Pending => match deadline {
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => std::thread::park_timeout(left),
+                    _ => return Lingered::TimedOut,
+                },
+                None => std::thread::park(),
+            },
+        }
+    }
+    Lingered::Counted
+}
+
 impl ShardHandle {
     /// Open the shard file at `path` on a new actor thread. `committed` is
     /// pinged after every commit that advanced this shard's sequence, so a
@@ -3259,8 +3360,20 @@ impl ShardHandle {
             };
             let mut next = None;
             let mut deleted = None;
+            // Write jobs the last group answered, and the messages already
+            // queued before it answered them.
+            let mut last_group = 0;
+            let mut waiting = 0;
+            // Write jobs a linger took off the queue that their group did
+            // not run (it ended early): next, ahead of `next`, which was
+            // queued after them.
+            let mut queued = std::collections::VecDeque::new();
             loop {
-                let message = match next.take() {
+                let message = match queued
+                    .pop_front()
+                    .map(Message::Write)
+                    .or_else(|| next.take())
+                {
                     Some(message) => message,
                     None => match rx.blocking_recv() {
                         Some(message) => message,
@@ -3291,15 +3404,54 @@ impl ShardHandle {
                     // queued, commit once (synced), and only then answer. A
                     // queued read ends the group and runs after its commit.
                     // A failed commit is recovered from before the answers.
+                    // After a group of several, first wait briefly for the
+                    // clients it answered to come back, on top of whoever
+                    // was already queued then ([`linger`]): counting those
+                    // alone, two cohorts of the same size would take turns
+                    // for ever.
                     Message::Write(job) => {
-                        let (replies, error) = shard.run_group(job, || match rx.try_recv() {
-                            Ok(Message::Write(job)) => Some(job),
-                            Ok(other) => {
-                                next = Some(other);
-                                None
+                        // Never with a message held, which it would replace;
+                        // one is held only behind jobs a failed group left.
+                        if last_group > 1 && next.is_none() {
+                            #[cfg(test)]
+                            shard.linger_log.entered.fetch_add(1, Ordering::SeqCst);
+                            let want = waiting + last_group - 1;
+                            let lingered = linger(&mut rx, &mut queued, want, shard.linger_bound());
+                            crate::metrics::record_shard_linger(matches!(
+                                lingered,
+                                Lingered::TimedOut
+                            ));
+                            #[cfg(test)]
+                            shard.linger_log.ends.lock().unwrap().push(match &lingered {
+                                Lingered::Counted => "counted",
+                                Lingered::TimedOut => "timed out",
+                                Lingered::Message(_) => "message",
+                                Lingered::Closed => "closed",
+                            });
+                            if let Lingered::Message(message) = lingered {
+                                next = Some(message);
                             }
-                            Err(_) => None,
+                        }
+                        let (replies, error) = shard.run_group(job, || {
+                            if let Some(job) = queued.pop_front() {
+                                return Some(job);
+                            }
+                            if next.is_some() {
+                                return None;
+                            }
+                            match rx.try_recv() {
+                                Ok(Message::Write(job)) => Some(job),
+                                Ok(other) => {
+                                    next = Some(other);
+                                    None
+                                }
+                                Err(_) => None,
+                            }
                         });
+                        // A group that failed may have left gathered jobs
+                        // behind: they run next, without a linger.
+                        last_group = if error.is_none() { replies.len() } else { 0 };
+                        waiting = rx.len();
                         publish(shard.seq());
                         shard_index.measure_if_due(shard.seq(), &shard.gate, runtime.as_ref());
                         for reply in replies {
@@ -5268,6 +5420,364 @@ mod group_tests {
         assert!(result.is_err());
         assert_eq!(locals(&handle).await, ["before"]);
         cleanup(handle, file);
+    }
+
+    /// A shard whose lingers wait at most `bound`, and its log of them.
+    fn lingering_shard(tag: &str, bound: Duration) -> (Arc<ShardHandle>, PathBuf, Arc<LingerLog>) {
+        let file = temp_file(tag);
+        let log = Arc::new(LingerLog::default());
+        let shared = Arc::clone(&log);
+        let path = file.clone();
+        let handle = ShardHandle::spawn_with("shard-linger".to_string(), Default::default(), {
+            move || {
+                let mut shard = Shard::open(&path, 1000, tests::CACHE)?;
+                shard.linger = Some(bound);
+                shard.linger_log = shared;
+                Ok(shard)
+            }
+        })
+        .unwrap();
+        (Arc::new(handle), file, log)
+    }
+
+    /// A shard whose lingers end only once the jobs are queued or another
+    /// message arrives, never by time.
+    fn patient(tag: &str) -> (Arc<ShardHandle>, PathBuf, Arc<LingerLog>) {
+        lingering_shard(tag, Duration::MAX)
+    }
+
+    impl LingerLog {
+        fn ends(&self) -> Vec<&'static str> {
+            self.ends.lock().unwrap().clone()
+        }
+    }
+
+    /// Until the shard has entered `count` lingers.
+    async fn lingered(log: &LingerLog, count: u64) {
+        while log.entered.load(Ordering::SeqCst) < count {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Until the shard has entered `count` lingers, failing if `write`
+    /// finishes first: it should be the job waiting in that linger.
+    async fn lingers_with<T>(log: &LingerLog, count: u64, write: &mut tokio::task::JoinHandle<T>) {
+        tokio::select! {
+            _ = &mut *write => panic!("the write finished without lingering"),
+            () = lingered(log, count) => {}
+        }
+    }
+
+    /// Run `job`, failing if the shard enters a linger first.
+    async fn without_linger(handle: &ShardHandle, log: &LingerLog, job: TestJob) {
+        let entered = log.entered.load(Ordering::SeqCst);
+        tokio::select! {
+            result = handle.call(job) => result.unwrap(),
+            () = lingered(log, entered + 1) => panic!("a write lingered"),
+        }
+    }
+
+    /// A group of three (it lingers for none), so the next write lingers
+    /// for two more.
+    async fn group_of_three(handle: &Arc<ShardHandle>) {
+        let (first, answers) = grouped(handle, vec![local("a"), local("b")]).await;
+        first.unwrap();
+        for answer in answers {
+            answer.unwrap();
+        }
+    }
+
+    /// Queue a write job straight on the actor, past the handle's own
+    /// checks (a deleted shard's handle answers for itself).
+    fn queue_write(
+        handle: &ShardHandle,
+        job: TestJob,
+    ) -> oneshot::Receiver<std::result::Result<(), ApiError>> {
+        let (job, answer) = call_job(job);
+        let queued = handle.tx.as_ref().unwrap().try_send(Message::Write(job));
+        assert!(queued.is_ok(), "the actor's queue is full");
+        answer
+    }
+
+    /// Writes that end a linger that should already have ended, so a test
+    /// whose linger did not end fails on what ended it instead of hanging,
+    /// and a read behind them that ends any linger they enter themselves.
+    fn backstop(handle: &ShardHandle) -> Vec<oneshot::Receiver<std::result::Result<(), ApiError>>> {
+        vec![
+            queue_write(handle, local("y")),
+            queue_write(handle, local("z")),
+            handle.barrier(),
+        ]
+    }
+
+    /// A job that writes the local `id` and records how many of `others`
+    /// were written before it in its own group: those it sees that are not
+    /// committed.
+    fn member(
+        id: &'static str,
+        others: &'static [&'static str],
+        log: &Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> TestJob {
+        let log = Arc::clone(log);
+        Box::new(move |txn| {
+            let mut pending = 0;
+            for &other in others {
+                if txn.get_local(other)?.is_some() && txn.committed_local(other).is_none() {
+                    pending += 1;
+                }
+            }
+            log.lock().unwrap().push(pending);
+            Ok(txn.put_local(id, id.as_bytes())?)
+        })
+    }
+
+    /// `job`, recording when it runs how many jobs `sent` says were sent.
+    fn counting(sent: &Arc<AtomicU64>, job: TestJob) -> TestJob {
+        let sent = Arc::clone(sent);
+        Box::new(move |txn| {
+            let seen = sent.load(Ordering::SeqCst);
+            job(txn)?;
+            txn.put_local("seen", seen.to_string().as_bytes())?;
+            Ok(())
+        })
+    }
+
+    async fn seen(handle: &ShardHandle) -> u64 {
+        let seen = handle
+            .read(|txn| Ok(txn.get_local("seen")?))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(seen).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn after_a_group_of_several_the_next_waits_for_as_many_jobs() {
+        let (handle, file, log) = patient("linger-gathers");
+        group_of_three(&handle).await;
+        // The next write waits for two more; the group starts once they are
+        // queued, one at a time while it waits.
+        let members = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = Arc::new(AtomicU64::new(1));
+        let mut x = tokio::spawn(handle.call(counting(&sent, member("x", &[], &members))));
+        lingers_with(&log, 1, &mut x).await;
+        let mut rest = Vec::new();
+        for (id, others) in [("y", &["x", "z"][..]), ("z", &["x", "y"][..])] {
+            sent.fetch_add(1, Ordering::SeqCst);
+            rest.push(tokio::spawn(handle.call(member(id, others, &members))));
+            tokio::task::yield_now().await;
+        }
+        // Should the count not end the linger, this read does.
+        let barrier = handle.barrier();
+        x.await.unwrap().unwrap();
+        for task in rest {
+            task.await.unwrap().unwrap();
+        }
+        barrier.await.unwrap().unwrap();
+        assert_eq!(log.ends(), ["counted"]);
+        assert_eq!(
+            seen(&handle).await,
+            3,
+            "the first job ran once all three were sent"
+        );
+        // In one group, each job sees every write before it pending.
+        assert_eq!(*members.lock().unwrap(), [0, 1, 2], "one group");
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn two_cohorts_of_the_same_size_merge() {
+        let (handle, file, log) = patient("linger-even");
+        // A group of two (the holder and `a`), which a read ends while `c`
+        // and `d` queue behind it: when the group answers, two jobs wait
+        // already, like a cohort queued during the other's commit.
+        let (started, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::spawn(handle.call(move |_| {
+            let _ = started.send(());
+            held.recv().map_err(ApiError::internal)
+        }));
+        running.await.unwrap();
+        let a = tokio::spawn(handle.call(local("a")));
+        let read = tokio::spawn(handle.read(|_| Ok(())));
+        let members = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = Arc::new(AtomicU64::new(0));
+        let mut c = tokio::spawn(handle.call(counting(&sent, member("c", &[], &members))));
+        let d = tokio::spawn(handle.call(member("d", &["c"], &members)));
+        while handle.queued() < 4 {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        a.await.unwrap().unwrap();
+        read.await.unwrap().unwrap();
+        // `c` waits for the two clients that group answered, on top of
+        // `d`, which alone would have made the two the group had.
+        lingers_with(&log, 1, &mut c).await;
+        let mut rest = Vec::new();
+        for (id, others) in [("e", &["c", "d", "f"][..]), ("f", &["c", "d", "e"][..])] {
+            sent.fetch_add(1, Ordering::SeqCst);
+            rest.push(tokio::spawn(handle.call(member(id, others, &members))));
+            tokio::task::yield_now().await;
+        }
+        let barrier = handle.barrier();
+        c.await.unwrap().unwrap();
+        d.await.unwrap().unwrap();
+        for task in rest {
+            task.await.unwrap().unwrap();
+        }
+        barrier.await.unwrap().unwrap();
+        assert_eq!(log.ends(), ["counted"]);
+        assert_eq!(
+            seen(&handle).await,
+            2,
+            "`c` ran once both returning jobs were sent"
+        );
+        assert_eq!(*members.lock().unwrap(), [0, 1, 2, 3], "one group of four");
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn after_a_group_of_one_the_next_starts_at_once() {
+        let (handle, file, log) = patient("linger-alone");
+        for id in ["a", "b", "c"] {
+            without_linger(&handle, &log, local(id)).await;
+        }
+        assert_eq!(log.entered.load(Ordering::SeqCst), 0);
+        assert_eq!(locals(&handle).await, ["a", "b", "c"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_linger_that_runs_out_of_time_starts_the_group() {
+        let (handle, file, log) = lingering_shard("linger-bound", Duration::ZERO);
+        let before = crate::metrics::snapshot()["shard"].clone();
+        group_of_three(&handle).await;
+        // Its bound is over at once, with nothing else queued.
+        handle.call(local("w")).await.unwrap();
+        assert_eq!(log.ends(), ["timed out"]);
+        // That was a group of one: the next write does not linger.
+        without_linger(&handle, &log, local("x")).await;
+        assert_eq!(log.ends(), ["timed out"]);
+        let after = crate::metrics::snapshot()["shard"].clone();
+        let delta = |name: &str| after[name].as_u64().unwrap() - before[name].as_u64().unwrap();
+        assert!(delta("lingers") >= 1, "{before} {after}");
+        assert!(delta("linger_timeouts") >= 1, "{before} {after}");
+        assert_eq!(locals(&handle).await, ["a", "b", "w", "x"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn jobs_a_linger_gathered_run_on_when_their_group_fails() {
+        let (handle, file, log) = patient("linger-panic");
+        group_of_three(&handle).await;
+        let mut x = tokio::spawn(handle.call(local("x")));
+        lingers_with(&log, 1, &mut x).await;
+        let panicker = tokio::spawn(handle.call(|txn| {
+            txn.put_local("p", b"")?;
+            panic!("boom in a gathered job");
+        }));
+        tokio::task::yield_now().await;
+        // Gathered behind the panic: it runs in the next group.
+        let c = tokio::spawn(handle.call(local("c")));
+        let x = x.await.unwrap();
+        let panicker = panicker.await.unwrap();
+        for (who, answer) in [("x", &x), ("panicker", &panicker)] {
+            let error = answer.as_ref().unwrap_err();
+            assert!(
+                error.reason.contains("boom in a gathered job"),
+                "{who}: {}",
+                error.reason
+            );
+        }
+        c.await.unwrap().unwrap();
+        assert_eq!(log.ends(), ["counted"]);
+        assert_eq!(locals(&handle).await, ["a", "b", "c"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_read_ends_a_linger_and_runs_after_its_group() {
+        let (handle, file, log) = patient("linger-read");
+        group_of_three(&handle).await;
+        let mut write = tokio::spawn(handle.call(local("w")));
+        lingers_with(&log, 1, &mut write).await;
+        let read = tokio::spawn(handle.read(|txn| {
+            Ok(txn
+                .locals()?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>())
+        }));
+        tokio::task::yield_now().await;
+        let backstop = backstop(&handle);
+        assert_eq!(
+            read.await.unwrap().unwrap(),
+            ["a", "b", "w"],
+            "the read runs after the group it ended"
+        );
+        write.await.unwrap().unwrap();
+        for answer in backstop {
+            answer.await.unwrap().unwrap();
+        }
+        assert_eq!(log.ends(), ["message"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_check_ends_a_linger() {
+        let (handle, file, log) = patient("linger-check");
+        group_of_three(&handle).await;
+        let mut write = tokio::spawn(handle.call(local("w")));
+        lingers_with(&log, 1, &mut write).await;
+        let queued = handle.tx.as_ref().unwrap().try_send(Message::Check);
+        assert!(queued.is_ok(), "the actor's queue is full");
+        let backstop = backstop(&handle);
+        write.await.unwrap().unwrap();
+        for answer in backstop {
+            answer.await.unwrap().unwrap();
+        }
+        assert_eq!(log.ends(), ["message"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_close_ends_a_linger_after_its_group() {
+        let (handle, file, log) = patient("linger-close");
+        group_of_three(&handle).await;
+        let mut write = tokio::spawn(handle.call(local("w")));
+        lingers_with(&log, 1, &mut write).await;
+        let close = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.close_deleted().await }
+        });
+        tokio::task::yield_now().await;
+        // Behind the close, should it not end the linger; the actor may
+        // be gone already, and drops them unanswered if not.
+        for id in ["y", "z"] {
+            let (job, _) = call_job(local(id));
+            let _ = handle.tx.as_ref().unwrap().try_send(Message::Write(job));
+        }
+        close.await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(log.ends(), ["message"]);
+        cleanup(handle, file);
+    }
+
+    #[tokio::test]
+    async fn a_closed_queue_ends_a_linger_after_its_group() {
+        let (handle, file, log) = patient("linger-closed");
+        group_of_three(&handle).await;
+        let mut write = tokio::spawn(handle.call(local("w")));
+        lingers_with(&log, 1, &mut write).await;
+        // The last sender goes; dropping the handle waits for the actor.
+        tokio::task::spawn_blocking(move || drop(handle))
+            .await
+            .unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(log.ends(), ["closed"]);
+        kv::forget_verified(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }
 
