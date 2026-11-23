@@ -17037,6 +17037,89 @@ async fn per_user_admission_caps_concurrency_and_preserves_other_users() {
     }
 }
 
+/// A request that admission control turns away is still a response to an
+/// allowed origin: like every CouchDB error response it carries the CORS
+/// headers, so a browser page can read the 429 instead of seeing a network
+/// error. A preflight is not client work and is never refused.
+#[tokio::test]
+async fn an_admission_429_carries_cors_headers_and_preflights_pass() {
+    let users = UsersFile::new(USERS);
+    let mut args = users_server_args(&users);
+    args.extend([
+        "--per-user-in-flight".to_string(),
+        "1".to_string(),
+        "--cors-origins".to_string(),
+        "http://example.test".to_string(),
+    ]);
+    let s = Server::start_with(&args, true);
+    let (status, body) = s
+        .req_with(Method::PUT, "/corslimit", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s
+        .req_with(
+            Method::PUT,
+            "/corslimit/_security",
+            Some(json!({
+                "admins": {"names": [], "roles": []},
+                "members": {"names": ["alice"], "roles": []}
+            })),
+            &admin_auth(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .req_with(Method::PUT, "/corslimit/d1", Some(json!({})), &admin_auth())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A continuous feed holds Alice's only slot.
+    let mut request = s.client.get(format!(
+        "{}/corslimit/_changes?feed=continuous&since=0&timeout=60000",
+        s.base
+    ));
+    for (name, value) in bearer("alice-token") {
+        request = request.header(name, value);
+    }
+    let mut feed = request.send().await.unwrap();
+    assert_eq!(feed.status(), StatusCode::OK);
+    assert!(feed.chunk().await.unwrap().is_some());
+
+    let mut request = s
+        .client
+        .get(format!("{}/corslimit", s.base))
+        .header("Origin", "http://example.test");
+    for (name, value) in bearer("alice-token") {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://example.test"),
+        "the 429 carries the CORS headers"
+    );
+
+    let response = s
+        .client
+        .request(Method::OPTIONS, format!("{}/corslimit", s.base))
+        .header("Origin", "http://example.test")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a preflight is answered while the user's slot is taken"
+    );
+    drop(feed);
+}
+
 /// A streamed feed outlives the handler, so it must keep its admission permit
 /// until the body ends or the client goes away; otherwise any number of
 /// continuous feeds escape the per-user limit.
