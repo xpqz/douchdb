@@ -7646,11 +7646,18 @@ async fn cluster_changes_use_an_opaque_version_vector() {
 /// reads on through the pages without waiting for a commit.
 #[tokio::test]
 async fn cluster_changes_page_through_large_shards() {
-    let nodes = start_cluster_sharded(3, 1, 1);
+    // One shard on one node, then four spread over the three nodes, each
+    // node's lane more than a page.
+    for (q, total) in [(1, 2500), (4, 4000)] {
+        cluster_changes_pages(q, total).await;
+    }
+}
+
+async fn cluster_changes_pages(q: u32, total: usize) {
+    let nodes = start_cluster_sharded(3, q, 1);
     for node in &nodes {
         node.fresh_db("clpages").await;
     }
-    let total = 2500;
     let docs: Vec<Value> = (0..total)
         .map(|i| json!({"_id": format!("d{i:05}")}))
         .collect();
@@ -7718,6 +7725,35 @@ async fn cluster_changes_page_through_large_shards() {
             .cloned()
             .collect();
         assert_eq!(ids(&rows).len(), total, "{}", node.base);
+
+        // A longpoll with changes waiting answers with all of them.
+        let (status, long) = node
+            .get("/clpages/_changes?feed=longpoll&since=0&timeout=60000")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = long["results"].as_array().unwrap();
+        assert_eq!(rows.len(), total, "{}", node.base);
+        assert_eq!(ids(rows).len(), total, "{}", node.base);
+        assert_eq!(long["pending"], 0);
+        let text = node
+            .client
+            .get(format!(
+                "{}/clpages/_changes?feed=longpoll&since=0&timeout=60000&heartbeat=10000",
+                node.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let long: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(
+            ids(long["results"].as_array().unwrap()).len(),
+            total,
+            "{}",
+            node.base
+        );
     }
 }
 

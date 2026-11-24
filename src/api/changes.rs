@@ -180,9 +180,7 @@ async fn changes_normal(
 }
 
 /// A clustered `feed=normal` read too large for one page: the first page is
-/// read already (so an error still gets its own status); the rest stream,
-/// each read from where the previous one ended, until no node has more or
-/// the request's `limit` is reached.
+/// read already (so an error still gets its own status); the rest stream.
 fn changes_normal_paged(
     st: Arc<AppState>,
     db: Arc<Db>,
@@ -192,12 +190,35 @@ fn changes_normal_paged(
     headers: &HeaderMap,
     first: ChangesList,
 ) -> Response {
+    let stream = paged_changes_body(st, db, dbname, q, body, headers, first);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| fail(ApiError::internal("building the changes response")))
+}
+
+/// The JSON of a clustered changes read that did not fit one page: `first`'s
+/// rows, then each further page's, each read from where the previous one
+/// ended, until no node has more or the request's `limit` is reached; then
+/// the last page's `last_seq` and `pending`. A paged read is not one
+/// snapshot: a document written while it runs may be listed again, with its
+/// new sequence, as any later read would list it.
+fn paged_changes_body(
+    st: Arc<AppState>,
+    db: Arc<Db>,
+    dbname: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+    headers: &HeaderMap,
+    first: ChangesList,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let dbname = dbname.to_string();
     let mut query = q.clone();
     let limit = num(q, "limit");
     let body = Bytes::copy_from_slice(body);
     let headers = headers.clone();
-    let stream = async_stream::stream! {
+    async_stream::stream! {
         let mut buffer = String::from("{\"results\":[");
         let (mut page, mut more) = (first, true);
         let mut sent = 0usize;
@@ -230,12 +251,7 @@ fn changes_normal_paged(
         buffer.push_str(&serde_json::to_string(&page.last_seq).unwrap_or_default());
         buffer.push_str(&format!(",\"pending\":{}}}", page.pending));
         yield Ok(Bytes::from(buffer));
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| fail(ApiError::internal("building the changes response")))
+    }
 }
 
 /// `feed=continuous` and `feed=eventsource`: one JSON line (or SSE event) per
@@ -390,18 +406,23 @@ fn changes_longpoll_stream(
             }
             wake.borrow_and_update();
             if poll {
-            // A clustered read answers with one page; its `pending` counts
-            // the rest, which the client's next request reads.
-            match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only)
-                .await
-                .map(|(value, _)| value)
-            {
-                Ok(value)
+            match changes_once(&st, &db, &dbname, &query, &body, &headers, local_only).await {
+                Ok((value, more))
                     if (!value.results.is_empty()
                         || started.elapsed().as_millis() as u64 >= deadline
                         || st.shutdown.is_cancelled())
                         && still_allowed(&st, &db, &principal) =>
                 {
+                    if more {
+                        let mut rest = Box::pin(paged_changes_body(
+                            st.clone(), db.clone(), &dbname, &query, &body, &headers, value,
+                        ));
+                        while let Some(chunk) = futures::StreamExt::next(&mut rest).await {
+                            yield chunk;
+                        }
+                        yield Ok(Bytes::from_static(b"\n"));
+                        break;
+                    }
                     let mut line = serde_json::to_vec(&value).unwrap_or_default();
                     line.push(b'\n');
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
@@ -409,7 +430,7 @@ fn changes_longpoll_stream(
                 }
                 // Read on from where this poll ended, so `since=now` is not
                 // resolved again past a write that wakes the feed.
-                Ok(value) => {
+                Ok((value, _)) => {
                     query.insert("since".to_string(), value.last_seq);
                 }
                 Err(error) => {
@@ -436,7 +457,7 @@ fn changes_longpoll_stream(
 /// `feed=longpoll` without a heartbeat: hold the request until a change
 /// arrives or the deadline passes, then answer once.
 async fn changes_longpoll(
-    st: &AppState,
+    st: &Arc<AppState>,
     db: &Arc<Db>,
     req: DbRequest<'_>,
     opts: &FeedOpts,
@@ -458,19 +479,25 @@ async fn changes_longpoll(
             return access_denied(principal);
         }
         wake.borrow_and_update();
-        // A clustered read answers with one page; its `pending` counts the
-        // rest, which the client's next request reads.
-        match changes_once(st, db, dbname, &q, body, headers, opts.local_only)
-            .await
-            .map(|(value, _)| value)
-        {
-            Ok(v) if !v.results.is_empty() => {
+        match changes_once(st, db, dbname, &q, body, headers, opts.local_only).await {
+            Ok((v, more)) if !v.results.is_empty() => {
                 if !still_allowed(st, db, principal) {
                     return access_denied(principal);
                 }
+                if more {
+                    return changes_normal_paged(
+                        st.clone(),
+                        db.clone(),
+                        dbname,
+                        &q,
+                        body,
+                        headers,
+                        v,
+                    );
+                }
                 return json_of(StatusCode::OK, &v);
             }
-            Ok(v)
+            Ok((v, _))
                 if started.elapsed().as_millis() as u64 >= opts.deadline
                     || st.shutdown.is_cancelled() =>
             {
@@ -481,7 +508,7 @@ async fn changes_longpoll(
             }
             // Read on from where this poll ended, so `since=now` is not
             // resolved again past a write that wakes the feed.
-            Ok(v) => {
+            Ok((v, _)) => {
                 q.insert("since".to_string(), v.last_seq);
             }
             Err(e) => return fail(e),
