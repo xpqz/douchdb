@@ -15,7 +15,7 @@ use md5::{Digest, Md5};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex, MutexGuard, PoisonError};
@@ -189,6 +189,32 @@ struct ShardRows {
     blocks: Vec<Arc<Vec<Row>>>,
     /// The row each block starts at, then the shard's row count.
     starts: Vec<usize>,
+}
+
+/// Rows in key order that a selection reads by position: held in memory,
+/// or a run of the key-ordered table (`DiskRun`).
+trait Positions {
+    /// How many rows.
+    fn count(&self) -> usize;
+    /// The first position whose row does not satisfy `pred`, which holds for
+    /// a prefix of the rows.
+    fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize;
+    /// The rows at `chosen` positions, in position order.
+    fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row>;
+}
+
+impl<S: SortedRows + ?Sized> Positions for S {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize {
+        self.partition_point(pred)
+    }
+
+    fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row> {
+        chosen.iter().map(|&at| self.row(at).clone()).collect()
+    }
 }
 
 /// Rows in key order that a query can binary search.
@@ -872,42 +898,234 @@ impl ViewRows {
         Ok(spans)
     }
 
-    /// Rows `query` can return from the shards in `mask` (all when `None`).
-    /// A reduce needs every row in range; otherwise at most `skip + limit`
-    /// rows are copied. `total_rows` and `offset` follow `ordered_rows`.
+    /// The in-memory selection, which the key-ordered table's must match.
+    #[cfg(test)]
+    fn select(
+        &self,
+        query: &ViewQuery,
+        mask: Option<&crate::cluster::ShardMask>,
+        visited: &AtomicU64,
+    ) -> Selection {
+        let runs = self.runs_for(query, mask);
+        select_runs(runs.iter().map(|&run| &self.shards[run]), query, visited)
+    }
+}
+
+/// A view index file as one query reads it: a read transaction, so every
+/// count and row it reads is one snapshot, and the index's registry handle,
+/// so the file is neither evicted nor closed while the query reads it.
+pub struct DiskView {
+    _slot: Arc<AsyncMutex<ViewIndex>>,
+    txn: redb::ReadTransaction,
+    placement: Placement,
+}
+
+/// One run of the key-ordered table a query reads: a shard, or one
+/// partition's rows in it, as positions `lo..lo + len` of the shard.
+struct RunWindow {
+    blocks: Arc<crate::view_store::ShardBlocks>,
+    lo: u64,
+    len: u64,
+}
+
+/// A run as a selection reads it. Position lookups cannot fail in the
+/// `Positions` interface, so the first read error is kept here and returned
+/// once the selection is done.
+struct DiskRun<'v> {
+    table: &'v redb::ReadOnlyTable<crate::view_store::ViewKey, &'static [u8]>,
+    window: RunWindow,
+    error: std::cell::RefCell<Option<JsError>>,
+}
+
+impl DiskRun<'_> {
+    /// Rows `first..first + count` of the run.
+    fn read(&self, first: u64, count: usize) -> Vec<Row> {
+        let read = crate::view_store::read_at(
+            self.table,
+            &self.window.blocks,
+            self.window.lo + first,
+            count,
+        )
+        .and_then(|rows| {
+            rows.iter()
+                .map(|(key, value)| stored_row(key, value))
+                .collect()
+        });
+        match read {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.error.borrow_mut().get_or_insert(error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn into_result<T>(self, value: T) -> Result<T, JsError> {
+        match self.error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
+    }
+}
+
+impl Positions for DiskRun<'_> {
+    fn count(&self) -> usize {
+        self.window.len as usize
+    }
+
+    /// Two levels: the first row of each block in the run is probed by
+    /// binary search, then the one block the point falls in is scanned.
+    fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize {
+        let (lo, hi) = (self.window.lo, self.window.lo + self.window.len);
+        let probes = crate::view_store::block_starts(&self.window.blocks, lo, hi);
+        let holds = |at: u64| self.read(at - lo, 1).first().is_some_and(pred);
+        let passed = probes.partition_point(|&at| at < hi && holds(at));
+        let Some(&start) = passed.checked_sub(1).and_then(|at| probes.get(at)) else {
+            return 0;
+        };
+        let end = probes.get(passed).copied().unwrap_or(hi).min(hi);
+        let rows = self.read(start - lo, (end - start) as usize);
+        (start - lo) as usize + rows.iter().take_while(|row| pred(row)).count()
+    }
+
+    fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row> {
+        // Consecutive positions are read together.
+        let mut rows = Vec::with_capacity(chosen.len());
+        let mut chosen = chosen.iter().copied().peekable();
+        while let Some(first) = chosen.next() {
+            let mut end = first + 1;
+            while chosen.next_if_eq(&end).is_some() {
+                end += 1;
+            }
+            rows.extend(self.read(first as u64, end - first));
+        }
+        rows
+    }
+}
+
+/// A stored row, from its `ViewKey` and value.
+fn stored_row(key: &[u8], value: &[u8]) -> Result<Row, JsError> {
+    let read = crate::view_store::read_row_key(key)?;
+    Ok(Row {
+        id: read.id.to_string(),
+        key: read.key,
+        value: decode_value(value)?,
+    })
+}
+
+impl DiskView {
+    fn by_key(
+        &self,
+    ) -> Result<redb::ReadOnlyTable<crate::view_store::ViewKey, &'static [u8]>, JsError> {
+        self.txn
+            .open_table(crate::view_store::BY_KEY)
+            .map_err(index_error)
+    }
+
+    /// The runs `query` reads in the shards of `mask` (all when `None`): each
+    /// shard, or for a view queried by partition, the partition's rows in it.
+    fn windows(
+        &self,
+        query: &ViewQuery,
+        mask: Option<&crate::cluster::ShardMask>,
+    ) -> Result<Vec<RunWindow>, JsError> {
+        let blocks = self
+            .txn
+            .open_table(crate::view_store::BLOCKS)
+            .map_err(index_error)?;
+        let by_key = self.by_key()?;
+        let mut windows = Vec::new();
+        for shard in 0..self.placement.q.max(1) {
+            if mask.is_some_and(|mask| !mask.covers(shard as usize)) {
+                continue;
+            }
+            let shard_blocks = Arc::new(crate::view_store::shard_blocks(&blocks, shard)?);
+            let (lo, hi) = if self.placement.by_partition {
+                let partition = query.partition.as_deref().ok_or_else(|| {
+                    JsError::Index("a partitioned view is read by partition".to_string())
+                })?;
+                let start = crate::view_store::partition_start(shard, partition.as_bytes())?;
+                let end = crate::view_store::partition_start(
+                    shard,
+                    &[partition.as_bytes(), &[0]].concat(),
+                )?;
+                (
+                    crate::view_store::rank(&by_key, &shard_blocks, &start)?,
+                    crate::view_store::rank(&by_key, &shard_blocks, &end)?,
+                )
+            } else {
+                (0, shard_blocks.total)
+            };
+            windows.push(RunWindow {
+                blocks: shard_blocks,
+                lo,
+                len: hi - lo,
+            });
+        }
+        Ok(windows)
+    }
+
+    /// The rows a map query can return from the shards in `mask` (all when
+    /// `None`), as `select_runs` selects them.
     pub fn select(
         &self,
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
-        reduce: bool,
         visited: &AtomicU64,
-    ) -> Selection {
-        let cap = if reduce {
-            usize::MAX
-        } else {
-            query.skip.saturating_add(query.limit)
-        };
-        let mut out = Selection {
-            rows: Vec::new(),
-            total_rows: 0,
-            offset: 0,
-        };
-        for index in self.runs_for(query, mask) {
-            select_sorted(&self.shards[index], query, cap, &mut out);
-        }
-        visit(visited, out.rows.len());
-        // Rows from one document share a shard, so a stable sort keeps the
-        // emission order of equal rows.
-        out.rows.sort_by(row_cmp);
-        if !reduce && query.keys.is_none() && out.rows.len() > cap {
-            if query.descending {
-                out.rows.drain(..out.rows.len() - cap);
-            } else {
-                out.rows.truncate(cap);
+    ) -> Result<Selection, JsError> {
+        let table = self.by_key()?;
+        let runs: Vec<DiskRun> = self
+            .windows(query, mask)?
+            .into_iter()
+            .map(|window| DiskRun {
+                table: &table,
+                window,
+                error: Default::default(),
+            })
+            .collect();
+        let selection = select_runs(&runs, query, visited);
+        let mut first_error = None;
+        for run in runs {
+            if let Err(error) = run.into_result(()) {
+                first_error.get_or_insert(error);
             }
         }
-        out
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(selection),
+        }
     }
+}
+
+/// The rows a map query can return from `runs`: at most `skip + limit`
+/// copied from each, merged into key order, and the counts CouchDB reports
+/// over them. `total_rows` and `offset` follow `ordered_rows`.
+fn select_runs<'r, R: Positions + 'r>(
+    runs: impl IntoIterator<Item = &'r R>,
+    query: &ViewQuery,
+    visited: &AtomicU64,
+) -> Selection {
+    let cap = query.skip.saturating_add(query.limit);
+    let mut out = Selection {
+        rows: Vec::new(),
+        total_rows: 0,
+        offset: 0,
+    };
+    for run in runs {
+        select_sorted(run, query, cap, &mut out);
+    }
+    visit(visited, out.rows.len());
+    // Rows from one document share a shard, so a stable sort keeps the
+    // emission order of equal rows.
+    out.rows.sort_by(row_cmp);
+    if query.keys.is_none() && out.rows.len() > cap {
+        if query.descending {
+            out.rows.drain(..out.rows.len() - cap);
+        } else {
+            out.rows.truncate(cap);
+        }
+    }
+    out
 }
 
 impl AsRef<Row> for Row {
@@ -916,16 +1134,15 @@ impl AsRef<Row> for Row {
     }
 }
 
-/// Add one sorted shard's contribution to `out`. Rows are in ascending key
-/// order; the query bounds are found by binary search on that order.
-fn select_sorted<S: SortedRows + ?Sized>(
+/// Where a query reads in one run: the run's rows, the rows before the
+/// query's start (CouchDB's offset rules), and the position ranges to read,
+/// in query order. Rows are in ascending key order; the query bounds are
+/// found by binary search on that order.
+fn query_window<S: Positions + ?Sized>(
     rows: &S,
     query: &ViewQuery,
-    cap: usize,
-    out: &mut Selection,
-) {
-    let len = rows.len();
-    out.total_rows += len;
+) -> (usize, usize, Vec<(usize, usize)>) {
+    let len = rows.count();
     let (lo, hi) = range_bounds(rows, query);
     let equal = |key: &Value| equal_range(rows, key);
     let before_key = |key: &Value| {
@@ -936,7 +1153,7 @@ fn select_sorted<S: SortedRows + ?Sized>(
             first
         }
     };
-    out.offset += if let Some(key) = &query.key {
+    let offset = if let Some(key) = &query.key {
         before_key(key)
     } else if let Some(keys) = &query.keys {
         match keys.as_slice() {
@@ -963,10 +1180,23 @@ fn select_sorted<S: SortedRows + ?Sized>(
     } else {
         vec![(lo, hi)]
     };
+    (len, offset, ranges)
+}
+
+/// Add one run's contribution to `out`: at most `cap` rows, in key order.
+fn select_sorted<S: Positions + ?Sized>(
+    rows: &S,
+    query: &ViewQuery,
+    cap: usize,
+    out: &mut Selection,
+) {
+    let (len, offset, ranges) = query_window(rows, query);
+    out.total_rows += len;
+    out.offset += offset;
 
     // Take up to `cap` row indexes in query order. Duplicate `keys` share a
     // range; each row is still selected once.
-    let mut chosen = std::collections::BTreeSet::new();
+    let mut chosen = BTreeSet::new();
     let mut remaining = cap;
     for (first, end) in ranges {
         if remaining == 0 {
@@ -986,8 +1216,7 @@ fn select_sorted<S: SortedRows + ?Sized>(
             }
         }
     }
-    out.rows
-        .extend(chosen.into_iter().map(|index| rows.row(index).clone()));
+    out.rows.extend(rows.rows_at(&chosen));
 }
 
 /// Count `rows` index rows a query looked at.
@@ -996,8 +1225,8 @@ fn visit(visited: &AtomicU64, rows: usize) {
 }
 
 /// The index range of sorted `rows` inside the query's start and end bounds.
-fn range_bounds<S: SortedRows + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, usize) {
-    let point = |pred: &dyn Fn(&Row) -> bool| rows.partition_point(pred);
+fn range_bounds<S: Positions + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, usize) {
+    let point = |pred: &dyn Fn(&Row) -> bool| rows.point(pred);
     // Rows before the start bound are a prefix (ascending) or a suffix
     // (descending); rows past the end bound are the opposite end.
     let (lo, hi) = if query.descending {
@@ -1015,10 +1244,10 @@ fn range_bounds<S: SortedRows + ?Sized>(rows: &S, query: &ViewQuery) -> (usize, 
 }
 
 /// The index range of sorted `rows` whose key equals `key`.
-fn equal_range<S: SortedRows + ?Sized>(rows: &S, key: &Value) -> (usize, usize) {
+fn equal_range<S: Positions + ?Sized>(rows: &S, key: &Value) -> (usize, usize) {
     (
-        rows.partition_point(|row| cmp_json(&row.key, key) == Ordering::Less),
-        rows.partition_point(|row| cmp_json(&row.key, key) != Ordering::Greater),
+        rows.point(&|row| cmp_json(&row.key, key) == Ordering::Less),
+        rows.point(&|row| cmp_json(&row.key, key) != Ordering::Greater),
     )
 }
 
@@ -2177,7 +2406,7 @@ pub async fn query_with_spec(
         })
         .await;
     }
-    let selection = local_select(db, ddoc_id, view_name, spec, query, reduce).await?;
+    let selection = local_select(db, ddoc_id, view_name, spec, query).await?;
     let mut query = query.clone();
     query.total_rows_override = Some(selection.total_rows);
     query.offset_override = Some(selection.offset);
@@ -2211,8 +2440,10 @@ pub struct MapRows {
 const DOC_CHUNK: usize = 256;
 
 /// Like `query`, but a map view's rows come back as a stream, so a large
-/// listing does not build its documents and JSON in memory at once. The
-/// selected index rows are still held; their documents are not.
+/// listing does not build its rows, documents and JSON in memory at once:
+/// the rows are read from the index file a chunk at a time, the shards
+/// merged as they are read. A `keys` query, bounded by its keys, selects
+/// its rows first.
 pub async fn query_stream(
     db: Arc<Db>,
     ddoc_id: &str,
@@ -2227,7 +2458,10 @@ pub async fn query_stream(
             .map(ViewReply::Reduced);
     }
     validate_view_partition(&db, &spec, query.partition.as_deref())?;
-    let selection = local_select(&db, ddoc_id, view_name, &spec, query, false).await?;
+    if query.keys.is_none() {
+        return stream_rows(db, ddoc_id, view_name, &spec, query).await;
+    }
+    let selection = local_select(&db, ddoc_id, view_name, &spec, query).await?;
     check_query(&spec, query)?;
     let mut query = query.clone();
     query.total_rows_override = Some(selection.total_rows);
@@ -2258,6 +2492,206 @@ pub async fn query_stream(
                 HashMap::new()
             };
             for row in chunk {
+                yield Ok(map_row_entry(row, &docs, include_docs));
+            }
+        }
+    };
+    Ok(ViewReply::Rows(MapRows {
+        total_rows,
+        offset: before_start + skip,
+        rows: futures::StreamExt::boxed(rows),
+    }))
+}
+
+/// Rows read from the index file at a time, per shard.
+const READ_CHUNK: usize = 256;
+
+/// One shard's rows a streamed query reads, as positions of the shard, and
+/// those read but not yet merged.
+struct Lane {
+    blocks: Arc<crate::view_store::ShardBlocks>,
+    /// The next position to read: going up, the first unread; going down,
+    /// one past the last unread.
+    next: u64,
+    /// Where reading stops: going up, the end; going down, the start.
+    stop: u64,
+    buffer: std::collections::VecDeque<Row>,
+}
+
+impl Lane {
+    fn unread(&self) -> u64 {
+        self.next.abs_diff(self.stop)
+    }
+}
+
+/// Refill every lane whose buffer is empty, from the file.
+fn refill(
+    view: &DiskView,
+    lanes: &mut [Lane],
+    descending: bool,
+    visited: &AtomicU64,
+) -> Result<(), JsError> {
+    let table = view.by_key()?;
+    for lane in lanes {
+        if !lane.buffer.is_empty() || lane.unread() == 0 {
+            continue;
+        }
+        let count = lane.unread().min(READ_CHUNK as u64);
+        let first = if descending {
+            lane.next - count
+        } else {
+            lane.next
+        };
+        let mut rows = crate::view_store::read_at(&table, &lane.blocks, first, count as usize)?
+            .iter()
+            .map(|(key, value)| stored_row(key, value))
+            .collect::<Result<Vec<Row>, JsError>>()?;
+        visit(visited, rows.len());
+        if descending {
+            rows.reverse();
+            lane.next = first;
+        } else {
+            lane.next = first + count;
+        }
+        lane.buffer.extend(rows);
+    }
+    Ok(())
+}
+
+/// A map query without `keys`, streamed from the index file: each shard's
+/// rows in the query's range are read a chunk at a time and merged in query
+/// order; `skip` and `limit` apply to the merged rows.
+async fn stream_rows(
+    db: Arc<Db>,
+    ddoc_id: &str,
+    view_name: &str,
+    spec: &ViewSpec,
+    query: &ViewQuery,
+) -> DbResult<ViewReply> {
+    let view = Arc::new(ensure_disk(&db, ddoc_id, view_name, spec, query.limits).await?);
+    check_query(spec, query)?;
+    let query = query.clone();
+    let reader = Arc::clone(&view);
+    let windows = query.clone();
+    let (lanes, total_rows, before_start) = blocking(move || {
+        let table = reader.by_key()?;
+        let mut lanes = Vec::new();
+        let (mut total_rows, mut before_start) = (0, 0);
+        for window in reader.windows(&windows, windows.owner_shards.as_ref())? {
+            let run = DiskRun {
+                table: &table,
+                window,
+                error: Default::default(),
+            };
+            let (len, offset, ranges) = query_window(&run, &windows);
+            total_rows += len;
+            before_start += offset;
+            let (first, end) = ranges.first().copied().unwrap_or((0, 0));
+            let (lo, blocks) = (run.window.lo, Arc::clone(&run.window.blocks));
+            run.into_result(())?;
+            let (first, end) = (lo + first as u64, lo + end as u64);
+            let (next, stop) = if windows.descending {
+                (end, first)
+            } else {
+                (first, end)
+            };
+            lanes.push(Lane {
+                blocks,
+                next,
+                stop,
+                buffer: Default::default(),
+            });
+        }
+        Ok((lanes, total_rows, before_start))
+    })
+    .await?;
+    let skip = query.skip.min(total_rows.saturating_sub(before_start));
+    let mut lanes = lanes;
+    let mut to_skip = skip;
+    // One shard steps over the skipped rows without reading them.
+    if let [lane] = lanes.as_mut_slice() {
+        let step = (to_skip as u64).min(lane.unread());
+        if query.descending {
+            lane.next -= step;
+        } else {
+            lane.next += step;
+        }
+        to_skip = 0;
+    }
+    let visited = db.view_rows_counter();
+    let rows = async_stream::stream! {
+        let (descending, include_docs) = (query.descending, query.include_docs);
+        let mut left = query.limit;
+        let mut lanes = lanes;
+        while left > 0 {
+            if lanes.iter().any(|lane| lane.buffer.is_empty() && lane.unread() > 0) {
+                let (view, visited) = (Arc::clone(&view), Arc::clone(&visited));
+                let read = blocking(move || {
+                    refill(&view, &mut lanes, descending, &visited)?;
+                    Ok(lanes)
+                })
+                .await;
+                lanes = match read {
+                    Ok(lanes) => lanes,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+            }
+            // A chunk of rows in query order, from the lanes' buffers.
+            let mut chunk = Vec::new();
+            while left > 0 && chunk.len() < DOC_CHUNK {
+                let next = lanes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, lane)| lane.buffer.front().map(|row| (at, row)))
+                    .reduce(|best, candidate| {
+                        let order = row_cmp(candidate.1, best.1);
+                        let better = if descending {
+                            order == Ordering::Greater
+                        } else {
+                            order == Ordering::Less
+                        };
+                        if better { candidate } else { best }
+                    })
+                    .map(|(at, _)| at);
+                let Some(at) = next else {
+                    break;
+                };
+                let row = lanes[at].buffer.pop_front().expect("a front row");
+                // A lane that ran dry must be read again before the merge
+                // can go on.
+                let dry = lanes[at].buffer.is_empty() && lanes[at].unread() > 0;
+                if to_skip > 0 {
+                    to_skip -= 1;
+                } else {
+                    left -= 1;
+                    chunk.push(row);
+                }
+                if dry {
+                    break;
+                }
+            }
+            if chunk.is_empty() {
+                if lanes.iter().all(|lane| lane.buffer.is_empty() && lane.unread() == 0) {
+                    break;
+                }
+                continue;
+            }
+            let docs = if include_docs {
+                let ids: Vec<String> = chunk.iter().map(|row| row.id.clone()).collect();
+                match docs_by_ids(&db, &ids).await {
+                    Ok(docs) => docs,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+            for row in &chunk {
                 yield Ok(map_row_entry(row, &docs, include_docs));
             }
         }
@@ -2315,15 +2749,14 @@ pub async fn local_select(
     view_name: &str,
     spec: &ViewSpec,
     query: &ViewQuery,
-    reduce: bool,
 ) -> DbResult<Selection> {
-    let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
-    Ok(rows.select(
-        query,
-        query.owner_shards.as_ref(),
-        reduce,
-        &db.view_rows_counter(),
-    ))
+    let view = ensure_disk(db, ddoc_id, view_name, spec, query.limits).await?;
+    let (query, visited) = (query.clone(), db.view_rows_counter());
+    blocking(move || {
+        view.select(&query, query.owner_shards.as_ref(), &visited)
+            .map_err(ApiError::from)
+    })
+    .await
 }
 
 pub async fn finish(
@@ -2400,6 +2833,7 @@ pub fn check_query(spec: &ViewSpec, query: &ViewQuery) -> DbResult<()> {
     Ok(())
 }
 
+/// The view's rows in memory, the index first brought up to date.
 async fn ensure_rows(
     db: &Db,
     ddoc_id: &str,
@@ -2407,6 +2841,45 @@ async fn ensure_rows(
     spec: &ViewSpec,
     limits: ViewLimits,
 ) -> DbResult<Arc<ViewRows>> {
+    ensure_index(db, ddoc_id, view_name, spec, limits, |index, _| {
+        index.sorted_rows()
+    })
+    .await
+}
+
+/// The view's index file opened for reading, the index first brought up to
+/// date. The read transaction is opened under the index lock, so it holds
+/// the state the update left.
+async fn ensure_disk(
+    db: &Db,
+    ddoc_id: &str,
+    view_name: &str,
+    spec: &ViewSpec,
+    limits: ViewLimits,
+) -> DbResult<DiskView> {
+    ensure_index(db, ddoc_id, view_name, spec, limits, |index, slot| {
+        Ok(DiskView {
+            txn: index.db()?.begin_read().map_err(index_error)?,
+            placement: index.placement,
+            _slot: slot,
+        })
+    })
+    .await
+}
+
+/// Bring the view's index up to date with the shards, then hand it to
+/// `finish`, under the index lock and the gate, on the blocking pool, with
+/// the index's registry handle.
+async fn ensure_index<T: Send + 'static>(
+    db: &Db,
+    ddoc_id: &str,
+    view_name: &str,
+    spec: &ViewSpec,
+    limits: ViewLimits,
+    finish: impl FnOnce(&mut ViewIndex, Arc<AsyncMutex<ViewIndex>>) -> Result<T, JsError>
+        + Send
+        + 'static,
+) -> DbResult<T> {
     let design = if NativeMap::parse(&spec.map).is_some() {
         format!(
             "{}|{}|native={NATIVE_MAP_VERSION}",
@@ -2438,6 +2911,7 @@ async fn ensure_rows(
     let gate = index_gate(db).read().await?;
     db.check_live()?;
     let handle = index_handle(&index_path(db, ddoc_id, view_name)).await?;
+    let slot = Arc::clone(&handle);
     // A query queued behind a long build leaves when the database is deleted.
     let mut index = gate.until(handle.lock_owned()).await?;
     index.set_placement(placement);
@@ -2521,7 +2995,7 @@ async fn ensure_rows(
         if index.cursor.same_copies_unpurged(&db.index_cursor()) {
             return blocking(move || {
                 let _gate = gate;
-                index.sorted_rows().map_err(ApiError::from)
+                finish(&mut index, slot).map_err(ApiError::from)
             })
             .await;
         }
@@ -2570,19 +3044,15 @@ async fn ensure_rows(
             };
             index
                 .finish_rebuild(rebuild, bound, &design)
-                .and_then(|()| index.sorted_rows())
+                .and_then(|()| finish(&mut index, slot))
                 .map_err(ApiError::from)
         })
         .await;
     }
 
-    // Warm: the snapshot is an Arc clone. Only a cold one reads the file.
-    if let Some(rows) = &index.cached {
-        return Ok(rows.clone());
-    }
     blocking(move || {
         let _gate = gate;
-        index.sorted_rows().map_err(ApiError::from)
+        finish(&mut index, slot).map_err(ApiError::from)
     })
     .await
 }
@@ -5459,6 +5929,366 @@ mod tests {
         }
     }
 
+    /// A small deterministic generator, so a failing sequence replays.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// The key-ordered table selects exactly what the in-memory snapshot
+    /// selects, for random rows and random queries: ranges, doc id bounds,
+    /// `inclusive_end`, `descending`, `key`, repeated `keys`, `skip`,
+    /// `limit`, owner masks and partitions, over several shards.
+    #[test]
+    fn disk_selection_matches_the_in_memory_one() {
+        let pool = || {
+            vec![
+                json!(null),
+                json!(false),
+                json!(1),
+                json!(2),
+                json!(2.5),
+                json!("a"),
+                json!("B"),
+                json!("b"),
+                json!([1]),
+                json!([1, "x"]),
+                json!({"k": 1}),
+            ]
+        };
+        for (q, by_partition) in [(1, false), (3, false), (2, true)] {
+            let mut rng = Lcg(u64::from(q) * 31 + u64::from(by_partition));
+            let placement = Placement {
+                q,
+                partitioned: by_partition,
+                by_partition,
+            };
+            let mut index = index_over(redb::backends::InMemoryBackend::new());
+            index.set_placement(placement);
+            let keys = pool();
+            let mut rows = Vec::new();
+            for n in 0..60 {
+                let id = if by_partition {
+                    format!("p{}:d{n:02}", n % 3)
+                } else {
+                    format!("d{n:02}")
+                };
+                for _ in 0..rng.below(4) {
+                    rows.push(Row {
+                        id: id.clone(),
+                        key: keys[rng.below(keys.len() as u64) as usize].clone(),
+                        value: json!(rng.below(1000)),
+                    });
+                }
+            }
+            index.rebuild(rows, cursor_at(1), "map|").unwrap();
+            let memory = ViewRows::from_rows(index.load_rows().unwrap(), placement);
+            let txn = index.db().unwrap().begin_read().unwrap();
+            let view = DiskView {
+                _slot: Arc::new(AsyncMutex::new(index)),
+                txn,
+                placement,
+            };
+            let visited = AtomicU64::new(0);
+            let pick = |rng: &mut Lcg| keys[rng.below(keys.len() as u64) as usize].clone();
+            for round in 0..400 {
+                let mut query = ViewQuery {
+                    limit: if rng.chance(50) {
+                        1 + rng.below(20) as usize
+                    } else {
+                        usize::MAX
+                    },
+                    skip: rng.below(6) as usize,
+                    descending: rng.chance(50),
+                    inclusive_end: rng.chance(70),
+                    ..Default::default()
+                };
+                match rng.below(4) {
+                    0 => query.key = Some(pick(&mut rng)),
+                    1 => query.keys = Some((0..1 + rng.below(4)).map(|_| pick(&mut rng)).collect()),
+                    _ => {
+                        if rng.chance(60) {
+                            query.startkey = Some(pick(&mut rng));
+                            if rng.chance(30) {
+                                query.startkey_docid = Some(format!("d{:02}", rng.below(60)));
+                            }
+                        }
+                        if rng.chance(60) {
+                            query.endkey = Some(pick(&mut rng));
+                            if rng.chance(30) {
+                                query.endkey_docid = Some(format!("d{:02}", rng.below(60)));
+                            }
+                        }
+                    }
+                }
+                let mask = if by_partition {
+                    query.partition = Some(format!("p{}", rng.below(4)));
+                    None
+                } else if rng.chance(30) {
+                    Some(
+                        (0..q)
+                            .map(|_| rng.chance(50))
+                            .collect::<crate::cluster::ShardMask>(),
+                    )
+                } else {
+                    None
+                };
+                let expected = memory.select(&query, mask.as_ref(), &visited);
+                let actual = view.select(&query, mask.as_ref(), &visited).unwrap();
+                let rows = |selection: &Selection| -> Vec<(String, Value, Value)> {
+                    selection
+                        .rows
+                        .iter()
+                        .map(|row| (row.id.clone(), row.key.clone(), row.value.clone()))
+                        .collect()
+                };
+                let context = format!("q={q} partitioned={by_partition} round {round}: {query:?}");
+                assert_eq!(rows(&actual), rows(&expected), "{context}");
+                assert_eq!(actual.total_rows, expected.total_rows, "{context}");
+                assert_eq!(actual.offset, expected.offset, "{context}");
+            }
+        }
+    }
+
+    /// A database for a streamed view query: `q` shards, its documents, and a
+    /// view `v` that emits each document's `n`.
+    async fn stream_db(name: &str, q: u32, docs: Vec<Value>) -> (Arc<Db>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("douchdb-{name}-{}", crate::util::uuid()));
+        let db = Db::open_or_create(
+            &root,
+            name,
+            crate::db::DbConfig {
+                q,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(q),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let mut all = vec![json!({"_id": "_design/d", "views": {
+            "v": {"map": "function(doc) { if (doc.n !== undefined) emit(doc.n, doc.n); }"},
+            "w": {"map": "function(doc) { if (doc.n !== undefined) emit(-doc.n, null); }"},
+        }})];
+        all.extend(docs);
+        db.put_docs(all, true).await.unwrap();
+        (Arc::new(db), root)
+    }
+
+    /// The keys a streamed query returns, with its `total_rows` and `offset`.
+    async fn streamed(db: &Arc<Db>, query: &ViewQuery) -> (Vec<Value>, usize, usize) {
+        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", query)
+            .await
+            .unwrap()
+        else {
+            panic!("a map query streams");
+        };
+        let keys: Vec<Value> = futures::StreamExt::collect::<Vec<_>>(rows.rows)
+            .await
+            .into_iter()
+            .map(|row| row.unwrap()["key"].clone())
+            .collect();
+        (keys, rows.total_rows, rows.offset)
+    }
+
+    /// Shards with keys [2, 4] and [1, 3] merge in key order: `skip=1&limit=2`
+    /// is [2, 3] ascending and [3, 2] descending. A repeated requested key
+    /// lists its rows again.
+    #[tokio::test]
+    async fn streamed_shards_merge_in_key_order() {
+        let shard = |id: &str| crate::db::shard_index_for(id, 2, false);
+        let ids: Vec<String> = (0..).map(|n| format!("d{n}")).take(200).collect();
+        let first: Vec<&String> = ids.iter().filter(|id| shard(id) == 0).take(2).collect();
+        let second: Vec<&String> = ids.iter().filter(|id| shard(id) == 1).take(2).collect();
+        let docs = vec![
+            json!({"_id": first[0], "n": 2}),
+            json!({"_id": first[1], "n": 4}),
+            json!({"_id": second[0], "n": 1}),
+            json!({"_id": second[1], "n": 3}),
+        ];
+        let (db, root) = stream_db("streammerge", 2, docs).await;
+        let page = |descending| ViewQuery {
+            skip: 1,
+            limit: 2,
+            descending,
+            ..Default::default()
+        };
+        assert_eq!(streamed(&db, &page(false)).await.0, [json!(2), json!(3)]);
+        assert_eq!(streamed(&db, &page(true)).await.0, [json!(3), json!(2)]);
+        let (all, total, offset) = streamed(
+            &db,
+            &ViewQuery {
+                limit: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(all, [json!(1), json!(2), json!(3), json!(4)]);
+        assert_eq!((total, offset), (4, 0));
+        let repeated = streamed(
+            &db,
+            &ViewQuery {
+                keys: Some(vec![json!(2), json!(1), json!(2)]),
+                limit: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .await
+        .0;
+        assert_eq!(repeated, [json!(2), json!(1), json!(2)]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Many documents over several shards and chunks: every streamed query
+    /// gives the rows, `total_rows` and `offset` of the in-memory selection.
+    #[tokio::test]
+    async fn streamed_queries_match_the_in_memory_selection() {
+        let docs: Vec<Value> = (0..700)
+            .map(|n| json!({"_id": format!("d{n:03}"), "n": n % 97}))
+            .collect();
+        let (db, root) = stream_db("streamoracle", 3, docs).await;
+        let spec = load_spec(&db, "_design/d", "v").await.unwrap();
+        let memory = ensure_rows(&db, "_design/d", "v", &spec, ViewLimits::default())
+            .await
+            .unwrap();
+        let mut rng = Lcg(11);
+        let visited = AtomicU64::new(0);
+        for round in 0..60 {
+            let mut query = ViewQuery {
+                limit: if rng.chance(50) {
+                    1 + rng.below(400) as usize
+                } else {
+                    usize::MAX
+                },
+                skip: rng.below(300) as usize,
+                descending: rng.chance(50),
+                inclusive_end: rng.chance(70),
+                ..Default::default()
+            };
+            if rng.chance(50) {
+                query.startkey = Some(json!(rng.below(97)));
+            }
+            if rng.chance(50) {
+                query.endkey = Some(json!(rng.below(97)));
+            }
+            if query.startkey.is_some() && query.endkey.is_some() {
+                let (start, end) = (query.startkey.clone(), query.endkey.clone());
+                if (cmp_json(start.as_ref().unwrap(), end.as_ref().unwrap()) == Ordering::Greater)
+                    != query.descending
+                {
+                    (query.startkey, query.endkey) = (end, start);
+                }
+            }
+            let selection = memory.select(&query, None, &visited);
+            let mut expected_query = query.clone();
+            expected_query.total_rows_override = Some(selection.total_rows);
+            expected_query.offset_override = Some(selection.offset);
+            let (ordered, total, before) = ordered_rows(&selection.rows, &expected_query);
+            let skip = query.skip.min(total.saturating_sub(before));
+            let expected: Vec<Value> = ordered
+                .into_iter()
+                .skip(skip)
+                .take(query.limit)
+                .map(|row| row.key.clone())
+                .collect();
+            let (keys, total_rows, offset) = streamed(&db, &query).await;
+            assert_eq!(keys, expected, "round {round}: {query:?}");
+            assert_eq!(
+                (total_rows, offset),
+                (total, before + skip),
+                "round {round}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A stream reads one snapshot of the index file: an update, a cleanup
+    /// that removes the file, and eviction pressure on the registry while it
+    /// is part-way do not change what it returns or cut it short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_keeps_its_snapshot() {
+        let _cap = crate::index_cache::CapGuard::new(1).await;
+        let docs: Vec<Value> = (0..900)
+            .map(|n| json!({"_id": format!("d{n:03}"), "n": n}))
+            .collect();
+        let (db, root) = stream_db("streamsnap", 2, docs).await;
+        let all = ViewQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        let (expected, ..) = streamed(&db, &all).await;
+        assert_eq!(expected.len(), 900);
+        let start = || async {
+            let ViewReply::Rows(rows) = query_stream(Arc::clone(&db), "_design/d", "v", &all)
+                .await
+                .unwrap()
+            else {
+                panic!("a map query streams");
+            };
+            let mut rows = rows.rows;
+            let first = futures::StreamExt::next(&mut rows).await.unwrap().unwrap();
+            (first, rows)
+        };
+        let drain = |first: Value, rows| async move {
+            let mut keys = vec![first["key"].clone()];
+            let rest: Vec<DbResult<Value>> = futures::StreamExt::collect(rows).await;
+            keys.extend(rest.into_iter().map(|row| row.unwrap()["key"].clone()));
+            keys
+        };
+
+        // An update, applied by another query, while the stream is part-way.
+        let (first, rows) = start().await;
+        let changed: Vec<Value> = {
+            let mut docs = Vec::new();
+            for n in (0..900).step_by(3) {
+                let id = format!("d{n:03}");
+                let rev = db.get_doc(&id, &Default::default()).await.unwrap()["_rev"].clone();
+                docs.push(json!({"_id": id, "_rev": rev, "n": n + 10_000}));
+            }
+            docs
+        };
+        db.put_docs(changed, true).await.unwrap();
+        let (after, ..) = streamed(&db, &all).await;
+        assert!(after.iter().any(|key| key.as_u64() > Some(9_999)));
+        assert_eq!(drain(first, rows).await, expected);
+
+        // Eviction pressure: another view opened past the cap of one.
+        let (first, rows) = start().await;
+        let other = query_stream(Arc::clone(&db), "_design/d", "w", &all).await;
+        assert!(other.is_ok());
+        let (now, ..) = streamed(&db, &all).await;
+        assert_eq!(drain(first, rows).await, now);
+
+        // Cleanup removing the view's file while the stream reads it.
+        let (first, rows) = start().await;
+        let rev = db.get_doc("_design/d", &Default::default()).await.unwrap()["_rev"].clone();
+        db.put_docs(
+            vec![json!({"_id": "_design/d", "_rev": rev, "_deleted": true})],
+            true,
+        )
+        .await
+        .unwrap();
+        // Cleanup does not wait for the stream: it holds no gate.
+        cleanup(&db).await.unwrap();
+        assert!(!index_path(&db, "_design/d", "v").exists());
+        assert_eq!(drain(first, rows).await, now);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// An index over a fresh database on `backend`, as `create_file` makes one.
     fn index_over(backend: impl StorageBackend) -> ViewIndex {
         let db = crate::kv::open_with(backend, VIEW_CACHE_BYTES).unwrap();
@@ -6576,7 +7406,7 @@ mod tests {
                 partition: Some(partition.into()),
                 ..Default::default()
             };
-            let selection = view.select(&query, None, false, &visited);
+            let selection = view.select(&query, None, &visited);
             (
                 selection.total_rows,
                 selection.rows.into_iter().map(|r| r.id).collect::<Vec<_>>(),

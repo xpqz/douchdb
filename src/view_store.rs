@@ -3,15 +3,22 @@
 //! `ViewKey` that redb orders by CouchDB collation, and blocks of about
 //! `BLOCK_ROWS` rows that count them.
 //!
-//! A `ViewKey` is the shard (u32, big-endian), then either nothing (the
-//! shard's sentinel, below every entry of the shard) or an entry: the
-//! partition (length and text; empty unless the view is queried by
-//! partition), the view key in `collate`'s encoded form, and a tail. A stored
-//! row's tail is `Row(doc id, ordinal)`; the other tails are bounds for range
-//! scans. Keys compare by shard, sentinel before entry, partition by bytes,
-//! view key by collation, then tail. A key that does not parse sorts after
-//! every well-formed one, and such keys among themselves by bytes, so the
-//! order stays total.
+//! A `ViewKey` is the shard (u32, big-endian) and then one of:
+//! - nothing: the shard's sentinel, below every other key of the shard;
+//! - a partition start: the partition (length and text), below every row of
+//!   that partition;
+//! - a row: the partition (empty unless the view is queried by partition),
+//!   the view key in `collate`'s encoded form, the doc id and the ordinal.
+//!
+//! Keys compare by shard, sentinel first, then partition by bytes (a
+//! partition's start before its rows), then view key by collation, doc id by
+//! bytes and ordinal. A key that does not parse sorts after every well-formed
+//! one, and such keys among themselves by bytes, so the order stays total.
+//!
+//! Queries work in row positions within a shard: `rank` turns a key into the
+//! count of rows below it, and `read_at` reads rows from a position, both
+//! through the block counts, so they read at most one block's rows beyond
+//! what they return.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,97 +87,67 @@ impl Key for ViewKey {
 }
 
 const SENTINEL: u8 = 0;
-const ENTRY: u8 = 1;
-
-const BEFORE_KEY: u8 = 0;
-const BEFORE_ID: u8 = 1;
+const PARTITION_START: u8 = 1;
 const ROW: u8 = 2;
-const AFTER_ID: u8 = 3;
-const AFTER_KEY: u8 = 4;
-
-/// What follows the view key.
-#[derive(Debug, PartialEq)]
-enum Tail<'a> {
-    BeforeKey,
-    BeforeId(&'a str),
-    Row(&'a str, u32),
-    AfterId(&'a str),
-    AfterKey,
-}
 
 /// A `ViewKey`, read.
 struct Parsed<'a> {
     shard: u32,
-    /// `None` for the shard's sentinel.
-    entry: Option<(&'a [u8], &'a [u8], Tail<'a>)>,
+    place: Place<'a>,
+}
+
+enum Place<'a> {
+    Sentinel,
+    PartitionStart(&'a [u8]),
+    /// Partition, encoded view key, doc id, ordinal.
+    Row(&'a [u8], &'a [u8], &'a str, u32),
 }
 
 fn parse(bytes: &[u8]) -> Option<Parsed<'_>> {
     let shard = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
     let (&kind, rest) = bytes.get(4..)?.split_first()?;
-    match kind {
-        SENTINEL if rest.is_empty() => Some(Parsed { shard, entry: None }),
-        ENTRY => {
+    let place = match kind {
+        SENTINEL if rest.is_empty() => Place::Sentinel,
+        PARTITION_START => {
+            let (partition, rest) = take_text(rest)?;
+            if !rest.is_empty() {
+                return None;
+            }
+            Place::PartitionStart(partition)
+        }
+        ROW => {
             let (partition, rest) = take_text(rest)?;
             let (key, rest) = crate::collate::split_key(rest)?;
-            let (&tag, rest) = rest.split_first()?;
-            let tail = match tag {
-                BEFORE_KEY if rest.is_empty() => Tail::BeforeKey,
-                AFTER_KEY if rest.is_empty() => Tail::AfterKey,
-                BEFORE_ID | AFTER_ID => {
-                    let id = whole_text(rest)?;
-                    if tag == BEFORE_ID {
-                        Tail::BeforeId(id)
-                    } else {
-                        Tail::AfterId(id)
-                    }
-                }
-                ROW => {
-                    let split = rest.len().checked_sub(4)?;
-                    let ordinal = u32::from_be_bytes(rest[split..].try_into().ok()?);
-                    Tail::Row(whole_text(&rest[..split])?, ordinal)
-                }
-                _ => return None,
-            };
-            Some(Parsed {
-                shard,
-                entry: Some((partition, key, tail)),
-            })
+            let split = rest.len().checked_sub(4)?;
+            let ordinal = u32::from_be_bytes(rest[split..].try_into().ok()?);
+            Place::Row(partition, key, whole_text(&rest[..split])?, ordinal)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(Parsed { shard, place })
 }
 
 fn cmp_parsed(a: &Parsed<'_>, b: &Parsed<'_>) -> Ordering {
-    a.shard
-        .cmp(&b.shard)
-        .then_with(|| match (&a.entry, &b.entry) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some((a_partition, a_key, a_tail)), Some((b_partition, b_key, b_tail))) => a_partition
-                .cmp(b_partition)
-                .then_with(|| crate::collate::cmp_split(a_key, b_key))
-                .then_with(|| cmp_tails(a_tail, b_tail)),
-        })
-}
-
-fn cmp_tails(a: &Tail<'_>, b: &Tail<'_>) -> Ordering {
-    // Before every id, at an id, after every id.
-    fn place<'a>(tail: &Tail<'a>) -> (u8, &'a str, u8, u32) {
-        match *tail {
-            Tail::BeforeKey => (0, "", 0, 0),
-            Tail::BeforeId(id) => (1, id, 0, 0),
-            Tail::Row(id, ordinal) => (1, id, 1, ordinal),
-            Tail::AfterId(id) => (1, id, 2, 0),
-            Tail::AfterKey => (2, "", 0, 0),
+    // The partition, and whether this is the partition's start (`0`) or a row
+    // (`1`), for everything but the sentinel.
+    fn partition<'a>(place: &Place<'a>) -> Option<(&'a [u8], u8)> {
+        match *place {
+            Place::Sentinel => None,
+            Place::PartitionStart(partition) => Some((partition, 0)),
+            Place::Row(partition, ..) => Some((partition, 1)),
         }
     }
-    let (a, b) = (place(a), place(b));
-    a.0.cmp(&b.0)
-        .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
-        .then_with(|| a.2.cmp(&b.2))
-        .then_with(|| a.3.cmp(&b.3))
+    a.shard
+        .cmp(&b.shard)
+        .then_with(|| partition(&a.place).cmp(&partition(&b.place)))
+        .then_with(|| match (&a.place, &b.place) {
+            (Place::Row(_, a_key, a_id, a_ordinal), Place::Row(_, b_key, b_id, b_ordinal)) => {
+                crate::collate::cmp_split(a_key, b_key)
+                    .then_with(|| a_id.as_bytes().cmp(b_id.as_bytes()))
+                    .then_with(|| a_ordinal.cmp(b_ordinal))
+            }
+            _ => Ordering::Equal,
+        })
 }
 
 fn take_text(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -201,6 +178,15 @@ pub(crate) fn sentinel(shard: u32) -> Vec<u8> {
     out
 }
 
+/// The key below every row of `partition` in `shard`. The partition after
+/// it in byte order starts at `partition` followed by a zero byte.
+pub(crate) fn partition_start(shard: u32, partition: &[u8]) -> Result<Vec<u8>, JsError> {
+    let mut out = shard.to_be_bytes().to_vec();
+    out.push(PARTITION_START);
+    put_text(partition, &mut out)?;
+    Ok(out)
+}
+
 /// The `ViewKey` of a stored row.
 pub(crate) fn row_key(
     shard: u32,
@@ -210,10 +196,9 @@ pub(crate) fn row_key(
     ordinal: u32,
 ) -> Result<Vec<u8>, JsError> {
     let mut out = shard.to_be_bytes().to_vec();
-    out.push(ENTRY);
+    out.push(ROW);
     put_text(partition.as_bytes(), &mut out)?;
     crate::collate::encode_into(key, &mut out);
-    out.push(ROW);
     put_text(id.as_bytes(), &mut out)?;
     out.extend_from_slice(&ordinal.to_be_bytes());
     Ok(out)
@@ -229,8 +214,8 @@ pub(crate) struct RowKey<'a> {
 pub(crate) fn read_row_key(bytes: &[u8]) -> Result<RowKey<'_>, JsError> {
     let damaged = || JsError::Index("view index: damaged row key".to_string());
     let parsed = parse(bytes).ok_or_else(damaged)?;
-    match parsed.entry {
-        Some((_, key, Tail::Row(id, _))) => Ok(RowKey {
+    match parsed.place {
+        Place::Row(_, key, id, _) => Ok(RowKey {
             key: crate::collate::decode(key).ok_or_else(damaged)?,
             id,
         }),
@@ -243,7 +228,7 @@ fn shard_of(fence: &[u8]) -> Option<u32> {
 }
 
 fn is_sentinel(fence: &[u8]) -> bool {
-    parse(fence).is_some_and(|parsed| parsed.entry.is_none())
+    parse(fence).is_some_and(|parsed| matches!(parsed.place, Place::Sentinel))
 }
 
 fn store_error(error: impl std::fmt::Display) -> JsError {
@@ -494,6 +479,107 @@ pub(crate) fn write_blocks(tables: &mut Tables<'_>, totals: &[u64]) -> Result<()
         put_count(&mut tables.blocks, &fence, rows)?;
     }
     Ok(())
+}
+
+/// A shard's blocks, as a query reads them: each fence and the position, in
+/// the shard's rows, its block starts at.
+pub(crate) struct ShardBlocks {
+    fences: Vec<Vec<u8>>,
+    starts: Vec<u64>,
+    /// The shard's rows.
+    pub total: u64,
+}
+
+/// The blocks of `shard`.
+pub(crate) fn shard_blocks(
+    blocks: &impl ReadableTable<ViewKey, &'static [u8]>,
+    shard: u32,
+) -> Result<ShardBlocks, JsError> {
+    let start = sentinel(shard);
+    let end = shard.checked_add(1).map(sentinel);
+    let range = match &end {
+        Some(end) => blocks.range::<&[u8]>(start.as_slice()..end.as_slice()),
+        None => blocks.range::<&[u8]>(start.as_slice()..),
+    }
+    .map_err(store_error)?;
+    let mut shard_blocks = ShardBlocks {
+        fences: Vec::new(),
+        starts: Vec::new(),
+        total: 0,
+    };
+    for entry in range {
+        let (fence, stored) = entry.map_err(store_error)?;
+        shard_blocks.fences.push(fence.value().to_vec());
+        shard_blocks.starts.push(shard_blocks.total);
+        shard_blocks.total += read_count(stored.value())?;
+    }
+    if shard_blocks.fences.first() != Some(&start) {
+        return Err(JsError::Index(format!(
+            "view index: shard {shard} has no blocks"
+        )));
+    }
+    Ok(shard_blocks)
+}
+
+/// How many of the shard's rows sort below `key`, a key of the same shard:
+/// whole blocks by their counts, then the rows of the one block `key` falls
+/// in.
+pub(crate) fn rank(
+    by_key: &impl ReadableTable<ViewKey, &'static [u8]>,
+    blocks: &ShardBlocks,
+    key: &[u8],
+) -> Result<u64, JsError> {
+    let block = blocks
+        .fences
+        .partition_point(|fence| ViewKey::compare(fence, key) != Ordering::Greater)
+        .saturating_sub(1);
+    let below = by_key
+        .range::<&[u8]>(blocks.fences[block].as_slice()..key)
+        .map_err(store_error)?
+        .count() as u64;
+    Ok(blocks.starts[block] + below)
+}
+
+/// Up to `count` rows of the shard from position `first` on, each as its
+/// `ViewKey` and stored value.
+/// A row as stored: its `ViewKey` and its sealed value.
+pub(crate) type StoredEntry = (Vec<u8>, Vec<u8>);
+
+pub(crate) fn read_at(
+    by_key: &impl ReadableTable<ViewKey, &'static [u8]>,
+    blocks: &ShardBlocks,
+    first: u64,
+    count: usize,
+) -> Result<Vec<StoredEntry>, JsError> {
+    if count == 0 || first >= blocks.total {
+        return Ok(Vec::new());
+    }
+    let block = blocks.starts.partition_point(|&start| start <= first) - 1;
+    let skip = usize::try_from(first - blocks.starts[block]).map_err(store_error)?;
+    by_key
+        .range::<&[u8]>(blocks.fences[block].as_slice()..)
+        .map_err(store_error)?
+        .skip(skip)
+        .take(count)
+        .map(|entry| {
+            let (key, value) = entry.map_err(store_error)?;
+            Ok((key.value().to_vec(), value.value().to_vec()))
+        })
+        .collect()
+}
+
+/// The first row of each block from position `from` on, with its position:
+/// what a search over positions probes before it reads a whole block.
+pub(crate) fn block_starts(blocks: &ShardBlocks, from: u64, to: u64) -> Vec<u64> {
+    let mut starts = vec![from];
+    starts.extend(
+        blocks
+            .starts
+            .iter()
+            .copied()
+            .filter(|&start| start > from && start < to),
+    );
+    starts
 }
 
 /// Check the invariants of the key-ordered tables against `rows` (the
