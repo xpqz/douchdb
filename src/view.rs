@@ -105,7 +105,26 @@ struct ViewIndex {
     /// Shard count and partitioning of the database and view: where each
     /// document's rows are stored.
     placement: Placement,
+    /// Reduce partials were committed without a sync since the last durable
+    /// commit: closing makes them durable, so they outlive a restart.
+    unsynced: bool,
+    /// Per shard, what queries read on every use: the block list, and once a
+    /// reduce has needed them, every block's partial and the levels above.
+    /// Filled from the file under the index lock, so it always matches the
+    /// committed state, and dropped for the shards a write changes.
+    cache: Vec<Option<ShardCache>>,
 }
+
+/// One shard's cached reading aids (see `ViewIndex::cache`).
+struct ShardCache {
+    blocks: Arc<crate::view_store::ShardBlocks>,
+    /// `levels[0]` holds each block's partial; each level above combines
+    /// `REDUCE_FANOUT` partials of the one below, and the last may be short.
+    levels: Option<Arc<Vec<Vec<Value>>>>,
+}
+
+/// Partials each upper level combines.
+const REDUCE_FANOUT: usize = 32;
 
 /// How a view's rows are split.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,8 +218,13 @@ trait Positions {
     fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize;
     /// The rows at `chosen` positions, in position order.
     fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row>;
-    /// The row at position `at`, which must be below `count()`.
-    fn row_at(&self, at: usize) -> Row;
+    /// The key of the row at position `at`, which must be below `count()`.
+    fn key_at(&self, at: usize) -> Value;
+    /// `gallop` over these rows. Rows that are cheaper to probe at some
+    /// positions than others choose where to probe.
+    fn gallop(&self, from: usize, bound: usize, inside: &dyn Fn(usize) -> bool) -> usize {
+        gallop(from, bound, inside)
+    }
 }
 
 impl<S: SortedRows + ?Sized> Positions for S {
@@ -216,8 +240,8 @@ impl<S: SortedRows + ?Sized> Positions for S {
         chosen.iter().map(|&at| self.row(at).clone()).collect()
     }
 
-    fn row_at(&self, at: usize) -> Row {
-        self.row(at).clone()
+    fn key_at(&self, at: usize) -> Value {
+        self.row(at).key.clone()
     }
 }
 
@@ -469,6 +493,8 @@ pub struct DiskView {
     _slot: Arc<AsyncMutex<ViewIndex>>,
     txn: redb::ReadTransaction,
     placement: Placement,
+    /// Each shard's blocks, as of the transaction's snapshot.
+    blocks: Vec<Arc<crate::view_store::ShardBlocks>>,
 }
 
 /// One run of the key-ordered table a query reads: a shard, or one
@@ -511,6 +537,30 @@ impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> DiskRun<'_, T>
         }
     }
 
+    /// The id and key of the shard's row at position `at` (its value is not
+    /// read: searches only compare keys and ids).
+    fn key_row(&self, at: u64) -> Option<Row> {
+        let read =
+            crate::view_store::read_key_at(self.table, &self.window.blocks, at).and_then(|key| {
+                key.map(|key| {
+                    let read = crate::view_store::read_row_key(&key)?;
+                    Ok(Row {
+                        id: read.id.to_string(),
+                        key: read.key,
+                        value: Value::Null,
+                    })
+                })
+                .transpose()
+            });
+        match read {
+            Ok(row) => row,
+            Err(error) => {
+                self.error.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
     fn into_result<V>(self, value: V) -> Result<V, JsError> {
         match self.error.into_inner() {
             Some(error) => Err(error),
@@ -524,19 +574,46 @@ impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> Positions for 
         self.window.len as usize
     }
 
-    /// Two levels: the first row of each block in the run is probed by
-    /// binary search, then the one block the point falls in is scanned.
+    /// Two levels of binary search: over the first rows of the blocks in
+    /// the run, then inside the one block the point falls in. Only keys and
+    /// ids are read.
     fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize {
         let (lo, hi) = (self.window.lo, self.window.lo + self.window.len);
-        let probes = crate::view_store::block_starts(&self.window.blocks, lo, hi);
-        let holds = |at: u64| self.read(at - lo, 1).first().is_some_and(pred);
-        let passed = probes.partition_point(|&at| at < hi && holds(at));
-        let Some(&start) = passed.checked_sub(1).and_then(|at| probes.get(at)) else {
+        let holds = |at: u64| self.key_row(at).is_some_and(|row| pred(&row));
+        if lo == hi || !holds(lo) {
             return 0;
-        };
-        let end = probes.get(passed).copied().unwrap_or(hi).min(hi);
-        let rows = self.read(start - lo, (end - start) as usize);
-        (start - lo) as usize + rows.iter().take_while(|row| pred(row)).count()
+        }
+        if holds(hi - 1) {
+            return self.window.len as usize;
+        }
+        // The blocks starting inside the run, `first..last`: find the first
+        // whose first row fails.
+        let starts = self.window.blocks.starts();
+        let first = starts.partition_point(|&start| start <= lo);
+        let last = starts.partition_point(|&start| start < hi);
+        let (mut low, mut high) = (first, last);
+        while low < high {
+            let mid = (low + high) / 2;
+            if holds(starts[mid]) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        // The point is after `from`, where `pred` holds, and at or before
+        // `to`, where it fails.
+        let from = if low > first { starts[low - 1] } else { lo };
+        let to = if low < last { starts[low] } else { hi - 1 };
+        let (mut low, mut high) = (from + 1, to);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if holds(mid) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        (low - lo) as usize
     }
 
     fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row> {
@@ -553,19 +630,63 @@ impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> Positions for 
         rows
     }
 
-    fn row_at(&self, at: usize) -> Row {
-        self.read(at as u64, 1).pop().unwrap_or(Row {
-            id: String::new(),
-            key: Value::Null,
-            value: Value::Null,
-        })
+    fn key_at(&self, at: usize) -> Value {
+        self.key_row(self.window.lo + at as u64)
+            .map_or(Value::Null, |row| row.key)
+    }
+
+    /// Block starts are probed first, since the first row of a block is read
+    /// without stepping over others; then one block's rows.
+    fn gallop(&self, from: usize, bound: usize, inside: &dyn Fn(usize) -> bool) -> usize {
+        let lo = self.window.lo;
+        let starts = self.window.blocks.starts();
+        let at = |position: usize| lo + position as u64;
+        // The block starts strictly between `from` and `bound`, in walk order,
+        // as run positions; probe `j` is `from` itself for `j == 0`.
+        let probes: Vec<usize> = if bound > from {
+            let first = starts.partition_point(|&start| start <= at(from));
+            let last = starts.partition_point(|&start| start < at(bound));
+            starts[first..last.max(first)]
+                .iter()
+                .map(|&start| (start - lo) as usize)
+                .collect()
+        } else {
+            let first = starts.partition_point(|&start| start <= at(bound));
+            let last = starts.partition_point(|&start| start <= at(from));
+            starts[first..last.max(first)]
+                .iter()
+                .rev()
+                .map(|&start| (start - lo) as usize)
+                .filter(|&position| position < from)
+                .collect()
+        };
+        let probe = |j: usize| if j == 0 { from } else { probes[j - 1] };
+        let failed = gallop(0, probes.len() + 1, |j| j == 0 || inside(probe(j)));
+        // The run ends between the last passing probe and the first failing
+        // one (or `bound`): search those positions, inside one block.
+        let passed = probe(failed - 1);
+        if bound > from {
+            let end = if failed <= probes.len() {
+                probe(failed)
+            } else {
+                bound
+            };
+            gallop(passed, end, inside)
+        } else {
+            let floor = if failed <= probes.len() {
+                probe(failed) + 1
+            } else {
+                bound
+            };
+            gallop(passed, floor, inside)
+        }
     }
 }
 
 /// The runs `query` reads in the shards of `mask` (all when `None`): each
 /// shard, or for a view queried by partition, the partition's rows in it.
 fn run_windows(
-    blocks: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
+    blocks: &[Arc<crate::view_store::ShardBlocks>],
     by_key: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
     placement: Placement,
     query: &ViewQuery,
@@ -576,7 +697,7 @@ fn run_windows(
         if mask.is_some_and(|mask| !mask.covers(shard as usize)) {
             continue;
         }
-        let shard_blocks = Arc::new(crate::view_store::shard_blocks(blocks, shard)?);
+        let shard_blocks = Arc::clone(&blocks[shard as usize]);
         let (lo, hi) = if placement.by_partition {
             let partition = query.partition.as_deref().ok_or_else(|| {
                 JsError::Index("a partitioned view is read by partition".to_string())
@@ -624,11 +745,7 @@ impl DiskView {
         query: &ViewQuery,
         mask: Option<&crate::cluster::ShardMask>,
     ) -> Result<Vec<RunWindow>, JsError> {
-        let blocks = self
-            .txn
-            .open_table(crate::view_store::BLOCKS)
-            .map_err(index_error)?;
-        run_windows(&blocks, &self.by_key()?, self.placement, query, mask)
+        run_windows(&self.blocks, &self.by_key()?, self.placement, query, mask)
     }
 
     /// The rows a map query can return from the shards in `mask` (all when
@@ -844,50 +961,109 @@ fn query_ranges<S: Positions + ?Sized>(
             Vec::new()
         };
     }
-    // Group keys never decrease along sorted rows, so each group is a run
-    // found by binary search.
+    // Group keys never decrease along sorted rows, so each group is a run.
+    // Its far end is found by galloping from its near one, which costs the
+    // log of the group's size rather than of the shard's. Only the first
+    // `skip + limit` groups in query order can be returned, from any shard,
+    // so no more are reduced.
+    let group_of = |at: usize| group_key(&rows.key_at(at), query.group_level);
+    let cap = query.skip.saturating_add(query.limit);
     let mut ranges = Vec::new();
-    let mut start = lo;
-    while start < hi {
-        let group = group_key(&rows.row_at(start).key, query.group_level);
-        // Rows before `start` are in earlier groups, so the point over the
-        // whole shard is the end of this group.
-        let end = rows
-            .point(&|row| {
-                cmp_json(&group_key(&row.key, query.group_level), &group) != Ordering::Greater
-            })
-            .min(hi);
-        ranges.push((group, (start, end)));
-        start = end;
+    if query.descending {
+        let mut end = hi;
+        while end > lo && ranges.len() < cap {
+            let group = group_of(end - 1);
+            let start = rows.gallop(end - 1, lo, &|at| cmp_json(&group_of(at), &group).is_eq());
+            ranges.push((group, (start, end)));
+            end = start;
+        }
+    } else {
+        let mut start = lo;
+        while start < hi && ranges.len() < cap {
+            let group = group_of(start);
+            let end = rows.gallop(start, hi, &|at| cmp_json(&group_of(at), &group).is_eq());
+            ranges.push((group, (start, end)));
+            start = end;
+        }
     }
     ranges
 }
 
-/// Reduce each of `ranges` (`first..end` of the run) from the stored
-/// partials of the blocks it covers whole, plus the rows at its edges. The
-/// edges, and the blocks whose partial is missing, are reduced together, and
-/// then the pieces of all ranges are combined together, so a custom reducer
-/// is called in batches. Each computed partial is stored; `stored` says
-/// whether any was.
-fn reduce_disk_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>>(
+/// The far end of the run of positions from `from` towards `bound` (up to
+/// `bound`, exclusive, or down to `bound`, inclusive) where `inside` holds,
+/// given that it holds at `from` and over a prefix of that walk: going up,
+/// the first position where it fails, or `bound`; going down, the lowest
+/// position where it holds.
+fn gallop(from: usize, bound: usize, inside: impl Fn(usize) -> bool) -> usize {
+    if bound > from {
+        // Up: find a failing position by doubling steps, then search back.
+        let (mut passed, mut step) = (from, 1);
+        let failed = loop {
+            let probe = from.saturating_add(step);
+            if probe >= bound {
+                break bound;
+            }
+            if !inside(probe) {
+                break probe;
+            }
+            passed = probe;
+            step *= 2;
+        };
+        let (mut low, mut high) = (passed + 1, failed);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if inside(mid) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    } else {
+        let (mut passed, mut step) = (from, 1);
+        let failed = loop {
+            let Some(probe) = from.checked_sub(step).filter(|&probe| probe >= bound) else {
+                break None;
+            };
+            if !inside(probe) {
+                break Some(probe);
+            }
+            passed = probe;
+            step *= 2;
+        };
+        let (mut low, mut high) = (failed.map_or(bound, |failed| failed + 1), passed);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if inside(mid) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        low
+    }
+}
+
+/// Reduce each of `ranges` (`first..end` of the run) from the fewest
+/// partials (`levels`) covering the blocks it covers whole, plus the rows at
+/// its edges. The edges of all ranges are reduced together, and then the
+/// pieces of all ranges are combined together, so a custom reducer is called
+/// in batches.
+fn reduce_level_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>>(
     run: &DiskRun<'_, T>,
-    partials: &mut redb::Table<'_, crate::view_store::ViewKey, &'static [u8]>,
+    levels: &[Vec<Value>],
     ranges: &[(usize, usize)],
     reducer: &mut JsReducer,
     visited: &AtomicU64,
-    stored: &mut bool,
 ) -> Result<Vec<Value>, JsError> {
-    /// A range's piece: rows reduced in the batch (`at` in it), or a block's
-    /// partial.
+    /// A range's piece: rows reduced in the batch (`at` in it), or a partial.
     enum Part {
         Rows(usize),
-        Block(usize),
+        Partial(Value),
     }
     let blocks = &run.window.blocks;
     let lo = run.window.lo;
     let mut row_sets: Vec<Vec<Row>> = Vec::new();
-    let mut known: HashMap<usize, Value> = HashMap::new();
-    let mut missing: Vec<usize> = Vec::new();
     let mut plan: Vec<Vec<Part>> = Vec::with_capacity(ranges.len());
     let edge = |first: u64, end: u64, parts: &mut Vec<Part>, sets: &mut Vec<Vec<Row>>| {
         let rows = run.read(first - lo, (end - first) as usize);
@@ -897,60 +1073,37 @@ fn reduce_disk_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>
     };
     for &(first, end) in ranges {
         let (first, end) = (lo + first as u64, lo + end as u64);
-        // The whole blocks in the range: from the first starting at or after
-        // `first` to the last ending at or before `end`.
-        let whole: Vec<usize> = (0..blocks.len())
-            .filter(|&at| {
-                blocks.start(at) >= first
-                    && blocks.end(at) <= end
-                    && blocks.start(at) < blocks.end(at)
-            })
-            .collect();
+        // The whole blocks in the range, `low..high`: from the first starting
+        // at or after `first` to the last ending at or before `end`. A block
+        // ends where the next starts, the last at the shard's total.
+        let starts = blocks.starts();
+        let low = starts.partition_point(|&start| start < first);
+        let high = if blocks.end(blocks.len() - 1) <= end {
+            blocks.len()
+        } else {
+            starts
+                .partition_point(|&start| start <= end)
+                .saturating_sub(1)
+        };
         let mut parts = Vec::new();
-        match (whole.first(), whole.last()) {
-            (Some(&low), Some(&high)) => {
-                if first < blocks.start(low) {
-                    edge(first, blocks.start(low), &mut parts, &mut row_sets);
-                }
-                for at in low..=high {
-                    if !known.contains_key(&at) && !missing.contains(&at) {
-                        match partials.get(blocks.fence(at)).map_err(index_error)? {
-                            Some(value) => {
-                                known.insert(at, decode_value(value.value())?);
-                            }
-                            None => missing.push(at),
-                        }
-                    }
-                    parts.push(Part::Block(at));
-                }
-                if blocks.end(high) < end {
-                    edge(blocks.end(high), end, &mut parts, &mut row_sets);
-                }
+        if low < high {
+            if first < blocks.start(low) {
+                edge(first, blocks.start(low), &mut parts, &mut row_sets);
             }
-            _ => edge(first, end, &mut parts, &mut row_sets),
+            parts.extend(
+                block_parts(levels, low, high)
+                    .into_iter()
+                    .map(Part::Partial),
+            );
+            if blocks.end(high - 1) < end {
+                edge(blocks.end(high - 1), end, &mut parts, &mut row_sets);
+            }
+        } else {
+            edge(first, end, &mut parts, &mut row_sets);
         }
         plan.push(parts);
     }
-    // The missing partials' rows go in the same batch as the edges.
-    let first_missing = row_sets.len();
-    for &at in &missing {
-        let rows = run.read(
-            blocks.start(at) - lo,
-            (blocks.end(at) - blocks.start(at)) as usize,
-        );
-        visit(visited, rows.len());
-        row_sets.push(rows);
-    }
-    let mut reduced = reduce_row_sets(&row_sets, reducer)?;
-    for (offset, &at) in missing.iter().enumerate() {
-        let partial = reduced[first_missing + offset].clone();
-        partials
-            .insert(blocks.fence(at), encode_value(&partial)?.as_slice())
-            .map_err(index_error)?;
-        *stored = true;
-        known.insert(at, partial);
-    }
-    reduced.truncate(first_missing);
+    let reduced = reduce_row_sets(&row_sets, reducer)?;
     let groups: Vec<Vec<Value>> = plan
         .into_iter()
         .map(|parts| {
@@ -958,12 +1111,48 @@ fn reduce_disk_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>
                 .into_iter()
                 .map(|part| match part {
                     Part::Rows(at) => reduced[at].clone(),
-                    Part::Block(at) => known[&at].clone(),
+                    Part::Partial(value) => value,
                 })
                 .collect()
         })
         .collect();
     combine_many(reducer, groups.iter().map(Vec::as_slice))
+}
+
+/// The fewest partials covering blocks `lo..hi`, in row order: whole
+/// parents at the highest level they fit, and the blocks or children left
+/// at either side.
+fn block_parts(levels: &[Vec<Value>], lo: usize, hi: usize) -> Vec<Value> {
+    let mut left = Vec::new();
+    let mut right: Vec<&[Value]> = Vec::new();
+    let (mut lo, mut hi) = (lo, hi);
+    let mut level = 0;
+    let middle = loop {
+        let units = &levels[level];
+        let Some(parents) = levels.get(level + 1).map(Vec::len) else {
+            break &units[lo..hi];
+        };
+        // The last parent may be short; it is whole when the span reaches
+        // the end of this level.
+        let parent_lo = lo.div_ceil(REDUCE_FANOUT);
+        let parent_hi = if hi == units.len() {
+            parents
+        } else {
+            (hi / REDUCE_FANOUT).min(parents)
+        };
+        if parent_lo >= parent_hi {
+            break &units[lo..hi];
+        }
+        left.extend_from_slice(&units[lo..parent_lo * REDUCE_FANOUT]);
+        right.push(&units[(parent_hi * REDUCE_FANOUT).min(hi)..hi]);
+        (lo, hi) = (parent_lo, parent_hi);
+        level += 1;
+    };
+    left.extend_from_slice(middle);
+    for part in right.into_iter().rev() {
+        left.extend_from_slice(part);
+    }
+    left
 }
 
 /// The reduction of each set of rows, with the custom reducer's calls in one
@@ -1614,6 +1803,8 @@ impl ViewIndex {
             cursor,
             design,
             placement: Placement::shards(1, false),
+            unsynced: false,
+            cache: Vec::new(),
         }
     }
 
@@ -1649,8 +1840,9 @@ impl ViewIndex {
                 write(&txn)?;
                 txn.commit().map_err(index_error)
             });
-        if outcome.is_err() {
-            self.close_after_failed_write();
+        match &outcome {
+            Ok(()) => self.unsynced = false,
+            Err(_) => self.close_after_failed_write(),
         }
         outcome
     }
@@ -1659,6 +1851,7 @@ impl ViewIndex {
     /// writes after a failed commit, and whether the commit reached the disk
     /// is only known from the file.
     fn close_after_failed_write(&mut self) {
+        self.cache.clear();
         drop(self.db.take());
         self.cursor = IndexCursor::default();
         self.design.clear();
@@ -1700,7 +1893,33 @@ impl ViewIndex {
     /// Record the database's placement: a change also changes the design
     /// signature, so the index is rebuilt.
     fn set_placement(&mut self, placement: Placement) {
+        if self.placement != placement {
+            self.cache.clear();
+        }
         self.placement = placement;
+    }
+
+    /// Every shard's blocks, from the cache or else from `table`, the
+    /// `BLOCKS` table of a transaction holding the committed state.
+    fn blocks(
+        &mut self,
+        table: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
+    ) -> Result<Vec<Arc<crate::view_store::ShardBlocks>>, JsError> {
+        let shards = self.placement.q.max(1) as usize;
+        self.cache.resize_with(shards, || None);
+        let mut out = Vec::with_capacity(shards);
+        for shard in 0..shards {
+            if self.cache[shard].is_none() {
+                self.cache[shard] = Some(ShardCache {
+                    blocks: Arc::new(crate::view_store::shard_blocks(table, shard as u32)?),
+                    levels: None,
+                });
+            }
+            out.push(Arc::clone(
+                &self.cache[shard].as_ref().expect("filled").blocks,
+            ));
+        }
+        Ok(out)
     }
 
     /// Replace the rows of the `changed` documents with `by_doc` and record
@@ -1713,6 +1932,7 @@ impl ViewIndex {
         design: &str,
     ) -> Result<(), JsError> {
         let placement = self.placement;
+        let mut touched = Vec::new();
         self.commit(|txn| {
             let mut tables = crate::view_store::Tables::open(txn)?;
             let mut edits = crate::view_store::BlockEdits::default();
@@ -1744,11 +1964,18 @@ impl ViewIndex {
                     JsError::Index("view index: a shard total went negative".into())
                 })?;
             }
+            touched.extend(edits.totals.keys().copied());
             edits.finish(&mut tables)?;
             drop(tables);
             write_totals(txn, &totals)?;
             write_state(txn, &cursor, design)
         })?;
+        // The changed shards' blocks and partials are read afresh.
+        for shard in touched {
+            if let Some(cache) = self.cache.get_mut(shard as usize) {
+                *cache = None;
+            }
+        }
 
         self.cursor = cursor;
         self.design = design.to_string();
@@ -1785,16 +2012,26 @@ impl ViewIndex {
                 .map_err(index_error)?;
             let mut out = Partials::new();
             let unique = query.keys.as_deref().map(unique_keys);
-            for window in run_windows(&blocks, &by_key, placement, query, mask)? {
+            let shard_blocks = self.blocks(&blocks)?;
+            for window in run_windows(&shard_blocks, &by_key, placement, query, mask)? {
+                let shard = shard_blocks
+                    .iter()
+                    .position(|blocks| Arc::ptr_eq(blocks, &window.blocks))
+                    .expect("a window of a listed shard");
                 let run = DiskRun {
                     table: &by_key,
                     window,
                     error: Default::default(),
                 };
                 let ranges = query_ranges(&run, query, unique.as_deref());
+                if ranges.is_empty() {
+                    run.into_result(())?;
+                    continue;
+                }
+                let levels =
+                    self.levels(shard, &by_key, &mut partials, reducer, visited, &mut stored)?;
                 let spans: Vec<(usize, usize)> = ranges.iter().map(|(_, span)| *span).collect();
-                let values =
-                    reduce_disk_spans(&run, &mut partials, &spans, reducer, visited, &mut stored)?;
+                let values = reduce_level_spans(&run, &levels, &spans, reducer, visited)?;
                 run.into_result(())?;
                 for ((key, _), value) in ranges.into_iter().zip(values) {
                     add_partial(&mut out, key, value);
@@ -1803,10 +2040,82 @@ impl ViewIndex {
             assemble_reduce(out, query, reducer)
         })()
         .map_err(|reason| reduce_failure(&reason))?;
-        if stored && txn.commit().is_err() {
-            self.close_after_failed_write();
+        if stored {
+            match txn.commit() {
+                Ok(()) => self.unsynced = true,
+                Err(_) => self.close_after_failed_write(),
+            }
         }
         Ok(answer)
+    }
+
+    /// Shard `shard`'s partials and the levels above them, from the cache,
+    /// or else built: each block's stored partial is read, and a block
+    /// without one is reduced from its rows (in one batch) and its partial
+    /// stored in `partials`, setting `stored`.
+    fn levels(
+        &mut self,
+        shard: usize,
+        by_key: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
+        partials: &mut redb::Table<'_, crate::view_store::ViewKey, &'static [u8]>,
+        reducer: &mut JsReducer,
+        visited: &AtomicU64,
+        stored: &mut bool,
+    ) -> Result<Arc<Vec<Vec<Value>>>, JsError> {
+        let cache = self.cache[shard].as_mut().expect("blocks listed first");
+        if let Some(levels) = &cache.levels {
+            return Ok(Arc::clone(levels));
+        }
+        let blocks = Arc::clone(&cache.blocks);
+        let mut leaves: Vec<Option<Value>> = Vec::with_capacity(blocks.len());
+        let mut missing = Vec::new();
+        for at in 0..blocks.len() {
+            if blocks.start(at) == blocks.end(at) {
+                // Only an empty shard's sentinel block holds no rows; no
+                // range ever covers it.
+                leaves.push(Some(Value::Null));
+                continue;
+            }
+            match partials.get(blocks.fence(at)).map_err(index_error)? {
+                Some(value) => leaves.push(Some(decode_value(value.value())?)),
+                None => {
+                    leaves.push(None);
+                    missing.push(at);
+                }
+            }
+        }
+        let mut sets = Vec::with_capacity(missing.len());
+        for &at in &missing {
+            let rows: Vec<Row> = crate::view_store::read_at(
+                by_key,
+                &blocks,
+                blocks.start(at),
+                (blocks.end(at) - blocks.start(at)) as usize,
+            )?
+            .iter()
+            .map(|(key, value)| stored_row(key, value))
+            .collect::<Result<_, JsError>>()?;
+            visit(visited, rows.len());
+            sets.push(rows);
+        }
+        for (at, partial) in missing.into_iter().zip(reduce_row_sets(&sets, reducer)?) {
+            partials
+                .insert(blocks.fence(at), encode_value(&partial)?.as_slice())
+                .map_err(index_error)?;
+            *stored = true;
+            leaves[at] = Some(partial);
+        }
+        let mut levels = vec![leaves
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect::<Vec<_>>()];
+        while let Some(below) = levels.last().filter(|below| below.len() > REDUCE_FANOUT) {
+            let above = combine_many(reducer, below.chunks(REDUCE_FANOUT))?;
+            levels.push(above);
+        }
+        let levels = Arc::new(levels);
+        self.cache[shard].as_mut().expect("still cached").levels = Some(Arc::clone(&levels));
+        Ok(levels)
     }
 
     /// Start replacing every stored row. The rows go in a page at a time
@@ -1851,6 +2160,8 @@ impl ViewIndex {
         }
         self.cursor = cursor;
         self.design = design.to_string();
+        self.unsynced = false;
+        self.cache.clear();
         Ok(())
     }
 
@@ -1925,6 +2236,14 @@ impl Drop for ViewIndex {
         let Some(db) = self.db.take() else {
             return;
         };
+        // A durable commit, even an empty one, makes the unsynced partials
+        // before it durable. A server shutting down retires its indexes too,
+        // so this runs for retired ones as well.
+        if self.unsynced {
+            if let Ok(txn) = crate::kv::begin_write(&db) {
+                let _ = txn.commit();
+            }
+        }
         match self.file.take() {
             Some(file) if !self.retired.load(AtomicOrdering::SeqCst) => {
                 close_in_background(db, file);
@@ -2427,9 +2746,15 @@ async fn ensure_disk(
             .db()
             .and_then(|db| db.begin_read().map_err(index_error))
             .map_err(ApiError::from)?;
+        let blocks = txn
+            .open_table(crate::view_store::BLOCKS)
+            .map_err(index_error)
+            .and_then(|table| index.blocks(&table))
+            .map_err(ApiError::from)?;
         Ok(DiskView {
             txn,
             placement: index.placement,
+            blocks,
             _slot: slot,
         })
     })
@@ -5271,10 +5596,14 @@ mod tests {
             index.rebuild(rows, cursor_at(1), "map|").unwrap();
             let memory = ViewRows::from_rows(index.load_rows().unwrap(), placement);
             let txn = index.db().unwrap().begin_read().unwrap();
+            let blocks = index
+                .blocks(&txn.open_table(crate::view_store::BLOCKS).unwrap())
+                .unwrap();
             let view = DiskView {
                 _slot: Arc::new(AsyncMutex::new(index)),
                 txn,
                 placement,
+                blocks,
             };
             let visited = AtomicU64::new(0);
             let pick = |rng: &mut Lcg| keys[rng.below(keys.len() as u64) as usize].clone();
@@ -5769,6 +6098,49 @@ mod tests {
                 .unwrap();
         index.check_tables().unwrap();
         assert_eq!(reduce(&mut index), expected);
+    }
+
+    /// Partials committed without a sync are made durable when the index
+    /// closes, so a reopened index has them and its first reduce reads no
+    /// rows.
+    #[test]
+    fn unsynced_partials_are_kept_on_a_clean_close() {
+        let dir = std::env::temp_dir().join(format!("douchdb-partials-{}", crate::util::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("v.redb");
+        let rows: Vec<Row> = (0..60)
+            .map(|n| Row {
+                id: format!("d{n:02}"),
+                key: json!(n % 7),
+                value: json!(n),
+            })
+            .collect();
+        let query = ViewQuery {
+            limit: usize::MAX,
+            inclusive_end: true,
+            ..Default::default()
+        };
+        let reduce = |index: &mut ViewIndex, visited: &AtomicU64| {
+            let mut js = JsReducer::new("_sum", query.limits);
+            index.reduce(&query, None, &mut js, visited).unwrap()
+        };
+        let expected = {
+            let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
+            index.rebuild(rows, cursor_at(1), "map|").unwrap();
+            let answer = reduce(&mut index, &AtomicU64::new(0));
+            assert!(index.unsynced);
+            answer
+        };
+        let mut index = ViewIndex::open(&file, Arc::default()).unwrap();
+        let visited = AtomicU64::new(0);
+        assert_eq!(reduce(&mut index, &visited), expected);
+        assert_eq!(
+            visited.load(AtomicOrdering::Relaxed),
+            0,
+            "partials were lost"
+        );
+        drop(index);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A stored row whose checksum fails is an error, never a row silently
