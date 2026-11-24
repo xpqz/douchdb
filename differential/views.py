@@ -48,6 +48,7 @@ CUSTOM_SUM = (
 
 VIEWS = {
     "numbers": {"map": MAP_NUMBERS},
+    "number_count": {"map": MAP_NUMBERS, "reduce": "_count"},
     "strings": {"map": MAP_STRINGS},
     "tags": {"map": MAP_TAGS, "reduce": "_sum"},
     "tag_count": {"map": MAP_TAG_COUNT, "reduce": "_count"},
@@ -184,6 +185,14 @@ def systematic_queries() -> list[tuple[str, dict[str, str]]]:
     for key in [1, 2, 2, 2.5, None]:
         queries.append(("numbers", {"keys": json_param([key])}))
     queries.append(("numbers", {"keys": json_param([1, 2, 2])}))
+    # 1 and 1.0 collate equal in CouchDB (Erlang term order).
+    queries.append(("numbers", {"key": json_param(1.0)}))
+    queries.append(("numbers", {"keys": json_param([1.0, 1])}))
+    queries.append(("numbers", {"startkey": json_param(1.0), "endkey": "2"}))
+    for keys in [[1.0], [1, 1.0], [1.0, 2.0, 2]]:
+        queries.append(("number_count", {"keys": json_param(keys), "group": "true"}))
+    queries.append(("number_count", {"key": json_param(1.0)}))
+    queries.append(("number_count", {"group": "true"}))
     queries.append(("numbers", {"keys": json_param([])}))
     queries.append(("numbers", {"startkey": "1", "endkey": "10"}))
     queries.append(

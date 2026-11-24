@@ -15518,6 +15518,58 @@ async fn sandboxes_agree_on_emitted_number_text() {
     }
 }
 
+/// Keys collate as CouchDB's: `1` and `1.0` are one key, so a requested key
+/// written either way finds the rows and the reduce group of the other, on
+/// one node and through a cluster coordinator. A float beyond f64's range is
+/// rejected, as CouchDB's JSON decoder rejects it.
+#[tokio::test]
+async fn numerically_equal_keys_are_one_key() {
+    let single = vec![Server::start(false)];
+    let cluster = start_cluster_sharded(3, 4, 1);
+    for nodes in [&single, &cluster] {
+        for node in nodes {
+            node.fresh_db("numkeys").await;
+        }
+        let docs = json!({"docs": [
+            {"_id": "a", "n": 1},
+            {"_id": "b", "n": 1},
+            {"_id": "c", "n": 2},
+            {"_id": "_design/d", "views": {"v": {
+                "map": "function(doc) { if (doc.n) emit(doc.n, 1); }",
+                "reduce": "_count"
+            }}},
+        ]});
+        let (status, body) = nodes[0].post("/numkeys/_bulk_docs", docs).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let node = nodes.last().unwrap();
+
+        let (_, rows) = node
+            .get("/numkeys/_design/d/_view/v?key=1.0&reduce=false")
+            .await;
+        assert_eq!(rows["rows"].as_array().unwrap().len(), 2, "{rows}");
+        let (_, grouped) = node
+            .get("/numkeys/_design/d/_view/v?keys=%5B1.0%2C2%5D&group=true")
+            .await;
+        assert_eq!(grouped["rows"][0]["value"], 2, "{grouped}");
+        assert_eq!(grouped["rows"][1]["value"], 1, "{grouped}");
+        // Each requested key is a row of its own, both forms finding the
+        // one group.
+        let (_, both) = node
+            .get("/numkeys/_design/d/_view/v?keys=%5B1%2C1.0%5D&group=true")
+            .await;
+        let both = both["rows"].as_array().unwrap();
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.iter().all(|row| row["value"] == 2), "{both:?}");
+        let (_, range) = node
+            .get("/numkeys/_design/d/_view/v?startkey=1.0&endkey=1&reduce=false")
+            .await;
+        assert_eq!(range["rows"].as_array().unwrap().len(), 2, "{range}");
+
+        let (status, body) = node.get("/numkeys/_design/d/_view/v?key=1e400").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+}
+
 #[tokio::test]
 async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
     // CouchDB takes the row id from the stored document, not from the object

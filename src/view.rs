@@ -11,8 +11,6 @@ use crate::index_cache::{Gate, Registry, Slot};
 use crate::js::JsError;
 use crate::util::hex;
 use crate::viewfn::{run_map_js, Builtin, Row, WRAPPER_SOURCE};
-use icu_collator::options::CollatorOptions;
-use icu_collator::Collator;
 use md5::{Digest, Md5};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
@@ -21,9 +19,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex, MutexGuard, PoisonError};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub use crate::collate::cmp_json;
 pub use crate::js::ViewLimits;
 
 #[derive(Clone, Debug, Default)]
@@ -420,9 +419,34 @@ fn split_into(blocks: &mut Vec<Arc<Vec<Row>>>, rows: Vec<Row>) {
 /// level they fit, so it touches few rows or partials per level.
 const REDUCE_FANOUT: usize = 32;
 
-/// Partial reductions by group key (by exact key for a `keys` query), with
-/// the key itself.
-pub(crate) type Partials = HashMap<String, (Value, Vec<Value>)>;
+/// Partial reductions by group key (by requested key for a `keys` query),
+/// with the key itself.
+pub(crate) type Partials = std::collections::BTreeMap<GroupKey, (Value, Vec<Value>)>;
+
+/// A group's key, ordered and compared by view collation, so keys that
+/// collate equal (`1` and `1.0`) share a group, as in CouchDB.
+#[derive(Clone, Debug)]
+pub(crate) struct GroupKey(Value);
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for GroupKey {}
+
+impl PartialOrd for GroupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GroupKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_json(&self.0, &other.0)
+    }
+}
 
 /// A shard's partial reductions for the reducer `source`. Blocks of
 /// consecutive rows grow and shrink as writes add and remove rows, so a write
@@ -1207,8 +1231,9 @@ pub(crate) fn unique_keys(keys: &[Value]) -> Vec<Value> {
 }
 
 pub(crate) fn add_partial(partials: &mut Partials, key: Value, value: Value) {
+    // The group keeps the first key it was given.
     partials
-        .entry(serde_json::to_string(&key).unwrap_or_default())
+        .entry(GroupKey(key.clone()))
         .or_insert_with(|| (key, Vec::new()))
         .1
         .push(value);
@@ -1233,8 +1258,7 @@ pub(crate) fn assemble_reduce(
         };
         let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
         for key in ordered {
-            let Some((_, values)) = partials.get(&serde_json::to_string(key).unwrap_or_default())
-            else {
+            let Some((_, values)) = partials.get(&GroupKey(key.clone())) else {
                 continue;
             };
             let group = if grouped {
@@ -1246,8 +1270,8 @@ pub(crate) fn assemble_reduce(
         }
         groups
     } else {
+        // Already in collation order.
         let mut groups: Vec<(Value, Vec<Value>)> = partials.into_values().collect();
-        groups.sort_by(|a, b| cmp_json(&a.0, &b.0));
         if query.descending {
             groups.reverse();
         }
@@ -3663,112 +3687,6 @@ pub(crate) fn number_value(value: f64) -> Value {
         json!(value as i64)
     } else {
         json!(value)
-    }
-}
-
-/// CouchDB JSON collation: null < false < true < number < string < array <
-/// object. Strings use ICU's default (tertiary) collation, as CouchDB does.
-pub fn cmp_json(a: &Value, b: &Value) -> Ordering {
-    fn rank(value: &Value) -> u8 {
-        match value {
-            Value::Null => 0,
-            Value::Bool(false) => 1,
-            Value::Bool(true) => 2,
-            Value::Number(_) => 3,
-            Value::String(_) => 4,
-            Value::Array(_) => 5,
-            Value::Object(_) => 6,
-        }
-    }
-
-    let (ra, rb) = (rank(a), rank(b));
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Number(a), Value::Number(b)) => cmp_numbers(a, b),
-        (Value::String(a), Value::String(b)) => compare_strings(a, b),
-        (Value::Array(a), Value::Array(b)) => {
-            for (left, right) in a.iter().zip(b.iter()) {
-                let order = cmp_json(left, right);
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            a.len().cmp(&b.len())
-        }
-        (Value::Object(a), Value::Object(b)) => {
-            // CouchDB object collation follows the stored member order, not
-            // sorted key order, and compares member names like strings.
-            let a: Vec<_> = a.iter().collect();
-            let b: Vec<_> = b.iter().collect();
-            for (left, right) in a.iter().zip(b.iter()) {
-                let order =
-                    compare_strings(left.0, right.0).then_with(|| cmp_json(left.1, right.1));
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            a.len().cmp(&b.len())
-        }
-        _ => Ordering::Equal,
-    }
-}
-
-fn cmp_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
-    if is_integer_literal(a.as_str()) && is_integer_literal(b.as_str()) {
-        return cmp_decimal_integers(a.as_str(), b.as_str());
-    }
-    let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
-    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-}
-
-fn is_integer_literal(raw: &str) -> bool {
-    !raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E'))
-}
-
-/// Compare decimal integer literals exactly. `f64` would collapse values that
-/// differ beyond its 53-bit mantissa.
-fn cmp_decimal_integers(a: &str, b: &str) -> Ordering {
-    fn parts(raw: &str) -> (bool, &str) {
-        let (negative, digits) = match raw.strip_prefix('-') {
-            Some(digits) => (true, digits),
-            None => (false, raw),
-        };
-        let digits = digits.trim_start_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
-        (negative && digits != "0", digits)
-    }
-
-    let (a_negative, a_digits) = parts(a);
-    let (b_negative, b_digits) = parts(b);
-    if a_negative != b_negative {
-        return if a_negative {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        };
-    }
-    let magnitude = a_digits
-        .len()
-        .cmp(&b_digits.len())
-        .then_with(|| a_digits.cmp(b_digits));
-    if a_negative {
-        magnitude.reverse()
-    } else {
-        magnitude
-    }
-}
-
-fn compare_strings(a: &str, b: &str) -> Ordering {
-    static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> = OnceLock::new();
-    let collator = COLLATOR
-        .get_or_init(|| Collator::try_new(Default::default(), CollatorOptions::default()).ok());
-    match collator {
-        Some(collator) => collator.compare(a, b),
-        None => a.cmp(b),
     }
 }
 

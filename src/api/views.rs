@@ -385,11 +385,22 @@ fn parse_view_query(
             "Can't specify group=false and group_level>0 at the same time",
         ));
     }
+    let key = json_param(q, "key")?;
+    let startkey = json_param(q, "startkey")?.or(json_param(q, "start_key")?);
+    let endkey = json_param(q, "endkey")?.or(json_param(q, "end_key")?);
+    // CouchDB's JSON decoder rejects a float beyond f64's range.
+    let given = [&key, &startkey, &endkey].into_iter().flatten();
+    if given
+        .chain(keys.iter().flatten())
+        .any(crate::collate::has_out_of_range_number)
+    {
+        return Err(ApiError::bad_request("invalid UTF-8 JSON"));
+    }
     Ok(crate::view::ViewQuery {
-        key: json_param(q, "key")?,
+        key,
         keys,
-        startkey: json_param(q, "startkey")?.or(json_param(q, "start_key")?),
-        endkey: json_param(q, "endkey")?.or(json_param(q, "end_key")?),
+        startkey,
+        endkey,
         startkey_docid: q
             .get("startkey_docid")
             .or_else(|| q.get("start_key_docid"))
