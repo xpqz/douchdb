@@ -10016,6 +10016,67 @@ async fn cluster_dbs_info_matches_db_info() {
     }
 }
 
+/// A cluster `_all_docs` reads the nodes a page at a time (1000 rows a node)
+/// and still lists exactly the rows an unpaged merge would: every id once, in
+/// order, with `skip`, `limit`, `descending`, `endkey` and `inclusive_end`
+/// applied, and `total_rows` and `offset` as before.
+#[tokio::test]
+async fn cluster_all_docs_page_through_large_shards() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("adpages").await;
+    }
+    let total = 4000;
+    let ids: Vec<String> = (0..total).map(|i| format!("d{i:05}")).collect();
+    let docs: Vec<Value> = ids.iter().map(|id| json!({ "_id": id })).collect();
+    let (status, body) = nodes[0]
+        .post("/adpages/_bulk_docs", json!({ "docs": docs }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let listed = |body: &Value| -> Vec<String> {
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut reversed = ids.clone();
+    reversed.reverse();
+    for node in &nodes {
+        let cases: Vec<(String, Vec<String>, usize)> = vec![
+            ("".into(), ids.clone(), 0),
+            (
+                "?skip=1500&limit=1200".into(),
+                ids[1500..2700].to_vec(),
+                1500,
+            ),
+            (
+                "?descending=true&limit=2500".into(),
+                reversed[..2500].to_vec(),
+                0,
+            ),
+            (
+                "?startkey=%22d01000%22&endkey=%22d03500%22&inclusive_end=false".into(),
+                ids[1000..3500].to_vec(),
+                1000,
+            ),
+            (
+                "?descending=true&startkey=%22d03000%22&skip=10".into(),
+                reversed[1009..].to_vec(),
+                1009,
+            ),
+        ];
+        for (query, expected, offset) in cases {
+            let (status, body) = node.get(&format!("/adpages/_all_docs{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(body["total_rows"], total, "{query}");
+            assert_eq!(body["offset"], offset, "{} {query}", node.base);
+            assert_eq!(listed(&body), expected, "{} {query}", node.base);
+        }
+    }
+}
+
 /// With q=4, n=1 on three nodes, a node owns one or two shards. Its
 /// anti-entropy pass asks a peer for those shards only, so of the 40 documents
 /// stored on node 0 it is sent just the ones of its own shards, and reads
