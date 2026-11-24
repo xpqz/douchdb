@@ -12,6 +12,11 @@ outside review).
   of the queried partition (docs/partitioned-databases.md), so it does not
   change when an unrelated partition gains rows. This is a deliberate
   difference from CouchDB, which reports the whole shard's count there.
+- **Partials are written without a sync.** They are a cache: losing them
+  loses no data and changes no answer, only makes the next reduce compute
+  them again. So the write a reduce query makes for them uses redb's
+  non-durable commit, and a reduce read never waits for a sync. Every other
+  index write stays fully durable.
 - **#195 is deferred.** The `inclusive_end=false` with `endkey_docid`
   behaviour stays as it is during this rewrite. Both query paths change
   together under that issue.
@@ -87,9 +92,12 @@ structure can be built on it.
 
 ## Anti-goals
 
-- Weaker durability. Every index write, partials included, stays one
-  `kv::begin_write` transaction (Immediate durability, two-phase commit). A
-  crash leaves rows, keyed rows, block counts, partials and cursor agreeing.
+- Weaker durability for anything but a cache. Every write of rows, keyed
+  rows, block counts and cursor stays one `kv::begin_write` transaction
+  (Immediate durability, two-phase commit). Only reduce partials are
+  committed non-durably (see Reduce partials). A crash leaves rows, keyed
+  rows, block counts, partials and cursor agreeing. Partials written since
+  the last durable commit may be missing, never wrong.
 - A different map answer for any query.
 - Reduce failures leaking into updates or map queries. Today a reduce
   function that throws, or `_stats` over a non-number, fails only reduce
@@ -302,8 +310,13 @@ extra for views that are never reduced.
 
 A reduce query does all its work in `ensure_rows`, while it holds the index
 lock and the gate, after bringing the index up to date. It works in one
-write transaction (`kv::begin_write`: Immediate durability, two-phase
-commit, like every index write):
+write transaction opened with a new `kv::begin_cache_write`. That is the
+same as `kv::begin_write` except that the commit is non-durable
+(`Durability::None`): it is written without a sync. The next durable commit
+to the file makes it durable, and a crash before that loses only those
+partials, which are computed again on the next reduce. The guard test in
+`src/kv.rs` that forbids setting durability outside `kv::begin_write` allows
+this one function. No other write uses it.
 
 1. It finds the blocks the query will combine whole: those its range or
    group covers whole. Only these need partials. Blocks reduced row by row
@@ -496,7 +509,9 @@ in-memory snapshots.
   its sentinel block.
 - **A crash test.** An update or partial write interrupted at commit leaves
   `ROWS`, `BY_KEY`, `BLOCKS`, `PARTIALS` and `CURSOR` agreeing (the
-  `PowerSwitch` harness).
+  `PowerSwitch` harness). A crash after a non-durable partial commit leaves
+  each of those partials either absent or correct, and the next reduce
+  gives the right answer.
 - **Stream tests.** An update during a stream does not change the rows that
   stream returns. Cleanup during a stream does not wait for it, and the
   stream completes. Deleting the database during an `include_docs` stream
@@ -524,7 +539,8 @@ Each step is its own PR, green on CI and Jepsen:
    sorting. A test check compares `BY_KEY` with the snapshot after each
    update.
 3. Map queries from `BY_KEY`, streamed, with stream lifetime rules.
-4. Reduce from block partials, computed lazily.
+4. Reduce from block partials, computed lazily and committed through
+   `kv::begin_cache_write`.
 5. Remove `ViewRows`, `BlockTree` and the snapshot. Shrink the page cache.
    Measure.
 6. #194: the cluster streaming merge.
