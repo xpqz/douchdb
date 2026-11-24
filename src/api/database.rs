@@ -494,8 +494,12 @@ pub async fn db_rest(
         _ => None,
     };
     // CouchDB (mochiweb) serves a HEAD as a GET, but still advertises only
-    // `PUT,GET` in `Allow`, so a HEAD of `_security` is checked as a GET.
-    let checked = if method == Method::HEAD && rest == "_security" {
+    // `PUT,GET` in `Allow`, so a HEAD of these endpoints is checked as a GET.
+    let checked = if method == Method::HEAD
+        && matches!(
+            rest.as_str(),
+            "_security" | "_revs_limit" | "_purged_infos_limit"
+        ) {
         &Method::GET
     } else {
         &method
@@ -795,9 +799,9 @@ async fn ensure_full_commit(req: DbRequest<'_>) -> Response {
     }
 }
 
-/// `GET` or `PUT /{db}/_revs_limit`.
+/// `GET`, `HEAD` or `PUT /{db}/_revs_limit`.
 async fn revs_limit(req: DbRequest<'_>) -> Response {
-    if *req.method == Method::GET {
+    if *req.method == Method::GET || *req.method == Method::HEAD {
         return match req.db.get_revs_limit().await {
             Ok(n) => json(StatusCode::OK, json!(n)),
             Err(e) => fail(e),
@@ -831,10 +835,10 @@ async fn revs_limit(req: DbRequest<'_>) -> Response {
     }
 }
 
-/// `GET` or `PUT /{db}/_purged_infos_limit`: how many purge infos each shard
-/// keeps (chttpd_db.erl, default 1000).
+/// `GET`, `HEAD` or `PUT /{db}/_purged_infos_limit`: how many purge infos
+/// each shard keeps (chttpd_db.erl, default 1000).
 async fn purged_infos_limit(req: DbRequest<'_>) -> Response {
-    if *req.method == Method::GET {
+    if *req.method == Method::GET || *req.method == Method::HEAD {
         return match req.db.get_purged_infos_limit().await {
             Ok(n) => json(StatusCode::OK, json!(n)),
             Err(e) => fail(e),
