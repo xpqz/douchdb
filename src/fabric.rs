@@ -2264,7 +2264,7 @@ pub(crate) struct ViewBatch {
 }
 
 /// Merged map rows for a cluster view query, with the counts CouchDB reports.
-pub(crate) struct ClusterViewRows {
+struct ClusterViewRows {
     pub spec: crate::view::ViewSpec,
     pub rows: Arc<Vec<crate::viewfn::Row>>,
     pub docs: HashMap<String, Value>,
@@ -2396,19 +2396,298 @@ fn push_range_params(params: &mut Vec<(&'static str, String)>, query: &crate::vi
     }
 }
 
-pub(crate) async fn cluster_view_rows(
+/// A cluster view query on its coordinator. A map query without `keys`
+/// streams: each owner streams its shards' rows in key order and the rows
+/// are merged as they arrive. A reduce whose function the owners cannot run
+/// for it, or a `keys` query (bounded by its keys), gathers the owners' rows
+/// first.
+pub(crate) async fn cluster_view(
+    read: ClusterRead<'_>,
+    owned: Arc<Db>,
+    view: IndexRef<'_>,
+    query: &crate::view::ViewQuery,
+) -> DbResult<crate::view::ViewReply> {
+    let ddoc_doc = design_doc(read, view.ddoc).await?;
+    let spec = crate::view::spec_from_doc(&ddoc_doc, view.name)?;
+    crate::view::validate_view_partition(read.db, &spec, query.partition.as_deref())?;
+    let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
+    if reduce || query.keys.is_some() {
+        let merged = cluster_view_rows(read, view, query, spec).await?;
+        let mut query = query.clone();
+        query.total_rows_override = Some(merged.total_rows);
+        query.offset_override = Some(merged.offset);
+        return crate::view::finish(&merged.spec, merged.rows, merged.docs, &query)
+            .await
+            .map(crate::view::ViewReply::Reduced);
+    }
+    crate::view::check_query(&spec, query)?;
+    cluster_view_stream(read, owned, view, query).await
+}
+
+/// One owner's rows for a streamed cluster view query, in query order, with
+/// the counts it reports for its shards.
+struct ViewLane {
+    total_rows: usize,
+    offset: usize,
+    rows: futures::stream::BoxStream<'static, DbResult<Value>>,
+}
+
+/// A map query without `keys` across the cluster: every owner streams the
+/// rows of its shards in the query's range, at most `skip + limit` of them,
+/// and they are merged in view order, `skip` and `limit` applying to the
+/// merged rows. The owners' shard sets are disjoint, so the merge needs no
+/// deduplication. An owner that fails before its first rows fails over to a
+/// replica, as any read does; one that fails after rows have gone out ends
+/// the reply early, as in CouchDB.
+async fn cluster_view_stream(
+    read: ClusterRead<'_>,
+    owned: Arc<Db>,
+    view: IndexRef<'_>,
+    query: &crate::view::ViewQuery,
+) -> DbResult<crate::view::ViewReply> {
+    let owned_by_node = preferred_shard_masks(read.ctx, read.db);
+    let mut local = query.clone();
+    local.skip = 0;
+    local.limit = query.skip.saturating_add(query.limit);
+    let local = &local;
+    let owned = &owned;
+    let lanes = scatter(read, &owned_by_node, "view", |node, mask, _| async move {
+        open_view_lane(read, owned, view, local, node, &mask).await
+    })
+    .await?;
+    let total_rows: usize = lanes.iter().map(|(_, _, lane)| lane.total_rows).sum();
+    let before_start: usize = lanes.iter().map(|(_, _, lane)| lane.offset).sum();
+    let skip = query.skip.min(total_rows.saturating_sub(before_start));
+    let lanes: Vec<_> = lanes.into_iter().map(|(_, _, lane)| lane.rows).collect();
+    Ok(crate::view::ViewReply::Rows(crate::view::MapRows {
+        total_rows,
+        offset: before_start + skip,
+        rows: merge_view_lanes(lanes, query.descending, skip, query.limit),
+    }))
+}
+
+/// The rows of several lanes, each already in view order, merged into one
+/// stream in that order, the first `skip` dropped and at most `limit` kept.
+/// A lane's error ends the merged stream with it.
+fn merge_view_lanes(
+    lanes: Vec<futures::stream::BoxStream<'static, DbResult<Value>>>,
+    descending: bool,
+    skip: usize,
+    limit: usize,
+) -> futures::stream::BoxStream<'static, DbResult<Value>> {
+    let rows = async_stream::stream! {
+        let mut lanes: Vec<(futures::stream::BoxStream<'static, DbResult<Value>>, Option<Value>)> =
+            lanes.into_iter().map(|lane| (lane, None)).collect();
+        // The first row of every lane, read together.
+        let heads = join_all(lanes.iter_mut().map(|(lane, _)| lane.next())).await;
+        for ((_, head), first) in lanes.iter_mut().zip(heads) {
+            match first {
+                Some(Ok(row)) => *head = Some(row),
+                Some(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
+                None => {}
+            }
+        }
+        let (mut to_skip, mut left) = (skip, limit);
+        while left > 0 {
+            let best = lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(at, (_, head))| head.as_ref().map(|row| (at, row)))
+                .reduce(|best, candidate| {
+                    let order = view_entry_cmp(candidate.1, best.1);
+                    let better = if descending {
+                        order == std::cmp::Ordering::Greater
+                    } else {
+                        order == std::cmp::Ordering::Less
+                    };
+                    if better { candidate } else { best }
+                })
+                .map(|(at, _)| at);
+            let Some(at) = best else {
+                break;
+            };
+            let (lane, head) = &mut lanes[at];
+            let row = head.take().expect("a head row");
+            match lane.next().await {
+                Some(Ok(next)) => *head = Some(next),
+                Some(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
+                None => {}
+            }
+            if to_skip > 0 {
+                to_skip -= 1;
+            } else {
+                left -= 1;
+                yield Ok(row);
+            }
+        }
+    };
+    rows.boxed()
+}
+
+/// View order for rows of a reply: by key in view collation, then by
+/// document id, as the index stores them.
+fn view_entry_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    static NULL: Value = Value::Null;
+    fn key(row: &Value) -> &Value {
+        row.get("key").unwrap_or(&NULL)
+    }
+    fn id(row: &Value) -> &str {
+        row.get("id").and_then(Value::as_str).unwrap_or("")
+    }
+    crate::collate::cmp_json(key(a), key(b)).then_with(|| id(a).cmp(id(b)))
+}
+
+/// Open one owner's stream of rows for `query` from the shards in `mask`:
+/// this node's from its index file, a peer's over the internal path as
+/// newline-delimited JSON. It returns once the owner's counts are in, so a
+/// failure up to there can still fail over.
+async fn open_view_lane(
+    read: ClusterRead<'_>,
+    owned: &Arc<Db>,
+    view: IndexRef<'_>,
+    query: &crate::view::ViewQuery,
+    node: usize,
+    mask: &ShardMask,
+) -> DbResult<ViewLane> {
+    let ClusterRead {
+        ctx,
+        dbname,
+        headers,
+        ..
+    } = read;
+    if node == ctx.cluster.me {
+        let mut local = query.clone();
+        local.owner_shards = Some(mask.clone());
+        return match crate::view::query_stream(Arc::clone(owned), view.ddoc, view.name, &local)
+            .await?
+        {
+            crate::view::ViewReply::Rows(rows) => Ok(ViewLane {
+                total_rows: rows.total_rows,
+                offset: rows.offset,
+                rows: rows.rows,
+            }),
+            crate::view::ViewReply::Reduced(_) => Err(ApiError::internal(
+                "a map view query was answered with a reduce",
+            )),
+        };
+    }
+    let peer = &ctx.cluster.nodes[node];
+    let mut params = vec![
+        ("reduce", "false".to_string()),
+        ("stream", "true".to_string()),
+        ("shards", mask.query_value()),
+    ];
+    if query.limit != usize::MAX {
+        params.push(("limit", query.limit.to_string()));
+    }
+    if query.include_docs {
+        params.push(("include_docs", "true".to_string()));
+    }
+    push_range_params(&mut params, query);
+    let request = crate::cluster_http::internal_request_raw(
+        &ctx.stream_client,
+        &ctx.cluster.secret,
+        reqwest::Method::GET,
+        peer,
+        &[dbname, view.ddoc, "_view", view.name],
+    );
+    let request = crate::cluster_http::forward_client_auth(request, headers).query(&params);
+    let response = send_peer(request)
+        .await
+        .map_err(|error| ApiError::new(502, "bad_gateway", error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            response.status().as_u16(),
+            "view_failed",
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+    let mut lines = ndjson_lines(response);
+    let head = match lines.next().await {
+        Some(head) => head?,
+        None => return Err(peer_stream_cut()),
+    };
+    let count = |name: &str| {
+        head.get(name)
+            .and_then(Value::as_u64)
+            .map(|count| count as usize)
+            .ok_or_else(|| ApiError::new(502, "bad_gateway", "a view stream without counts"))
+    };
+    let (total_rows, offset) = (count("total_rows")?, count("offset")?);
+    // Rows up to the end marker; a stream that stops before it was cut.
+    let rows = async_stream::stream! {
+        let mut lines = lines;
+        loop {
+            match lines.next().await {
+                Some(Ok(line)) if line.get("end").is_some() => return,
+                Some(Ok(row)) => yield Ok(row),
+                Some(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
+                None => {
+                    yield Err(peer_stream_cut());
+                    return;
+                }
+            }
+        }
+    };
+    Ok(ViewLane {
+        total_rows,
+        offset,
+        rows: rows.boxed(),
+    })
+}
+
+fn peer_stream_cut() -> ApiError {
+    ApiError::new(502, "bad_gateway", "a peer's view stream ended early")
+}
+
+/// The JSON values of a newline-delimited body, one per line, read as the
+/// body arrives.
+fn ndjson_lines(
+    response: reqwest::Response,
+) -> futures::stream::BoxStream<'static, DbResult<Value>> {
+    let lines = async_stream::stream! {
+        let mut response = response;
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                match serde_json::from_slice::<Value>(&line[..end]) {
+                    Ok(value) => yield Ok(value),
+                    Err(error) => {
+                        yield Err(ApiError::new(502, "bad_gateway", error.to_string()));
+                        return;
+                    }
+                }
+            }
+            match response.chunk().await {
+                Ok(Some(bytes)) => buffer.extend_from_slice(&bytes),
+                Ok(None) => return,
+                Err(error) => {
+                    yield Err(ApiError::new(502, "bad_gateway", error.to_string()));
+                    return;
+                }
+            }
+        }
+    };
+    lines.boxed()
+}
+
+async fn cluster_view_rows(
     read: ClusterRead<'_>,
     view: IndexRef<'_>,
     query: &crate::view::ViewQuery,
+    spec: crate::view::ViewSpec,
 ) -> DbResult<ClusterViewRows> {
     let ClusterRead { ctx, db, .. } = read;
-    let IndexRef {
-        ddoc,
-        name: view_name,
-    } = view;
-    let ddoc_doc = design_doc(read, ddoc).await?;
-    let spec = crate::view::spec_from_doc(&ddoc_doc, view_name)?;
-    crate::view::validate_view_partition(db, &spec, query.partition.as_deref())?;
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
     // Owners apply the key range themselves. A reduce needs every row in it;
     // a map query takes only the global window from each owner because the
@@ -3452,6 +3731,7 @@ mod tests {
                 secret: "test-secret".to_string(),
             },
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             auth: None,
             health: Default::default(),
         };

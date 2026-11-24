@@ -220,6 +220,7 @@ fn build_state(
                     .chain(&args.seed_nodes)
                     .any(|node| node.starts_with("https://")),
             )?,
+            stream_client: crate::cluster_http::peer_stream_client()?,
             auth,
             health: Default::default(),
         },

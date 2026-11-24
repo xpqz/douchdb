@@ -946,6 +946,7 @@ pub(crate) fn test_state(root: PathBuf, max_open_dbs: usize) -> Arc<AppState> {
                 secret: String::new(),
             },
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             health: Default::default(),
         },
         db_updates: Default::default(),

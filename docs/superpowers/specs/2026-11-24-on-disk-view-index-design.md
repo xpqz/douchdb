@@ -30,6 +30,21 @@ outside review).
   dropped for the shards a write changes. Blocks are 64 rows, not 256. This
   is what brought reduce back to the old speed; it costs about one entry
   per 64 rows. Measurements: docs/performance.md, "Views on disk".
+- **The cluster merge streams map queries without `keys`** (step 6, #194).
+  Each owner streams its shards' rows, at most `skip + limit` of them, as
+  newline-delimited JSON on the internal path (`stream=true`): a line of
+  counts, one line per row, and an end line, so a cut stream is told apart
+  from a finished one. The coordinator merges them in view order and
+  writes rows as they arrive. Owner shard sets are disjoint, so the old
+  counting deduplication goes. An owner that fails before its counts are
+  in fails over to a replica as before; one that fails after rows have
+  gone out ends the reply early, as in CouchDB. These streams use their
+  own HTTP/1.1 peer client with a 60 s idle limit and no overall deadline:
+  a slow client then holds back only its own TCP connection, never the
+  shared HTTP/2 connection's flow-control window that other peer calls
+  use. `keys` queries (bounded by their keys) and reduces whose function
+  the owners cannot run for the coordinator still gather rows first;
+  reduces the owners run already send one value per group.
 - **#195 is deferred.** The `inclusive_end=false` with `endkey_docid`
   behaviour stays as it is during this rewrite. Both query paths change
   together under that issue.
@@ -416,7 +431,7 @@ Streams end with their request.
   sort are removed.
 - Per open view, what's left is redb's page cache plus the blocks a query
   reads. A reduce answer is still built whole, but its size is bounded by
-  the query's groups. The cluster coordinator buffers peer rows until #194. Today's `VIEW_CACHE_BYTES` (4 MB per file) times up to 256 open
+  the query's groups. The cluster coordinator streams map rows (#194). Today's `VIEW_CACHE_BYTES` (4 MB per file) times up to 256 open
   views is about 1 GB once warm; it was mostly cold before, because queries
   read the snapshot. Per-file cache drops to 1 MB, relying on the operating
   system's file cache, and the effect on latency is measured in step 5.

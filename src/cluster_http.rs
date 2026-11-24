@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 pub struct ClusterCtx {
     pub cluster: Cluster,
     pub client: reqwest::Client,
+    /// The client for long reads that stream from a peer (see
+    /// `peer_stream_client`).
+    pub stream_client: reqwest::Client,
     pub auth: Option<Auth>,
     /// Which peers discovery last found unreachable.
     pub health: NodeHealth,
@@ -69,6 +72,20 @@ pub(crate) fn peer_client(tls_peers: bool) -> reqwest::Result<reqwest::Client> {
         .http2_keep_alive_interval(peer_h2::PING_INTERVAL)
         .http2_keep_alive_timeout(peer_h2::PING_TIMEOUT)
         .http2_keep_alive_while_idle(true)
+        .build()
+}
+
+/// The client for peer replies read as they arrive, such as a view's rows,
+/// which can take longer than any fixed deadline. A peer silent for 60 s
+/// fails the read; one that keeps sending has no deadline. Each stream has
+/// its own HTTP/1.1 connection, so a reader that stops (a slow client)
+/// holds back only its own peer, through TCP, and never the shared HTTP/2
+/// connection that carries this node's other peer calls.
+pub(crate) fn peer_stream_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .read_timeout(Duration::from_secs(60))
+        .http1_only()
         .build()
 }
 
