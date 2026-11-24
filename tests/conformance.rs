@@ -223,11 +223,14 @@ impl Server {
     async fn req(&self, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         let mut request = self
             .client
-            .request(method, format!("{}{}", self.base, path));
+            .request(method.clone(), format!("{}{}", self.base, path));
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.expect("request");
+        let response = request
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{method} {path}: {error:?}"));
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         let value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -21364,9 +21367,21 @@ async fn a_cluster_view_stream_reads_what_it_sends_and_ends_early_when_an_owner_
             .await;
         assert!(status.is_success(), "{status}");
     }
-    // Build the index, then measure a small page.
-    let (status, body) = nodes[0].get("/clstreambig/_design/d/_view/v?limit=1").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // Build the index on its owner, which on a loaded machine can take
+    // longer than a request's usual deadline, then measure a small page.
+    let patient = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .unwrap();
+    let built = patient
+        .get(format!(
+            "{}/clstreambig/_design/d/_view/v?limit=1",
+            nodes[1].base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(built.status(), StatusCode::OK);
     let before = db_counter(&nodes[1], "clstreambig", "view_rows_visited").await;
     let (status, body) = nodes[0]
         .get("/clstreambig/_design/d/_view/v?limit=10")
