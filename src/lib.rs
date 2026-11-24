@@ -42,6 +42,7 @@ pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod validate;
 pub(crate) mod view;
+pub(crate) mod view_store;
 pub(crate) mod viewfn;
 pub(crate) mod worker;
 
