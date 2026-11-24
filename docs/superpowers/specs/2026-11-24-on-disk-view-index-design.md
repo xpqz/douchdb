@@ -17,6 +17,13 @@ outside review).
   them again. So the write a reduce query makes for them uses redb's
   non-durable commit, and a reduce read never waits for a sync. Every other
   index write stays fully durable.
+- **Queries work in row positions, not bound keys** (agreed 2026-11-24, step
+  3). A query's start and end, `key` and each `keys` entry become positions
+  in a shard's rows through the block counts. The selection code that works
+  in positions today (start and end rules, `key`/`keys`, `offset`, `skip`)
+  then runs unchanged over the file, so its answers stay identical by
+  construction. This replaces the bound-tail encoding and its tables; see
+  Positions.
 - **#195 is deferred.** The `inclusive_end=false` with `endkey_docid`
   behaviour stays as it is during this rewrite. Both query paths change
   together under that issue.
@@ -111,8 +118,9 @@ structure can be built on it.
   keys, so an update removes exactly the keyed rows it wrote, by their bytes,
   without comparing values. The value is no longer stored here.
 - `BY_KEY: ViewKey → sealed value`, where a stored `ViewKey` is
-  (shard u32, partition, encoded view key, Row(doc id, ordinal)); see Bounds
-  for the other tail forms. The ordinal is the row's emit index within its
+  (shard u32, partition, encoded view key, doc id, ordinal). Two other
+  forms are never stored as rows: a shard's sentinel (fence of its first
+  block) and a partition's start (see Positions). The ordinal is the row's emit index within its
   document, in updates and rebuilds alike. It keeps equal (key, id) rows in
   emission order, as today's stable sort does.
 - `BLOCKS: fence ViewKey → sealed count`. A block covers the keyed rows from
@@ -180,11 +188,12 @@ re-runs any row that is not `js_exact` through QuickJS), so in practice
 exact integers beyond 2^53 reach the comparator only from query parameters.
 
 Equal keys are not a problem for redb. Every stored `ViewKey` ends with
-Row(doc id, ordinal), so two stored entries never compare Equal unless they
+doc id and ordinal, so two stored entries never compare Equal unless they
 are the same row. ICU already returns Equal for canonically equivalent
 strings with different bytes, and the same suffix resolves those. The
-comparator is a total order on entries: shard, then partition, then view key
-(with Equal ties), then the tail as defined under Bounds.
+comparator is a total order on entries: shard; the shard's sentinel first;
+partition by bytes, a partition's start before its rows; view key (with
+Equal ties); doc id by bytes; ordinal.
 
 Two consequences:
 
@@ -208,59 +217,29 @@ key, so `compare` stays total and never panics; reading it is an error. View
 keys move from a sealed value into a redb key, so they are protected by
 redb's page checksums rather than by `kv::seal`.
 
-### Bounds
+### Positions
 
-Range scans need bounds that are not real rows: "before every row with key
-K", "after every row with key K", and "after every array that starts with
-P" (for `group_level`). So a `ViewKey`'s tail, after shard, partition and
-view key, is one of:
+A query does not build keys for its bounds. It works in positions: the
+rows of a shard, numbered in key order. The block counts turn a key into
+a position, and a position into a row, reading at most one block's rows
+beyond what is returned:
 
-- `BeforeKey`, before every row with this key;
-- `BeforeId(D)`, before every row with this key and doc id D;
-- `Row(D, ordinal)`, a stored row;
-- `AfterId(D)`, after every row with this key and doc id D;
-- `AfterKey`, after every row with this key.
+- **Rank.** The rows below a key are the counts of the blocks before the
+  one the key falls in, plus that block's rows below the key.
+- **Read at a position.** The block holding the position is found from the
+  counts. Its rows are read from the fence, skipping to the position.
+- **Search.** The first position whose row fails a predicate that holds for
+  a prefix (all the selection needs) is found in two levels. The first row
+  of each block in range is probed by binary search, then the one block the
+  point falls in is scanned.
 
-Tails compare in that order. Between two tails that carry a doc id, ids
-compare first, by bytes, as `before_start` does today. Then
-`BeforeId` < `Row` (by ordinal) < `AfterId`.
-
-`group_level` also needs "after every array that starts with P". That is a
-bound of its own, `AfterPrefix(P)`, which takes the place of the view key
-and has no tail. It compares greater than every view key that is an array
-whose first members equal P's (P itself included), and compares with any
-other key as P does.
-
-Only stored entries use `Row`. The other tails appear only in bounds and
-fences, never in `BY_KEY`.
-
-The bounds below reproduce today's `before_start` and `past_end` exactly
-(`src/view.rs`), including one difference from CouchDB filed as #195: with
-`inclusive_end=false`, every row whose key equals `endkey` is excluded, even
-when `endkey_docid` is set. #195 changes both paths together, later.
-
-Ascending (scan upwards):
-
-| Parameter | Bound |
-|---|---|
-| `startkey` K | from (K, BeforeKey) |
-| `startkey` K, `startkey_docid` D | from (K, BeforeId(D)) |
-| `endkey` K, `inclusive_end` | to (K, AfterKey) |
-| `endkey` K, `inclusive_end`, `endkey_docid` D | to (K, AfterId(D)) |
-| `endkey` K, `inclusive_end=false` | to (K, BeforeKey), exclusive |
-| `key` K, or each `keys` entry | from (K, BeforeKey) to (K, AfterKey) |
-
-Descending (scan downwards; `startkey` is the high end):
-
-| Parameter | Bound |
-|---|---|
-| `startkey` K | from (K, AfterKey) |
-| `startkey` K, `startkey_docid` D | from (K, AfterId(D)) |
-| `endkey` K, `inclusive_end` | to (K, BeforeKey) |
-| `endkey` K, `inclusive_end`, `endkey_docid` D | to (K, BeforeId(D)) |
-| `endkey` K, `inclusive_end=false` | to (K, AfterKey), exclusive |
-| `key` K, or each `keys` entry | from (K, AfterKey) to (K, BeforeKey) |
-
+A run is a shard, or for a view queried by partition, the partition's
+rows inside the shard: from the rank of the partition's start key to the
+rank of the next partition's (the partition name followed by a zero byte).
+Today's position-based selection (`range_bounds`, `equal_range`, the offset
+rules, the choice of rows for `key`/`keys` within `skip + limit`) runs over
+these runs unchanged. That includes the behaviour #195 will change.
+`group_level` needs no prefix bound: groups are found by the same search.
 ### Block counts
 
 Blocks hold about B rows. B is 256: a block may reach 2B = 512 rows before
@@ -358,7 +337,8 @@ lock once it is open, as today's snapshot is taken under the lock. That
 transaction is one snapshot of rows, counts and the recorded cursor, so
 `update_seq` reporting is unchanged. No generation counter is needed.
 
-- **Order.** Each shard's range comes from the bounds above. Shards are
+- **Order.** Each run's range of positions comes from today's selection
+  rules (see Positions). Shards are
   merged lazily with a heap. The heap does not use the storage comparator,
   which orders by shard first and would emit shard 0's rows before shard
   1's. It compares heads by (view key, doc id, ordinal), the storage order
@@ -387,12 +367,8 @@ transaction is one snapshot of rows, counts and the recorded cursor, so
   edge blocks. That keeps today's per-partition counts
   (docs/partitioned-databases.md). CouchDB reports the whole shard's count
   there; changing that is a separate question.
-- **`offset`.** The rows of the selected run before the start bound. The run
-  is the shard, or the partition's range inside it. Descending counts the
-  rows above the start bound. The count is the shorter of two sums: whole
-  blocks before the bound plus a scan of the bound's block, or the run's
-  total minus whole blocks after it. A partition's edge blocks are scanned
-  where it begins and ends mid-block. `key` and single-key `keys` use the
+- **`offset`.** The rows of the selected run before the query's start,
+  found by the same position search, as today's selection counts them. `key` and single-key `keys` use the
   key's insertion point. Multi-key `keys` report 0. The reported offset stays
   `before_start + min(skip, total_rows - before_start)`.
 - **`include_docs`.** Documents are read a chunk at a time, as now.

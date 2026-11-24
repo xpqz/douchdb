@@ -251,7 +251,7 @@ pub(crate) fn compare_strings(a: &str, b: &str) -> Ordering {
 
 /// Bumped whenever the encoding or the order changes; a view index written
 /// under another version is rebuilt.
-pub(crate) const CODEC_VERSION: u32 = 1;
+pub(crate) const CODEC_VERSION: u32 = 2;
 
 /// The ICU collation data strings are ordered by. A view index written under
 /// other data is rebuilt, so a dependency upgrade that changes string order

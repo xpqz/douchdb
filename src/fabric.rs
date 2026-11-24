@@ -2301,7 +2301,7 @@ async fn fetch_view_mask(
     local.limit = limit.unwrap_or(usize::MAX);
     local.owner_shards = Some(mask.clone());
     if node == ctx.cluster.me {
-        let selection = crate::view::local_select(db, ddoc, view_name, spec, &local, false).await?;
+        let selection = crate::view::local_select(db, ddoc, view_name, spec, &local).await?;
         let docs = if query.include_docs {
             let ids = selection
                 .rows
