@@ -338,19 +338,35 @@ fn take_text(bytes: &[u8]) -> Option<(&str, &[u8])> {
     Some((text, &rest[len..]))
 }
 
-/// The encoded value at the start of `bytes`, and the bytes after it.
-fn take_value(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+/// Bytes behind a length at the start of `bytes`, and the bytes after them.
+fn take_bytes(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, rest) = take_len(bytes)?;
+    Some((rest.get(..len)?, &rest[len..]))
+}
+
+/// The encoded value at the start of `bytes`, and the bytes after it. With
+/// `check`, every text must also be UTF-8; without, only the lengths are
+/// followed, which is all finding a key's end needs. Comparing reads the
+/// text as UTF-8 anyway, and a text that is not compares as empty.
+fn take_value(bytes: &[u8], check: bool) -> Option<(&[u8], &[u8])> {
+    let text = |bytes| -> Option<&[u8]> {
+        if check {
+            take_text(bytes).map(|(_, rest)| rest)
+        } else {
+            take_bytes(bytes).map(|(_, rest)| rest)
+        }
+    };
     let (&tag, body) = bytes.split_first()?;
     let rest = match tag {
         TAG_NULL | TAG_FALSE | TAG_TRUE => body,
-        TAG_NUMBER | TAG_STRING => take_text(body)?.1,
+        TAG_NUMBER | TAG_STRING => text(body)?,
         TAG_ARRAY | TAG_OBJECT => {
             let (count, mut rest) = take_len(body)?;
             for _ in 0..count {
                 if tag == TAG_OBJECT {
-                    rest = take_text(rest)?.1;
+                    rest = text(rest)?;
                 }
-                rest = take_value(rest)?.1;
+                rest = take_value(rest, check)?.1;
             }
             rest
         }
@@ -362,12 +378,13 @@ fn take_value(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// The encoded value at the start of `bytes` and the bytes after it, or
 /// `None` when they do not start with a well-formed value.
 pub(crate) fn split_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    take_value(bytes)
+    take_value(bytes, false)
 }
 
 /// The value of an encoded key split off by `split_key`, or `None` when a
 /// number in it does not parse.
 pub(crate) fn decode(key: &[u8]) -> Option<Value> {
+    take_value(key, true)?;
     to_value(Encoded(key))
 }
 
@@ -420,7 +437,7 @@ impl<'a> Iterator for EncodedMembers<'a> {
             name = text;
             self.rest = rest;
         }
-        let (value, rest) = take_value(self.rest)?;
+        let (value, rest) = take_value(self.rest, false)?;
         self.rest = rest;
         Some((name, Encoded(value)))
     }

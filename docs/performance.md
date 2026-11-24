@@ -367,6 +367,64 @@ What the numbers say:
   - The rule for keeping it was a gain of at least 10% at 10,000 documents and
     no loss at 250 or 1,000; the four-client loss at 10,000 failed it.
 
+## Views on disk (2026-11)
+
+Views moved from a sorted copy of every queried view held in memory to a
+key-ordered table in each view's redb file
+(docs/superpowers/specs/2026-11-24-on-disk-view-index-design.md). Map
+queries read and stream from the file. Reduce combines stored per-block
+partials, with a small per-shard cache of the block list and of the
+partial levels. The numbers below compare the last in-memory build
+(`d751cde`) with the final on-disk one, on the same generated data.
+
+| | |
+|---|---|
+| Date | 2026-11-24 |
+| Machine | Apple M2 Pro, 10 cores, 32 GiB, macOS 27; scratch on an external SSD |
+| Build | `cargo build --release` |
+| Server | single node, `--q 4 --n 1` |
+| Data | 250,000 documents; ten views of four rows per document (1M rows each, `_sum` reduce); a partitioned database of 100,000 documents, one partition each |
+| Reproduce | `python3 scripts/view_bench.py --binary <douchdb> --scratch <dir>` |
+
+| Measure | In memory | On disk |
+|---|---:|---:|
+| Memory (RSS) after querying the ten views | 5,814 MB | 391 MB |
+| Map query, `limit=10`, p50 | 1.44 ms | 1.19 ms |
+| Map query, `limit=1000`, p50 | 5.21 ms | 2.10 ms |
+| Map query, all 1M rows | 1,283 ms | 1,190 ms |
+| Reduce, whole view, p50 | 0.78 ms | 0.31 ms |
+| Reduce, key range, p50 | 1.10 ms | 1.19 ms |
+| Reduce, `group_level=1` (100 groups), p50 | 6.4 ms | 59 ms |
+| Reduce, `group=true&limit=1000`, p50 | 3,414 ms | 67 ms |
+| Update of 1,000 documents, then a query, p50 | 140 ms | 295 ms |
+| Index build, per view | 5.3 s | 8.2 s |
+| First map query after a restart | 1,768 ms | 376 ms |
+| First reduce after a restart (another view) | 2,069 ms | 1,773 ms |
+| Memory after a restart and two queries | 1,734 MB | 181 MB |
+| Partition map query, p50 | 0.26 ms | 0.33 ms |
+| Partition reduce, p50 | 0.26 ms | 0.27 ms |
+
+The machine was not quiet: across runs of the same binary, loading the
+documents took 2.7 to 8.4 seconds. Read differences under about 30% as noise.
+
+What the numbers say:
+
+- Memory no longer grows with the views queried. What is left per open view
+  is redb's page cache (1 MB) and the cached block list and partial levels,
+  about one entry per 64 rows.
+- `group=true` with a limit is far faster: only the first `skip + limit`
+  groups of each shard are reduced.
+- `group_level` reduce over groups that start and end mid-block is about 9x
+  slower. Each group's edges, up to 128 rows, are read from the file and
+  reduced, and its end is found with a few seeks.
+- Updates cost about twice as much: each changed row is written to the
+  by-document and the key-ordered tables and counted in its block. A build
+  is about 1.6x slower for the same reason, but no longer holds the view in
+  memory to sort it.
+- The first reduce after a restart is dominated by redb's integrity check of
+  a file whose previous close did not finish its check before the process
+  exited.
+
 ## JavaScript sandbox throughput
 
 Design-document map/reduce/search-index work can run in four places: in-process
@@ -445,10 +503,10 @@ surface and deadline/memory limits.
   view query fan out across shards and can use more cores.
 - This is a snapshot on one machine, not an SLO. Run the same script on the
   target hardware before sizing a deployment.
-- Open view indexes keep their sorted row snapshot in memory, and each shard
-  keeps its live `_all_docs` map in memory once a range query has used it. Those
-  are what make reads cheap, but a deployment with many large views or databases
-  should account for the memory.
+- Each shard keeps its live `_all_docs` map in memory once a range query has
+  used it. That is what makes those reads cheap, but a deployment with many
+  large databases should account for the memory. Views no longer hold their
+  rows in memory (see Views on disk).
 
 ## Future optimizations suggested by the baseline
 

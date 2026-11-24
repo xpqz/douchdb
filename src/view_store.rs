@@ -31,7 +31,7 @@ use crate::js::JsError;
 
 /// Rows a block holds, about: a block splits past twice this and merges
 /// below half of it. Small in tests, so splits and merges happen.
-pub(crate) const BLOCK_ROWS: u64 = if cfg!(test) { 4 } else { 256 };
+pub(crate) const BLOCK_ROWS: u64 = if cfg!(test) { 4 } else { 64 };
 
 /// `ViewKey` → the row's value as sealed JSON.
 pub(crate) const BY_KEY: TableDefinition<ViewKey, &[u8]> = TableDefinition::new("by_key");
@@ -506,6 +506,11 @@ impl ShardBlocks {
         self.starts.get(at + 1).copied().unwrap_or(self.total)
     }
 
+    /// The position each block starts at, in order.
+    pub(crate) fn starts(&self) -> &[u64] {
+        &self.starts
+    }
+
     /// The fence of block `at`: the key its `PARTIALS` entry is under.
     pub(crate) fn fence(&self, at: usize) -> &[u8] {
         &self.fences[at]
@@ -590,18 +595,26 @@ pub(crate) fn read_at(
         .collect()
 }
 
-/// The first row of each block from position `from` on, with its position:
-/// what a search over positions probes before it reads a whole block.
-pub(crate) fn block_starts(blocks: &ShardBlocks, from: u64, to: u64) -> Vec<u64> {
-    let mut starts = vec![from];
-    starts.extend(
-        blocks
-            .starts
-            .iter()
-            .copied()
-            .filter(|&start| start > from && start < to),
-    );
-    starts
+/// The `ViewKey` of the shard's row at position `at`, if there is one.
+pub(crate) fn read_key_at(
+    by_key: &impl ReadableTable<ViewKey, &'static [u8]>,
+    blocks: &ShardBlocks,
+    at: u64,
+) -> Result<Option<Vec<u8>>, JsError> {
+    if at >= blocks.total {
+        return Ok(None);
+    }
+    let block = blocks.starts.partition_point(|&start| start <= at) - 1;
+    let skip = usize::try_from(at - blocks.starts[block]).map_err(store_error)?;
+    by_key
+        .range::<&[u8]>(blocks.fences[block].as_slice()..)
+        .map_err(store_error)?
+        .nth(skip)
+        .map(|entry| {
+            let (key, _) = entry.map_err(store_error)?;
+            Ok(key.value().to_vec())
+        })
+        .transpose()
 }
 
 /// Check the invariants of the key-ordered tables against `rows` (the
