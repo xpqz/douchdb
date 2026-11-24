@@ -564,8 +564,8 @@ pub struct Db {
     view_rows_visited: Arc<AtomicU64>,
 }
 
-/// Documents `map_docs` reads at a time.
-const MAP_DOCS_PAGE: usize = 1000;
+/// Documents an index build reads at a time.
+pub(crate) const MAP_DOCS_PAGE: usize = 1000;
 
 /// Where a paged `map_docs_page` read has got to.
 #[derive(Default)]
@@ -2324,11 +2324,8 @@ impl Db {
         Ok((head, rows))
     }
 
-    /// Documents for a view build, as JSON text with `_id` and `_rev` already
-    /// spliced into the stored body. This avoids parsing every body into a
-    /// `Value` and serializing it again just to hand it to QuickJS.
-    /// View documents from selected shards. Cluster nodes pass their owned
-    /// shards so replicas do not pay to index documents they never serve.
+    /// Every page `map_docs_page` would return, for tests to compare with.
+    #[cfg(test)]
     pub async fn map_docs(&self, owned: Option<&ShardMask>) -> DbResult<Vec<(String, String)>> {
         let mut docs = Vec::new();
         let mut cursor = MapCursor::default();
@@ -2343,10 +2340,14 @@ impl Db {
         }
     }
 
-    /// The next at most `limit` documents `map_docs` would return, in shard
+    /// The next at most `limit` documents for a view or search build, in shard
     /// and id order, and none once they are all read. A caller that maps each
     /// page before asking for the next holds one page of bodies, not every
-    /// body in the database.
+    /// body in the database. Each is JSON text with `_id` and `_rev` already
+    /// spliced into the stored body, which avoids parsing every body into a
+    /// `Value` and serializing it again just to hand it to QuickJS. Cluster
+    /// nodes pass their owned shards so replicas do not pay to index
+    /// documents they never serve.
     pub async fn map_docs_page(
         &self,
         owned: Option<&ShardMask>,

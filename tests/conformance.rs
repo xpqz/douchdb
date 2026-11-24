@@ -15248,6 +15248,55 @@ async fn quickjs_sandbox_exposes_no_host_globals() {
     }
 }
 
+/// Every sandbox hands back the number text QuickJS produced: large integers
+/// and long decimals from map and reduce functions read the same whichever
+/// mode ran them.
+#[tokio::test]
+async fn sandboxes_agree_on_emitted_number_text() {
+    let mut seen: Option<(String, String)> = None;
+    for mode in ["native", "process", "wasm"] {
+        if !sandbox_tested(mode) {
+            continue;
+        }
+        let args = vec!["--js-sandbox".to_string(), mode.to_string()];
+        let s = Server::start_with(&args, false);
+        let db = format!("jsnumbers{mode}");
+        s.fresh_db(&db).await;
+        let (status, _) = s.put(&format!("/{db}/doc"), json!({"v": 1})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = s
+            .put(
+                &format!("/{db}/_design/v"),
+                json!({"views": {
+                    "n": {"map": "function(doc){ emit(doc._id, [12345678901234567000, 1e21, 0.1 + 0.2, -9007199254740993, 123.456e-300]); }"},
+                    "r": {"map": "function(doc){ emit(doc._id, 1); }",
+                          "reduce": "function(k, v){ return [12345678901234567000, 1e21, 0.1 + 0.2, -9007199254740993, 123.456e-300]; }"}
+                }}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut value = String::new();
+        for view in ["n", "r"] {
+            let url = format!("{}/{db}/_design/v/_view/{view}", s.base);
+            let text = s
+                .client
+                .get(&url)
+                .send()
+                .await
+                .expect("view")
+                .text()
+                .await
+                .expect("view body");
+            let start = text.find("\"value\":").expect("a value") + 8;
+            value.push_str(&text[start..text[start..].find(']').unwrap() + start + 1]);
+        }
+        match &seen {
+            None => seen = Some((mode.to_string(), value)),
+            Some((first, expected)) => assert_eq!(&value, expected, "{mode} vs {first}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn view_rows_keep_the_original_id_when_map_changes_doc_id() {
     // CouchDB takes the row id from the stored document, not from the object
@@ -16699,10 +16748,11 @@ async fn server_admin_endpoints_reject_anonymous_and_non_admin_callers() {
     }
 }
 
-/// CouchDB 3.5 answers `HEAD /{db}/_security` with 200 and the headers of the
-/// GET, `content-length` included, and no body.
+/// CouchDB 3.5 (mochiweb) answers a HEAD of `_security`, `_revs_limit` and
+/// `_purged_infos_limit` with 200 and the headers of the GET, `content-length`
+/// included, and no body, and the HEAD changes nothing.
 #[tokio::test]
-async fn head_security_matches_get_headers_without_a_body() {
+async fn head_of_get_put_endpoints_matches_get_headers_without_a_body() {
     let s = Server::start(false);
     s.fresh_db("headsec").await;
     let (status, _) = s
@@ -16713,24 +16763,34 @@ async fn head_security_matches_get_headers_without_a_body() {
         .await;
     assert_eq!(status, StatusCode::OK);
 
-    let url = format!("{}/headsec/_security", s.base);
-    let get = s.client.get(&url).send().await.expect("get");
-    assert_eq!(get.status(), StatusCode::OK);
-    let content_type = get.headers().get("content-type").cloned();
-    let length = get.bytes().await.expect("get body").len();
-    assert!(length > 0);
+    for endpoint in ["_security", "_revs_limit", "_purged_infos_limit"] {
+        let url = format!("{}/headsec/{endpoint}", s.base);
+        let get = s.client.get(&url).send().await.expect("get");
+        assert_eq!(get.status(), StatusCode::OK, "{endpoint}");
+        let content_type = get.headers().get("content-type").cloned();
+        let before = get.bytes().await.expect("get body");
+        assert!(!before.is_empty(), "{endpoint}");
 
-    let head = s.client.head(&url).send().await.expect("head");
-    assert_eq!(head.status(), StatusCode::OK);
-    assert_eq!(head.headers().get("content-type"), content_type.as_ref());
-    assert_eq!(
-        head.headers()
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok()),
-        Some(length)
-    );
-    assert!(head.bytes().await.expect("head body").is_empty());
+        let head = s.client.head(&url).send().await.expect("head");
+        assert_eq!(head.status(), StatusCode::OK, "{endpoint}");
+        assert_eq!(
+            head.headers().get("content-type"),
+            content_type.as_ref(),
+            "{endpoint}"
+        );
+        assert_eq!(
+            head.headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(before.len()),
+            "{endpoint}"
+        );
+        assert!(head.bytes().await.expect("head body").is_empty());
+
+        let after = s.client.get(&url).send().await.expect("get");
+        assert_eq!(after.bytes().await.expect("get body"), before, "{endpoint}");
+    }
 }
 
 #[tokio::test]
