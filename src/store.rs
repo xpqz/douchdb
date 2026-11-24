@@ -2375,6 +2375,7 @@ impl<'s> ShardTxn<'s> {
     }
 
     /// See [`Shard::release_indexes`].
+    #[cfg(test)]
     pub fn release_indexes(&mut self) {
         self.shard.release_indexes();
     }

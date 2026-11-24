@@ -9863,8 +9863,9 @@ async fn write_to_one_node(node: &Server, db: &str, docs: Vec<Value>) {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
-/// In a cluster `_dbs_info` reports the same sequence tokens and sizes as
-/// `GET /{db}`: positions on every shard range, not only this node's copies.
+/// In a cluster `_dbs_info` reports the same sequence tokens, sizes and
+/// document counts as `GET /{db}`: over every shard range, not only this
+/// node's copies.
 #[tokio::test]
 async fn cluster_dbs_info_matches_db_info() {
     let nodes = start_cluster_sharded(3, 4, 1);
@@ -9883,7 +9884,17 @@ async fn cluster_dbs_info_matches_db_info() {
         .await;
     assert_eq!(status, StatusCode::OK, "{many}");
     let listed = &many[0]["info"];
-    for field in ["update_seq", "purge_seq", "sizes"] {
+    // Counted over one copy of every shard range, as CouchDB's fabric_db_info
+    // does, not over this node's copies only.
+    assert_eq!(info["doc_count"], 12, "{info}");
+    assert_eq!(info["doc_del_count"], 0, "{info}");
+    for field in [
+        "update_seq",
+        "purge_seq",
+        "sizes",
+        "doc_count",
+        "doc_del_count",
+    ] {
         assert_eq!(listed[field], info[field], "{field}: {listed} vs {info}");
     }
 }

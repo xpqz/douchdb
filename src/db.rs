@@ -845,19 +845,6 @@ impl Db {
         }))
     }
 
-    /// Drop every shard's lazily built indexes so an idle database holds none
-    /// of them; the next query rebuilds what it needs from the shards' records.
-    pub async fn release_indexes(&self) {
-        for shard in &self.shards {
-            let _ = shard
-                .read(|shard| {
-                    shard.release_indexes();
-                    Ok(())
-                })
-                .await;
-        }
-    }
-
     /// Close the shard files without the close-time integrity check when the
     /// last handle to this database goes: the process is exiting.
     pub fn skip_close_checks(&self) {
@@ -870,19 +857,6 @@ impl Db {
     #[cfg(test)]
     pub(crate) fn shard_handle(&self, index: usize) -> &ShardHandle {
         &self.shards[index]
-    }
-
-    /// Entries the shards hold in their live and latest-changes indexes.
-    #[cfg(test)]
-    pub async fn index_entries(&self) -> usize {
-        let mut total = 0;
-        for shard in &self.shards {
-            total += shard
-                .read(|shard| Ok(shard.index_entries()))
-                .await
-                .unwrap_or(0);
-        }
-        total
     }
 
     /// Whether the database can be closed and reopened without losing
