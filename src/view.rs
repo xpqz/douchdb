@@ -102,12 +102,9 @@ struct ViewIndex {
     retired: Arc<AtomicBool>,
     cursor: IndexCursor,
     design: String,
-    /// Shard count and partitioning of the database and view, used to split
-    /// the cached rows.
+    /// Shard count and partitioning of the database and view: where each
+    /// document's rows are stored.
     placement: Placement,
-    /// Sorted rows for the current index state. Warm queries reuse this
-    /// instead of scanning and parsing every stored row on each request.
-    cached: Option<Arc<ViewRows>>,
 }
 
 /// How a view's rows are split.
@@ -153,16 +150,15 @@ impl Placement {
 /// result rather than the size of the index. A partition's run is its own
 /// sorted run, so a partition query never walks the other partitions that
 /// share its shard.
+#[cfg(test)]
 #[derive(Default)]
 pub struct ViewRows {
     shards: Vec<ShardRows>,
-    /// Per run, partial reductions for one reducer: built by the first
-    /// reduce that needs them and kept up to date across writes.
-    blocks: Vec<StdMutex<Option<BlockTree>>>,
     /// For a partitioned view, which run belongs to which partition and shard.
     partitions: Option<Partitions>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 struct Partitions {
     by_name: HashMap<String, usize>,
@@ -180,10 +176,12 @@ fn run_name(id: &str) -> String {
 
 /// Rows per storage block of a shard. A write copies only the blocks it
 /// changes, and a copy of the view shares the rest.
+#[cfg(test)]
 const ROW_BLOCK: usize = 256;
 
 /// One shard's rows in key order, held in blocks of about `ROW_BLOCK` rows.
 /// No block is empty.
+#[cfg(test)]
 #[derive(Clone, Default)]
 struct ShardRows {
     blocks: Vec<Arc<Vec<Row>>>,
@@ -201,6 +199,8 @@ trait Positions {
     fn point(&self, pred: &dyn Fn(&Row) -> bool) -> usize;
     /// The rows at `chosen` positions, in position order.
     fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row>;
+    /// The row at position `at`, which must be below `count()`.
+    fn row_at(&self, at: usize) -> Row;
 }
 
 impl<S: SortedRows + ?Sized> Positions for S {
@@ -214,6 +214,10 @@ impl<S: SortedRows + ?Sized> Positions for S {
 
     fn rows_at(&self, chosen: &BTreeSet<usize>) -> Vec<Row> {
         chosen.iter().map(|&at| self.row(at).clone()).collect()
+    }
+
+    fn row_at(&self, at: usize) -> Row {
+        self.row(at).clone()
     }
 }
 
@@ -238,6 +242,7 @@ impl<R: AsRef<Row>> SortedRows for [R] {
     }
 }
 
+#[cfg(test)]
 impl SortedRows for ShardRows {
     fn len(&self) -> usize {
         self.starts.last().copied().unwrap_or(0)
@@ -260,6 +265,7 @@ impl SortedRows for ShardRows {
     }
 }
 
+#[cfg(test)]
 impl ShardRows {
     fn from_sorted(rows: Vec<Row>) -> ShardRows {
         let mut rows = rows.into_iter();
@@ -296,155 +302,7 @@ impl ShardRows {
             .saturating_sub(1)
             .min(self.blocks.len())
     }
-
-    fn range(&self, first: usize, end: usize) -> impl Iterator<Item = &Row> + Clone {
-        let block = self.block_of(first);
-        let skip = first - self.starts.get(block).copied().unwrap_or(first);
-        self.blocks[block..]
-            .iter()
-            .flat_map(|rows| rows.iter())
-            .skip(skip)
-            .take(end.saturating_sub(first))
-    }
-
-    /// Positions of the rows `(id, key)` emitted by the documents being
-    /// replaced, sorted. A document's rows with one key are adjacent.
-    fn positions(&self, gone: &[(&str, &Value)]) -> Vec<usize> {
-        let order =
-            |a: &(&str, &Value), b: &(&str, &Value)| cmp_json(a.1, b.1).then_with(|| a.0.cmp(b.0));
-        let mut gone = gone.to_vec();
-        gone.sort_by(order);
-        let mut positions = Vec::new();
-        for run in gone.chunk_by(|a, b| order(a, b) == Ordering::Equal) {
-            let (id, key) = run[0];
-            let row_order = |row: &Row| order(&(row.id.as_str(), &row.key), &(id, key));
-            let first = self.partition_point(|row| row_order(row) == Ordering::Less);
-            let end = self.partition_point(|row| row_order(row) != Ordering::Greater);
-            if end - first == run.len() {
-                positions.extend(first..end);
-            } else {
-                // Not where its stored key says (a float that did not survive
-                // the round trip exactly): find the document's rows by id
-                // instead, so a stale row can never be left behind.
-                positions.extend(
-                    self.range(0, self.len())
-                        .enumerate()
-                        .filter(|(_, row)| row.id == id)
-                        .map(|(at, _)| at),
-                );
-            }
-        }
-        positions.sort_unstable();
-        positions.dedup();
-        positions
-    }
-
-    /// Remove the rows at sorted `removed` positions and merge in sorted
-    /// `added`. Returns each added row's position among the kept rows.
-    fn replace(&mut self, removed: &[usize], added: Vec<Row>) -> Vec<usize> {
-        let mut touched = vec![false; self.blocks.len()];
-        let mut next = 0;
-        while next < removed.len() {
-            let block = self.block_of(removed[next]);
-            let (start, end) = (self.starts[block], self.starts[block + 1]);
-            let upto = next + removed[next..].partition_point(|at| *at < end);
-            let mut gone = removed[next..upto].iter().map(|at| at - start).peekable();
-            let mut at = 0;
-            Arc::make_mut(&mut self.blocks[block]).retain(|_| {
-                let drop = gone.next_if_eq(&at).is_some();
-                at += 1;
-                !drop
-            });
-            touched[block] = true;
-            next = upto;
-        }
-        // Drop emptied blocks so every block has a last row to search by.
-        let mut flags = touched.into_iter();
-        let mut touched = Vec::new();
-        self.blocks.retain(|rows| {
-            let flag = flags.next().unwrap_or(false);
-            if !rows.is_empty() {
-                touched.push(flag);
-            }
-            !rows.is_empty()
-        });
-        self.index();
-
-        let inserted: Vec<usize> = added
-            .iter()
-            .map(|row| self.partition_point(|kept| row_cmp(kept, row) == Ordering::Less))
-            .collect();
-        if !added.is_empty() && self.blocks.is_empty() {
-            self.blocks.push(Arc::default());
-            touched.push(true);
-        }
-        // A row goes to the block holding the kept row it lands before, or
-        // to the last block when it lands after every kept row.
-        let mut added = added.into_iter().zip(&inserted).peekable();
-        while let Some((row, &at)) = added.next() {
-            let block = self.block_of(at).min(self.blocks.len() - 1);
-            let mut run = vec![row];
-            while let Some((row, _)) =
-                added.next_if(|(_, &at)| self.block_of(at).min(self.blocks.len() - 1) == block)
-            {
-                run.push(row);
-            }
-            let rows = Arc::make_mut(&mut self.blocks[block]);
-            *rows = merge_sorted_rows(std::mem::take(rows), run);
-            touched[block] = true;
-        }
-        self.rebalance(&touched);
-        inserted
-    }
-
-    /// Split touched blocks grown past twice `ROW_BLOCK` and join those
-    /// shrunk below half of it to the next block.
-    fn rebalance(&mut self, touched: &[bool]) {
-        let mut blocks = Vec::with_capacity(self.blocks.len());
-        let mut carry: Vec<Row> = Vec::new();
-        for (rows, &touched) in std::mem::take(&mut self.blocks).into_iter().zip(touched) {
-            if !touched && carry.is_empty() {
-                blocks.push(rows);
-                continue;
-            }
-            carry.extend(Arc::unwrap_or_clone(rows));
-            if carry.len() >= ROW_BLOCK / 2 {
-                split_into(&mut blocks, std::mem::take(&mut carry));
-            }
-        }
-        if !carry.is_empty() {
-            if let Some(last) = blocks.pop() {
-                let mut rows = Arc::unwrap_or_clone(last);
-                rows.extend(carry);
-                carry = rows;
-            }
-            split_into(&mut blocks, carry);
-        }
-        self.blocks = blocks;
-        self.index();
-    }
 }
-
-/// Push `rows` as one block, or as even pieces of about `ROW_BLOCK` when it
-/// is more than twice that.
-fn split_into(blocks: &mut Vec<Arc<Vec<Row>>>, rows: Vec<Row>) {
-    let pieces = if rows.len() > 2 * ROW_BLOCK {
-        rows.len().div_ceil(ROW_BLOCK)
-    } else {
-        1
-    };
-    let (size, extra) = (rows.len() / pieces, rows.len() % pieces);
-    let mut rows = rows.into_iter();
-    for piece in 0..pieces {
-        let take = size + usize::from(piece < extra);
-        blocks.push(Arc::new(rows.by_ref().take(take).collect()));
-    }
-}
-
-/// Rows per block when a shard's partials are built, and children per
-/// partial at each level above. A span reads whole partials at the highest
-/// level they fit, so it touches few rows or partials per level.
-const REDUCE_FANOUT: usize = 32;
 
 /// Partial reductions by group key (by requested key for a `keys` query),
 /// with the key itself.
@@ -472,185 +330,6 @@ impl PartialOrd for GroupKey {
 impl Ord for GroupKey {
     fn cmp(&self, other: &Self) -> Ordering {
         cmp_json(&self.0, &other.0)
-    }
-}
-
-/// A shard's partial reductions for the reducer `source`. Blocks of
-/// consecutive rows grow and shrink as writes add and remove rows, so a write
-/// marks only the blocks it touched for recomputation, plus their parents.
-#[derive(Clone)]
-struct BlockTree {
-    source: String,
-    spans: Arc<Spans>,
-    /// Blocks whose partial a write invalidated.
-    dirty: Vec<usize>,
-}
-
-/// Block boundaries and partials.
-#[derive(Clone, Default)]
-struct Spans {
-    /// The row each block starts at, then the shard's row count.
-    starts: Vec<usize>,
-    /// `levels[0]` holds each block's partial; each level above combines
-    /// `REDUCE_FANOUT` partials of the one below, and the last may be short.
-    levels: Vec<Vec<Value>>,
-}
-
-impl BlockTree {
-    fn build(rows: &ShardRows, reducer: &mut JsReducer) -> Result<BlockTree, JsError> {
-        let len = rows.len();
-        let mut starts: Vec<usize> = (0..len).step_by(REDUCE_FANOUT).collect();
-        starts.push(len);
-        let leaves = reduce_blocks(
-            rows,
-            starts.windows(2).map(|span| (span[0], span[1])),
-            reducer,
-        )?;
-        let mut spans = Spans {
-            starts,
-            levels: vec![leaves],
-        };
-        spans.build_upper(reducer)?;
-        Ok(BlockTree {
-            source: reducer.source().to_string(),
-            spans: Arc::new(spans),
-            dirty: Vec::new(),
-        })
-    }
-
-    /// Follow a write to the shard. `removed` holds the sorted positions of
-    /// the old rows dropped, and `inserted` each added row's index among the
-    /// rows kept. Returns false when there is no block to place a row in.
-    fn apply_write(&mut self, removed: &[usize], inserted: &[usize]) -> bool {
-        let spans = Arc::make_mut(&mut self.spans);
-        let count = spans.starts.len().saturating_sub(1);
-        if count == 0 {
-            return inserted.is_empty();
-        }
-        let mut sizes: Vec<usize> = spans.starts.windows(2).map(|w| w[1] - w[0]).collect();
-        let mut touched = vec![false; count];
-        for &block in &self.dirty {
-            touched[block] = true;
-        }
-        let mut next = 0;
-        for block in 0..count {
-            let upto = next + removed[next..].partition_point(|at| *at < spans.starts[block + 1]);
-            let dropped = upto - next;
-            next = upto;
-            if dropped > 0 {
-                sizes[block] -= dropped;
-                touched[block] = true;
-            }
-        }
-        // A row goes to the block holding the kept row it lands before, or
-        // to the last block when it lands after every kept row.
-        let mut kept_ends = Vec::with_capacity(count);
-        let mut end = 0;
-        for size in &sizes {
-            end += size;
-            kept_ends.push(end);
-        }
-        for &at in inserted {
-            let block = kept_ends.partition_point(|end| *end <= at).min(count - 1);
-            sizes[block] += 1;
-            touched[block] = true;
-        }
-
-        let mut leaves = std::mem::take(&mut spans.levels[0]).into_iter();
-        let mut starts = vec![0];
-        let mut kept_leaves = Vec::with_capacity(count);
-        let mut dirty = Vec::new();
-        let mut start = 0;
-        for (block, size) in sizes.into_iter().enumerate() {
-            let leaf = leaves.next().unwrap_or(Value::Null);
-            if size == 0 {
-                continue;
-            }
-            // A block that has grown past twice the build size is split.
-            let pieces = if touched[block] {
-                size.div_ceil(2 * REDUCE_FANOUT)
-            } else {
-                1
-            };
-            for piece in 0..pieces {
-                start += size / pieces + usize::from(piece < size % pieces);
-                starts.push(start);
-                if touched[block] {
-                    dirty.push(kept_leaves.len());
-                    kept_leaves.push(Value::Null);
-                } else {
-                    kept_leaves.push(leaf.clone());
-                }
-            }
-        }
-        if kept_leaves.len() != count {
-            // Parents group blocks by position, so they are rebuilt.
-            spans.levels.truncate(1);
-        }
-        spans.starts = starts;
-        spans.levels[0] = kept_leaves;
-        self.dirty = dirty;
-        true
-    }
-
-    /// Recompute what writes invalidated.
-    fn refresh(&mut self, rows: &ShardRows, reducer: &mut JsReducer) -> Result<(), JsError> {
-        let stale_upper =
-            self.spans.levels.len() == 1 && self.spans.levels[0].len() > REDUCE_FANOUT;
-        if self.dirty.is_empty() && !stale_upper {
-            return Ok(());
-        }
-        let spans = Arc::make_mut(&mut self.spans);
-        let fresh = reduce_blocks(
-            rows,
-            self.dirty
-                .iter()
-                .map(|&block| (spans.starts[block], spans.starts[block + 1])),
-            reducer,
-        )?;
-        for (&block, partial) in self.dirty.iter().zip(fresh) {
-            spans.levels[0][block] = partial;
-        }
-        if spans.levels.len() == 1 {
-            spans.build_upper(reducer)?;
-        } else {
-            let mut changed = std::mem::take(&mut self.dirty);
-            for level in 1..spans.levels.len() {
-                changed = changed
-                    .into_iter()
-                    .map(|child| child / REDUCE_FANOUT)
-                    .collect();
-                changed.dedup();
-                let below = &spans.levels[level - 1];
-                let fresh = combine_many(
-                    reducer,
-                    changed.iter().map(|&parent| {
-                        &below[parent * REDUCE_FANOUT
-                            ..((parent + 1) * REDUCE_FANOUT).min(below.len())]
-                    }),
-                )?;
-                for (&parent, partial) in changed.iter().zip(fresh) {
-                    spans.levels[level][parent] = partial;
-                }
-            }
-        }
-        self.dirty.clear();
-        Ok(())
-    }
-}
-
-impl Spans {
-    /// Add levels above the top one until a level fits in one parent.
-    fn build_upper(&mut self, reducer: &mut JsReducer) -> Result<(), JsError> {
-        while let Some(below) = self
-            .levels
-            .last()
-            .filter(|below| below.len() > REDUCE_FANOUT)
-        {
-            let above = combine_many(reducer, below.chunks(REDUCE_FANOUT))?;
-            self.levels.push(above);
-        }
-        Ok(())
     }
 }
 
@@ -692,46 +371,8 @@ fn combine_many<'a>(
         .collect()
 }
 
-/// The partials of the row spans `first..end`, with the custom reducer's
-/// calls in one batch. A span too long for one call is reduced on its own.
-fn reduce_blocks(
-    rows: &ShardRows,
-    spans: impl Iterator<Item = (usize, usize)>,
-    reducer: &mut JsReducer,
-) -> Result<Vec<Value>, JsError> {
-    let spans: Vec<(usize, usize)> = spans.collect();
-    if is_builtin(reducer.source()) || spans.iter().any(|(first, end)| end - first > REDUCE_CHUNK) {
-        return spans
-            .into_iter()
-            .map(|(first, end)| reduce_rows(rows.range(first, end), reducer))
-            .collect();
-    }
-    let calls = spans
-        .into_iter()
-        .map(|(first, end)| ReduceCall::rows(rows.range(first, end)));
-    reducer.call_many(calls)
-}
-
 fn is_builtin(source: &str) -> bool {
     Builtin::parse(source).is_some()
-}
-
-impl Clone for ViewRows {
-    fn clone(&self) -> Self {
-        ViewRows {
-            shards: self.shards.clone(),
-            partitions: self.partitions.clone(),
-            blocks: self
-                .blocks
-                .iter()
-                .map(|slot| StdMutex::new(lock_blocks(slot).clone()))
-                .collect(),
-        }
-    }
-}
-
-fn lock_blocks(slot: &StdMutex<Option<BlockTree>>) -> std::sync::MutexGuard<'_, Option<BlockTree>> {
-    slot.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// The rows a query can return, in key order, plus the counts CouchDB
@@ -742,6 +383,7 @@ pub struct Selection {
     pub offset: usize,
 }
 
+#[cfg(test)]
 impl ViewRows {
     fn from_rows(rows: Vec<Row>, placement: Placement) -> ViewRows {
         let mut view = ViewRows::default();
@@ -749,7 +391,6 @@ impl ViewRows {
             view.partitions = Some(Partitions::default());
         } else {
             view.shards = vec![ShardRows::default(); placement.q.max(1) as usize];
-            view.blocks = view.shards.iter().map(|_| StdMutex::new(None)).collect();
         }
         let mut runs: Vec<Vec<Row>> = vec![Vec::new(); view.shards.len()];
         for row in rows {
@@ -778,17 +419,8 @@ impl ViewRows {
                 entry.insert(run);
                 partitions.shard_of.push(placement.shard_of(id));
                 self.shards.push(ShardRows::default());
-                self.blocks.push(StdMutex::new(None));
                 run
             }
-        }
-    }
-
-    /// The run of document `id`, if it has one.
-    fn existing_run(&self, id: &str, placement: Placement) -> Option<usize> {
-        match &self.partitions {
-            Some(partitions) => partitions.by_name.get(&run_name(id)).copied(),
-            None => Some(placement.shard_of(id)),
         }
     }
 
@@ -815,87 +447,6 @@ impl ViewRows {
         runs.into_iter()
             .filter(|run| mask.is_none_or(|mask| mask.covers(self.shard_of_run(*run))))
             .collect()
-    }
-
-    /// Replace the rows `removed` (each an id and key) of the documents
-    /// that changed with `added`, run by run. Only the blocks holding
-    /// those rows are changed.
-    fn replace_docs(&mut self, removed: &[(String, Value)], added: Vec<Row>, placement: Placement) {
-        type Touched<'a> = (Vec<(&'a str, &'a Value)>, Vec<Row>);
-        let mut touched: HashMap<usize, Touched> = HashMap::new();
-        for (id, key) in removed {
-            if let Some(run) = self.existing_run(id, placement) {
-                touched.entry(run).or_default().0.push((id, key));
-            }
-        }
-        for row in added {
-            let run = self.run_for(&row.id, placement);
-            touched.entry(run).or_default().1.push(row);
-        }
-        for (run, (gone, mut rows)) in touched {
-            let positions = self.shards[run].positions(&gone);
-            sort_rows(&mut rows);
-            let inserted = self.shards[run].replace(&positions, rows);
-            if let Some(slot) = self.blocks.get_mut(run) {
-                let tree = slot.get_mut().unwrap_or_else(|poison| poison.into_inner());
-                if let Some(blocks) = tree.as_mut() {
-                    if !blocks.apply_write(&positions, &inserted) {
-                        *tree = None;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reduce `query` over the shards in `mask` (all when `None`), or over its
-    /// partition. Each range or group reads the stored partials of the blocks
-    /// it covers whole and reduces only the rows at its edges.
-    pub(crate) fn reduce(
-        &self,
-        query: &ViewQuery,
-        mask: Option<&crate::cluster::ShardMask>,
-        reducer: &mut JsReducer,
-        visited: &AtomicU64,
-    ) -> Result<Value, JsError> {
-        let mut partials = Partials::new();
-        let unique = query.keys.as_deref().map(unique_keys);
-        for index in self.runs_for(query, mask) {
-            let rows = &self.shards[index];
-            let blocks = self.block_partials(index, reducer, visited)?;
-            reduce_ranges(
-                rows,
-                query,
-                unique.as_deref(),
-                &mut partials,
-                &mut |ranges| reduce_spans(rows, &blocks, ranges, reducer, visited),
-            )?;
-        }
-        assemble_reduce(partials, query, reducer)
-    }
-
-    fn block_partials(
-        &self,
-        shard: usize,
-        reducer: &mut JsReducer,
-        visited: &AtomicU64,
-    ) -> Result<Arc<Spans>, JsError> {
-        let Some(slot) = self.blocks.get(shard) else {
-            return Ok(Arc::default());
-        };
-        let rows = &self.shards[shard];
-        let mut slot = lock_blocks(slot);
-        if let Some(tree) = slot.as_mut().filter(|tree| tree.source == reducer.source()) {
-            if let Err(error) = tree.refresh(rows, reducer) {
-                *slot = None;
-                return Err(error);
-            }
-            return Ok(Arc::clone(&tree.spans));
-        }
-        visit(visited, rows.len());
-        let tree = BlockTree::build(rows, reducer)?;
-        let spans = Arc::clone(&tree.spans);
-        *slot = Some(tree);
-        Ok(spans)
     }
 
     /// The in-memory selection, which the key-ordered table's must match.
@@ -931,13 +482,13 @@ struct RunWindow {
 /// A run as a selection reads it. Position lookups cannot fail in the
 /// `Positions` interface, so the first read error is kept here and returned
 /// once the selection is done.
-struct DiskRun<'v> {
-    table: &'v redb::ReadOnlyTable<crate::view_store::ViewKey, &'static [u8]>,
+struct DiskRun<'v, T> {
+    table: &'v T,
     window: RunWindow,
     error: std::cell::RefCell<Option<JsError>>,
 }
 
-impl DiskRun<'_> {
+impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> DiskRun<'_, T> {
     /// Rows `first..first + count` of the run.
     fn read(&self, first: u64, count: usize) -> Vec<Row> {
         let read = crate::view_store::read_at(
@@ -960,7 +511,7 @@ impl DiskRun<'_> {
         }
     }
 
-    fn into_result<T>(self, value: T) -> Result<T, JsError> {
+    fn into_result<V>(self, value: V) -> Result<V, JsError> {
         match self.error.into_inner() {
             Some(error) => Err(error),
             None => Ok(value),
@@ -968,7 +519,7 @@ impl DiskRun<'_> {
     }
 }
 
-impl Positions for DiskRun<'_> {
+impl<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>> Positions for DiskRun<'_, T> {
     fn count(&self) -> usize {
         self.window.len as usize
     }
@@ -1001,6 +552,52 @@ impl Positions for DiskRun<'_> {
         }
         rows
     }
+
+    fn row_at(&self, at: usize) -> Row {
+        self.read(at as u64, 1).pop().unwrap_or(Row {
+            id: String::new(),
+            key: Value::Null,
+            value: Value::Null,
+        })
+    }
+}
+
+/// The runs `query` reads in the shards of `mask` (all when `None`): each
+/// shard, or for a view queried by partition, the partition's rows in it.
+fn run_windows(
+    blocks: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
+    by_key: &impl ReadableTable<crate::view_store::ViewKey, &'static [u8]>,
+    placement: Placement,
+    query: &ViewQuery,
+    mask: Option<&crate::cluster::ShardMask>,
+) -> Result<Vec<RunWindow>, JsError> {
+    let mut windows = Vec::new();
+    for shard in 0..placement.q.max(1) {
+        if mask.is_some_and(|mask| !mask.covers(shard as usize)) {
+            continue;
+        }
+        let shard_blocks = Arc::new(crate::view_store::shard_blocks(blocks, shard)?);
+        let (lo, hi) = if placement.by_partition {
+            let partition = query.partition.as_deref().ok_or_else(|| {
+                JsError::Index("a partitioned view is read by partition".to_string())
+            })?;
+            let start = crate::view_store::partition_start(shard, partition.as_bytes())?;
+            let end =
+                crate::view_store::partition_start(shard, &[partition.as_bytes(), &[0]].concat())?;
+            (
+                crate::view_store::rank(by_key, &shard_blocks, &start)?,
+                crate::view_store::rank(by_key, &shard_blocks, &end)?,
+            )
+        } else {
+            (0, shard_blocks.total)
+        };
+        windows.push(RunWindow {
+            blocks: shard_blocks,
+            lo,
+            len: hi - lo,
+        });
+    }
+    Ok(windows)
 }
 
 /// A stored row, from its `ViewKey` and value.
@@ -1022,8 +619,6 @@ impl DiskView {
             .map_err(index_error)
     }
 
-    /// The runs `query` reads in the shards of `mask` (all when `None`): each
-    /// shard, or for a view queried by partition, the partition's rows in it.
     fn windows(
         &self,
         query: &ViewQuery,
@@ -1033,36 +628,7 @@ impl DiskView {
             .txn
             .open_table(crate::view_store::BLOCKS)
             .map_err(index_error)?;
-        let by_key = self.by_key()?;
-        let mut windows = Vec::new();
-        for shard in 0..self.placement.q.max(1) {
-            if mask.is_some_and(|mask| !mask.covers(shard as usize)) {
-                continue;
-            }
-            let shard_blocks = Arc::new(crate::view_store::shard_blocks(&blocks, shard)?);
-            let (lo, hi) = if self.placement.by_partition {
-                let partition = query.partition.as_deref().ok_or_else(|| {
-                    JsError::Index("a partitioned view is read by partition".to_string())
-                })?;
-                let start = crate::view_store::partition_start(shard, partition.as_bytes())?;
-                let end = crate::view_store::partition_start(
-                    shard,
-                    &[partition.as_bytes(), &[0]].concat(),
-                )?;
-                (
-                    crate::view_store::rank(&by_key, &shard_blocks, &start)?,
-                    crate::view_store::rank(&by_key, &shard_blocks, &end)?,
-                )
-            } else {
-                (0, shard_blocks.total)
-            };
-            windows.push(RunWindow {
-                blocks: shard_blocks,
-                lo,
-                len: hi - lo,
-            });
-        }
-        Ok(windows)
+        run_windows(&blocks, &self.by_key()?, self.placement, query, mask)
     }
 
     /// The rows a map query can return from the shards in `mask` (all when
@@ -1074,7 +640,7 @@ impl DiskView {
         visited: &AtomicU64,
     ) -> Result<Selection, JsError> {
         let table = self.by_key()?;
-        let runs: Vec<DiskRun> = self
+        let runs: Vec<DiskRun<_>> = self
             .windows(query, mask)?
             .into_iter()
             .map(|window| DiskRun {
@@ -1251,30 +817,9 @@ fn equal_range<S: Positions + ?Sized>(rows: &S, key: &Value) -> (usize, usize) {
     )
 }
 
-/// Reduces row ranges, `first..end` each, to one value apiece.
-type SpanReducer<'a> = dyn FnMut(&[(usize, usize)]) -> Result<Vec<Value>, JsError> + 'a;
-
-/// Add one sorted shard's partial reductions for `query` to `partials`.
-/// `spans` reduces the row ranges it is given, `first..end` each, all at once
-/// so a sandboxed reducer is not called once per range.
-fn reduce_ranges<S: SortedRows + ?Sized>(
-    rows: &S,
-    query: &ViewQuery,
-    unique: Option<&[Value]>,
-    partials: &mut Partials,
-    spans: &mut SpanReducer,
-) -> Result<(), JsError> {
-    let ranges = query_ranges(rows, query, unique);
-    let values = spans(&ranges.iter().map(|(_, span)| *span).collect::<Vec<_>>())?;
-    for ((key, _), value) in ranges.into_iter().zip(values) {
-        add_partial(partials, key, value);
-    }
-    Ok(())
-}
-
 /// The groups of `query` in one sorted shard, each with its partial's key and
 /// the rows `first..end` it covers.
-fn query_ranges<S: SortedRows + ?Sized>(
+fn query_ranges<S: Positions + ?Sized>(
     rows: &S,
     query: &ViewQuery,
     unique: Option<&[Value]>,
@@ -1304,11 +849,11 @@ fn query_ranges<S: SortedRows + ?Sized>(
     let mut ranges = Vec::new();
     let mut start = lo;
     while start < hi {
-        let group = group_key(&rows.row(start).key, query.group_level);
+        let group = group_key(&rows.row_at(start).key, query.group_level);
         // Rows before `start` are in earlier groups, so the point over the
         // whole shard is the end of this group.
         let end = rows
-            .partition_point(|row| {
+            .point(&|row| {
                 cmp_json(&group_key(&row.key, query.group_level), &group) != Ordering::Greater
             })
             .min(hi);
@@ -1318,107 +863,119 @@ fn query_ranges<S: SortedRows + ?Sized>(
     ranges
 }
 
-/// One piece of a span's reduction: the rows at an edge, reduced with the
-/// edges of the other spans, or a stored partial.
-enum Piece {
-    Edge,
-    Stored(Value),
-}
-
-/// Reduce each of `ranges` (`first..end` of `rows`) from the largest stored
-/// partials it covers whole, plus the rows and partials at either edge. The
-/// edges of all ranges are reduced together, and then the pieces of all
-/// ranges are combined together, so a custom reducer is called in batches.
-fn reduce_spans(
-    rows: &ShardRows,
-    spans: &Spans,
+/// Reduce each of `ranges` (`first..end` of the run) from the stored
+/// partials of the blocks it covers whole, plus the rows at its edges. The
+/// edges, and the blocks whose partial is missing, are reduced together, and
+/// then the pieces of all ranges are combined together, so a custom reducer
+/// is called in batches. Each computed partial is stored; `stored` says
+/// whether any was.
+fn reduce_disk_spans<T: ReadableTable<crate::view_store::ViewKey, &'static [u8]>>(
+    run: &DiskRun<'_, T>,
+    partials: &mut redb::Table<'_, crate::view_store::ViewKey, &'static [u8]>,
     ranges: &[(usize, usize)],
     reducer: &mut JsReducer,
     visited: &AtomicU64,
+    stored: &mut bool,
 ) -> Result<Vec<Value>, JsError> {
-    let starts = &spans.starts;
-    let count = starts.len().saturating_sub(1);
-    let mut edges = Vec::new();
-    let mut plan: Vec<Vec<Piece>> = Vec::with_capacity(ranges.len());
+    /// A range's piece: rows reduced in the batch (`at` in it), or a block's
+    /// partial.
+    enum Part {
+        Rows(usize),
+        Block(usize),
+    }
+    let blocks = &run.window.blocks;
+    let lo = run.window.lo;
+    let mut row_sets: Vec<Vec<Row>> = Vec::new();
+    let mut known: HashMap<usize, Value> = HashMap::new();
+    let mut missing: Vec<usize> = Vec::new();
+    let mut plan: Vec<Vec<Part>> = Vec::with_capacity(ranges.len());
+    let edge = |first: u64, end: u64, parts: &mut Vec<Part>, sets: &mut Vec<Vec<Row>>| {
+        let rows = run.read(first - lo, (end - first) as usize);
+        visit(visited, rows.len());
+        parts.push(Part::Rows(sets.len()));
+        sets.push(rows);
+    };
     for &(first, end) in ranges {
-        // The whole blocks in the span: from the first block starting at or
-        // after `first` to the last ending at or before `end`.
-        let lo = starts[..count].partition_point(|start| *start < first);
-        let hi = starts[1..].partition_point(|end_of| *end_of <= end);
-        let mut pieces = Vec::new();
-        let mut edge = |first: usize, end: usize, pieces: &mut Vec<Piece>| {
-            visit(visited, end - first);
-            edges.push((first, end));
-            pieces.push(Piece::Edge);
-        };
-        match (starts.get(lo), starts.get(hi)) {
-            (Some(&block_lo), Some(&block_hi)) if lo < hi => {
-                if first < block_lo {
-                    edge(first, block_lo, &mut pieces);
+        let (first, end) = (lo + first as u64, lo + end as u64);
+        // The whole blocks in the range: from the first starting at or after
+        // `first` to the last ending at or before `end`.
+        let whole: Vec<usize> = (0..blocks.len())
+            .filter(|&at| {
+                blocks.start(at) >= first
+                    && blocks.end(at) <= end
+                    && blocks.start(at) < blocks.end(at)
+            })
+            .collect();
+        let mut parts = Vec::new();
+        match (whole.first(), whole.last()) {
+            (Some(&low), Some(&high)) => {
+                if first < blocks.start(low) {
+                    edge(first, blocks.start(low), &mut parts, &mut row_sets);
                 }
-                pieces.extend(
-                    block_parts(&spans.levels, lo, hi)
-                        .into_iter()
-                        .map(Piece::Stored),
-                );
-                if block_hi < end {
-                    edge(block_hi, end, &mut pieces);
+                for at in low..=high {
+                    if !known.contains_key(&at) && !missing.contains(&at) {
+                        match partials.get(blocks.fence(at)).map_err(index_error)? {
+                            Some(value) => {
+                                known.insert(at, decode_value(value.value())?);
+                            }
+                            None => missing.push(at),
+                        }
+                    }
+                    parts.push(Part::Block(at));
+                }
+                if blocks.end(high) < end {
+                    edge(blocks.end(high), end, &mut parts, &mut row_sets);
                 }
             }
-            _ => edge(first, end, &mut pieces),
+            _ => edge(first, end, &mut parts, &mut row_sets),
         }
-        plan.push(pieces);
+        plan.push(parts);
     }
-    let mut edges = reduce_blocks(rows, edges.into_iter(), reducer)?.into_iter();
+    // The missing partials' rows go in the same batch as the edges.
+    let first_missing = row_sets.len();
+    for &at in &missing {
+        let rows = run.read(
+            blocks.start(at) - lo,
+            (blocks.end(at) - blocks.start(at)) as usize,
+        );
+        visit(visited, rows.len());
+        row_sets.push(rows);
+    }
+    let mut reduced = reduce_row_sets(&row_sets, reducer)?;
+    for (offset, &at) in missing.iter().enumerate() {
+        let partial = reduced[first_missing + offset].clone();
+        partials
+            .insert(blocks.fence(at), encode_value(&partial)?.as_slice())
+            .map_err(index_error)?;
+        *stored = true;
+        known.insert(at, partial);
+    }
+    reduced.truncate(first_missing);
     let groups: Vec<Vec<Value>> = plan
         .into_iter()
-        .map(|pieces| {
-            pieces
+        .map(|parts| {
+            parts
                 .into_iter()
-                .map(|piece| match piece {
-                    Piece::Stored(value) => Ok(value),
-                    Piece::Edge => edges
-                        .next()
-                        .ok_or_else(|| JsError::Runtime("edge reduction missing".into())),
+                .map(|part| match part {
+                    Part::Rows(at) => reduced[at].clone(),
+                    Part::Block(at) => known[&at].clone(),
                 })
                 .collect()
         })
-        .collect::<Result<_, JsError>>()?;
+        .collect();
     combine_many(reducer, groups.iter().map(Vec::as_slice))
 }
 
-/// The fewest stored partials covering blocks `lo..hi`, in row order.
-fn block_parts(levels: &[Vec<Value>], lo: usize, hi: usize) -> Vec<Value> {
-    let mut left = Vec::new();
-    let mut right: Vec<&[Value]> = Vec::new();
-    let (mut lo, mut hi) = (lo, hi);
-    let mut level = 0;
-    let middle = loop {
-        let units = &levels[level];
-        let Some(parents) = levels.get(level + 1).map(Vec::len) else {
-            break &units[lo..hi];
-        };
-        // The last parent may be short; it is whole when the span reaches
-        // the end of this level.
-        let parent_lo = lo.div_ceil(REDUCE_FANOUT);
-        let parent_hi = if hi == units.len() {
-            parents
-        } else {
-            (hi / REDUCE_FANOUT).min(parents)
-        };
-        if parent_lo >= parent_hi {
-            break &units[lo..hi];
-        }
-        left.extend_from_slice(&units[lo..parent_lo * REDUCE_FANOUT]);
-        right.push(&units[(parent_hi * REDUCE_FANOUT).min(hi)..hi]);
-        (lo, hi) = (parent_lo, parent_hi);
-        level += 1;
-    };
-    left.extend_from_slice(middle);
-    for part in right.into_iter().rev() {
-        left.extend_from_slice(part);
+/// The reduction of each set of rows, with the custom reducer's calls in one
+/// batch. A set too long for one call is reduced on its own.
+fn reduce_row_sets(sets: &[Vec<Row>], reducer: &mut JsReducer) -> Result<Vec<Value>, JsError> {
+    if is_builtin(reducer.source()) || sets.iter().any(|rows| rows.len() > REDUCE_CHUNK) {
+        return sets
+            .iter()
+            .map(|rows| reduce_rows(rows.iter(), reducer))
+            .collect();
     }
-    left
+    reducer.call_many(sets.iter().map(|rows| ReduceCall::rows(rows.iter())))
 }
 
 fn reduce_rows<'a>(
@@ -1636,34 +1193,6 @@ pub fn sort_rows(rows: &mut [Row]) {
 
 fn row_cmp(a: &Row, b: &Row) -> Ordering {
     cmp_json(&a.key, &b.key).then_with(|| a.id.cmp(&b.id))
-}
-
-/// Merge two already-sorted row runs. On equal rows, `base` comes first.
-fn merge_sorted_rows(base: Vec<Row>, added: Vec<Row>) -> Vec<Row> {
-    let mut out = Vec::with_capacity(base.len() + added.len());
-    let mut base = base.into_iter().peekable();
-    let mut added = added.into_iter().peekable();
-    loop {
-        match (base.peek(), added.peek()) {
-            (Some(left), Some(right)) => {
-                if row_cmp(left, right) == Ordering::Greater {
-                    out.push(added.next().expect("peeked row"));
-                } else {
-                    out.push(base.next().expect("peeked row"));
-                }
-            }
-            (Some(_), None) => {
-                out.extend(base);
-                break;
-            }
-            (None, Some(_)) => {
-                out.extend(added);
-                break;
-            }
-            (None, None) => break,
-        }
-    }
-    out
 }
 
 /// An index registry entry. The index is opened once, by whichever request
@@ -2085,7 +1614,6 @@ impl ViewIndex {
             cursor,
             design,
             placement: Placement::shards(1, false),
-            cached: None,
         }
     }
 
@@ -2101,7 +1629,6 @@ impl ViewIndex {
                     .ok_or_else(|| JsError::Index("the view index is closed".to_string()))?;
                 let (db, state) = open_file(file)?;
                 (self.cursor, self.design) = state;
-                self.cached = None;
                 db
             }
         };
@@ -2135,13 +1662,13 @@ impl ViewIndex {
         drop(self.db.take());
         self.cursor = IndexCursor::default();
         self.design.clear();
-        self.cached = None;
         // A reopen that fails is retried on the next use.
         let _ = self.db();
     }
 
     /// Every row, in key order within each shard (and partition): the
     /// key-ordered table read through.
+    #[cfg(test)]
     fn load_rows(&mut self) -> Result<Vec<Row>, JsError> {
         let txn = self.db()?.begin_read().map_err(index_error)?;
         let table = txn
@@ -2160,24 +1687,20 @@ impl ViewIndex {
         Ok(rows)
     }
 
-    /// Sorted rows for the current index state. The first query after a
-    /// rebuild or incremental update pays for loading/sorting; later queries
-    /// reuse the same immutable snapshot.
+    /// Every row in memory, in the runs the in-memory reference selection
+    /// reads.
+    #[cfg(test)]
     fn sorted_rows(&mut self) -> Result<Arc<ViewRows>, JsError> {
-        if let Some(rows) = &self.cached {
-            return Ok(rows.clone());
-        }
-        let rows = Arc::new(ViewRows::from_rows(self.load_rows()?, self.placement));
-        self.cached = Some(rows.clone());
-        Ok(rows)
+        Ok(Arc::new(ViewRows::from_rows(
+            self.load_rows()?,
+            self.placement,
+        )))
     }
 
-    /// Record the database's placement; a change drops the cached split.
+    /// Record the database's placement: a change also changes the design
+    /// signature, so the index is rebuilt.
     fn set_placement(&mut self, placement: Placement) {
-        if self.placement != placement {
-            self.placement = placement;
-            self.cached = None;
-        }
+        self.placement = placement;
     }
 
     /// Replace the rows of the `changed` documents with `by_doc` and record
@@ -2189,10 +1712,6 @@ impl ViewIndex {
         cursor: IndexCursor,
         design: &str,
     ) -> Result<(), JsError> {
-        // The keys of the rows being replaced locate them in the snapshot.
-        let track = self.cached.is_some();
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
         let placement = self.placement;
         self.commit(|txn| {
             let mut tables = crate::view_store::Tables::open(txn)?;
@@ -2205,10 +1724,6 @@ impl ViewIndex {
                 for entry in table.range(rows.clone()).map_err(index_error)? {
                     let (_, stored) = entry.map_err(index_error)?;
                     let key = unsealed(stored.value())?;
-                    if track {
-                        let read = crate::view_store::read_row_key(key)?;
-                        removed.push((id.clone(), read.key));
-                    }
                     tables.by_key.remove(key).map_err(index_error)?;
                     edits.count(&tables, key, -1)?;
                 }
@@ -2219,7 +1734,6 @@ impl ViewIndex {
                 insert_rows(txn, &mut tables, rows, placement, |tables, key| {
                     edits.count(tables, key, 1)
                 })?;
-                added.extend(rows.iter().cloned());
             }
             let mut totals = read_totals(txn)?;
             for (&shard, &change) in &edits.totals {
@@ -2236,18 +1750,63 @@ impl ViewIndex {
             write_state(txn, &cursor, design)
         })?;
 
-        // Update the in-memory snapshot incrementally: drop rows for changed
-        // documents and merge in the new ones, in the blocks they touch.
-        if let Some(cached) = self.cached.take() {
-            // Reuse the cached allocation when no in-flight query still
-            // holds the snapshot; otherwise clone it.
-            let mut kept = Arc::try_unwrap(cached).unwrap_or_else(|cached| (*cached).clone());
-            kept.replace_docs(&removed, added, self.placement);
-            self.cached = Some(Arc::new(kept));
-        }
         self.cursor = cursor;
         self.design = design.to_string();
         Ok(())
+    }
+
+    /// Reduce `query` over the shards in `mask` (all when `None`), or over
+    /// its partition, from the key-ordered table. Each range or group
+    /// combines the stored partials of the blocks it covers whole with the
+    /// rows at its edges. A covered block without a partial is reduced from
+    /// its rows and its partial stored, in a cache write (no sync) committed
+    /// after the answer is made; a failed commit still gives the answer.
+    fn reduce(
+        &mut self,
+        query: &ViewQuery,
+        mask: Option<&crate::cluster::ShardMask>,
+        reducer: &mut JsReducer,
+        visited: &AtomicU64,
+    ) -> DbResult<Value> {
+        let placement = self.placement;
+        let txn = self
+            .db()
+            .and_then(|db| crate::kv::begin_cache_write(db).map_err(index_error))?;
+        let mut stored = false;
+        let answer = (|| {
+            let by_key = txn
+                .open_table(crate::view_store::BY_KEY)
+                .map_err(index_error)?;
+            let blocks = txn
+                .open_table(crate::view_store::BLOCKS)
+                .map_err(index_error)?;
+            let mut partials = txn
+                .open_table(crate::view_store::PARTIALS)
+                .map_err(index_error)?;
+            let mut out = Partials::new();
+            let unique = query.keys.as_deref().map(unique_keys);
+            for window in run_windows(&blocks, &by_key, placement, query, mask)? {
+                let run = DiskRun {
+                    table: &by_key,
+                    window,
+                    error: Default::default(),
+                };
+                let ranges = query_ranges(&run, query, unique.as_deref());
+                let spans: Vec<(usize, usize)> = ranges.iter().map(|(_, span)| *span).collect();
+                let values =
+                    reduce_disk_spans(&run, &mut partials, &spans, reducer, visited, &mut stored)?;
+                run.into_result(())?;
+                for ((key, _), value) in ranges.into_iter().zip(values) {
+                    add_partial(&mut out, key, value);
+                }
+            }
+            assemble_reduce(out, query, reducer)
+        })()
+        .map_err(|reason| reduce_failure(&reason))?;
+        if stored && txn.commit().is_err() {
+            self.close_after_failed_write();
+        }
+        Ok(answer)
     }
 
     /// Start replacing every stored row. The rows go in a page at a time
@@ -2292,7 +1851,6 @@ impl ViewIndex {
         }
         self.cursor = cursor;
         self.design = design.to_string();
-        self.cached = None;
         Ok(())
     }
 
@@ -2394,16 +1952,21 @@ pub async fn query_with_spec(
     let reduce = query.reduce.unwrap_or(spec.reduce.is_some());
     if let Some(reducer) = spec.reduce.as_deref().filter(|_| reduce) {
         check_query(spec, query)?;
-        let rows = ensure_rows(db, ddoc_id, view_name, spec, query.limits).await?;
         let visited = db.view_rows_counter();
         let reducer = reducer.to_string();
-        let query = query.clone();
-        return blocking(move || {
-            let mut js = JsReducer::new(&reducer, query.limits);
-            let mask = query.owner_shards.as_ref();
-            rows.reduce(&query, mask, &mut js, &visited)
-                .map_err(|reason| reduce_failure(&reason))
-        })
+        let owned = query.clone();
+        return ensure_index(
+            db,
+            ddoc_id,
+            view_name,
+            spec,
+            query.limits,
+            move |index, _| {
+                let mut js = JsReducer::new(&reducer, owned.limits);
+                let mask = owned.owner_shards.as_ref();
+                index.reduce(&owned, mask, &mut js, &visited)
+            },
+        )
         .await;
     }
     let selection = local_select(db, ddoc_id, view_name, spec, query).await?;
@@ -2833,7 +2396,9 @@ pub fn check_query(spec: &ViewSpec, query: &ViewQuery) -> DbResult<()> {
     Ok(())
 }
 
-/// The view's rows in memory, the index first brought up to date.
+/// The view's rows in memory, the index first brought up to date: the
+/// reference the key-ordered table's answers are checked against.
+#[cfg(test)]
 async fn ensure_rows(
     db: &Db,
     ddoc_id: &str,
@@ -2842,7 +2407,7 @@ async fn ensure_rows(
     limits: ViewLimits,
 ) -> DbResult<Arc<ViewRows>> {
     ensure_index(db, ddoc_id, view_name, spec, limits, |index, _| {
-        index.sorted_rows()
+        index.sorted_rows().map_err(ApiError::from)
     })
     .await
 }
@@ -2858,8 +2423,12 @@ async fn ensure_disk(
     limits: ViewLimits,
 ) -> DbResult<DiskView> {
     ensure_index(db, ddoc_id, view_name, spec, limits, |index, slot| {
+        let txn = index
+            .db()
+            .and_then(|db| db.begin_read().map_err(index_error))
+            .map_err(ApiError::from)?;
         Ok(DiskView {
-            txn: index.db()?.begin_read().map_err(index_error)?,
+            txn,
             placement: index.placement,
             _slot: slot,
         })
@@ -2876,9 +2445,7 @@ async fn ensure_index<T: Send + 'static>(
     view_name: &str,
     spec: &ViewSpec,
     limits: ViewLimits,
-    finish: impl FnOnce(&mut ViewIndex, Arc<AsyncMutex<ViewIndex>>) -> Result<T, JsError>
-        + Send
-        + 'static,
+    finish: impl FnOnce(&mut ViewIndex, Arc<AsyncMutex<ViewIndex>>) -> DbResult<T> + Send + 'static,
 ) -> DbResult<T> {
     let design = if NativeMap::parse(&spec.map).is_some() {
         format!(
@@ -2995,7 +2562,7 @@ async fn ensure_index<T: Send + 'static>(
         if index.cursor.same_copies_unpurged(&db.index_cursor()) {
             return blocking(move || {
                 let _gate = gate;
-                finish(&mut index, slot).map_err(ApiError::from)
+                finish(&mut index, slot)
             })
             .await;
         }
@@ -3042,17 +2609,15 @@ async fn ensure_index<T: Send + 'static>(
                 Some(rebuild) => rebuild,
                 None => index.start_rebuild()?,
             };
-            index
-                .finish_rebuild(rebuild, bound, &design)
-                .and_then(|()| finish(&mut index, slot))
-                .map_err(ApiError::from)
+            index.finish_rebuild(rebuild, bound, &design)?;
+            finish(&mut index, slot)
         })
         .await;
     }
 
     blocking(move || {
         let _gate = gate;
-        finish(&mut index, slot).map_err(ApiError::from)
+        finish(&mut index, slot)
     })
     .await
 }
@@ -4354,7 +3919,6 @@ pub(crate) fn number_value(value: f64) -> Value {
 mod tests {
     use super::*;
     use redb::StorageBackend;
-    use std::collections::HashSet;
     use std::time::Duration;
 
     fn reduce_value(
@@ -4973,310 +4537,11 @@ mod tests {
     }
 
     #[test]
-    fn block_partials_follow_writes() {
-        // One shard with enough blocks for a level of parents above them.
-        let placement = Placement::shards(1, false);
-        let base = ViewQuery {
-            inclusive_end: true,
-            limit: usize::MAX,
-            ..ViewQuery::default()
-        };
-        let queries = [
-            base.clone(),
-            ViewQuery {
-                group_level: 1,
-                ..base.clone()
-            },
-            ViewQuery {
-                startkey: Some(json!([3, 5])),
-                endkey: Some(json!([9, 2])),
-                ..base.clone()
-            },
-            ViewQuery {
-                startkey: Some(json!([1, 7])),
-                endkey: Some(json!([1, 9])),
-                inclusive_end: false,
-                ..base.clone()
-            },
-        ];
-        for reducer in [
-            "_sum",
-            "_stats",
-            "_approx_count_distinct",
-            "_top_3",
-            "_bottom_2",
-            "_first",
-            "_last",
-            "function(k, v, re){ return sum(v); }",
-        ] {
-            let spec = ViewSpec {
-                map: String::new(),
-                reduce: Some(reducer.to_string()),
-                partitioned: false,
-            };
-            let mut state = 0x9e37_79b9_7f4a_7c15u64;
-            let mut next = move |bound: u64| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state % bound
-            };
-            let doc_rows = |id: &str, count: u64, key: u64| -> Vec<Row> {
-                (0..count)
-                    .map(|i| Row {
-                        id: id.to_string(),
-                        key: json!([(key + i) % 13, (key * 7 + i) % 17]),
-                        value: json!(key * 10 + i),
-                    })
-                    .collect()
-            };
-            let mut rows: Vec<Row> = (0..1100)
-                .flat_map(|i| doc_rows(&format!("d{i}"), 1 + i % 3, i))
-                .collect();
-            sort_rows(&mut rows);
-            let mut view = ViewRows::from_rows(rows.clone(), placement);
-            let mut fresh = 1100;
-            for step in 0..80 {
-                let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-                let pick = |n: u64| ids[n as usize % ids.len()].clone();
-                let (changed, added): (Vec<String>, Vec<Row>) = match next(5) {
-                    // New documents, sometimes a burst on one key so a block
-                    // grows past its split size.
-                    0 => {
-                        let burst = if step % 4 == 0 { 70 } else { 1 };
-                        let key = next(1000);
-                        let docs: Vec<String> =
-                            (0..burst).map(|i| format!("n{}", fresh + i)).collect();
-                        fresh += burst;
-                        let added = docs.iter().flat_map(|id| doc_rows(id, 1, key)).collect();
-                        (docs, added)
-                    }
-                    // Deletes, sometimes every document with one key so
-                    // blocks empty.
-                    1 => {
-                        let docs: Vec<String> = if step % 3 == 0 {
-                            let key = rows[next(rows.len() as u64) as usize].key.clone();
-                            rows.iter()
-                                .filter(|row| row.key == key)
-                                .map(|row| row.id.clone())
-                                .collect()
-                        } else {
-                            vec![pick(next(1 << 20))]
-                        };
-                        (docs, Vec::new())
-                    }
-                    // Key changes move a document's rows between blocks.
-                    2 => {
-                        let id = pick(next(1 << 20));
-                        let added = doc_rows(&id, 1 + next(3), next(1000));
-                        (vec![id], added)
-                    }
-                    // A value change leaves the rows in place.
-                    3 => {
-                        let id = pick(next(1 << 20));
-                        let mut added: Vec<Row> =
-                            rows.iter().filter(|row| row.id == id).cloned().collect();
-                        for row in &mut added {
-                            row.value = json!(next(100));
-                        }
-                        (vec![id], added)
-                    }
-                    _ => {
-                        let docs: Vec<String> = (0..5).map(|_| pick(next(1 << 20))).collect();
-                        let added = docs
-                            .iter()
-                            .flat_map(|id| doc_rows(id, 2, next(1000)))
-                            .collect();
-                        (docs, added)
-                    }
-                };
-                view.replace_docs(&emitted(&rows, &changed), added.clone(), placement);
-                rows.retain(|row| !changed.contains(&row.id));
-                rows.extend(added);
-                sort_rows(&mut rows);
-                // Checking every third write also covers several writes
-                // landing before the next reduce.
-                if step % 3 != 2 {
-                    continue;
-                }
-                for query in &queries {
-                    let expected = render(&spec, &rows, &HashMap::new(), query).unwrap();
-                    let mut js = JsReducer::new(reducer, query.limits);
-                    let actual = view
-                        .reduce(query, None, &mut js, &AtomicU64::new(0))
-                        .unwrap();
-                    assert_eq!(actual, expected, "{reducer} step {step} {query:?}");
-                }
-            }
-        }
-    }
-
-    /// The id and key of each row the `changed` documents emitted.
-    fn emitted(rows: &[Row], changed: &[String]) -> Vec<(String, Value)> {
-        let changed: HashSet<&String> = changed.iter().collect();
-        rows.iter()
-            .filter(|row| changed.contains(&row.id))
-            .map(|row| (row.id.clone(), row.key.clone()))
-            .collect()
-    }
-
-    #[test]
-    fn shard_blocks_follow_writes() {
-        let placement = Placement::shards(1, false);
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move |bound: u64| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state % bound
-        };
-        // Documents emit one to three rows, sometimes with the same key twice.
-        let doc_rows = |id: &str, count: u64, key: u64| -> Vec<Row> {
-            (0..count)
-                .map(|i| Row {
-                    id: id.to_string(),
-                    key: json!(key + i / 2),
-                    value: json!(i),
-                })
-                .collect()
-        };
-        let mut rows: Vec<Row> = (0..3000)
-            .flat_map(|i| doc_rows(&format!("d{i}"), 1 + i % 3, i % 500))
-            .collect();
-        sort_rows(&mut rows);
-        let mut view = ViewRows::from_rows(rows.clone(), placement);
-        let mut fresh = 0;
-        for step in 0..300 {
-            let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-            let mut pick = || ids[next(ids.len() as u64) as usize].clone();
-            let (changed, added): (Vec<String>, Vec<Row>) = match step % 4 {
-                // A burst of new documents on one key grows a block past its
-                // split size.
-                0 => {
-                    let key = next(600);
-                    let count = if step % 40 == 0 { 600 } else { 1 + next(4) };
-                    let docs: Vec<String> = (0..count).map(|i| format!("n{}-{i}", fresh)).collect();
-                    fresh += 1;
-                    let added = docs.iter().flat_map(|id| doc_rows(id, 1, key)).collect();
-                    (docs, added)
-                }
-                // Deleting a run of keys empties and shrinks blocks.
-                1 => {
-                    let low = next(600);
-                    let width = if step % 10 == 1 { 40 } else { 1 };
-                    let docs: Vec<String> = rows
-                        .iter()
-                        .filter(|row| {
-                            row.key
-                                .as_u64()
-                                .is_some_and(|key| key >= low && key < low + width)
-                        })
-                        .map(|row| row.id.clone())
-                        .collect();
-                    (docs, Vec::new())
-                }
-                2 => {
-                    let id = pick();
-                    let added = doc_rows(&id, 1 + next(3), next(600));
-                    (vec![id], added)
-                }
-                _ => {
-                    let docs: Vec<String> = (0..3).map(|_| pick()).collect();
-                    let added = docs
-                        .iter()
-                        .flat_map(|id| doc_rows(id, 2, next(600)))
-                        .collect();
-                    (docs, added)
-                }
-            };
-            let mut changed = changed;
-            changed.sort();
-            changed.dedup();
-            let before = view.clone();
-            let gone = emitted(&rows, &changed);
-            let old = &before.shards[0];
-            let mut emptied: Vec<usize> = gone
-                .iter()
-                .map(|(id, key)| old.block_of(old.positions(&[(id.as_str(), key)])[0]))
-                .collect();
-            emptied.sort_unstable();
-            emptied.dedup();
-            // Blocks a write may copy: those it removes rows from or adds
-            // rows to, and a neighbour of each it joins.
-            let touched = 2 * (emptied.len() + added.len());
-            view.replace_docs(&gone, added.clone(), placement);
-            let set: HashSet<&String> = changed.iter().collect();
-            rows.retain(|row| !set.contains(&row.id));
-            rows.extend(added);
-            sort_rows(&mut rows);
-
-            let shard = &view.shards[0];
-            let actual: Vec<(&str, &Value, &Value)> = shard
-                .range(0, shard.len())
-                .map(|row| (row.id.as_str(), &row.key, &row.value))
-                .collect();
-            let expected: Vec<(&str, &Value, &Value)> = rows
-                .iter()
-                .map(|row| (row.id.as_str(), &row.key, &row.value))
-                .collect();
-            assert_eq!(actual, expected, "step {step}");
-            let sizes: Vec<usize> = shard.blocks.iter().map(|rows| rows.len()).collect();
-            assert!(
-                sizes.iter().all(|size| (1..=2 * ROW_BLOCK).contains(size)),
-                "step {step} {sizes:?}"
-            );
-            assert!(
-                sizes.iter().filter(|size| **size < ROW_BLOCK / 2).count() <= 1,
-                "step {step} {sizes:?}"
-            );
-            assert_eq!(shard.starts.len(), sizes.len() + 1, "step {step}");
-            for (block, size) in sizes.iter().enumerate() {
-                assert_eq!(shard.starts[block + 1] - shard.starts[block], *size);
-            }
-            // The blocks a write did not touch stay shared with the copy
-            // taken before it.
-            let shared = before.shards[0]
-                .blocks
-                .iter()
-                .filter(|old| shard.blocks.iter().any(|new| Arc::ptr_eq(old, new)))
-                .count();
-            assert!(
-                shared + touched >= before.shards[0].blocks.len(),
-                "step {step}: {shared} of {} blocks shared, {touched} touched",
-                before.shards[0].blocks.len()
-            );
-        }
-
-        // A row whose recorded key does not match is still found by its id.
-        let id = rows[rows.len() / 2].id.clone();
-        view.replace_docs(&[(id.clone(), json!("not its key"))], Vec::new(), placement);
-        let shard = &view.shards[0];
-        assert!(shard.range(0, shard.len()).all(|row| row.id != id));
-
-        // Two keys one step apart whose recorded keys both read back as the
-        // lower one: the run found is short, so both rows go by id.
-        let near = |key: f64| Row {
-            id: "near".into(),
-            key: json!(key),
-            value: json!(0),
-        };
-        let above = f64::from_bits(1.0f64.to_bits() + 1);
-        view.replace_docs(&[], vec![near(1.0), near(above)], placement);
-        view.replace_docs(
-            &[("near".into(), json!(1.0)), ("near".into(), json!(1.0))],
-            Vec::new(),
-            placement,
-        );
-        let shard = &view.shards[0];
-        assert!(shard.range(0, shard.len()).all(|row| row.id != "near"));
-    }
-
-    #[test]
     fn block_reductions_match_a_single_pass() {
         // Enough rows that every shard has several full blocks, keyed so
         // groups and ranges start and end inside blocks.
         let placement = Placement::shards(3, false);
-        let mut rows: Vec<Row> = (0..5000)
+        let mut rows: Vec<Row> = (0..1500)
             .map(|i| Row {
                 id: format!("d{i:05}"),
                 key: json!([i % 7, i % 11]),
@@ -5284,7 +4549,6 @@ mod tests {
             })
             .collect();
         sort_rows(&mut rows);
-        let mut view = ViewRows::from_rows(rows.clone(), placement);
         let base = ViewQuery {
             inclusive_end: true,
             limit: usize::MAX,
@@ -5328,7 +4592,7 @@ mod tests {
             },
             ViewQuery {
                 startkey: Some(json!([3, 4])),
-                startkey_docid: Some("d02000".into()),
+                startkey_docid: Some("d00700".into()),
                 ..base.clone()
             },
             ViewQuery {
@@ -5358,7 +4622,7 @@ mod tests {
         ];
         // Ranges that stop just short of, or exactly at, a shard's last row,
         // whose block is shorter than the rest.
-        for k in 50..64 {
+        for k in 4..18 {
             queries.push(ViewQuery {
                 endkey: Some(json!([6, 10])),
                 endkey_docid: Some(format!("d{:05}", 76 + 77 * k)),
@@ -5383,44 +4647,42 @@ mod tests {
             "_last",
             "function(k, v, re){ return sum(v); }",
         ];
-        let check = |view: &ViewRows, rows: &[Row], reducers: &[&str]| {
-            for &reducer in reducers {
-                let spec = ViewSpec {
-                    map: String::new(),
-                    reduce: Some(reducer.to_string()),
-                    partitioned: false,
-                };
-                for query in &queries {
-                    // The oracle filters by shard itself, independently of the
-                    // block tree under test.
-                    let visible: Vec<Row> = rows
-                        .iter()
-                        .filter(|row| {
-                            query.owner_shards.as_ref().is_none_or(|owned| {
-                                let shard = crate::db::shard_index_for(&row.id, placement.q, false);
-                                owned.covers(shard)
-                            })
+        // A view has one reducer, so each gets an index of its own; the
+        // stored partials are checked, written, then checked again after a
+        // write has invalidated some of them.
+        let check = |index: &mut ViewIndex, rows: &[Row], reducer: &str| {
+            let spec = ViewSpec {
+                map: String::new(),
+                reduce: Some(reducer.to_string()),
+                partitioned: false,
+            };
+            for query in &queries {
+                // The oracle filters by shard itself, independently of the
+                // blocks under test.
+                let visible: Vec<Row> = rows
+                    .iter()
+                    .filter(|row| {
+                        query.owner_shards.as_ref().is_none_or(|owned| {
+                            let shard = crate::db::shard_index_for(&row.id, placement.q, false);
+                            owned.covers(shard)
                         })
-                        .cloned()
-                        .collect();
-                    let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
-                    let mut js = JsReducer::new(reducer, query.limits);
-                    let actual = view
-                        .reduce(
-                            query,
-                            query.owner_shards.as_ref(),
-                            &mut js,
-                            &AtomicU64::new(0),
-                        )
-                        .unwrap();
-                    assert_eq!(actual, expected, "{reducer} {query:?}");
-                }
+                    })
+                    .cloned()
+                    .collect();
+                let expected = render(&spec, &visible, &HashMap::new(), query).unwrap();
+                let mut js = JsReducer::new(reducer, query.limits);
+                let actual = index
+                    .reduce(
+                        query,
+                        query.owner_shards.as_ref(),
+                        &mut js,
+                        &AtomicU64::new(0),
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "{reducer} {query:?}");
             }
         };
-        check(&view, &rows, &reducers);
-
-        // A write invalidates the stored partials of the shard it touches.
-        let changed: Vec<String> = (0..40).map(|i| format!("d{:05}", i * 97)).collect();
+        let changed: Vec<String> = (0..15).map(|i| format!("d{:05}", i * 97)).collect();
         let added: Vec<Row> = changed
             .iter()
             .map(|id| Row {
@@ -5429,13 +4691,27 @@ mod tests {
                 value: json!(100000),
             })
             .collect();
-        view.replace_docs(&emitted(&rows, &changed), added.clone(), placement);
-        rows.retain(|row| !changed.contains(&row.id));
-        rows.extend(added);
-        sort_rows(&mut rows);
-        // The last reducer checked first, so its partials are still stored.
-        let reversed: Vec<&str> = reducers.iter().rev().copied().collect();
-        check(&view, &rows, &reversed);
+        let mut after = rows.clone();
+        after.retain(|row| !changed.contains(&row.id));
+        after.extend(added.clone());
+        sort_rows(&mut after);
+        for reducer in reducers {
+            let mut index = index_over(redb::backends::InMemoryBackend::new());
+            index.set_placement(placement);
+            index.rebuild(rows.clone(), cursor_at(1), "map|").unwrap();
+            check(&mut index, &rows, reducer);
+            // Again, from the partials the first pass stored.
+            check(&mut index, &rows, reducer);
+            let by_doc: HashMap<String, Vec<Row>> = added
+                .iter()
+                .map(|row| (row.id.clone(), vec![row.clone()]))
+                .collect();
+            index
+                .apply(changed.clone(), by_doc, cursor_at(2), "map|")
+                .unwrap();
+            index.check_tables().unwrap();
+            check(&mut index, &after, reducer);
+        }
     }
 
     #[test]
@@ -6289,6 +5565,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The rows of a streamed `include_docs` query, read one at a time, with
+    /// `between` run after the first: every row's key, and whether the stream
+    /// ended with an error.
+    async fn stream_across<F: std::future::Future<Output = ()>>(
+        db: &Arc<Db>,
+        between: impl FnOnce() -> F,
+    ) -> (Vec<Value>, bool) {
+        let query = ViewQuery {
+            limit: usize::MAX,
+            include_docs: true,
+            ..Default::default()
+        };
+        let ViewReply::Rows(rows) = query_stream(Arc::clone(db), "_design/d", "v", &query)
+            .await
+            .unwrap()
+        else {
+            panic!("a map query streams");
+        };
+        let mut rows = rows.rows;
+        let first = futures::StreamExt::next(&mut rows).await.unwrap().unwrap();
+        between().await;
+        let mut keys = vec![first["key"].clone()];
+        let mut failed = false;
+        while let Some(row) = futures::StreamExt::next(&mut rows).await {
+            match row {
+                Ok(row) => keys.push(row["key"].clone()),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        (keys, failed)
+    }
+
+    /// Deleting the database while an `include_docs` stream is part-way ends
+    /// the stream with an error once it reads documents again: it never
+    /// finishes as if it had every row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_of_a_deleted_database_ends_with_an_error() {
+        let docs: Vec<Value> = (0..900)
+            .map(|n| json!({"_id": format!("d{n:03}"), "n": n}))
+            .collect();
+        let (db, root) = stream_db("streamdelete", 2, docs).await;
+        let (keys, failed) = stream_across(&db, || async {
+            forget_db(&db.path).await;
+            db.close_deleted().await;
+        })
+        .await;
+        assert!(failed, "the stream ran on after the database was deleted");
+        assert!(keys.len() < 900, "{} rows", keys.len());
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An index write that fails closes and reopens the file, as a failed
+    /// commit does. A stream reading it meanwhile either keeps its snapshot
+    /// to the end or ends with an error: it never ends early as if complete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_index_write_never_cuts_a_stream_short_silently() {
+        let docs: Vec<Value> = (0..900)
+            .map(|n| json!({"_id": format!("d{n:03}"), "n": n}))
+            .collect();
+        let (db, root) = stream_db("streamfail", 2, docs).await;
+        let handle = index_handle(&index_path(&db, "_design/d", "v"))
+            .await
+            .unwrap();
+        let (keys, failed) = stream_across(&db, || async {
+            handle.lock().await.close_after_failed_write();
+        })
+        .await;
+        if !failed {
+            let expected: Vec<Value> = (0..900).map(|n| json!(n)).collect();
+            assert_eq!(keys, expected);
+        }
+        // The reopened index serves the next query whole.
+        let (all, ..) = streamed(
+            &db,
+            &ViewQuery {
+                limit: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(all.len(), 900);
+        drop(handle);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// An index over a fresh database on `backend`, as `create_file` makes one.
     fn index_over(backend: impl StorageBackend) -> ViewIndex {
         let db = crate::kv::open_with(backend, VIEW_CACHE_BYTES).unwrap();
@@ -6368,6 +5734,43 @@ mod tests {
         assert!(cuts > 0, "the power was never cut during the update");
     }
 
+    /// Reduce partials are committed without a sync. Power lost right after
+    /// leaves them absent or correct, never wrong: the reopened index's
+    /// tables agree and its next reduce gives the same answer.
+    #[test]
+    fn reduce_partials_survive_a_power_cut_absent_or_correct() {
+        let rows: Vec<Row> = (0..60)
+            .map(|n| Row {
+                id: format!("d{n:02}"),
+                key: json!(n % 7),
+                value: json!(n),
+            })
+            .collect();
+        let query = ViewQuery {
+            limit: usize::MAX,
+            group: true,
+            inclusive_end: true,
+            ..Default::default()
+        };
+        let reduce = |index: &mut ViewIndex| {
+            let mut js = JsReducer::new("_sum", query.limits);
+            index
+                .reduce(&query, None, &mut js, &AtomicU64::new(0))
+                .unwrap()
+        };
+        let (backend, switch) = crate::kv::powercut::PowerCut::new();
+        let mut index = index_over(backend);
+        index.rebuild(rows, cursor_at(1), "map|").unwrap();
+        let expected = reduce(&mut index);
+        switch.cut();
+        drop(index);
+        let mut index =
+            ViewIndex::over(crate::kv::open_with(switch.backend(), VIEW_CACHE_BYTES).unwrap())
+                .unwrap();
+        index.check_tables().unwrap();
+        assert_eq!(reduce(&mut index), expected);
+    }
+
     /// A stored row whose checksum fails is an error, never a row silently
     /// left out of the result.
     #[tokio::test]
@@ -6409,13 +5812,12 @@ mod tests {
             .unwrap();
         assert_eq!(result["total_rows"], 2, "{result}");
 
-        // Damage the stored value of a's row, and drop the warm rows so the
-        // next query reads the file.
+        // Damage the stored value of a's row; the next query reads it.
         let handle = index_handle(&index_path(&db, "_design/d", "v"))
             .await
             .unwrap();
         {
-            let mut index = handle.lock().await;
+            let index = handle.lock().await;
             let file = index.db.as_ref().unwrap();
             let txn = crate::kv::begin_write(file).unwrap();
             // a's row's key, from its by-document entry.
@@ -6431,7 +5833,6 @@ mod tests {
                 .insert(key.as_slice(), damaged.as_slice())
                 .unwrap();
             txn.commit().unwrap();
-            index.cached = None;
         }
         drop(handle);
 
@@ -7378,77 +6779,6 @@ mod tests {
         assert_eq!(jobs, 1, "shard jobs for one incremental update");
         drop(db);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A partitioned view keeps one run per partition. Writes move rows
-    /// between keys, drop them, and start runs for new partitions, and a
-    /// partition's reads follow, as they do a rebuild from the same rows.
-    #[test]
-    fn partition_runs_follow_writes() {
-        let row = |id: &str, key: i64| Row {
-            id: id.into(),
-            key: json!(key),
-            value: json!(1),
-        };
-        let placement = Placement {
-            q: 2,
-            partitioned: true,
-            by_partition: true,
-        };
-        let mut rows: Vec<Row> = (0..700)
-            .flat_map(|n| ["a", "b", "c"].map(|p| row(&format!("{p}:d{n}"), n % 50)))
-            .collect();
-        let mut view = ViewRows::from_rows(rows.clone(), placement);
-        let visited = AtomicU64::new(0);
-        let ids = |view: &ViewRows, partition: &str| {
-            let query = ViewQuery {
-                limit: usize::MAX,
-                partition: Some(partition.into()),
-                ..Default::default()
-            };
-            let selection = view.select(&query, None, &visited);
-            (
-                selection.total_rows,
-                selection.rows.into_iter().map(|r| r.id).collect::<Vec<_>>(),
-            )
-        };
-        let count = |view: &ViewRows, partition: &str| {
-            let query = ViewQuery {
-                limit: usize::MAX,
-                partition: Some(partition.into()),
-                ..Default::default()
-            };
-            let mut js = JsReducer::new("_count", query.limits);
-            view.reduce(&query, None, &mut js, &visited).unwrap()
-        };
-        assert_eq!(ids(&view, "b").0, 700);
-        assert_eq!(
-            count(&view, "b"),
-            json!({"rows": [{"key": null, "value": 700}]})
-        );
-
-        // Move b:d0 to a later key, delete b:d1, add rows to a new partition.
-        let removed = vec![
-            ("b:d0".to_string(), json!(0)),
-            ("b:d1".to_string(), json!(1)),
-        ];
-        let added = vec![row("b:d0", 99), row("z:d0", 5), row("z:d1", 5)];
-        view.replace_docs(&removed, added.clone(), placement);
-        rows.retain(|r| r.id != "b:d0" && r.id != "b:d1");
-        rows.extend(added);
-        let fresh = ViewRows::from_rows(rows, placement);
-        for partition in ["a", "b", "c", "z", "missing"] {
-            assert_eq!(ids(&view, partition), ids(&fresh, partition), "{partition}");
-            assert_eq!(
-                count(&view, partition),
-                count(&fresh, partition),
-                "{partition}"
-            );
-        }
-        assert_eq!(ids(&view, "b").0, 699);
-        assert_eq!(ids(&view, "z").0, 2);
-        assert_eq!(ids(&view, "missing"), (0, Vec::new()));
-        assert_eq!(ids(&view, "b").1.last().map(String::as_str), Some("b:d0"));
     }
 
     /// A partition's view query works on that partition's rows, however many

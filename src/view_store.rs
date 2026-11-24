@@ -490,6 +490,28 @@ pub(crate) struct ShardBlocks {
     pub total: u64,
 }
 
+impl ShardBlocks {
+    /// How many blocks.
+    pub(crate) fn len(&self) -> usize {
+        self.fences.len()
+    }
+
+    /// The position block `at` starts at.
+    pub(crate) fn start(&self, at: usize) -> u64 {
+        self.starts[at]
+    }
+
+    /// The position just past block `at`.
+    pub(crate) fn end(&self, at: usize) -> u64 {
+        self.starts.get(at + 1).copied().unwrap_or(self.total)
+    }
+
+    /// The fence of block `at`: the key its `PARTIALS` entry is under.
+    pub(crate) fn fence(&self, at: usize) -> &[u8] {
+        &self.fences[at]
+    }
+}
+
 /// The blocks of `shard`.
 pub(crate) fn shard_blocks(
     blocks: &impl ReadableTable<ViewKey, &'static [u8]>,

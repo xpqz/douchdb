@@ -405,6 +405,19 @@ pub(crate) fn begin_write(
     Ok(txn)
 }
 
+/// A write transaction for a cache: data derived from what is stored, that
+/// a crash may lose but never get wrong (a view's reduce partials). It
+/// commits without a sync (`Durability::None`): the next durable commit to
+/// the file makes it durable, and a crash before that rolls the file back to
+/// the last durable commit, without it. Nothing else may use it.
+pub(crate) fn begin_cache_write(
+    db: &Database,
+) -> std::result::Result<WriteTransaction, redb::Error> {
+    let mut txn = begin_write(db)?;
+    txn.set_durability(redb::Durability::None)?;
+    Ok(txn)
+}
+
 /// Whether the file at `path` would open without the full check.
 #[cfg(test)]
 pub(crate) fn is_verified(path: &Path) -> bool {
@@ -867,8 +880,8 @@ mod tests {
 
     /// Every write transaction commits in two phases only if it begins in
     /// [`begin_write`]: nothing else in `src/` begins one, in method or path
-    /// form, or changes how one commits. The helper's own body is the one
-    /// exemption. The patterns are assembled at run time so that this test
+    /// form, or changes how one commits. The helper's own body, and
+    /// [`begin_cache_write`]'s, are the only exemptions. The patterns are assembled at run time so that this test
     /// does not match itself.
     #[test]
     fn every_write_transaction_goes_through_kv_begin_write() {
@@ -880,7 +893,10 @@ mod tests {
             .flat_map(|call| [format!(".{call}("), format!("Database::{call}(")])
             .collect();
         patterns.extend(["two_phase_commit", "durability"].map(|knob| format!("set_{knob}(")));
-        let helper = format!("pub(crate) fn {}(", calls[0]);
+        let helpers = [
+            format!("pub(crate) fn {}(", calls[0]),
+            "pub(crate) fn begin_cache_write(".to_string(),
+        ];
         let mut dirs = vec![root];
         let (mut scanned, mut found, mut exempt) = (0, Vec::new(), 0);
         while let Some(dir) = dirs.pop() {
@@ -893,7 +909,7 @@ mod tests {
                     let text = std::fs::read_to_string(&path).unwrap();
                     let mut in_helper = false;
                     for (n, line) in text.lines().enumerate() {
-                        if path == own && line.starts_with(&helper) {
+                        if path == own && helpers.iter().any(|helper| line.starts_with(helper)) {
                             in_helper = true;
                         }
                         if in_helper {
