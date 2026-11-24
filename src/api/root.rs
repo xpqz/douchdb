@@ -226,6 +226,7 @@ pub async fn dbs_info(
     State(st): State<Arc<AppState>>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     _: AdminOnly,
     body: Bytes,
 ) -> Response {
@@ -260,8 +261,10 @@ pub async fn dbs_info(
             Ok(db) => match db.info().await {
                 Ok(mut info) => {
                     info.compact_running |= queued;
-                    let (seq, purge_seq) = info.local_tokens(st.ctx.cluster.me);
-                    match info_json(&info, &seq, &purge_seq) {
+                    // The same tokens and sizes `GET /{db}` reports.
+                    let tokens =
+                        super::database::public_tokens(&st, &db, name, &headers, &mut info).await;
+                    match tokens.and_then(|(seq, purge_seq)| info_json(&info, &seq, &purge_seq)) {
                         Ok(info) => results.push(json!({"key": name, "info": info})),
                         Err(error) => results.push(json!({
                             "key": name,

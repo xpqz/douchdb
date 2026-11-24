@@ -195,26 +195,9 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
             if st.ctx.cluster.is_internal(headers) {
                 return json_of(StatusCode::OK, &info);
             }
-            // The sequences are opaque tokens, as in CouchDB 3: one position
-            // per shard range, on a named copy, the same form the changes
-            // feed returns, so they work as `since`.
-            let (seq, purge_seq) = if st.ctx.cluster.is_clustered() {
-                match cluster_seq_tokens(ClusterRead {
-                    ctx: &st.ctx,
-                    db,
-                    dbname: name,
-                    headers,
-                })
-                .await
-                {
-                    Ok(tokens) => {
-                        info.set_sizes(tokens.sizes);
-                        (tokens.update_seq, tokens.purge_seq)
-                    }
-                    Err(e) => return fail(e),
-                }
-            } else {
-                info.local_tokens(st.ctx.cluster.me)
+            let (seq, purge_seq) = match public_tokens(st, db, name, headers, &mut info).await {
+                Ok(tokens) => tokens,
+                Err(e) => return fail(e),
             };
             match info_json(&info, &seq, &purge_seq) {
                 Ok(info) => json(StatusCode::OK, info),
@@ -223,6 +206,32 @@ async fn db_info(req: DbRequest<'_>, principal: &Principal) -> Response {
         }
         Err(e) => fail(e),
     }
+}
+
+/// The `update_seq` and `purge_seq` a client sees for a database. They are
+/// opaque tokens, as in CouchDB 3: one position per shard range, on a named
+/// copy, the same form the changes feed returns, so they work as `since`. In
+/// a cluster they come from one fan-out to the nodes, which also gives the
+/// cluster-wide sizes.
+pub(crate) async fn public_tokens(
+    st: &AppState,
+    db: &Db,
+    name: &str,
+    headers: &HeaderMap,
+    info: &mut crate::db::DbInfo,
+) -> DbResult<(String, String)> {
+    if !st.ctx.cluster.is_clustered() {
+        return Ok(info.local_tokens(st.ctx.cluster.me));
+    }
+    let tokens = cluster_seq_tokens(ClusterRead {
+        ctx: &st.ctx,
+        db,
+        dbname: name,
+        headers,
+    })
+    .await?;
+    info.set_sizes(tokens.sizes);
+    Ok((tokens.update_seq, tokens.purge_seq))
 }
 
 /// `POST /{db}`: create a document with a server-generated id.
