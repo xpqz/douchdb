@@ -2634,11 +2634,18 @@ fn bad_token(error: impl std::fmt::Display) -> ApiError {
     )
 }
 
+/// A clustered `_changes` read. With `page`, each node is asked for at most
+/// that many rows, and the second value says whether any node had more: the
+/// caller reads again from the returned `last_seq` for the rest, so the
+/// coordinator never holds more than a page per node. A filtered read asks
+/// the nodes without a limit (the filter decides how many rows a node
+/// returns), so it is never paged.
 pub(crate) async fn cluster_changes(
     read: ClusterRead<'_>,
     q: &HashMap<String, String>,
     body: &[u8],
-) -> DbResult<ChangesList> {
+    page: Option<usize>,
+) -> DbResult<(ChangesList, bool)> {
     let ClusterRead { ctx, db, .. } = read;
     let since = parse_since(q.get("since").map(String::as_str))?;
     let limit = num(q, "limit");
@@ -2657,7 +2664,12 @@ pub(crate) async fn cluster_changes(
         filter: change_filter.as_ref(),
         q,
     };
-    let node_limit = if change_filter.is_some() { None } else { limit };
+    let page = page.filter(|_| change_filter.is_none());
+    let node_limit = match (change_filter.is_some(), page) {
+        (true, _) => None,
+        (false, Some(page)) => Some(limit.map_or(page, |limit| limit.min(page))),
+        (false, None) => limit,
+    };
     let since_ref = &since;
     let responses = scatter(
         read,
@@ -2688,8 +2700,10 @@ pub(crate) async fn cluster_changes(
     let mut progress: BTreeMap<usize, CopyPos> = BTreeMap::new();
     let mut lanes: Vec<ChangeLane> = Vec::new();
     let mut pending = 0;
+    let mut more = false;
     for (_, _, (shards, start, value)) in responses {
         pending += value.pending;
+        more |= page.is_some() && node_limit.is_some_and(|limit| value.results.len() >= limit);
         let last = crate::since::decode(&value.last_seq).map_err(bad_token)?;
         let mut rows = std::collections::VecDeque::with_capacity(value.results.len());
         for row in value.results {
@@ -2758,11 +2772,14 @@ pub(crate) async fn cluster_changes(
 
     // Each shard is read by exactly one node, so each document's change
     // comes from exactly one lane.
-    Ok(ChangesList {
-        results: out,
-        last_seq: encode_progress(&progress),
-        pending,
-    })
+    Ok((
+        ChangesList {
+            results: out,
+            last_seq: encode_progress(&progress),
+            pending,
+        },
+        more,
+    ))
 }
 
 fn encode_progress(progress: &BTreeMap<usize, CopyPos>) -> String {
