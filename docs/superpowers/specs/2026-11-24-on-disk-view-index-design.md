@@ -24,6 +24,12 @@ outside review).
   then runs unchanged over the file, so its answers stay identical by
   construction. This replaces the bound-tail encoding and its tables; see
   Positions.
+- **A small in-memory cache per open view** (agreed 2026-11-24, step 5,
+  after measuring). Each shard's block list, and every block's partial with
+  levels of 32 combined above it, are cached under the index lock and
+  dropped for the shards a write changes. Blocks are 64 rows, not 256. This
+  is what brought reduce back to the old speed; it costs about one entry
+  per 64 rows. Measurements: docs/performance.md, "Views on disk".
 - **#195 is deferred.** The `inclusive_end=false` with `endkey_docid`
   behaviour stays as it is during this rewrite. Both query paths change
   together under that issue.

@@ -66,8 +66,10 @@ pub struct ViewSpec {
     pub partitioned: bool,
 }
 
-/// Page cache of each view file: fixed and small, since many can be open.
-const VIEW_CACHE_BYTES: usize = 4 << 20;
+/// Page cache of each view file: fixed and small, since many can be open
+/// (up to `--max-open-indexes`); queries also lean on the operating
+/// system's file cache.
+const VIEW_CACHE_BYTES: usize = 1 << 20;
 
 // The tables of a view file. Every value is sealed (`kv::seal`), so a damaged
 // one is an error when read, never a wrong or missing row.
