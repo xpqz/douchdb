@@ -1345,39 +1345,57 @@ fn highlight_fragment(
             origin.extend(std::iter::repeat_n(span, lowered.len_utf8()));
         }
     }
-    let mut fragments = Vec::new();
-    for term in terms {
-        if term.is_empty() || fragments.len() >= number {
-            continue;
+    // Every whole-token occurrence of a query term, as a span of the original
+    // text. The index splits text where a character is not alphanumeric
+    // (tantivy's `SimpleTokenizer`), so a term inside a longer word is no
+    // match, as in Lucene's highlighter.
+    let word = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    let mut first: Vec<(usize, usize)> = Vec::new();
+    for term in terms.iter().filter(|term| !term.is_empty()) {
+        let mut seen_first = false;
+        for (found, _) in lower.match_indices(term.as_str()) {
+            let after = found + term.len();
+            if word(lower[..found].chars().next_back()) || word(lower[after..].chars().next()) {
+                continue;
+            }
+            let (Some(head), Some(tail)) = (origin.get(found), origin.get(after - 1)) else {
+                continue;
+            };
+            matches.push((head.0, tail.1));
+            if !seen_first {
+                seen_first = true;
+                first.push((head.0, tail.1));
+            }
         }
-        let Some(found) = lower.find(term) else {
-            continue;
-        };
-        let (Some(first), Some(last)) = (
-            origin.get(found),
-            origin.get((found + term.len()).saturating_sub(1)),
-        ) else {
-            continue;
-        };
-        let (index, term_end) = (first.0, last.1);
-        let start = index.saturating_sub(size / 2);
-        let end = (term_end + size / 2).min(text.len());
-        let start = text
-            .char_indices()
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    // One fragment around each term's first occurrence, in query order, with
+    // every occurrence inside it marked.
+    let boundary = |at: usize| {
+        text.char_indices()
             .map(|(i, _)| i)
-            .find(|i| *i >= start)
-            .unwrap_or(0);
-        let end = text
-            .char_indices()
-            .map(|(i, _)| i)
-            .find(|i| *i >= end)
-            .unwrap_or(text.len());
+            .find(|i| *i >= at)
+            .unwrap_or(text.len())
+    };
+    let mut fragments = Vec::new();
+    for (index, term_end) in first.into_iter().take(number) {
+        let start = boundary(index.saturating_sub(size / 2));
+        let end = boundary((term_end + size / 2).min(text.len()));
         let mut fragment = String::new();
-        fragment.push_str(&text[start..index]);
-        fragment.push_str(pre);
-        fragment.push_str(&text[index..term_end]);
-        fragment.push_str(post);
-        fragment.push_str(&text[term_end..end]);
+        let mut at = start;
+        for &(from, to) in &matches {
+            if from < at || to > end {
+                continue;
+            }
+            fragment.push_str(&text[at..from]);
+            fragment.push_str(pre);
+            fragment.push_str(&text[from..to]);
+            fragment.push_str(post);
+            at = to;
+        }
+        fragment.push_str(&text[at..end]);
         fragments.push(fragment);
     }
     fragments
@@ -1924,7 +1942,7 @@ mod tests {
 
         let terms = query_terms("ΟΔΟΣ");
         let fragments = highlight_fragment("η ΟΔΟΣ και οδοσ", &terms, "<b>", "</b>", 100, 1);
-        assert_eq!(fragments, ["η <b>ΟΔΟΣ</b> και οδοσ"]);
+        assert_eq!(fragments, ["η <b>ΟΔΟΣ</b> και <b>οδοσ</b>"]);
     }
 
     #[test]
@@ -1947,6 +1965,30 @@ mod tests {
             let fragments = highlight_fragment(text, &terms, "<b>", "</b>", 100, 1);
             assert_eq!(fragments, vec![expected.to_string()], "{text}");
         }
+    }
+
+    /// As Lucene's highlighter does, every whole-token match inside a
+    /// fragment is marked, and a term inside a longer word is not a match.
+    #[test]
+    fn highlights_mark_every_whole_token_match() {
+        for (text, query, expected) in [
+            ("foo bar foo", "foo", vec!["<b>foo</b> bar <b>foo</b>"]),
+            ("food foo", "foo", vec!["food <b>foo</b>"]),
+            ("seafood", "foo", vec![]),
+            ("bar foo baz", "foo baz", vec!["bar <b>foo</b> <b>baz</b>"]),
+            ("foo-foo", "foo", vec!["<b>foo</b>-<b>foo</b>"]),
+        ] {
+            let terms = query_terms(query);
+            let fragments = highlight_fragment(text, &terms, "<b>", "</b>", 100, 1);
+            assert_eq!(fragments, expected, "{text}");
+        }
+        // Two fragments, one per term, each with what falls inside it.
+        let terms = query_terms("alpha omega");
+        let text = format!("alpha {} omega", "x ".repeat(40));
+        let fragments = highlight_fragment(&text, &terms, "<b>", "</b>", 20, 2);
+        assert_eq!(fragments.len(), 2, "{fragments:?}");
+        assert!(fragments[0].starts_with("<b>alpha</b>"), "{fragments:?}");
+        assert!(fragments[1].ends_with("<b>omega</b>"), "{fragments:?}");
     }
 
     #[test]

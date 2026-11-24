@@ -91,7 +91,11 @@ async fn parse_feed(
             ))
         }
     };
-    parse_since(q.get("since").map(String::as_str))?;
+    // A descending feed starts from the current update_seq whatever `since`
+    // says, so CouchDB never validates it there.
+    if !flag(q, "descending") {
+        parse_since(q.get("since").map(String::as_str))?;
+    }
     let timeout = changes_timeout(q)?;
     let heartbeat = changes_heartbeat(q)?;
     resolve_changes_filter(db, q).await?;
@@ -642,7 +646,11 @@ async fn changes_once(
         )
         .await;
     }
-    let since = parse_since(q.get("since").map(String::as_str))?;
+    let since = if flag(q, "descending") {
+        crate::since::Since::Zero
+    } else {
+        parse_since(q.get("since").map(String::as_str))?
+    };
     let opts = changes_options(st, db, q, body, headers, &since).await?;
     // The sequences are opaque, as in CouchDB 3, where even one node is a
     // cluster. A peer's own reads get one shard per row token, which is all a

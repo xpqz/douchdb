@@ -1899,6 +1899,13 @@ async fn changes_returns_latest_per_document_and_pending() {
         "{descending}"
     );
     assert_eq!(descending["pending"], 1);
+    // CouchDB replaces `since` with the current update_seq before it reads a
+    // descending feed, so a malformed one is never validated there.
+    let (status, garbage) = s
+        .get("/latest/_changes?since=garbage&limit=1&descending=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{garbage}");
+    assert_eq!(garbage["results"], descending["results"], "{garbage}");
 
     let (_, all_docs) = s
         .get("/latest/_changes?since=0&style=all_docs&include_docs=true")
@@ -9854,6 +9861,31 @@ async fn write_to_one_node(node: &Server, db: &str, docs: Vec<Value>) {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// In a cluster `_dbs_info` reports the same sequence tokens and sizes as
+/// `GET /{db}`: positions on every shard range, not only this node's copies.
+#[tokio::test]
+async fn cluster_dbs_info_matches_db_info() {
+    let nodes = start_cluster_sharded(3, 4, 1);
+    for node in &nodes {
+        node.fresh_db("dbsinfo").await;
+    }
+    for i in 0..12 {
+        let (status, body) = nodes[0]
+            .put(&format!("/dbsinfo/d{i}"), json!({"v": i}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, info) = nodes[1].get("/dbsinfo").await;
+    let (status, many) = nodes[1]
+        .post("/_dbs_info", json!({"keys": ["dbsinfo"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{many}");
+    let listed = &many[0]["info"];
+    for field in ["update_seq", "purge_seq", "sizes"] {
+        assert_eq!(listed[field], info[field], "{field}: {listed} vs {info}");
+    }
 }
 
 /// With q=4, n=1 on three nodes, a node owns one or two shards. Its

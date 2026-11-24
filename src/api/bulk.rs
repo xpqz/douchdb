@@ -482,7 +482,7 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
         .iter()
         .map(|(id, _)| bulk_read_candidates(db, id, st.ctx.cluster.me))
         .collect();
-    let mut out = Map::new();
+    let mut found: Vec<Option<crate::db::RevsDiffEntry>> = entries.iter().map(|_| None).collect();
     let mut pending: Vec<usize> = (0..entries.len()).collect();
     while !pending.is_empty() {
         let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -497,14 +497,28 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
                     .collect(),
             );
             async move {
+                // A reply that is not a `_revs_diff` answer fails like an
+                // unreachable copy, rather than reading as nothing missing.
                 let result = if node == st.ctx.cluster.me {
-                    match db.revs_diff(&sub).await {
-                        Ok(diff) => serde_json::to_value(&diff).map_err(ApiError::internal),
-                        Err(error) => Err(error),
-                    }
+                    db.revs_diff(&sub)
+                        .await
+                        .map(|diff| diff.0.into_iter().collect::<HashMap<_, _>>())
                 } else {
                     let peer = st.ctx.cluster.nodes[node].clone();
-                    forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers).await
+                    forward_json(&st.ctx, &peer, dbname, "_revs_diff", "", &sub, headers)
+                        .await
+                        .and_then(|value| {
+                            serde_json::from_value::<HashMap<String, crate::db::RevsDiffEntry>>(
+                                value,
+                            )
+                            .map_err(|error| {
+                                ApiError::new(
+                                    502,
+                                    "bad_gateway",
+                                    format!("bad _revs_diff reply from a peer: {error}"),
+                                )
+                            })
+                        })
                 };
                 (slots, result)
             }
@@ -513,11 +527,9 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
             crate::cluster_http::in_one_round(futures::future::join_all(requests)).await
         {
             match result {
-                Ok(value) => {
-                    if let Some(obj) = value.as_object() {
-                        for (id, entry) in obj {
-                            out.insert(id.clone(), entry.clone());
-                        }
+                Ok(mut diff) => {
+                    for slot in slots {
+                        found[slot] = diff.remove(&entries[slot].0);
                     }
                 }
                 Err(error) => {
@@ -528,13 +540,19 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
                         } else if peer_unreachable(&error) {
                             // fabric_doc_missing_revs ignores workers that
                             // went down: what nobody answered for is missing.
-                            let (id, revs) = &entries[slot];
-                            let missing = if revs.is_array() {
-                                revs.clone()
-                            } else {
-                                json!([])
-                            };
-                            out.insert(id.clone(), json!({ "missing": missing }));
+                            let missing = entries[slot]
+                                .1
+                                .as_array()
+                                .map(|revs| {
+                                    revs.iter()
+                                        .filter_map(|rev| rev.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            found[slot] = Some(crate::db::RevsDiffEntry {
+                                missing,
+                                possible_ancestors: Vec::new(),
+                            });
                         } else {
                             return fail(error);
                         }
@@ -543,7 +561,15 @@ pub(super) async fn revs_diff(req: DbRequest<'_>) -> Response {
             }
         }
     }
-    json(StatusCode::OK, Value::Object(out))
+    // In the order the documents were asked for.
+    let diff = crate::db::RevsDiff(
+        entries
+            .into_iter()
+            .zip(found)
+            .filter_map(|((id, _), entry)| entry.map(|entry| (id, entry)))
+            .collect(),
+    );
+    json_of(StatusCode::OK, &diff)
 }
 
 const ALL_DOCS_BOOL_PARAMS: &[&str] = &[
