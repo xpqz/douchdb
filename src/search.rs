@@ -494,9 +494,31 @@ async fn build_index(
     // cursor, and the next query reads it again.
     gate.check()?;
     let cursor = db.index_cursor();
-    let docs = db.map_docs(None).await?;
+    let placement = (db.q, db.partitioned);
+    // The documents are read and indexed a page at a time, so a build holds
+    // one page of document bodies, not the whole database's.
+    let mut pages = crate::db::MapCursor::default();
+    let mut indexed = Vec::new();
+    let mut gate = gate;
+    loop {
+        let docs = db
+            .map_docs_page(None, &mut pages, crate::db::MAP_DOCS_PAGE)
+            .await?;
+        if docs.is_empty() {
+            break;
+        }
+        let source = spec.source.clone();
+        (gate, indexed) = crate::view::blocking(move || {
+            indexed.extend(
+                index_in_batches(&source, &docs, limits, &gate)?
+                    .into_iter()
+                    .map(|doc| Arc::new(SearchDoc::new(doc.id, doc.fields, placement))),
+            );
+            Ok((gate, indexed))
+        })
+        .await?;
+    }
     let path = index_dir(db, ddoc, index_name);
-    let source = spec.source.clone();
     // Everything but the documents is known before the build starts.
     let meta = SearchMeta {
         version: SEARCH_VERSION,
@@ -507,7 +529,6 @@ async fn build_index(
         docs: HashMap::new(),
         kinds: KindStats::default(),
     };
-    let placement = (db.q, db.partitioned);
     // QuickJS/Tantivy work is CPU- and IO-bound. Run it on the blocking pool so
     // a search rebuild cannot occupy a Tokio async worker for its full duration.
     let (result, gate) = tokio::task::spawn_blocking(move || {
@@ -516,7 +537,7 @@ async fn build_index(
         // permit is returned so a query can keep it for its whole lifetime.
         // The old index's files are about to be removed, so forget it first.
         *entry = None;
-        let result = build_index_files(path, docs, &source, meta, placement, limits, &gate)
+        let result = build_index_files(path, indexed, meta, &gate)
             .and_then(|(index, meta)| Cached::open(index, meta))
             .map(|cached| {
                 let snapshot = cached.snapshot.clone();
@@ -558,18 +579,10 @@ fn index_in_batches(
 /// Build the index at `path` and write `meta` with the indexed documents.
 fn build_index_files(
     path: PathBuf,
-    docs: Vec<(String, String)>,
-    source: &str,
+    indexed: Vec<Arc<SearchDoc>>,
     mut meta: SearchMeta,
-    placement: (u32, bool),
-    limits: crate::view::ViewLimits,
     gate: &Permit,
 ) -> DbResult<(Index, SearchMeta)> {
-    let indexed = index_in_batches(source, &docs, limits, gate)?;
-    let indexed: Vec<Arc<SearchDoc>> = indexed
-        .into_iter()
-        .map(|doc| Arc::new(SearchDoc::new(doc.id, doc.fields, placement)))
-        .collect();
     for doc in &indexed {
         meta.kinds.add(doc);
     }
@@ -2359,6 +2372,50 @@ mod tests {
         let jobs = db.shard_jobs() - before;
         assert_eq!(result["total_rows"], json!(2), "{result}");
         assert_eq!(jobs, 4, "shard jobs for one incremental update");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A build reads the documents a page at a time; one shard spanning
+    /// several pages still indexes every document once.
+    #[tokio::test]
+    async fn a_build_over_several_pages_indexes_every_document() {
+        let root = std::env::temp_dir().join(format!(
+            "douchdb-search-pages-{}-{}",
+            std::process::id(),
+            crate::util::uuid()
+        ));
+        let db = Db::open_or_create(
+            &root,
+            "searchpages",
+            crate::db::DbConfig {
+                q: 1,
+                revs_limit: 1000,
+                cache_bytes: crate::state::DEFAULT_CACHE_MB << 20,
+                shard_map: crate::cluster::ShardMap::single(1),
+                partitioned: false,
+            },
+        )
+        .unwrap();
+        let n = 2 * crate::db::MAP_DOCS_PAGE + 1;
+        let mut docs = vec![json!({"_id": "_design/d", "indexes": {"idx": {
+            "index": "function(doc){ if (doc.a) index('a', doc.a); }"}}})];
+        docs.extend((0..n).map(|i| json!({"_id": format!("d{i:05}"), "a": "word"})));
+        db.put_docs(docs, true).await.unwrap();
+        let request = SearchRequest {
+            query: "a:word".to_string(),
+            limit: 1,
+            ..SearchRequest::default()
+        };
+        let result = query(
+            &db,
+            "_design/d",
+            "idx",
+            &request,
+            crate::view::ViewLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["total_rows"], json!(n), "{result}");
         let _ = std::fs::remove_dir_all(root);
     }
 
