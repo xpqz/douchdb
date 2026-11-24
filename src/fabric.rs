@@ -1747,6 +1747,89 @@ pub(crate) async fn cluster_all_docs(
     })
 }
 
+/// One round of a paged cluster `_all_docs` read (no `keys`): the rows of
+/// every node merged in id order, cut where a node that returned a full page
+/// stopped, since that node may hold the ids after it. The next round starts
+/// after the last row (`after`); `more` says whether one is needed. The
+/// coordinator applies `skip` and `limit` itself, so `opts`' are ignored.
+pub(crate) struct AllDocsPage {
+    pub total_rows: u64,
+    /// Rows before the request's start key, over all nodes.
+    pub before: u64,
+    pub rows: Vec<DocListRow>,
+    pub more: bool,
+}
+
+pub(crate) async fn cluster_all_docs_page(
+    read: ClusterRead<'_>,
+    opts: &AllDocsOpts,
+    after: Option<&str>,
+    page: usize,
+) -> DbResult<AllDocsPage> {
+    let ClusterRead { ctx, db, .. } = read;
+    let owned_by_node = preferred_shard_masks(ctx, db);
+    let mut window = opts.clone();
+    window.keys = None;
+    window.skip = 0;
+    // From the last row sent: it comes back first and is dropped.
+    window.limit = page + usize::from(after.is_some());
+    if let Some(after) = after {
+        window.startkey = Some(after.to_string());
+    }
+    let window = &window;
+    let values = scatter(
+        read,
+        &owned_by_node,
+        "all_docs",
+        |node, mask, _| async move { fetch_all_docs(read, node, window, Some(&mask)).await },
+    )
+    .await?;
+    let before_bound = |id: &str, bound: &str| {
+        if opts.descending {
+            id >= bound
+        } else {
+            id <= bound
+        }
+    };
+    let (mut total_rows, mut before) = (0u64, 0u64);
+    let mut bound: Option<String> = None;
+    let mut rows: Vec<(String, DocListRow)> = Vec::new();
+    for (_, _, response) in values {
+        total_rows += response.total_rows.unwrap_or(0);
+        before += response.offset.unwrap_or(0);
+        if response.rows.len() >= window.limit {
+            if let Some(last) = response.rows.last().and_then(|row| row.id.clone()) {
+                if bound
+                    .as_deref()
+                    .is_none_or(|bound| before_bound(&last, bound))
+                {
+                    bound = Some(last);
+                }
+            }
+        }
+        for row in response.rows {
+            if let Some(id) = row.id.clone() {
+                if after != Some(id.as_str()) {
+                    rows.push((id, row));
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if opts.descending {
+        rows.reverse();
+    }
+    if let Some(bound) = &bound {
+        rows.retain(|(id, _)| before_bound(id, bound));
+    }
+    Ok(AllDocsPage {
+        total_rows,
+        before,
+        rows: rows.into_iter().map(|(_, row)| row).collect(),
+        more: bound.is_some(),
+    })
+}
+
 pub(crate) async fn fetch_all_docs(
     read: ClusterRead<'_>,
     node: usize,

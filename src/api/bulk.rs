@@ -772,6 +772,9 @@ pub(super) async fn all_docs(req: DbRequest<'_>, partition: Option<String>) -> R
     if !req.st.ctx.cluster.is_clustered() && !req.st.ctx.cluster.is_internal(req.headers) {
         return stream_all_docs(&req, &opts, update_seq).await;
     }
+    if opts.keys.is_none() && !req.st.ctx.cluster.is_internal(req.headers) {
+        return stream_cluster_all_docs(&req, opts, update_seq).await;
+    }
     let result = run_all_docs(&req, &opts).await;
     all_docs_reply(&req, result, update_seq)
 }
@@ -892,6 +895,83 @@ async fn stream_all_docs(
     if !still_allowed(req.st, req.db, req.principal) {
         return access_denied(req.principal);
     }
+    stream_json_response(req.method, head.into_bytes(), rows, rows_tail(update_seq)).await
+}
+
+/// Rows a cluster `_all_docs` asks each node for at a time.
+const CLUSTER_PAGE: usize = 1000;
+
+/// `_all_docs` on a cluster coordinator: the nodes are read a page at a
+/// time (`cluster_all_docs_page`) and the body is written as the pages
+/// arrive, so the coordinator holds a page per node, not the listing. The
+/// first page is read before the status is sent, so an error there still
+/// gets its own. `total_rows` and `offset` come from the first page.
+async fn stream_cluster_all_docs(
+    req: &DbRequest<'_>,
+    opts: AllDocsOpts,
+    update_seq: Option<Value>,
+) -> Response {
+    let (st, db) = (req.st.clone(), req.db.clone());
+    let (name, headers) = (req.name.to_string(), req.headers.clone());
+    let first = match cluster_all_docs_page(
+        ClusterRead {
+            ctx: &st.ctx,
+            db: &db,
+            dbname: &name,
+            headers: &headers,
+        },
+        &opts,
+        None,
+        CLUSTER_PAGE,
+    )
+    .await
+    {
+        Ok(first) => first,
+        Err(error) => return fail(error),
+    };
+    if !still_allowed(req.st, req.db, req.principal) {
+        return access_denied(req.principal);
+    }
+    let head = format!(
+        "{{\"total_rows\":{},\"offset\":{},\"rows\":[",
+        first.total_rows,
+        first.before.saturating_add(opts.skip as u64)
+    );
+    let rows = async_stream::stream! {
+        let (mut skip, mut left) = (opts.skip, opts.limit);
+        let mut page = first;
+        loop {
+            let mut last = None;
+            for row in page.rows {
+                last = row.id.clone();
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if left == 0 {
+                    break;
+                }
+                left -= 1;
+                yield Ok::<crate::db::DocListRow, ApiError>(row);
+            }
+            let Some(after) = last.filter(|_| page.more && left > 0) else {
+                break;
+            };
+            let read = ClusterRead {
+                ctx: &st.ctx,
+                db: &db,
+                dbname: &name,
+                headers: &headers,
+            };
+            match cluster_all_docs_page(read, &opts, Some(&after), CLUSTER_PAGE).await {
+                Ok(next) => page = next,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    };
     stream_json_response(req.method, head.into_bytes(), rows, rows_tail(update_seq)).await
 }
 
